@@ -34,6 +34,7 @@ to be lifted into its own package when a second consumer appears.
 | `_torchao_mx.py` | Internal: TorchAO MX (MXFP8 / MXFP4) optional-import + layout validation, supported-dtype gate, and dequant/requant; consumed by `mx_adapter.py` |
 | `_torchao_float8.py`, `_torchao_static_float8.py` | Internal: TorchAO dynamic/weight-only `Float8Tensor` and calibrated static `PrototypeFloat8Tensor` optional imports, layout validation, and dequant/requant; consumed by the corresponding FP8 adapters |
 | `_torchao_int8.py` | Internal: TorchAO INT8 optional-import + layout validation and dequant/requant; consumed by `int8_adapter.py` |
+| `_triton_*_lora.py` | Internal: format-specific CUDA LoRA merge kernels; adapters select them only for validated raw layouts and otherwise use their reference merge |
 | `_torchao_int4_tile.py` | Internal: TorchAO INT4 tile-packed (CUDA-native tinygemm) optional-import + layout validation; consumed by `int4_tile_adapter.py` |
 | `_dtensor.py` | Internal: PyTorch `DTensor` optional-import + mesh/placements signatures and local-shard rewrap; consumed by `dtensor_adapter.py` |
 
@@ -276,8 +277,8 @@ immediately after the owning
 component copies the base weight from pinned CPU storage to GPU, so both
 block-streamed and non-block weights use the same merge path. Merge
 compatibility is adapter-owned: plain dense tensors opt into in-place
-`addmm_`; structured quantized wrappers can opt into
-dequantize/requantize plus `copy_into` updates. Use routed mode for
+`addmm_`; structured quantized wrappers can opt into a format-specific
+staged merge or dequantize/requantize plus `copy_into`. Use routed mode for
 formats that do not expose either merge capability but still provide a
 compatible logical Linear weight shape and compute dtype. `PinnedParam`
 remains a storage primitive; LoRA merge mode asks the selected adapter
@@ -358,16 +359,16 @@ merge_lora(
 )
 ```
 
-This uses an in-place `addmm_` for plain fp/bf bases and
-dequantize/requantize for quantized bases that expose it (quanto,
-bitsandbytes, and TorchAO scaled-FP8 / INT8 / MX / NVFP4 — lossy but
-standard); formats without a merge path (GGUF, TorchAO INT4 tile-packed)
-need routed LoRA instead. See [Quantized weight
+This uses an in-place `addmm_` for plain fp/bf bases. Supported quantized
+adapters use format-specific Triton kernels on CUDA and retain their
+dequantize/requantize reference path as a fallback. Formats without a merge
+path (GGUF, TorchAO INT4 tile-packed) need routed LoRA instead. See [Quantized weight
 support](#quantized-weight-support) for the full matrix. Unlike an
 activation-scoped LoRA request, this is not reversible. Unknown targets
 raise, and all target names, factor shapes, and advertised merge
 capabilities are preflighted before mutation. Multiple LoRAs for one
-quantized parameter are accumulated in dense space and requantized once.
+quantized parameter are packed into one staged low-rank update and the
+weight is re-encoded once.
 
 ### Heterogeneous block lists
 
@@ -782,25 +783,28 @@ dtype, no merge capability required.
 | Weight type | Offload | LoRA merge (`mode="merge"` / `merge_lora`) |
 |---|---|---|
 | Plain bf16 / fp16 / fp32 | ✓ | dense in-place `addmm_` |
-| optimum-quanto (int8 / int4 / …) | ✓ | dequant / requant |
-| bitsandbytes NF4 / FP4 | ✓ | dequant / requant |
-| bitsandbytes int8 | ✓ | dequant / requant |
-| TorchAO scaled-FP8 | ✓ | dequant / requant |
+| optimum-quanto qint8 / qfloat8 | ✓ | fixed-scale Triton merge on CUDA; dequant / requant fallback |
+| bitsandbytes NF4 / FP4 | ✓ | blockwise Triton merge on CUDA; dequant / requant fallback |
+| bitsandbytes int8 | ✓ | rowwise Triton merge on CUDA; dequant / requant fallback |
+| TorchAO scaled-FP8 | ✓ | Triton merge on CUDA; dequant / requant fallback |
 | TorchAO static-activation scaled-FP8 | ✓ | fused Triton merge on CUDA; dequant / requant fallback |
-| TorchAO INT8 | ✓ | dequant / requant |
-| TorchAO MX (MXFP8 / MXFP4) | ✓ | dequant / requant † |
-| TorchAO NVFP4 | ✓ | dequant / requant † |
+| TorchAO INT8 | ✓ | affine Triton merge on CUDA; dequant / requant fallback |
+| TorchAO MX (MXFP8 / MXFP4) | ✓ | blockwise Triton merge on CUDA; dequant / requant fallback † |
+| TorchAO NVFP4 | ✓ | blockwise Triton merge on CUDA; dequant / requant fallback † |
 | GGUF (k-quants) | ✓ | — routed only |
 | TorchAO INT4 tile-packed | ✓ | — routed only |
 | DTensor (tensor-parallel shard) | ✓ | — routed only ‡ |
 
 Notes:
 
-- **Merging into a quantized base is lossy** (dequantize → apply delta →
-  re-encode) but standard; choosing merge vs routed is the caller's
+- **Merging into a quantized base is lossy** because the updated value is
+  re-encoded onto the quantization grid; choosing merge vs routed is the caller's
   accuracy/latency tradeoff, and is coarser the fewer bits the format has
   (e.g. MXFP4 / NVFP4 at 4 bits). Re-encoding recomputes scales from the
   merged values, and zero-amax blocks are floored to avoid NaN scales.
+- **Triton dispatch is layout-conservative.** Each adapter checks its raw
+  storage, scale metadata, compute dtype, and device before launching. A valid
+  but nonstandard representation transparently uses the reference merge.
 - **†** MX and NVFP4 store weights in a block-structured packed layout, so
   the standard re-encode (which produces the contiguous layout) cannot fill
   a transposed (non-contiguous `qdata`) target's storage; those raise a
@@ -828,17 +832,18 @@ A naive `param.data.clone()` on a quanto tensor silently
 *dequantizes* it via the dispatch fallback — the explicit decomposition
 is required for correctness.
 
-LoRA on quanto bases supports both activation-scoped merge and permanent
-`merge_lora()` through dequantize -> addmm -> requantize; neither path
-attempts the ineffective native in-place `addmm_` on a
-`WeightQBytesTensor`. Use `lora_mode="routed"` when the base must remain
-untouched or adapters need to switch without reloading it.
+LoRA on qint8 and the common E4M3/E5M2 qfloat8 bases uses a fixed-scale
+Triton merge on CUDA. Other layouts, including qfloat8 E4M3FNUZ, use the equivalent
+dequantize/addmm/requantize path. Both update the existing inner storage;
+neither attempts native in-place `addmm_` on a `WeightQBytesTensor`. Use
+`lora_mode="routed"` when the base must remain untouched or adapters need
+to switch without reloading it.
 
 ## TorchAO NVFP4 support
 
 TorchAO NVFP4 weights
 (`torchao.prototype.mx_formats.nvfp4_tensor.NVFP4Tensor`) are handled
-when the `nvfp4` optional extra is installed.
+when the `torchao` optional extra is installed.
 `PinnedParam` pins the packed FP4 `qdata`, FP8 block `scale`,
 optional per-tensor scales, and the TorchAO dispatch metadata, then
 rebuilds the `NVFP4Tensor` wrapper around GPU storage on activation.
@@ -847,21 +852,18 @@ matmul execution still depends on Blackwell-class CUDA hardware and the
 matching PyTorch CUDA stack.
 For uv-managed installs on Linux/Windows, this repo routes `torch` and
 `torchao` through PyTorch's CUDA 13.0 wheel index. Use
-`uv sync --extra nvfp4 --group dev` and then
+`uv sync --extra torchao --group dev` and then
 `pytest tests/test_nvfp4_adapter.py -q -rs` to exercise the optional
 TorchAO NVFP4 coverage.
 
-NVFP4 weights support merged LoRA: the adapter exposes
-dequantize/requantize plus `copy_into`, so both activation-scoped merge mode
-and permanent `merge_lora()` re-derive the FP8 (E4M3) block scales — and,
-for two-level scaling, the global `per_tensor_scale` — from the merged
-values via `NVFP4Tensor.to_nvfp4`. Re-encoding uses the torch reference
-path (`use_triton_kernel=False`), which produces the identical
-swizzled-scale layout without NVFP4's optional Triton/`mslk` dependency;
-the merged bytes are copied into the existing wrapper, which keeps its own
-`use_triton_kernel` flag for the forward matmul. Like any merge into a
-quantized base it is lossy, and NVFP4's 4-bit grid makes it coarse, so
-choosing merge vs routed LoRA is the caller's tradeoff.
+Contiguous rank-two NVFP4 weights support a block-local Triton merge for
+ordinary or swizzled scales. Single-level scaling needs one merge/pack pass;
+two-level scaling first reduces the merged amax to a new global scale and
+then recomputes and packs each block. Neither path materializes the dense
+weight. Unsupported layouts use the existing `NVFP4Tensor.to_nvfp4`
+reference path. Both preserve the wrapper and its dispatch metadata while
+re-deriving the data-dependent scales. Like any merge into a quantized base,
+NVFP4's 4-bit re-encoding is lossy.
 
 The adapter does not opt into CPU round-trip or trainable
 `Parameter.data` swap: the quant state lives in the wrapper object, not
@@ -889,40 +891,33 @@ depends on Blackwell-class CUDA hardware and the matching PyTorch CUDA
 stack. Use `uv sync --extra torchao --group dev` and then
 `pytest tests/test_mx_adapter.py -q -rs` to exercise the coverage.
 
-MX weights support merged LoRA: the adapter exposes dequantize/requantize
-plus `copy_into`, so both activation-scoped merge mode and permanent
-`merge_lora()` work by dequantizing to dense, applying the delta, and
-re-encoding the power-of-two (E8M0) block scales through the public
-`MXTensor.to_mx`. Both element dtypes are mergeable, but MXFP4's 4-bit
-grid makes a requantized merge far coarser than MXFP8 — choosing merge vs
-routed LoRA is the caller's accuracy/latency tradeoff. The adapter does
-not opt into CPU round-trip or trainable `Parameter.data` swap: like
-NVFP4 the wrapper's quant state lives in the object, not its bytes, so MX
-weights stay frozen for streaming/training. Routed LoRA remains available
-when the target module is a logical `nn.Linear` with compatible shape and
-compute dtype.
+Standard blocksize-32 MX weights support a block-local Triton merge for
+MXFP8 E4M3/E5M2 and packed MXFP4, including regular or swizzled scales and
+TorchAO's FLOOR, RCEIL, CEIL, and EVEN scale modes. Each kernel program
+updates and packs one 32-element block without materializing the dense
+weight. Unsupported layouts use the existing `MXTensor.to_mx` reference
+path. MXFP4's grid makes a permanent merge much coarser than MXFP8. The
+adapter does not opt into CPU round-trip or trainable `Parameter.data`
+swap: like NVFP4, the wrapper's quant state lives in the object, so MX
+weights stay frozen. Routed LoRA remains the non-destructive alternative.
 
 ## TorchAO scaled FP8 support
 
 TorchAO scaled-fp8 weights (`torchao.quantization.Float8Tensor`, created
 by `quantize_(..., Float8WeightOnlyConfig/Float8DynamicActivationFloat8WeightConfig)`)
-are handled when the `fp8` optional extra is installed. `PinnedParam`
+are handled when the `torchao` optional extra is installed. `PinnedParam`
 pins the fp8 `qdata` and fp32 `scale` tensors plus the TorchAO dispatch
 metadata (`block_size`, `mm_config`, `kernel_preference`,
 `act_quant_kwargs`), then rebuilds the `Float8Tensor` wrapper around GPU
-storage on activation. Per-row and per-tensor scale granularities are
+storage on activation. Per-group, per-row, and per-tensor scale granularities are
 supported; fp8 matmul execution requires SM89+ (Ada/Hopper or newer)
 CUDA hardware.
 
-Like MX, INT8, and NVFP4, scaled-fp8 weights support merged LoRA: the
-adapter exposes dequantize/requantize plus `copy_into`, so both
-activation-scoped merge mode and permanent `merge_lora()` work by
-dequantizing to dense, applying the delta, and re-encoding with
-recomputed scales through the public `Float8Tensor.from_hp` (lossy but
-standard practice for merges into quantized bases). The GPU
-representation is byte-identical to the host one, so the CPU round-trip
-capability is also available. Trainable `Parameter.data` swap is not —
-scaled-fp8 weights stay frozen.
+Standard scaled-FP8 layouts use format-specific Triton merges on CUDA and
+recompute the affected scales; unsupported layouts retain the public
+`Float8Tensor.from_hp` reference path. The GPU representation is
+byte-identical to the host one, so CPU round-trip is also available.
+Trainable `Parameter.data` swap is not — scaled-FP8 weights stay frozen.
 
 TorchAO's calibrated static-activation representation is handled separately
 by `StaticFloat8Adapter`. It targets only

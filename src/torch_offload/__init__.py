@@ -82,8 +82,8 @@ hooks run immediately after the owning component copies a base weight
 from pinned CPU storage to GPU, so block-streamed and non-block weights
 use the same merge path. Merge eligibility is owned by the selected
 tensor adapter: plain dense tensors opt into in-place
-``addmm_``; structured quantized wrappers can opt into
-dequantize/requantize plus ``copy_into`` merge, otherwise use routed
+``addmm_``; structured quantized wrappers can opt into a format-specific
+staged merge or dequantize/requantize plus ``copy_into``, otherwise use routed
 LoRA when their module exposes a compatible logical Linear weight shape
 and compute dtype.
 
