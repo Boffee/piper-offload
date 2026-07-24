@@ -904,13 +904,15 @@ stack. Use `uv sync --extra torchao --group dev` and then
 
 Standard blocksize-32 MX weights support a block-local Triton merge for
 MXFP8 E4M3/E5M2 and packed MXFP4, including regular or swizzled scales and
-TorchAO's FLOOR, RCEIL, CEIL, and EVEN scale modes. Each kernel program
-updates and packs one 32-element block without materializing the dense
-weight. Unsupported layouts use the existing `MXTensor.to_mx` reference
-path. MXFP4's grid makes a permanent merge much coarser than MXFP8. The
-adapter does not opt into CPU round-trip or trainable `Parameter.data`
-swap: like NVFP4, the wrapper's quant state lives in the object, so MX
-weights stay frozen. Routed LoRA remains the non-destructive alternative.
+TorchAO's FLOOR, RCEIL, CEIL, and EVEN scale modes when the mode is recorded
+in `act_quant_kwargs`. Weight-only wrappers do not retain the mode and use
+TorchAO's default FLOOR when re-encoded. Each kernel program updates and
+packs one 32-element block without materializing the dense weight.
+Unsupported layouts use the existing `MXTensor.to_mx` reference path.
+MXFP4's grid makes a permanent merge much coarser than MXFP8. The adapter
+does not opt into CPU round-trip or trainable `Parameter.data` swap: like
+NVFP4, the wrapper's quant state lives in the object, so MX weights stay
+frozen. Routed LoRA remains the non-destructive alternative.
 
 ## TorchAO scaled FP8 support
 
