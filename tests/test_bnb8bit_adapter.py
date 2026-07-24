@@ -338,6 +338,38 @@ class TestBnb8bitAdapter:
         assert torch.equal(target.SCB, expected.SCB)
 
     @CUDA
+    def test_cuda_merge_falls_back_past_triton_width_limit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        rows, cols, rank = 16, 24, 5
+        target = _make_int8(rows=rows, cols=cols, device="cuda")
+        a = torch.randn(rank, cols, device="cuda", dtype=torch.float16)
+        b = torch.randn(rows, rank, device="cuda", dtype=torch.float16)
+        dense = Bnb8bitAdapter.dequantize(target)
+        dense.addmm_(b, a, alpha=-0.25)
+        expected = Bnb8bitAdapter.requantize(dense, like=target)
+
+        monkeypatch.setattr(
+            bnb8bit_adapter_impl,
+            "_TRITON_MAX_COLUMNS",
+            cols - 1,
+        )
+
+        def fail_triton(*_args: object) -> tuple[torch.Tensor, torch.Tensor]:
+            raise AssertionError("oversized BNB8 weights must use fallback")
+
+        monkeypatch.setattr(
+            bnb8bit_adapter_impl,
+            "_triton_merge_bnb8_lora",
+            fail_triton,
+        )
+        Bnb8bitAdapter.merge_lora_(target, b, a, -0.25)
+
+        assert torch.equal(target.CB, expected.CB)
+        assert torch.equal(target.SCB, expected.SCB)
+
+    @CUDA
     def test_triton_merge_handles_zero_and_fp16_extremes(self) -> None:
         pytest.importorskip("triton")
         rows, cols, rank = 17, 19, 3

@@ -65,6 +65,8 @@ except ModuleNotFoundError as exc:
         raise
     _triton_merge_bnb8_lora = None
 
+_TRITON_MAX_COLUMNS = 8_388_608
+
 
 def _torch_merge_bnb8_lora(
     target: torch.Tensor,
@@ -87,7 +89,7 @@ def _can_use_triton_merge(
     b: torch.Tensor,
     a: torch.Tensor,
 ) -> bool:
-    return (
+    if not (
         _triton_merge_bnb8_lora is not None
         and cb.device.type == "cuda"
         and cb.dtype is torch.int8
@@ -95,6 +97,19 @@ def _can_use_triton_merge(
         and b.dtype is torch.float16
         and a.dtype is torch.float16
         and cb.device == scb.device == b.device == a.device
+        and cb.ndim == b.ndim == a.ndim == 2
+    ):
+        return False
+
+    rows, cols = cb.shape
+    rank = a.shape[0]
+    return (
+        rows > 0
+        and 0 < cols <= _TRITON_MAX_COLUMNS
+        and rank > 0
+        and scb.numel() == rows
+        and b.shape == (rows, rank)
+        and a.shape[1] == cols
     )
 
 
