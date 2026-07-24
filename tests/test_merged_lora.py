@@ -1888,7 +1888,9 @@ class TestRoutedMode:
     def test_routed_forward_matches_manual_baseline(self) -> None:
         # Routed mode: base weight stays exactly as constructed; the
         # LoRA contribution rides as a forward-hook addition.
-        m = _make_bf16_model(num_blocks=3, dim=16)
+        with torch.random.fork_rng():
+            torch.manual_seed(0)
+            m = _make_bf16_model(num_blocks=3, dim=16)
         loras = [
             (_make_lora(num_blocks=3, dim=16, seed=11), 0.5),
             (_make_lora(num_blocks=3, dim=16, seed=22), 0.25),
@@ -1899,7 +1901,14 @@ class TestRoutedMode:
         _request_loras(s, loras, mode="routed")
         _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         try:
-            x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+            generator = torch.Generator(device="cuda").manual_seed(0)
+            x = torch.randn(
+                2,
+                16,
+                dtype=torch.bfloat16,
+                device="cuda",
+                generator=generator,
+            )
             actual = m(x)
             torch.cuda.synchronize()
             expected = self._expected_routed_output(m, x, loras)
