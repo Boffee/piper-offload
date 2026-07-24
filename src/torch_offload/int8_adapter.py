@@ -48,7 +48,7 @@ from .tensor_adapters import metadata_key
 from .torchao_structured_adapter import TorchaoStructuredAdapter, copy_storage_into
 
 try:
-    from ._triton_int8 import merge_int8_lora as _triton_merge_int8_lora
+    from ._triton_int8_lora import merge_int8_lora as _triton_merge_int8_lora
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
