@@ -8,9 +8,13 @@ import pytest
 import torch
 from torch import nn
 
+import torch_offload.bnb8bit_adapter as bnb8bit_adapter_impl
+
 from torch_offload import (
     LoRA,
+    LoRATransform,
     ModelOffloader,
+    ScaledLoRAFactor,
     StreamConfig,
     merge_lora,
 )
@@ -254,6 +258,207 @@ class TestBnb8bitAdapter:
         assert merged == 1
         assert torch.isfinite(model.lin.weight.SCB).all()
         assert not torch.equal(model.lin.weight.CB, original_cb)
+
+    @CUDA
+    def test_triton_merge_matches_bnb_round_trip_on_odd_shape(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("triton")
+        rows, cols, rank = 70, 130, 7
+        target = _make_int8(rows=rows, cols=cols, device="cuda")
+        a = torch.randn(
+            cols,
+            rank,
+            device="cuda",
+            dtype=torch.float16,
+        ).t()
+        b = torch.randn(
+            rank,
+            rows,
+            device="cuda",
+            dtype=torch.float16,
+        ).t()
+        assert not a.is_contiguous()
+        assert not b.is_contiguous()
+
+        dense = Bnb8bitAdapter.dequantize(target)
+        dense.addmm_(b, a, alpha=0.375)
+        expected = Bnb8bitAdapter.requantize(dense, like=target)
+        cb_ptr = target.CB.data_ptr()
+        scb_ptr = target.SCB.data_ptr()
+
+        def fail_fallback(
+            _target: torch.Tensor,
+            _b: torch.Tensor,
+            _a: torch.Tensor,
+            _strength: float,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            raise AssertionError("supported CUDA BNB8 must use Triton")
+
+        monkeypatch.setattr(
+            bnb8bit_adapter_impl,
+            "_torch_merge_bnb8_lora",
+            fail_fallback,
+        )
+        Bnb8bitAdapter.merge_lora_(target, b, a, 0.375)
+        torch.cuda.synchronize()
+
+        assert target.CB.data_ptr() == cb_ptr
+        assert target.SCB.data_ptr() == scb_ptr
+        difference = (target.CB.to(torch.int16) - expected.CB).abs()
+        assert difference.max().item() <= 1
+        torch.testing.assert_close(
+            Bnb8bitAdapter.dequantize(target),
+            Bnb8bitAdapter.dequantize(expected),
+            rtol=0.02,
+            atol=0.02,
+        )
+
+    @CUDA
+    def test_cuda_merge_falls_back_when_triton_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        target = _make_int8(rows=16, cols=24, device="cuda")
+        a = torch.randn(5, 24, device="cuda", dtype=torch.float16)
+        b = torch.randn(16, 5, device="cuda", dtype=torch.float16)
+        dense = Bnb8bitAdapter.dequantize(target)
+        dense.addmm_(b, a, alpha=-0.25)
+        expected = Bnb8bitAdapter.requantize(dense, like=target)
+
+        monkeypatch.setattr(
+            bnb8bit_adapter_impl,
+            "_triton_merge_bnb8_lora",
+            None,
+        )
+        Bnb8bitAdapter.merge_lora_(target, b, a, -0.25)
+
+        assert torch.equal(target.CB, expected.CB)
+        assert torch.equal(target.SCB, expected.SCB)
+
+    @CUDA
+    def test_triton_merge_handles_zero_and_fp16_extremes(self) -> None:
+        pytest.importorskip("triton")
+        rows, cols, rank = 17, 19, 3
+        zero = _make_int8(
+            rows=rows,
+            cols=cols,
+            device="cuda",
+            weight=torch.zeros(rows, cols, dtype=torch.float16),
+        )
+        zero_a = torch.zeros(rank, cols, device="cuda", dtype=torch.float16)
+        zero_b = torch.zeros(rows, rank, device="cuda", dtype=torch.float16)
+
+        Bnb8bitAdapter.merge_lora_(zero, zero_b, zero_a, 1.0)
+
+        assert torch.count_nonzero(zero.CB).item() == 0
+        assert torch.count_nonzero(zero.SCB).item() == 0
+        assert torch.isfinite(Bnb8bitAdapter.dequantize(zero)).all()
+
+        extreme = _make_int8(
+            rows=rows,
+            cols=cols,
+            device="cuda",
+            weight=torch.zeros(rows, cols, dtype=torch.float16),
+        )
+        extreme_a = torch.full(
+            (rank, cols),
+            400.0,
+            device="cuda",
+            dtype=torch.float16,
+        )
+        extreme_b = torch.full(
+            (rows, rank),
+            400.0,
+            device="cuda",
+            dtype=torch.float16,
+        )
+
+        Bnb8bitAdapter.merge_lora_(
+            extreme,
+            extreme_b,
+            extreme_a,
+            1000.0,
+        )
+
+        assert torch.isfinite(extreme.SCB).all()
+        assert torch.equal(
+            extreme.SCB,
+            torch.full_like(extreme.SCB, torch.finfo(torch.float16).max),
+        )
+        assert torch.isfinite(Bnb8bitAdapter.dequantize(extreme)).all()
+
+    @CUDA
+    def test_triton_transform_packs_multiple_loras_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("triton")
+        rows, cols = 32, 48
+        target = _make_int8(rows=rows, cols=cols, device="cuda")
+        factor_inputs = [
+            (
+                torch.randn(3, cols),
+                torch.randn(rows, 3),
+                0.5,
+            ),
+            (
+                torch.randn(5, cols),
+                torch.randn(rows, 5),
+                -0.25,
+            ),
+        ]
+        factors = [
+            ScaledLoRAFactor.from_tensors(a, b, strength)
+            for a, b, strength in factor_inputs
+        ]
+        dense = Bnb8bitAdapter.dequantize(target)
+        packed_a = torch.cat(
+            [
+                a.to(device="cuda", dtype=torch.float16).mul_(strength)
+                for a, _b, strength in factor_inputs
+            ],
+            dim=0,
+        )
+        packed_b = torch.cat(
+            [
+                b.to(device="cuda", dtype=torch.float16)
+                for _a, b, _strength in factor_inputs
+            ],
+            dim=1,
+        )
+        dense.addmm_(packed_b, packed_a)
+        expected = Bnb8bitAdapter.requantize(dense, like=target)
+        cb_ptr = target.CB.data_ptr()
+        scb_ptr = target.SCB.data_ptr()
+
+        def fail_fallback(
+            _target: torch.Tensor,
+            _b: torch.Tensor,
+            _a: torch.Tensor,
+            _strength: float,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            raise AssertionError("packed BNB8 merge must use Triton")
+
+        monkeypatch.setattr(
+            bnb8bit_adapter_impl,
+            "_torch_merge_bnb8_lora",
+            fail_fallback,
+        )
+        LoRATransform(factors).apply(target)
+        torch.cuda.synchronize()
+
+        assert target.CB.data_ptr() == cb_ptr
+        assert target.SCB.data_ptr() == scb_ptr
+        difference = (target.CB.to(torch.int16) - expected.CB).abs()
+        assert difference.max().item() <= 1
+        torch.testing.assert_close(
+            Bnb8bitAdapter.dequantize(target),
+            Bnb8bitAdapter.dequantize(expected),
+            rtol=0.02,
+            atol=0.02,
+        )
 
     def test_tied_int8_weights_rejected(self) -> None:
         # int8 quant state migrates onto the module on first forward, so a

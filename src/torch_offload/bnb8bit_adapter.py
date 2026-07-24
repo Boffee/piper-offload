@@ -56,6 +56,47 @@ from .tensor_adapters import (
     tensor_layout,
 )
 
+try:
+    from ._triton_bnb8_lora import (
+        merge_bnb8_lora as _triton_merge_bnb8_lora,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "triton":
+        raise
+    _triton_merge_bnb8_lora = None
+
+
+def _torch_merge_bnb8_lora(
+    target: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge through the ordinary dequantize/addmm/requantize path."""
+    dense = dequantize_int8_params(target)
+    dense.addmm_(b, a, alpha=strength)
+    merged = require_int8_params(
+        requantize_int8_params(dense, like=target)
+    )
+    return merged.CB, merged.SCB
+
+
+def _can_use_triton_merge(
+    cb: torch.Tensor,
+    scb: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+) -> bool:
+    return (
+        _triton_merge_bnb8_lora is not None
+        and cb.device.type == "cuda"
+        and cb.dtype is torch.int8
+        and scb.dtype is torch.float32
+        and b.dtype is torch.float16
+        and a.dtype is torch.float16
+        and cb.device == scb.device == b.device == a.device
+    )
+
 
 @dataclass(slots=True)
 class _Bnb8bitPinned:
@@ -202,6 +243,34 @@ class Bnb8bitAdapter:
     @staticmethod
     def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
         return requantize_int8_params(t, like=like)
+
+    @staticmethod
+    def merge_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Merge into BNB8 storage, preferring the raw Triton path."""
+        qt = require_int8_params(target)
+        if _can_use_triton_merge(qt.CB, qt.SCB, b, a):
+            assert _triton_merge_bnb8_lora is not None
+            cb, scb = _triton_merge_bnb8_lora(
+                qt.CB,
+                qt.SCB,
+                b,
+                a,
+                strength,
+            )
+        else:
+            cb, scb = _torch_merge_bnb8_lora(
+                target,
+                b,
+                a,
+                strength,
+            )
+        qt.CB.copy_(cb)
+        qt.SCB.copy_(scb)
 
     @staticmethod
     def rearm_after_load(param: nn.Parameter, gpu_state: _Bnb8bitGpu) -> None:

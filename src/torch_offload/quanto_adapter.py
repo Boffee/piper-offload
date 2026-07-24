@@ -28,6 +28,7 @@ optimum-quanto is not installed — quanto support is optional.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import nn
@@ -42,6 +43,15 @@ from ._quanto import (
     validate_layout,
 )
 from .tensor_adapters import clone_to_pinned_cpu
+
+try:
+    from ._triton_quanto_qint8_lora import (
+        merge_quanto_qint8_lora as _triton_merge_quanto_qint8_lora,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "triton":
+        raise
+    _triton_merge_quanto_qint8_lora = None
 
 
 @dataclass(slots=True)
@@ -76,6 +86,59 @@ def _build_qbytes(
     return create_qbytes_tensor(
         state.qtype, state.axis, state.size, state.stride,
         data, scale, state.act_qt,
+    )
+
+
+def _torch_merge_quanto_lora(
+    target: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+) -> torch.Tensor:
+    """Merge through the ordinary dequantize/addmm/requantize path."""
+    dense = dequantize_qbytes_tensor(target)
+    dense.addmm_(b, a, alpha=strength)
+    return requantize_qbytes_tensor(dense, like=target)
+
+
+def _is_qint8_layout(qt: Any) -> bool:  # noqa: ANN401
+    qtype = qt.qtype
+    return (
+        qt._data.dtype is torch.int8
+        and getattr(qtype, "bits", None) == 8
+        and not getattr(qtype, "is_floating_point", True)
+    )
+
+
+def _has_supported_scale_layout(qt: Any) -> bool:  # noqa: ANN401
+    rows, cols = qt.size()
+    axis = qt.axis
+    scale = qt._scale
+    return (
+        (axis is None and scale.numel() == 1)
+        or (axis == 0 and scale.numel() == rows)
+        or (axis in (-1, 1) and scale.numel() == cols)
+    )
+
+
+def _can_use_triton_merge(
+    qt: Any,  # noqa: ANN401
+    b: torch.Tensor,
+    a: torch.Tensor,
+) -> bool:
+    data = qt._data
+    scale = qt._scale
+    return (
+        _triton_merge_quanto_qint8_lora is not None
+        and _is_qint8_layout(qt)
+        and data.device.type == "cuda"
+        and data.ndim == 2
+        and tuple(data.shape) == tuple(qt.size())
+        and _has_supported_scale_layout(qt)
+        and scale.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and scale.dtype is b.dtype
+        and b.dtype is a.dtype
+        and data.device == scale.device == b.device == a.device
     )
 
 
@@ -224,6 +287,34 @@ class QuantoAdapter:
     @staticmethod
     def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
         return requantize_qbytes_tensor(t, like=like)
+
+    @staticmethod
+    def merge_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Merge qint8 storage with Triton when its fixed-scale layout fits."""
+        qt = require_qbytes_tensor(target)
+        if _can_use_triton_merge(qt, b, a):
+            assert _triton_merge_quanto_qint8_lora is not None
+            data = _triton_merge_quanto_qint8_lora(
+                qt._data,
+                qt._scale,
+                qt.axis,
+                b,
+                a,
+                strength,
+            )
+            qt._data.copy_(data)
+            return
+
+        merged = require_qbytes_tensor(
+            _torch_merge_quanto_lora(target, b, a, strength)
+        )
+        qt._data.copy_(merged._data)
+        qt._scale.copy_(merged._scale)
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:
