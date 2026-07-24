@@ -19,9 +19,8 @@ per-tensor, per-row, and per-group layouts use raw Triton kernels when
 available; other layouts and environments use the exact generic
 dequantize/GEMM/requantize path. Both recompute the per-block weight
 scale and preserve the existing wrapper and storage tensors. Like any
-merge into a quantized base it is lossy, and int8's 256-level grid makes
-it lossier than fp8 — choosing merge vs routed (non-destructive) LoRA is
-the caller's tradeoff.
+merge into a quantized base it is lossy; choosing merge vs routed
+(non-destructive) LoRA is the caller's tradeoff.
 
 It does not opt into CPU round-trip, trainable ``Parameter.data`` swap,
 or activation-scoped dense ``addmm_`` merge: the quant state lives in the
