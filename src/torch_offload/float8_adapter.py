@@ -12,9 +12,10 @@ Beyond inference movement, this adapter opts into:
 
 - CPU round-trip: GPU storage is the identical fp8 bytes, so D2H back
   into the pinned host state is lossless.
-- Format-specific LoRA merge: CUDA per-row and per-tensor weights use raw
-  Triton kernels when available. Other layouts and installations without
-  Triton use the existing dequantize/GEMM/requantize path.
+- Format-specific LoRA merge: CUDA per-row, per-tensor, and standard
+  per-group weights use raw Triton kernels when available. Other layouts
+  and installations without Triton use the existing
+  dequantize/GEMM/requantize path.
 - Dequantize/requantize plus ``copy_into`` remains the generic update path.
   Requantization recomputes scales via the public ``Float8Tensor.from_hp``,
   which is lossy but standard practice for permanent merges into quantized
@@ -48,29 +49,53 @@ from .torchao_structured_adapter import (
 )
 
 try:
-    from ._triton_float8_lora import (
-        merge_float8_lora as _triton_merge_float8_lora,
-    )
+    from . import _triton_float8_lora
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
+    _TRITON_MAX_GROUP_SIZE = 0
     _triton_merge_float8_lora = None
+else:
+    _TRITON_MAX_GROUP_SIZE = _triton_float8_lora.MAX_GROUP_SIZE
+    _triton_merge_float8_lora = _triton_float8_lora.merge_float8_lora
 
 
-def _is_triton_float8_layout(t: Any) -> bool:  # noqa: ANN401
+def _is_triton_float8_layout(
+    t: Any,  # noqa: ANN401
+    b: torch.Tensor,
+    a: torch.Tensor,
+) -> bool:
     """Return whether ``t`` uses a raw layout supported by the Triton path."""
     if (
-        t.qdata.device.type != "cuda"
+        _triton_merge_float8_lora is None
+        or t.qdata.device.type != "cuda"
         or t.qdata.ndim != 2
         or t.qdata.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
         or t.scale.dtype is not torch.float32
+        or b.ndim != 2
+        or a.ndim != 2
+        or b.dtype is not a.dtype
+        or b.dtype is not t.dtype
+        or b.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or t.qdata.device != t.scale.device
+        or t.qdata.device != b.device
+        or t.qdata.device != a.device
     ):
         return False
     rows, cols = t.qdata.shape
+    rank = a.shape[0]
+    if rows == 0 or cols == 0 or rank == 0 or b.shape != (rows, rank) or a.shape[1] != cols:
+        return False
+
     block_size = tuple(t.block_size)
-    return (block_size == (1, cols) and tuple(t.scale.shape) == (rows, 1)) or (
-        block_size == (rows, cols) and t.scale.numel() == 1
-    )
+    if block_size == (rows, cols):
+        return t.scale.numel() == 1
+    if len(block_size) != 2 or block_size[0] != 1 or not 0 < block_size[1] <= cols or cols % block_size[1] != 0:
+        return False
+    group_size = block_size[1]
+    if group_size < cols and group_size > _TRITON_MAX_GROUP_SIZE:
+        return False
+    return tuple(t.scale.shape) == (rows, cols // group_size)
 
 
 def _torch_merge_float8_lora_(
@@ -199,13 +224,8 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
     ) -> None:
         """Merge a staged LoRA update while preserving the target wrapper."""
         f8 = require_float8_tensor(target)
-        if (
-            _triton_merge_float8_lora is not None
-            and _is_triton_float8_layout(f8)
-            and b.dtype is a.dtype
-            and b.dtype is f8.dtype
-            and b.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        ):
+        if _is_triton_float8_layout(f8, b, a):
+            assert _triton_merge_float8_lora is not None
             qdata, scale = _triton_merge_float8_lora(
                 f8.qdata,
                 f8.scale,

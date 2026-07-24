@@ -15,6 +15,9 @@ _COMPUTE_FP16 = 0
 _COMPUTE_BF16 = 1
 _COMPUTE_FP32 = 2
 _REDUCTION_BLOCK = 8192
+# A group maps to one output tile. Bound that tile so unusual very large
+# groups use the generic path instead of producing an impractical kernel.
+MAX_GROUP_SIZE = 256
 
 
 @triton.jit
@@ -96,6 +99,95 @@ def _merge_dense_kernel(
     else:
         tile_max = tl.max(tl.max(absolute, axis=1), axis=0)
         tl.store(partial_max_ptr + pid, tile_max)
+
+
+@triton.jit
+def _merge_group_kernel(
+    qdata_ptr,
+    scale_ptr,
+    b_ptr,
+    a_ptr,
+    output_qdata_ptr,
+    output_scale_ptr,
+    strength,
+    M,
+    N,
+    K: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    FP8_LIMIT: tl.constexpr,
+    COMPUTE_DTYPE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    group = tl.program_id(axis=1)
+    offsets_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offsets_in_group = tl.arange(0, BLOCK_N)
+    offsets_n = group * GROUP_SIZE + offsets_in_group
+    row_mask = offsets_m < M
+    group_mask = offsets_in_group < GROUP_SIZE
+    mask = row_mask[:, None] & group_mask[None, :]
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k_start in range(0, K, BLOCK_K):
+        offsets_k = k_start + tl.arange(0, BLOCK_K)
+        b = tl.load(
+            b_ptr + offsets_m[:, None] * K + offsets_k[None, :],
+            mask=row_mask[:, None] & (offsets_k[None, :] < K),
+            other=0.0,
+        )
+        a = tl.load(
+            a_ptr + offsets_k[:, None] * N + offsets_n[None, :],
+            mask=(offsets_k[:, None] < K) & group_mask[None, :],
+            other=0.0,
+        )
+        if COMPUTE_DTYPE == 2:
+            accumulator += tl.dot(b, a, input_precision="ieee")
+        else:
+            accumulator += tl.dot(b, a)
+
+    offsets = offsets_m[:, None] * N + offsets_n[None, :]
+    scale_offsets = offsets_m * NUM_GROUPS + group
+    weight_scale = tl.load(
+        scale_ptr + scale_offsets,
+        mask=row_mask,
+        other=1.0,
+    )
+    base = tl.load(qdata_ptr + offsets, mask=mask, other=0.0)
+    base = base.to(tl.float32) * weight_scale[:, None]
+    if COMPUTE_DTYPE == 0:
+        base = base.to(tl.float16)
+    elif COMPUTE_DTYPE == 1:
+        base = base.to(tl.bfloat16)
+
+    merged = base.to(tl.float32) + accumulator * strength
+    if COMPUTE_DTYPE == 0:
+        merged = merged.to(tl.float16)
+    elif COMPUTE_DTYPE == 1:
+        merged = merged.to(tl.bfloat16)
+
+    absolute = tl.where(mask, tl.abs(merged.to(tl.float32)), 0.0)
+    output_scale = tl.max(absolute, axis=1) / FP8_LIMIT
+    if COMPUTE_DTYPE == 0:
+        output_scale = output_scale.to(tl.float16).to(tl.float32)
+    elif COMPUTE_DTYPE == 1:
+        output_scale = output_scale.to(tl.bfloat16).to(tl.float32)
+    output_scale = tl.where(
+        output_scale == 0.0,
+        1.1920928955078125e-07,
+        output_scale,
+    )
+    tl.store(
+        output_scale_ptr + scale_offsets,
+        output_scale,
+        mask=row_mask,
+    )
+
+    scaled = merged.to(tl.float32) / output_scale[:, None]
+    scaled = tl.minimum(tl.maximum(scaled, -FP8_LIMIT), FP8_LIMIT)
+    tl.store(output_qdata_ptr + offsets, scaled, mask=mask)
 
 
 @triton.jit
@@ -207,7 +299,7 @@ def _validate_inputs(  # noqa: PLR0912
     block_size: tuple[int, ...],
     b: torch.Tensor,
     a: torch.Tensor,
-) -> tuple[int, int, int, int, bool]:
+) -> tuple[int, int, int, int, bool, int | None]:
     """Validate a scaled-FP8 launch and return its normalized dimensions."""
     if qdata.device.type != "cuda":
         raise ValueError("Triton scaled-FP8 merge requires CUDA tensors.")
@@ -227,6 +319,11 @@ def _validate_inputs(  # noqa: PLR0912
     rank = a.shape[0]
     per_row = block_size == (1, cols)
     per_tensor = block_size == (rows, cols)
+    group_size = (
+        block_size[1]
+        if (len(block_size) == 2 and block_size[0] == 1 and 0 < block_size[1] < cols and cols % block_size[1] == 0)
+        else None
+    )
     if per_row:
         if tuple(scale.shape) != (rows, 1):
             raise ValueError(
@@ -235,15 +332,71 @@ def _validate_inputs(  # noqa: PLR0912
     elif per_tensor:
         if scale.numel() != 1:
             raise ValueError("Triton per-tensor scaled-FP8 merge expects one scale.")
+    elif group_size is not None:
+        if group_size > MAX_GROUP_SIZE:
+            raise ValueError(
+                f"Triton per-group scaled-FP8 merge supports group sizes up to {MAX_GROUP_SIZE}, got {group_size}."
+            )
+        expected_scale_shape = (rows, cols // group_size)
+        if tuple(scale.shape) != expected_scale_shape:
+            raise ValueError(
+                "Triton per-group scaled-FP8 merge expects scale shape "
+                f"{expected_scale_shape}, got {tuple(scale.shape)}."
+            )
     else:
         raise ValueError(
-            f"Triton scaled-FP8 merge supports per-row and per-tensor layouts, got block_size={block_size!r}."
+            "Triton scaled-FP8 merge supports per-row, per-tensor, and "
+            f"standard per-group layouts, got block_size={block_size!r}."
         )
     if rows == 0 or cols == 0 or rank == 0:
         raise ValueError("Triton scaled-FP8 merge requires non-empty weight and factors.")
     if b.shape != (rows, rank) or a.shape[1] != cols:
         raise ValueError("LoRA factors do not match the scaled-FP8 weight shape.")
-    return rows, cols, rank, compute_dtype, per_row
+    return rows, cols, rank, compute_dtype, per_row, group_size
+
+
+def _merge_group_lora(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+    *,
+    rows: int,
+    cols: int,
+    rank: int,
+    group_size: int,
+    compute_dtype: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge and requantize independent row groups without a dense buffer."""
+    output_qdata = torch.empty_like(qdata)
+    output_scale = torch.empty_like(scale)
+    block_m = 16
+    block_n = max(16, int(triton.next_power_of_2(group_size)))
+    block_k = 16 if rank <= 16 else 32
+    num_pid_m = (rows + block_m - 1) // block_m
+    num_groups = cols // group_size
+    _merge_group_kernel[(num_pid_m, num_groups)](
+        qdata,
+        scale,
+        b,
+        a,
+        output_qdata,
+        output_scale,
+        strength,
+        M=rows,
+        N=cols,
+        K=rank,
+        NUM_GROUPS=num_groups,
+        GROUP_SIZE=group_size,
+        FP8_LIMIT=torch.finfo(qdata.dtype).max,
+        COMPUTE_DTYPE=compute_dtype,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=4,
+    )
+    return output_qdata, output_scale
 
 
 def _reduce_output_scale(
@@ -309,8 +462,8 @@ def merge_float8_lora(
     a: torch.Tensor,
     strength: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return raw scaled-FP8 buffers after one per-row or per-tensor merge."""
-    rows, cols, rank, compute_dtype, per_row = _validate_inputs(
+    """Return raw scaled-FP8 buffers after one supported-layout merge."""
+    rows, cols, rank, compute_dtype, per_row, group_size = _validate_inputs(
         qdata,
         scale,
         block_size,
@@ -322,6 +475,20 @@ def merge_float8_lora(
     scale = scale.contiguous()
     b = b.contiguous()
     a = a.contiguous()
+
+    if group_size is not None:
+        return _merge_group_lora(
+            qdata,
+            scale,
+            b,
+            a,
+            strength,
+            rows=rows,
+            cols=cols,
+            rank=rank,
+            group_size=group_size,
+            compute_dtype=compute_dtype,
+        )
 
     block_m = 64
     block_n = 128
