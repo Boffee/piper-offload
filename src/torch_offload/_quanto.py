@@ -134,7 +134,10 @@ def _quantize_to_qbytes(
         if axis == 0
         else float_data / scale
     )
-    return scaled.round().clamp(
-        torch.iinfo(reference._data.dtype).min,
-        torch.iinfo(reference._data.dtype).max,
-    ).to(reference._data.dtype)
+    storage_dtype = reference._data.dtype
+    if storage_dtype.is_floating_point:
+        limits = torch.finfo(storage_dtype)
+    else:
+        scaled = scaled.round()
+        limits = torch.iinfo(storage_dtype)
+    return scaled.clamp(limits.min, limits.max).to(storage_dtype)

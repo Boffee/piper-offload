@@ -21,6 +21,10 @@ repo depends on. If quanto refactors the wrapper class, the
 :meth:`matches` (validates the expected attributes exist on first
 match).
 
+CUDA qint8 and qfloat8 merges use one fixed-scale Triton pipeline when
+available. Unsupported layouts and installations without Triton keep the
+same dequantize/GEMM/requantize fallback.
+
 Selected by :mod:`tensor_adapter_registry`. Importing fails silently if
 optimum-quanto is not installed — quanto support is optional.
 """
@@ -45,12 +49,16 @@ from ._quanto import (
 from .tensor_adapters import clone_to_pinned_cpu
 
 try:
-    from ._triton_quanto_qint8_lora import (
+    from ._triton_quanto_lora import (
+        merge_quanto_qfloat8_lora as _triton_merge_quanto_qfloat8_lora,
+    )
+    from ._triton_quanto_lora import (
         merge_quanto_qint8_lora as _triton_merge_quanto_qint8_lora,
     )
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
+    _triton_merge_quanto_qfloat8_lora = None
     _triton_merge_quanto_qint8_lora = None
 
 
@@ -110,6 +118,19 @@ def _is_qint8_layout(qt: Any) -> bool:  # noqa: ANN401
     )
 
 
+def _is_qfloat8_layout(qt: Any) -> bool:  # noqa: ANN401
+    qtype = qt.qtype
+    return (
+        qt._data.dtype
+        in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
+        and getattr(qtype, "bits", None) == 8
+        and getattr(qtype, "is_floating_point", False)
+    )
+
+
 def _has_supported_scale_layout(qt: Any) -> bool:  # noqa: ANN401
     rows, cols = qt.size()
     axis = qt.axis
@@ -121,7 +142,7 @@ def _has_supported_scale_layout(qt: Any) -> bool:  # noqa: ANN401
     )
 
 
-def _can_use_triton_merge(
+def _has_triton_compatible_layout(
     qt: Any,  # noqa: ANN401
     b: torch.Tensor,
     a: torch.Tensor,
@@ -129,9 +150,7 @@ def _can_use_triton_merge(
     data = qt._data
     scale = qt._scale
     return (
-        _triton_merge_quanto_qint8_lora is not None
-        and _is_qint8_layout(qt)
-        and data.device.type == "cuda"
+        data.device.type == "cuda"
         and data.ndim == 2
         and tuple(data.shape) == tuple(qt.size())
         and _has_supported_scale_layout(qt)
@@ -295,11 +314,16 @@ class QuantoAdapter:
         a: torch.Tensor,
         strength: float,
     ) -> None:
-        """Merge qint8 storage with Triton when its fixed-scale layout fits."""
+        """Merge qint8/qfloat8 storage with Triton when its layout fits."""
         qt = require_qbytes_tensor(target)
-        if _can_use_triton_merge(qt, b, a):
-            assert _triton_merge_quanto_qint8_lora is not None
-            data = _triton_merge_quanto_qint8_lora(
+        triton_merge = None
+        if _is_qint8_layout(qt):
+            triton_merge = _triton_merge_quanto_qint8_lora
+        elif _is_qfloat8_layout(qt):
+            triton_merge = _triton_merge_quanto_qfloat8_lora
+
+        if triton_merge is not None and _has_triton_compatible_layout(qt, b, a):
+            data = triton_merge(
                 qt._data,
                 qt._scale,
                 qt.axis,
