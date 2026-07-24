@@ -40,7 +40,7 @@ from .torchao_structured_adapter import (
 )
 
 try:
-    from ._triton_static_float8 import (
+    from ._triton_static_float8_lora import (
         merge_static_float8_lora as _triton_merge_static_float8_lora,
     )
 except ModuleNotFoundError as exc:
