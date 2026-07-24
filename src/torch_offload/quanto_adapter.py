@@ -53,6 +53,7 @@ from ._quanto import (
     copy_qbytes_tensor_,
     create_qbytes_tensor,
     dequantize_qbytes_tensor,
+    is_marlin_f8_qbytes_tensor,
     is_weight_qbytes_tensor,
     qbytes_activation_qtype,
     qbytes_data_storage,
@@ -337,14 +338,15 @@ class QuantoAdapter:
         a: torch.Tensor,
         strength: float,
     ) -> None:
-        """Merge qint8/qfloat8 storage with Triton when its layout fits."""
+        """Merge with Triton when possible, except for packed Marlin targets."""
         target_qt = require_qbytes_tensor(target)
         qt = canonicalize_qbytes_tensor(target_qt)
         triton_merge = None
-        if _is_qint8_layout(qt):
-            triton_merge = _triton_merge_quanto_qint8_lora
-        elif _is_qfloat8_layout(qt):
-            triton_merge = _triton_merge_quanto_qfloat8_lora
+        if not is_marlin_f8_qbytes_tensor(target_qt):
+            if _is_qint8_layout(qt):
+                triton_merge = _triton_merge_quanto_qint8_lora
+            elif _is_qfloat8_layout(qt):
+                triton_merge = _triton_merge_quanto_qfloat8_lora
 
         if triton_merge is not None and _has_triton_compatible_layout(qt, b, a):
             data = triton_merge(

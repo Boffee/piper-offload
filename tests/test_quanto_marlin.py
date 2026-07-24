@@ -155,11 +155,9 @@ class TestQuantoMarlin:
         assert torch.equal(canonical._scale, updated._scale)
 
     @CUDA
-    @pytest.mark.parametrize("force_fallback", [False, True])
-    def test_merge_lora_repacks_existing_marlin_storage_in_place(
+    def test_merge_lora_uses_generic_repack_for_existing_marlin_storage(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        force_fallback: bool,
     ) -> None:
         assert MarlinF8QBytesTensor is not None
         model = _make_marlin_model()
@@ -185,27 +183,14 @@ class TestQuantoMarlin:
         workspace_ptr = target._workspace.data_ptr()
         packed_before = target._data._data.clone()
 
-        if force_fallback:
-            monkeypatch.setattr(
-                quanto_adapter_module,
-                "_triton_merge_quanto_qfloat8_lora",
-                None,
-            )
-        elif quanto_adapter_module._triton_merge_quanto_qfloat8_lora is not None:
+        def fail_triton(*_args: object) -> torch.Tensor:
+            raise AssertionError("packed Marlin FP8 must not use raw Triton")
 
-            def fail_fallback(
-                _target: torch.Tensor,
-                _b: torch.Tensor,
-                _a: torch.Tensor,
-                _strength: float,
-            ) -> torch.Tensor:
-                raise AssertionError("canonical Marlin FP8 data must use Triton")
-
-            monkeypatch.setattr(
-                quanto_adapter_module,
-                "_torch_merge_quanto_lora",
-                fail_fallback,
-            )
+        monkeypatch.setattr(
+            quanto_adapter_module,
+            "_triton_merge_quanto_qfloat8_lora",
+            fail_triton,
+        )
 
         QuantoAdapter.merge_lora_(target, b, a, -0.1875)
         torch.cuda.synchronize()

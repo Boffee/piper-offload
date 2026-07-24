@@ -836,8 +836,9 @@ storage on activation.
 Optimized `MarlinF8QBytesTensor` weights are first canonicalized to the
 ordinary unpacked `WeightQBytesTensor` representation for pinned streaming,
 so streamed execution is correct but does not use Marlin's packed matmul.
-Direct merges into an existing Marlin weight repack the result into that
-weight's original physical storage.
+Direct merges into an existing Marlin weight use the reference
+dequantize/addmm/requantize path and repack the result into that weight's
+original physical storage.
 
 A naive `param.data.clone()` on a quanto tensor silently
 *dequantizes* it via the dispatch fallback — the explicit decomposition
