@@ -43,6 +43,11 @@ except ImportError:
     QUANTO_AVAILABLE = False
     WeightQBytesTensor: Any = None
 
+try:
+    from optimum.quanto.tensor.weights.marlin.fp8 import MarlinF8QBytesTensor
+except ImportError:
+    MarlinF8QBytesTensor: Any = None
+
 
 def is_weight_qbytes_tensor(t: object) -> bool:
     """Return whether ``t`` is an optimum-quanto WeightQBytesTensor."""
@@ -62,19 +67,130 @@ def qbytes_activation_qtype(t: Any) -> object | None:  # noqa: ANN401
     return getattr(t, "activation_qtype", None)
 
 
+def is_marlin_f8_qbytes_tensor(t: object) -> bool:
+    """Return whether ``t`` uses optimum-quanto's optimized FP8 packing."""
+    return MarlinF8QBytesTensor is not None and isinstance(
+        t,
+        MarlinF8QBytesTensor,
+    )
+
+
+def canonicalize_qbytes_tensor(t: torch.Tensor) -> Any:  # noqa: ANN401
+    """Return an unoptimized ``WeightQBytesTensor`` with natural storage.
+
+    Optimized Quanto subclasses may wrap a device-specific packed tensor and
+    reorder their scales. Their ``weight_qbytes_tensor`` conversion is the
+    serialization contract for recovering raw qbytes and natural scale order.
+    """
+    qbytes = require_qbytes_tensor(t)
+    if type(qbytes) is WeightQBytesTensor:
+        return qbytes
+    if not is_marlin_f8_qbytes_tensor(qbytes):
+        raise RuntimeError(
+            "torch-offload does not support this optimized optimum-quanto "
+            f"WeightQBytesTensor subclass: {type(qbytes).__name__}. Convert it "
+            "to WeightQBytesTensor before offloading."
+        )
+    canonical = qbytes.weight_qbytes_tensor()
+    if type(canonical) is not WeightQBytesTensor:
+        raise RuntimeError(
+            "optimum-quanto did not convert MarlinF8QBytesTensor to the "
+            "expected unoptimized WeightQBytesTensor representation."
+        )
+    validate_layout(canonical)
+    return canonical
+
+
 def create_qbytes_tensor(
     qtype: object,
-    axis: int,
+    axis: int | None,
     size: torch.Size,
     stride: tuple[int, ...],
     data: torch.Tensor,
     scale: torch.Tensor,
     activation_qtype: object | None,
 ) -> torch.Tensor:
-    """Create an optimum-quanto WeightQBytesTensor."""
+    """Create the canonical, kernel-agnostic Quanto representation."""
     if not QUANTO_AVAILABLE:
         raise RuntimeError("optimum-quanto is required to create a WeightQBytesTensor")
-    return WeightQBytesTensor.create(qtype, axis, size, stride, data, scale, activation_qtype)
+    return WeightQBytesTensor(
+        qtype,
+        axis,
+        size,
+        stride,
+        data,
+        scale,
+        activation_qtype,
+    )
+
+
+def qbytes_data_storage(t: torch.Tensor) -> torch.Tensor:
+    """Return the physical data leaf used for identity and deduplication."""
+    qbytes = require_qbytes_tensor(t)
+    if is_marlin_f8_qbytes_tensor(qbytes):
+        return qbytes._data._data
+    return qbytes._data
+
+
+def canonical_qbytes_storage_layout(
+    t: torch.Tensor,
+) -> tuple[
+    tuple[int, ...],
+    torch.dtype,
+    tuple[int, ...],
+    torch.dtype,
+]:
+    """Return raw data/scale layout after optimized-subclass conversion."""
+    qbytes = require_qbytes_tensor(t)
+    if is_marlin_f8_qbytes_tensor(qbytes):
+        rows, cols = qbytes.size()
+        return (
+            (rows, cols),
+            qbytes.qtype.dtype,
+            (rows, 1),
+            qbytes._scale.dtype,
+        )
+    return (
+        tuple(qbytes._data.shape),
+        qbytes._data.dtype,
+        tuple(qbytes._scale.shape),
+        qbytes._scale.dtype,
+    )
+
+
+def copy_qbytes_tensor_(src: torch.Tensor, target: torch.Tensor) -> None:
+    """Copy canonical qbytes into a base or Marlin target in place."""
+    source = canonicalize_qbytes_tensor(src)
+    target_qbytes = require_qbytes_tensor(target)
+    if (
+        source.qtype is not target_qbytes.qtype
+        or source.axis != target_qbytes.axis
+        or tuple(source.size()) != tuple(target_qbytes.size())
+        or source.dtype is not target_qbytes.dtype
+    ):
+        raise ValueError(
+            "Cannot copy between incompatible optimum-quanto qbytes representations."
+        )
+
+    if is_marlin_f8_qbytes_tensor(target_qbytes):
+        packed = MarlinF8QBytesTensor(
+            target_qbytes.qtype,
+            target_qbytes.axis,
+            target_qbytes.size(),
+            target_qbytes.stride(),
+            source._data,
+            source._scale,
+        )
+        target_qbytes._data._data.copy_(packed._data._data)
+        target_qbytes._scale.copy_(packed._scale)
+        return
+    if type(target_qbytes) is not WeightQBytesTensor:
+        raise RuntimeError(
+            "torch-offload cannot update optimized optimum-quanto subclass "
+            f"{type(target_qbytes).__name__} in place."
+        )
+    target_qbytes._data.copy_(source._data)
+    target_qbytes._scale.copy_(source._scale)
 
 
 def validate_layout(qt: torch.Tensor) -> None:
@@ -107,7 +223,7 @@ def requantize_qbytes_tensor(
     t: torch.Tensor, *, like: torch.Tensor,
 ) -> torch.Tensor:
     """Encode dense ``t`` using the quanto layout and scale from ``like``."""
-    qbytes = require_qbytes_tensor(like)
+    qbytes = canonicalize_qbytes_tensor(like)
     if tuple(t.shape) != tuple(qbytes.size()):
         raise ValueError(
             f"Cannot requantize tensor with shape {tuple(t.shape)} like "

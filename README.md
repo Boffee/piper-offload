@@ -833,6 +833,12 @@ the wrapper into its inner `_data` (int8/fp8) and `_scale` (fp16/fp32)
 tensors, pins each, and reconstructs the quanto wrapper around the GPU
 storage on activation.
 
+Optimized `MarlinF8QBytesTensor` weights are first canonicalized to the
+ordinary unpacked `WeightQBytesTensor` representation for pinned streaming,
+so streamed execution is correct but does not use Marlin's packed matmul.
+Direct merges into an existing Marlin weight repack the result into that
+weight's original physical storage.
+
 A naive `param.data.clone()` on a quanto tensor silently
 *dequantizes* it via the dispatch fallback — the explicit decomposition
 is required for correctness.

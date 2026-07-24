@@ -13,6 +13,16 @@ Parameter's wrapped object, not its bytes. So this adapter:
   PyTorch optimizers keyed by the user's pre-wrap Parameter id are
   orphaned across cycles — quanto-quantized weights are inference-only.
 
+Device-optimized subclasses need one additional boundary rule.
+optimum-quanto 0.2.7's ``MarlinF8QBytesTensor`` stores packed INT32 data
+and permuted scales, and its wrapper-level ``copy_`` unpacks instead of
+updating the packed leaf. The adapter therefore canonicalizes Marlin
+inputs to the kernel-agnostic ``WeightQBytesTensor`` representation when
+pinning and keeps that raw representation throughout streaming. Direct
+updates to an existing Marlin wrapper are repacked into its physical
+``_data._data`` buffer so wrapper, workspace, and storage identity remain
+stable.
+
 Reaches into quanto's private attributes (``_data``, ``_scale``,
 ``qtype``, ``axis``, ``activation_qtype``). Pinned to the
 ``WeightQBytesTensor`` layout in optimum-quanto as of the version this
@@ -38,10 +48,14 @@ import torch
 from torch import nn
 
 from ._quanto import (
+    canonical_qbytes_storage_layout,
+    canonicalize_qbytes_tensor,
+    copy_qbytes_tensor_,
     create_qbytes_tensor,
     dequantize_qbytes_tensor,
     is_weight_qbytes_tensor,
     qbytes_activation_qtype,
+    qbytes_data_storage,
     requantize_qbytes_tensor,
     require_qbytes_tensor,
     validate_layout,
@@ -70,7 +84,7 @@ class _QuantoPinned:
     data: torch.Tensor   # pinned int8/fp8
     scale: torch.Tensor  # pinned fp16/fp32
     qtype: object
-    axis: int
+    axis: int | None
     size: torch.Size
     stride: tuple[int, ...]
     act_qt: object | None
@@ -92,8 +106,13 @@ def _build_qbytes(
     """Reconstruct a :class:`WeightQBytesTensor` from raw pieces +
     cached quant metadata."""
     return create_qbytes_tensor(
-        state.qtype, state.axis, state.size, state.stride,
-        data, scale, state.act_qt,
+        state.qtype,
+        state.axis,
+        state.size,
+        state.stride,
+        data,
+        scale,
+        state.act_qt,
     )
 
 
@@ -134,11 +153,11 @@ def _is_qfloat8_layout(qt: Any) -> bool:  # noqa: ANN401
 def _has_supported_scale_layout(qt: Any) -> bool:  # noqa: ANN401
     rows, cols = qt.size()
     axis = qt.axis
-    scale = qt._scale
+    scale_shape = tuple(qt._scale.shape)
     return (
-        (axis is None and scale.numel() == 1)
-        or (axis == 0 and scale.numel() == rows)
-        or (axis in (-1, 1) and scale.numel() == cols)
+        (axis is None and qt._scale.numel() == 1)
+        or (axis == 0 and scale_shape == (rows, 1))
+        or (axis in (-1, 1) and scale_shape == (1, cols))
     )
 
 
@@ -186,14 +205,15 @@ class QuantoAdapter:
         # underlying _data/_scale storage AND matching quant params are
         # the same logical tensor and dedup safely.
         qt = require_qbytes_tensor(t)
+        data = qbytes_data_storage(qt)
         return (
             "quanto",
-            qt._data.device,
-            qt._data.data_ptr(),
-            qt._data.dtype,
-            tuple(qt._data.shape),
-            qt._data.stride(),
-            qt._data.storage_offset(),
+            data.device,
+            data.data_ptr(),
+            data.dtype,
+            tuple(data.shape),
+            data.stride(),
+            data.storage_offset(),
             qt._scale.device,
             qt._scale.data_ptr(),
             qt._scale.dtype,
@@ -210,6 +230,9 @@ class QuantoAdapter:
     @staticmethod
     def layout_signature(t: torch.Tensor) -> tuple[object, ...]:
         qt = require_qbytes_tensor(t)
+        data_shape, data_dtype, scale_shape, scale_dtype = (
+            canonical_qbytes_storage_layout(qt)
+        )
         return (
             tuple(qt.shape),
             qt.dtype,
@@ -217,19 +240,19 @@ class QuantoAdapter:
             qt.qtype,
             qt.axis,
             qbytes_activation_qtype(qt),
-            ("_data", tuple(qt._data.shape), qt._data.dtype),
-            ("_scale", tuple(qt._scale.shape), qt._scale.dtype),
+            ("_data", data_shape, data_dtype),
+            ("_scale", scale_shape, scale_dtype),
         )
 
     @staticmethod
     def clone_pin(t: torch.Tensor) -> _QuantoPinned:
-        qt = require_qbytes_tensor(t)
+        qt = canonicalize_qbytes_tensor(t)
         # contiguous_format clone: fp8-quanto leaves some _data buffers
         # strided via internal transposes; the default preserve_format
         # would carry that through pin_memory(), breaking downstream
         # assumptions of a contiguous pinned buffer. The original quant
-        # stride is captured separately and reapplied via
-        # WeightQBytesTensor.create on the GPU side.
+        # stride is captured separately and reapplied when rebuilding the
+        # canonical WeightQBytesTensor wrapper.
         return _QuantoPinned(
             data=clone_to_pinned_cpu(
                 qt._data,
@@ -315,7 +338,8 @@ class QuantoAdapter:
         strength: float,
     ) -> None:
         """Merge qint8/qfloat8 storage with Triton when its layout fits."""
-        qt = require_qbytes_tensor(target)
+        target_qt = require_qbytes_tensor(target)
+        qt = canonicalize_qbytes_tensor(target_qt)
         triton_merge = None
         if _is_qint8_layout(qt):
             triton_merge = _triton_merge_quanto_qint8_lora
@@ -331,21 +355,26 @@ class QuantoAdapter:
                 a,
                 strength,
             )
-            qt._data.copy_(data)
+            merged = create_qbytes_tensor(
+                qt.qtype,
+                qt.axis,
+                qt.size(),
+                qt.stride(),
+                data,
+                qt._scale,
+                qbytes_activation_qtype(qt),
+            )
+            copy_qbytes_tensor_(merged, target_qt)
             return
 
         merged = require_qbytes_tensor(
-            _torch_merge_quanto_lora(target, b, a, strength)
+            _torch_merge_quanto_lora(qt, b, a, strength)
         )
-        qt._data.copy_(merged._data)
-        qt._scale.copy_(merged._scale)
+        copy_qbytes_tensor_(merged, target_qt)
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:
-        target_qt = require_qbytes_tensor(target)
-        src_qt = require_qbytes_tensor(src)
-        target_qt._data.copy_(src_qt._data)
-        target_qt._scale.copy_(src_qt._scale)
+        copy_qbytes_tensor_(src, target)
 
     @staticmethod
     def cache_bytes(state: _QuantoPinned) -> int:
