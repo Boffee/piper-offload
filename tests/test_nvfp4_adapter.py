@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import nn
 
+import torch_offload.nvfp4_adapter as nvfp4_adapter_module
 from torch_offload import (
     LoRA,
     LoRATransform,
@@ -88,6 +89,81 @@ def _make_nvfp4_amax(
         per_tensor_scale=per_tensor_scale,
         is_swizzled_scales=swizzled,
         use_triton_kernel=False,
+    )
+
+
+def _make_nvfp4_cuda(
+    weight: torch.Tensor,
+    *,
+    swizzled: bool,
+    two_level: bool,
+    dynamic_activation: bool = False,
+    use_triton_kernel: bool = False,
+    act_per_tensor_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    nvfp4_tensor_cls, kwargs_cls = _nvfp4_modules()
+    mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
+    per_tensor_scale = (
+        mod.per_tensor_amax_to_scale(weight.abs().max()).clamp_min(torch.finfo(torch.float32).eps)
+        if two_level
+        else None
+    )
+    act_quant_kwargs = (
+        kwargs_cls(
+            is_swizzled_scales=swizzled,
+            use_dynamic_per_tensor_scale=True,
+            use_triton_kernel=use_triton_kernel,
+        )
+        if dynamic_activation
+        else None
+    )
+    nv = nvfp4_tensor_cls.to_nvfp4(
+        weight,
+        per_tensor_scale=per_tensor_scale,
+        act_per_tensor_scale=act_per_tensor_scale,
+        is_swizzled_scales=swizzled,
+        use_triton_kernel=False,
+        act_quant_kwargs=act_quant_kwargs,
+    )
+    nv.use_triton_kernel = use_triton_kernel
+    return nv
+
+
+def _expected_nvfp4_merge(
+    nv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+) -> torch.Tensor:
+    dense = Nvfp4Adapter.dequantize(nv)
+    dense.addmm_(b, a, alpha=strength)
+    return Nvfp4Adapter.requantize(dense, like=nv)
+
+
+def _assert_triton_nvfp4_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> None:
+    if actual.per_tensor_scale is not None:
+        assert expected.per_tensor_scale is not None
+        torch.testing.assert_close(
+            actual.per_tensor_scale,
+            expected.per_tensor_scale,
+            rtol=0.02,
+            atol=torch.finfo(torch.float32).eps,
+        )
+    torch.testing.assert_close(
+        actual.get_hp_scales().to(torch.float32),
+        expected.get_hp_scales().to(torch.float32),
+        rtol=0.13,
+        atol=torch.finfo(torch.float32).eps,
+    )
+    block_step = expected.get_hp_scales().to(torch.float32).max().item()
+    torch.testing.assert_close(
+        actual.dequantize(torch.float32),
+        expected.dequantize(torch.float32),
+        rtol=0.2,
+        atol=max(2 * block_step, torch.finfo(torch.float32).eps),
     )
 
 
@@ -313,6 +389,285 @@ class TestNvfp4Adapter:
         assert not torch.equal(model.lin.weight.data.qdata, original_qdata)
 
     @CUDA
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("swizzled", [False, True])
+    @pytest.mark.parametrize("two_level", [False, True])
+    def test_triton_merge_matches_supported_representations(
+        self,
+        dtype: torch.dtype,
+        swizzled: bool,
+        two_level: bool,
+    ) -> None:
+        # NVFP4 requires K divisible by 16. Odd M and rank exercise both
+        # Triton tail masks while retaining a valid packed representation.
+        rows, cols, rank = 19, 80, 13
+        weight = torch.randn(rows, cols, device="cuda", dtype=dtype)
+        nv = _make_nvfp4_cuda(
+            weight,
+            swizzled=swizzled,
+            two_level=two_level,
+        )
+        a = torch.randn(cols, rank, device="cuda", dtype=dtype).t()
+        b = torch.randn(rank, rows, device="cuda", dtype=dtype).t()
+        strength = -0.234375
+        expected = _expected_nvfp4_merge(nv, b, a, strength)
+        qdata_ptr = nv.qdata.data_ptr()
+        scale_ptr = nv.scale.data_ptr()
+        global_scale_ptr = nv.per_tensor_scale.data_ptr() if nv.per_tensor_scale is not None else None
+
+        assert not a.is_contiguous()
+        assert not b.is_contiguous()
+        Nvfp4Adapter.merge_lora_(nv, b, a, strength)
+        torch.cuda.synchronize()
+
+        assert nv.qdata.data_ptr() == qdata_ptr
+        assert nv.scale.data_ptr() == scale_ptr
+        if nv.per_tensor_scale is not None:
+            assert nv.per_tensor_scale.data_ptr() == global_scale_ptr
+        assert nv.is_swizzled_scales is swizzled
+        _assert_triton_nvfp4_close(nv, expected)
+
+    @CUDA
+    def test_triton_transform_packs_loras_and_preserves_all_metadata(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        rows, cols = 21, 80
+        dtype = torch.bfloat16
+        act_per_tensor_scale = torch.tensor(
+            0.0078125,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        nv = _make_nvfp4_cuda(
+            torch.randn(rows, cols, device="cuda", dtype=dtype),
+            swizzled=True,
+            two_level=True,
+            dynamic_activation=True,
+            use_triton_kernel=True,
+            act_per_tensor_scale=act_per_tensor_scale,
+        )
+        param = nn.Parameter(nv, requires_grad=False)
+        factor_inputs = [
+            (
+                torch.randn(5, cols),
+                torch.randn(rows, 5),
+                0.5,
+            ),
+            (
+                torch.randn(3, cols),
+                torch.randn(rows, 3),
+                -0.25,
+            ),
+        ]
+        factors = [ScaledLoRAFactor.from_tensors(a, b, strength) for a, b, strength in factor_inputs]
+        packed_a = torch.cat(
+            [a.to(device="cuda", dtype=dtype).mul_(strength) for a, _b, strength in factor_inputs],
+            dim=0,
+        )
+        packed_b = torch.cat(
+            [b.to(device="cuda", dtype=dtype) for _a, b, _strength in factor_inputs],
+            dim=1,
+        )
+        dense = Nvfp4Adapter.dequantize(nv)
+        dense.addmm_(packed_b, packed_a)
+        expected = Nvfp4Adapter.requantize(dense, like=nv)
+        storage = (
+            nv.qdata,
+            nv.scale,
+            nv.per_tensor_scale,
+            nv.act_per_tensor_scale,
+        )
+        storage_ptrs = tuple(t.data_ptr() for t in storage)
+        activation_value = nv.act_per_tensor_scale.clone()
+        metadata = (
+            nv.block_size,
+            nv.orig_dtype,
+            nv.is_swizzled_scales,
+            nv.use_triton_kernel,
+            nv.act_quant_kwargs,
+        )
+        calls: list[tuple[tuple[int, ...], tuple[int, ...], float]] = []
+        triton_merge = nvfp4_adapter_module._triton_merge_nvfp4_lora
+        assert triton_merge is not None
+
+        def tracked_triton_merge(
+            qdata: torch.Tensor,
+            scale: torch.Tensor,
+            per_tensor_scale: torch.Tensor | None,
+            block_size: int,
+            is_swizzled_scales: bool,
+            b: torch.Tensor,
+            a: torch.Tensor,
+            strength: float,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+            calls.append((tuple(b.shape), tuple(a.shape), strength))
+            return triton_merge(
+                qdata,
+                scale,
+                per_tensor_scale,
+                block_size,
+                is_swizzled_scales,
+                b,
+                a,
+                strength,
+            )
+
+        def fail_dequantize(_tensor: torch.Tensor) -> torch.Tensor:
+            raise AssertionError("supported NVFP4 merge materialized the generic dense path")
+
+        monkeypatch.setattr(
+            nvfp4_adapter_module,
+            "_triton_merge_nvfp4_lora",
+            tracked_triton_merge,
+        )
+        monkeypatch.setattr(
+            nvfp4_adapter_module,
+            "dequantize_nvfp4_tensor",
+            fail_dequantize,
+        )
+        LoRATransform(factors).apply(param)
+        torch.cuda.synchronize()
+
+        assert calls == [((rows, 8), (8, cols), 1.0)]
+        merged = param.data
+        merged_storage = (
+            merged.qdata,
+            merged.scale,
+            merged.per_tensor_scale,
+            merged.act_per_tensor_scale,
+        )
+        assert tuple(t.data_ptr() for t in merged_storage) == storage_ptrs
+        assert torch.equal(merged.act_per_tensor_scale, activation_value)
+        assert (
+            merged.block_size,
+            merged.orig_dtype,
+            merged.is_swizzled_scales,
+            merged.use_triton_kernel,
+            merged.act_quant_kwargs,
+        ) == metadata
+        _assert_triton_nvfp4_close(merged, expected)
+
+    @CUDA
+    def test_fused_merge_uses_exact_fallback_when_triton_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        rows, cols, rank = 16, 64, 5
+        nv = _make_nvfp4_cuda(
+            torch.randn(
+                rows,
+                cols,
+                device="cuda",
+                dtype=torch.bfloat16,
+            ),
+            swizzled=True,
+            two_level=True,
+        )
+        param = nn.Parameter(nv, requires_grad=False)
+        a = torch.randn(rank, cols)
+        b = torch.randn(rows, rank)
+        expected = _expected_nvfp4_merge(
+            nv,
+            b.to(device="cuda", dtype=nv.orig_dtype),
+            a.to(device="cuda", dtype=nv.orig_dtype),
+            0.5,
+        )
+
+        monkeypatch.setattr(
+            nvfp4_adapter_module,
+            "_triton_merge_nvfp4_lora",
+            None,
+        )
+        LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)]).apply(param)
+
+        assert torch.equal(param.data.qdata, expected.qdata)
+        assert torch.equal(
+            param.data.scale.view(torch.uint8),
+            expected.scale.view(torch.uint8),
+        )
+        assert torch.equal(
+            param.data.per_tensor_scale,
+            expected.per_tensor_scale,
+        )
+
+    @CUDA
+    def test_fused_merge_falls_back_for_transposed_storage(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        base = _make_nvfp4_cuda(
+            torch.randn(16, 64, device="cuda", dtype=torch.bfloat16),
+            swizzled=False,
+            two_level=True,
+        )
+        transposed = base.t()
+        rows, cols = transposed.shape
+        assert not transposed.qdata.is_contiguous()
+
+        def fail_triton_merge(*_args, **_kwargs):
+            raise AssertionError("unsupported transposed storage reached Triton")
+
+        monkeypatch.setattr(
+            nvfp4_adapter_module,
+            "_triton_merge_nvfp4_lora",
+            fail_triton_merge,
+        )
+        with pytest.raises(ValueError, match="non-contiguous.*NVFP4"):
+            Nvfp4Adapter.merge_lora_(
+                transposed,
+                torch.randn(
+                    rows,
+                    3,
+                    device="cuda",
+                    dtype=transposed.orig_dtype,
+                ),
+                torch.randn(
+                    3,
+                    cols,
+                    device="cuda",
+                    dtype=transposed.orig_dtype,
+                ),
+                0.5,
+            )
+
+    @CUDA
+    @pytest.mark.parametrize("two_level", [False, True])
+    def test_triton_merge_encodes_zero_weight_safely(
+        self,
+        two_level: bool,
+    ) -> None:
+        rows, cols, rank = 17, 48, 7
+        nv = _make_nvfp4_cuda(
+            torch.zeros(
+                rows,
+                cols,
+                device="cuda",
+                dtype=torch.bfloat16,
+            ),
+            swizzled=True,
+            two_level=two_level,
+        )
+        a = torch.zeros(rank, cols, device="cuda", dtype=nv.orig_dtype)
+        b = torch.zeros(rows, rank, device="cuda", dtype=nv.orig_dtype)
+
+        Nvfp4Adapter.merge_lora_(nv, b, a, 1.0)
+        torch.cuda.synchronize()
+
+        assert torch.isfinite(nv.scale.to(torch.float32)).all()
+        logical_scales = nv.get_hp_scales()
+        assert torch.count_nonzero(logical_scales).item() == logical_scales.numel()
+        assert torch.count_nonzero(nv.dequantize()).item() == 0
+        if nv.per_tensor_scale is not None:
+            assert torch.equal(
+                nv.per_tensor_scale,
+                torch.full_like(
+                    nv.per_tensor_scale,
+                    torch.finfo(torch.float32).eps,
+                ),
+            )
+
+    @CUDA
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:
         nvfp4_tensor_cls, _ = _nvfp4_modules()
         pinned_param = PinnedParam(
@@ -440,7 +795,8 @@ class TestNvfp4Adapter:
         )
         try:
             x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
-            with activated_model(offloader,
+            with activated_model(
+                offloader,
                 "cuda",
                 loras=[lora],
                 lora_strengths=[0.5],
@@ -449,10 +805,9 @@ class TestNvfp4Adapter:
             ) as active:
                 merged = active.blocks[0].weight.data
                 assert isinstance(merged, nvfp4_cls)
-                torch.testing.assert_close(
-                    merged.dequantize(nv.orig_dtype).to(torch.float32),
-                    expected.dequantize(nv.orig_dtype).to(torch.float32),
-                )
+                # Triton's tiled BF16 update can move a handful of values
+                # across an FP4 rounding boundary relative to addmm.
+                _assert_triton_nvfp4_close(merged, expected)
                 y = active(x)
                 torch.cuda.synchronize()
             assert y.shape == (8, 64)
@@ -509,7 +864,8 @@ class TestNvfp4Adapter:
         )
         try:
             x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
-            with activated_model(offloader,
+            with activated_model(
+                offloader,
                 "cuda",
                 loras=[lora],
                 lora_strengths=[0.25],
