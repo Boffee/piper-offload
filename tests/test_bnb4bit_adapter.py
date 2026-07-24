@@ -524,7 +524,7 @@ class TestBnb4bitAdapter:
             )
 
     @CUDA
-    def test_triton_merge_handles_odd_shape_rank_and_block_tail(
+    def test_row_unaligned_blocks_use_generic_fallback(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -552,23 +552,49 @@ class TestBnb4bitAdapter:
         ).t()
         expected = _expected_cuda_merge(target, b, a, -0.125)
 
-        def fail_fallback(
-            _target: torch.Tensor,
-            _b: torch.Tensor,
-            _a: torch.Tensor,
-            _strength: float,
+        fallback_called = False
+        original_fallback = bnb4bit_adapter_impl._torch_merge_bnb4_lora
+
+        monkeypatch.setattr(
+            bnb4bit_adapter_impl,
+            "_triton_merge_bnb4_lora",
+            lambda *_args: pytest.fail(
+                "row-unaligned blocks must not use Triton"
+            ),
+        )
+
+        def record_fallback(
+            fallback_target: torch.Tensor,
+            fallback_b: torch.Tensor,
+            fallback_a: torch.Tensor,
+            fallback_strength: float,
         ) -> torch.Tensor:
-            raise AssertionError("even packed tail must use Triton")
+            nonlocal fallback_called
+            fallback_called = True
+            return original_fallback(
+                fallback_target,
+                fallback_b,
+                fallback_a,
+                fallback_strength,
+            )
 
         monkeypatch.setattr(
             bnb4bit_adapter_impl,
             "_torch_merge_bnb4_lora",
-            fail_fallback,
+            record_fallback,
         )
         Bnb4bitAdapter.merge_lora_(target, b, a, -0.125)
         torch.cuda.synchronize()
 
-        _assert_bnb4_merge_close(target, expected)
+        assert fallback_called
+        assert torch.equal(
+            target.data.view(torch.uint8),
+            expected.data.view(torch.uint8),
+        )
+        assert torch.equal(
+            target.quant_state.absmax,
+            expected.quant_state.absmax,
+        )
 
     @CUDA
     def test_cuda_merge_falls_back_when_triton_is_unavailable(

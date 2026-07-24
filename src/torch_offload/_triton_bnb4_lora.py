@@ -14,147 +14,61 @@ import triton.language as tl
 _COMPUTE_FP16 = 0
 _COMPUTE_BF16 = 1
 _COMPUTE_FP32 = 2
+_QUANT_NF4 = 0
+_QUANT_FP4 = 1
+_QUANT_BLOCK = 64
 _NESTED_BLOCK = 256
 _REDUCTION_BLOCK = 8192
 
 
 @triton.jit
-def _block_scale(
-    block_indices,
-    absmax_ptr,
-    nested_absmax_ptr,
-    nested_code_ptr,
-    offset_ptr,
-    NESTED: tl.constexpr,
-):
-    if NESTED:
-        scale_codes = tl.load(absmax_ptr + block_indices).to(tl.int32)
-        quantized_scales = tl.load(nested_code_ptr + scale_codes)
-        nested_scales = tl.load(
-            nested_absmax_ptr + block_indices // 256,
-        )
-        return quantized_scales * nested_scales + tl.load(offset_ptr)
-    return tl.load(absmax_ptr + block_indices).to(tl.float32)
-
-
-@triton.jit
-def _merged_values(
-    indices,
-    mask,
-    packed_ptr,
-    absmax_ptr,
+def _nearest_sorted_code(
+    values,
     code_ptr,
-    nested_absmax_ptr,
-    nested_code_ptr,
-    offset_ptr,
-    b_ptr,
-    a_ptr,
-    strength,
-    N,
-    K: tl.constexpr,
-    QUANT_BLOCK: tl.constexpr,
-    NESTED: tl.constexpr,
-    COMPUTE_DTYPE: tl.constexpr,
+    MAX_INDEX: tl.constexpr,
+    STEPS: tl.constexpr,
 ):
-    packed = tl.load(
-        packed_ptr + indices // 2,
-        mask=mask,
-        other=0,
-    ).to(tl.int32)
-    code_indices = tl.where(
-        indices % 2 == 0,
-        packed >> 4,
-        packed & 0xF,
-    )
-    codes = tl.load(code_ptr + code_indices)
-    scales = _block_scale(
-        indices // QUANT_BLOCK,
-        absmax_ptr,
-        nested_absmax_ptr,
-        nested_code_ptr,
-        offset_ptr,
-        NESTED,
-    )
-    base = codes * scales
-    if COMPUTE_DTYPE == 0:
-        base = base.to(tl.float16)
-    elif COMPUTE_DTYPE == 1:
-        base = base.to(tl.bfloat16)
+    """Return nearest indices in a monotonically increasing codebook."""
+    low = tl.zeros(values.shape, dtype=tl.int32)
+    high = low + MAX_INDEX
+    for _ in range(STEPS):
+        middle = (low + high) // 2
+        middle_value = tl.load(code_ptr + middle)
+        move_right = middle_value < values
+        low = tl.where(move_right, middle + 1, low)
+        high = tl.where(move_right, high, middle)
 
-    rows = indices // N
-    cols = indices % N
-    update = tl.zeros(indices.shape, dtype=tl.float32)
-    for rank_index in range(K):
-        b = tl.load(
-            b_ptr + rows * K + rank_index,
-            mask=mask,
-            other=0.0,
-        )
-        a = tl.load(
-            a_ptr + rank_index * N + cols,
-            mask=mask,
-            other=0.0,
-        )
-        update += b.to(tl.float32) * a.to(tl.float32)
-
-    merged = base.to(tl.float32) + update * strength
-    if COMPUTE_DTYPE == 0:
-        merged = merged.to(tl.float16)
-    elif COMPUTE_DTYPE == 1:
-        merged = merged.to(tl.bfloat16)
-    return merged
+    upper_index = low
+    lower_index = tl.maximum(upper_index - 1, 0)
+    lower = tl.load(code_ptr + lower_index)
+    upper = tl.load(code_ptr + upper_index)
+    choose_lower = tl.abs(values - lower) <= tl.abs(values - upper)
+    return tl.where(choose_lower, lower_index, upper_index)
 
 
 @triton.jit
-def _merge_block_max_kernel(
-    packed_ptr,
-    absmax_ptr,
-    code_ptr,
-    nested_absmax_ptr,
-    nested_code_ptr,
-    offset_ptr,
-    b_ptr,
-    a_ptr,
-    output_absmax_ptr,
-    strength,
-    NUMEL,
-    N,
-    K: tl.constexpr,
-    QUANT_BLOCK: tl.constexpr,
-    NESTED: tl.constexpr,
-    COMPUTE_DTYPE: tl.constexpr,
-):
-    block = tl.program_id(axis=0)
-    indices = block * QUANT_BLOCK + tl.arange(0, QUANT_BLOCK)
-    mask = indices < NUMEL
-    merged = _merged_values(
-        indices,
-        mask,
-        packed_ptr,
-        absmax_ptr,
-        code_ptr,
-        nested_absmax_ptr,
-        nested_code_ptr,
-        offset_ptr,
-        b_ptr,
-        a_ptr,
-        strength,
-        N,
-        K,
-        QUANT_BLOCK,
-        NESTED,
-        COMPUTE_DTYPE,
+def _nearest_fp4_code(values):
+    """Encode the fixed bitsandbytes FP4 magnitude/sign code layout."""
+    magnitude = tl.abs(values)
+    level = tl.zeros(values.shape, dtype=tl.int32)
+    level += magnitude > 0.0026041667442768812
+    level += magnitude > 0.08593750256113708
+    level += magnitude > 0.2083333358168602
+    level += magnitude > 0.2916666716337204
+    level += magnitude > 0.4166666716337204
+    level += magnitude > 0.5833333432674408
+    level += magnitude > 0.8333333432674408
+
+    code = tl.where(
+        level < 2,
+        level,
+        tl.where(
+            level < 4,
+            level + 4,
+            tl.where(level < 6, level, level - 4),
+        ),
     )
-    absolute = tl.where(mask, tl.abs(merged.to(tl.float32)), 0.0)
-    tl.store(output_absmax_ptr + block, tl.max(absolute, axis=0))
-
-
-@triton.jit
-def _nearest_main_code(values, code_ptr):
-    code_offsets = tl.arange(0, 16)
-    codes = tl.load(code_ptr + code_offsets)
-    differences = tl.abs(values[:, None] - codes[None, :])
-    return tl.argmin(differences, axis=1)
+    return tl.where((values < 0.0) & (level != 0), code + 8, code)
 
 
 @triton.jit
@@ -170,68 +84,123 @@ def _merge_quantize_kernel(
     output_absmax_ptr,
     output_packed_ptr,
     strength,
-    NUMEL,
+    M,
     N,
     K: tl.constexpr,
-    QUANT_BLOCK: tl.constexpr,
+    QUANT_TYPE: tl.constexpr,
     NESTED: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    NESTED_BLOCK: tl.constexpr,
 ):
-    block = tl.program_id(axis=0)
-    byte_offsets = (
-        block * (QUANT_BLOCK // 2)
-        + tl.arange(0, QUANT_BLOCK // 2)
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    offsets_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offsets_n = pid_n * QUANT_BLOCK + tl.arange(0, QUANT_BLOCK)
+    row_mask = offsets_m < M
+
+    accumulator = tl.zeros((BLOCK_M, QUANT_BLOCK), dtype=tl.float32)
+    for rank_start in range(0, K, BLOCK_K):
+        offsets_k = rank_start + tl.arange(0, BLOCK_K)
+        b = tl.load(
+            b_ptr + offsets_m[:, None] * K + offsets_k[None, :],
+            mask=row_mask[:, None] & (offsets_k[None, :] < K),
+            other=0.0,
+        )
+        a = tl.load(
+            a_ptr + offsets_k[:, None] * N + offsets_n[None, :],
+            mask=offsets_k[:, None] < K,
+            other=0.0,
+        )
+        if COMPUTE_DTYPE == 2:
+            accumulator += tl.dot(b, a, input_precision="ieee")
+        else:
+            accumulator += tl.dot(b, a)
+
+    packed_cols = pid_n * (QUANT_BLOCK // 2) + tl.arange(
+        0,
+        QUANT_BLOCK // 2,
     )
-    even_indices = byte_offsets * 2
-    odd_indices = even_indices + 1
-    even_mask = even_indices < NUMEL
-    odd_mask = odd_indices < NUMEL
+    packed_offsets = offsets_m[:, None] * (N // 2) + packed_cols[None, :]
+    packed = tl.load(
+        packed_ptr + packed_offsets,
+        mask=row_mask[:, None],
+        other=0,
+    ).to(tl.int32)
+    code_indices = tl.interleave(packed >> 4, packed & 0xF)
+    base = tl.load(code_ptr + code_indices)
 
-    even = _merged_values(
-        even_indices,
-        even_mask,
-        packed_ptr,
-        absmax_ptr,
-        code_ptr,
-        nested_absmax_ptr,
-        nested_code_ptr,
-        offset_ptr,
-        b_ptr,
-        a_ptr,
-        strength,
-        N,
-        K,
-        QUANT_BLOCK,
-        NESTED,
-        COMPUTE_DTYPE,
-    ).to(tl.float32)
-    odd = _merged_values(
-        odd_indices,
-        odd_mask,
-        packed_ptr,
-        absmax_ptr,
-        code_ptr,
-        nested_absmax_ptr,
-        nested_code_ptr,
-        offset_ptr,
-        b_ptr,
-        a_ptr,
-        strength,
-        N,
-        K,
-        QUANT_BLOCK,
-        NESTED,
-        COMPUTE_DTYPE,
-    ).to(tl.float32)
+    blocks_per_row = N // QUANT_BLOCK
+    scale_offsets = offsets_m * blocks_per_row + pid_n
+    if NESTED:
+        scale_codes = tl.load(
+            absmax_ptr + scale_offsets,
+            mask=row_mask,
+            other=0,
+        ).to(tl.int32)
+        quantized_scales = tl.load(nested_code_ptr + scale_codes)
+        nested_scales = tl.load(
+            nested_absmax_ptr + scale_offsets // NESTED_BLOCK,
+            mask=row_mask,
+            other=0.0,
+        )
+        scales = quantized_scales * nested_scales + tl.load(offset_ptr)
+    else:
+        scales = tl.load(
+            absmax_ptr + scale_offsets,
+            mask=row_mask,
+            other=0.0,
+        ).to(tl.float32)
 
-    scale = tl.load(output_absmax_ptr + block)
-    safe_scale = tl.where(scale == 0.0, 1.0, scale)
-    even = tl.minimum(tl.maximum(even / safe_scale, -1.0), 1.0)
-    odd = tl.minimum(tl.maximum(odd / safe_scale, -1.0), 1.0)
-    even_codes = _nearest_main_code(even, code_ptr)
-    odd_codes = _nearest_main_code(odd, code_ptr)
-    packed = (even_codes << 4) | odd_codes
-    tl.store(output_packed_ptr + byte_offsets, packed, mask=even_mask)
+    base *= scales[:, None]
+    if COMPUTE_DTYPE == 0:
+        base = base.to(tl.float16)
+    elif COMPUTE_DTYPE == 1:
+        base = base.to(tl.bfloat16)
+
+    merged = base.to(tl.float32) + accumulator * strength
+    if COMPUTE_DTYPE == 0:
+        merged = merged.to(tl.float16)
+    elif COMPUTE_DTYPE == 1:
+        merged = merged.to(tl.bfloat16)
+    merged_f32 = merged.to(tl.float32)
+
+    output_scale = tl.max(tl.abs(merged_f32), axis=1)
+    safe_scale = tl.where(output_scale == 0.0, 1.0, output_scale)
+    normalized = tl.minimum(
+        tl.maximum(merged_f32 / safe_scale[:, None], -1.0),
+        1.0,
+    )
+    if QUANT_TYPE == 0:
+        output_codes = _nearest_sorted_code(
+            normalized,
+            code_ptr,
+            15,
+            4,
+        )
+    else:
+        output_codes = _nearest_fp4_code(normalized)
+
+    high, low = tl.split(
+        output_codes.reshape(
+            BLOCK_M,
+            QUANT_BLOCK // 2,
+            2,
+        )
+    )
+    output_packed = (high << 4) | low
+    tl.store(
+        output_packed_ptr + packed_offsets,
+        output_packed,
+        mask=row_mask[:, None],
+    )
+    tl.store(
+        output_absmax_ptr + scale_offsets,
+        output_scale,
+        mask=row_mask,
+    )
 
 
 @triton.jit
@@ -268,14 +237,6 @@ def _mean_kernel(
 
 
 @triton.jit
-def _nearest_nested_code(values, code_ptr):
-    code_offsets = tl.arange(0, 256)
-    codes = tl.load(code_ptr + code_offsets)
-    differences = tl.abs(values[:, None] - codes[None, :])
-    return tl.argmin(differences, axis=1)
-
-
-@triton.jit
 def _quantize_nested_scales_kernel(
     absmax_ptr,
     offset_ptr,
@@ -299,7 +260,7 @@ def _quantize_nested_scales_kernel(
         tl.maximum(centered / safe_absmax, -1.0),
         1.0,
     )
-    quantized = _nearest_nested_code(scaled, code_ptr)
+    quantized = _nearest_sorted_code(scaled, code_ptr, 255, 8)
     tl.store(output_qabsmax_ptr + indices, quantized, mask=mask)
     tl.store(output_nested_absmax_ptr + block, nested_absmax)
 
@@ -315,6 +276,14 @@ def _compute_dtype_id(dtype: torch.dtype) -> int:
         "Triton BNB4 merge supports float16, bfloat16, and float32 "
         f"compute dtypes, got {dtype}."
     )
+
+
+def _quant_type_id(quant_type: str) -> int:
+    if quant_type == "nf4":
+        return _QUANT_NF4
+    if quant_type == "fp4":
+        return _QUANT_FP4
+    raise ValueError("Triton BNB4 merge supports NF4 and FP4.")
 
 
 def _mean_absmax(absmax: torch.Tensor) -> torch.Tensor:
@@ -371,13 +340,12 @@ def merge_bnb4_lora(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Merge by recomputing each block twice, without a dense weight buffer."""
+    """Merge each row-aligned quantization block without a dense weight."""
     if packed.device.type != "cuda":
         raise ValueError("Triton BNB4 merge requires CUDA tensors.")
     if packed.dtype is not torch.uint8:
         raise ValueError("Triton BNB4 merge expects a raw uint8 packed view.")
-    if quant_type not in ("nf4", "fp4"):
-        raise ValueError("Triton BNB4 merge supports NF4 and FP4.")
+    quant_type_id = _quant_type_id(quant_type)
     if code.dtype is not torch.float32 or code.numel() != 16:
         raise ValueError("Triton BNB4 merge expects a 16-value float32 codebook.")
     if b.dtype is not a.dtype:
@@ -397,6 +365,8 @@ def merge_bnb4_lora(
         raise ValueError("Triton BNB4 merge requires exact two-values-per-byte storage.")
     if blocksize != 64:
         raise ValueError("Triton BNB4 merge expects the standard 64-value blocks.")
+    if cols % blocksize != 0:
+        raise ValueError("Triton BNB4 merge requires row-aligned 64-value blocks.")
     if b.shape != (rows, rank) or a.shape[1] != cols:
         raise ValueError("LoRA factors do not match the BNB4 weight shape.")
     if absmax.numel() != num_blocks:
@@ -457,26 +427,13 @@ def merge_bnb4_lora(
         dtype=torch.float32,
     )
     output_packed = torch.empty_like(packed)
-    _merge_block_max_kernel[(num_blocks,)](
-        packed,
-        absmax,
-        code,
-        nested_absmax_input,
-        nested_code_input,
-        offset_input,
-        b,
-        a,
-        raw_absmax,
-        strength,
-        NUMEL=numel,
-        N=cols,
-        K=rank,
-        QUANT_BLOCK=blocksize,
-        NESTED=nested,
-        COMPUTE_DTYPE=compute_dtype,
-        num_warps=8,
+    block_m = 16
+    block_k = 16 if rank <= 16 else 32
+    grid = (
+        triton.cdiv(rows, block_m),
+        cols // _QUANT_BLOCK,
     )
-    _merge_quantize_kernel[(num_blocks,)](
+    _merge_quantize_kernel[grid](
         packed,
         absmax,
         code,
@@ -488,13 +445,17 @@ def merge_bnb4_lora(
         raw_absmax,
         output_packed,
         strength,
-        NUMEL=numel,
+        M=rows,
         N=cols,
         K=rank,
-        QUANT_BLOCK=blocksize,
+        QUANT_TYPE=quant_type_id,
         NESTED=nested,
         COMPUTE_DTYPE=compute_dtype,
-        num_warps=8,
+        BLOCK_M=block_m,
+        BLOCK_K=block_k,
+        QUANT_BLOCK=_QUANT_BLOCK,
+        NESTED_BLOCK=_NESTED_BLOCK,
+        num_warps=4,
     )
 
     if not nested:

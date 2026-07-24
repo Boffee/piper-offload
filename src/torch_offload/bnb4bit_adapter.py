@@ -109,6 +109,7 @@ def _can_use_triton_merge(
         and qt.data.dtype in _TRITON_STORAGE_DTYPES
         and qt.data.is_contiguous()
         and qt.data.storage_offset() == 0
+        and cols % 64 == 0
         and numel % 2 == 0
         and qt.data.numel() * qt.data.element_size() == numel // 2
         and state.quant_type in ("nf4", "fp4")
