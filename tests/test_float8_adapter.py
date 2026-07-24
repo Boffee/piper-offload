@@ -579,6 +579,26 @@ class TestFloat8Adapter:
         assert torch.equal(f8.scale, expected.scale)
 
     @CUDA
+    def test_lora_merge_rejects_transposed_group_layout_clearly(self) -> None:
+        rows, cols, rank = 16, 32, 4
+        f8 = _make_float8(
+            rows=rows,
+            cols=cols,
+            group_size=4,
+            dynamic_activation=False,
+        ).cuda().t()
+        assert tuple(f8.block_size) == (4, 1)
+        assert not f8.qdata.is_contiguous()
+        a = torch.randn(rank, rows, device="cuda", dtype=f8.dtype)
+        b = torch.randn(cols, rank, device="cuda", dtype=f8.dtype)
+
+        with pytest.raises(
+            ValueError,
+            match="transposed PerGroup.*routed LoRA",
+        ):
+            Float8Adapter.merge_lora_(f8, b, a, 0.5)
+
+    @CUDA
     @pytest.mark.parametrize("per_tensor", [False, True])
     def test_triton_lora_merge_repairs_zero_scaling_block(
         self,

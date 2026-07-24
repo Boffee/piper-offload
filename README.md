@@ -800,16 +800,21 @@ Notes:
 - **Merging into a quantized base is lossy** because the updated value is
   re-encoded onto the quantization grid; choosing merge vs routed is the caller's
   accuracy/latency tradeoff, and is coarser the fewer bits the format has
-  (e.g. MXFP4 / NVFP4 at 4 bits). Re-encoding recomputes scales from the
-  merged values, and zero-amax blocks are floored to avoid NaN scales.
+  (e.g. MXFP4 / NVFP4 at 4 bits). Most formats recompute scales from the
+  merged values and floor zero-amax blocks where their encoding requires a
+  positive scale. Quanto instead preserves its fixed scale, and bitsandbytes
+  int8 retains an exact zero scale for an all-zero row.
 - **Triton dispatch is layout-conservative.** Each adapter checks its raw
   storage, scale metadata, compute dtype, and device before launching. A valid
-  but nonstandard representation transparently uses the reference merge.
+  but nonstandard representation uses the reference merge when that format can
+  re-encode the layout.
 - **†** MX and NVFP4 store weights in a block-structured packed layout, so
   the standard re-encode (which produces the contiguous layout) cannot fill
   a transposed (non-contiguous `qdata`) target's storage; those raise a
-  clear error pointing to routed LoRA. int8 cannot be transposed, and
-  scaled-FP8 is unpacked (1 byte/element), so neither is affected.
+  clear error pointing to routed LoRA. A transposed scaled-FP8 `PerGroup`
+  weight is likewise unsupported because TorchAO only reconstructs groups
+  along the last axis. `PerRow` and `PerTensor` scaled-FP8 transposes remain
+  mergeable. int8 cannot be transposed.
 - **‡** `DTensorAdapter` delegates the local shard to the inner adapter
   only for *movement*; it exposes no merge capability of its own, so a
   merge into a DTensor weight raises (frozen-inference scope). Routed LoRA

@@ -117,9 +117,17 @@ def requantize_float8_tensor(
             f"Cannot requantize tensor with shape {tuple(t.shape)} like "
             f"Float8Tensor with shape {tuple(f8.shape)}."
         )
-    granularity = granularity_from_block_size(
-        tuple(f8.block_size), tuple(f8.shape), label="Float8Tensor",
-    )
+    try:
+        granularity = granularity_from_block_size(
+            tuple(f8.block_size), tuple(f8.shape), label="Float8Tensor",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "Cannot re-encode this Float8Tensor layout. TorchAO can rebuild "
+            "PerTensor, PerRow, and last-axis PerGroup weights, but not a "
+            "transposed PerGroup layout. Use routed LoRA instead of merging "
+            "into this weight."
+        ) from exc
     out = Float8Tensor.from_hp(
         t.to(dtype=f8.dtype),
         float8_dtype=f8.qdata.dtype,
