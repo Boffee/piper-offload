@@ -1022,6 +1022,43 @@ class TestLoRATransform:
         assert packed_calls == 1
         torch.testing.assert_close(param, expected, rtol=2e-5, atol=2e-5)
 
+    @CUDA
+    @pytest.mark.parametrize("factor_count", [1, 2])
+    def test_fused_staging_uses_logical_shape_and_compute_dtype(
+        self,
+        factor_count: int,
+    ) -> None:
+        rows, cols = 12, 16
+        factors = [
+            ScaledLoRAFactor.from_tensors(
+                torch.randn(rank, cols),
+                torch.randn(rows, rank),
+                0.5,
+            )
+            for rank in range(2, 2 + factor_count)
+        ]
+        transform = LoRATransform(factors)
+        packed_representation = torch.empty(
+            (rows * cols // 2, 1),
+            device="cuda",
+            dtype=torch.uint8,
+        )
+
+        staged = transform._stage_single_or_packed_update(
+            packed_representation,
+            transform._factor_tensors(),
+            logical_shape=(rows, cols),
+            compute_dtype=torch.float16,
+        )
+
+        assert staged is not None
+        b, a, _strength = staged
+        total_rank = sum(factor.rank for factor in factors)
+        assert b.shape == (rows, total_rank)
+        assert a.shape == (total_rank, cols)
+        assert b.dtype is torch.float16
+        assert a.dtype is torch.float16
+
     def test_regular_non_addmm_dtype_raises_on_apply(self) -> None:
         param = nn.Parameter(torch.zeros(4, 8, dtype=torch.int32), requires_grad=False)
         a = torch.randn(2, 8)
