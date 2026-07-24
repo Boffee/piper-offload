@@ -13,13 +13,14 @@ this module supplies the INT8-specific hooks. One adapter covers both
 because TorchAO models them as the same ``Int8Tensor`` parameterized by
 ``act_quant_kwargs``.
 
-Beyond inference movement, this adapter opts into dequantize/requantize
-plus ``copy_into``, enabling merged (permanent) LoRA on int8 bases.
-Requantization recomputes the per-block weight scale from the merged
-values via the public ``Int8Tensor.from_hp``; like any merge into a
-quantized base it is lossy, and int8's 256-level grid makes it lossier
-than fp8 — choosing merge vs routed (non-destructive) LoRA is the
-caller's tradeoff.
+Beyond inference movement, this adapter opts into dequantize/requantize,
+``copy_into``, and a format-specific CUDA LoRA merge. Supported
+per-tensor, per-row, and per-group layouts use raw Triton kernels when
+available; other layouts and environments use the exact generic
+dequantize/GEMM/requantize path. Both recompute the per-block weight
+scale and preserve the existing wrapper and storage tensors. Like any
+merge into a quantized base it is lossy; choosing merge vs routed
+(non-destructive) LoRA is the caller's tradeoff.
 
 It does not opt into CPU round-trip, trainable ``Parameter.data`` swap,
 or activation-scoped dense ``addmm_`` merge: the quant state lives in the
@@ -44,6 +45,62 @@ from ._torchao_int8 import (
 )
 from .tensor_adapters import metadata_key
 from .torchao_structured_adapter import TorchaoStructuredAdapter, copy_storage_into
+
+try:
+    from ._triton_int8_lora import merge_int8_lora as _triton_merge_int8_lora
+except ModuleNotFoundError as exc:
+    if exc.name != "triton":
+        raise
+    _triton_merge_int8_lora = None
+
+
+_TRITON_COMPUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _triton_int8_layout_supported(
+    qt: Any,  # noqa: ANN401
+    b: torch.Tensor,
+    a: torch.Tensor,
+) -> bool:
+    """Return whether the raw buffers fit the Triton affine-INT8 pipeline."""
+    if (
+        _triton_merge_int8_lora is None
+        or qt.qdata.device.type != "cuda"
+        or qt.qdata.dtype is not torch.int8
+        or qt.qdata.ndim != 2
+        or b.ndim != 2
+        or a.ndim != 2
+        or b.dtype is not a.dtype
+        or b.dtype is not qt.scale.dtype
+        or b.dtype not in _TRITON_COMPUTE_DTYPES
+        or qt.qdata.device != qt.scale.device
+        or qt.qdata.device != b.device
+        or qt.qdata.device != a.device
+    ):
+        return False
+
+    rows, cols = qt.qdata.shape
+    rank = a.shape[0]
+    if rows == 0 or cols == 0 or rank == 0 or b.shape != (rows, rank) or a.shape[1] != cols:
+        return False
+
+    block_size = tuple(qt.block_size)
+    if block_size == (rows, cols):
+        expected_qparam_shape = (1, 1)
+    elif len(block_size) == 2 and block_size[0] == 1 and 0 < block_size[1] <= cols and cols % block_size[1] == 0:
+        expected_qparam_shape = (rows, cols // block_size[1])
+    else:
+        return False
+
+    if tuple(qt.scale.shape) != expected_qparam_shape:
+        return False
+    if qt.zero_point is None:
+        return True
+    return (
+        qt.zero_point.dtype is torch.int8
+        and qt.zero_point.device == qt.qdata.device
+        and tuple(qt.zero_point.shape) == expected_qparam_shape
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -100,12 +157,8 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
         )
 
     @staticmethod
-    def _reconstruct(
-        storage: tuple[torch.Tensor | None, ...], meta: _Int8Meta
-    ) -> torch.Tensor:
-        qdata, scale, zero_point, act_quant_scale, act_quant_zero_point, act_pre_scale = (
-            storage
-        )
+    def _reconstruct(storage: tuple[torch.Tensor | None, ...], meta: _Int8Meta) -> torch.Tensor:
+        qdata, scale, zero_point, act_quant_scale, act_quant_zero_point, act_pre_scale = storage
         assert qdata is not None
         assert scale is not None
         return create_int8_tensor(
@@ -150,6 +203,39 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
     @staticmethod
     def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
         return requantize_int8_tensor(t, like=like)
+
+    @staticmethod
+    def merge_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Merge a staged LoRA update while preserving target storage."""
+        qt = require_int8_tensor(target)
+        if _triton_int8_layout_supported(qt, b, a):
+            assert _triton_merge_int8_lora is not None
+            asymmetric = qt.zero_point is not None and bool(qt.zero_point.any())
+            qdata, scale, zero_point = _triton_merge_int8_lora(
+                qt.qdata,
+                qt.scale,
+                qt.zero_point,
+                tuple(qt.block_size),
+                b,
+                a,
+                strength,
+                asymmetric=asymmetric,
+            )
+            qt.qdata.copy_(qdata)
+            qt.scale.copy_(scale)
+            if qt.zero_point is not None:
+                qt.zero_point.copy_(zero_point)
+            return
+
+        dense = dequantize_int8_tensor(target)
+        dense.addmm_(b, a, alpha=strength)
+        new_data = requantize_int8_tensor(dense, like=target)
+        Int8Adapter.copy_into(new_data, target=target)
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:

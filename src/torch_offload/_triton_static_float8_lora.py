@@ -1,4 +1,4 @@
-"""Triton kernels for static per-tensor FP8 LoRA merges."""
+"""Triton kernels for static per-tensor FP8 LoRA merging."""
 
 # Triton JIT kernel signatures intentionally use untyped pointer parameters
 # and upper-case constexpr names.

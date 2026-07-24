@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import torch_offload.lora as lora_impl
+import torch_offload.quanto_adapter as quanto_adapter_impl
 
 from torch_offload import (
     LoRA,
@@ -39,6 +40,7 @@ from torch_offload import (
 )
 from torch_offload.pinned_module import PinnedModuleInstance
 from torch_offload.pinned_param import PinnedParam
+from torch_offload.quanto_adapter import QuantoAdapter
 from torch_offload.protocols import (
     ResourceBinding,
     ResourceStore,
@@ -1022,6 +1024,43 @@ class TestLoRATransform:
         assert packed_calls == 1
         torch.testing.assert_close(param, expected, rtol=2e-5, atol=2e-5)
 
+    @CUDA
+    @pytest.mark.parametrize("factor_count", [1, 2])
+    def test_fused_staging_uses_logical_shape_and_compute_dtype(
+        self,
+        factor_count: int,
+    ) -> None:
+        rows, cols = 12, 16
+        factors = [
+            ScaledLoRAFactor.from_tensors(
+                torch.randn(rank, cols),
+                torch.randn(rows, rank),
+                0.5,
+            )
+            for rank in range(2, 2 + factor_count)
+        ]
+        transform = LoRATransform(factors)
+        packed_representation = torch.empty(
+            (rows * cols // 2, 1),
+            device="cuda",
+            dtype=torch.uint8,
+        )
+
+        staged = transform._stage_single_or_packed_update(
+            packed_representation,
+            transform._factor_tensors(),
+            logical_shape=(rows, cols),
+            compute_dtype=torch.float16,
+        )
+
+        assert staged is not None
+        b, a, _strength = staged
+        total_rank = sum(factor.rank for factor in factors)
+        assert b.shape == (rows, total_rank)
+        assert a.shape == (total_rank, cols)
+        assert b.dtype is torch.float16
+        assert a.dtype is torch.float16
+
     def test_regular_non_addmm_dtype_raises_on_apply(self) -> None:
         param = nn.Parameter(torch.zeros(4, 8, dtype=torch.int32), requires_grad=False)
         a = torch.randn(2, 8)
@@ -1113,6 +1152,356 @@ class TestLoRATransform:
         )
 
         transform.validate_target(nn.Parameter(qt, requires_grad=False))
+
+    @CUDA
+    @pytest.mark.parametrize("axis", [0, -1, None])
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float16, torch.bfloat16, torch.float32],
+    )
+    def test_triton_quanto_qint8_matches_fixed_scale_round_trip(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        axis: int | None,
+        dtype: torch.dtype,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        pytest.importorskip("triton")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols, rank = 70, 130, 7
+        scale_shape = (
+            (rows, 1)
+            if axis == 0
+            else ((1, cols) if axis == -1 else ())
+        )
+        data = torch.randint(
+            -32,
+            33,
+            (rows, cols),
+            device="cuda",
+            dtype=torch.int8,
+        )
+        scale = torch.rand(
+            scale_shape,
+            device="cuda",
+            dtype=dtype,
+        ).add_(0.25)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8,
+            axis,
+            (rows, cols),
+            (cols, 1),
+            data,
+            scale,
+            None,
+        )
+        a = torch.randn(
+            cols,
+            rank,
+            device="cuda",
+            dtype=dtype,
+        ).t()
+        b = torch.randn(
+            rank,
+            rows,
+            device="cuda",
+            dtype=dtype,
+        ).t()
+        assert not a.is_contiguous()
+        assert not b.is_contiguous()
+        expected_dense = qt.dequantize()
+        expected_dense.addmm_(b, a, alpha=0.375)
+        expected_data = (
+            (expected_dense / scale)
+            .round()
+            .clamp(-128, 127)
+            .to(torch.int8)
+        )
+        data_ptr = qt._data.data_ptr()
+        scale_ptr = qt._scale.data_ptr()
+        scale_before = qt._scale.clone()
+
+        def fail_fallback(
+            _target: torch.Tensor,
+            _b: torch.Tensor,
+            _a: torch.Tensor,
+            _strength: float,
+        ) -> torch.Tensor:
+            raise AssertionError("supported CUDA Quanto qint8 must use Triton")
+
+        monkeypatch.setattr(
+            quanto_adapter_impl,
+            "_torch_merge_quanto_lora",
+            fail_fallback,
+        )
+        QuantoAdapter.merge_lora_(qt, b, a, 0.375)
+        torch.cuda.synchronize()
+
+        assert qt._data.data_ptr() == data_ptr
+        assert qt._scale.data_ptr() == scale_ptr
+        assert qt.qtype is quanto.qint8
+        assert qt.axis == axis
+        assert torch.equal(qt._scale, scale_before)
+        difference = (qt._data.to(torch.int16) - expected_data).abs()
+        assert difference.max().item() <= 1
+
+    @CUDA
+    def test_quanto_qint8_falls_back_when_triton_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols, rank = 16, 24, 5
+        scale = torch.rand(
+            rows,
+            1,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).add_(0.25)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8,
+            0,
+            (rows, cols),
+            (cols, 1),
+            torch.randint(
+                -32,
+                33,
+                (rows, cols),
+                device="cuda",
+                dtype=torch.int8,
+            ),
+            scale,
+            None,
+        )
+        a = torch.randn(rank, cols, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16)
+        expected_dense = qt.dequantize()
+        expected_dense.addmm_(b, a, alpha=-0.25)
+        expected = QuantoAdapter.requantize(expected_dense, like=qt)
+
+        monkeypatch.setattr(
+            quanto_adapter_impl,
+            "_triton_merge_quanto_qint8_lora",
+            None,
+        )
+        QuantoAdapter.merge_lora_(qt, b, a, -0.25)
+
+        assert torch.equal(qt._data, expected._data)
+        assert torch.equal(qt._scale, expected._scale)
+
+    @CUDA
+    @pytest.mark.parametrize("axis", [0, -1, None])
+    @pytest.mark.parametrize(
+        "qtype_name",
+        ["qfloat8_e4m3fn", "qfloat8_e5m2"],
+    )
+    def test_triton_quanto_qfloat8_matches_fixed_scale_round_trip(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        axis: int | None,
+        qtype_name: str,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        pytest.importorskip("triton")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols, rank = 8, 12, 3
+        qtype = getattr(quanto, qtype_name)
+        scale_shape = (
+            (rows, 1)
+            if axis == 0
+            else ((1, cols) if axis == -1 else ())
+        )
+        qt = WeightQBytesTensor.create(
+            qtype,
+            axis,
+            (rows, cols),
+            (cols, 1),
+            torch.randn(rows, cols, device="cuda").to(qtype.dtype),
+            torch.rand(
+                scale_shape,
+                device="cuda",
+                dtype=torch.bfloat16,
+            ).add_(0.25),
+            None,
+        )
+        a = torch.randn(rank, cols, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16)
+        expected_dense = qt.dequantize()
+        expected_dense.addmm_(b, a, alpha=0.5)
+        limits = torch.finfo(qt._data.dtype)
+        expected_data = (expected_dense / qt._scale).clamp(
+            limits.min,
+            limits.max,
+        ).to(qt._data.dtype)
+        data_ptr = qt._data.data_ptr()
+        scale_ptr = qt._scale.data_ptr()
+        scale_before = qt._scale.clone()
+
+        def fail_fallback(
+            _target: torch.Tensor,
+            _b: torch.Tensor,
+            _a: torch.Tensor,
+            _strength: float,
+        ) -> torch.Tensor:
+            raise AssertionError("supported CUDA Quanto qfloat8 must use Triton")
+
+        monkeypatch.setattr(
+            quanto_adapter_impl,
+            "_torch_merge_quanto_lora",
+            fail_fallback,
+        )
+        QuantoAdapter.merge_lora_(qt, b, a, 0.5)
+        torch.cuda.synchronize()
+
+        assert qt._data.data_ptr() == data_ptr
+        assert qt._scale.data_ptr() == scale_ptr
+        assert qt.qtype is qtype
+        assert qt.axis == axis
+        assert torch.equal(qt._scale, scale_before)
+        torch.testing.assert_close(
+            qt._data.float(),
+            expected_data.float(),
+            rtol=0.15,
+            atol=1.0,
+        )
+
+    @CUDA
+    @pytest.mark.parametrize("fallback", ["unavailable", "unsupported-storage"])
+    def test_quanto_qfloat8_uses_generic_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fallback: str,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols, rank = 8, 12, 3
+        qtype = (
+            quanto.qfloat8
+            if fallback == "unavailable"
+            else quanto.qfloat8_e4m3fnuz
+        )
+        qt = WeightQBytesTensor.create(
+            qtype,
+            0,
+            (rows, cols),
+            (cols, 1),
+            torch.randn(rows, cols, device="cuda").to(qtype.dtype),
+            torch.rand(
+                rows,
+                1,
+                device="cuda",
+                dtype=torch.bfloat16,
+            ).add_(0.25),
+            None,
+        )
+        a = torch.randn(rank, cols, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16)
+        expected_dense = qt.dequantize()
+        expected_dense.addmm_(b, a, alpha=-0.25)
+        expected = QuantoAdapter.requantize(expected_dense, like=qt)
+
+        if fallback == "unavailable":
+            monkeypatch.setattr(
+                quanto_adapter_impl,
+                "_triton_merge_quanto_qfloat8_lora",
+                None,
+            )
+        else:
+            def fail_triton(*_args: object) -> torch.Tensor:
+                raise AssertionError("unsupported qfloat8 storage reached Triton")
+
+            monkeypatch.setattr(
+                quanto_adapter_impl,
+                "_triton_merge_quanto_qfloat8_lora",
+                fail_triton,
+            )
+        QuantoAdapter.merge_lora_(qt, b, a, -0.25)
+
+        assert torch.equal(qt._data, expected._data)
+        assert torch.equal(qt._scale, expected._scale)
+
+    @CUDA
+    def test_triton_quanto_qint8_handles_zero_and_saturation(self) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        pytest.importorskip("triton")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols, rank = 18, 23, 3
+        scale = torch.ones(
+            rows,
+            1,
+            device="cuda",
+            dtype=torch.float16,
+        )
+        zero = WeightQBytesTensor.create(
+            quanto.qint8,
+            0,
+            (rows, cols),
+            (cols, 1),
+            torch.zeros(
+                rows,
+                cols,
+                device="cuda",
+                dtype=torch.int8,
+            ),
+            scale.clone(),
+            None,
+        )
+        QuantoAdapter.merge_lora_(
+            zero,
+            torch.zeros(
+                rows,
+                rank,
+                device="cuda",
+                dtype=torch.float16,
+            ),
+            torch.zeros(
+                rank,
+                cols,
+                device="cuda",
+                dtype=torch.float16,
+            ),
+            1.0,
+        )
+        assert torch.count_nonzero(zero._data).item() == 0
+
+        saturated = WeightQBytesTensor.create(
+            quanto.qint8,
+            0,
+            (rows, cols),
+            (cols, 1),
+            torch.zeros(
+                rows,
+                cols,
+                device="cuda",
+                dtype=torch.int8,
+            ),
+            scale.clone(),
+            None,
+        )
+        b = torch.full(
+            (rows, rank),
+            400.0,
+            device="cuda",
+            dtype=torch.float16,
+        )
+        b[rows // 2 :] *= -1
+        a = torch.full(
+            (rank, cols),
+            400.0,
+            device="cuda",
+            dtype=torch.float16,
+        )
+        QuantoAdapter.merge_lora_(saturated, b, a, 1000.0)
+
+        assert torch.all(saturated._data[: rows // 2] == 127)
+        assert torch.all(saturated._data[rows // 2 :] == -128)
+        assert torch.equal(saturated._scale, scale)
 
     @CUDA
     def test_non_block_quanto_merge_requantizes_on_activate(self) -> None:
@@ -1577,7 +1966,9 @@ class TestRoutedMode:
     def test_routed_forward_matches_manual_baseline(self) -> None:
         # Routed mode: base weight stays exactly as constructed; the
         # LoRA contribution rides as a forward-hook addition.
-        m = _make_bf16_model(num_blocks=3, dim=16)
+        with torch.random.fork_rng():
+            torch.manual_seed(0)
+            m = _make_bf16_model(num_blocks=3, dim=16)
         loras = [
             (_make_lora(num_blocks=3, dim=16, seed=11), 0.5),
             (_make_lora(num_blocks=3, dim=16, seed=22), 0.25),
@@ -1588,7 +1979,14 @@ class TestRoutedMode:
         _request_loras(s, loras, mode="routed")
         _activate(s, "cuda", stream_config=_strategy_stream_config(m))
         try:
-            x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+            generator = torch.Generator(device="cuda").manual_seed(0)
+            x = torch.randn(
+                2,
+                16,
+                dtype=torch.bfloat16,
+                device="cuda",
+                generator=generator,
+            )
             actual = m(x)
             torch.cuda.synchronize()
             expected = self._expected_routed_output(m, x, loras)

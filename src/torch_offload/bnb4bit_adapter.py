@@ -22,6 +22,12 @@ shape, dtype, quant type) rides in a small packed blob that bitsandbytes
 keeps host-resident; only the packed weight and the per-block scales DMA
 to the GPU.
 
+CUDA LoRA updates use a raw-storage Triton merge for standard 64-value
+blocks whose physical storage contains exactly two logical values per byte.
+This covers NF4 and FP4, ordinary and nested scales, and byte-aligned
+uint8/fp16/bf16/fp32 quant storage. Other layouts keep the precise generic
+dequantize/addmm/requantize path.
+
 Reaches into bitsandbytes' 4-bit layout through :mod:`._bnb`; if
 bitsandbytes refactors, the pin/read paths fail with a clear validation
 error (``require_params_4bit`` checks the expected attributes before reading
@@ -35,6 +41,7 @@ bitsandbytes is not installed — 4-bit support is optional.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import nn
@@ -54,6 +61,97 @@ from .tensor_adapters import (
     optional_tensor_id,
     tensor_layout,
 )
+
+try:
+    from ._triton_bnb4_lora import (
+        merge_bnb4_lora as _triton_merge_bnb4_lora,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "triton":
+        raise
+    _triton_merge_bnb4_lora = None
+
+_TRITON_STORAGE_DTYPES = (
+    torch.uint8,
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+)
+
+
+def _torch_merge_bnb4_lora(
+    target: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+) -> torch.Tensor:
+    """Merge through the ordinary dequantize/addmm/requantize path."""
+    dense = dequantize_params_4bit(target)
+    dense.addmm_(b, a, alpha=strength)
+    return requantize_params_4bit(dense, like=target)
+
+
+def _can_use_triton_merge(
+    qt: Any,  # noqa: ANN401
+    b: torch.Tensor,
+    a: torch.Tensor,
+) -> bool:
+    state = qt.quant_state
+    logical_shape = tuple(state.shape)
+    if len(logical_shape) != 2:
+        return False
+    rows, cols = logical_shape
+    numel = rows * cols
+    num_blocks = (numel + state.blocksize - 1) // state.blocksize
+    common = (
+        _triton_merge_bnb4_lora is not None
+        and qt.data.device.type == "cuda"
+        and qt.data.dtype in _TRITON_STORAGE_DTYPES
+        and qt.data.is_contiguous()
+        and qt.data.storage_offset() == 0
+        and cols % 64 == 0
+        and numel % 2 == 0
+        and qt.data.numel() * qt.data.element_size() == numel // 2
+        and state.quant_type in ("nf4", "fp4")
+        and state.blocksize == 64
+        and state.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and state.code.dtype is torch.float32
+        and state.code.numel() == 16
+        and state.absmax.numel() == num_blocks
+        and b.ndim == 2
+        and a.ndim == 2
+        and b.dtype is state.dtype
+        and a.dtype is state.dtype
+        and b.shape == (rows, a.shape[0])
+        and a.shape[1] == cols
+        and qt.data.device == state.absmax.device == state.code.device
+        and qt.data.device == b.device == a.device
+    )
+    if not common:
+        return False
+    if not state.nested:
+        return state.absmax.dtype is torch.float32
+
+    state2 = state.state2
+    offset = state.offset
+    expected_nested_blocks = (num_blocks + 255) // 256
+    return (
+        state.absmax.dtype is torch.uint8
+        and state2 is not None
+        and state2.blocksize == 256
+        and state2.dtype is torch.float32
+        and state2.absmax.dtype is torch.float32
+        and state2.absmax.numel() == expected_nested_blocks
+        and state2.code.dtype is torch.float32
+        and state2.code.numel() == 256
+        and isinstance(offset, torch.Tensor)
+        and offset.dtype is torch.float32
+        and offset.numel() == 1
+        and qt.data.device
+        == state2.absmax.device
+        == state2.code.device
+        == offset.device
+    )
 
 
 @dataclass(slots=True)
@@ -282,6 +380,46 @@ class Bnb4bitAdapter:
     @staticmethod
     def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
         return requantize_params_4bit(t, like=like)
+
+    @staticmethod
+    def merge_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Merge into BNB4 storage, preferring the raw Triton path."""
+        qt = require_params_4bit(target)
+        if _can_use_triton_merge(qt, b, a):
+            assert _triton_merge_bnb4_lora is not None
+            state = qt.quant_state
+            state2 = state.state2 if state.nested else None
+            packed, absmax, nested_absmax, offset = _triton_merge_bnb4_lora(
+                qt.data.view(torch.uint8).reshape(-1),
+                state.absmax,
+                state.code,
+                state2.absmax if state2 is not None else None,
+                state2.code if state2 is not None else None,
+                state.offset if state.nested else None,
+                tuple(state.shape),
+                state.blocksize,
+                state.quant_type,
+                b,
+                a,
+                strength,
+            )
+            qt.data.view(torch.uint8).reshape(-1).copy_(packed)
+            state.absmax.copy_(absmax)
+            if state.nested:
+                assert state2 is not None
+                assert nested_absmax is not None
+                assert offset is not None
+                state2.absmax.copy_(nested_absmax)
+                state.offset.copy_(offset)
+            return
+
+        merged = _torch_merge_bnb4_lora(target, b, a, strength)
+        Bnb4bitAdapter.copy_into(merged, target=target)
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:

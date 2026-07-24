@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import nn
 
+import torch_offload.mx_adapter as mx_adapter_impl
 from torch_offload import (
     LoRA,
     LoRATransform,
@@ -30,7 +31,8 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 _FP4 = getattr(torch, "float4_e2m1fn_x2", None)
 
 ELEM_DTYPES = [
-    pytest.param(torch.float8_e4m3fn, id="mxfp8"),
+    pytest.param(torch.float8_e4m3fn, id="mxfp8-e4m3"),
+    pytest.param(torch.float8_e5m2, id="mxfp8-e5m2"),
     pytest.param(
         _FP4,
         id="mxfp4",
@@ -68,17 +70,32 @@ def _quantize_mx(
     *,
     elem_dtype: torch.dtype,
     dynamic_activation: bool = False,
+    block_size: int = 32,
+    scaling_mode: object | None = None,
+    is_swizzled_scales: bool = False,
 ) -> torch.Tensor:
     mx_cls = _mx_tensor_cls()
     # Weight-only MX cannot run a matmul on its own; a forward needs the
     # activation-quant kwargs that the dynamic-activation MX recipe carries.
     kwargs_cls = _mx_kwargs_cls()
-    act_quant_kwargs = kwargs_cls(elem_dtype=elem_dtype, block_size=32) if dynamic_activation else None
+    kwargs = {} if scaling_mode is None else {"scaling_mode": scaling_mode}
+    act_quant_kwargs = (
+        kwargs_cls(
+            elem_dtype=elem_dtype,
+            block_size=block_size,
+            is_swizzled_scales=is_swizzled_scales,
+            **kwargs,
+        )
+        if dynamic_activation
+        else None
+    )
     return mx_cls.to_mx(
         data,
         elem_dtype,
-        block_size=32,
+        block_size=block_size,
         act_quant_kwargs=act_quant_kwargs,
+        is_swizzled_scales=is_swizzled_scales,
+        **kwargs,
     )
 
 
@@ -95,6 +112,54 @@ def _make_mx(
         elem_dtype=elem_dtype,
         dynamic_activation=dynamic_activation,
     )
+
+
+def _scale_mode(name: str) -> object:
+    mod = pytest.importorskip("torchao.prototype.mx_formats.config")
+    return getattr(mod.ScaleCalculationMode, name)
+
+
+def _clone_mx(mx: torch.Tensor) -> torch.Tensor:
+    mx_cls = _mx_tensor_cls()
+    return mx_cls(
+        mx.qdata.clone(),
+        mx.scale.clone(),
+        mx.elem_dtype,
+        mx.block_size,
+        mx.orig_dtype,
+        mx.kernel_preference,
+        mx.act_quant_kwargs,
+        mx.is_swizzled_scales,
+    )
+
+
+def _reference_merge(
+    mx: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+) -> torch.Tensor:
+    dense = MxAdapter.dequantize(mx)
+    dense.addmm_(b, a, alpha=strength)
+    return MxAdapter.requantize(dense, like=mx)
+
+
+def _assert_mx_merge_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> None:
+    assert torch.equal(
+        actual.scale.view(torch.uint8),
+        expected.scale.view(torch.uint8),
+    )
+    torch.testing.assert_close(
+        actual.dequantize(torch.float32),
+        expected.dequantize(torch.float32),
+        rtol=0.15,
+        atol=0.25,
+    )
+    differing_bytes = torch.count_nonzero(actual.qdata.view(torch.uint8) != expected.qdata.view(torch.uint8)).item()
+    assert differing_bytes <= actual.qdata.numel() // 50 + 1
 
 
 class TestMxAdapter:
@@ -369,6 +434,360 @@ class TestMxAdapter:
 
     @CUDA
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
+    @pytest.mark.parametrize("scaling_mode_name", ["FLOOR", "RCEIL"])
+    @pytest.mark.parametrize("is_swizzled_scales", [False, True])
+    def test_triton_merge_matches_generic_for_odd_shape_and_rank(
+        self,
+        elem_dtype: torch.dtype,
+        scaling_mode_name: str,
+        is_swizzled_scales: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        torch.manual_seed(31)
+        rows, cols, rank = 19, 96, 7
+        scaling_mode = _scale_mode(scaling_mode_name)
+        base = _quantize_mx(
+            torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16),
+            elem_dtype=elem_dtype,
+            dynamic_activation=True,
+            scaling_mode=scaling_mode,
+            is_swizzled_scales=is_swizzled_scales,
+        )
+        target = _clone_mx(base)
+        a = torch.randn(rank, cols, device="cuda", dtype=torch.bfloat16).mul_(0.15)
+        b = torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16).mul_(0.15)
+        expected = _reference_merge(base, b, a, 0.7)
+        qdata_ptr = target.qdata.data_ptr()
+        scale_ptr = target.scale.data_ptr()
+        metadata = (
+            target.elem_dtype,
+            target.block_size,
+            target.orig_dtype,
+            target.kernel_preference,
+            target.act_quant_kwargs,
+            target.is_swizzled_scales,
+        )
+
+        def fail_fallback(
+            _target: torch.Tensor,
+            _b: torch.Tensor,
+            _a: torch.Tensor,
+            _strength: float,
+        ) -> None:
+            raise AssertionError("supported CUDA MX merge must use Triton")
+
+        monkeypatch.setattr(mx_adapter_impl, "_torch_merge_mx_lora_", fail_fallback)
+        result = MxAdapter.merge_lora_(target, b, a, 0.7)
+        torch.cuda.synchronize()
+
+        assert result is None
+        assert target.qdata.data_ptr() == qdata_ptr
+        assert target.scale.data_ptr() == scale_ptr
+        assert (
+            target.elem_dtype,
+            target.block_size,
+            target.orig_dtype,
+            target.kernel_preference,
+            target.act_quant_kwargs,
+            target.is_swizzled_scales,
+        ) == metadata
+        _assert_mx_merge_close(target, expected)
+
+    @CUDA
+    @pytest.mark.parametrize("scaling_mode_name", ["CEIL", "EVEN"])
+    def test_triton_merge_supports_additional_scale_modes(
+        self,
+        scaling_mode_name: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        torch.manual_seed(32)
+        rows, cols, rank = 17, 64, 5
+        scaling_mode = _scale_mode(scaling_mode_name)
+        base = _quantize_mx(
+            torch.randn(rows, cols, device="cuda", dtype=torch.float32),
+            elem_dtype=torch.float8_e4m3fn,
+            dynamic_activation=True,
+            scaling_mode=scaling_mode,
+        )
+        target = _clone_mx(base)
+        a = torch.randn(rank, cols, device="cuda").mul_(0.1)
+        b = torch.randn(rows, rank, device="cuda").mul_(0.1)
+        expected = _reference_merge(base, b, a, -0.4)
+
+        def fail_fallback(
+            _target: torch.Tensor,
+            _b: torch.Tensor,
+            _a: torch.Tensor,
+            _strength: float,
+        ) -> None:
+            raise AssertionError("supported MX scale mode must use Triton")
+
+        monkeypatch.setattr(mx_adapter_impl, "_torch_merge_mx_lora_", fail_fallback)
+        MxAdapter.merge_lora_(target, b, a, -0.4)
+        torch.cuda.synchronize()
+
+        _assert_mx_merge_close(target, expected)
+
+    @CUDA
+    def test_triton_merge_handles_multiple_swizzled_scale_tiles(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        torch.manual_seed(36)
+        rows, cols, rank = 131, 160, 3
+        base = _quantize_mx(
+            torch.randn(rows, cols, device="cuda"),
+            elem_dtype=torch.float8_e5m2,
+            scaling_mode=_scale_mode("RCEIL"),
+            is_swizzled_scales=True,
+        )
+        target = _clone_mx(base)
+        a = torch.randn(rank, cols, device="cuda").mul_(0.1)
+        b = torch.randn(rows, rank, device="cuda").mul_(0.1)
+        expected = _reference_merge(base, b, a, 0.6)
+
+        def fail_fallback(
+            _target: torch.Tensor,
+            _b: torch.Tensor,
+            _a: torch.Tensor,
+            _strength: float,
+        ) -> None:
+            raise AssertionError("supported swizzled MX layout must use Triton")
+
+        monkeypatch.setattr(mx_adapter_impl, "_torch_merge_mx_lora_", fail_fallback)
+        MxAdapter.merge_lora_(target, b, a, 0.6)
+        torch.cuda.synchronize()
+
+        _assert_mx_merge_close(target, expected)
+
+    @CUDA
+    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
+    def test_triton_zero_update_matches_generic(
+        self,
+        elem_dtype: torch.dtype,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        torch.manual_seed(37)
+        rows, cols, rank = 17, 64, 5
+        target = _quantize_mx(
+            torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16),
+            elem_dtype=elem_dtype,
+        )
+        zeros_b = torch.zeros(rows, rank, device="cuda", dtype=torch.bfloat16)
+        zeros_a = torch.zeros(rank, cols, device="cuda", dtype=torch.bfloat16)
+        expected = _reference_merge(target, zeros_b, zeros_a, 1.0)
+
+        def fail_fallback(
+            _target: torch.Tensor,
+            _b: torch.Tensor,
+            _a: torch.Tensor,
+            _strength: float,
+        ) -> None:
+            raise AssertionError("supported CUDA MX merge must use Triton")
+
+        monkeypatch.setattr(mx_adapter_impl, "_torch_merge_mx_lora_", fail_fallback)
+        MxAdapter.merge_lora_(
+            target,
+            zeros_b,
+            zeros_a,
+            1.0,
+        )
+        torch.cuda.synchronize()
+
+        assert torch.equal(
+            target.qdata.view(torch.uint8),
+            expected.qdata.view(torch.uint8),
+        )
+        assert torch.equal(
+            target.scale.view(torch.uint8),
+            expected.scale.view(torch.uint8),
+        )
+
+    @CUDA
+    @pytest.mark.parametrize(
+        "elem_dtype",
+        [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+            pytest.param(
+                _FP4,
+                marks=pytest.mark.skipif(
+                    _FP4 is None,
+                    reason="torch lacks float4_e2m1fn_x2",
+                ),
+            ),
+        ],
+    )
+    def test_triton_preserves_e8m0_code_zero_subnormal(
+        self,
+        elem_dtype: torch.dtype,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        rows, cols, rank = 3, 32, 2
+        target = _quantize_mx(
+            torch.full(
+                (rows, cols),
+                torch.finfo(torch.float32).tiny,
+                device="cuda",
+            ),
+            elem_dtype=elem_dtype,
+        )
+        assert torch.all(target.scale.view(torch.uint8) == 0)
+        zeros_b = torch.zeros(rows, rank, device="cuda")
+        zeros_a = torch.zeros(rank, cols, device="cuda")
+        expected = _reference_merge(target, zeros_b, zeros_a, 1.0)
+        assert torch.count_nonzero(expected.dequantize()).item() > 0
+
+        def fail_fallback(
+            _target: torch.Tensor,
+            _b: torch.Tensor,
+            _a: torch.Tensor,
+            _strength: float,
+        ) -> None:
+            raise AssertionError("standard MX storage must use Triton")
+
+        monkeypatch.setattr(mx_adapter_impl, "_torch_merge_mx_lora_", fail_fallback)
+        MxAdapter.merge_lora_(target, zeros_b, zeros_a, 1.0)
+        torch.cuda.synchronize()
+
+        assert torch.equal(
+            target.qdata.view(torch.uint8),
+            expected.qdata.view(torch.uint8),
+        )
+        assert torch.equal(
+            target.scale.view(torch.uint8),
+            expected.scale.view(torch.uint8),
+        )
+
+    @CUDA
+    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
+    def test_triton_merge_handles_multiple_factors(
+        self,
+        elem_dtype: torch.dtype,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        torch.manual_seed(33)
+        rows, cols = 19, 96
+        base = _quantize_mx(
+            torch.randn(rows, cols, device="cuda", dtype=torch.float32),
+            elem_dtype=elem_dtype,
+        )
+        target = nn.Parameter(_clone_mx(base), requires_grad=False)
+        factor_specs = [
+            (3, 0.25),
+            (5, -0.4),
+        ]
+        factors = []
+        packed_a = []
+        packed_b = []
+        for rank, strength in factor_specs:
+            a = torch.randn(rank, cols)
+            b = torch.randn(rows, rank)
+            factors.append(ScaledLoRAFactor.from_tensors(a, b, strength))
+            packed_a.append(a.cuda().mul(strength))
+            packed_b.append(b.cuda())
+        expected = _reference_merge(
+            base,
+            torch.cat(packed_b, dim=1),
+            torch.cat(packed_a, dim=0),
+            1.0,
+        )
+        calls = 0
+        triton_merge = mx_adapter_impl._triton_merge_mx_lora_
+        assert triton_merge is not None
+
+        def record_triton(*args: object, **kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            triton_merge(*args, **kwargs)
+
+        monkeypatch.setattr(
+            mx_adapter_impl,
+            "_triton_merge_mx_lora_",
+            record_triton,
+        )
+        param_id = id(target)
+        qdata_ptr = target.data.qdata.data_ptr()
+        scale_ptr = target.data.scale.data_ptr()
+        LoRATransform(factors).apply(target)
+        torch.cuda.synchronize()
+
+        assert calls == 1
+        assert id(target) == param_id
+        assert target.data.qdata.data_ptr() == qdata_ptr
+        assert target.data.scale.data_ptr() == scale_ptr
+        _assert_mx_merge_close(target.data, expected)
+
+    @CUDA
+    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
+    def test_merge_falls_back_for_nonstandard_block_size(
+        self,
+        elem_dtype: torch.dtype,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        torch.manual_seed(34)
+        rows, cols, rank = 13, 64, 3
+        base = _quantize_mx(
+            torch.randn(rows, cols, device="cuda", dtype=torch.float32),
+            elem_dtype=elem_dtype,
+            block_size=16,
+        )
+        target = _clone_mx(base)
+        a = torch.randn(rank, cols, device="cuda")
+        b = torch.randn(rows, rank, device="cuda")
+        expected = _reference_merge(base, b, a, 0.3)
+
+        def fail_triton(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("nonstandard MX block size must use fallback")
+
+        monkeypatch.setattr(
+            mx_adapter_impl,
+            "_triton_merge_mx_lora_",
+            fail_triton,
+        )
+        MxAdapter.merge_lora_(target, b, a, 0.3)
+
+        assert torch.equal(
+            target.qdata.view(torch.uint8),
+            expected.qdata.view(torch.uint8),
+        )
+        assert torch.equal(
+            target.scale.view(torch.uint8),
+            expected.scale.view(torch.uint8),
+        )
+
+    @CUDA
+    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
+    def test_merge_falls_back_when_triton_is_unavailable(
+        self,
+        elem_dtype: torch.dtype,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        torch.manual_seed(35)
+        rows, cols, rank = 11, 64, 3
+        base = _quantize_mx(
+            torch.randn(rows, cols, device="cuda", dtype=torch.float32),
+            elem_dtype=elem_dtype,
+        )
+        target = _clone_mx(base)
+        a = torch.randn(rank, cols, device="cuda")
+        b = torch.randn(rows, rank, device="cuda")
+        expected = _reference_merge(base, b, a, -0.2)
+
+        monkeypatch.setattr(mx_adapter_impl, "_triton_merge_mx_lora_", None)
+        MxAdapter.merge_lora_(target, b, a, -0.2)
+
+        assert torch.equal(
+            target.qdata.view(torch.uint8),
+            expected.qdata.view(torch.uint8),
+        )
+        assert torch.equal(
+            target.scale.view(torch.uint8),
+            expected.scale.view(torch.uint8),
+        )
+
+    @CUDA
+    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self, elem_dtype: torch.dtype) -> None:
         mx_cls = _mx_tensor_cls()
         pinned_param = PinnedParam(
@@ -458,7 +877,8 @@ class TestMxAdapter:
         )
         try:
             x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
-            with activated_model(offloader,
+            with activated_model(
+                offloader,
                 "cuda",
                 loras=[lora],
                 lora_strengths=[0.25],
@@ -532,7 +952,8 @@ class TestMxAdapter:
         )
         try:
             x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
-            with activated_model(offloader,
+            with activated_model(
+                offloader,
                 "cuda",
                 loras=[lora],
                 lora_strengths=[0.5],

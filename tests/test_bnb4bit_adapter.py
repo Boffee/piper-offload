@@ -8,6 +8,8 @@ import pytest
 import torch
 from torch import nn
 
+import torch_offload.bnb4bit_adapter as bnb4bit_adapter_impl
+
 from torch_offload import (
     LoRA,
     LoRATransform,
@@ -46,6 +48,7 @@ def _make_nf4(
     quant_type: str = "nf4",
     double_quant: bool = False,
     quant_storage: torch.dtype = torch.uint8,
+    blocksize: int | None = None,
     device: str = "cpu",
     weight: torch.Tensor | None = None,
 ) -> Any:
@@ -68,6 +71,7 @@ def _make_nf4(
         quant_type=quant_type,
         compress_statistics=double_quant,
         quant_storage=quant_storage,
+        blocksize=blocksize,
     ).to(device)
 
 
@@ -83,6 +87,29 @@ def _unquantized_params4bit(*, rows: int = 64, cols: int = 32) -> Any:
 
     params4bit: Any = Params4bit
     return params4bit(torch.randn(rows, cols, dtype=torch.bfloat16), requires_grad=False)
+
+
+def _expected_cuda_merge(
+    target: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+) -> torch.Tensor:
+    dense = Bnb4bitAdapter.dequantize(target)
+    dense.addmm_(b, a, alpha=strength)
+    return Bnb4bitAdapter.requantize(dense, like=target)
+
+
+def _assert_bnb4_merge_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> None:
+    difference = (
+        Bnb4bitAdapter.dequantize(actual).to(torch.float32)
+        - Bnb4bitAdapter.dequantize(expected).to(torch.float32)
+    ).abs()
+    assert difference.mean().item() < 0.02
+    assert difference.max().item() < 2.0
 
 
 class TestBnb4bitAdapter:
@@ -310,6 +337,459 @@ class TestBnb4bitAdapter:
 
         assert merged == 1
         assert not torch.equal(model.lin.weight.data.data, original_packed)
+
+    @CUDA
+    @pytest.mark.parametrize("quant_type", ["nf4", "fp4"])
+    @pytest.mark.parametrize("double_quant", [False, True])
+    def test_triton_merge_matches_bnb_round_trip_and_preserves_metadata(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        quant_type: str,
+        double_quant: bool,
+    ) -> None:
+        pytest.importorskip("triton")
+        rows, cols, rank = 65, 128, 7
+        target = _make_nf4(
+            rows=rows,
+            cols=cols,
+            dtype=torch.bfloat16,
+            quant_type=quant_type,
+            double_quant=double_quant,
+            device="cuda",
+        )
+        a = torch.randn(
+            cols,
+            rank,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).t()
+        b = torch.randn(
+            rank,
+            rows,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).t()
+        assert not a.is_contiguous()
+        assert not b.is_contiguous()
+        expected = _expected_cuda_merge(target, b, a, 0.25)
+
+        state = target.quant_state
+        data_ptr = target.data.data_ptr()
+        absmax_ptr = state.absmax.data_ptr()
+        code_ptr = state.code.data_ptr()
+        code = state.code.clone()
+        state2 = state.state2 if state.nested else None
+        nested_absmax_ptr = (
+            state2.absmax.data_ptr() if state2 is not None else None
+        )
+        nested_code_ptr = (
+            state2.code.data_ptr() if state2 is not None else None
+        )
+        nested_code = state2.code.clone() if state2 is not None else None
+        offset_ptr = state.offset.data_ptr() if state.nested else None
+
+        def fail_fallback(
+            _target: torch.Tensor,
+            _b: torch.Tensor,
+            _a: torch.Tensor,
+            _strength: float,
+        ) -> torch.Tensor:
+            raise AssertionError("supported CUDA BNB4 must use Triton")
+
+        monkeypatch.setattr(
+            bnb4bit_adapter_impl,
+            "_torch_merge_bnb4_lora",
+            fail_fallback,
+        )
+        Bnb4bitAdapter.merge_lora_(target, b, a, 0.25)
+        torch.cuda.synchronize()
+
+        assert target.data.data_ptr() == data_ptr
+        assert state.absmax.data_ptr() == absmax_ptr
+        assert state.code.data_ptr() == code_ptr
+        assert torch.equal(state.code, code)
+        assert state.quant_type == quant_type
+        assert state.blocksize == 64
+        assert tuple(state.shape) == (rows, cols)
+        assert state.nested is double_quant
+        _assert_bnb4_merge_close(target, expected)
+
+        if state2 is None:
+            torch.testing.assert_close(
+                state.absmax,
+                expected.quant_state.absmax,
+                rtol=0.02,
+                atol=0.03,
+            )
+        else:
+            assert nested_code is not None
+            assert state2.absmax.data_ptr() == nested_absmax_ptr
+            assert state2.code.data_ptr() == nested_code_ptr
+            assert state.offset.data_ptr() == offset_ptr
+            assert torch.equal(state2.code, nested_code)
+            torch.testing.assert_close(
+                state.offset,
+                expected.quant_state.offset,
+                rtol=0.02,
+                atol=0.02,
+            )
+            torch.testing.assert_close(
+                state2.absmax,
+                expected.quant_state.state2.absmax,
+                rtol=0.05,
+                atol=0.05,
+            )
+
+    @CUDA
+    @pytest.mark.parametrize(
+        "quant_storage",
+        [torch.uint8, torch.float16, torch.bfloat16, torch.float32],
+    )
+    @pytest.mark.parametrize("double_quant", [False, True])
+    def test_triton_merge_supports_exact_quant_storage_layouts(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        quant_storage: torch.dtype,
+        double_quant: bool,
+    ) -> None:
+        pytest.importorskip("triton")
+        rows, cols, rank = 65, 128, 3
+        compute_dtype = (
+            quant_storage
+            if quant_storage in (torch.float16, torch.float32)
+            else torch.bfloat16
+        )
+        target = _make_nf4(
+            rows=rows,
+            cols=cols,
+            dtype=compute_dtype,
+            quant_type="fp4",
+            double_quant=double_quant,
+            quant_storage=quant_storage,
+            device="cuda",
+        )
+        b = torch.zeros(
+            rows,
+            rank,
+            device="cuda",
+            dtype=compute_dtype,
+        )
+        a = torch.zeros(
+            rank,
+            cols,
+            device="cuda",
+            dtype=compute_dtype,
+        )
+        expected = _expected_cuda_merge(target, b, a, 1.0)
+        data_ptr = target.data.data_ptr()
+
+        def fail_fallback(
+            _target: torch.Tensor,
+            _b: torch.Tensor,
+            _a: torch.Tensor,
+            _strength: float,
+        ) -> torch.Tensor:
+            raise AssertionError("exact packed storage must use Triton")
+
+        monkeypatch.setattr(
+            bnb4bit_adapter_impl,
+            "_torch_merge_bnb4_lora",
+            fail_fallback,
+        )
+        Bnb4bitAdapter.merge_lora_(target, b, a, 1.0)
+        torch.cuda.synchronize()
+
+        assert target.data.dtype is quant_storage
+        assert target.data.data_ptr() == data_ptr
+        assert torch.equal(
+            target.data.view(torch.uint8),
+            expected.data.view(torch.uint8),
+        )
+        assert torch.equal(
+            target.quant_state.absmax,
+            expected.quant_state.absmax,
+        )
+        if double_quant:
+            torch.testing.assert_close(
+                target.quant_state.state2.absmax,
+                expected.quant_state.state2.absmax,
+                rtol=1e-6,
+                atol=1e-6,
+            )
+            torch.testing.assert_close(
+                target.quant_state.offset,
+                expected.quant_state.offset,
+                rtol=1e-6,
+                atol=1e-6,
+            )
+
+    @CUDA
+    def test_row_unaligned_blocks_use_generic_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("triton")
+        rows, cols, rank = 65, 130, 7
+        target = _make_nf4(
+            rows=rows,
+            cols=cols,
+            dtype=torch.float16,
+            quant_type="fp4",
+            double_quant=True,
+            device="cuda",
+        )
+        a = torch.randn(
+            cols,
+            rank,
+            device="cuda",
+            dtype=torch.float16,
+        ).t()
+        b = torch.randn(
+            rank,
+            rows,
+            device="cuda",
+            dtype=torch.float16,
+        ).t()
+        expected = _expected_cuda_merge(target, b, a, -0.125)
+
+        fallback_called = False
+        original_fallback = bnb4bit_adapter_impl._torch_merge_bnb4_lora
+
+        monkeypatch.setattr(
+            bnb4bit_adapter_impl,
+            "_triton_merge_bnb4_lora",
+            lambda *_args: pytest.fail(
+                "row-unaligned blocks must not use Triton"
+            ),
+        )
+
+        def record_fallback(
+            fallback_target: torch.Tensor,
+            fallback_b: torch.Tensor,
+            fallback_a: torch.Tensor,
+            fallback_strength: float,
+        ) -> torch.Tensor:
+            nonlocal fallback_called
+            fallback_called = True
+            return original_fallback(
+                fallback_target,
+                fallback_b,
+                fallback_a,
+                fallback_strength,
+            )
+
+        monkeypatch.setattr(
+            bnb4bit_adapter_impl,
+            "_torch_merge_bnb4_lora",
+            record_fallback,
+        )
+        Bnb4bitAdapter.merge_lora_(target, b, a, -0.125)
+        torch.cuda.synchronize()
+
+        assert fallback_called
+        assert torch.equal(
+            target.data.view(torch.uint8),
+            expected.data.view(torch.uint8),
+        )
+        assert torch.equal(
+            target.quant_state.absmax,
+            expected.quant_state.absmax,
+        )
+
+    @CUDA
+    def test_cuda_merge_falls_back_when_triton_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        rows, cols, rank = 64, 128, 5
+        target = _make_nf4(
+            rows=rows,
+            cols=cols,
+            double_quant=True,
+            device="cuda",
+        )
+        b = torch.randn(
+            rows,
+            rank,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        a = torch.randn(
+            rank,
+            cols,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        expected = _expected_cuda_merge(target, b, a, 0.25)
+
+        monkeypatch.setattr(
+            bnb4bit_adapter_impl,
+            "_triton_merge_bnb4_lora",
+            None,
+        )
+        Bnb4bitAdapter.merge_lora_(target, b, a, 0.25)
+
+        assert torch.equal(target.data, expected.data)
+        assert torch.equal(
+            target.quant_state.absmax,
+            expected.quant_state.absmax,
+        )
+        assert torch.equal(
+            target.quant_state.state2.absmax,
+            expected.quant_state.state2.absmax,
+        )
+        assert torch.equal(
+            target.quant_state.offset,
+            expected.quant_state.offset,
+        )
+
+    @CUDA
+    @pytest.mark.parametrize(
+        ("cols", "quant_storage", "blocksize"),
+        [
+            (129, torch.uint8, None),
+            (130, torch.float32, None),
+            (128, torch.uint8, 32),
+        ],
+    )
+    def test_unsupported_layout_uses_generic_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        cols: int,
+        quant_storage: torch.dtype,
+        blocksize: int | None,
+    ) -> None:
+        pytest.importorskip("triton")
+        rows, rank = 65, 3
+        target = _make_nf4(
+            rows=rows,
+            cols=cols,
+            quant_storage=quant_storage,
+            blocksize=blocksize,
+            device="cuda",
+        )
+        b = torch.randn(
+            rows,
+            rank,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        a = torch.randn(
+            rank,
+            cols,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        expected = _expected_cuda_merge(target, b, a, 0.125)
+        fallback_called = False
+        original_fallback = bnb4bit_adapter_impl._torch_merge_bnb4_lora
+
+        def fail_triton(*_args: object) -> tuple[torch.Tensor, ...]:
+            raise AssertionError("unsupported BNB4 layout must not use Triton")
+
+        def record_fallback(
+            fallback_target: torch.Tensor,
+            fallback_b: torch.Tensor,
+            fallback_a: torch.Tensor,
+            fallback_strength: float,
+        ) -> torch.Tensor:
+            nonlocal fallback_called
+            fallback_called = True
+            return original_fallback(
+                fallback_target,
+                fallback_b,
+                fallback_a,
+                fallback_strength,
+            )
+
+        monkeypatch.setattr(
+            bnb4bit_adapter_impl,
+            "_triton_merge_bnb4_lora",
+            fail_triton,
+        )
+        monkeypatch.setattr(
+            bnb4bit_adapter_impl,
+            "_torch_merge_bnb4_lora",
+            record_fallback,
+        )
+        Bnb4bitAdapter.merge_lora_(target, b, a, 0.125)
+
+        assert fallback_called
+        assert torch.equal(
+            target.data.view(torch.uint8),
+            expected.data.view(torch.uint8),
+        )
+        assert torch.equal(
+            target.quant_state.absmax,
+            expected.quant_state.absmax,
+        )
+
+    @CUDA
+    def test_triton_merge_packs_multiple_loras_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("triton")
+        rows, cols = 64, 128
+        target = _make_nf4(
+            rows=rows,
+            cols=cols,
+            double_quant=True,
+            device="cuda",
+        )
+        factor_inputs = [
+            (
+                torch.randn(3, cols),
+                torch.randn(rows, 3),
+                0.5,
+            ),
+            (
+                torch.randn(5, cols),
+                torch.randn(rows, 5),
+                -0.25,
+            ),
+        ]
+        factors = [
+            ScaledLoRAFactor.from_tensors(a, b, strength)
+            for a, b, strength in factor_inputs
+        ]
+        dense = Bnb4bitAdapter.dequantize(target)
+        packed_a = torch.cat(
+            [
+                a.to(device="cuda", dtype=dense.dtype).mul_(strength)
+                for a, _b, strength in factor_inputs
+            ],
+            dim=0,
+        )
+        packed_b = torch.cat(
+            [
+                b.to(device="cuda", dtype=dense.dtype)
+                for _a, b, _strength in factor_inputs
+            ],
+            dim=1,
+        )
+        dense.addmm_(packed_b, packed_a)
+        expected = Bnb4bitAdapter.requantize(dense, like=target)
+        data_ptr = target.data.data_ptr()
+
+        def fail_fallback(
+            _target: torch.Tensor,
+            _b: torch.Tensor,
+            _a: torch.Tensor,
+            _strength: float,
+        ) -> torch.Tensor:
+            raise AssertionError("packed BNB4 LoRAs must use Triton")
+
+        monkeypatch.setattr(
+            bnb4bit_adapter_impl,
+            "_torch_merge_bnb4_lora",
+            fail_fallback,
+        )
+        LoRATransform(factors).apply(target)
+        torch.cuda.synchronize()
+
+        assert target.data.data_ptr() == data_ptr
+        _assert_bnb4_merge_close(target, expected)
 
     @CUDA
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:

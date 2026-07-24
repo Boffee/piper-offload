@@ -256,10 +256,13 @@ class LoRATransform:
         if representation.device.type == "cuda" and isinstance(
             adapter, FusedLoRAMergeTensorAdapter
         ):
-            _validate_factor_shapes(self._factors, tuple(representation.shape))
+            logical_shape = self._logical_shape(representation, adapter)
+            _validate_factor_shapes(self._factors, logical_shape)
             if self._apply_fused(
                 representation,
                 adapter,
+                logical_shape=logical_shape,
+                compute_dtype=adapter.compute_dtype(representation),
             ):
                 return
 
@@ -303,10 +306,18 @@ class LoRATransform:
         self,
         data: torch.Tensor,
         adapter: FusedLoRAMergeTensorAdapter[Any, Any],
+        *,
+        logical_shape: tuple[int, ...],
+        compute_dtype: torch.dtype,
     ) -> bool:
         """Apply a format-specific merge when factors can be staged plainly."""
         factor_tensors = self._factor_tensors()
-        staged = self._stage_single_or_packed_update(data, factor_tensors)
+        staged = self._stage_single_or_packed_update(
+            data,
+            factor_tensors,
+            logical_shape=logical_shape,
+            compute_dtype=compute_dtype,
+        )
         if staged is None:
             return False
 
@@ -338,6 +349,9 @@ class LoRATransform:
         factor_tensors: Sequence[
             tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
         ],
+        *,
+        logical_shape: tuple[int, ...],
+        compute_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
         if len(factor_tensors) == 1 and cls._are_plain_pinned_factors(
             factor_tensors
@@ -346,19 +360,24 @@ class LoRATransform:
             return (
                 b.to(
                     device=data.device,
-                    dtype=data.dtype,
+                    dtype=compute_dtype,
                     non_blocking=True,
                 ),
                 a.to(
                     device=data.device,
-                    dtype=data.dtype,
+                    dtype=compute_dtype,
                     non_blocking=True,
                 ),
                 factor.strength,
             )
 
         if cls._can_pack_factors(factor_tensors, data.device):
-            a, b = cls._pack_factors(data, factor_tensors)
+            a, b = cls._pack_factors(
+                data,
+                factor_tensors,
+                logical_shape=logical_shape,
+                compute_dtype=compute_dtype,
+            )
             return b, a, 1.0
         return None
 
@@ -400,6 +419,9 @@ class LoRATransform:
         factor_tensors: Sequence[
             tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
         ],
+        *,
+        logical_shape: tuple[int, ...],
+        compute_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Stage several LoRAs for one GEMM with no per-factor GPU tensors.
 
@@ -410,14 +432,14 @@ class LoRATransform:
         """
         total_rank = sum(factor.rank for factor, _a, _b in factor_tensors)
         a_packed = torch.empty(
-            (total_rank, data.shape[1]),
+            (total_rank, logical_shape[1]),
             device=data.device,
-            dtype=data.dtype,
+            dtype=compute_dtype,
         )
         b_packed = torch.empty(
-            (data.shape[0], total_rank),
+            (logical_shape[0], total_rank),
             device=data.device,
-            dtype=data.dtype,
+            dtype=compute_dtype,
         )
 
         rank_offset = 0
@@ -446,6 +468,8 @@ class LoRATransform:
         a_packed, b_packed = LoRATransform._pack_factors(
             data,
             factor_tensors,
+            logical_shape=tuple(data.shape),
+            compute_dtype=data.dtype,
         )
         data.addmm_(b_packed, a_packed)
 
