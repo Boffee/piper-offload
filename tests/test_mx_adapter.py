@@ -604,6 +604,62 @@ class TestMxAdapter:
         )
 
     @CUDA
+    @pytest.mark.parametrize(
+        "elem_dtype",
+        [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+            pytest.param(
+                _FP4,
+                marks=pytest.mark.skipif(
+                    _FP4 is None,
+                    reason="torch lacks float4_e2m1fn_x2",
+                ),
+            ),
+        ],
+    )
+    def test_triton_preserves_e8m0_code_zero_subnormal(
+        self,
+        elem_dtype: torch.dtype,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        rows, cols, rank = 3, 32, 2
+        target = _quantize_mx(
+            torch.full(
+                (rows, cols),
+                torch.finfo(torch.float32).tiny,
+                device="cuda",
+            ),
+            elem_dtype=elem_dtype,
+        )
+        assert torch.all(target.scale.view(torch.uint8) == 0)
+        zeros_b = torch.zeros(rows, rank, device="cuda")
+        zeros_a = torch.zeros(rank, cols, device="cuda")
+        expected = _reference_merge(target, zeros_b, zeros_a, 1.0)
+        assert torch.count_nonzero(expected.dequantize()).item() > 0
+
+        def fail_fallback(
+            _target: torch.Tensor,
+            _b: torch.Tensor,
+            _a: torch.Tensor,
+            _strength: float,
+        ) -> None:
+            raise AssertionError("standard MX storage must use Triton")
+
+        monkeypatch.setattr(mx_adapter_impl, "_torch_merge_mx_lora_", fail_fallback)
+        MxAdapter.merge_lora_(target, zeros_b, zeros_a, 1.0)
+        torch.cuda.synchronize()
+
+        assert torch.equal(
+            target.qdata.view(torch.uint8),
+            expected.qdata.view(torch.uint8),
+        )
+        assert torch.equal(
+            target.scale.view(torch.uint8),
+            expected.scale.view(torch.uint8),
+        )
+
+    @CUDA
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
     def test_triton_merge_handles_multiple_factors(
         self,

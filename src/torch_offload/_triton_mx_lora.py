@@ -25,8 +25,11 @@ _MX_BLOCK_SIZE = 32
 
 @triton.jit
 def _e8m0_to_fp32(scale):
-    exponent = scale.to(tl.int16) - 127
-    value = tl.exp2(exponent.to(tl.float32))
+    # E8M0 code 0 is 2**-127, a valid FP32 subnormal. ``tl.exp2(-127)``
+    # flushes it to zero on CUDA, so construct the exact IEEE-754 bits.
+    bits = scale.to(tl.int32) << 23
+    bits = tl.where(scale == 0, 1 << 22, bits)
+    value = bits.to(tl.float32, bitcast=True)
     return tl.where(scale != 255, value, float("nan"))
 
 
