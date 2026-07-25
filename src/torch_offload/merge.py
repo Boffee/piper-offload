@@ -1,8 +1,9 @@
 """Permanent LoRA merge into model weights.
 
 Merges LoRA deltas directly into model parameters, supporting tensors
-whose adapter exposes either dense in-place ``addmm_`` or a
-dequantize/requantize plus ``copy_into`` update path. Requantized
+whose adapter exposes either dense in-place ``addmm_`` or a staged LoRA
+merge. Quantized adapters own their encoding path and may select a
+format-specific kernel or a dequantize/requantize fallback; requantized
 merges are lossy but standard practice for permanent LoRA merges into
 quantized bases.
 

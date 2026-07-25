@@ -9,8 +9,8 @@ from torch import nn
 from torch_offload.pinned_buffer import PinnedBuffer
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.tensor_adapters import (
-    DequantRequantCopyIntoTensorAdapter,
     DequantRequantTensorAdapter,
+    LoRAMergeTensorAdapter,
     TensorCopyIntoAdapter,
 )
 from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
@@ -141,7 +141,7 @@ class TestPinnedParamQuanto:
         assert key[1] == qt._data.device
         assert key[7] == qt._scale.device
 
-    def test_quanto_adapter_dequant_requant_capability(self) -> None:
+    def test_quanto_adapter_conversion_and_merge_capabilities(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
@@ -153,8 +153,8 @@ class TestPinnedParamQuanto:
         )
 
         adapter = select_adapter(qt)
-        assert isinstance(adapter, DequantRequantCopyIntoTensorAdapter)
         assert isinstance(adapter, DequantRequantTensorAdapter)
+        assert isinstance(adapter, LoRAMergeTensorAdapter)
         assert isinstance(adapter, TensorCopyIntoAdapter)
         dense = adapter.dequantize(qt)
         assert type(dense) is torch.Tensor

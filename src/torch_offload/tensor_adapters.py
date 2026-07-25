@@ -43,9 +43,8 @@ __all__ = [
     "BindLayoutTensorAdapter",
     "CpuRoundTripTensorAdapter",
     "DenseAddmmTensorAdapter",
-    "DequantRequantCopyIntoTensorAdapter",
     "DequantRequantTensorAdapter",
-    "FusedLoRAMergeTensorAdapter",
+    "LoRAMergeTensorAdapter",
     "LogicalShapeTensorAdapter",
     "ParameterDataSwapTensorAdapter",
     "PostLoadRearmTensorAdapter",
@@ -216,15 +215,32 @@ class DenseAddmmTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
 
 
 @runtime_checkable
-class FusedLoRAMergeTensorAdapter(
-    TensorAdapter[PinnedStateT, GpuStateT],
+class LogicalShapeTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+    """Optional capability for reading logical shape without materialization.
+
+    Packed tensor subclasses may report a physical storage shape from their
+    outer object. Adapters that can recover the logical shape from wrapper or
+    quantization metadata expose it here, allowing validation paths to avoid a
+    full dequantization solely to inspect ``dense.shape``.
+    """
+
+    @staticmethod
+    def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
+        """Return the dense logical shape represented by ``t``."""
+        ...
+
+
+@runtime_checkable
+class LoRAMergeTensorAdapter(
+    LogicalShapeTensorAdapter[PinnedStateT, GpuStateT],
     Protocol,
 ):
-    """Optional capability for a format-specific staged LoRA merge.
+    """Optional capability for an adapter-owned staged LoRA merge.
 
     The caller validates and stages one combined ``B @ A`` update on the
     target device. The adapter applies it while preserving the target tensor's
-    object and storage identities.
+    object and storage identities. Implementations may select a format-specific
+    kernel or a regular framework-operator fallback.
     """
 
     @staticmethod
@@ -240,7 +256,7 @@ class FusedLoRAMergeTensorAdapter(
 
 @runtime_checkable
 class DequantRequantTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
-    """Optional capability for shape-preserving dequantize/requantize updates.
+    """Optional capability for shape-preserving dequantize/requantize conversion.
 
     ``dequantize(t)`` returns a dense logical tensor for ``t`` in
     ``compute_dtype(t)``. ``requantize(t, like=...)`` converts a
@@ -252,6 +268,8 @@ class DequantRequantTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protoc
     ``like``'s quantization scales (quanto) or recompute them from the
     new dense values (float8). Both satisfy this contract; callers must
     not assume scale bytes survive a dequantize/requantize round trip.
+    This conversion capability does not by itself advertise in-place copy or
+    LoRA merge support.
     """
 
     @staticmethod
@@ -262,22 +280,6 @@ class DequantRequantTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protoc
     @staticmethod
     def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
         """Return ``t`` encoded in the same representation as ``like``."""
-        ...
-
-
-@runtime_checkable
-class LogicalShapeTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
-    """Optional capability for reading logical shape without materialization.
-
-    Packed tensor subclasses may report a physical storage shape from their
-    outer object. Adapters that can recover the logical shape from wrapper or
-    quantization metadata expose it here, allowing validation paths to avoid a
-    full dequantization solely to inspect ``dense.shape``.
-    """
-
-    @staticmethod
-    def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
-        """Return the dense logical shape represented by ``t``."""
         ...
 
 
@@ -358,15 +360,6 @@ class PostLoadRearmTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protoco
         called once per load after :meth:`TensorAdapter.copy_to_gpu` and
         before the wrapper is installed into its module."""
         ...
-
-
-@runtime_checkable
-class DequantRequantCopyIntoTensorAdapter(
-    DequantRequantTensorAdapter[PinnedStateT, GpuStateT],
-    TensorCopyIntoAdapter[PinnedStateT, GpuStateT],
-    Protocol,
-):
-    """Combined capability for in-place representation-preserving updates."""
 
 
 # ---------------------------------------------------------------------------
