@@ -38,12 +38,18 @@ from torch_offload import (
     StreamedComponent,
     merge_lora,
 )
+from torch_offload.gguf_adapter import GgufAdapter
 from torch_offload.pinned_module import PinnedModuleInstance
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.quanto_adapter import QuantoAdapter
 from torch_offload.protocols import (
     ResourceBinding,
     ResourceStore,
+)
+from torch_offload.tensor_adapters import (
+    DequantRequantTensorAdapter,
+    LoRAMergeTensorAdapter,
+    TensorCopyIntoAdapter,
 )
 
 from tests.conftest import activated_model, streamed_components
@@ -1024,10 +1030,17 @@ class TestLoRATransform:
         assert packed_calls == 1
         torch.testing.assert_close(param, expected, rtol=2e-5, atol=2e-5)
 
-    @CUDA
+    @pytest.mark.parametrize(
+        "device",
+        [
+            "cpu",
+            pytest.param("cuda", marks=CUDA),
+        ],
+    )
     @pytest.mark.parametrize("factor_count", [1, 2])
-    def test_fused_staging_uses_logical_shape_and_compute_dtype(
+    def test_adapter_staging_uses_logical_shape_and_compute_dtype(
         self,
+        device: str,
         factor_count: int,
     ) -> None:
         rows, cols = 12, 16
@@ -1042,7 +1055,7 @@ class TestLoRATransform:
         transform = LoRATransform(factors)
         packed_representation = torch.empty(
             (rows * cols // 2, 1),
-            device="cuda",
+            device=device,
             dtype=torch.uint8,
         )
 
@@ -1053,13 +1066,60 @@ class TestLoRATransform:
             compute_dtype=torch.float16,
         )
 
-        assert staged is not None
         b, a, _strength = staged
         total_rank = sum(factor.rank for factor in factors)
         assert b.shape == (rows, total_rank)
         assert a.shape == (total_rank, cols)
+        assert b.device.type == device
+        assert a.device.type == device
         assert b.dtype is torch.float16
         assert a.dtype is torch.float16
+
+    def test_conversion_and_copy_capabilities_do_not_enable_merge(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class ConversionOnlyAdapter(GgufAdapter):
+            @staticmethod
+            def dequantize(t: torch.Tensor) -> torch.Tensor:
+                return t
+
+            @staticmethod
+            def requantize(
+                t: torch.Tensor,
+                *,
+                like: torch.Tensor,
+            ) -> torch.Tensor:
+                del like
+                return t
+
+            @staticmethod
+            def copy_into(
+                src: torch.Tensor,
+                *,
+                target: torch.Tensor,
+            ) -> None:
+                target.copy_(src)
+
+        adapter = ConversionOnlyAdapter()
+        assert isinstance(adapter, DequantRequantTensorAdapter)
+        assert isinstance(adapter, TensorCopyIntoAdapter)
+        assert not isinstance(adapter, LoRAMergeTensorAdapter)
+        monkeypatch.setattr(lora_impl, "select_adapter", lambda _data: adapter)
+
+        param = nn.Parameter(torch.randn(4, 8), requires_grad=False)
+        transform = LoRATransform(
+            [
+                ScaledLoRAFactor.from_tensors(
+                    torch.randn(2, 8),
+                    torch.randn(4, 2),
+                    0.5,
+                )
+            ]
+        )
+
+        with pytest.raises(ValueError, match="adapter-owned LoRA merge"):
+            transform.validate_target(param)
 
     def test_regular_non_addmm_dtype_raises_on_apply(self) -> None:
         param = nn.Parameter(torch.zeros(4, 8, dtype=torch.int32), requires_grad=False)
@@ -1070,7 +1130,10 @@ class TestLoRATransform:
         with pytest.raises(ValueError, match="dense in-place addmm requires"):
             transform.apply(param)
 
-    def test_quanto_transform_requantizes_param_in_place(self) -> None:
+    def test_quanto_transform_delegates_cpu_merge_in_place(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
@@ -1093,6 +1156,30 @@ class TestLoRATransform:
         original_param = param
         original_packed_ptr = param.data._data.data_ptr()
         expected_dense = qt.dequantize()
+        merge_calls: list[tuple[str, tuple[int, ...], tuple[int, ...], float]] = []
+        original_merge = QuantoAdapter.merge_lora_
+
+        def tracked_merge(
+            target: torch.Tensor,
+            staged_b: torch.Tensor,
+            staged_a: torch.Tensor,
+            strength: float,
+        ) -> None:
+            merge_calls.append(
+                (
+                    target.device.type,
+                    tuple(staged_b.shape),
+                    tuple(staged_a.shape),
+                    strength,
+                )
+            )
+            original_merge(target, staged_b, staged_a, strength)
+
+        monkeypatch.setattr(
+            QuantoAdapter,
+            "merge_lora_",
+            staticmethod(tracked_merge),
+        )
 
         transform.apply(param)
 
@@ -1110,6 +1197,7 @@ class TestLoRATransform:
         assert param is original_param
         assert param.data._data.data_ptr() == original_packed_ptr
         assert isinstance(param.data, WeightQBytesTensor)
+        assert merge_calls == [("cpu", (rows, rank), (rank, cols), 0.5)]
         torch.testing.assert_close(param.data._data, expected_packed)
         torch.testing.assert_close(param.data._scale, scale)
 

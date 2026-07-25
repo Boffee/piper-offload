@@ -16,7 +16,8 @@ Beyond inference movement, this adapter opts into:
   per-group weights use raw Triton kernels when available. Other layouts
   and installations without Triton use the existing
   dequantize/GEMM/requantize path.
-- Dequantize/requantize plus ``copy_into`` remains the generic update path.
+- Dequantize/requantize and ``copy_into`` remain separate conversion and copy
+  capabilities and supply the adapter's reference merge fallback.
   Requantization recomputes scales via the public ``Float8Tensor.from_hp``,
   which is lossy but standard practice for permanent merges into quantized
   weights.

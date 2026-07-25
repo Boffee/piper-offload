@@ -18,7 +18,8 @@ module.
   so movement stays codebook- and nesting-agnostic.
 - :func:`dequantize_params_4bit` / :func:`requantize_params_4bit` — the
   pieces used by :class:`~torch_offload.bnb4bit_adapter.Bnb4bitAdapter`
-  to expose a dequantize/requantize adapter capability (LoRA merge).
+  to expose a dequantize/requantize conversion capability and implement its
+  LoRA merge fallback.
 
 Both pin/move/wrap and dequantize/requantize support consume from here
 through :mod:`bnb4bit_adapter`, so the layout assumption only has to be

@@ -25,7 +25,7 @@ to be lifted into its own package when a second consumer appears.
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, DTensor, and TorchAO dynamic/static scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
 | `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `static_float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao / DTensor support |
-| `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (scaled-FP8 / INT8 / MX / NVFP4 / INT4 tile-packed) — common pin/move/identity mechanics + per-format hooks; capabilities beyond inference movement (CPU round-trip, dequant/requant LoRA merge) are opted into per subclass |
+| `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (scaled-FP8 / INT8 / MX / NVFP4 / INT4 tile-packed) — common pin/move/identity mechanics + per-format hooks; capabilities beyond inference movement (CPU round-trip, dequant/requant conversion, copy, and staged LoRA merge) are opted into per subclass |
 | `dtensor_adapter.py` | Internal: movement-only `DTensorAdapter` for tensor-parallel `DTensor` weights — composes with every other adapter by delegating the local shard to the registry and replaying the `(mesh, placements)` wrapper; frozen-inference scope (see `_dtensor.py`) |
 | `tensor_adapter_registry.py` | Public external-adapter registration plus adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
@@ -277,10 +277,11 @@ immediately after the owning
 component copies the base weight from pinned CPU storage to GPU, so both
 block-streamed and non-block weights use the same merge path. Merge
 compatibility is adapter-owned: plain dense tensors opt into in-place
-`addmm_`; structured quantized wrappers can opt into a format-specific
-staged merge or dequantize/requantize plus `copy_into`. Use routed mode for
-formats that do not expose either merge capability but still provide a
-compatible logical Linear weight shape and compute dtype. `PinnedParam`
+`addmm_`; structured quantized wrappers can opt into an adapter-owned staged
+merge, whose implementation may select a format-specific kernel or its own
+framework-operator fallback. Use routed mode for formats that do not expose
+either merge capability but still provide a compatible logical Linear weight
+shape and compute dtype. `PinnedParam`
 remains a storage primitive; LoRA merge mode asks the selected adapter
 for the required update capability.
 
@@ -654,9 +655,11 @@ inside a top-level model runtime rather than acting as one themselves.
 only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,
 cache bytes, logical compute dtype, and block-layout signatures. Extra
 behaviors are explicit capabilities: CPU round-trip for optimizer-step
-sync, `Parameter.data` swap for trainable streaming, and — for LoRA merge
-— either dense in-place `addmm_` (plain bases) or dequantize/requantize
-plus `copy_into` (quantized wrappers).
+sync, `Parameter.data` swap for trainable streaming, shape-preserving
+dequantize/requantize conversion, representation-preserving `copy_into`, and
+adapter-owned staged LoRA merge. LoRA dispatch uses either dense in-place
+`addmm_` for plain bases or the staged merge capability for structured bases;
+conversion and copy capabilities do not implicitly advertise merge support.
 
 Downstream tensor subclasses can provide their adapter without adding a
 format-specific dependency to torch-offload:

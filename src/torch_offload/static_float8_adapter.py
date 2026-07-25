@@ -83,7 +83,10 @@ def _merge_static_float8_lora(
     strength: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Prefer Triton, falling back to the pure-Torch raw-storage merge."""
-    if _triton_merge_static_float8_lora is not None:
+    if (
+        _triton_merge_static_float8_lora is not None
+        and qdata.device.type == "cuda"
+    ):
         return _triton_merge_static_float8_lora(
             qdata,
             scale,

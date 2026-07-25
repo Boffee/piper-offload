@@ -18,12 +18,13 @@ exposes the per-format parts as small hooks. Concrete adapters
 implement those hooks.
 
 Capabilities beyond inference movement and metadata queries (CPU round-trip,
-dequantize/requantize LoRA merge) are added by the concrete subclass that
-supports them — and only that subclass — so the ``@runtime_checkable``
-capability protocols, which test for method presence on the class, report each
-format's true capability. The base deliberately implements no mutation
-capabilities: subclasses that add nothing stay frozen-inference, while a
-subclass that defines the extra methods advertises exactly those capabilities.
+dequantize/requantize conversion, representation-preserving copy, and staged
+LoRA merge) are added by the concrete subclass that supports them — and only
+that subclass — so the ``@runtime_checkable`` capability protocols, which test
+for method presence on the class, report each format's true capability. The
+base deliberately implements no mutation capabilities: subclasses that add
+nothing stay frozen-inference, while a subclass that defines the extra methods
+advertises exactly those capabilities.
 """
 
 from __future__ import annotations
@@ -126,7 +127,7 @@ class TorchaoStructuredAdapter(ABC, Generic[MetaT]):
     sets :attr:`_TAG` / :attr:`_STORAGE_NAMES` and implements the ``_*``
     hooks; it opts into capabilities beyond inference movement by defining
     the relevant methods (``copy_to_cpu``, ``dequantize`` / ``requantize``
-    / ``copy_into``) itself.
+    / ``copy_into``, or ``merge_lora_``) itself.
 
     The hooks operate on the validated wrapper, typed :data:`Any` because
     TorchAO tensor subclasses are untyped — the same boundary the

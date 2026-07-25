@@ -81,11 +81,10 @@ Unknown targets raise during activation. The
 hooks run immediately after the owning component copies a base weight
 from pinned CPU storage to GPU, so block-streamed and non-block weights
 use the same merge path. Merge eligibility is owned by the selected
-tensor adapter: plain dense tensors opt into in-place
-``addmm_``; structured quantized wrappers can opt into a format-specific
-staged merge or dequantize/requantize plus ``copy_into``, otherwise use routed
-LoRA when their module exposes a compatible logical Linear weight shape
-and compute dtype.
+tensor adapter: plain dense tensors opt into in-place ``addmm_``; structured
+quantized wrappers can opt into an adapter-owned staged merge that selects its
+own kernel or framework-operator fallback. Otherwise, use routed LoRA when the
+module exposes a compatible logical Linear weight shape and compute dtype.
 
 :class:`LoRA` owns immutable pinned factor storage. Merge and routed consumers
 read that backing directly and may overlap; routed hooks stage their own
