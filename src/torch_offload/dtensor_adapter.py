@@ -1,4 +1,4 @@
-"""Composing movement adapter for PyTorch ``DTensor`` (tensor-parallel) weights.
+"""Composing adapter for PyTorch ``DTensor`` (tensor-parallel) weights.
 
 A ``DTensor`` is an *orthogonal outer wrapper*: a local shard plus a
 ``DeviceMesh`` and placements. Moving it across the CPU<->GPU boundary is
@@ -20,11 +20,17 @@ rejects such a local shard with ``NotImplementedError`` rather than silently
 corrupting it. (bitsandbytes + tensor parallelism is not a supported
 combination upstream regardless.)
 
-Scope: **movement only, for frozen-inference tensor parallelism.** The
-adapter advertises no capability beyond movement (no CPU round-trip, no
-dequantize/requantize, no ``copy_into``, no trainable ``.data`` swap), so
-capability detection stays honest regardless of what the inner adapter
-supports — routed LoRA, not merged, is the inference path.
+Scope: **movement plus shard-local LoRA merge, for frozen-inference tensor
+parallelism.** Merge mode supports rank-two weights with ordinary
+``Replicate`` and contiguous ``Shard`` placements. It stages the full factors
+on each rank, takes the views needed by that rank's local weight shard, and
+delegates the actual update to the local shard's adapter. This keeps
+tensor-parallel concerns out of format-specific quant adapters.
+
+The adapter advertises no CPU round-trip, dequantize/requantize, ``copy_into``,
+or trainable ``.data`` swap capability. A DTensor is mergeable only when its
+local shard's adapter supports dense ``addmm_`` or adapter-owned LoRA merge;
+otherwise routed LoRA remains the inference path.
 
 Identity and layout keys are taken from the **local shard** (delegated to
 the inner adapter) plus a structural ``(mesh, placements)`` signature. This
@@ -61,7 +67,14 @@ from ._dtensor import (
     rebuild_dtensor,
     require_dtensor,
 )
-from .tensor_adapters import BindLayoutTensorAdapter, TensorAdapter
+from .tensor_adapters import (
+    BindLayoutTensorAdapter,
+    DenseAddmmTensorAdapter,
+    LogicalShapeTensorAdapter,
+    LoRAMergeTensorAdapter,
+    TensorAdapter,
+    adapter_name,
+)
 
 
 @dataclass(slots=True)
@@ -100,8 +113,144 @@ def _select(local: torch.Tensor) -> TensorAdapter[Any, Any]:
     return select_adapter(local)
 
 
+def _local_shape_and_offsets(
+    global_shape: tuple[int, ...],
+    mesh_shape: tuple[int, ...],
+    coordinate: tuple[int, ...],
+    placements: tuple[object, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return this rank's contiguous shard shape and global offsets.
+
+    LoRA merge intentionally accepts only the common tensor-parallel placement
+    vocabulary: replication and contiguous sharding. Applying placements from
+    left to right mirrors DTensor's sharding semantics, including uneven and
+    repeated sharding of one tensor dimension.
+    """
+    from torch.distributed.tensor import Replicate, Shard  # noqa: PLC0415
+
+    if not (len(mesh_shape) == len(coordinate) == len(placements)):
+        raise ValueError(
+            "DTensor LoRA merge requires one placement and coordinate per "
+            f"mesh dimension; mesh shape is {mesh_shape}, coordinate is "
+            f"{coordinate}, and placements are {placements}."
+        )
+
+    local_shape = list(global_shape)
+    offsets = [0] * len(global_shape)
+    for mesh_dim, (mesh_size, shard_coordinate, placement) in enumerate(
+        zip(mesh_shape, coordinate, placements, strict=True)
+    ):
+        if isinstance(placement, Replicate):
+            continue
+        if type(placement) is not Shard:
+            raise ValueError(
+                "DTensor LoRA merge supports only Replicate and contiguous "
+                f"Shard placements; mesh dimension {mesh_dim} uses "
+                f"{placement!r}. Use routed LoRA for this layout."
+            )
+
+        tensor_dim = placement.dim
+        if tensor_dim < 0:
+            tensor_dim += len(global_shape)
+        if not 0 <= tensor_dim < len(global_shape):
+            raise ValueError(
+                f"DTensor LoRA merge placement {placement!r} refers to tensor "
+                f"dimension {placement.dim}, but the target shape is "
+                f"{global_shape}."
+            )
+
+        shard_size, relative_offset = Shard.local_shard_size_and_offset(
+            local_shape[tensor_dim],
+            mesh_size,
+            shard_coordinate,
+        )
+        local_shape[tensor_dim] = int(shard_size)
+        if shard_size == 0:
+            # Match DTensor's checkpointing offset semantics: every empty
+            # shard is anchored at the end of the original global dimension,
+            # including when repeated sharding made an earlier local shard
+            # empty.
+            offsets[tensor_dim] = global_shape[tensor_dim]
+        else:
+            offsets[tensor_dim] += int(relative_offset)
+
+    return tuple(local_shape), tuple(offsets)
+
+
+def _logical_shape(
+    tensor: torch.Tensor,
+    adapter: TensorAdapter[Any, Any],
+) -> tuple[int, ...]:
+    if isinstance(adapter, LogicalShapeTensorAdapter):
+        return adapter.logical_shape(tensor)
+    return tuple(tensor.shape)
+
+
+@dataclass(slots=True, frozen=True)
+class _DTensorMergeContext:
+    """Validated global-to-local information for one DTensor merge."""
+
+    global_shape: tuple[int, ...]
+    local_shape: tuple[int, ...]
+    offsets: tuple[int, ...]
+    local: torch.Tensor
+    inner: TensorAdapter[Any, Any]
+
+
+def _merge_context(target: torch.Tensor) -> _DTensorMergeContext:
+    """Validate a DTensor merge target before any weight mutation."""
+    dt = require_dtensor(target)
+    global_shape = tuple(dt.shape)
+    if len(global_shape) != 2:
+        raise ValueError(
+            "DTensor LoRA merge requires a rank-two weight, "
+            f"got global shape {global_shape}."
+        )
+
+    coordinate = dt.device_mesh.get_coordinate()
+    if coordinate is None:
+        raise ValueError(
+            "DTensor LoRA merge cannot run on a rank outside the target "
+            "device mesh."
+        )
+    local_shape, offsets = _local_shape_and_offsets(
+        global_shape,
+        tuple(dt.device_mesh.shape),
+        tuple(coordinate),
+        tuple(dt.placements),
+    )
+
+    local = dt.to_local()
+    inner = _select(local)
+    actual_local_shape = _logical_shape(local, inner)
+    if actual_local_shape != local_shape:
+        raise ValueError(
+            "DTensor LoRA merge computed a local shard shape that does not "
+            "match the target representation: "
+            f"computed={local_shape}, actual={actual_local_shape}, "
+            f"global={global_shape}, placements={tuple(dt.placements)}."
+        )
+
+    if isinstance(inner, DenseAddmmTensorAdapter):
+        inner.validate_dense_addmm_target(local)
+    elif not isinstance(inner, LoRAMergeTensorAdapter):
+        raise ValueError(
+            f"DTensor local shard adapter {adapter_name(inner)} does not support "
+            "dense in-place addmm or adapter-owned LoRA merge. Use routed LoRA "
+            "for this tensor type."
+        )
+
+    return _DTensorMergeContext(
+        global_shape=global_shape,
+        local_shape=local_shape,
+        offsets=offsets,
+        local=local,
+        inner=inner,
+    )
+
+
 class DTensorAdapter:
-    """Movement-only adapter for tensor-parallel ``DTensor`` weights."""
+    """Movement and local LoRA-merge adapter for tensor-parallel weights."""
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
@@ -235,6 +384,56 @@ class DTensorAdapter:
     def copy_to_gpu(src: _DTensorPinned, dst: _DTensorGpu, *, non_blocking: bool = False) -> None:
         # Pure local-shard DMA; never a collective.
         src.inner.copy_to_gpu(src.inner_state, dst.inner_gpu, non_blocking=non_blocking)
+
+    @staticmethod
+    def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
+        """Validate the merge target and return its global logical shape."""
+        return _merge_context(t).global_shape
+
+    @staticmethod
+    def merge_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Merge full LoRA factors into this rank's local weight shard.
+
+        ``LoRATransform`` has already staged ordinary full factors on the
+        target GPU. This method takes the row/column views corresponding to the
+        local DTensor shard, then delegates representation-specific mutation to
+        the inner adapter. No collective is needed because the LoRA rank
+        dimension is not sharded.
+        """
+        context = _merge_context(target)
+        global_shape = context.global_shape
+        if (
+            b.ndim != 2
+            or a.ndim != 2
+            or b.shape[0] != global_shape[0]
+            or a.shape[1] != global_shape[1]
+            or b.shape[1] != a.shape[0]
+        ):
+            raise ValueError(
+                "DTensor LoRA factors do not match the global weight shape: "
+                f"weight={global_shape}, B={tuple(b.shape)}, A={tuple(a.shape)}."
+            )
+
+        out_offset, in_offset = context.offsets
+        out_size, in_size = context.local_shape
+        local_b = b.narrow(0, out_offset, out_size).contiguous()
+        local_a = a.narrow(1, in_offset, in_size).contiguous()
+
+        if isinstance(context.inner, DenseAddmmTensorAdapter):
+            context.local.addmm_(local_b, local_a, alpha=strength)
+            return
+        assert isinstance(context.inner, LoRAMergeTensorAdapter)
+        context.inner.merge_lora_(
+            context.local,
+            local_b,
+            local_a,
+            strength,
+        )
 
     @staticmethod
     def compute_dtype(t: torch.Tensor) -> torch.dtype:
