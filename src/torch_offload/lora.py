@@ -40,6 +40,7 @@ from typing import Any, Literal
 import torch
 from torch import nn
 
+from .dtensor_adapter import DTensorAdapter
 from .pinned_param import PinnedParam
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import LoRAMergeTensorAdapter, adapter_name
@@ -233,7 +234,13 @@ class LoRATransform:
             self._factors,
             logical_shape,
         )
-        self._validate_staged_factors(self._factor_tensors())
+        factor_tensors, _ = self._localize_factor_tensors(
+            representation,
+            adapter,
+            self._factor_tensors(),
+            logical_shape=logical_shape,
+        )
+        self._validate_staged_factors(factor_tensors)
 
     def apply(self, param: nn.Parameter) -> None:
         # Operate on the representation tensor: ``param.data`` for plain and
@@ -272,10 +279,16 @@ class LoRATransform:
     ) -> None:
         """Stage one combined update and delegate it to the target adapter."""
         factor_tensors = self._factor_tensors()
+        factor_tensors, staging_shape = self._localize_factor_tensors(
+            data,
+            adapter,
+            factor_tensors,
+            logical_shape=logical_shape,
+        )
         staged = self._stage_single_or_packed_update(
             data,
             factor_tensors,
-            logical_shape=logical_shape,
+            logical_shape=staging_shape,
             compute_dtype=compute_dtype,
         )
         b, a, strength = staged
@@ -285,6 +298,36 @@ class LoRATransform:
             a,
             strength,
         )
+
+    @staticmethod
+    def _localize_factor_tensors(
+        data: torch.Tensor,
+        adapter: LoRAMergeTensorAdapter[Any, Any],
+        factor_tensors: Sequence[
+            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
+        ],
+        *,
+        logical_shape: tuple[int, ...],
+    ) -> tuple[
+        list[tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]],
+        tuple[int, ...],
+    ]:
+        """Slice pinned factors to a DTensor target's local shard."""
+        if not isinstance(adapter, DTensorAdapter):
+            return list(factor_tensors), logical_shape
+
+        (out_offset, out_size), (in_offset, in_size) = (
+            adapter.lora_factor_ranges(data)
+        )
+        localized = [
+            (
+                factor,
+                a.narrow(1, in_offset, in_size),
+                b.narrow(0, out_offset, out_size),
+            )
+            for factor, a, b in factor_tensors
+        ]
+        return localized, (out_size, in_size)
 
     @classmethod
     def _stage_single_or_packed_update(
@@ -305,12 +348,12 @@ class LoRATransform:
                     device=data.device,
                     dtype=compute_dtype,
                     non_blocking=True,
-                ),
+                ).contiguous(),
                 a.to(
                     device=data.device,
                     dtype=compute_dtype,
                     non_blocking=True,
-                ),
+                ).contiguous(),
                 factor.strength,
             )
 

@@ -22,10 +22,10 @@ combination upstream regardless.)
 
 Scope: **movement plus shard-local LoRA merge, for frozen-inference tensor
 parallelism.** Merge mode supports rank-two weights with ordinary
-``Replicate`` and contiguous ``Shard`` placements. It stages the full factors
-on each rank, takes the views needed by that rank's local weight shard, and
-delegates the actual update to the local shard's adapter. This keeps
-tensor-parallel concerns out of format-specific quant adapters.
+``Replicate`` and contiguous ``Shard`` placements. It selects the pinned
+factor regions needed by each rank before device staging, then delegates the
+actual update to the local shard's adapter. This keeps tensor-parallel
+concerns out of format-specific quant adapters.
 
 The adapter advertises no CPU round-trip, dequantize/requantize, ``copy_into``,
 or trainable ``.data`` swap capability. A DTensor is mergeable only when its
@@ -387,43 +387,58 @@ class DTensorAdapter:
         return _merge_context(t).global_shape
 
     @staticmethod
+    def lora_factor_ranges(
+        target: torch.Tensor,
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Return the local ``B`` row and ``A`` column ranges."""
+        context = _merge_context(target)
+        out_offset, in_offset = context.offsets
+        out_size, in_size = context.local_shape
+        return (out_offset, out_size), (in_offset, in_size)
+
+    @staticmethod
     def merge_lora_(
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
     ) -> None:
-        """Merge full LoRA factors into this rank's local weight shard.
+        """Merge local or global LoRA factors into this rank's weight shard.
 
-        ``LoRATransform`` has already staged ordinary full factors on the
-        target GPU. This method takes the row/column views corresponding to the
-        local DTensor shard, then delegates representation-specific mutation to
-        the inner adapter. No collective is needed because the LoRA rank
-        dimension is not sharded.
+        The optimized ``LoRATransform`` path supplies factors already localized
+        to this rank. Generic callers may still supply factors matching the
+        DTensor's global logical shape; those are sliced here as before. The
+        resulting contiguous factors are delegated to the inner adapter. No
+        collective is needed because the LoRA rank dimension is not sharded.
         """
         context = _merge_context(target)
-        global_shape = context.global_shape
-        if (
-            b.ndim != 2
-            or a.ndim != 2
-            or b.shape[0] != global_shape[0]
-            or a.shape[1] != global_shape[1]
-            or b.shape[1] != a.shape[0]
-        ):
+        if b.ndim != 2 or a.ndim != 2 or b.shape[1] != a.shape[0]:
             raise ValueError(
-                "DTensor LoRA factors do not match the global weight shape: "
-                f"weight={global_shape}, B={tuple(b.shape)}, A={tuple(a.shape)}."
+                "DTensor LoRA factors must be rank two with matching inner "
+                f"dimensions, got B={tuple(b.shape)}, A={tuple(a.shape)}."
             )
 
-        out_offset, in_offset = context.offsets
-        out_size, in_size = context.local_shape
-        local_b = b.narrow(0, out_offset, out_size).contiguous()
-        local_a = a.narrow(1, in_offset, in_size).contiguous()
+        factor_shape = (b.shape[0], a.shape[1])
+        if factor_shape == context.local_shape:
+            local_b = b
+            local_a = a
+        elif factor_shape == context.global_shape:
+            out_offset, in_offset = context.offsets
+            out_size, in_size = context.local_shape
+            local_b = b.narrow(0, out_offset, out_size)
+            local_a = a.narrow(1, in_offset, in_size)
+        else:
+            raise ValueError(
+                "DTensor LoRA factors must match either the global or local "
+                f"weight shape: global={context.global_shape}, "
+                f"local={context.local_shape}, B={tuple(b.shape)}, "
+                f"A={tuple(a.shape)}."
+            )
 
         context.inner.merge_lora_(
             context.local,
-            local_b,
-            local_a,
+            local_b.contiguous(),
+            local_a.contiguous(),
             strength,
         )
 

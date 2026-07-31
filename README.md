@@ -819,9 +819,10 @@ Notes:
   along the last axis. `PerRow` and `PerTensor` scaled-FP8 transposes remain
   mergeable. int8 cannot be transposed.
 - **‡** DTensor merge supports rank-two weights with ordinary `Replicate`
-  and contiguous `Shard` placements. Each rank stages the full plain LoRA
-  factors, selects the rows and columns needed by its local weight shard, and
-  delegates the update to that shard's adapter; no collective is required.
+  and contiguous `Shard` placements. Each rank selects the rows and columns
+  needed by its local weight shard from the pinned plain LoRA factors before
+  device staging, then delegates the update to that shard's adapter; no
+  collective is required. The full factors remain in pinned host memory.
   The inner adapter must support LoRA merge.
   Unsupported local tensor types and placements must use routed LoRA.
   DTensor factors themselves are not accepted in merge mode.
