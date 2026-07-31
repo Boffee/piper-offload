@@ -1,9 +1,9 @@
 """Internal optional-import module for PyTorch ``DTensor`` (tensor parallel).
 
-Single source of truth for the small slice of the ``DTensor`` API that the
-movement-only :class:`~torch_offload.dtensor_adapter.DTensorAdapter` needs:
-the predicate, the local shard, and stable hashable signatures for the
-``DeviceMesh`` and placements (used in identity / block-pool keys).
+Single source of truth for the small slice of the ``DTensor`` API that
+:class:`~torch_offload.dtensor_adapter.DTensorAdapter` needs: the predicate,
+the local shard, and stable hashable signatures for the ``DeviceMesh`` and
+placements (used in identity / block-pool keys).
 
 ``DTensor`` is the standard PyTorch tensor-parallel representation: an outer
 wrapper carrying a local shard plus a ``DeviceMesh`` and per-dim placements

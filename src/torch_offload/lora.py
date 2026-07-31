@@ -8,9 +8,8 @@ routed consumers may share.
 Two application paths apply the resource's factors:
 
 - :class:`LoRATransform` (merge mode) — applied to the GPU parameter
-  after DMA; integrates with block streaming. Uses dense in-place
-  ``addmm_`` when available or an adapter-owned staged merge for structured
-  representations.
+  after DMA; integrates with block streaming. Stages the factors and delegates
+  the in-place update to the target tensor's adapter.
 - routed mode (:func:`install_routed_residual_hook`) — a forward-PRE hook
   copies the target's factors from pinned CPU storage to the input device for
   that invocation; a forward-POST hook adds
@@ -43,11 +42,7 @@ from torch import nn
 
 from .pinned_param import PinnedParam
 from .tensor_adapter_registry import param_representation, select_adapter
-from .tensor_adapters import (
-    DenseAddmmTensorAdapter,
-    LoRAMergeTensorAdapter,
-    adapter_name,
-)
+from .tensor_adapters import LoRAMergeTensorAdapter, adapter_name
 
 __all__ = [
     "LoRA",
@@ -213,9 +208,9 @@ class LoRATransform:
 
     Holds references to LoRA-owned pinned factor matrices — no cloning or
     pinning happens here. :meth:`apply` copies factors to the target
-    parameter's device and applies the update using either dense in-place
-    ``addmm_`` or an adapter-owned staged merge. Multiple ordinary factors are
-    packed into transient buffers and applied as one update. The target
+    parameter's device and delegates the update to its tensor adapter. Multiple
+    ordinary factors are packed into transient buffers and applied as one
+    update. The target
     :class:`~torch.nn.Parameter` object is always preserved.
     """
 
@@ -233,17 +228,12 @@ class LoRATransform:
         """
         representation = param_representation(param)
         adapter = _select_lora_merge_adapter(representation)
-        logical_shape = (
-            tuple(representation.shape)
-            if adapter is None
-            else adapter.logical_shape(representation)
-        )
+        logical_shape = adapter.logical_shape(representation)
         _validate_factor_shapes(
             self._factors,
             logical_shape,
         )
-        if adapter is not None:
-            self._validate_staged_factors(self._factor_tensors())
+        self._validate_staged_factors(self._factor_tensors())
 
     def apply(self, param: nn.Parameter) -> None:
         # Operate on the representation tensor: ``param.data`` for plain and
@@ -251,14 +241,9 @@ class LoRATransform:
         # subclass whose ``.data`` is lossy (bitsandbytes Params4bit).
         representation = param_representation(param)
         adapter = _select_lora_merge_adapter(representation)
-        if adapter is None:
-            _validate_factor_shapes(self._factors, tuple(representation.shape))
-            self._apply_dense(representation)
-            return
-
         logical_shape = adapter.logical_shape(representation)
         _validate_factor_shapes(self._factors, logical_shape)
-        self._apply_adapter_merge(
+        self._apply_merge(
             representation,
             adapter,
             logical_shape=logical_shape,
@@ -277,7 +262,7 @@ class LoRATransform:
             for factor in self._factors
         ]
 
-    def _apply_adapter_merge(
+    def _apply_merge(
         self,
         data: torch.Tensor,
         adapter: LoRAMergeTensorAdapter[Any, Any],
@@ -285,7 +270,7 @@ class LoRATransform:
         logical_shape: tuple[int, ...],
         compute_dtype: torch.dtype,
     ) -> None:
-        """Stage one combined update and delegate its encoding to the adapter."""
+        """Stage one combined update and delegate it to the target adapter."""
         factor_tensors = self._factor_tensors()
         staged = self._stage_single_or_packed_update(
             data,
@@ -300,18 +285,6 @@ class LoRATransform:
             a,
             strength,
         )
-
-    def _apply_dense(self, data: torch.Tensor) -> None:
-        dev, dt = data.device, data.dtype
-        factor_tensors = self._factor_tensors()
-        if self._can_pack_factors(factor_tensors, dev):
-            self._apply_dense_packed(data, factor_tensors)
-            return
-
-        for factor, a, b in factor_tensors:
-            a_gpu = a.to(device=dev, dtype=dt, non_blocking=True)
-            b_gpu = b.to(device=dev, dtype=dt, non_blocking=True)
-            data.addmm_(b_gpu, a_gpu, alpha=factor.strength)
 
     @classmethod
     def _stage_single_or_packed_update(
@@ -359,7 +332,7 @@ class LoRATransform:
         if cls._are_plain_pinned_factors(factor_tensors):
             return
         raise ValueError(
-            "Adapter-owned LoRA merge requires plain pinned torch.Tensor "
+            "LoRA merge requires plain pinned torch.Tensor "
             "factors; wrapped factor representations are unsupported."
         )
 
@@ -377,22 +350,6 @@ class LoRATransform:
             and a.is_pinned()
             and b.is_pinned()
             for _factor, a, b in factor_tensors
-        )
-
-    @staticmethod
-    def _can_pack_factors(
-        factor_tensors: Sequence[
-            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
-        ],
-        device: torch.device,
-    ) -> bool:
-        # Packing is a CUDA optimization for multiple ordinary pinned factor
-        # pairs. Outer tensor wrappers (for example DTensor) retain the
-        # adapter-aware sequential materialization path.
-        return (
-            device.type == "cuda"
-            and len(factor_tensors) > 1
-            and LoRATransform._are_plain_pinned_factors(factor_tensors)
         )
 
     @staticmethod
@@ -439,22 +396,6 @@ class LoRATransform:
 
         return a_packed, b_packed
 
-    @staticmethod
-    def _apply_dense_packed(
-        data: torch.Tensor,
-        factor_tensors: Sequence[
-            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
-        ],
-    ) -> None:
-        """Apply several staged LoRAs with one GEMM."""
-        a_packed, b_packed = LoRATransform._pack_factors(
-            data,
-            factor_tensors,
-            logical_shape=tuple(data.shape),
-            compute_dtype=data.dtype,
-        )
-        data.addmm_(b_packed, a_packed)
-
 
 def _validate_factor_shapes(
     factors: Sequence[ScaledLoRAFactor],
@@ -473,32 +414,28 @@ def _validate_factor_shapes(
 
 def _select_lora_merge_adapter(
     data: torch.Tensor,
-) -> LoRAMergeTensorAdapter[Any, Any] | None:
+) -> LoRAMergeTensorAdapter[Any, Any]:
     try:
         adapter = select_adapter(data)
     except NotImplementedError as exc:
         raise ValueError(
             f"Tensor type {type(data).__name__} has no registered tensor adapter. "
-            "Merge requires a tensor adapter with dense addmm or an "
-            "adapter-owned LoRA merge."
+            "Merge requires a tensor adapter with LoRA merge support."
         ) from exc
 
-    if isinstance(adapter, DenseAddmmTensorAdapter):
-        try:
-            adapter.validate_dense_addmm_target(data)
-        except ValueError as exc:
-            if isinstance(adapter, LoRAMergeTensorAdapter):
-                return adapter
-            raise ValueError(str(exc)) from exc
-        return None
+    if not isinstance(adapter, LoRAMergeTensorAdapter):
+        raise ValueError(
+            f"{adapter_name(adapter)} does not support LoRA merge. "
+            "Use routed LoRA for this tensor type."
+        )
 
-    if isinstance(adapter, LoRAMergeTensorAdapter):
-        return adapter
-
-    raise ValueError(
-        f"{adapter_name(adapter)} does not support dense in-place addmm "
-        "or an adapter-owned LoRA merge. Use routed LoRA for this tensor type."
-    )
+    compute_dtype = adapter.compute_dtype(data)
+    if not compute_dtype.is_floating_point:
+        raise ValueError(
+            "LoRA merge requires a floating-point compute dtype, "
+            f"got {compute_dtype}."
+        )
+    return adapter
 
 
 @dataclass(slots=True, frozen=True)

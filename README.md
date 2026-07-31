@@ -26,7 +26,7 @@ to be lifted into its own package when a second consumer appears.
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
 | `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `static_float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao / DTensor support |
 | `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (scaled-FP8 / INT8 / MX / NVFP4 / INT4 tile-packed) — common pin/move/identity mechanics + per-format hooks; capabilities beyond inference movement (CPU round-trip, dequant/requant conversion, copy, and staged LoRA merge) are opted into per subclass |
-| `dtensor_adapter.py` | Internal: movement-only `DTensorAdapter` for tensor-parallel `DTensor` weights — composes with every other adapter by delegating the local shard to the registry and replaying the `(mesh, placements)` wrapper; frozen-inference scope (see `_dtensor.py`) |
+| `dtensor_adapter.py` | Internal: `DTensorAdapter` for tensor-parallel `DTensor` weights — composes with other adapters by delegating local-shard movement and LoRA merge to the registry, then replaying the `(mesh, placements)` wrapper; frozen-inference scope (see `_dtensor.py`) |
 | `tensor_adapter_registry.py` | Public external-adapter registration plus adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
@@ -785,7 +785,7 @@ dtype, no merge capability required.
 
 | Weight type | Offload | LoRA merge (`mode="merge"` / `merge_lora`) |
 |---|---|---|
-| Plain bf16 / fp16 / fp32 | ✓ | dense in-place `addmm_` |
+| Plain floating-point tensor | ✓ | native in-place `addmm_` |
 | optimum-quanto qint8 / qfloat8 | ✓ | fixed-scale Triton merge on CUDA; dequant / requant fallback |
 | bitsandbytes NF4 / FP4 | ✓ | blockwise Triton merge on CUDA; dequant / requant fallback |
 | bitsandbytes int8 | ✓ | rowwise Triton merge on CUDA; dequant / requant fallback |
@@ -796,7 +796,7 @@ dtype, no merge capability required.
 | TorchAO NVFP4 | ✓ | blockwise Triton merge on CUDA; dequant / requant fallback † |
 | GGUF (k-quants) | ✓ | — routed only |
 | TorchAO INT4 tile-packed | ✓ | — routed only |
-| DTensor (tensor-parallel shard) | ✓ | — routed only ‡ |
+| DTensor (tensor-parallel shard) | ✓ | shard-local delegation to the inner adapter ‡ |
 
 Notes:
 
@@ -818,10 +818,13 @@ Notes:
   weight is likewise unsupported because TorchAO only reconstructs groups
   along the last axis. `PerRow` and `PerTensor` scaled-FP8 transposes remain
   mergeable. int8 cannot be transposed.
-- **‡** `DTensorAdapter` delegates the local shard to the inner adapter
-  only for *movement*; it exposes no merge capability of its own, so a
-  merge into a DTensor weight raises (frozen-inference scope). Routed LoRA
-  is the intended path for tensor-parallel weights.
+- **‡** DTensor merge supports rank-two weights with ordinary `Replicate`
+  and contiguous `Shard` placements. Each rank stages the full plain LoRA
+  factors, selects the rows and columns needed by its local weight shard, and
+  delegates the update to that shard's adapter; no collective is required.
+  The inner adapter must support LoRA merge.
+  Unsupported local tensor types and placements must use routed LoRA.
+  DTensor factors themselves are not accepted in merge mode.
 - **CPU round-trip** (D2H, for context-free CPU optimizer steps) and
   **trainable `Parameter.data` swap** are separate capabilities: plain
   tensors have both; quanto and both scaled-FP8 representations add CPU

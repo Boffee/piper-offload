@@ -1,4 +1,4 @@
-"""Tests for the movement-only :class:`DTensorAdapter` (tensor-parallel weights).
+"""Tests for :class:`DTensorAdapter` (tensor-parallel weights).
 
 A ``DTensor`` weight needs a ``DeviceMesh`` and a process group, so the whole
 module requires CUDA and initializes a single-rank group. Single-rank means
@@ -16,12 +16,13 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import LoRA, ModelOffloader, StreamConfig
+from torch_offload import LoRA, ModelOffloader, StreamConfig, merge_lora
 from torch_offload.dtensor_adapter import DTensorAdapter
 from torch_offload.pinned_param import PinnedParam
 from torch_offload.tensor_adapters import (
     CpuRoundTripTensorAdapter,
     DequantRequantTensorAdapter,
+    LoRAMergeTensorAdapter,
     ParameterDataSwapTensorAdapter,
     RegularAdapter,
     TensorCopyIntoAdapter,
@@ -99,6 +100,7 @@ class TestDTensorAdapter:
         # A plain local shard is moved by the registry's RegularAdapter — the
         # DTensorAdapter only adds the distributed wrapper on top.
         assert isinstance(pinned_param.pinned_state.inner, RegularAdapter)
+        assert isinstance(pinned_param.pinned_state.inner, LoRAMergeTensorAdapter)
 
     def test_pinned_param_roundtrip_reconstructs_dtensor(self, tp_mesh: Any) -> None:
         dt, full = _dtensor_weight(tp_mesh)
@@ -255,6 +257,109 @@ class TestDTensorAdapter:
         finally:
             pw.deactivate()
 
+    def test_merge_lora_updates_plain_dtensor_local_shard(
+        self,
+        tp_mesh: Any,
+    ) -> None:
+        from torch.distributed.tensor import distribute_tensor
+
+        in_dim = 8
+        out_dim = 12
+        rank = 3
+        weight = torch.randn(out_dim, in_dim, device="cuda")
+        a = torch.randn(rank, in_dim, device="cuda")
+        b = torch.randn(out_dim, rank, device="cuda")
+        strength = 0.4
+
+        class Net(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.target = nn.Linear(in_dim, out_dim, bias=False, device="meta")
+                self.target.weight = nn.Parameter(
+                    distribute_tensor(weight, tp_mesh, [_shard(0)]),
+                    requires_grad=False,
+                )
+
+        model = Net()
+        lora = LoRA.from_state_dict(
+            {
+                "target.lora_A.weight": a,
+                "target.lora_B.weight": b,
+            }
+        )
+        expected = weight + strength * (b @ a)
+        offloader = ModelOffloader.from_module(model)
+
+        # A fresh base copy precedes every activation-scoped merge, so repeated
+        # activation must not accumulate the update.
+        for _ in range(2):
+            with activated_model(
+                offloader,
+                "cuda",
+                loras=[lora],
+                lora_strengths=[strength],
+                lora_mode="merge",
+            ) as active:
+                actual = active.target.weight.data
+                assert _is_dtensor(actual)
+                torch.testing.assert_close(actual.full_tensor(), expected)
+
+    def test_permanent_merge_preflight_rejects_unsupported_placement(
+        self,
+        tp_mesh: Any,
+    ) -> None:
+        from torch.distributed.tensor import DTensor, Partial
+
+        rows = 12
+        cols = 8
+        rank = 3
+        first_local = torch.randn(rows, cols, device="cuda")
+        second_local = torch.randn(rows, cols, device="cuda")
+
+        class Net(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.first = nn.Linear(cols, rows, bias=False, device="meta")
+                self.first.weight = nn.Parameter(
+                    DTensor.from_local(
+                        first_local,
+                        tp_mesh,
+                        [_shard(0)],
+                        run_check=False,
+                    ),
+                    requires_grad=False,
+                )
+                self.second = nn.Linear(cols, rows, bias=False, device="meta")
+                self.second.weight = nn.Parameter(
+                    DTensor.from_local(
+                        second_local,
+                        tp_mesh,
+                        [Partial()],
+                        run_check=False,
+                    ),
+                    requires_grad=False,
+                )
+
+        model = Net()
+        lora = LoRA.from_state_dict(
+            {
+                "first.lora_A.weight": torch.randn(rank, cols),
+                "first.lora_B.weight": torch.randn(rows, rank),
+                "second.lora_A.weight": torch.randn(rank, cols),
+                "second.lora_B.weight": torch.randn(rows, rank),
+            }
+        )
+        first_before = first_local.clone()
+
+        with pytest.raises(
+            ValueError,
+            match="supports only Replicate and contiguous Shard placements",
+        ):
+            merge_lora(model, [(lora, 0.25)])
+
+        # merge_lora preflights every target before mutating any of them.
+        torch.testing.assert_close(model.first.weight.to_local(), first_before)
+
     def test_routed_lora_materializes_factors_on_cuda_mesh(
         self,
         tp_mesh: Any,
@@ -313,11 +418,15 @@ class TestDTensorAdapter:
             assert actual.device_mesh == tp_mesh
             torch.testing.assert_close(actual.full_tensor(), expected)
 
-    def test_advertises_movement_only(self, tp_mesh: Any) -> None:
-        # Frozen-inference scope: no CPU round-trip, no dequant/requant, no
-        # copy_into, no trainable .data swap — even if the inner adapter has
-        # them (routed LoRA, not merged, is the inference path).
+    def test_advertises_merge_but_not_training_capabilities(
+        self,
+        tp_mesh: Any,
+    ) -> None:
+        # Frozen-inference scope: local LoRA merge is available, but CPU
+        # round-trip, dequant/requant, copy_into, and trainable .data swap stay
+        # hidden even when the inner adapter has those capabilities.
         adapter = select_adapter(_dtensor_weight(tp_mesh)[0])
+        assert isinstance(adapter, LoRAMergeTensorAdapter)
         assert not isinstance(adapter, CpuRoundTripTensorAdapter)
         assert not isinstance(adapter, DequantRequantTensorAdapter)
         assert not isinstance(adapter, TensorCopyIntoAdapter)
@@ -365,3 +474,92 @@ class TestDTensorAdapter:
         # the reconstructed local shard is still the Float8 quant subclass
         assert isinstance(select_adapter(gpu_param.data.to_local()), Float8Adapter)
         assert gpu_param.data.placements == dt.placements
+
+    def test_merge_lora_delegates_to_quantized_local_adapter(
+        self,
+        tp_mesh: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("torchao")
+        from torch.distributed.tensor import DTensor
+        from torchao.quantization import Float8WeightOnlyConfig, quantize_
+
+        from torch_offload.float8_adapter import Float8Adapter
+
+        in_dim = 8
+        out_dim = 16
+        rank = 3
+        layer = nn.Linear(
+            in_dim,
+            out_dim,
+            bias=False,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        try:
+            quantize_(layer, Float8WeightOnlyConfig())
+            local_weight = layer.weight.data
+            weight = DTensor.from_local(
+                local_weight,
+                tp_mesh,
+                [_shard(0)],
+                run_check=False,
+            )
+        except Exception as exc:
+            pytest.skip(f"torchao Float8 DTensor unavailable: {exc}")
+
+        class Net(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.target = nn.Linear(in_dim, out_dim, bias=False, device="meta")
+                self.target.weight = nn.Parameter(weight, requires_grad=False)
+
+        calls: list[tuple[type[torch.Tensor], tuple[int, ...], tuple[int, ...]]] = []
+        original_merge = Float8Adapter.merge_lora_
+
+        def record_local_merge(
+            target: torch.Tensor,
+            b: torch.Tensor,
+            a: torch.Tensor,
+            strength: float,
+        ) -> None:
+            calls.append((type(target), tuple(b.shape), tuple(a.shape)))
+            original_merge(target, b, a, strength)
+
+        monkeypatch.setattr(
+            Float8Adapter,
+            "merge_lora_",
+            staticmethod(record_local_merge),
+        )
+
+        model = Net()
+        lora = LoRA.from_state_dict(
+            {
+                "target.lora_A.weight": torch.randn(
+                    rank,
+                    in_dim,
+                    dtype=torch.bfloat16,
+                ),
+                "target.lora_B.weight": torch.randn(
+                    out_dim,
+                    rank,
+                    dtype=torch.bfloat16,
+                ),
+            }
+        )
+        offloader = ModelOffloader.from_module(model)
+
+        with activated_model(
+            offloader,
+            "cuda",
+            loras=[lora],
+            lora_strengths=[0.25],
+            lora_mode="merge",
+        ):
+            assert calls == [
+                (
+                    type(local_weight),
+                    (out_dim, rank),
+                    (rank, in_dim),
+                )
+            ]
