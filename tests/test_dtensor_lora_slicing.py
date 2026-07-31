@@ -8,11 +8,14 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch import nn
 from torch.distributed.tensor import Partial, Replicate, Shard
 
 import torch_offload.dtensor_adapter as dtensor_adapter_module
+import torch_offload.lora as lora_module
+from torch_offload import LoRATransform, ScaledLoRAFactor
 from torch_offload.dtensor_adapter import DTensorAdapter, _local_shape_and_offsets
-from torch_offload.float8_adapter import Float8Adapter
+from torch_offload.tensor_adapters import RegularAdapter
 
 
 def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
@@ -32,11 +35,53 @@ def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
         b = torch.arange(11 * 3, dtype=torch.float32).reshape(11, 3) / 30
         strength = 0.25
         expected = weight + strength * (b @ a)
+        transform = LoRATransform(
+            [ScaledLoRAFactor.from_tensors(a, b, strength)]
+        )
 
         for shard_dim in (0, 1):
             target = distribute_tensor(weight.clone(), mesh, [Shard(shard_dim)])
-            DTensorAdapter.merge_lora_(target, b, a, strength)
+            transform.apply(nn.Parameter(target, requires_grad=False))
             torch.testing.assert_close(target.full_tensor(), expected)
+
+            direct_target = distribute_tensor(
+                weight.clone(),
+                mesh,
+                [Shard(shard_dim)],
+            )
+            DTensorAdapter.merge_lora_(direct_target, b, a, strength)
+            torch.testing.assert_close(direct_target.full_tensor(), expected)
+
+        empty_cases = (
+            (torch.arange(2, dtype=torch.float32).reshape(1, 2), 0),
+            (torch.arange(2, dtype=torch.float32).reshape(2, 1), 1),
+        )
+        for empty_weight, shard_dim in empty_cases:
+            empty_a = torch.arange(
+                2 * empty_weight.shape[1],
+                dtype=torch.float32,
+            ).reshape(2, empty_weight.shape[1])
+            empty_b = torch.arange(
+                empty_weight.shape[0] * 2,
+                dtype=torch.float32,
+            ).reshape(empty_weight.shape[0], 2)
+            empty_transform = LoRATransform(
+                [ScaledLoRAFactor.from_tensors(empty_a, empty_b, strength)]
+            )
+            empty_target = distribute_tensor(
+                empty_weight.clone(),
+                mesh,
+                [Shard(shard_dim)],
+            )
+
+            empty_transform.apply(
+                nn.Parameter(empty_target, requires_grad=False)
+            )
+
+            torch.testing.assert_close(
+                empty_target.full_tensor(),
+                empty_weight + strength * (empty_b @ empty_a),
+            )
     finally:
         dist.destroy_process_group()
 
@@ -108,16 +153,104 @@ def test_empty_repeated_shard_uses_pytorch_global_end_offset() -> None:
     ) == ((1, 0), (0, 2))
 
 
-def test_adapter_owned_merge_receives_contiguous_factor_slices(
+@pytest.mark.parametrize("factor_count", [1, 2])
+def test_transform_localizes_factors_before_staging(
+    monkeypatch: pytest.MonkeyPatch,
+    factor_count: int,
+) -> None:
+    target = nn.Parameter(torch.zeros(4, 3), requires_grad=False)
+    context = dtensor_adapter_module._DTensorMergeContext(
+        global_shape=(6, 8),
+        local_shape=(4, 3),
+        offsets=(2, 5),
+        local=target.data,
+        inner=RegularAdapter(),
+    )
+    monkeypatch.setattr(
+        dtensor_adapter_module,
+        "_merge_context",
+        lambda _target: context,
+    )
+    monkeypatch.setattr(
+        lora_module,
+        "_select_lora_merge_adapter",
+        lambda _target: DTensorAdapter(),
+    )
+
+    staged_inputs: list[
+        tuple[list[tuple[tuple[int, ...], tuple[int, ...]]], tuple[int, ...]]
+    ] = []
+    original_stage = LoRATransform._stage_single_or_packed_update.__func__
+
+    def record_stage(
+        cls: type[LoRATransform],
+        data: torch.Tensor,
+        factor_tensors: list[
+            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
+        ],
+        *,
+        logical_shape: tuple[int, ...],
+        compute_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        staged_inputs.append(
+            (
+                [
+                    (tuple(a.shape), tuple(b.shape))
+                    for _factor, a, b in factor_tensors
+                ],
+                logical_shape,
+            )
+        )
+        return original_stage(
+            cls,
+            data,
+            factor_tensors,
+            logical_shape=logical_shape,
+            compute_dtype=compute_dtype,
+        )
+
+    monkeypatch.setattr(
+        LoRATransform,
+        "_stage_single_or_packed_update",
+        classmethod(record_stage),
+    )
+
+    factor_inputs = [
+        (
+            torch.randn(rank, 8),
+            torch.randn(6, rank),
+            0.25 * (rank - 1),
+        )
+        for rank in range(2, 2 + factor_count)
+    ]
+    transform = LoRATransform([
+        ScaledLoRAFactor.from_tensors(a, b, strength)
+        for a, b, strength in factor_inputs
+    ])
+
+    transform.apply(target)
+
+    assert staged_inputs == [
+        (
+            [((rank, 3), (4, rank)) for rank in range(2, 2 + factor_count)],
+            (4, 3),
+        )
+    ]
+    expected = torch.zeros_like(target)
+    for a, b, strength in factor_inputs:
+        expected.addmm_(b[2:6], a[:, 5:8], alpha=strength)
+    torch.testing.assert_close(target, expected)
+
+
+def test_adapter_owned_merge_receives_contiguous_local_factors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    inner = Float8Adapter()
     context = dtensor_adapter_module._DTensorMergeContext(
         global_shape=(6, 8),
         local_shape=(6, 4),
         offsets=(0, 4),
         local=torch.empty(6, 4),
-        inner=inner,
+        inner=RegularAdapter(),
     )
     monkeypatch.setattr(
         dtensor_adapter_module,
@@ -143,7 +276,7 @@ def test_adapter_owned_merge_receives_contiguous_factor_slices(
         )
 
     monkeypatch.setattr(
-        Float8Adapter,
+        RegularAdapter,
         "merge_lora_",
         staticmethod(record_merge),
     )
@@ -151,7 +284,7 @@ def test_adapter_owned_merge_receives_contiguous_factor_slices(
     DTensorAdapter.merge_lora_(
         torch.empty(0),
         torch.randn(6, 3),
-        torch.randn(3, 8),
+        torch.randn(3, 8)[:, 4:],
         0.25,
     )
 
@@ -181,7 +314,7 @@ def test_mesh_metadata_lengths_must_match() -> None:
         )
 
 
-def test_two_rank_row_and_column_shard_merge(tmp_path: Path) -> None:
+def test_two_rank_row_column_and_empty_shard_merge(tmp_path: Path) -> None:
     init_file = tmp_path / "dtensor-lora-init"
     mp.spawn(
         _run_two_rank_merge,
