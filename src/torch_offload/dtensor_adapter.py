@@ -29,8 +29,8 @@ tensor-parallel concerns out of format-specific quant adapters.
 
 The adapter advertises no CPU round-trip, dequantize/requantize, ``copy_into``,
 or trainable ``.data`` swap capability. A DTensor is mergeable only when its
-local shard's adapter supports dense ``addmm_`` or adapter-owned LoRA merge;
-otherwise routed LoRA remains the inference path.
+local shard's adapter supports LoRA merge; otherwise routed LoRA remains the
+inference path.
 
 Identity and layout keys are taken from the **local shard** (delegated to
 the inner adapter) plus a structural ``(mesh, placements)`` signature. This
@@ -69,7 +69,6 @@ from ._dtensor import (
 )
 from .tensor_adapters import (
     BindLayoutTensorAdapter,
-    DenseAddmmTensorAdapter,
     LogicalShapeTensorAdapter,
     LoRAMergeTensorAdapter,
     TensorAdapter,
@@ -194,7 +193,7 @@ class _DTensorMergeContext:
     local_shape: tuple[int, ...]
     offsets: tuple[int, ...]
     local: torch.Tensor
-    inner: TensorAdapter[Any, Any]
+    inner: LoRAMergeTensorAdapter[Any, Any]
 
 
 def _merge_context(target: torch.Tensor) -> _DTensorMergeContext:
@@ -231,13 +230,10 @@ def _merge_context(target: torch.Tensor) -> _DTensorMergeContext:
             f"global={global_shape}, placements={tuple(dt.placements)}."
         )
 
-    if isinstance(inner, DenseAddmmTensorAdapter):
-        inner.validate_dense_addmm_target(local)
-    elif not isinstance(inner, LoRAMergeTensorAdapter):
+    if not isinstance(inner, LoRAMergeTensorAdapter):
         raise ValueError(
             f"DTensor local shard adapter {adapter_name(inner)} does not support "
-            "dense in-place addmm or adapter-owned LoRA merge. Use routed LoRA "
-            "for this tensor type."
+            "LoRA merge. Use routed LoRA for this tensor type."
         )
 
     return _DTensorMergeContext(
@@ -424,10 +420,6 @@ class DTensorAdapter:
         local_b = b.narrow(0, out_offset, out_size).contiguous()
         local_a = a.narrow(1, in_offset, in_size).contiguous()
 
-        if isinstance(context.inner, DenseAddmmTensorAdapter):
-            context.local.addmm_(local_b, local_a, alpha=strength)
-            return
-        assert isinstance(context.inner, LoRAMergeTensorAdapter)
         context.inner.merge_lora_(
             context.local,
             local_b,

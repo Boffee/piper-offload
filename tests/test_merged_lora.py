@@ -49,6 +49,7 @@ from torch_offload.protocols import (
 from torch_offload.tensor_adapters import (
     DequantRequantTensorAdapter,
     LoRAMergeTensorAdapter,
+    RegularAdapter,
     TensorCopyIntoAdapter,
 )
 
@@ -669,7 +670,7 @@ class TestActivationLoraValidation:
         route_count = _activate_loras_for_test(s)
         assert route_count == 1
 
-    def test_merge_mode_defers_regular_non_addmm_dtype_until_apply(self) -> None:
+    def test_merge_mode_defers_non_floating_dtype_until_apply(self) -> None:
         m = _make_bf16_model()
         m.embed.weight = nn.Parameter(
             torch.zeros(16, 16, dtype=torch.int32),
@@ -946,7 +947,7 @@ class TestMergeCorrectness:
 
 
 class TestLoRATransform:
-    def test_validate_target_accepts_dense_without_mutation(self) -> None:
+    def test_validate_target_accepts_regular_tensor_without_mutation(self) -> None:
         param = nn.Parameter(torch.randn(4, 8), requires_grad=False)
         before = param.detach().clone()
         a = torch.randn(2, 8)
@@ -966,11 +967,15 @@ class TestLoRATransform:
         with pytest.raises(ValueError, match="B@A produces"):
             transform.validate_target(param)
 
-    def test_dense_transform_mutates_param_in_place(self) -> None:
-        param = nn.Parameter(torch.randn(4, 8), requires_grad=False)
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_regular_transform_mutates_param_in_place(
+        self,
+        dtype: torch.dtype,
+    ) -> None:
+        param = nn.Parameter(torch.randn(4, 8, dtype=dtype), requires_grad=False)
         before = param.detach().clone()
-        a = torch.randn(2, 8)
-        b = torch.randn(4, 2)
+        a = torch.randn(2, 8, dtype=dtype)
+        b = torch.randn(4, 2, dtype=dtype)
         transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
 
         transform.apply(param)
@@ -999,23 +1004,23 @@ class TestLoRATransform:
             for a, b, strength in factor_inputs
         ]
         transform = LoRATransform(factors)
-        packed_calls = 0
-        original = LoRATransform._apply_dense_packed
+        merge_calls = 0
+        original = RegularAdapter.merge_lora_
 
-        def tracked_packed_merge(
-            data: torch.Tensor,
-            factor_tensors: Sequence[
-                tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
-            ],
+        def tracked_merge(
+            target: torch.Tensor,
+            b: torch.Tensor,
+            a: torch.Tensor,
+            strength: float,
         ) -> None:
-            nonlocal packed_calls
-            packed_calls += 1
-            original(data, factor_tensors)
+            nonlocal merge_calls
+            merge_calls += 1
+            original(target, b, a, strength)
 
         monkeypatch.setattr(
-            LoRATransform,
-            "_apply_dense_packed",
-            staticmethod(tracked_packed_merge),
+            RegularAdapter,
+            "merge_lora_",
+            staticmethod(tracked_merge),
         )
 
         transform.apply(param)
@@ -1027,7 +1032,7 @@ class TestLoRATransform:
                 a.cuda(),
                 alpha=strength,
             )
-        assert packed_calls == 1
+        assert merge_calls == 1
         torch.testing.assert_close(param, expected, rtol=2e-5, atol=2e-5)
 
     @pytest.mark.parametrize(
@@ -1118,16 +1123,16 @@ class TestLoRATransform:
             ]
         )
 
-        with pytest.raises(ValueError, match="adapter-owned LoRA merge"):
+        with pytest.raises(ValueError, match="does not support LoRA merge"):
             transform.validate_target(param)
 
-    def test_regular_non_addmm_dtype_raises_on_apply(self) -> None:
+    def test_non_floating_compute_dtype_raises_on_apply(self) -> None:
         param = nn.Parameter(torch.zeros(4, 8, dtype=torch.int32), requires_grad=False)
         a = torch.randn(2, 8)
         b = torch.randn(4, 2)
         transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
 
-        with pytest.raises(ValueError, match="dense in-place addmm requires"):
+        with pytest.raises(ValueError, match="floating-point compute dtype"):
             transform.apply(param)
 
     def test_quanto_transform_delegates_cpu_merge_in_place(
@@ -1810,6 +1815,39 @@ class TestPermanentMerge:
         )
 
         with pytest.raises(ValueError, match="second.weight.*shape mismatch"):
+            merge_lora(m, [(lora, 1.0)])
+
+        torch.testing.assert_close(m.first.weight, first_before)
+        torch.testing.assert_close(m.second.weight, second_before)
+
+    def test_compute_dtype_preflight_prevents_partial_merge(self) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.first = nn.Linear(3, 3, bias=False)
+                self.second = nn.Linear(3, 3, bias=False)
+                self.second.weight = nn.Parameter(
+                    torch.zeros(3, 3, dtype=torch.int32),
+                    requires_grad=False,
+                )
+
+        m = M()
+        m.requires_grad_(False)
+        first_before = m.first.weight.detach().clone()
+        second_before = m.second.weight.detach().clone()
+        lora = LoRA.from_state_dict(
+            {
+                "first.lora_A.weight": torch.randn(1, 3),
+                "first.lora_B.weight": torch.randn(3, 1),
+                "second.lora_A.weight": torch.randn(1, 3),
+                "second.lora_B.weight": torch.randn(3, 1),
+            }
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="second.weight.*floating-point compute dtype",
+        ):
             merge_lora(m, [(lora, 1.0)])
 
         torch.testing.assert_close(m.first.weight, first_before)

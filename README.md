@@ -785,7 +785,7 @@ dtype, no merge capability required.
 
 | Weight type | Offload | LoRA merge (`mode="merge"` / `merge_lora`) |
 |---|---|---|
-| Plain bf16 / fp16 / fp32 | ✓ | dense in-place `addmm_` |
+| Plain floating-point tensor | ✓ | native in-place `addmm_` |
 | optimum-quanto qint8 / qfloat8 | ✓ | fixed-scale Triton merge on CUDA; dequant / requant fallback |
 | bitsandbytes NF4 / FP4 | ✓ | blockwise Triton merge on CUDA; dequant / requant fallback |
 | bitsandbytes int8 | ✓ | rowwise Triton merge on CUDA; dequant / requant fallback |
@@ -822,7 +822,7 @@ Notes:
   and contiguous `Shard` placements. Each rank stages the full plain LoRA
   factors, selects the rows and columns needed by its local weight shard, and
   delegates the update to that shard's adapter; no collective is required.
-  The inner adapter must support dense `addmm_` or adapter-owned merge.
+  The inner adapter must support LoRA merge.
   Unsupported local tensor types and placements must use routed LoRA.
   DTensor factors themselves are not accepted in merge mode.
 - **CPU round-trip** (D2H, for context-free CPU optimizer steps) and

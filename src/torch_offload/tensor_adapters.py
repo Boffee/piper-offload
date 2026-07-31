@@ -3,7 +3,7 @@
 Different tensor subclasses need different machinery to move bytes
 across the CPU↔GPU boundary while preserving correctness:
 
-- Plain ``torch.Tensor`` (bf16/fp16/fp32): single contiguous pinned
+- Plain ``torch.Tensor``: single contiguous pinned
   buffer; consumers either replace ``module._parameters[leaf]`` with a
   fresh :class:`nn.Parameter` wrapping it, or ``.data``-swap to preserve
   identity for trainable params.
@@ -39,10 +39,8 @@ import torch
 from torch import nn
 
 __all__ = [
-    "DENSE_ADDMM_DTYPES",
     "BindLayoutTensorAdapter",
     "CpuRoundTripTensorAdapter",
-    "DenseAddmmTensorAdapter",
     "DequantRequantTensorAdapter",
     "LoRAMergeTensorAdapter",
     "LogicalShapeTensorAdapter",
@@ -57,9 +55,6 @@ __all__ = [
     "optional_tensor_id",
     "tensor_layout",
 ]
-
-
-DENSE_ADDMM_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 # Adapter-specific opaque state types. The Protocol is generic over
 # them so consumers (PinnedParam) can stay tensor-type-agnostic
@@ -200,21 +195,6 @@ class CpuRoundTripTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol
 
 
 @runtime_checkable
-class DenseAddmmTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
-    """Optional capability for in-place dense ``addmm_`` updates."""
-
-    @staticmethod
-    def validate_dense_addmm_target(t: torch.Tensor) -> None:
-        """Raise if ``t`` cannot safely receive an in-place ``addmm_``.
-
-        Used before installing a post-copy hook that mutates the freshly
-        copied GPU tensor. Adapters that do not implement this capability
-        are treated as non-mergeable by that caller.
-        """
-        ...
-
-
-@runtime_checkable
 class LogicalShapeTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
     """Optional capability for reading logical shape without materialization.
 
@@ -235,7 +215,7 @@ class LoRAMergeTensorAdapter(
     LogicalShapeTensorAdapter[PinnedStateT, GpuStateT],
     Protocol,
 ):
-    """Optional capability for an adapter-owned staged LoRA merge.
+    """Optional capability for an in-place staged LoRA merge.
 
     The caller validates and stages one combined ``B @ A`` update on the
     target device. The adapter applies it while preserving the target tensor's
@@ -585,17 +565,13 @@ class RegularAdapter:
         return tuple(t.shape)
 
     @staticmethod
-    def validate_dense_addmm_target(t: torch.Tensor) -> None:
-        if type(t) is not torch.Tensor:
-            raise ValueError(
-                f"Dense addmm target is {type(t).__name__}; "
-                "dense in-place addmm requires a plain torch.Tensor."
-            )
-        if t.dtype not in DENSE_ADDMM_DTYPES:
-            raise ValueError(
-                f"Dense addmm target has dtype {t.dtype}; "
-                "dense in-place addmm requires bf16, fp16, or fp32."
-            )
+    def merge_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        target.addmm_(b, a, alpha=strength)
 
     @staticmethod
     def validate_parameter_data_swap_target(t: torch.Tensor) -> None:

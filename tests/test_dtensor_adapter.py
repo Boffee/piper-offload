@@ -100,6 +100,7 @@ class TestDTensorAdapter:
         # A plain local shard is moved by the registry's RegularAdapter — the
         # DTensorAdapter only adds the distributed wrapper on top.
         assert isinstance(pinned_param.pinned_state.inner, RegularAdapter)
+        assert isinstance(pinned_param.pinned_state.inner, LoRAMergeTensorAdapter)
 
     def test_pinned_param_roundtrip_reconstructs_dtensor(self, tp_mesh: Any) -> None:
         dt, full = _dtensor_weight(tp_mesh)
