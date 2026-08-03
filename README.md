@@ -985,3 +985,7 @@ than silent corruption.
 Use `cache.used_cache_bytes` and `cache.available_cache_bytes` for
 current cache accounting. Use `cache.info(key)` for per-key state when
 needed.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

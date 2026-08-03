@@ -3,6 +3,8 @@ name = "torch-offload"
 version = "0.1.0"
 description = "Model-agnostic GPU/CPU memory management for PyTorch — pinned-host offloading, block streaming, and LRU model caching."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=2.0",
