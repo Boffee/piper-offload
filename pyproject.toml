@@ -16,7 +16,14 @@ bnb = ["bitsandbytes>=0.49"]
 torchao = ["torchao>=0.17"]
 gguf = ["gguf>=0.18"]
 quanto = ["optimum-quanto>=0.2"]
-all = ["bitsandbytes>=0.49", "gguf>=0.18", "optimum-quanto>=0.2", "torchao>=0.17"]
+convrot = ["piper-kernels[convrot]>=0.1"]
+all = [
+    "bitsandbytes>=0.49",
+    "gguf>=0.18",
+    "optimum-quanto>=0.2",
+    "piper-kernels[convrot]>=0.1",
+    "torchao>=0.17",
+]
 
 [build-system]
 requires = ["uv_build>=0.9.8,<0.10.0"]
@@ -29,7 +36,7 @@ dev = [
     "pytest~=9.0",
     "ruff>=0.14.3",
     # Every adapter backend, so `uv sync` yields a complete test environment
-    # (otherwise the bnb / torchao / gguf / quanto adapter suites silently skip).
+    # (otherwise optional adapter suites silently skip).
     "torch-offload[all]",
 ]
 
@@ -52,6 +59,7 @@ torch = [
 torchao = [
     { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
+piper-kernels = { git = "https://github.com/Boffee/piper-kernels.git", rev = "2ea581d25e09c563c861602580702130cec78409" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

@@ -24,6 +24,7 @@ from .int4_tile_adapter import Int4TilePackedAdapter
 from .int8_adapter import Int8Adapter
 from .mx_adapter import MxAdapter
 from .nvfp4_adapter import Nvfp4Adapter
+from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from .quanto_adapter import QuantoAdapter
 from .static_float8_adapter import StaticFloat8Adapter
 from .tensor_adapters import RegularAdapter, TensorAdapter
@@ -47,6 +48,7 @@ _BUILTIN_ADAPTERS: tuple[type[TensorAdapter[Any, Any]], ...] = (
     Int8Adapter,
     Int4TilePackedAdapter,
     GgufAdapter,
+    PiperConvRotInt8Adapter,
     RegularAdapter,
 )
 
