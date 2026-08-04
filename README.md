@@ -9,6 +9,8 @@ optional `optimum.quanto`, `gguf`, `piper-kernels`, and `torchao` for
 quantized models). Designed to be lifted into its own package when a second
 consumer appears.
 
+Requires Python 3.14 or newer.
+
 ## What's in here
 
 | Module | Role |
