@@ -5,7 +5,7 @@ bytes (``qdata``), per-row/per-tensor ``scale``, an optional
 ``zero_point`` (asymmetric quant), optional static-activation tensors
 (``act_quant_scale`` / ``act_quant_zero_point`` / ``act_pre_scale``), and
 metadata controlling the matmul dispatch (``block_size``, ``dtype``,
-``act_quant_kwargs``). The shared
+``act_quant_kwargs``, ``reduce_range``). The shared
 :class:`~torch_offload.torchao_structured_adapter.TorchaoStructuredAdapter`
 base preserves that representation across pinned CPU and GPU storage;
 this module supplies the INT8-specific hooks. One adapter covers both
@@ -69,8 +69,9 @@ def _triton_int8_layout_supported(
         or b.ndim != 2
         or a.ndim != 2
         or b.dtype is not a.dtype
-        or b.dtype is not qt.scale.dtype
+        or b.dtype is not qt.dtype
         or b.dtype not in _TRITON_COMPUTE_DTYPES
+        or qt.scale.dtype not in _TRITON_COMPUTE_DTYPES
         or qt.qdata.device != qt.scale.device
         or qt.qdata.device != b.device
         or qt.qdata.device != a.device
@@ -108,6 +109,7 @@ class _Int8Meta:
     block_size: tuple[int, ...]
     dtype: torch.dtype  # logical (pre-quantization) dtype
     act_quant_kwargs: object | None
+    reduce_range: bool | None
 
 
 class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
@@ -152,6 +154,7 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
             block_size=tuple(t.block_size),
             dtype=t.dtype,
             act_quant_kwargs=t.act_quant_kwargs,
+            reduce_range=t.reduce_range,
         )
 
     @staticmethod
@@ -169,6 +172,7 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
             act_quant_zero_point,
             act_pre_scale,
             meta.act_quant_kwargs,
+            meta.reduce_range,
         )
 
     @staticmethod
@@ -177,6 +181,7 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
             tuple(t.block_size),
             t.dtype,
             metadata_key(t.act_quant_kwargs),
+            t.reduce_range,
         )
 
     @classmethod
@@ -186,6 +191,7 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
         return (
             tuple(t.block_size),
             metadata_key(t.act_quant_kwargs),
+            t.reduce_range,
         )
 
     @staticmethod
@@ -223,6 +229,7 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
                 a,
                 strength,
                 asymmetric=asymmetric,
+                reduce_range=bool(qt.reduce_range),
             )
             qt.qdata.copy_(qdata)
             qt.scale.copy_(scale)

@@ -648,8 +648,8 @@ wheels = [
 
 [package.optional-dependencies]
 convrot = [
-    { name = "torchao", version = "0.17.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torchao", version = "0.17.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 
 [[package]]
@@ -920,16 +920,16 @@ all = [
     { name = "numpy" },
     { name = "optimum-quanto" },
     { name = "piper-kernels", extra = ["convrot"] },
-    { name = "torchao", version = "0.17.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torchao", version = "0.17.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 bnb = [
     { name = "bitsandbytes" },
 ]
 convrot = [
     { name = "piper-kernels", extra = ["convrot"] },
-    { name = "torchao", version = "0.17.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torchao", version = "0.17.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 gguf = [
     { name = "gguf" },
@@ -939,8 +939,8 @@ quanto = [
 ]
 torchao = [
     { name = "numpy" },
-    { name = "torchao", version = "0.17.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torchao", version = "0.17.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 
 [package.dev-dependencies]
@@ -966,12 +966,12 @@ requires-dist = [
     { name = "piper-kernels", extras = ["convrot"], marker = "extra == 'convrot'", specifier = ">=0.1.0,<0.2" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.13,<2.14" },
     { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.13,<2.14", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'all') or (sys_platform == 'win32' and extra == 'all')", specifier = ">=0.17,<0.18", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'convrot') or (sys_platform == 'win32' and extra == 'convrot')", specifier = ">=0.17,<0.18", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'torchao') or (sys_platform == 'win32' and extra == 'torchao')", specifier = ">=0.17,<0.18", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'all'", specifier = ">=0.17,<0.18" },
-    { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'convrot'", specifier = ">=0.17,<0.18" },
-    { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'torchao'", specifier = ">=0.17,<0.18" },
+    { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'all') or (sys_platform == 'win32' and extra == 'all')", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'convrot') or (sys_platform == 'win32' and extra == 'convrot')", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'torchao') or (sys_platform == 'win32' and extra == 'torchao')", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'all'", specifier = ">=0.18,<0.19" },
+    { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'convrot'", specifier = ">=0.18,<0.19" },
+    { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'torchao'", specifier = ">=0.18,<0.19" },
 ]
 provides-extras = ["bnb", "torchao", "gguf", "quanto", "convrot", "all"]
 
@@ -986,24 +986,24 @@ dev = [
 
 [[package]]
 name = "torchao"
-version = "0.17.0"
+version = "0.18.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "sys_platform != 'linux' and sys_platform != 'win32'",
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c9/37/ef37ca885265e5f79a168616767dd416a3cea1cc3b28bb6b503ce4a5b652/torchao-0.17.0-py3-none-any.whl", hash = "sha256:02eba449036715b9ae784fbaa1a6f97994bb7b0421ce92d1d5d1c08e5bd6d349", size = 1200680, upload-time = "2026-03-30T22:25:54.457Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/4d/485477bb8f05bd501016059c6d8abd742f830cb1b24ab7704e086c7cc35a/torchao-0.18.0-py3-none-any.whl", hash = "sha256:5c2b4485341bf28b7fed2c4fc95b9f298e209f41685350f067de85527a05585e", size = 1369798, upload-time = "2026-08-03T19:43:12.649Z" },
 ]
 
 [[package]]
 name = "torchao"
-version = "0.17.0+cu130"
+version = "0.18.0+cu130"
 source = { registry = "https://download.pytorch.org/whl/cu130" }
 resolution-markers = [
     "sys_platform == 'linux' or sys_platform == 'win32'",
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu130/torchao-0.17.0%2Bcu130-cp310-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:79ddf24c7e846ac9fb856f709394c4f60932994c2a125708d39833c12ea41d87", upload-time = "2026-03-30T20:39:51Z" },
+    { url = "https://download.pytorch.org/whl/cu130/torchao-0.18.0%2Bcu130-cp310-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b5b6b2822e3a6bc28975b8287874964ba025cc99991b0fa8bc284b2420339c78", upload-time = "2026-08-03T19:00:14Z" },
 ]
 
 [[package]]

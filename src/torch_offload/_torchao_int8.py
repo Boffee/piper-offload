@@ -12,8 +12,9 @@ tensors.
 ``Int8Tensor`` carries two required storage tensors (``qdata`` int8 +
 ``scale``) and up to four optional ones (``zero_point`` for asymmetric
 weight quant, plus ``act_quant_scale`` / ``act_quant_zero_point`` /
-``act_pre_scale`` for static-activation recipes). Absent optionals are
-``None`` and are skipped end-to-end by the structured-adapter base.
+``act_pre_scale`` for static-activation recipes). It also records whether
+weights use INT8's reduced range. Absent optionals are ``None`` and are
+skipped end-to-end by the structured-adapter base.
 """
 
 from typing import Any
@@ -32,6 +33,7 @@ LAYOUT_ATTRS = (
     "block_size",
     "dtype",
     "act_quant_kwargs",
+    "reduce_range",
 )
 """Attributes this repo reads from a TorchAO ``Int8Tensor``."""
 
@@ -72,6 +74,7 @@ def create_int8_tensor(
     act_quant_zero_point: torch.Tensor | None,
     act_pre_scale: torch.Tensor | None,
     act_quant_kwargs: object | None,
+    reduce_range: bool | None,
 ) -> torch.Tensor:
     """Rebuild a TorchAO ``Int8Tensor`` from raw storage + metadata."""
     if not TORCHAO_INT8_AVAILABLE:
@@ -86,6 +89,7 @@ def create_int8_tensor(
         act_quant_zero_point=act_quant_zero_point,
         act_pre_scale=act_pre_scale,
         act_quant_kwargs=act_quant_kwargs,
+        reduce_range=reduce_range,
     )
 
 
@@ -109,7 +113,9 @@ def dequantize_int8_tensor(t: torch.Tensor) -> torch.Tensor:
 
 
 def requantize_int8_tensor(
-    t: torch.Tensor, *, like: torch.Tensor,
+    t: torch.Tensor,
+    *,
+    like: torch.Tensor,
 ) -> torch.Tensor:
     """Encode dense ``t`` using the int8 layout and metadata from ``like``.
 
@@ -134,16 +140,15 @@ def requantize_int8_tensor(
     qt = require_int8_tensor(like)
     if tuple(t.shape) != tuple(qt.shape):
         raise ValueError(
-            f"Cannot requantize tensor with shape {tuple(t.shape)} like "
-            f"Int8Tensor with shape {tuple(qt.shape)}."
+            f"Cannot requantize tensor with shape {tuple(t.shape)} like Int8Tensor with shape {tuple(qt.shape)}."
         )
     mapping_type = (
-        MappingType.ASYMMETRIC
-        if qt.zero_point is not None and bool(qt.zero_point.any())
-        else MappingType.SYMMETRIC
+        MappingType.ASYMMETRIC if qt.zero_point is not None and bool(qt.zero_point.any()) else MappingType.SYMMETRIC
     )
     granularity = granularity_from_block_size(
-        tuple(qt.block_size), tuple(qt.shape), label="Int8Tensor",
+        tuple(qt.block_size),
+        tuple(qt.shape),
+        label="Int8Tensor",
     )
     return Int8Tensor.from_hp(
         t.to(dtype=qt.dtype),
@@ -153,4 +158,5 @@ def requantize_int8_tensor(
         act_quant_scale=qt.act_quant_scale,
         act_quant_zero_point=qt.act_quant_zero_point,
         act_pre_scale=qt.act_pre_scale,
+        reduce_range=qt.reduce_range,
     )

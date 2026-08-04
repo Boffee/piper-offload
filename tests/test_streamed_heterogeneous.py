@@ -164,7 +164,7 @@ def _int8_quantizer():
     """Return a callable that int8-quantizes a Linear in place, or skip.
 
     Mirrors ``test_int8_adapter.py``: the int8 adapter targets the
-    torchao>=0.17 version-2 ``Int8Tensor`` workflow, so probe whether the
+    torchao>=0.18 version-2 ``Int8Tensor`` workflow, so probe whether the
     installed torchao produces a weight this package's registry supports
     and skip (don't fail) when it predates it.
     """
