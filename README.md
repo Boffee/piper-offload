@@ -10,6 +10,21 @@ dependency beyond `torch`. Optional integrations support `bitsandbytes`,
 
 Requires Python 3.14 or newer and PyTorch 2.13.
 
+## Installation
+
+Install the base package from PyPI:
+
+```bash
+pip install piper-offload
+```
+
+Optional integrations are available individually through the `bnb`, `torchao`,
+`gguf`, `quanto`, and `convrot` extras, or together through `all`:
+
+```bash
+pip install "piper-offload[all]"
+```
+
 ## What's in here
 
 | Module | Role |

@@ -1,4 +1,4 @@
-"""CPU-only tests for DTensor LoRA shard localization."""
+"""Tests for DTensor LoRA shard localization."""
 
 from pathlib import Path
 
@@ -14,6 +14,8 @@ import piper_offload.lora as lora_module
 from piper_offload import LoRATransform, ScaledLoRAFactor
 from piper_offload.dtensor_adapter import DTensorAdapter, _local_shape_and_offsets
 from piper_offload.tensor_adapters import RegularAdapter
+
+CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
@@ -312,6 +314,7 @@ def test_mesh_metadata_lengths_must_match() -> None:
         )
 
 
+@CUDA
 def test_two_rank_row_column_and_empty_shard_merge(tmp_path: Path) -> None:
     init_file = tmp_path / "dtensor-lora-init"
     mp.spawn(

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Model-agnostic GPU/CPU memory management for PyTorch — pinned-host offloading, block streaming, and LRU model caching."
 readme = "README.md"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.14"
 keywords = ["inference", "offloading", "pytorch", "quantization", "streaming"]
 classifiers = [
@@ -22,6 +22,7 @@ dependencies = [
 Homepage = "https://github.com/Boffee/piper-offload"
 Repository = "https://github.com/Boffee/piper-offload.git"
 Issues = "https://github.com/Boffee/piper-offload/issues"
+Changelog = "https://github.com/Boffee/piper-offload/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 bnb = ["bitsandbytes>=0.49,<0.51"]
