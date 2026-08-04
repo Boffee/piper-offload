@@ -905,7 +905,7 @@ wheels = [
 ]
 
 [[package]]
-name = "torch-offload"
+name = "piper-offload"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -949,7 +949,7 @@ dev = [
     { name = "pyright" },
     { name = "pytest" },
     { name = "ruff" },
-    { name = "torch-offload", extra = ["all"] },
+    { name = "piper-offload", extra = ["all"] },
 ]
 
 [package.metadata]
@@ -981,7 +981,7 @@ dev = [
     { name = "pyright", specifier = ">=1.1.411" },
     { name = "pytest", specifier = "~=9.1" },
     { name = "ruff", specifier = ">=0.16.1" },
-    { name = "torch-offload", extras = ["all"] },
+    { name = "piper-offload", extras = ["all"] },
 ]
 
 [[package]]

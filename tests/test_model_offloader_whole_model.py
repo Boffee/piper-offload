@@ -1,4 +1,4 @@
-"""Tests for ``torch_offload.model_offloader.ModelOffloader``."""
+"""Tests for ``piper_offload.model_offloader.ModelOffloader``."""
 
 from typing import Any, cast
 
@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import (
+from piper_offload import (
     ModelOffloader,
     PinnedComponent,
     PinnedComponentStore,

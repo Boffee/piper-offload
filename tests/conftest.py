@@ -1,6 +1,6 @@
 """Shared test configuration.
 
-torch-offload is a GPU offloading library — pinned host memory and device
+Piper Offload is a GPU offloading library — pinned host memory and device
 transfers are CUDA features — so most of the suite genuinely needs a GPU.
 The CPU-runnable subset (registry/dispatch, specs, caching, dequant math,
 layout signatures) is what a CPU-only gate (and CI runner) can cover.
@@ -20,7 +20,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import ModelOffloader
+from piper_offload import ModelOffloader
 
 
 def pytest_configure(config: pytest.Config) -> None:

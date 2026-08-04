@@ -1,4 +1,4 @@
-"""Tests for the block-streaming machinery in ``torch_offload``.
+"""Tests for the block-streaming machinery in ``piper_offload``.
 
 Covers ``ModelOffloader`` (the public composite),
 and ``StreamedComponent`` (the per-block-list primitive).
@@ -15,7 +15,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 
-from torch_offload import (
+from piper_offload import (
     ModelOffloader,
     PinnedComponent,
     ResourceBinding,
@@ -24,7 +24,7 @@ from torch_offload import (
     StreamedComponent,
     StreamedComponentStore,
 )
-from torch_offload.composite_component import CompositeComponent
+from piper_offload.composite_component import CompositeComponent
 
 from tests.conftest import activated_model, pinned_component, streamed_components
 
@@ -980,7 +980,7 @@ class TestValidation:
 
 class TestResourceCacheIntegration:
     def test_model_spec_reuses_single_model(self) -> None:
-        from torch_offload import ModelCache, ModelSpec
+        from piper_offload import ModelCache, ModelSpec
 
         device = torch.device("cpu")
         factory_calls = 0
@@ -1029,7 +1029,7 @@ class TestResourceCacheIntegration:
         cache.clear()
 
     def test_model_spec_leases_the_same_offloader(self) -> None:
-        from torch_offload import ResourceCache, ModelSpec
+        from piper_offload import ResourceCache, ModelSpec
 
         factory_calls = 0
 
@@ -1056,7 +1056,7 @@ class TestResourceCacheIntegration:
         cache.clear()
 
     def test_model_spec_rejects_nested_use(self) -> None:
-        from torch_offload import ModelCache, ModelRuntimeInUseError, ModelSpec
+        from piper_offload import ModelCache, ModelRuntimeInUseError, ModelSpec
 
         cache = ModelCache(max_cache_bytes=10_000_000)
         spec = ModelSpec(
@@ -1076,7 +1076,7 @@ class TestResourceCacheIntegration:
         cache.clear()
 
     def test_model_cache_deactivates_after_body_error(self) -> None:
-        from torch_offload import ModelCache, ModelSpec
+        from piper_offload import ModelCache, ModelSpec
 
         cache = ModelCache(max_cache_bytes=10_000_000)
         spec = ModelSpec(
@@ -1099,7 +1099,7 @@ class TestResourceCacheIntegration:
         cache.clear()
 
     def test_model_cache_is_a_resource_cache(self) -> None:
-        from torch_offload import ModelCache, ResourceCache
+        from piper_offload import ModelCache, ResourceCache
 
         cache = ModelCache(max_cache_bytes=10_000_000)
 
@@ -1107,7 +1107,7 @@ class TestResourceCacheIntegration:
         assert cache.max_cache_bytes == 10_000_000
 
     def test_model_spec_trainable_reuses_primary_model(self) -> None:
-        from torch_offload import ModelCache, ModelSpec
+        from piper_offload import ModelCache, ModelSpec
 
         device = torch.device("cpu")
         factory_calls = 0
@@ -1135,7 +1135,7 @@ class TestResourceCacheIntegration:
         cache.clear()
 
     def test_model_spec_trainable_rejects_nested_binding(self) -> None:
-        from torch_offload import ModelCache, ModelRuntimeInUseError, ModelSpec
+        from piper_offload import ModelCache, ModelRuntimeInUseError, ModelSpec
 
         cache = ModelCache(max_cache_bytes=10_000_000)
         spec = ModelSpec(

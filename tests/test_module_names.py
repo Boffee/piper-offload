@@ -3,11 +3,11 @@
 import torch
 from torch import nn
 
-from torch_offload.module_names import (
+from piper_offload.module_names import (
     named_buffer_entries,
     named_parameter_entries,
 )
-from torch_offload.tensor_adapter_registry import (
+from piper_offload.tensor_adapter_registry import (
     buffer_tensor_id,
     param_tensor_id,
 )

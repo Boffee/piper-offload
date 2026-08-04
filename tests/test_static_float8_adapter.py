@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import (
+from piper_offload import (
     BlockCompileConfig,
     LoRA,
     LoRATransform,
@@ -13,11 +13,11 @@ from torch_offload import (
     StreamConfig,
     merge_lora,
 )
-from torch_offload.float8_adapter import Float8Adapter
-from torch_offload.pinned_param import PinnedParam
-from torch_offload.static_float8_adapter import StaticFloat8Adapter
-from torch_offload.streamed_component import _param_target_layout
-from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
+from piper_offload.float8_adapter import Float8Adapter
+from piper_offload.pinned_param import PinnedParam
+from piper_offload.static_float8_adapter import StaticFloat8Adapter
+from piper_offload.streamed_component import _param_target_layout
+from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from tests.conftest import activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -461,7 +461,7 @@ class TestStaticFloat8Adapter:
         expected = StaticFloat8Adapter.requantize(expected_dense, like=f8)
 
         monkeypatch.setattr(
-            "torch_offload.static_float8_adapter._triton_merge_static_float8_lora",
+            "piper_offload.static_float8_adapter._triton_merge_static_float8_lora",
             None,
         )
         transform.apply(param)

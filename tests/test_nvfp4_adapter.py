@@ -5,8 +5,8 @@ import pytest
 import torch
 from torch import nn
 
-import torch_offload.nvfp4_adapter as nvfp4_adapter_module
-from torch_offload import (
+import piper_offload.nvfp4_adapter as nvfp4_adapter_module
+from piper_offload import (
     LoRA,
     LoRATransform,
     ModelOffloader,
@@ -14,10 +14,10 @@ from torch_offload import (
     StreamConfig,
     merge_lora,
 )
-from torch_offload.nvfp4_adapter import Nvfp4Adapter
-from torch_offload.pinned_param import PinnedParam
-from torch_offload.tensor_adapter_registry import tensor_id
-from torch_offload.streamed_component import _param_target_layout
+from piper_offload.nvfp4_adapter import Nvfp4Adapter
+from piper_offload.pinned_param import PinnedParam
+from piper_offload.tensor_adapter_registry import tensor_id
+from piper_offload.streamed_component import _param_target_layout
 from tests.conftest import activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -268,7 +268,7 @@ class TestNvfp4Adapter:
         # itself so a future per-expert layout fails loudly instead of
         # collapsing every expert to one global scale. Build it through the
         # raw wrapper to exercise the guard.
-        from torch_offload._torchao_nvfp4 import create_nvfp4_tensor
+        from piper_offload._torchao_nvfp4 import create_nvfp4_tensor
 
         nvfp4_cls, _ = _nvfp4_modules()
         mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")

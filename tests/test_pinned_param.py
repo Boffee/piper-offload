@@ -1,17 +1,17 @@
-"""Tests for ``torch_offload.pinned_param.PinnedParam``."""
+"""Tests for ``piper_offload.pinned_param.PinnedParam``."""
 
 import pytest
 import torch
 from torch import nn
 
-from torch_offload.pinned_buffer import PinnedBuffer
-from torch_offload.pinned_param import PinnedParam
-from torch_offload.tensor_adapters import (
+from piper_offload.pinned_buffer import PinnedBuffer
+from piper_offload.pinned_param import PinnedParam
+from piper_offload.tensor_adapters import (
     DequantRequantTensorAdapter,
     LoRAMergeTensorAdapter,
     TensorCopyIntoAdapter,
 )
-from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
+from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -372,7 +372,7 @@ class TestCopyToCpu:
         # implemented. Surface it as NotImplementedError, not a silent
         # corruption of the pinned packed bytes.
         gguf = pytest.importorskip("gguf")
-        from torch_offload.gguf_adapter import GGUFWeight
+        from piper_offload.gguf_adapter import GGUFWeight
 
         # Build minimal GGUF state directly via the adapter — avoids
         # needing a real .gguf file to load. Q4_0 has the simplest

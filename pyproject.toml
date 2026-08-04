@@ -1,14 +1,27 @@
 [project]
-name = "torch-offload"
+name = "piper-offload"
 version = "0.1.0"
 description = "Model-agnostic GPU/CPU memory management for PyTorch — pinned-host offloading, block streaming, and LRU model caching."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.14"
+keywords = ["inference", "offloading", "pytorch", "quantization", "streaming"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "torch>=2.13,<2.14",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Boffee/piper-offload"
+Repository = "https://github.com/Boffee/piper-offload.git"
+Issues = "https://github.com/Boffee/piper-offload/issues"
 
 [project.optional-dependencies]
 bnb = ["bitsandbytes>=0.49,<0.51"]
@@ -40,7 +53,7 @@ dev = [
     "ruff>=0.16.1",
     # Every adapter backend, so `uv sync` yields a complete test environment
     # (otherwise optional adapter suites silently skip).
-    "torch-offload[all]",
+    "piper-offload[all]",
 ]
 
 [tool.ruff]
@@ -48,7 +61,7 @@ target-version = "py314"
 line-length = 120
 
 [tool.pyright]
-include = ["src/torch_offload"]
+include = ["src/piper_offload"]
 exclude = ["tests"]
 pythonVersion = "3.14"
 typeCheckingMode = "standard"
@@ -84,7 +97,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"src/torch_offload/_triton_*_lora.py" = [
+"src/piper_offload/_triton_*_lora.py" = [
     # Triton JIT kernels expose positional pointer and constexpr parameters.
     "PLR0917",
 ]
@@ -114,4 +127,4 @@ ignore = [
 max-args = 10
 
 [tool.ruff.lint.isort]
-known-first-party = ["torch_offload"]
+known-first-party = ["piper_offload"]

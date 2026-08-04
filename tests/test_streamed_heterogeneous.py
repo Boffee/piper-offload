@@ -14,7 +14,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import ModelOffloader, StreamConfig
+from piper_offload import ModelOffloader, StreamConfig
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -174,7 +174,7 @@ def _int8_quantizer():
     except ImportError as exc:  # pragma: no cover - torchao API drift
         pytest.skip(f"torchao int8 API unavailable: {exc}")
 
-    from torch_offload.tensor_adapter_registry import select_adapter
+    from piper_offload.tensor_adapter_registry import select_adapter
 
     try:
         cfg = Int8WeightOnlyConfig(version=2)
@@ -190,7 +190,7 @@ def _int8_quantizer():
         select_adapter(probe.weight.data)
     except NotImplementedError:  # pragma: no cover - torchao format drift
         pytest.skip(
-            "installed torchao int8 weight type has no torch-offload adapter"
+            "installed torchao int8 weight type has no piper-offload adapter"
         )
     return quantize
 

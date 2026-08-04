@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload.gguf_adapter import GGUFWeight, GgufAdapter
+from piper_offload.gguf_adapter import GGUFWeight, GgufAdapter
 
 QUANT_TYPE = 2  # arbitrary, just needs to round-trip
 
