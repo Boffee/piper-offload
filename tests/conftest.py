@@ -6,11 +6,10 @@ The CPU-runnable subset (registry/dispatch, specs, caching, dequant math,
 layout signatures) is what a CPU-only gate (and CI runner) can cover.
 
 To make ``pytest`` green on a CPU-only machine without hand-marking every
-GPU test, a test that reaches a CUDA op when no GPU is present raises
-``RuntimeError("... CUDA ...")``; treat that as "needs a GPU" and report it
-as skipped rather than failed. On a GPU box nothing is intercepted and the
-full suite runs. Tests that intend to assert a CUDA error catch it
-themselves, so they are unaffected.
+GPU test, treat PyTorch's CUDA-unavailable and missing-NVIDIA-driver runtime
+errors as "needs a GPU" and report them as skipped rather than failed. On a
+GPU box nothing is intercepted and the full suite runs. Tests that intend to
+assert a CUDA error catch it themselves, so they are unaffected.
 """
 
 import contextlib
@@ -21,6 +20,8 @@ import torch
 from torch import nn
 
 from piper_offload import ModelOffloader
+
+_CUDA_UNAVAILABLE_ERROR_FRAGMENTS = ("CUDA", "NVIDIA driver")
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -33,7 +34,9 @@ def pytest_runtest_call(item: pytest.Item) -> Generator[None]:
     if torch.cuda.is_available() or outcome.excinfo is None:
         return
     exc = outcome.excinfo[1]
-    if isinstance(exc, RuntimeError) and "CUDA" in str(exc):
+    if isinstance(exc, RuntimeError) and any(
+        fragment in str(exc) for fragment in _CUDA_UNAVAILABLE_ERROR_FRAGMENTS
+    ):
         outcome.force_exception(
             pytest.skip.Exception(f"needs a CUDA GPU: {exc}", _use_item_location=True)
         )
