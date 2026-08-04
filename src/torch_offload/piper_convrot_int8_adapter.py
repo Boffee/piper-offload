@@ -1,14 +1,17 @@
 """Piper ``ConvRotInt8Tensor`` offload adapter.
 
 ``piper-kernels`` owns ConvRot's tensor semantics and execution backends.
-torch-offload owns only the movement integration: pin the public ``qdata`` and
-``scale`` storage tensors, move those bytes, and reconstruct the wrapper with
-its ``group_size`` and logical ``dtype`` metadata.
+torch-offload owns the movement and merge integration: pin the public ``qdata``
+and ``scale`` storage tensors, move those bytes, reconstruct the wrapper with
+its ``group_size`` and logical ``dtype`` metadata, and delegate staged LoRA
+updates to the public in-place ``ConvRotInt8Tensor.addmm_`` operation.
 
-The adapter intentionally exposes frozen-inference movement only. It does not
-advertise CPU round-trip, trainable ``Parameter.data`` swap, requantization,
-copy, or staged LoRA merge capabilities. Routed LoRA remains available when
-the owning module is a compatible logical ``nn.Linear``.
+The adapter remains frozen-only: it does not advertise CPU round-trip or
+trainable ``Parameter.data`` swap. Permanent and activation-time LoRA merge
+preserve the existing target wrapper and storage identities. Piper selects its
+optimized Triton backend on supported CUDA devices and its portable reference
+backend elsewhere. Routed LoRA remains available when the base must remain
+untouched.
 """
 
 from __future__ import annotations
@@ -88,3 +91,12 @@ class PiperConvRotInt8Adapter(
     @staticmethod
     def _compute_dtype(t: Any) -> torch.dtype:  # noqa: ANN401
         return t.dtype
+
+    @staticmethod
+    def merge_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        require_convrot_int8_tensor(target).addmm_(b, a, alpha=strength)

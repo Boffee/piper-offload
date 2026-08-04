@@ -59,7 +59,7 @@ torch = [
 torchao = [
     { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
-piper-kernels = { git = "https://github.com/Boffee/piper-kernels.git", rev = "2ea581d25e09c563c861602580702130cec78409" }
+piper-kernels = { git = "https://github.com/Boffee/piper-kernels.git", rev = "2f6b1b6f6def99e3bd89fe45341a46715d2ffdc8" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

@@ -1,9 +1,9 @@
 """Internal optional-import boundary for Piper ConvRot INT8 support.
 
 ``piper-kernels`` owns the :class:`ConvRotInt8Tensor` representation and its
-linear execution backends.  torch-offload only needs the public wrapper
-constructor and its two storage tensors so it can preserve the representation
-while moving weights between pinned CPU and CUDA storage.
+linear and in-place ``addmm_`` execution backends. torch-offload uses the
+public wrapper constructor and storage fields to preserve the representation
+during movement; its adapter delegates LoRA merges to the public ``addmm_``.
 
 The dependency remains optional: importing :mod:`torch_offload` succeeds when
 ``piper-kernels`` (or its ``convrot`` extra) is absent.

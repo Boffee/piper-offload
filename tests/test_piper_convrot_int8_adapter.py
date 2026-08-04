@@ -10,7 +10,14 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import ModelOffloader
+from torch_offload import (
+    LoRA,
+    LoRATransform,
+    ModelOffloader,
+    ScaledLoRAFactor,
+    StreamConfig,
+    merge_lora,
+)
 from torch_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from torch_offload.dtensor_adapter import DTensorAdapter
 from torch_offload.pinned_module import PinnedModuleStore
@@ -213,13 +220,70 @@ class TestPiperConvRotInt8Adapter:
 
         assert isinstance(select_adapter(convrot), DTensorAdapter)
 
-    def test_does_not_advertise_out_of_scope_capabilities(self) -> None:
+    def test_lora_transform_uses_piper_addmm_in_place(self) -> None:
+        convrot_cls = _convrot_cls()
+        rows, cols, rank = 8, 64, 4
+        convrot = convrot_cls.from_hp(
+            torch.randn(rows, cols, dtype=torch.bfloat16),
+            group_size=64,
+        )
+        param = nn.Parameter(convrot, requires_grad=False)
+        a = torch.randn(rank, cols)
+        b = torch.randn(rows, rank)
+        transform = LoRATransform(
+            [ScaledLoRAFactor.from_tensors(a, b, 0.5)]
+        )
+        original_param = param
+        qdata_ptr = param.data.qdata.data_ptr()
+        scale_ptr = param.data.scale.data_ptr()
+
+        expected = convrot.clone()
+        expected.addmm_(
+            b.to(expected.dtype),
+            a.to(expected.dtype),
+            alpha=0.5,
+        )
+
+        transform.apply(param)
+
+        assert param is original_param
+        assert param.data.qdata.data_ptr() == qdata_ptr
+        assert param.data.scale.data_ptr() == scale_ptr
+        assert torch.equal(param.data.qdata, expected.qdata)
+        assert torch.equal(param.data.scale, expected.scale)
+
+    def test_merge_lora_merges_convrot_weight(self) -> None:
+        convrot_cls = _convrot_cls()
+        model = nn.Module()
+        model.lin = nn.Linear(64, 8, bias=False, dtype=torch.bfloat16)
+        model.lin.weight = nn.Parameter(
+            convrot_cls.from_hp(
+                torch.zeros(8, 64, dtype=torch.bfloat16),
+                group_size=64,
+            ),
+            requires_grad=False,
+        )
+        original_qdata = model.lin.weight.data.qdata.clone()
+        lora = LoRA.from_state_dict(
+            state_dict={
+                "lin.lora_A.weight": torch.ones(4, 64),
+                "lin.lora_B.weight": torch.ones(8, 4),
+            }
+        )
+
+        merged = merge_lora(model, [(lora, 1.0)])
+
+        assert merged == 1
+        assert isinstance(model.lin.weight.data, convrot_cls)
+        assert not torch.equal(model.lin.weight.data.qdata, original_qdata)
+
+    def test_advertises_merge_but_not_training_capabilities(self) -> None:
         adapter = PiperConvRotInt8Adapter()
 
         assert not isinstance(adapter, CpuRoundTripTensorAdapter)
         assert not isinstance(adapter, DequantRequantTensorAdapter)
         assert not isinstance(adapter, TensorCopyIntoAdapter)
-        assert not isinstance(adapter, LoRAMergeTensorAdapter)
+        assert isinstance(adapter, LoRAMergeTensorAdapter)
         assert not isinstance(adapter, ParameterDataSwapTensorAdapter)
 
         pinned_param = PinnedParam(
@@ -272,5 +336,99 @@ class TestPiperConvRotInt8Adapter:
                 assert active.weight.data.qdata.is_cuda
                 torch.cuda.synchronize()
             torch.testing.assert_close(actual, expected)
+        finally:
+            offloader.deactivate()
+
+    @CUDA
+    def test_streamed_merge_requantizes_on_activate(self) -> None:
+        convrot_cls = _convrot_cls()
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocks = nn.ModuleList(
+                    [
+                        nn.Linear(
+                            64,
+                            64,
+                            bias=False,
+                            dtype=torch.bfloat16,
+                        ),
+                        nn.Linear(
+                            64,
+                            64,
+                            bias=False,
+                            dtype=torch.bfloat16,
+                        ),
+                    ]
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.blocks:
+                    x = block(x)
+                return x
+
+        model = M()
+        for block in model.blocks:
+            block.weight = nn.Parameter(
+                convrot_cls.from_hp(
+                    torch.randn(64, 64, dtype=torch.bfloat16),
+                    group_size=64,
+                ),
+                requires_grad=False,
+            )
+        convrot = model.blocks[0].weight.data
+        rank = 4
+        a = torch.randn(rank, 64)
+        b = torch.randn(64, rank)
+        lora = LoRA.from_state_dict(
+            state_dict={
+                "blocks.0.lora_A.weight": a,
+                "blocks.0.lora_B.weight": b,
+            }
+        )
+
+        convrot_cuda = convrot_cls(
+            convrot.qdata.cuda(),
+            convrot.scale.cuda(),
+            convrot.group_size,
+            convrot.dtype,
+        )
+        expected = convrot_cuda.clone()
+        expected.addmm_(
+            b.cuda().to(expected.dtype),
+            a.cuda().to(expected.dtype),
+            alpha=0.5,
+        )
+
+        offloader = ModelOffloader.from_module(
+            model,
+            blocks_attr=["blocks"],
+        )
+        try:
+            inputs = torch.randn(
+                4,
+                64,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            with activated_model(
+                offloader,
+                "cuda",
+                loras=[lora],
+                lora_strengths=[0.5],
+                lora_mode="merge",
+                stream_config=StreamConfig(
+                    num_resident_blocks=1,
+                    num_prefetch_blocks=0,
+                ),
+            ) as active:
+                merged = active.blocks[0].weight.data
+                assert isinstance(merged, convrot_cls)
+                assert torch.equal(merged.qdata, expected.qdata)
+                assert torch.equal(merged.scale, expected.scale)
+                output = active(inputs)
+                torch.cuda.synchronize()
+            assert output.shape == (4, 64)
         finally:
             offloader.deactivate()

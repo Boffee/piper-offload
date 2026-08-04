@@ -798,7 +798,7 @@ dtype, no merge capability required.
 | TorchAO NVFP4 | ✓ | blockwise Triton merge on CUDA; dequant / requant fallback † |
 | GGUF (k-quants) | ✓ | — routed only |
 | TorchAO INT4 tile-packed | ✓ | — routed only |
-| Piper ConvRot INT8 | ✓ | — routed only |
+| Piper ConvRot INT8 | ✓ | Piper in-place `addmm_` (Triton on supported CUDA) |
 | DTensor (tensor-parallel shard) | ✓ | shard-local delegation to the inner adapter ‡ |
 
 Notes:
@@ -832,8 +832,8 @@ Notes:
 - **CPU round-trip** (D2H, for context-free CPU optimizer steps) and
   **trainable `Parameter.data` swap** are separate capabilities: plain
   tensors have both; quanto and both scaled-FP8 representations add CPU
-  round-trip; ConvRot and the other quantized formats are movement + (where
-  shown) merge only. See the per-format sections below.
+  round-trip; the other quantized formats are movement + (where shown) merge
+  only. See the per-format sections below.
 
 ## Quanto support
 
@@ -870,10 +870,13 @@ only the built-in `PiperConvRotInt8Adapter`. `PinnedParam` pins the INT8 `qdata`
 float32 per-output `scale`, preserves `group_size` and the logical floating
 `dtype`, and reconstructs the same wrapper around CUDA storage on activation.
 
-The adapter is frozen-inference and movement-only. It does not expose CPU
-round-trip, trainable `Parameter.data` swap, dequantize/requantize conversion,
-or merge-mode LoRA. Use routed LoRA for compatible logical `nn.Linear`
-modules. The base package remains importable without `piper-kernels`; use
+The adapter remains frozen-only: it does not expose CPU round-trip or
+trainable `Parameter.data` swap. Merge-mode LoRA delegates the staged low-rank
+update to Piper's public in-place `ConvRotInt8Tensor.addmm_`, preserving the
+wrapper and its storage identities. Piper uses its optimized Triton backend on
+supported CUDA devices and its portable reference backend elsewhere. Use
+routed LoRA when the base must remain untouched. The base package remains
+importable without `piper-kernels`; use
 `uv sync --extra convrot --group dev` and then
 `pytest tests/test_piper_convrot_int8_adapter.py -q -rs` to exercise the
 optional suite.
