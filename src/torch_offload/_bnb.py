@@ -29,8 +29,6 @@ Pinned to bitsandbytes' internal layout (validated against 0.49.x). Not
 part of the public API.
 """
 
-from __future__ import annotations
-
 from typing import Any
 
 import torch

@@ -5,8 +5,6 @@
 # ruff: noqa: ANN001, ANN202, N803, PLR0913
 # pyright: reportCallIssue=false, reportGeneralTypeIssues=false
 
-from __future__ import annotations
-
 import torch
 import triton
 import triton.language as tl

@@ -40,15 +40,13 @@ Design highlights
 Instance-owned (not global) so it's library-friendly and embeddable.
 """
 
-from __future__ import annotations
-
 import contextlib
 import logging
 import threading
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, Protocol, cast
 
 import torch
 
@@ -59,9 +57,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Public dataclasses and policy interfaces
 # ---------------------------------------------------------------------------
-
-
-T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,7 +358,7 @@ class ResourceCache:
             del self._entries[key]
 
     @contextlib.contextmanager
-    def lease(
+    def lease[T](
         self,
         resource: str | ResourceSpec[T],
     ) -> Iterator[T]:

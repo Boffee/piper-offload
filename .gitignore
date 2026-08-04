@@ -5,8 +5,6 @@ dist/
 wheels/
 *.egg-info
 .venv
-.python-version
 .idea/
 .vscode/
-uv.lock
 .DS_Store

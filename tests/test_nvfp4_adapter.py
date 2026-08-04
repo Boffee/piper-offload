@@ -1,7 +1,5 @@
 """Tests for TorchAO NVFP4 adapter integration."""
 
-from __future__ import annotations
-
 
 import pytest
 import torch

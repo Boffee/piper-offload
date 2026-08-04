@@ -1,7 +1,5 @@
 """Tests for the bitsandbytes 8-bit (``Int8Params`` / LLM.int8) adapter."""
 
-from __future__ import annotations
-
 from typing import Any
 
 import pytest

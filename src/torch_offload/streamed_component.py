@@ -44,8 +44,6 @@ when you need bespoke composition (e.g., multiple block lists like Flux's
 ``transformer_blocks`` + ``single_transformer_blocks``).
 """
 
-from __future__ import annotations
-
 import contextlib
 import functools
 import logging
@@ -54,7 +52,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import cast
+from typing import Self, cast
 
 import torch
 from torch import nn
@@ -73,7 +71,7 @@ from .stream_config import DEFAULT_STREAM_CONFIG, StreamConfig
 
 logger = logging.getLogger(__name__)
 
-_LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
+type _LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
 
 
 def _stream_config_from_kwargs(kwargs: dict[str, object]) -> StreamConfig:
@@ -117,7 +115,7 @@ def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-BlockSignature = tuple[object, ...]
+type BlockSignature = tuple[object, ...]
 
 
 def _instance_target_signature(instance: PinnedModuleInstance) -> BlockSignature:
@@ -580,7 +578,7 @@ class StreamedComponentStore:
         *,
         blocks_path: str,
         stream_trainable_weights: bool = False,
-    ) -> StreamedComponentStore:
+    ) -> Self:
         """Resolve ``blocks_path`` on ``model`` and pin its streamed blocks.
 
         Structurally-empty positions (no parameters or buffers) are skipped and

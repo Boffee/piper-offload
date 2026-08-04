@@ -7,8 +7,6 @@ and ``cache_bytes`` over-accounting — can't be reproduced here), so those are
 covered by reasoning: the adapter keys identity/bytes off the *local* shard.
 """
 
-from __future__ import annotations
-
 import os
 from typing import Any
 

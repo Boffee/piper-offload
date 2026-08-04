@@ -12,8 +12,6 @@ wrapper carrying a local shard plus a ``DeviceMesh`` and per-dim placements
 "never matches" rather than importing at package load.
 """
 
-from __future__ import annotations
-
 from typing import Any
 
 import torch

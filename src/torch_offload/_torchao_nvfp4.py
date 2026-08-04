@@ -9,8 +9,6 @@ the adapter only preserves, moves, and (for LoRA merge) re-encodes those
 already-quantized tensors.
 """
 
-from __future__ import annotations
-
 from typing import Any
 
 import torch

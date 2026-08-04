@@ -38,8 +38,6 @@ Selected by :mod:`tensor_adapter_registry`. Importing fails silently if
 bitsandbytes is not installed — 4-bit support is optional.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 

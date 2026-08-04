@@ -17,8 +17,6 @@ mutated, and non-static/non-scalar PrototypeFloat8Tensor paths retain their
 original TorchAO handlers.
 """
 
-from __future__ import annotations
-
 from collections.abc import Callable
 from typing import Any
 
@@ -57,7 +55,7 @@ except ImportError:
 
 
 _LINEAR_PATCH_ERROR: str | None = None
-_LinearHandler = Callable[
+type _LinearHandler = Callable[
     [object, tuple[type, ...], tuple[object, ...], dict[str, object]],
     torch.Tensor,
 ]

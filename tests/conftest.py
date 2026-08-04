@@ -13,20 +13,14 @@ full suite runs. Tests that intend to assert a CUDA error catch it
 themselves, so they are unaffected.
 """
 
-from __future__ import annotations
-
 import contextlib
-from typing import TYPE_CHECKING
+from collections.abc import Generator, Iterator
 
 import pytest
 import torch
+from torch import nn
 
-if TYPE_CHECKING:
-    from collections.abc import Generator, Iterator
-
-    from torch import nn
-
-    from torch_offload import ModelOffloader
+from torch_offload import ModelOffloader
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -34,7 +28,7 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 @pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_call(item: pytest.Item) -> Generator[None, None, None]:
+def pytest_runtest_call(item: pytest.Item) -> Generator[None]:
     outcome = yield
     if torch.cuda.is_available() or outcome.excinfo is None:
         return

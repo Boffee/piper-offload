@@ -1,7 +1,5 @@
 """Minimal whole-model CPU->MPS materializer."""
 
-from __future__ import annotations
-
 import contextlib
 from collections.abc import Iterator
 

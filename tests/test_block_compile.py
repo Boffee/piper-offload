@@ -1,7 +1,5 @@
 """Opt-in ``torch.compile`` integration for streamed blocks."""
 
-from __future__ import annotations
-
 from collections.abc import Callable
 
 import pytest

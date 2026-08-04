@@ -11,8 +11,6 @@ Vendored code — lint rules relaxed intentionally.
 """
 # ruff: noqa: N802, ARG001, E501, RUF005
 
-from __future__ import annotations
-
 from collections.abc import Callable
 
 import gguf

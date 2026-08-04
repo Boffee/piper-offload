@@ -27,11 +27,9 @@ nothing stay frozen-inference, while a subclass that defines the extra methods
 advertises exactly those capabilities.
 """
 
-from __future__ import annotations
-
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, ClassVar, Generic, TypeVar
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -43,8 +41,6 @@ from .tensor_adapters import (
     tensor_layout,
 )
 
-MetaT = TypeVar("MetaT")
-
 __all__ = [
     "TorchaoGpu",
     "TorchaoPinned",
@@ -54,7 +50,7 @@ __all__ = [
 
 
 @dataclass(slots=True, frozen=True)
-class TorchaoPinned(Generic[MetaT]):
+class TorchaoPinned[MetaT]:
     """Pinned-CPU state for a TorchAO structured tensor.
 
     ``storage`` holds the inner storage tensors positionally, parallel to
@@ -118,7 +114,7 @@ def copy_storage_into(
         d.copy_(s, non_blocking=non_blocking)
 
 
-class TorchaoStructuredAdapter(ABC, Generic[MetaT]):
+class TorchaoStructuredAdapter[MetaT](ABC):
     """Base adapter for TorchAO structured (subclass-wrapped) weights.
 
     Implements the full

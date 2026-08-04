@@ -2,10 +2,8 @@
 
 # Triton JIT kernel signatures intentionally use untyped pointer parameters
 # and upper-case constexpr names.
-# ruff: noqa: ANN001, ANN202, N803, PLR0912, PLR0913
+# ruff: noqa: ANN001, ANN202, N803, PLR0912, PLR0913, PLR0915
 # pyright: reportCallIssue=false
-
-from __future__ import annotations
 
 import torch
 import triton
@@ -125,6 +123,8 @@ def _choose_qparams_kernel(
     CHUNKS_PER_BLOCK: tl.constexpr,
     ASYMMETRIC: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
+    QUANT_MIN: tl.constexpr,
+    QUANT_MAX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     qparam_id = tl.program_id(axis=0)
@@ -153,9 +153,9 @@ def _choose_qparams_kernel(
             value_range = value_range.to(tl.float16).to(tl.float32)
         elif COMPUTE_DTYPE == 1:
             value_range = value_range.to(tl.bfloat16).to(tl.float32)
-        scale = value_range / 255.0
+        scale = value_range / (QUANT_MAX - QUANT_MIN)
     else:
-        scale = tl.maximum(-min_value, max_value) / 127.5
+        scale = tl.maximum(-min_value, max_value) / ((QUANT_MAX - QUANT_MIN) / 2.0)
 
     if COMPUTE_DTYPE == 0:
         scale = scale.to(tl.float16).to(tl.float32)
@@ -174,8 +174,8 @@ def _choose_qparams_kernel(
             ratio = ratio.to(tl.float16).to(tl.float32)
         elif COMPUTE_DTYPE == 1:
             ratio = ratio.to(tl.bfloat16).to(tl.float32)
-        zero_point = -128 - libdevice.llrint(ratio)
-        zero_point = tl.minimum(tl.maximum(zero_point, -128), 127)
+        zero_point = QUANT_MIN - libdevice.llrint(ratio)
+        zero_point = tl.minimum(tl.maximum(zero_point, QUANT_MIN), QUANT_MAX)
 
     tl.store(output_scale_ptr + qparam_id, scale)
     tl.store(output_zero_point_ptr + qparam_id, zero_point)
@@ -189,7 +189,9 @@ def _quantize_kernel(
     output_ptr,
     NUMEL,
     BLOCK_NUMEL: tl.constexpr,
-    COMPUTE_DTYPE: tl.constexpr,
+    QPARAM_DTYPE: tl.constexpr,
+    QUANT_MIN: tl.constexpr,
+    QUANT_MAX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     offsets = tl.program_id(axis=0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -198,14 +200,14 @@ def _quantize_kernel(
     values = tl.load(dense_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     scale = tl.load(scale_ptr + qparam_offsets, mask=mask, other=1.0).to(tl.float32)
     inverse_scale = 1.0 / scale
-    if COMPUTE_DTYPE == 0:
+    if QPARAM_DTYPE == 0:
         inverse_scale = inverse_scale.to(tl.float16).to(tl.float32)
-    elif COMPUTE_DTYPE == 1:
+    elif QPARAM_DTYPE == 1:
         inverse_scale = inverse_scale.to(tl.bfloat16).to(tl.float32)
     scaled = values * inverse_scale
-    if COMPUTE_DTYPE == 0:
+    if QPARAM_DTYPE == 0:
         scaled = scaled.to(tl.float16).to(tl.float32)
-    elif COMPUTE_DTYPE == 1:
+    elif QPARAM_DTYPE == 1:
         scaled = scaled.to(tl.bfloat16).to(tl.float32)
     quantized = libdevice.llrint(scaled)
     zero_point = tl.load(
@@ -214,18 +216,20 @@ def _quantize_kernel(
         other=0,
     )
     quantized += zero_point
-    quantized = tl.minimum(tl.maximum(quantized, -128), 127)
+    quantized = tl.minimum(tl.maximum(quantized, QUANT_MIN), QUANT_MAX)
     tl.store(output_ptr + offsets, quantized, mask=mask)
 
 
-def _compute_dtype_id(dtype: torch.dtype) -> int:
+def _float_dtype_id(dtype: torch.dtype, *, label: str) -> int:
     if dtype is torch.float16:
         return _COMPUTE_FP16
     if dtype is torch.bfloat16:
         return _COMPUTE_BF16
     if dtype is torch.float32:
         return _COMPUTE_FP32
-    raise ValueError(f"Triton INT8 merge supports float16, bfloat16, and float32 LoRA factors, got {dtype}.")
+    raise ValueError(
+        f"Triton INT8 merge supports float16, bfloat16, and float32 {label}, got {dtype}."
+    )
 
 
 def _block_numel(
@@ -254,6 +258,7 @@ def merge_int8_lora(
     strength: float,
     *,
     asymmetric: bool,
+    reduce_range: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return raw affine-INT8 buffers after one LoRA merge."""
     if qdata.device.type != "cuda":
@@ -262,9 +267,11 @@ def merge_int8_lora(
         raise ValueError(f"Triton INT8 merge requires int8 weight storage, got {qdata.dtype}.")
     if qdata.ndim != 2 or b.ndim != 2 or a.ndim != 2:
         raise ValueError("Triton INT8 merge expects rank-two tensors.")
-    if b.dtype is not a.dtype or scale.dtype is not b.dtype:
-        raise ValueError("Triton INT8 merge requires matching scale and LoRA factor dtypes.")
-    compute_dtype = _compute_dtype_id(b.dtype)
+    if b.dtype is not a.dtype:
+        raise ValueError("Triton INT8 merge requires matching LoRA factor dtypes.")
+    compute_dtype = _float_dtype_id(b.dtype, label="LoRA factors")
+    qparam_dtype = _float_dtype_id(scale.dtype, label="scales")
+    quant_min, quant_max = (-64, 63) if reduce_range else (-128, 127)
     if (
         qdata.device != scale.device
         or qdata.device != b.device
@@ -357,6 +364,8 @@ def merge_int8_lora(
         CHUNKS_PER_BLOCK=chunks_per_block,
         ASYMMETRIC=asymmetric,
         COMPUTE_DTYPE=compute_dtype,
+        QUANT_MIN=quant_min,
+        QUANT_MAX=quant_max,
         BLOCK_SIZE=qparam_reduction_block,
         num_warps=4 if qparam_reduction_block <= 2048 else 8,
     )
@@ -370,7 +379,9 @@ def merge_int8_lora(
         output_qdata,
         NUMEL=qdata.numel(),
         BLOCK_NUMEL=block_numel,
-        COMPUTE_DTYPE=compute_dtype,
+        QPARAM_DTYPE=qparam_dtype,
+        QUANT_MIN=quant_min,
+        QUANT_MAX=quant_max,
         BLOCK_SIZE=quant_block,
         num_warps=8,
     )

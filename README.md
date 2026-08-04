@@ -5,8 +5,11 @@ model and LoRA resources, and swaps independent models in and out of
 GPU memory under a policy-driven cache.
 
 Self-contained, library-friendly: no dependencies beyond `torch` (plus
-optional `optimum.quanto`, `gguf`, and `torchao` for quantized models). Designed
-to be lifted into its own package when a second consumer appears.
+optional `bitsandbytes`, `optimum.quanto`, `gguf`, `piper-kernels`, and
+`torchao` for quantized models). Designed to be lifted into its own package
+when a second consumer appears.
+
+Requires Python 3.14 or newer and PyTorch 2.13.
 
 ## What's in here
 
@@ -22,14 +25,15 @@ to be lifted into its own package when a second consumer appears.
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
 | `lora.py` | `LoRA`, `LoRATransform` — cached pinned factors plus merge and routed application hooks |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights |
-| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, DTensor, and TorchAO dynamic/static scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
+| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, Piper ConvRot INT8, DTensor, and TorchAO dynamic/static scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
-| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `static_float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / torchao / DTensor support |
+| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `piper_convrot_int8_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `static_float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / Piper ConvRot / torchao / DTensor support |
 | `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (scaled-FP8 / INT8 / MX / NVFP4 / INT4 tile-packed) — common pin/move/identity mechanics + per-format hooks; capabilities beyond inference movement (CPU round-trip, dequant/requant conversion, copy, and staged LoRA merge) are opted into per subclass |
 | `dtensor_adapter.py` | Internal: `DTensorAdapter` for tensor-parallel `DTensor` weights — composes with other adapters by delegating local-shard movement and LoRA merge to the registry, then replaying the `(mesh, placements)` wrapper; frozen-inference scope (see `_dtensor.py`) |
 | `tensor_adapter_registry.py` | Public external-adapter registration plus adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
+| `_piper_convrot_int8.py` | Internal: Piper ConvRot INT8 optional-import, public-layout validation, and wrapper reconstruction; consumed by `piper_convrot_int8_adapter.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation and dequant/requant; consumed by `nvfp4_adapter.py` |
 | `_torchao_mx.py` | Internal: TorchAO MX (MXFP8 / MXFP4) optional-import + layout validation, supported-dtype gate, and dequant/requant; consumed by `mx_adapter.py` |
 | `_torchao_float8.py`, `_torchao_static_float8.py` | Internal: TorchAO dynamic/weight-only `Float8Tensor` and calibrated static `PrototypeFloat8Tensor` optional imports, layout validation, and dequant/requant; consumed by the corresponding FP8 adapters |
@@ -796,6 +800,7 @@ dtype, no merge capability required.
 | TorchAO NVFP4 | ✓ | blockwise Triton merge on CUDA; dequant / requant fallback † |
 | GGUF (k-quants) | ✓ | — routed only |
 | TorchAO INT4 tile-packed | ✓ | — routed only |
+| Piper ConvRot INT8 | ✓ | Piper in-place `addmm_` (Triton on supported CUDA) |
 | DTensor (tensor-parallel shard) | ✓ | shard-local delegation to the inner adapter ‡ |
 
 Notes:
@@ -829,8 +834,8 @@ Notes:
 - **CPU round-trip** (D2H, for context-free CPU optimizer steps) and
   **trainable `Parameter.data` swap** are separate capabilities: plain
   tensors have both; quanto and both scaled-FP8 representations add CPU
-  round-trip; the other quantized formats are movement + (where shown)
-  merge only. See the per-format sections below.
+  round-trip; the other quantized formats are movement + (where shown) merge
+  only. See the per-format sections below.
 
 ## Quanto support
 
@@ -858,6 +863,26 @@ neither attempts native in-place `addmm_` on a `WeightQBytesTensor`. Use
 `lora_mode="routed"` when the base must remain untouched or adapters need
 to switch without reloading it.
 
+## Piper ConvRot INT8 support
+
+Piper ConvRot weights (`piper_kernels.convrot.ConvRotInt8Tensor`) are handled
+when the `convrot` optional extra is installed. `piper-kernels` owns the tensor
+semantics plus reference and optimized execution backends; torch-offload owns
+only the built-in `PiperConvRotInt8Adapter`. `PinnedParam` pins the INT8 `qdata` and
+float32 per-output `scale`, preserves `group_size` and the logical floating
+`dtype`, and reconstructs the same wrapper around CUDA storage on activation.
+
+The adapter remains frozen-only: it does not expose CPU round-trip or
+trainable `Parameter.data` swap. Merge-mode LoRA delegates the staged low-rank
+update to Piper's public in-place `ConvRotInt8Tensor.addmm_`, preserving the
+wrapper and its storage identities. Piper uses its optimized Triton backend on
+supported CUDA devices and its portable reference backend elsewhere. Use
+routed LoRA when the base must remain untouched. The base package remains
+importable without `piper-kernels`; use
+`uv sync --extra convrot --group dev` and then
+`pytest tests/test_piper_convrot_int8_adapter.py -q -rs` to exercise the
+optional suite.
+
 ## TorchAO NVFP4 support
 
 TorchAO NVFP4 weights
@@ -866,8 +891,8 @@ when the `torchao` optional extra is installed.
 `PinnedParam` pins the packed FP4 `qdata`, FP8 block `scale`,
 optional per-tensor scales, and the TorchAO dispatch metadata, then
 rebuilds the `NVFP4Tensor` wrapper around GPU storage on activation.
-The optional extra requires TorchAO plus PyTorch 2.8+; dynamic NVFP4
-matmul execution still depends on Blackwell-class CUDA hardware and the
+The optional extra requires the package's supported TorchAO release; dynamic
+NVFP4 matmul execution still depends on Blackwell-class CUDA hardware and the
 matching PyTorch CUDA stack.
 For uv-managed installs on Linux/Windows, this repo routes `torch` and
 `torchao` through PyTorch's CUDA 13.0 wheel index. Use
@@ -985,3 +1010,7 @@ than silent corruption.
 Use `cache.used_cache_bytes` and `cache.available_cache_bytes` for
 current cache accounting. Use `cache.info(key)` for per-key state when
 needed.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

@@ -1,7 +1,5 @@
 """Tests for TorchAO scaled-fp8 (``Float8Tensor``) adapter integration."""
 
-from __future__ import annotations
-
 
 import pytest
 import torch
@@ -47,7 +45,7 @@ def _float8_modules():
             QuantizeTensorToFloat8Kwargs,
         )
     except ImportError as exc:
-        # The float8 adapter targets the torchao>=0.17 Float8Tensor workflow;
+        # The float8 adapter targets the torchao>=0.18 Float8Tensor workflow;
         # skip (don't error) when the installed torchao predates it — or a
         # future release moves it — matching the importorskip above.
         pytest.skip(f"torchao float8 API unavailable: {exc}")

@@ -8,8 +8,6 @@ Most lifecycle tests run on CPU (the merge math is device-agnostic);
 CUDA-only tests gate on availability.
 """
 
-from __future__ import annotations
-
 from collections.abc import Sequence
 
 import pytest

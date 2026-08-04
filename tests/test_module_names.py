@@ -1,7 +1,5 @@
 """Tests for shared name and tensor-identity helpers."""
 
-from __future__ import annotations
-
 import torch
 from torch import nn
 

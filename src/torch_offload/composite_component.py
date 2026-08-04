@@ -17,11 +17,10 @@ list — pinned first, then the streamed groups — and calls the same method on
 each, never branching on concrete type.
 """
 
-from __future__ import annotations
-
 import contextlib
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from typing import Self
 
 import torch
 from torch import nn
@@ -177,7 +176,7 @@ class CompositeComponentStore:
         *,
         blocks_attr: Sequence[str] = (),
         stream_trainable_weights: bool = False,
-    ) -> CompositeComponentStore:
+    ) -> Self:
         """Decompose ``model`` into a pinned remainder + streamed block groups.
 
         Each ``blocks_attr`` path becomes one

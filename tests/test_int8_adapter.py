@@ -1,8 +1,5 @@
 """Tests for TorchAO Int8 (``Int8Tensor``) adapter integration."""
 
-from __future__ import annotations
-
-
 import pytest
 import torch
 from torch import nn
@@ -46,7 +43,7 @@ def _int8_config(*, dynamic_activation: bool) -> object:
             Int8WeightOnlyConfig,
         )
     except ImportError as exc:
-        # The int8 adapter targets the torchao>=0.17 version-2 Int8Tensor
+        # The int8 adapter targets the torchao>=0.18 version-2 Int8Tensor
         # workflow; skip (don't error) when the installed torchao predates
         # it — or a future release moves it.
         pytest.skip(f"torchao int8 API unavailable: {exc}")
@@ -109,6 +106,7 @@ def _make_affine_int8(
     *,
     layout: str = "row",
     asymmetric: bool = False,
+    reduce_range: bool = False,
 ) -> torch.Tensor:
     pytest.importorskip("torchao")
     from torchao.quantization.granularity import PerGroup, PerRow, PerTensor
@@ -126,7 +124,12 @@ def _make_affine_int8(
     else:
         raise AssertionError(f"unknown test INT8 layout: {layout}")
     mapping_type = MappingType.ASYMMETRIC if asymmetric else MappingType.SYMMETRIC
-    return int8_cls.from_hp(weight, granularity, mapping_type)
+    return int8_cls.from_hp(
+        weight,
+        granularity,
+        mapping_type,
+        reduce_range=reduce_range,
+    )
 
 
 def _expected_int8_merge(
@@ -192,6 +195,7 @@ class TestInt8Adapter:
             assert pinned.zero_point.data_ptr() == pinned_param.pinned_state.storage[2].data_ptr()
         assert pinned.block_size == qt.block_size
         assert pinned.dtype == qt.dtype
+        assert pinned.reduce_range == qt.reduce_range
         assert pinned_param.compute_dtype is torch.bfloat16
         assert torch.equal(pinned.dequantize(), qt.dequantize())
 
@@ -215,6 +219,38 @@ class TestInt8Adapter:
         weight_only = nn.Parameter(_make_int8(dynamic_activation=False), requires_grad=False)
 
         assert _param_target_layout(with_activation) != _param_target_layout(weight_only)
+
+    def test_reduced_range_is_preserved_and_part_of_layout(self) -> None:
+        weight = torch.randn(32, 16, dtype=torch.bfloat16)
+        full_range = _make_affine_int8(weight)
+        reduced_range = _make_affine_int8(weight, reduce_range=True)
+
+        assert reduced_range.scale.dtype is torch.float32
+        assert reduced_range.reduce_range is True
+        assert reduced_range.qdata.min().item() >= -64
+        assert reduced_range.qdata.max().item() <= 63
+        assert _param_target_layout(
+            nn.Parameter(full_range, requires_grad=False),
+        ) != _param_target_layout(
+            nn.Parameter(reduced_range, requires_grad=False),
+        )
+
+        again = Int8Adapter.requantize(
+            Int8Adapter.dequantize(reduced_range),
+            like=reduced_range,
+        )
+        assert again.reduce_range is True
+        assert again.qdata.min().item() >= -64
+        assert again.qdata.max().item() <= 63
+
+        pinned = (
+            PinnedParam(
+                nn.Parameter(reduced_range, requires_grad=False),
+            )
+            .make_cpu_param()
+            .data
+        )
+        assert pinned.reduce_range is True
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
         pinned_param = PinnedParam(
@@ -307,6 +343,7 @@ class TestInt8Adapter:
             list(base.block_size),
             base.dtype,
             zero_point=None,
+            reduce_range=base.reduce_range,
         )
         assert like.zero_point is None
 
@@ -464,6 +501,7 @@ class TestInt8Adapter:
             list(base.block_size),
             base.dtype,
             zero_point=None,
+            reduce_range=base.reduce_range,
         )
         a = torch.randn(rank, cols, device="cuda", dtype=qt.dtype)
         b = torch.randn(rows, rank, device="cuda", dtype=qt.dtype)
@@ -505,7 +543,10 @@ class TestInt8Adapter:
             act_quant_zero_point=act_quant_zero_point,
             act_pre_scale=act_pre_scale,
             act_quant_kwargs=base.act_quant_kwargs,
+            reduce_range=base.reduce_range,
         )
+        assert qt.scale.dtype is torch.float32
+        assert qt.dtype is torch.bfloat16
         param = nn.Parameter(qt, requires_grad=False)
         factor_inputs = [
             (
@@ -555,6 +596,7 @@ class TestInt8Adapter:
             strength: float,
             *,
             asymmetric: bool,
+            reduce_range: bool,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             calls.append((tuple(b.shape), tuple(a.shape), strength))
             return triton_merge(
@@ -566,6 +608,7 @@ class TestInt8Adapter:
                 a,
                 strength,
                 asymmetric=asymmetric,
+                reduce_range=reduce_range,
             )
 
         monkeypatch.setattr(
@@ -594,6 +637,33 @@ class TestInt8Adapter:
         ):
             assert torch.equal(actual, original)
         _assert_triton_int8_close(merged, expected)
+
+    @CUDA
+    @pytest.mark.parametrize("asymmetric", [False, True])
+    def test_triton_merge_preserves_reduced_range(
+        self,
+        asymmetric: bool,
+    ) -> None:
+        rows, cols, rank = 35, 69, 7
+        dtype = torch.bfloat16
+        qt = _make_affine_int8(
+            torch.randn(rows, cols, device="cuda", dtype=dtype),
+            layout="group",
+            asymmetric=asymmetric,
+            reduce_range=True,
+        )
+        a = torch.randn(rank, cols, device="cuda", dtype=dtype)
+        b = torch.randn(rows, rank, device="cuda", dtype=dtype)
+        expected = _expected_int8_merge(qt, b, a, 0.25)
+
+        assert qt.scale.dtype is torch.float32
+        Int8Adapter.merge_lora_(qt, b, a, 0.25)
+        torch.cuda.synchronize()
+
+        assert qt.reduce_range is True
+        assert qt.qdata.min().item() >= -64
+        assert qt.qdata.max().item() <= 63
+        _assert_triton_int8_close(qt, expected)
 
     @CUDA
     @pytest.mark.parametrize("fallback", ["unavailable", "unsupported-layout"])
@@ -866,10 +936,7 @@ class TestInt8Adapter:
             ) as active:
                 merged = active.blocks[0].weight.data
                 assert isinstance(merged, int8_cls)
-                torch.testing.assert_close(
-                    merged.dequantize().to(torch.float32),
-                    expected.dequantize().to(torch.float32),
-                )
+                _assert_triton_int8_close(merged, expected)
                 y = active(x)
                 torch.cuda.synchronize()
             assert y.shape == (8, 32)

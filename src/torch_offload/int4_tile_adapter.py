@@ -21,8 +21,6 @@ remains possible when the owning module is a logical ``nn.Linear`` with
 compatible shape/dtype.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 

@@ -1,15 +1,13 @@
 """Opt-in ``torch.compile`` policy for streamed model blocks."""
 
-from __future__ import annotations
-
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import cast
+from typing import Self, cast
 
 import torch
 from torch import nn
 
-_BlockForward = Callable[..., object]
+type _BlockForward = Callable[..., object]
 _NO_INSTANCE_FORWARD = object()
 
 
@@ -76,7 +74,7 @@ class _BlockCompileState:
         cls,
         blocks: Sequence[nn.Module],
         config: BlockCompileConfig | None,
-    ) -> _BlockCompileState:
+    ) -> Self:
         if config is None:
             return cls(config=None, _forwards=())
 

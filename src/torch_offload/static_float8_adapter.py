@@ -16,8 +16,6 @@ uses the ordinary logical shape and compute dtype exposed by the shared adapter
 contract.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 

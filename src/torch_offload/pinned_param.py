@@ -15,8 +15,6 @@ such as D2H round-trip, trainable ``.data`` swap, and dense updates
 are exposed through adapter capability methods.
 """
 
-from __future__ import annotations
-
 from typing import Any, cast
 
 import torch

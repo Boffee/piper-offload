@@ -30,12 +30,10 @@ routed path lives as forward hooks installed on activate and removed
 on deactivate.
 """
 
-from __future__ import annotations
-
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import torch
 from torch import nn
@@ -53,7 +51,7 @@ __all__ = [
     "ScaledLoRAFactor",
 ]
 
-LoRAMode = Literal["merge", "routed"]
+type LoRAMode = Literal["merge", "routed"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -122,7 +120,7 @@ class ScaledLoRAFactor:
         a: torch.Tensor,
         b: torch.Tensor,
         strength: float,
-    ) -> ScaledLoRAFactor:
+    ) -> Self:
         """Pin an unbound tensor pair and bind it to ``strength``."""
         return cls(
             PinnedParam(nn.Parameter(a, requires_grad=False)),
@@ -181,7 +179,7 @@ class LoRA:
         state_dict: dict[str, torch.Tensor],
         *,
         dtype: torch.dtype | None = None,
-    ) -> LoRA:
+    ) -> Self:
         """Pair, validate, build, and pin ``state_dict`` into a LoRA.
 
         ``dtype`` casts every factor before pinning. For routed mode, matching

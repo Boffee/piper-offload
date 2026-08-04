@@ -4,11 +4,10 @@ Supports whole-model pinned bulk offload or block streaming, with optional
 per-weight LoRA application in both modes.
 """
 
-from __future__ import annotations
-
 import contextlib
 import threading
 from collections.abc import Callable, Iterator, Sequence
+from typing import Self
 
 import torch
 from torch import nn
@@ -25,7 +24,7 @@ from .lora import (
 )
 from .module_names import resolve_parent_leaf
 
-_LoraParamMap = dict[str, list[ScaledLoRAFactor]]
+type _LoraParamMap = dict[str, list[ScaledLoRAFactor]]
 
 
 class ModelRuntimeInUseError(RuntimeError):
@@ -136,7 +135,7 @@ class ModelOffloader:
         blocks_attr: Sequence[str] = (),
         stream_trainable_weights: bool = False,
         block_compile: BlockCompileConfig | None = None,
-    ) -> ModelOffloader:
+    ) -> Self:
         """Pin and bind ``model`` as one reusable cached runtime.
 
         The intermediate component store exists only during construction.

@@ -50,11 +50,10 @@ Class-specific caveats
   activation, preserving the tying invariant on GPU.
 """
 
-from __future__ import annotations
-
 import contextlib
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from typing import Self
 
 import torch
 from torch import nn
@@ -86,7 +85,7 @@ class PinnedComponentStore:
         *,
         include_param_names: Iterable[str] | None = None,
         include_buffer_names: Iterable[str] | None = None,
-    ) -> PinnedComponentStore:
+    ) -> Self:
         """Pin selected model state into a reusable component store."""
         return cls(
             PinnedModuleStore.from_module(

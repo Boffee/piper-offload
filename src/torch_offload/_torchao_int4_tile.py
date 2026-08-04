@@ -15,8 +15,6 @@ optional ``act_pre_scale``, and metadata ``block_size`` plus the logical
 ``shape`` (needed to reconstruct the wrapper, since ``qdata`` is packed).
 """
 
-from __future__ import annotations
-
 from typing import Any
 
 import torch
