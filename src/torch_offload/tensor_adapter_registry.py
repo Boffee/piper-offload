@@ -7,8 +7,6 @@ tensor subclasses can participate through :func:`register_adapter` without
 adding a format-specific dependency to this package.
 """
 
-from __future__ import annotations
-
 from collections.abc import Callable
 from typing import Any
 

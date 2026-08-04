@@ -7,5 +7,4 @@ wheels/
 .venv
 .idea/
 .vscode/
-uv.lock
 .DS_Store

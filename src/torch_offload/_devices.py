@@ -1,7 +1,5 @@
 """Internal helpers for normalizing user-provided torch devices."""
 
-from __future__ import annotations
-
 import torch
 
 

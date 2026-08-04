@@ -28,8 +28,6 @@ wrapper object, not its bytes, so int8 weights stay frozen for
 streaming/training. Routed LoRA remains the non-destructive alternative.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 

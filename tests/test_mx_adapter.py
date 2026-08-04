@@ -1,7 +1,5 @@
 """Tests for TorchAO MX (MXFP8 / MXFP4) adapter integration."""
 
-from __future__ import annotations
-
 
 import pytest
 import torch

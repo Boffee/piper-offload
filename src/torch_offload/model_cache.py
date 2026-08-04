@@ -6,11 +6,9 @@ including LoRA dependency leasing and device activation, while keeping the
 generic cache machinery unaware of models and adapters.
 """
 
-from __future__ import annotations
-
 import contextlib
 from collections.abc import Iterator, Sequence
-from typing import TypeVar, cast
+from typing import cast
 
 import torch
 from torch import nn
@@ -20,8 +18,6 @@ from .model_offloader import ModelOffloader
 from .resource_cache import ResourceCache
 from .resource_specs import LoRASpec, ModelSpec
 from .stream_config import StreamConfig
-
-M = TypeVar("M", bound=nn.Module)
 
 
 class ModelCache(ResourceCache):
@@ -33,7 +29,7 @@ class ModelCache(ResourceCache):
     """
 
     @contextlib.contextmanager
-    def use(
+    def use[M: nn.Module](
         self,
         model: ModelSpec[M],
         *,

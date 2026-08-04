@@ -39,8 +39,6 @@ Selected by :mod:`tensor_adapter_registry`. Importing fails silently if
 optimum-quanto is not installed — quanto support is optional.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 

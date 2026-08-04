@@ -34,8 +34,6 @@ bitsandbytes refactors, the pin/read path fails with a clear validation error
 not installed — 8-bit support is optional.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 

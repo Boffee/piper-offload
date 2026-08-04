@@ -6,8 +6,6 @@ bytes (the pinned-CPU path the adapter exercises) works on CPU, but the
 source tensor still has to be built on the GPU.
 """
 
-from __future__ import annotations
-
 
 import pytest
 import torch

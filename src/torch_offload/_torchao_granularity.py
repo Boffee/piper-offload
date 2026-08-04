@@ -10,8 +10,6 @@ per-format layout — so it lives here once instead of in each
 ``_torchao_<format>`` module.
 """
 
-from __future__ import annotations
-
 from typing import Any
 
 try:

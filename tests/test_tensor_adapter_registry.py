@@ -1,7 +1,5 @@
 """Tests for public external tensor-adapter registration."""
 
-from __future__ import annotations
-
 import subprocess
 import sys
 from typing import cast

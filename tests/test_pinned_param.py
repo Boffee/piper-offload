@@ -1,7 +1,5 @@
 """Tests for ``torch_offload.pinned_param.PinnedParam``."""
 
-from __future__ import annotations
-
 import pytest
 import torch
 from torch import nn

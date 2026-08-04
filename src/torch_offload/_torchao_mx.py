@@ -15,8 +15,6 @@ admitted; such tensors fall through to a clear "no adapter" error rather
 than being silently mishandled.
 """
 
-from __future__ import annotations
-
 from typing import Any
 
 import torch

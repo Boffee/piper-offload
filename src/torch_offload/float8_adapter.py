@@ -26,8 +26,6 @@ No trainable ``Parameter.data`` swap — the quant state lives in the
 wrapper object, not its bytes, so scaled-fp8 weights stay frozen.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 

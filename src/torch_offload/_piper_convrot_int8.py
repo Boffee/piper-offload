@@ -9,8 +9,6 @@ The dependency remains optional: importing :mod:`torch_offload` succeeds when
 ``piper-kernels`` (or its ``convrot`` extra) is absent.
 """
 
-from __future__ import annotations
-
 from typing import Any
 
 import torch

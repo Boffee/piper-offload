@@ -1,7 +1,5 @@
 """Tests for Piper ``ConvRotInt8Tensor`` offload support."""
 
-from __future__ import annotations
-
 import subprocess
 import sys
 from typing import Any

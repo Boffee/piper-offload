@@ -16,8 +16,6 @@ weight quant, plus ``act_quant_scale`` / ``act_quant_zero_point`` /
 ``None`` and are skipped end-to-end by the structured-adapter base.
 """
 
-from __future__ import annotations
-
 from typing import Any
 
 import torch

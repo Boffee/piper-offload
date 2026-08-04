@@ -12,8 +12,6 @@ merge; the permanence comes from applying it to the model's resident
 parameter instead of a freshly loaded activation parameter.
 """
 
-from __future__ import annotations
-
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass

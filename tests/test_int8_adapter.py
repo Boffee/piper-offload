@@ -1,7 +1,5 @@
 """Tests for TorchAO Int8 (``Int8Tensor``) adapter integration."""
 
-from __future__ import annotations
-
 
 import pytest
 import torch

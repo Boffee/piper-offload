@@ -7,8 +7,6 @@ CUDA-only tests gate on availability. CPU activation is pass-through
 over the host-backed pinned state.
 """
 
-from __future__ import annotations
-
 from collections.abc import Sequence
 from concurrent.futures import Future
 

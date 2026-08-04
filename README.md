@@ -5,11 +5,11 @@ model and LoRA resources, and swaps independent models in and out of
 GPU memory under a policy-driven cache.
 
 Self-contained, library-friendly: no dependencies beyond `torch` (plus
-optional `optimum.quanto`, `gguf`, `piper-kernels`, and `torchao` for
-quantized models). Designed to be lifted into its own package when a second
-consumer appears.
+optional `bitsandbytes`, `optimum.quanto`, `gguf`, `piper-kernels`, and
+`torchao` for quantized models). Designed to be lifted into its own package
+when a second consumer appears.
 
-Requires Python 3.14 or newer.
+Requires Python 3.14 or newer and PyTorch 2.13.
 
 ## What's in here
 
@@ -891,8 +891,8 @@ when the `torchao` optional extra is installed.
 `PinnedParam` pins the packed FP4 `qdata`, FP8 block `scale`,
 optional per-tensor scales, and the TorchAO dispatch metadata, then
 rebuilds the `NVFP4Tensor` wrapper around GPU storage on activation.
-The optional extra requires TorchAO plus PyTorch 2.8+; dynamic NVFP4
-matmul execution still depends on Blackwell-class CUDA hardware and the
+The optional extra requires the package's supported TorchAO release; dynamic
+NVFP4 matmul execution still depends on Blackwell-class CUDA hardware and the
 matching PyTorch CUDA stack.
 For uv-managed installs on Linux/Windows, this repo routes `torch` and
 `torchao` through PyTorch's CUDA 13.0 wheel index. Use

@@ -19,8 +19,6 @@ updated once when optimum-quanto refactors.
 Pinned to optimum-quanto's internal layout. Not part of the public API.
 """
 
-from __future__ import annotations
-
 from typing import Any
 
 import torch

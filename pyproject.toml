@@ -7,34 +7,37 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = [
-    "numpy>=2.0",
-    "torch>=2.12",
+    "torch>=2.13,<2.14",
 ]
 
 [project.optional-dependencies]
-bnb = ["bitsandbytes>=0.49"]
-torchao = ["torchao>=0.17"]
-gguf = ["gguf>=0.18"]
-quanto = ["optimum-quanto>=0.2"]
-convrot = ["piper-kernels[convrot]>=0.1.0,<0.2"]
-all = [
-    "bitsandbytes>=0.49",
-    "gguf>=0.18",
-    "optimum-quanto>=0.2",
+bnb = ["bitsandbytes>=0.49,<0.51"]
+torchao = ["numpy>=2.3.2,<3", "torchao>=0.17,<0.18"]
+gguf = ["gguf>=0.18,<0.20"]
+quanto = ["optimum-quanto>=0.2.7,<0.3"]
+convrot = [
     "piper-kernels[convrot]>=0.1.0,<0.2",
-    "torchao>=0.17",
+    "torchao>=0.17,<0.18",
+]
+all = [
+    "bitsandbytes>=0.49,<0.51",
+    "gguf>=0.18,<0.20",
+    "numpy>=2.3.2,<3",
+    "optimum-quanto>=0.2.7,<0.3",
+    "piper-kernels[convrot]>=0.1.0,<0.2",
+    "torchao>=0.17,<0.18",
 ]
 
 [build-system]
-requires = ["uv_build>=0.9.8,<0.10.0"]
+requires = ["uv_build>=0.11.32,<0.12"]
 build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "pre-commit>=4.0",
-    "pyright>=1.1.409",
-    "pytest~=9.0",
-    "ruff>=0.14.3",
+    "pre-commit>=4.6.1",
+    "pyright>=1.1.411",
+    "pytest~=9.1",
+    "ruff>=0.16.1",
     # Every adapter backend, so `uv sync` yields a complete test environment
     # (otherwise optional adapter suites silently skip).
     "torch-offload[all]",
@@ -67,7 +70,7 @@ explicit = true
 [tool.ruff.lint]
 select = [
     "E", "F", "W", "I", "N", "ANN", "B", "A", "COM", "C4",
-    "DTZ", "EXE", "PIE", "T20", "PT", "SIM", "ARG", "PTH",
+    "DTZ", "EXE", "PIE", "T20", "PT", "SIM", "ARG", "PTH", "UP",
     "ERA", "RUF", "PL",
 ]
 ignore = [
@@ -81,6 +84,10 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"src/torch_offload/_triton_*_lora.py" = [
+    # Triton JIT kernels expose positional pointer and constexpr parameters.
+    "PLR0917",
+]
 "tests/**/*.py" = [
     # Tests intentionally use local helpers, optional imports guarded by
     # importorskip(), and assertion-oriented context-manager structure.

@@ -1,7 +1,5 @@
 """Name-based helpers for walking and mutating ``nn.Module`` trees."""
 
-from __future__ import annotations
-
 from collections.abc import Callable, Hashable, Iterable, Iterator
 
 import torch

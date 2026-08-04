@@ -5,11 +5,9 @@ model, LoRA, and ordinary-object factories to the structural resource-spec
 protocol.
 """
 
-from __future__ import annotations
-
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Generic, TypeVar, cast
+from typing import cast
 
 import torch
 from torch import nn
@@ -19,12 +17,9 @@ from .lora import LoRA
 from .model_offloader import ModelOffloader
 from .protocols import ResourceStore
 
-M = TypeVar("M", bound=nn.Module)
-T = TypeVar("T")
-
 
 @dataclass(frozen=True, kw_only=True, slots=True)
-class ModelSpec(Generic[M]):
+class ModelSpec[M: nn.Module]:
     """Model resource built from one user model factory.
 
     ``factory`` runs once to construct the cached :class:`ModelOffloader`.
@@ -80,7 +75,7 @@ class LoRASpec:
 
 
 @dataclass(frozen=True, slots=True)
-class _ObjectStore(Generic[T]):
+class _ObjectStore[T]:
     """Accounting wrapper for a plain Python object."""
 
     value: T
@@ -88,7 +83,7 @@ class _ObjectStore(Generic[T]):
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
-class ObjectSpec(Generic[T]):
+class ObjectSpec[T]:
     """Resource spec for a tokenizer, processor, config, or other object.
 
     Every lease yields the same object instance. The default zero-byte charge

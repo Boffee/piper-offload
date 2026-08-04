@@ -50,8 +50,6 @@ and CUDA-resident forms compare equal. The resident GPU parameter is rebuilt
 on the original CUDA mesh in :meth:`gpu_param`.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 
@@ -313,10 +311,13 @@ class DTensorAdapter:
     def clone_pin(t: torch.Tensor) -> _DTensorPinned:
         dt = require_dtensor(t)
         local = dt.to_local()
-        if isinstance(local, nn.Parameter):
+        if issubclass(type(local), nn.Parameter):
             # Parameter-subclass locals (bitsandbytes Params4bit/Int8Params)
             # carry quant state on the object, not .data — and gpu_param
-            # reconstructs via .data. Fail closed rather than silently drop it.
+            # reconstructs via .data. Check real inheritance rather than
+            # isinstance(): PyTorch 2.13 propagates DTensor's logical
+            # ``_is_param`` marker to a plain local Tensor. Fail closed rather
+            # than silently dropping representation metadata.
             raise NotImplementedError(
                 f"DTensorAdapter cannot move a local shard that is itself an "
                 f"nn.Parameter subclass ({type(local).__name__}); its quant "

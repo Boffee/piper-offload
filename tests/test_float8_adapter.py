@@ -1,7 +1,5 @@
 """Tests for TorchAO scaled-fp8 (``Float8Tensor``) adapter integration."""
 
-from __future__ import annotations
-
 
 import pytest
 import torch

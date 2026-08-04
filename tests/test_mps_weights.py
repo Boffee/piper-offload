@@ -1,7 +1,5 @@
 """Tests for ``torch_offload.mps_weights.MpsWeights``."""
 
-from __future__ import annotations
-
 import gc
 import weakref
 

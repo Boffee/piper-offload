@@ -29,11 +29,9 @@ capability protocols, and plain tensor implementation live here; built-in and
 external adapter selection lives in :mod:`tensor_adapter_registry`.
 """
 
-from __future__ import annotations
-
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, is_dataclass
-from typing import Any, Protocol, TypeVar, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 from torch import nn
@@ -56,15 +54,8 @@ __all__ = [
     "tensor_layout",
 ]
 
-# Adapter-specific opaque state types. The Protocol is generic over
-# them so consumers (PinnedParam) can stay tensor-type-agnostic
-# while each adapter pins its own concrete state shape.
-PinnedStateT = TypeVar("PinnedStateT")
-GpuStateT = TypeVar("GpuStateT")
-
-
 @runtime_checkable
-class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
+class TensorAdapter[PinnedStateT, GpuStateT](Protocol):
     """Adapter encoding the mechanics of pinning, moving, and wrapping
     one tensor type. Adapter instances are stateless; they hold no
     per-param data.
@@ -174,7 +165,10 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
 
 
 @runtime_checkable
-class CpuRoundTripTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+class CpuRoundTripTensorAdapter[PinnedStateT, GpuStateT](
+    TensorAdapter[PinnedStateT, GpuStateT],
+    Protocol,
+):
     """Optional D2H counterpart to the base H2D movement contract."""
 
     @staticmethod
@@ -195,7 +189,10 @@ class CpuRoundTripTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol
 
 
 @runtime_checkable
-class LogicalShapeTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+class LogicalShapeTensorAdapter[PinnedStateT, GpuStateT](
+    TensorAdapter[PinnedStateT, GpuStateT],
+    Protocol,
+):
     """Optional capability for reading logical shape without materialization.
 
     Packed tensor subclasses may report a physical storage shape from their
@@ -211,7 +208,7 @@ class LogicalShapeTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol
 
 
 @runtime_checkable
-class LoRAMergeTensorAdapter(
+class LoRAMergeTensorAdapter[PinnedStateT, GpuStateT](
     LogicalShapeTensorAdapter[PinnedStateT, GpuStateT],
     Protocol,
 ):
@@ -235,7 +232,10 @@ class LoRAMergeTensorAdapter(
 
 
 @runtime_checkable
-class DequantRequantTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+class DequantRequantTensorAdapter[PinnedStateT, GpuStateT](
+    TensorAdapter[PinnedStateT, GpuStateT],
+    Protocol,
+):
     """Optional capability for shape-preserving dequantize/requantize conversion.
 
     ``dequantize(t)`` returns a dense logical tensor for ``t`` in
@@ -264,7 +264,10 @@ class DequantRequantTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protoc
 
 
 @runtime_checkable
-class ParameterDataSwapTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+class ParameterDataSwapTensorAdapter[PinnedStateT, GpuStateT](
+    TensorAdapter[PinnedStateT, GpuStateT],
+    Protocol,
+):
     """Optional capability for trainable streaming via ``Parameter.data`` swap."""
 
     @staticmethod
@@ -279,7 +282,10 @@ class ParameterDataSwapTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Pro
 
 
 @runtime_checkable
-class TensorCopyIntoAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+class TensorCopyIntoAdapter[PinnedStateT, GpuStateT](
+    TensorAdapter[PinnedStateT, GpuStateT],
+    Protocol,
+):
     """Optional capability for representation-preserving copy into ``target``.
 
     ``copy_into(src, target=...)`` copies ``src``'s representation into
@@ -295,7 +301,10 @@ class TensorCopyIntoAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
 
 
 @runtime_checkable
-class BindLayoutTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+class BindLayoutTensorAdapter[PinnedStateT, GpuStateT](
+    TensorAdapter[PinnedStateT, GpuStateT],
+    Protocol,
+):
     """Optional capability: relaxed layout for store↔module bind validation.
 
     Binding replaces every managed tensor in the target module with
@@ -317,7 +326,10 @@ class BindLayoutTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
 
 
 @runtime_checkable
-class PostLoadRearmTensorAdapter(TensorAdapter[PinnedStateT, GpuStateT], Protocol):
+class PostLoadRearmTensorAdapter[PinnedStateT, GpuStateT](
+    TensorAdapter[PinnedStateT, GpuStateT],
+    Protocol,
+):
     """Optional capability: re-arm the active GPU wrapper after each load.
 
     The offloader builds one GPU wrapper per pool target and reuses it

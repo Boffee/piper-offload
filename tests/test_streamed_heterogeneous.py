@@ -6,8 +6,6 @@ weights. Before that, the pool was templated off block 0 and a hard layout
 check rejected any block that differed — the case these tests cover.
 """
 
-from __future__ import annotations
-
 from tests.conftest import activated_model, streamed_components
 
 from collections.abc import Sequence

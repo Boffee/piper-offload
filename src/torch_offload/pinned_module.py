@@ -5,8 +5,6 @@ concrete model instances. Names are the durable relationship between a
 store and an instance.
 """
 
-from __future__ import annotations
-
 from collections.abc import (
     Callable,
     Iterable,
@@ -15,7 +13,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass, field
-from typing import TypeVar
+from typing import Self
 
 import torch
 from torch import nn
@@ -25,8 +23,7 @@ from .pinned_buffer import PinnedBuffer
 from .pinned_param import PinnedParam
 from .tensor_adapter_registry import buffer_tensor_id, param_tensor_id
 
-PostCopyHook = Callable[[nn.Parameter], None]
-_NamedT = TypeVar("_NamedT")
+type PostCopyHook = Callable[[nn.Parameter], None]
 
 
 @dataclass(slots=True)
@@ -77,7 +74,7 @@ class PinnedModuleStore:
         *,
         include_param_names: Iterable[str] | None = None,
         include_buffer_names: Iterable[str] | None = None,
-    ) -> PinnedModuleStore:
+    ) -> Self:
         """Pin ``module`` into a name-keyed store.
 
         Store construction is intentionally side-effecting like the
@@ -389,10 +386,10 @@ def _pin_buffers(buffers: Mapping[str, torch.Tensor]) -> dict[str, PinnedBuffer]
     return pinned_by_name
 
 
-def _select_known_names(
-    items: Mapping[str, _NamedT],
+def _select_known_names[NamedT](
+    items: Mapping[str, NamedT],
     names: Iterable[str] | None,
-) -> dict[str, _NamedT]:
+) -> dict[str, NamedT]:
     if names is None:
         return dict(items)
 
@@ -403,10 +400,10 @@ def _select_known_names(
     return {name: value for name, value in items.items() if name in included}
 
 
-def _items_for_names(
-    items: Mapping[str, _NamedT],
+def _items_for_names[NamedT](
+    items: Mapping[str, NamedT],
     names: Iterable[str],
-) -> dict[str, _NamedT]:
+) -> dict[str, NamedT]:
     included = set(names)
     return {name: value for name, value in items.items() if name in included}
 
@@ -727,10 +724,10 @@ def _named_buffers(module: nn.Module) -> dict[str, torch.Tensor]:
     return _unique_name_dict(module.named_buffers(remove_duplicate=False))
 
 
-def _unique_name_dict(
-    items: Iterable[tuple[str, _NamedT]],
-) -> dict[str, _NamedT]:
-    values: dict[str, _NamedT] = {}
+def _unique_name_dict[NamedT](
+    items: Iterable[tuple[str, NamedT]],
+) -> dict[str, NamedT]:
+    values: dict[str, NamedT] = {}
     for name, value in items:
         if name in values:
             raise ValueError(f"Module yielded duplicate name {name!r}.")

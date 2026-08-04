@@ -55,13 +55,9 @@ deactivate; ownership of any user-held model references is the user's
 concern.
 """
 
-from __future__ import annotations
-
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import torch
-
-T_co = TypeVar("T_co", covariant=True)
 
 
 @runtime_checkable
@@ -74,7 +70,7 @@ class ResourceStore(Protocol):
         ...
 
 
-class ResourceSpec(Protocol[T_co]):
+class ResourceSpec[T](Protocol):
     """Structural contract for one lazily built cache entry.
 
     ``key`` is the cache identity and must include every construction input
@@ -97,13 +93,13 @@ class ResourceSpec(Protocol[T_co]):
         """Build fresh reusable backing storage on a cache miss."""
         ...
 
-    def value(self, store: ResourceStore) -> T_co:
+    def value(self, store: ResourceStore) -> T:
         """Project the leased store to the value returned to the caller."""
         ...
 
 
 @runtime_checkable
-class ResourceBinding(Protocol[T_co]):
+class ResourceBinding[T](Protocol):
     """Active-resource lifecycle.
 
     Extends lifecycle methods with a typed :attr:`value` accessor. The
@@ -112,7 +108,7 @@ class ResourceBinding(Protocol[T_co]):
     """
 
     @property
-    def value(self) -> T_co:
+    def value(self) -> T:
         """The bound payload made usable by :meth:`activate`."""
         ...
 

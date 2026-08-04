@@ -1,8 +1,7 @@
 """Per-buffer pinned-CPU storage primitive."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
+from typing import Self
 
 import torch
 
@@ -17,7 +16,7 @@ class PinnedBuffer:
     target_layout: tuple[object, ...]
 
     @classmethod
-    def clone(cls, buffer: torch.Tensor) -> PinnedBuffer:
+    def clone(cls, buffer: torch.Tensor) -> Self:
         """Clone ``buffer`` into pinned CPU storage."""
         tensor = clone_to_pinned_cpu(
             buffer,

@@ -13,8 +13,6 @@ component state to fall out of sync with a running stream.
 config stays valid across models of different depth.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 
