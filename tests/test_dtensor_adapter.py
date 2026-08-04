@@ -14,10 +14,10 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import LoRA, ModelOffloader, StreamConfig, merge_lora
-from torch_offload.dtensor_adapter import DTensorAdapter
-from torch_offload.pinned_param import PinnedParam
-from torch_offload.tensor_adapters import (
+from piper_offload import LoRA, ModelOffloader, StreamConfig, merge_lora
+from piper_offload.dtensor_adapter import DTensorAdapter
+from piper_offload.pinned_param import PinnedParam
+from piper_offload.tensor_adapters import (
     CpuRoundTripTensorAdapter,
     DequantRequantTensorAdapter,
     LoRAMergeTensorAdapter,
@@ -25,7 +25,7 @@ from torch_offload.tensor_adapters import (
     RegularAdapter,
     TensorCopyIntoAdapter,
 )
-from torch_offload.tensor_adapter_registry import (
+from piper_offload.tensor_adapter_registry import (
     param_representation,
     select_adapter,
     tensor_id,
@@ -442,7 +442,7 @@ class TestDTensorAdapter:
         pytest.importorskip("torchao")
         from torch.distributed.tensor import DTensor
 
-        from torch_offload.float8_adapter import Float8Adapter
+        from piper_offload.float8_adapter import Float8Adapter
 
         try:
             from torchao.quantization import (
@@ -482,7 +482,7 @@ class TestDTensorAdapter:
         from torch.distributed.tensor import DTensor
         from torchao.quantization import Float8WeightOnlyConfig, quantize_
 
-        from torch_offload.float8_adapter import Float8Adapter
+        from piper_offload.float8_adapter import Float8Adapter
 
         in_dim = 8
         out_dim = 16

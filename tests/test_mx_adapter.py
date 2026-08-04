@@ -5,8 +5,8 @@ import pytest
 import torch
 from torch import nn
 
-import torch_offload.mx_adapter as mx_adapter_impl
-from torch_offload import (
+import piper_offload.mx_adapter as mx_adapter_impl
+from piper_offload import (
     LoRA,
     LoRATransform,
     ModelOffloader,
@@ -14,11 +14,11 @@ from torch_offload import (
     StreamConfig,
     merge_lora,
 )
-from torch_offload._torchao_mx import is_supported_mx_elem_dtype
-from torch_offload.mx_adapter import MxAdapter
-from torch_offload.pinned_param import PinnedParam
-from torch_offload.streamed_component import _param_target_layout
-from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
+from piper_offload._torchao_mx import is_supported_mx_elem_dtype
+from piper_offload.mx_adapter import MxAdapter
+from piper_offload.pinned_param import PinnedParam
+from piper_offload.streamed_component import _param_target_layout
+from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from tests.conftest import activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

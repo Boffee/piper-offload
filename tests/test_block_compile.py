@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import (
+from piper_offload import (
     BlockCompileConfig,
     LoRA,
     ModelOffloader,

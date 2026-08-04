@@ -1,4 +1,4 @@
-"""Tests for the store-only :mod:`torch_offload.resource_cache` API."""
+"""Tests for the store-only :mod:`piper_offload.resource_cache` API."""
 
 import queue
 import threading
@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from torch_offload import (
+from piper_offload import (
     CacheError,
     DuplicateResourceKeyError,
     EvictionContext,
@@ -20,7 +20,7 @@ from torch_offload import (
     ResourceSpec,
     ResourceTooLargeError,
 )
-from torch_offload.protocols import ResourceStore
+from piper_offload.protocols import ResourceStore
 
 
 class FakeStore:

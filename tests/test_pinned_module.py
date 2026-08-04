@@ -6,16 +6,16 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import pinned_module
-from torch_offload.pinned_buffer import PinnedBuffer
-from torch_offload.pinned_module import (
+from piper_offload import pinned_module
+from piper_offload.pinned_buffer import PinnedBuffer
+from piper_offload.pinned_module import (
     PinnedBufferTarget,
     PinnedModuleInstance,
     PinnedModuleStore,
     PinnedModuleTarget,
     PinnedParamTarget,
 )
-from torch_offload.pinned_param import PinnedParam
+from piper_offload.pinned_param import PinnedParam
 
 
 class _FakePinnedParam:

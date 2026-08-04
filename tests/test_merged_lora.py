@@ -15,10 +15,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-import torch_offload.lora as lora_impl
-import torch_offload.quanto_adapter as quanto_adapter_impl
+import piper_offload.lora as lora_impl
+import piper_offload.quanto_adapter as quanto_adapter_impl
 
-from torch_offload import (
+from piper_offload import (
     LoRA,
     LoRAFactor,
     LoRAMode,
@@ -36,15 +36,15 @@ from torch_offload import (
     StreamedComponent,
     merge_lora,
 )
-from torch_offload.gguf_adapter import GgufAdapter
-from torch_offload.pinned_module import PinnedModuleInstance
-from torch_offload.pinned_param import PinnedParam
-from torch_offload.quanto_adapter import QuantoAdapter
-from torch_offload.protocols import (
+from piper_offload.gguf_adapter import GgufAdapter
+from piper_offload.pinned_module import PinnedModuleInstance
+from piper_offload.pinned_param import PinnedParam
+from piper_offload.quanto_adapter import QuantoAdapter
+from piper_offload.protocols import (
     ResourceBinding,
     ResourceStore,
 )
-from torch_offload.tensor_adapters import (
+from piper_offload.tensor_adapters import (
     DequantRequantTensorAdapter,
     LoRAMergeTensorAdapter,
     RegularAdapter,
@@ -1211,7 +1211,7 @@ class TestLoRATransform:
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
-        from torch_offload.quanto_adapter import QuantoAdapter
+        from piper_offload.quanto_adapter import QuantoAdapter
 
         rows, cols, rank = 4, 8, 2
         qt = WeightQBytesTensor.create(

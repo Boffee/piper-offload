@@ -9,11 +9,11 @@ import torch.multiprocessing as mp
 from torch import nn
 from torch.distributed.tensor import Partial, Replicate, Shard
 
-import torch_offload.dtensor_adapter as dtensor_adapter_module
-import torch_offload.lora as lora_module
-from torch_offload import LoRATransform, ScaledLoRAFactor
-from torch_offload.dtensor_adapter import DTensorAdapter, _local_shape_and_offsets
-from torch_offload.tensor_adapters import RegularAdapter
+import piper_offload.dtensor_adapter as dtensor_adapter_module
+import piper_offload.lora as lora_module
+from piper_offload import LoRATransform, ScaledLoRAFactor
+from piper_offload.dtensor_adapter import DTensorAdapter, _local_shape_and_offsets
+from piper_offload.tensor_adapters import RegularAdapter
 
 
 def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:

@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import (
+from piper_offload import (
     LoRA,
     LoRATransform,
     ModelOffloader,
@@ -16,13 +16,13 @@ from torch_offload import (
     StreamConfig,
     merge_lora,
 )
-from torch_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
-from torch_offload.dtensor_adapter import DTensorAdapter
-from torch_offload.pinned_module import PinnedModuleStore
-from torch_offload.pinned_param import PinnedParam
-from torch_offload.streamed_component import _param_target_layout
-from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
-from torch_offload.tensor_adapters import (
+from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
+from piper_offload.dtensor_adapter import DTensorAdapter
+from piper_offload.pinned_module import PinnedModuleStore
+from piper_offload.pinned_param import PinnedParam
+from piper_offload.streamed_component import _param_target_layout
+from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
+from piper_offload.tensor_adapters import (
     CpuRoundTripTensorAdapter,
     DequantRequantTensorAdapter,
     LoRAMergeTensorAdapter,
@@ -85,8 +85,8 @@ def test_package_import_does_not_require_piper_kernels() -> None:
         "    return real_import(name, globals, locals, fromlist, level)\n"
         "builtins.__import__ = import_without_piper\n"
         "import torch\n"
-        "import torch_offload\n"
-        "from torch_offload.piper_convrot_int8_adapter import "
+        "import piper_offload\n"
+        "from piper_offload.piper_convrot_int8_adapter import "
         "PiperConvRotInt8Adapter\n"
         "assert not PiperConvRotInt8Adapter.matches(torch.zeros(1))\n"
     )

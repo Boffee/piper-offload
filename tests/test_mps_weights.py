@@ -1,4 +1,4 @@
-"""Tests for ``torch_offload.mps_weights.MpsWeights``."""
+"""Tests for ``piper_offload.mps_weights.MpsWeights``."""
 
 import gc
 import weakref
@@ -7,8 +7,8 @@ import pytest
 import torch
 from torch import nn
 
-from torch_offload import MpsWeights, ResourceBinding
-from torch_offload._devices import canonical_device
+from piper_offload import MpsWeights, ResourceBinding
+from piper_offload._devices import canonical_device
 
 MPS = pytest.mark.skipif(
     not (

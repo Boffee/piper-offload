@@ -4,11 +4,11 @@ import pytest
 import torch
 from torch import nn
 
-import torch_offload.quanto_adapter as quanto_adapter_module
-from torch_offload import LoRA, ModelOffloader
-from torch_offload.pinned_param import PinnedParam
-from torch_offload.quanto_adapter import QuantoAdapter
-from torch_offload.tensor_adapter_registry import tensor_id
+import piper_offload.quanto_adapter as quanto_adapter_module
+from piper_offload import LoRA, ModelOffloader
+from piper_offload.pinned_param import PinnedParam
+from piper_offload.quanto_adapter import QuantoAdapter
+from piper_offload.tensor_adapter_registry import tensor_id
 from tests.conftest import activated_model
 
 try:

@@ -7,10 +7,10 @@ from typing import cast
 import pytest
 import torch
 
-from torch_offload import TensorAdapter, register_adapter
-from torch_offload.dtensor_adapter import DTensorAdapter
-from torch_offload.tensor_adapter_registry import select_adapter, tensor_id
-from torch_offload.tensor_adapters import RegularAdapter
+from piper_offload import TensorAdapter, register_adapter
+from piper_offload.dtensor_adapter import DTensorAdapter
+from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
+from piper_offload.tensor_adapters import RegularAdapter
 
 
 def test_package_import_does_not_require_triton() -> None:
@@ -24,7 +24,7 @@ def test_package_import_does_not_require_triton() -> None:
         "'No module named triton', name='triton')\n"
         "    return real_import(name, globals, locals, fromlist, level)\n"
         "builtins.__import__ = import_without_triton\n"
-        "import torch_offload\n"
+        "import piper_offload\n"
     )
     completed = subprocess.run(
         [sys.executable, "-c", script],

@@ -1,13 +1,12 @@
-# Memory
+# Piper Offload
 
 A model-agnostic GPU/CPU memory manager for PyTorch. It caches reusable
 model and LoRA resources, and swaps independent models in and out of
 GPU memory under a policy-driven cache.
 
-Self-contained, library-friendly: no dependencies beyond `torch` (plus
-optional `bitsandbytes`, `optimum.quanto`, `gguf`, `piper-kernels`, and
-`torchao` for quantized models). Designed to be lifted into its own package
-when a second consumer appears.
+Piper Offload is self-contained and library-friendly: it has no required
+dependency beyond `torch`. Optional integrations support `bitsandbytes`,
+`optimum.quanto`, `gguf`, `piper-kernels`, and `torchao` quantized models.
 
 Requires Python 3.14 or newer and PyTorch 2.13.
 
@@ -77,7 +76,7 @@ This library gives you:
 
 ```python
 import torch
-from torch_offload import ModelCache, ModelSpec
+from piper_offload import ModelCache, ModelSpec
 
 cache = ModelCache(max_cache_bytes=24 * 1024**3)
 model_spec = ModelSpec(
@@ -112,7 +111,7 @@ Use `ModelOffloader` directly when you want explicit lifecycle control without
 
 ```python
 import torch
-from torch_offload import ModelOffloader
+from piper_offload import ModelOffloader
 
 model = build_my_model()
 offload = ModelOffloader.from_module(model)
@@ -148,7 +147,7 @@ and a CUDA-stream-based async prefetcher.
 
 ```python
 import torch
-from torch_offload import ModelOffloader, StreamConfig
+from piper_offload import ModelOffloader, StreamConfig
 
 # Construction pins and binds once; cache_bytes is final immediately.
 # blocks_attr selects what streams; the residency policy is supplied per
@@ -201,7 +200,7 @@ Repeated streamed blocks can opt into forward-only Inductor compilation at
 runtime construction:
 
 ```python
-from torch_offload import BlockCompileConfig, ModelOffloader
+from piper_offload import BlockCompileConfig, ModelOffloader
 
 offload = ModelOffloader.from_module(
     model,
@@ -220,7 +219,7 @@ default mode; CUDA Graph modes and backend-specific options are intentionally
 not exposed.
 
 Only each distinct block module's `forward` is compiled. Its module
-`__call__` and torch-offload's forward-pre hook stay eager, so block
+`__call__` and Piper Offload's forward-pre hook stay eager, so block
 activation and prefetch finish before compiled computation begins. Compiled
 forwards are installed only for CUDA activations and the exact original
 forwards are restored on deactivate or activation rollback. CPU activation
@@ -239,7 +238,7 @@ a later activation with no routed LoRA uses compiled forwards again.
 Selecting `lora_mode="routed"` without supplying a LoRA does not bypass
 compilation.
 
-Compiler and backend failures propagate normally. torch-offload never catches
+Compiler and backend failures propagate normally. Piper Offload never catches
 a failed compiled invocation and retries that same block eagerly: with graph
 breaks, earlier segments may already have executed, so retrying could duplicate
 mutations. Dynamo's native graph-break and recompilation-limit behavior still
@@ -296,7 +295,7 @@ or validated when the merge hook applies.
 
 ```python
 import torch
-from torch_offload import ModelOffloader, LoRA
+from piper_offload import ModelOffloader, LoRA
 from safetensors.torch import load_file
 
 offload = ModelOffloader.from_module(
@@ -356,7 +355,7 @@ For a one-shot **permanent** merge — bake the LoRA into the model
 weights and discard the LoRA — use `merge_lora`:
 
 ```python
-from torch_offload import merge_lora, LoRA
+from piper_offload import merge_lora, LoRA
 
 merge_lora(
     model,
@@ -427,7 +426,7 @@ safe because no autograd graph spans across reuses.
 
 ```python
 import torch
-from torch_offload import ModelOffloader
+from piper_offload import ModelOffloader
 
 offload = ModelOffloader.from_module(
     model,
@@ -491,7 +490,7 @@ eviction. `ModelCache` inherits that API and adds dependency leasing, LoRA
 attachment, and device activation for model uses.
 
 ```python
-from torch_offload import (
+from piper_offload import (
     LoRASpec,
     ModelCache,
     ModelSpec,
@@ -622,7 +621,7 @@ A custom cached resource needs only one spec and one store:
 ```python
 from dataclasses import dataclass
 
-from torch_offload import ResourceSpec, ResourceStore
+from piper_offload import ResourceSpec, ResourceStore
 
 
 class MyStore:
@@ -666,10 +665,10 @@ adapter-owned staged LoRA merge. LoRA dispatch uses either dense in-place
 conversion and copy capabilities do not implicitly advertise merge support.
 
 Downstream tensor subclasses can provide their adapter without adding a
-format-specific dependency to torch-offload:
+format-specific dependency to piper-offload:
 
 ```python
-from torch_offload import TensorAdapter, register_adapter
+from piper_offload import TensorAdapter, register_adapter
 
 
 class MyTensorAdapter:
@@ -867,7 +866,7 @@ to switch without reloading it.
 
 Piper ConvRot weights (`piper_kernels.convrot.ConvRotInt8Tensor`) are handled
 when the `convrot` optional extra is installed. `piper-kernels` owns the tensor
-semantics plus reference and optimized execution backends; torch-offload owns
+semantics plus reference and optimized execution backends; Piper Offload owns
 only the built-in `PiperConvRotInt8Adapter`. `PinnedParam` pins the INT8 `qdata` and
 float32 per-output `scale`, preserves `group_size` and the logical floating
 `dtype`, and reconstructs the same wrapper around CUDA storage on activation.
@@ -975,7 +974,7 @@ H2D/D2H movement, and wrapper reconstruction; the ordinary `Float8Tensor`
 adapter remains the weight-only/dynamic path.
 
 TorchAO 0.17 normally requires the activation scale rank to equal the input
-rank. torch-offload's static adapter installs a narrow `nn.Linear` dispatch
+rank. Piper Offload's static adapter installs a narrow `nn.Linear` dispatch
 shim that flattens ordinary activations before static quantization and reshapes
 the result afterwards. A checkpoint scalar (or any one-element scale layout)
 therefore works unchanged for both 2-D and 3-D Linear inputs. LoRA merge uses
