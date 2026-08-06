@@ -34,6 +34,7 @@ bitsandbytes refactors, the pin/read path fails with a clear validation error
 not installed — 8-bit support is optional.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -48,6 +49,7 @@ from ._bnb import (
     require_int8_params,
 )
 from .tensor_adapters import (
+    adopt_cpu_storage,
     clone_to_pinned_cpu,
     empty_like_strided,
     optional_tensor_id,
@@ -189,12 +191,23 @@ class Bnb8bitAdapter:
 
     @staticmethod
     def clone_pin(t: torch.Tensor) -> _Bnb8bitPinned:
+        return Bnb8bitAdapter._host_state(t, clone_to_pinned_cpu)
+
+    @staticmethod
+    def adopt_host(t: torch.Tensor) -> _Bnb8bitPinned:
+        return Bnb8bitAdapter._host_state(t, adopt_cpu_storage)
+
+    @staticmethod
+    def _host_state(
+        t: torch.Tensor,
+        clone: Callable[..., torch.Tensor],
+    ) -> _Bnb8bitPinned:
         qt = require_int8_params(t)
         return _Bnb8bitPinned(
-            data=clone_to_pinned_cpu(
+            data=clone(
                 qt.CB, memory_format=torch.contiguous_format
             ),
-            scb=clone_to_pinned_cpu(
+            scb=clone(
                 qt.SCB, memory_format=torch.contiguous_format
             ),
         )

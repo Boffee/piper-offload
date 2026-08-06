@@ -126,6 +126,22 @@ class TestBnb8bitAdapter:
             Bnb8bitAdapter.dequantize(pinned), Bnb8bitAdapter.dequantize(p)
         )
 
+    def test_adopted_backing_retains_storage_and_metadata(self) -> None:
+        p = _make_int8()
+        cb_ptr = p.CB.data_ptr()
+        scb_ptr = p.SCB.data_ptr()
+        pageable_param = PinnedParam(p, pin_memory=False)
+        pageable = pageable_param.make_cpu_param()
+
+        assert not pageable.CB.is_pinned()
+        assert not pageable.SCB.is_pinned()
+        assert pageable_param.pinned_state.data.data_ptr() == cb_ptr
+        assert pageable_param.pinned_state.scb.data_ptr() == scb_ptr
+        assert torch.equal(
+            Bnb8bitAdapter.dequantize(pageable),
+            Bnb8bitAdapter.dequantize(p),
+        )
+
     def test_tensor_id_tracks_cb_and_scb(self) -> None:
         p = _make_int8()
         key = tensor_id(p)

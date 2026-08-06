@@ -59,6 +59,10 @@ from torch import nn
 
 from ._devices import canonical_device
 from .block_compile import BlockCompileConfig, _BlockCompileState
+from .host_backing import (
+    HostBacking,
+    validate_host_backing,
+)
 from .module_names import group_names, walk_attr_path
 from .pinned_module import (
     PinnedModuleInstance,
@@ -351,6 +355,7 @@ def _pin_block_module_stores(
     *,
     stream_param_names: set[str] | None = None,
     stream_buffer_names: set[str] | None = None,
+    pin_memory: bool = True,
 ) -> list[PinnedModuleStore]:
     """Collect, validate, and pin one :class:`PinnedModuleStore` per block.
 
@@ -378,6 +383,8 @@ def _pin_block_module_stores(
             block,
             include_param_names=params,
             include_buffer_names=buffers,
+            pin_memory=pin_memory,
+            install_backing=pin_memory,
         )
         for block, params, buffers in zip(
             blocks, block_params, block_buffers, strict=True,
@@ -578,6 +585,7 @@ class StreamedComponentStore:
         *,
         blocks_path: str,
         stream_trainable_weights: bool = False,
+        host_backing: HostBacking = "pinned",
     ) -> Self:
         """Resolve ``blocks_path`` on ``model`` and pin its streamed blocks.
 
@@ -586,6 +594,7 @@ class StreamedComponentStore:
         agree on selected names (see
         :func:`_streamed_param_names_for_blocks`).
         """
+        backing = validate_host_backing(host_backing)
         all_blocks = _resolve_blocks(model, blocks_path)
         kept = [
             (idx, block)
@@ -608,6 +617,7 @@ class StreamedComponentStore:
             blocks,
             stream_param_names=stream_param_names,
             stream_buffer_names=stream_buffer_names,
+            pin_memory=backing == "pinned",
         )
         return cls(
             _block_stores=tuple(block_stores),

@@ -22,6 +22,7 @@ from torch import nn
 
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
+    AdoptableTensorAdapter,
     BindLayoutTensorAdapter,
     CpuRoundTripTensorAdapter,
     ParameterDataSwapTensorAdapter,
@@ -36,7 +37,8 @@ class PinnedParam:
 
     Construction picks an adapter via :func:`select_adapter` based on
     the parameter's tensor type, then uses the adapter to clone-and-pin
-    the bytes. Model-bound callers create their own
+    the bytes or strictly adopt frozen CPU storage. Model-bound callers create
+    their own
     deactivated-state :class:`nn.Parameter` wrappers with
     :meth:`make_cpu_param`.
 
@@ -56,17 +58,19 @@ class PinnedParam:
     trainable Parameter identity by ``.data``-swapping into the user's
     persistent Parameter — both are supported.
 
-    Low-peak construction behavior: for plain ``torch.Tensor`` parameters,
-    construction immediately repoints the source ``Parameter.data`` at the
-    pinned clone. This releases the original source storage before the
-    owning store finishes constructing every pinned parameter, avoiding a temporary
-    2x peak for large CPU-resident models and promptly freeing GPU storage
-    for CUDA-origin models. It also means construction is not
-    rollback-safe after pinning has started: if a later pinned parameter fails
-    to pin, recovery of the partially constructed store/model is unsupported.
-    Drop those references and rebuild from a fresh model instance. Tensor
-    subclasses skip this optimization because ``.data =`` can drop wrapper
-    state.
+    Low-peak pinned construction behavior: for plain ``torch.Tensor``
+    parameters, construction immediately repoints the source
+    ``Parameter.data`` at the pinned clone. This releases the original source
+    storage before the owning store finishes constructing every pinned
+    parameter, avoiding a temporary 2x peak for large CPU-resident models and
+    promptly freeing GPU storage for CUDA-origin models. It also means pinned
+    construction is not rollback-safe after copying has started: if a later
+    parameter fails to pin, recovery of the partially constructed store/model
+    is unsupported. Drop those references and rebuild from a fresh model
+    instance. Tensor subclasses skip this optimization because ``.data =``
+    can drop wrapper state. Adopted construction instead aliases existing
+    frozen CPU storage, never copies or normalizes it, and leaves the source
+    parameter untouched until the owning store binds successfully.
     """
 
     __slots__ = (
@@ -79,7 +83,7 @@ class PinnedParam:
         "requires_grad",
     )
 
-    def __init__(self, param: nn.Parameter) -> None:
+    def __init__(self, param: nn.Parameter, *, pin_memory: bool = True) -> None:
         # The adapter operates on the tensor that carries the parameter's
         # representation: ``param.data`` for plain Parameters (including ones
         # wrapping a quant subclass), but the param object itself for a
@@ -101,15 +105,32 @@ class PinnedParam:
             self.adapter, representation,
         )
         self.requires_grad: bool = param.requires_grad
-        self.pinned_state = self.adapter.clone_pin(representation)
-        # Low-peak construction optimization: release the original source
-        # storage by repointing the source Parameter at the
-        # pinned clone immediately. This is an intentional mutation of
-        # the caller's model before the owning store has finished
+        if pin_memory:
+            self.pinned_state = self.adapter.clone_pin(representation)
+        elif self.requires_grad:
+            raise ValueError(
+                "adopted host backing is inference-only and cannot retain "
+                "a parameter with requires_grad=True. Freeze the parameter "
+                "or use host_backing='pinned'."
+            )
+        elif isinstance(self.adapter, AdoptableTensorAdapter):
+            self.pinned_state = self.adapter.adopt_host(representation)
+        else:
+            raise NotImplementedError(
+                f"{adapter_name(self.adapter)} does not support zero-copy "
+                "host adoption; implement adopt_host() on the tensor adapter "
+                "or use host_backing='pinned'."
+            )
+        # Low-peak pinned construction optimization: release the original
+        # source storage by repointing the source Parameter at the selected
+        # host backing immediately. Adopted backing deliberately skips this
+        # assignment so store capture remains non-mutating until bind commits
+        # replacement wrappers. The pinned assignment is an intentional
+        # mutation of the caller's model before the owning store has finished
         # construction; see the class docstring for failure semantics.
         # Only safe for plain tensors; subclass wrappers (and Parameter
         # subclasses) can lose metadata or ignore .data assignment.
-        if type(representation) is torch.Tensor:
+        if pin_memory and type(representation) is torch.Tensor:
             param.data = self.make_cpu_param().data
 
     @staticmethod
@@ -244,7 +265,7 @@ class PinnedParam:
         tensor wrappers such as ``DTensor``: the local shard must move and the
         wrapper must then be rebuilt on its original device mesh.
 
-        CPU materialization is a zero-copy wrapper over the pinned backing.
+        CPU materialization is a zero-copy wrapper over the host backing.
         CUDA materialization returns a parameter wrapping fresh adapter
         storage.
         """
@@ -300,5 +321,5 @@ class PinnedParam:
 
     @property
     def cache_bytes(self) -> int:
-        """Bytes this pinned parameter consumes in pinned host memory."""
+        """Logical host bytes reported by this parameter's adapter."""
         return self.adapter.cache_bytes(self.pinned_state)

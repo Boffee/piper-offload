@@ -38,6 +38,7 @@ Selected by :mod:`tensor_adapter_registry`. Importing fails silently if
 bitsandbytes is not installed — 4-bit support is optional.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,6 +55,7 @@ from ._bnb import (
     require_params_4bit,
 )
 from .tensor_adapters import (
+    adopt_cpu_storage,
     clone_to_pinned_cpu,
     empty_like_strided,
     optional_tensor_id,
@@ -268,16 +270,27 @@ class Bnb4bitAdapter:
 
     @staticmethod
     def clone_pin(t: torch.Tensor) -> _Bnb4bitPinned:
+        return Bnb4bitAdapter._host_state(t, clone_to_pinned_cpu)
+
+    @staticmethod
+    def adopt_host(t: torch.Tensor) -> _Bnb4bitPinned:
+        return Bnb4bitAdapter._host_state(t, adopt_cpu_storage)
+
+    @staticmethod
+    def _host_state(
+        t: torch.Tensor,
+        clone: Callable[..., torch.Tensor],
+    ) -> _Bnb4bitPinned:
         qt = require_params_4bit(t)
         quant_state = qt.quant_state
         stats = quant_stats(qt)
         blob_key = metadata_blob_key(stats)
         return _Bnb4bitPinned(
-            data=clone_to_pinned_cpu(
+            data=clone(
                 qt.data, memory_format=torch.contiguous_format
             ),
             buffers={
-                key: clone_to_pinned_cpu(
+                key: clone(
                     value, memory_format=torch.contiguous_format
                 )
                 for key, value in stats.items()
@@ -286,7 +299,7 @@ class Bnb4bitAdapter:
             blob_key=blob_key,
             # Metadata blob is tiny, constant, and host-resident — pin it
             # once and inject it at reconstruction; it never DMAs.
-            blob=clone_to_pinned_cpu(
+            blob=clone(
                 stats[blob_key], memory_format=torch.contiguous_format
             ),
             # The nested double-quant offset is data-dependent but lives in
@@ -294,7 +307,7 @@ class Bnb4bitAdapter:
             # across pooled streamed blocks would keep the wrong offset. Pin
             # it separately and alias it per load like the other scales.
             offset=(
-                clone_to_pinned_cpu(
+                clone(
                     quant_state.offset, memory_format=torch.contiguous_format
                 )
                 if quant_state.nested

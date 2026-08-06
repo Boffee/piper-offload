@@ -31,12 +31,12 @@ Class-specific caveats
   older pinned CPU bytes and discards active GPU updates.
 - **Caller owns lifecycle correctness.** Calling :meth:`activate`
   twice without an intervening :meth:`deactivate` raises before registry
-  movement or GPU allocation. Construction optimizes peak host memory
-  by letting :class:`PinnedParam` repoint plain ``Parameter.data``
-  at pinned clones as each pinned parameter is created; if construction or
-  activation raises after that point, retrying the same model/component
-  is unsupported — drop references and rebuild from a fresh model
-  instance.
+  movement or GPU allocation. Pinned construction optimizes peak host memory
+  by letting :class:`PinnedParam` repoint plain ``Parameter.data`` at pinned
+  clones as each pinned parameter is created; if construction or activation
+  raises after that point, retrying the same model/component is unsupported —
+  drop references and rebuild from a fresh model instance. Adopted capture is
+  non-mutating until bind, so an adoption failure leaves the model unchanged.
 - There is no ``close()``. Pinned memory is freed when the caller
   drops the component AND model references; Python's refcount-based
   GC reclaims the pinned tensors immediately. The component releases
@@ -59,6 +59,10 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
+from .host_backing import (
+    HostBacking,
+    validate_host_backing,
+)
 from .pinned_module import (
     PinnedModuleInstance,
     PinnedModuleStore,
@@ -85,13 +89,17 @@ class PinnedComponentStore:
         *,
         include_param_names: Iterable[str] | None = None,
         include_buffer_names: Iterable[str] | None = None,
+        host_backing: HostBacking = "pinned",
     ) -> Self:
-        """Pin selected model state into a reusable component store."""
+        """Create a reusable pinned-copy or adopted host store."""
+        backing = validate_host_backing(host_backing)
         return cls(
             PinnedModuleStore.from_module(
                 model,
                 include_param_names=include_param_names,
                 include_buffer_names=include_buffer_names,
+                pin_memory=backing == "pinned",
+                install_backing=backing == "pinned",
             )
         )
 
@@ -107,7 +115,7 @@ class PinnedComponentStore:
 
     @property
     def cache_bytes(self) -> int:
-        """Total pinned host bytes held by this store."""
+        """Total host-backing bytes held by this store."""
         return self._module_store.cache_bytes
 
     @property

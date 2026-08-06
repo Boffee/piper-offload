@@ -9,6 +9,7 @@ over the host-backed pinned state.
 
 from collections.abc import Sequence
 from concurrent.futures import Future
+from pathlib import Path
 
 import pytest
 import torch
@@ -191,6 +192,148 @@ class TestConstructorPins:
         finally:
             strategy.deactivate()
 
+    def test_constructor_supports_adopted_host_backing(self) -> None:
+        m = _make_block_model()
+        original_ptrs = {
+            name: param.data_ptr() for name, param in m.named_parameters()
+        }
+        strategy = ModelOffloader.from_module(
+            m,
+            blocks_attr=["transformer_blocks"],
+            host_backing="adopt",
+        )
+        try:
+            assert all(not param.is_pinned() for param in m.parameters())
+            assert {
+                name: param.data_ptr()
+                for name, param in m.named_parameters()
+            } == original_ptrs
+            assert strategy.cache_bytes > 0
+        finally:
+            strategy.deactivate()
+
+    def test_adoption_rejects_trainables_before_mutating_model(self) -> None:
+        m = nn.Linear(8, 8, bias=False)
+        original_ptr = m.weight.data_ptr()
+
+        with pytest.raises(ValueError, match="inference-only"):
+            ModelOffloader.from_module(m, host_backing="adopt")
+
+        assert m.weight.data_ptr() == original_ptr
+
+    def test_late_adoption_failure_does_not_mutate_model(self) -> None:
+        class Block(nn.Module):
+            def __init__(self, weight: torch.Tensor) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(weight, requires_grad=False)
+                self.register_buffer("state", torch.randn(2))
+
+            def forward(self, value: torch.Tensor) -> torch.Tensor:
+                return nn.functional.linear(value, self.weight)
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocks = nn.ModuleList(
+                    [
+                        Block(torch.randn(2, 3)),
+                        Block(torch.randn(3, 2).t()),
+                    ]
+                )
+
+        model = Model()
+        original_params = [block.weight for block in model.blocks]
+        original_buffers = [block.state for block in model.blocks]
+
+        with pytest.raises(ValueError, match="non-contiguous"):
+            ModelOffloader.from_module(
+                model,
+                blocks_attr=("blocks",),
+                host_backing="adopt",
+            )
+
+        assert all(
+            block.weight is original
+            for block, original in zip(
+                model.blocks, original_params, strict=True,
+            )
+        )
+        assert all(
+            block.state is original
+            for block, original in zip(
+                model.blocks, original_buffers, strict=True,
+            )
+        )
+
+    def test_adopted_backing_preserves_mmap(self, tmp_path: Path) -> None:
+        rows, cols = 8, 16
+        path = tmp_path / "weight.bin"
+        path.write_bytes(bytes(rows * cols * 4))
+        mapped = torch.from_file(
+            str(path),
+            shared=False,
+            size=rows * cols,
+            dtype=torch.float32,
+        ).view(rows, cols)
+        mapped.copy_(torch.arange(rows * cols).view(rows, cols))
+        model = nn.Linear(cols, rows, bias=False)
+        model.weight = nn.Parameter(mapped, requires_grad=False)
+        mapped_ptr = mapped.data_ptr()
+
+        strategy = ModelOffloader.from_module(
+            model,
+            host_backing="adopt",
+        )
+        try:
+            assert model.weight.data_ptr() == mapped_ptr
+            torch.testing.assert_close(model.weight, mapped)
+        finally:
+            strategy.deactivate()
+
+    def test_adopted_cache_bytes_uses_logical_component_sizes(
+        self,
+    ) -> None:
+        class Block(nn.Module):
+            def __init__(self, weight: torch.Tensor) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(weight, requires_grad=False)
+
+        class Model(nn.Module):
+            def __init__(self, backing: torch.Tensor) -> None:
+                super().__init__()
+                self.remainder = nn.Parameter(
+                    backing[:4].view(2, 2),
+                    requires_grad=False,
+                )
+                self.blocks = nn.ModuleList(
+                    [Block(backing[16:20].view(2, 2))]
+                )
+
+        backing = torch.empty(1024, dtype=torch.float32)
+        model = Model(backing)
+        strategy = ModelOffloader.from_module(
+            model,
+            blocks_attr=("blocks",),
+            host_backing="adopt",
+        )
+        try:
+            assert strategy.cache_bytes == model.remainder.nbytes + model.blocks[0].weight.nbytes
+        finally:
+            strategy.deactivate()
+
+    def test_invalid_host_backing_fails_before_mutating_model(self) -> None:
+        m = _make_block_model()
+        original = [param.data_ptr() for param in m.parameters()]
+
+        with pytest.raises(ValueError, match="host_backing"):
+            ModelOffloader.from_module(
+                m,
+                blocks_attr=["transformer_blocks"],
+                host_backing="invalid",
+            )
+
+        assert [param.data_ptr() for param in m.parameters()] == original
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle: constructor → activate → deactivate
@@ -305,6 +448,39 @@ class TestLifecycle:
             )
             assert m.embed.weight.is_cuda
             assert m.head.weight.is_cuda
+        finally:
+            strategy.deactivate()
+
+    @CUDA
+    def test_adopted_streaming_matches_eager_model(self) -> None:
+        torch.manual_seed(42)
+        eager = _make_block_model(num_blocks=4, width=32)
+        offloaded = _make_block_model(num_blocks=4, width=32)
+        offloaded.load_state_dict(eager.state_dict())
+        x = torch.randn(2, 32)
+        with torch.no_grad():
+            expected = eager(x).cuda()
+
+        strategy = ModelOffloader.from_module(
+            offloaded,
+            blocks_attr=["transformer_blocks"],
+            host_backing="adopt",
+        )
+        try:
+            with activated_model(
+                strategy,
+                "cuda",
+                stream_config=StreamConfig(
+                    num_resident_blocks=1,
+                    num_prefetch_blocks=2,
+                ),
+            ) as active:
+                with torch.no_grad():
+                    actual = active(x.cuda())
+                torch.cuda.synchronize()
+
+            torch.testing.assert_close(actual, expected)
+            assert all(not param.is_pinned() for param in offloaded.parameters())
         finally:
             strategy.deactivate()
 
@@ -979,6 +1155,26 @@ class TestValidation:
 
 
 class TestResourceCacheIntegration:
+    def test_model_spec_propagates_adopted_host_backing(self) -> None:
+        from piper_offload import ModelSpec
+
+        spec = ModelSpec(
+            key="adopted",
+            estimated_cache_bytes=1024,
+            factory=_make_block_model,
+            blocks_attr=("transformer_blocks",),
+            host_backing="adopt",
+        )
+
+        offloader = spec.build_store()
+        try:
+            assert all(
+                not param.is_pinned()
+                for param in offloader.value.parameters()
+            )
+        finally:
+            offloader.deactivate()
+
     def test_model_spec_reuses_single_model(self) -> None:
         from piper_offload import ModelCache, ModelSpec
 

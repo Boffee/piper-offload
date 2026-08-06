@@ -37,7 +37,7 @@ pip install "piper-offload[all]"
 | `model_offloader.py` | `ModelOffloader` — cached single-model runtime for whole-model bulk pinned-CPU↔GPU or streamed block offload |
 | `pinned_component.py` | `PinnedComponentStore`, `PinnedComponent` — lower-level reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
-| `lora.py` | `LoRA`, `LoRATransform` — cached pinned factors plus merge and routed application hooks |
+| `lora.py` | `LoRA`, `LoRATransform` — cached host-backed factors plus merge and routed application hooks |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, Piper ConvRot INT8, DTensor, and TorchAO dynamic/static scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
@@ -118,6 +118,62 @@ need concurrent replicas must register separately constructed models under
 distinct cache keys, which intentionally duplicates their pinned host storage.
 To release pinned host memory, evict or clear inactive cache entries and drop
 any escaped model references.
+
+### Pinned copies versus adopted model backing
+
+Model weights use owned pinned host copies by default for maximum CPU-to-GPU
+transfer bandwidth. Systems with a tight pinned-memory limit can instead
+adopt existing CPU backing without copying it:
+
+```python
+model_spec = ModelSpec(
+    key="main-adopted",
+    estimated_cache_bytes=12 * 1024**3,
+    factory=build_my_model,
+    blocks_attr=("transformer_blocks",),
+    host_backing="adopt",
+)
+
+# The same option exists on the low-level API.
+offload = ModelOffloader.from_module(
+    model,
+    blocks_attr=("transformer_blocks",),
+    host_backing="adopt",
+)
+```
+
+Adopt mode is a strict zero-copy path for frozen model state that
+already lives on CPU. The offloader retains the existing tensors rather than
+cloning them, so anonymous pageable allocations and file-backed/mmap storage
+use the same implementation and preserve their original backing. Copies go
+directly into the existing GPU target pool; CUDA owns any implicit staging.
+Trainable parameters, non-CPU tensors, incompatible layouts, and adapters that
+cannot preserve the source representation raise instead of silently
+materializing a copy. The policy applies to both streamed blocks and the
+non-streamed model remainder. LoRA resources choose their host storage
+independently (pinned by default), and `cache_bytes` accounts for model bytes
+the same way in either mode using each tensor adapter's logical byte count.
+For mmap backing, this is the size of the retained model tensors, not the
+checkpoint file size or the mmap pages currently resident in RAM.
+
+Because adopted model backing aliases its source allocations, callers must
+not mutate retained parameter or buffer references—or writable mmap contents—
+for the offloader's lifetime. `requires_grad=False` disables autograd tracking;
+it does not make the underlying bytes immutable.
+
+Adopted capture retains every selected tensor before changing any module
+registry. Only after the complete composite store succeeds does binding install
+the adopted wrappers. An adoption failure therefore leaves the supplied model's
+original parameter and buffer objects untouched.
+
+Pinned backing remains faster for transfer-bound streaming, while adopted
+backing has near-zero construction-copy cost and can be competitive
+when computation hides weight movement. Compare the complete offloader path on
+a target system with:
+
+```bash
+python benchmarks/benchmark_offloader_host_backing.py
+```
 
 ## Manual offloader lifecycle
 
@@ -206,7 +262,7 @@ bulk-pinned component that activation copies to the GPU.
 no target pool, no streaming hooks, no weight copies.
 `lora_mode="merge"` is CUDA-only; use routed LoRA mode for
 CPU activation. Routed LoRA installs target-Linear hooks: a forward-PRE
-hook copies that target's pinned factors to the input device, and a
+hook copies that target's host-backed factors to the input device, and a
 forward-POST hook applies the residual and releases those device copies.
 
 ### Optional streamed-block compilation
@@ -320,7 +376,7 @@ offload = ModelOffloader.from_module(
 )
 device = torch.device("cuda")
 
-# Each LoRA owns immutable pinned factors shared by merge and routed uses.
+# Each LoRA owns immutable factors shared by merge and routed uses.
 lora_a = LoRA.from_state_dict(
     state_dict=load_file("lora_a.safetensors"),
 )
@@ -339,6 +395,25 @@ try:
 finally:
     offload.deactivate()
 ```
+
+LoRA factors use pinned storage by default. To retain existing anonymous
+pageable or mmap/file-backed CPU tensors without copying them, use strict
+adoption:
+
+```python
+lora = LoRA.from_state_dict(
+    state_dict=load_file("lora.safetensors"),
+    host_backing="adopt",
+)
+```
+
+The loader must return tensors that still reference the desired backing.
+Adopted LoRA backing requires contiguous CPU factors and raises rather than
+moving or normalizing them. A `dtype=` conversion is also rejected because it
+would allocate new storage; pre-convert the checkpoint or use pinned backing.
+Because the resource aliases adopted tensors, callers must not mutate those
+storages during the LoRA's lifetime. Pinned factors generally transfer faster,
+especially in routed mode where the matched factors move on every invocation.
 
 Block reload from pristine pinned CPU storage automatically clears
 the previous merge — no explicit unmerge step needed.
@@ -602,7 +677,7 @@ registration / cache admission
         |                            |
         |                            +-- PinnedParam(s)
         |
-        +-- builds/admit --> LoRA (pinned factors)
+        +-- builds/admit --> LoRA (pinned or adopted factors)
         |
         +-- builds/admit --> custom ResourceStore
         |
@@ -675,7 +750,10 @@ cache bytes, logical compute dtype, and block-layout signatures. Extra
 behaviors are explicit capabilities: CPU round-trip for optimizer-step
 sync, `Parameter.data` swap for trainable streaming, shape-preserving
 dequantize/requantize conversion, representation-preserving `copy_into`, and
-adapter-owned staged LoRA merge. LoRA dispatch uses either dense in-place
+adapter-owned staged LoRA merge. Zero-copy host adoption is another optional
+capability: `adopt_host()` returns adapter-specific state that aliases the
+existing CPU storage. The existing `cache_bytes()` method accounts for either
+pinned or adopted state. LoRA dispatch uses either dense in-place
 `addmm_` for plain bases or the staged merge capability for structured bases;
 conversion and copy capabilities do not implicitly advertise merge support.
 
@@ -683,11 +761,17 @@ Downstream tensor subclasses can provide their adapter without adding a
 format-specific dependency to piper-offload:
 
 ```python
-from piper_offload import TensorAdapter, register_adapter
+from piper_offload import (
+    AdoptableTensorAdapter,
+    TensorAdapter,
+    register_adapter,
+)
 
 
 class MyTensorAdapter:
     # Implement the stateless TensorAdapter protocol.
+    # To support host_backing="adopt", also implement the
+    # AdoptableTensorAdapter protocol and return adopted adapter state.
     ...
 
 
@@ -704,14 +788,14 @@ for tests and scoped integrations.
 
 ## Cached resource lifecycle
 
-Cached resources own cache accounting. Pinning happens during construction so
-`cache_bytes` is final at admission time; leases protect resources while they
-are used. `ModelOffloader` owns one exclusive activation lifecycle. `LoRA`
-remains immutable pinned backing throughout its lease:
+Cached resources own cache accounting. Host capture happens during construction
+so `cache_bytes` is final at admission time; leases protect resources while
+they are used. `ModelOffloader` owns one exclusive activation lifecycle. `LoRA`
+remains immutable host backing throughout its lease:
 
 ```
 ModelOffloader: construct -> lease -> activate <-> deactivate -> release lease
-LoRA:            construct -> lease -> read pinned factors -> release lease
+LoRA:            construct -> lease -> read host factors -> release lease
 ```
 
 `ModelOffloader.activate(device=...)` makes the model usable for compute on the
@@ -722,8 +806,8 @@ release them after enqueueing the residual.
 `StreamedComponent` require an explicit device. CUDA activation uses the
 streaming/DMA path where applicable; CPU activation is pass-through over
 pinned host-backed storage.
-`deactivate()` releases transient device resources. Pinned storage remains
-cached until its resource is evicted or otherwise released.
+`deactivate()` releases transient device resources. Host backing remains cached
+until its resource is evicted or otherwise released.
 
 Construction optimizes peak host memory. Pinning clones managed tensors
 into pinned CPU storage. For plain `torch.Tensor` parameters, the source
@@ -839,9 +923,9 @@ Notes:
   mergeable. int8 cannot be transposed.
 - **‡** DTensor merge supports rank-two weights with ordinary `Replicate`
   and contiguous `Shard` placements. Each rank selects the rows and columns
-  needed by its local weight shard from the pinned plain LoRA factors before
-  device staging, then delegates the update to that shard's adapter; no
-  collective is required. The full factors remain in pinned host memory.
+  needed by its local weight shard from the plain host-backed LoRA factors
+  before device staging, then delegates the update to that shard's adapter; no
+  collective is required. The full factors remain in host memory.
   The inner adapter must support LoRA merge.
   Unsupported local tensor types and placements must use routed LoRA.
   DTensor factors themselves are not accepted in merge mode.

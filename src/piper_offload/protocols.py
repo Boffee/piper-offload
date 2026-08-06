@@ -29,9 +29,12 @@ Composable lifecycle pieces inside a model runtime include
 Lifecycle
 ---------
 Backing state is set up before cache admission so store ``cache_bytes``
-is final immediately. :class:`~piper_offload.ResourceCache` keeps stores
-cached and protects them with reference-counted leases. A store may itself
-implement the active lifecycle. That lifecycle is
+is final immediately. Tensor-backed stores report logical representation bytes
+through their adapters; this is not a measurement of allocation capacity,
+checkpoint file size, or mmap pages currently resident in RAM.
+:class:`~piper_offload.ResourceCache` keeps stores cached and protects them
+with reference-counted leases. A store may itself implement the active
+lifecycle. That lifecycle is
 ``activate(device=...)`` (make the value usable, on the caller-selected
 device when device-aware) ->
 ``deactivate()`` (release transient compute resources while store

@@ -1,9 +1,9 @@
 """LoRA types and per-weight merge / routed transforms.
 
-:class:`LoRA` pairs, validates, and pins factor matrices from a flat
-safetensors state dict at construction. The raw state dict is not retained —
-the resource owns one immutable copy of the pinned factors that merge and
-routed consumers may share.
+:class:`LoRA` pairs and validates factor matrices from a flat safetensors state
+dict at construction. By default it owns pinned copies; strict adoption mode
+instead adopts existing CPU allocations, including mmap-backed storage. Merge
+and routed consumers may share either immutable host backing.
 
 Two application paths apply the resource's factors:
 
@@ -39,6 +39,10 @@ import torch
 from torch import nn
 
 from .dtensor_adapter import DTensorAdapter
+from .host_backing import (
+    HostBacking,
+    validate_host_backing,
+)
 from .pinned_param import PinnedParam
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import LoRAMergeTensorAdapter, adapter_name
@@ -56,13 +60,13 @@ type LoRAMode = Literal["merge", "routed"]
 
 @dataclass(slots=True, frozen=True)
 class LoRAFactor:
-    """A LoRA's pinned factor pair for one target weight.
+    """A LoRA's host-backed factor pair for one target weight.
 
     ``a`` is the ``(rank, in_dim)`` down-projection and ``b`` the
     ``(out_dim, rank)`` up-projection, each held as a :class:`PinnedParam`.
     Strength is *not* part of the pair — it is extrinsic and supplied when the
     LoRA is bound to a target. Per-pair shape
-    validity is checked before pinning (in :func:`_validate_factor_pair`); the
+    validity is checked before capture (in :func:`_validate_factor_pair`); the
     match against a concrete target shape is checked separately, where the
     target is known.
 
@@ -76,17 +80,17 @@ class LoRAFactor:
 
     @property
     def cache_bytes(self) -> int:
-        """Pinned host bytes held by this factor pair."""
+        """Host-backing bytes held by this factor pair."""
         return self.a.cache_bytes + self.b.cache_bytes
 
     def scaled(self, strength: float) -> ScaledLoRAFactor:
-        """Bind this pinned factor pair to ``strength``."""
+        """Bind this host-backed factor pair to ``strength``."""
         return ScaledLoRAFactor(self.a, self.b, strength)
 
 
 @dataclass(slots=True, frozen=True)
 class ScaledLoRAFactor:
-    """A pinned factor pair bound to an application ``strength``.
+    """A host-backed factor pair bound to an application ``strength``.
 
     The application-side carrier used by :class:`LoRATransform` and routed
     hooks. Keeping :class:`PinnedParam` rather than CPU tensor views preserves
@@ -96,7 +100,7 @@ class ScaledLoRAFactor:
 
     Use :meth:`from_tensors` when constructing a standalone transform from
     unpinned tensors. LoRA resources normally create this through
-    :meth:`LoRAFactor.scaled` and reuse their existing pinned backing.
+    :meth:`LoRAFactor.scaled` and reuse their existing host backing.
     """
 
     a: PinnedParam
@@ -147,11 +151,13 @@ class ScaledLoRAFactor:
 
 
 class LoRA:
-    """Reusable immutable pinned LoRA resource.
+    """Reusable immutable host-backed LoRA resource.
 
     Build once from a flat ``state_dict``: factor pairs are validated, cast to
-    the optional storage ``dtype``, and pinned directly. The resource owns the
-    single pinned copy and does not retain the raw ``state_dict``.
+    the optional storage ``dtype``, and pinned directly by default. Adopt mode
+    retains compatible CPU factor storage without copying it. The resource
+    retains the resulting factor tensors but not the raw ``state_dict``
+    mapping.
 
     Satisfies :class:`~piper_offload.protocols.ResourceStore`, so it can be
     registered in :class:`~piper_offload.ResourceCache` for budget tracking and
@@ -179,18 +185,31 @@ class LoRA:
         state_dict: dict[str, torch.Tensor],
         *,
         dtype: torch.dtype | None = None,
+        host_backing: HostBacking = "pinned",
     ) -> Self:
-        """Pair, validate, build, and pin ``state_dict`` into a LoRA.
+        """Pair, validate, and build ``state_dict`` into a LoRA.
 
-        ``dtype`` casts every factor before pinning. For routed mode, matching
-        the model's compute dtype reduces pinned storage and per-forward H2D
+        ``dtype`` casts every factor before pinned capture. For routed mode,
+        matching the model's compute dtype reduces storage and per-forward H2D
         traffic. Left as ``None``, factors keep their stored dtype. Merge mode
-        casts at apply time regardless.
+        casts at apply time regardless. ``host_backing="adopt"`` strictly
+        adopts existing CPU storage and therefore rejects any ``dtype`` that
+        would require conversion. Adopted factor storage must remain immutable
+        for the resource's lifetime.
         """
+        backing = validate_host_backing(host_backing)
         if dtype is not None and not dtype.is_floating_point:
             raise ValueError(f"LoRA dtype must be floating-point, got {dtype}.")
         _validate_lora_state_dict(state_dict)
-        return cls(_pin_lora_targets(state_dict, dtype=dtype))
+        if backing == "adopt":
+            _validate_adopted_lora_dtype(state_dict, dtype=dtype)
+        return cls(
+            _build_lora_targets(
+                state_dict,
+                dtype=dtype,
+                pin_memory=backing == "pinned",
+            )
+        )
 
     @property
     def targets(self) -> Mapping[str, LoRAFactor]:
@@ -205,7 +224,7 @@ class LoRA:
 class LoRATransform:
     """Per-weight LoRA factors applied to one base parameter.
 
-    Holds references to LoRA-owned pinned factor matrices — no cloning or
+    Holds references to LoRA-owned host factor matrices — no cloning or
     pinning happens here. :meth:`apply` copies factors to the target
     parameter's device and delegates the update to its tensor adapter. Multiple
     ordinary factors are packed into transient buffers and applied as one
@@ -310,7 +329,7 @@ class LoRATransform:
         list[tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]],
         tuple[int, ...],
     ]:
-        """Slice pinned factors to a DTensor target's local shard."""
+        """Slice host-backed factors to a DTensor target's local shard."""
         if not isinstance(adapter, DTensorAdapter):
             return list(factor_tensors), logical_shape
 
@@ -370,15 +389,15 @@ class LoRATransform:
             tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
         ],
     ) -> None:
-        if cls._are_plain_pinned_factors(factor_tensors):
+        if cls._are_plain_cpu_factors(factor_tensors):
             return
         raise ValueError(
-            "LoRA merge requires plain pinned torch.Tensor "
+            "LoRA merge requires plain CPU torch.Tensor "
             "factors; wrapped factor representations are unsupported."
         )
 
     @staticmethod
-    def _are_plain_pinned_factors(
+    def _are_plain_cpu_factors(
         factor_tensors: Sequence[
             tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
         ],
@@ -388,8 +407,6 @@ class LoRATransform:
             and type(b) is torch.Tensor
             and a.device.type == "cpu"
             and b.device.type == "cpu"
-            and a.is_pinned()
-            and b.is_pinned()
             for _factor, a, b in factor_tensors
         )
 
@@ -540,7 +557,7 @@ def _stage_routed_factors(
     factors: Sequence[ScaledLoRAFactor],
     x: torch.Tensor,
 ) -> tuple[_StagedLoRAFactor, ...]:
-    """Adapter-materialize pinned factors on the invocation's input device."""
+    """Materialize host factors on the invocation's input device."""
     return tuple(
         _StagedLoRAFactor(
             factor.a.materialize(x.device, non_blocking=True),
@@ -555,7 +572,7 @@ def install_routed_residual_hook(
     parent: nn.Module,
     factors: Sequence[ScaledLoRAFactor],
 ) -> Callable[[], None]:
-    """Stage pinned factors in a PRE hook and add their residual in POST.
+    """Stage host factors in a PRE hook and add their residual in POST.
 
     Returns an idempotent callable that removes both hooks. One hook pair
     covers every LoRA targeting this parent. Device copies are scoped to a
@@ -623,23 +640,62 @@ def install_routed_residual_hook(
 # ---------------------------------------------------------------------------
 
 
-def _pin_lora_targets(
+def _build_lora_targets(
     state_dict: dict[str, torch.Tensor],
     *,
     dtype: torch.dtype | None = None,
+    pin_memory: bool = True,
 ) -> Mapping[str, LoRAFactor]:
-    """Pin each validated factor pair without building a module hierarchy."""
+    """Build each validated factor pair without a module hierarchy."""
     a_tensors, b_tensors = _split_factor_tensors(state_dict)
     factors: dict[str, LoRAFactor] = {}
     for base, a_source in a_tensors.items():
         b_source = b_tensors[base]
-        a_tensor = a_source if dtype is None else a_source.to(dtype=dtype)
-        b_tensor = b_source if dtype is None else b_source.to(dtype=dtype)
+        a_tensor = (
+            a_source
+            if dtype is None or a_source.dtype is dtype
+            else a_source.to(dtype=dtype)
+        )
+        b_tensor = (
+            b_source
+            if dtype is None or b_source.dtype is dtype
+            else b_source.to(dtype=dtype)
+        )
         factors[f"{base}.weight"] = LoRAFactor(
-            a=PinnedParam(nn.Parameter(a_tensor, requires_grad=False)),
-            b=PinnedParam(nn.Parameter(b_tensor, requires_grad=False)),
+            a=PinnedParam(
+                nn.Parameter(a_tensor, requires_grad=False),
+                pin_memory=pin_memory,
+            ),
+            b=PinnedParam(
+                nn.Parameter(b_tensor, requires_grad=False),
+                pin_memory=pin_memory,
+            ),
         )
     return factors
+
+
+def _validate_adopted_lora_dtype(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    dtype: torch.dtype | None,
+) -> None:
+    """Reject a requested conversion that would defeat source adoption."""
+    if dtype is None:
+        return
+    a_tensors, b_tensors = _split_factor_tensors(state_dict)
+    incompatible = [
+        f"{base}.lora_{side}.weight"
+        for side, tensors in (("A", a_tensors), ("B", b_tensors))
+        for base, tensor in tensors.items()
+        if tensor.dtype is not dtype
+    ]
+    if incompatible:
+        raise ValueError(
+            "adopted LoRA host backing cannot convert factor dtype without "
+            "copying and losing source/mmap backing. Remove dtype=, convert "
+            "the source before loading, or use host_backing='pinned'. "
+            f"Mismatched factors: {incompatible!r}."
+        )
 
 
 def _validate_lora_state_dict(state_dict: dict[str, torch.Tensor]) -> None:

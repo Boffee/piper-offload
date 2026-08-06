@@ -100,6 +100,15 @@ class TestDTensorAdapter:
         assert isinstance(pinned_param.pinned_state.inner, RegularAdapter)
         assert isinstance(pinned_param.pinned_state.inner, LoRAMergeTensorAdapter)
 
+    def test_host_adoption_rejects_cuda_local_shard(self, tp_mesh: Any) -> None:
+        dt, _ = _dtensor_weight(tp_mesh)
+
+        with pytest.raises(NotImplementedError, match="host adoption"):
+            PinnedParam(
+                nn.Parameter(dt, requires_grad=False),
+                pin_memory=False,
+            )
+
     def test_pinned_param_roundtrip_reconstructs_dtensor(self, tp_mesh: Any) -> None:
         dt, full = _dtensor_weight(tp_mesh)
         pinned_param = PinnedParam(nn.Parameter(dt, requires_grad=False))

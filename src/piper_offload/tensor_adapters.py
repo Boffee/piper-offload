@@ -37,6 +37,7 @@ import torch
 from torch import nn
 
 __all__ = [
+    "AdoptableTensorAdapter",
     "BindLayoutTensorAdapter",
     "CpuRoundTripTensorAdapter",
     "DequantRequantTensorAdapter",
@@ -47,6 +48,7 @@ __all__ = [
     "TensorAdapter",
     "TensorCopyIntoAdapter",
     "adapter_name",
+    "adopt_cpu_storage",
     "clone_to_pinned_cpu",
     "empty_like_strided",
     "metadata_key",
@@ -159,8 +161,26 @@ class TensorAdapter[PinnedStateT, GpuStateT](Protocol):
 
     @staticmethod
     def cache_bytes(state: PinnedStateT) -> int:
-        """Total bytes this state consumes in host memory. Used by
-        :class:`ResourceCache` for budget accounting."""
+        """Logical representation bytes charged to :class:`ResourceCache`.
+
+        Count the tensor bytes represented by ``state``. This is deliberately
+        independent of an adopted tensor's underlying allocation capacity,
+        checkpoint file size, and current mmap residency.
+        """
+        ...
+
+
+@runtime_checkable
+class AdoptableTensorAdapter[PinnedStateT](Protocol):
+    """Optional capability for adopting existing CPU host state.
+
+    This stays separate from :class:`TensorAdapter` so existing third-party
+    adapters remain compatible with the default pinned path.
+    """
+
+    @staticmethod
+    def adopt_host(t: torch.Tensor) -> PinnedStateT:
+        """Return adapter state that aliases existing CPU storage."""
         ...
 
 
@@ -386,6 +406,44 @@ def clone_to_pinned_cpu(
     return pinned
 
 
+def adopt_cpu_storage(
+    t: torch.Tensor,
+    *,
+    memory_format: torch.memory_format = torch.preserve_format,
+) -> torch.Tensor:
+    """Return a detached alias of compatible existing CPU storage.
+
+    Adoption is deliberately strict: callers are asking to retain the source
+    allocation (including mmap/file backing), so this helper never moves,
+    clones, or normalizes a tensor implicitly.
+    """
+    source = t.detach()
+    if source.device.type != "cpu":
+        raise ValueError(
+            "adopted host backing requires an existing CPU tensor; "
+            f"got device {source.device}. Move the model to CPU first or use "
+            "host_backing='pinned'."
+        )
+    if (
+        memory_format == torch.contiguous_format
+        and not source.is_contiguous()
+    ):
+        raise ValueError(
+            "adopted host backing cannot retain a non-contiguous tensor "
+            "where this adapter requires contiguous storage; materialize a "
+            "contiguous CPU tensor before constructing the offloader."
+        )
+    if memory_format not in (
+        torch.preserve_format,
+        torch.contiguous_format,
+    ):
+        raise ValueError(
+            "adopted host backing only supports preserve_format or "
+            "contiguous_format adoption."
+        )
+    return source
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers for structured-tensor adapters (nvfp4, float8, ...)
 # ---------------------------------------------------------------------------
@@ -528,6 +586,15 @@ class RegularAdapter:
     def clone_pin(t: torch.Tensor) -> _RegularPinned:
         return _RegularPinned(
             data=clone_to_pinned_cpu(
+                t.data,
+                memory_format=torch.contiguous_format,
+            )
+        )
+
+    @staticmethod
+    def adopt_host(t: torch.Tensor) -> _RegularPinned:
+        return _RegularPinned(
+            data=adopt_cpu_storage(
                 t.data,
                 memory_format=torch.contiguous_format,
             )

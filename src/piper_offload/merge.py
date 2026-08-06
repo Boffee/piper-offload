@@ -51,7 +51,7 @@ def merge_lora(
     """Merge one or more LoRAs into model parameters in-place.
 
     Returns the number of unique parameters that were modified. Merge reads
-    immutable pinned factor backing, so the same LoRA may also serve other
+    immutable host factor backing, so the same LoRA may also serve other
     merge or routed uses. All target names and merge capabilities are
     validated before any parameter is modified.
     """

@@ -5,7 +5,7 @@ from typing import Self
 
 import torch
 
-from .tensor_adapters import clone_to_pinned_cpu
+from .tensor_adapters import adopt_cpu_storage, clone_to_pinned_cpu
 
 
 @dataclass(slots=True, eq=False)
@@ -16,9 +16,10 @@ class PinnedBuffer:
     target_layout: tuple[object, ...]
 
     @classmethod
-    def clone(cls, buffer: torch.Tensor) -> Self:
-        """Clone ``buffer`` into pinned CPU storage."""
-        tensor = clone_to_pinned_cpu(
+    def clone(cls, buffer: torch.Tensor, *, pin_memory: bool = True) -> Self:
+        """Clone into pinned RAM or adopt existing CPU storage."""
+        materialize = clone_to_pinned_cpu if pin_memory else adopt_cpu_storage
+        tensor = materialize(
             buffer,
             memory_format=torch.contiguous_format,
         )
@@ -53,7 +54,7 @@ class PinnedBuffer:
 
     @property
     def cache_bytes(self) -> int:
-        return self.tensor.numel() * self.tensor.element_size()
+        return self.tensor.nbytes
 
 
 __all__ = ["PinnedBuffer"]

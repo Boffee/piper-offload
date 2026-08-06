@@ -26,6 +26,10 @@ import torch
 from torch import nn
 
 from .block_compile import BlockCompileConfig
+from .host_backing import (
+    HostBacking,
+    validate_host_backing,
+)
 from .module_names import buffer_names, parameter_names
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .pinned_module import PostCopyHook
@@ -176,6 +180,7 @@ class CompositeComponentStore:
         *,
         blocks_attr: Sequence[str] = (),
         stream_trainable_weights: bool = False,
+        host_backing: HostBacking = "pinned",
     ) -> Self:
         """Decompose ``model`` into a pinned remainder + streamed block groups.
 
@@ -185,12 +190,15 @@ class CompositeComponentStore:
         :class:`~piper_offload.PinnedComponentStore`. With no ``blocks_attr``
         (the default), nothing streams — the whole model is one pinned store.
         """
+        backing = validate_host_backing(host_backing)
+
         # One streamed store per block path.
         streamed_stores = tuple(
             StreamedComponentStore.from_module(
                 model,
                 blocks_path=blocks_path,
                 stream_trainable_weights=stream_trainable_weights,
+                host_backing=backing,
             )
             for blocks_path in blocks_attr
         )
@@ -205,6 +213,7 @@ class CompositeComponentStore:
                 model,
                 include_param_names=pinned_params,
                 include_buffer_names=pinned_buffers,
+                host_backing=backing,
             )
             if pinned_params or pinned_buffers
             else None
@@ -220,7 +229,7 @@ class CompositeComponentStore:
     @property
     def cache_bytes(self) -> int:
         pinned = self.pinned_store.cache_bytes if self.pinned_store else 0
-        return pinned + sum(s.cache_bytes for s in self.streamed_stores)
+        return pinned + sum(store.cache_bytes for store in self.streamed_stores)
 
     @property
     def has_trainables(self) -> bool:

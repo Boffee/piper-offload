@@ -7,7 +7,11 @@ from typing import cast
 import pytest
 import torch
 
-from piper_offload import TensorAdapter, register_adapter
+from piper_offload import (
+    AdoptableTensorAdapter,
+    TensorAdapter,
+    register_adapter,
+)
 from piper_offload.dtensor_adapter import DTensorAdapter
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import RegularAdapter
@@ -174,3 +178,13 @@ def test_dtensor_outer_wrapper_precedes_external_adapters(
 
 def test_tensor_adapter_contract_is_public() -> None:
     assert isinstance(_ExternalAdapter(), TensorAdapter)
+
+
+def test_host_adoption_contract_is_public() -> None:
+    tensor = _external_tensor()
+    adapter = _ExternalAdapter()
+
+    assert isinstance(adapter, AdoptableTensorAdapter)
+    state = adapter.adopt_host(tensor)
+
+    assert state.data.data_ptr() == tensor.data_ptr()

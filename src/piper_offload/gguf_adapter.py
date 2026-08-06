@@ -26,13 +26,14 @@ Selected by :mod:`tensor_adapter_registry`. Import fails silently if the
 ``gguf`` package is not installed — GGUF support is optional.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
 from torch import nn
 
-from .tensor_adapters import clone_to_pinned_cpu
+from .tensor_adapters import adopt_cpu_storage, clone_to_pinned_cpu
 
 _DEQUANT_SHAPE: Any = None
 _DEQUANTIZE: Any = None
@@ -203,9 +204,20 @@ class GgufAdapter:
 
     @staticmethod
     def clone_pin(t: torch.Tensor) -> _GgufPinned:
+        return GgufAdapter._host_state(t, clone_to_pinned_cpu)
+
+    @staticmethod
+    def adopt_host(t: torch.Tensor) -> _GgufPinned:
+        return GgufAdapter._host_state(t, adopt_cpu_storage)
+
+    @staticmethod
+    def _host_state(
+        t: torch.Tensor,
+        clone: Callable[..., torch.Tensor],
+    ) -> _GgufPinned:
         weight = _require_gguf_weight(t)
         raw = weight.as_subclass(torch.Tensor)
-        pinned = clone_to_pinned_cpu(
+        pinned = clone(
             raw,
             memory_format=torch.contiguous_format,
         )

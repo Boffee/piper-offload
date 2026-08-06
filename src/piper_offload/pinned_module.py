@@ -74,13 +74,23 @@ class PinnedModuleStore:
         *,
         include_param_names: Iterable[str] | None = None,
         include_buffer_names: Iterable[str] | None = None,
+        pin_memory: bool = True,
+        install_backing: bool = True,
     ) -> Self:
-        """Pin ``module`` into a name-keyed store.
+        """Capture ``module`` into a name-keyed host store.
 
-        Store construction is intentionally side-effecting like the
-        existing pinning path: after bytes are pinned, selected module
-        state is restored to the store-backed pinned CPU state.
+        For adopted capture, ``install_backing=False`` leaves module
+        registries untouched. Composite construction uses that two-phase path
+        so all source tensors can be adopted successfully before :meth:`bind`
+        commits any replacement wrappers. Pinned callers retain the existing
+        eager-install behavior and cannot defer it because pinning may release
+        source allocations incrementally.
         """
+        if pin_memory and not install_backing:
+            raise ValueError(
+                "deferred host-backing installation is only supported for "
+                "host adoption."
+            )
         all_params = _named_parameters(module)
         params = _select_known_names(
             all_params,
@@ -93,18 +103,33 @@ class PinnedModuleStore:
             include_buffer_names,
         )
 
+        if not pin_memory:
+            trainable_names = [
+                name for name, param in params.items() if param.requires_grad
+            ]
+            if trainable_names:
+                raise ValueError(
+                    "adopted host backing is inference-only; freeze the "
+                    "selected parameters before constructing the store. "
+                    f"Trainable parameters: {trainable_names!r}."
+                )
+
         store = cls(
-            params=_pin_params(params),
-            buffers=_pin_buffers(buffers),
+            params=_pin_params(params, pin_memory=pin_memory),
+            buffers=_pin_buffers(buffers, pin_memory=pin_memory),
         )
         _validate_trainable_param_data_swaps(store.params)
-        _install_pinned_params(module, store.params)
-        _install_pinned_buffers(module, store.buffers)
+        if install_backing:
+            _install_pinned_params(module, store.params)
+            _install_pinned_buffers(module, store.buffers)
         return store
 
     @property
     def cache_bytes(self) -> int:
-        return _unique_cache_bytes(self.params) + _unique_cache_bytes(self.buffers)
+        return (
+            _unique_cache_bytes(self.params)
+            + _unique_cache_bytes(self.buffers)
+        )
 
     @property
     def has_trainables(self) -> bool:
@@ -338,14 +363,18 @@ class PinnedModuleInstance:
             yield param
 
 
-def _pin_params(params: Mapping[str, nn.Parameter]) -> dict[str, PinnedParam]:
+def _pin_params(
+    params: Mapping[str, nn.Parameter],
+    *,
+    pin_memory: bool,
+) -> dict[str, PinnedParam]:
     pinned_by_name: dict[str, PinnedParam] = {}
     for names in group_names(
         params.keys(),
         lambda name: param_tensor_id(params[name]),
     ):
         _validate_param_storage_group_requires_grad(names, params)
-        pinned = PinnedParam(params[names[0]])
+        pinned = PinnedParam(params[names[0]], pin_memory=pin_memory)
         _validate_param_storage_group_tieable(names, pinned)
         for name in names:
             pinned_by_name[name] = pinned
@@ -374,13 +403,20 @@ def _validate_param_storage_group_tieable(
         )
 
 
-def _pin_buffers(buffers: Mapping[str, torch.Tensor]) -> dict[str, PinnedBuffer]:
+def _pin_buffers(
+    buffers: Mapping[str, torch.Tensor],
+    *,
+    pin_memory: bool,
+) -> dict[str, PinnedBuffer]:
     pinned_by_name: dict[str, PinnedBuffer] = {}
     for names in group_names(
         buffers.keys(),
         lambda name: buffer_tensor_id(buffers[name]),
     ):
-        pinned = PinnedBuffer.clone(buffers[names[0]])
+        pinned = PinnedBuffer.clone(
+            buffers[names[0]],
+            pin_memory=pin_memory,
+        )
         for name in names:
             pinned_by_name[name] = pinned
     return pinned_by_name

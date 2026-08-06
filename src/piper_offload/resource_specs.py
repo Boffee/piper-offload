@@ -13,6 +13,7 @@ import torch
 from torch import nn
 
 from .block_compile import BlockCompileConfig
+from .host_backing import HostBacking
 from .lora import LoRA
 from .model_offloader import ModelOffloader
 from .protocols import ResourceStore
@@ -25,7 +26,9 @@ class ModelSpec[M: nn.Module]:
     ``factory`` runs once to construct the cached :class:`ModelOffloader`.
     Every lease reuses that same model runtime sequentially; overlapping uses
     are rejected by the offloader. ``block_compile`` is an opt-in construction
-    policy for every streamed group named by ``blocks_attr``.
+    policy for every streamed group named by ``blocks_attr``. ``host_backing``
+    selects pinned copies (the default) or strict zero-copy adoption of
+    existing CPU model backing.
     """
 
     key: str
@@ -34,6 +37,7 @@ class ModelSpec[M: nn.Module]:
     blocks_attr: tuple[str, ...] = ()
     stream_trainable_weights: bool = False
     block_compile: BlockCompileConfig | None = None
+    host_backing: HostBacking = "pinned"
 
     def build_store(self) -> ModelOffloader:
         """Build, pin, and bind the cached model runtime."""
@@ -42,6 +46,7 @@ class ModelSpec[M: nn.Module]:
             blocks_attr=self.blocks_attr,
             stream_trainable_weights=self.stream_trainable_weights,
             block_compile=self.block_compile,
+            host_backing=self.host_backing,
         )
 
     def value(self, store: ResourceStore) -> ModelOffloader:
@@ -53,20 +58,24 @@ class ModelSpec[M: nn.Module]:
 class LoRASpec:
     """LoRA resource built from a state-dict factory.
 
-    ``dtype`` is forwarded to :meth:`LoRA.from_state_dict`; matching the
-    model's compute dtype reduces routed per-forward transfer volume.
+    ``dtype`` and ``host_backing`` are forwarded to
+    :meth:`LoRA.from_state_dict`; matching the model's compute dtype reduces
+    routed per-forward transfer volume when using pinned backing. Adopted
+    backing strictly retains compatible CPU factor tensors.
     """
 
     key: str
     estimated_cache_bytes: int
     factory: Callable[[], dict[str, torch.Tensor]]
     dtype: torch.dtype | None = None
+    host_backing: HostBacking = "pinned"
 
     def build_store(self) -> LoRA:
         """Build and pin this reusable adapter resource."""
         return LoRA.from_state_dict(
             self.factory(),
             dtype=self.dtype,
+            host_backing=self.host_backing,
         )
 
     def value(self, store: ResourceStore) -> LoRA:
