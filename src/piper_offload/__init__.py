@@ -13,7 +13,7 @@ High-level API:
 
 Lower-level resource bindings:
 
-- :class:`ModelOffloader` -- whole-model pinned-CPU bulk cache when
+- :class:`ModelOffloader` -- whole-model host-RAM bulk cache when
   created by ``ModelOffloader.from_module(model)``, or per-block streaming
   when it is constructed with ``blocks_attr``
   and activation receives a :class:`StreamConfig`. Streaming mode supports optional LoRA merge,
@@ -26,9 +26,9 @@ Lower-level resource bindings:
   ``stream_trainable_weights=True`` to stream in-block trainable weights
   and materialize them only around ``optimizer.step()``. That step runs on
   the GPU via the ``optimizer_step()`` context; calling ``optimizer.step()``
-  after deactivation instead runs the optimizer on CPU over the pinned
+  after deactivation instead runs the optimizer on CPU over the host-backed
   weights (state stays on host). On deactivation every managed trainable's
-  ``.grad`` follows its ``.data`` to pinned CPU, so the context-free CPU
+  ``.grad`` follows its ``.data`` to CPU, so the context-free CPU
   step works for both streamed and non-streamed trainables — keep such
   trainables in fp32.
 
@@ -39,7 +39,7 @@ Lower-level resource bindings:
   close to one model plus the current tensor.
 
 The CUDA-oriented :class:`ModelOffloader` shares the underlying
-per-parameter pinned storage from
+per-parameter host storage from
 :class:`~piper_offload.pinned_param.PinnedParam` (clone + pin
 + optional quanto ``WeightQBytesTensor`` decomposition, bitsandbytes
 4-bit ``Params4bit`` (NF4/FP4) and 8-bit ``Int8Params`` (LLM.int8)
@@ -52,22 +52,32 @@ tensor-parallel ``DTensor`` weights wrapping any of the above).
 implement the :class:`ResourceBinding` Protocol. Each owns exactly one model
 runtime and is reused sequentially.
 
-Package resources make ``cache_bytes`` final during construction.
+``ModelOffloader.from_module(..., host_backing="adopt")`` adopts frozen
+model state already in CPU RAM without copying it. Anonymous pageable and
+file-backed/mmap tensors therefore share one path and retain their original
+storage. Copies go directly into the same GPU targets; CUDA performs any
+implicit staging. Unsupported adoption raises rather than materializing a
+hidden copy. Capture completes for the entire adopted store before binding
+changes any module registry, so adoption failures leave the supplied model
+untouched. Adopted tensors and writable mmap contents must remain immutable for
+the offloader's lifetime. The default ``"pinned"`` policy preserves the
+full-bandwidth asynchronous path. Package resources make ``cache_bytes`` final
+during construction.
 ``activate(device)`` then makes the resource usable on the requested device. For
 :class:`ModelOffloader`, ``deactivate()`` returns managed tensors to
-pinned CPU. For :class:`MpsWeights`,
+their configured host backing. For :class:`MpsWeights`,
 construction has already materialized the model on MPS, so
 ``activate('mps')`` and ``deactivate()`` are lifecycle-only.
 
-Pinned construction intentionally optimizes peak host memory. For plain
-``torch.Tensor`` parameters, pinning clones into pinned CPU storage and
-may immediately repoint the source ``Parameter.data`` at that pinned
-clone so the original source storage can be freed before all buffers
-finish pinning. This avoids a temporary 2x host-memory peak for
-CPU-origin models and promptly frees GPU storage for CUDA-origin models.
-If construction raises after pinning has started,
-recovery of the partially constructed resource/model is unsupported;
-drop those references and rebuild from a fresh model instance.
+Pinned host-store construction intentionally optimizes peak host memory. For
+plain ``torch.Tensor`` parameters, it may immediately repoint the source
+``Parameter.data`` at each pinned clone so the original source storage can be
+freed before all buffers finish. This avoids a temporary 2x host-memory peak
+for CPU-origin models and promptly frees GPU storage for CUDA-origin models.
+Adopted inference instead retains the existing CPU allocation. If pinned
+construction raises after pinning has started, recovery of the partially
+constructed resource/model is unsupported; drop those references and rebuild
+from a fresh model instance.
 
 :class:`ModelOffloader` composes (in order):
   1. A :class:`PinnedComponent` for every non-streamed parameter and
@@ -79,22 +89,25 @@ Optional LoRA merging is requested directly on :meth:`ModelOffloader.activate`
 and resolved by installing post-copy hooks for managed parameter targets.
 Unknown targets raise during activation. The
 hooks run immediately after the owning component copies a base weight
-from pinned CPU storage to GPU, so block-streamed and non-block weights
+from host storage to GPU, so block-streamed and non-block weights
 use the same merge path. Merge eligibility is owned by the selected
 tensor adapter: plain dense tensors opt into in-place ``addmm_``; structured
 quantized wrappers can opt into an adapter-owned staged merge that selects its
 own kernel or framework-operator fallback. Otherwise, use routed LoRA when the
 module exposes a compatible logical Linear weight shape and compute dtype.
 
-:class:`LoRA` owns immutable pinned factor storage. Merge and routed consumers
-read that backing directly and may overlap; routed hooks stage their own
-per-forward device copies.
+:class:`LoRA` owns immutable factor storage, pinned by default or strictly
+adopted from existing CPU backing. Merge and routed consumers read
+that backing directly and may overlap; routed hooks stage their own per-forward
+device copies.
 
 Downstream tensor subclasses can participate in pinning and movement without
 adding format-specific dependencies here: implement the public
 :class:`TensorAdapter` contract and register it during application startup with
 :func:`register_adapter`. Registered adapters are used for both movement and
-tied-storage identity.
+tied-storage identity. To additionally support ``host_backing="adopt"``,
+implement :class:`AdoptableTensorAdapter`; its ``adopt_host()`` method returns
+adapter state that aliases the retained source storage.
 
 :class:`ResourceCache` manages cached backing stores with policy-driven
 eviction, reference-counted leases, and transactional admission.
@@ -119,6 +132,7 @@ Compatibility
 
 from .block_compile import BlockCompileConfig
 from .gguf_adapter import GGUFWeight
+from .host_backing import HostBacking
 from .lora import (
     LoRA,
     LoRAFactor,
@@ -155,9 +169,13 @@ from .resource_specs import LoRASpec, ModelSpec, ObjectSpec
 from .stream_config import StreamConfig
 from .streamed_component import StreamedComponent, StreamedComponentStore
 from .tensor_adapter_registry import register_adapter
-from .tensor_adapters import TensorAdapter
+from .tensor_adapters import (
+    AdoptableTensorAdapter,
+    TensorAdapter,
+)
 
 __all__ = [
+    "AdoptableTensorAdapter",
     "BlockCompileConfig",
     "CacheError",
     "DuplicateResourceKeyError",
@@ -166,6 +184,7 @@ __all__ = [
     "EvictionPolicy",
     "EvictionPolicyError",
     "GGUFWeight",
+    "HostBacking",
     "LRUEvictionPolicy",
     "LoRA",
     "LoRAFactor",

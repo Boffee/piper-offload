@@ -28,6 +28,7 @@ advertises exactly those capabilities.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -35,6 +36,7 @@ import torch
 from torch import nn
 
 from .tensor_adapters import (
+    adopt_cpu_storage,
     clone_to_pinned_cpu,
     empty_like_strided,
     optional_tensor_id,
@@ -229,11 +231,23 @@ class TorchaoStructuredAdapter[MetaT](ABC):
 
     @classmethod
     def clone_pin(cls, t: torch.Tensor) -> TorchaoPinned[MetaT]:
+        return cls._host_state(t, clone_to_pinned_cpu)
+
+    @classmethod
+    def adopt_host(cls, t: torch.Tensor) -> TorchaoPinned[MetaT]:
+        return cls._host_state(t, adopt_cpu_storage)
+
+    @classmethod
+    def _host_state(
+        cls,
+        t: torch.Tensor,
+        clone: Callable[..., torch.Tensor],
+    ) -> TorchaoPinned[MetaT]:
         w = cls._require(t)
         # preserve_format (clone_to_pinned_cpu default): inner-tensor stride
         # ordering can encode a transposed quantized tensor.
         storage = tuple(
-            clone_to_pinned_cpu(s) if s is not None else None
+            clone(s) if s is not None else None
             for s in cls._storage_of(w)
         )
         return TorchaoPinned(storage=storage, meta=cls._meta_of(w))

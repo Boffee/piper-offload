@@ -54,6 +54,61 @@ class TestPinnedParam:
         # pinned backing without making PinnedParam own that wrapper.
         assert p.data.data_ptr() == pinned_param.pinned_state.data.data_ptr()
 
+    def test_non_quanto_adoption_retains_source_storage(self) -> None:
+        source = torch.randn(8, 16, dtype=torch.bfloat16)
+        p = nn.Parameter(source.clone(), requires_grad=False)
+        source_ptr = p.data_ptr()
+        pageable_param = PinnedParam(p, pin_memory=False)
+        cpu_param = pageable_param.make_cpu_param()
+
+        assert not cpu_param.data.is_pinned()
+        assert cpu_param.data.is_contiguous()
+        assert pageable_param.pinned_state.data.data_ptr() == source_ptr
+        assert cpu_param.data.data_ptr() == pageable_param.pinned_state.data.data_ptr()
+        assert p.data.data_ptr() == pageable_param.pinned_state.data.data_ptr()
+        torch.testing.assert_close(cpu_param.data, source)
+
+    def test_adoption_rejects_trainable_source(self) -> None:
+        p = nn.Parameter(torch.randn(8), requires_grad=True)
+
+        with pytest.raises(ValueError, match="inference-only"):
+            PinnedParam(p, pin_memory=False)
+
+    def test_adoption_rejects_non_contiguous_source(self) -> None:
+        p = nn.Parameter(torch.randn(2, 3).t(), requires_grad=False)
+
+        with pytest.raises(ValueError, match="non-contiguous"):
+            PinnedParam(p, pin_memory=False)
+
+    def test_adopted_cache_bytes_uses_adapter_logical_size(self) -> None:
+        source = torch.empty(1024, dtype=torch.float32)
+        p = nn.Parameter(source[:8], requires_grad=False)
+
+        pageable = PinnedParam(p, pin_memory=False)
+
+        assert pageable.cache_bytes == p.nbytes
+
+    @CUDA
+    def test_adoption_rejects_cuda_source(self) -> None:
+        p = nn.Parameter(torch.randn(8, device="cuda"), requires_grad=False)
+
+        with pytest.raises(ValueError, match="existing CPU tensor"):
+            PinnedParam(p, pin_memory=False)
+
+    @CUDA
+    def test_adopted_source_copies_to_gpu_target(self) -> None:
+        source = torch.randn(64, dtype=torch.bfloat16)
+        pageable_param = PinnedParam(
+            nn.Parameter(source.clone(), requires_grad=False),
+            pin_memory=False,
+        )
+        gpu_state = pageable_param.allocate_gpu_storage(torch.device("cuda"))
+
+        pageable_param.copy_to_gpu(gpu_state, non_blocking=True)
+        torch.cuda.synchronize()
+
+        assert torch.equal(gpu_state.data.cpu(), source)
+
     @CUDA
     def test_allocate_copy_make_gpu_param_non_quanto(self) -> None:
         p = nn.Parameter(torch.randn(4, 8, dtype=torch.bfloat16), requires_grad=False)
@@ -116,6 +171,29 @@ class TestPinnedBuffer:
         assert pinned.target_layout == PinnedBuffer.target_layout_for(
             pinned.tensor,
         )
+
+    def test_adoption_retains_source_storage(self) -> None:
+        source = torch.randn(2, 3)
+
+        pageable = PinnedBuffer.clone(source, pin_memory=False)
+
+        assert not pageable.tensor.is_pinned()
+        assert pageable.tensor.is_contiguous()
+        assert pageable.tensor.data_ptr() == source.data_ptr()
+        torch.testing.assert_close(pageable.tensor, source)
+
+    def test_adoption_rejects_non_contiguous_buffer(self) -> None:
+        source = torch.randn(2, 3).t()
+
+        with pytest.raises(ValueError, match="non-contiguous"):
+            PinnedBuffer.clone(source, pin_memory=False)
+
+    def test_adopted_cache_bytes_uses_tensor_logical_size(self) -> None:
+        source = torch.empty(1024, dtype=torch.float32)
+
+        pageable = PinnedBuffer.clone(source[:8], pin_memory=False)
+
+        assert pageable.cache_bytes == source[:8].nbytes
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +291,31 @@ class TestPinnedParamQuanto:
         # pinned host buffers the adapter pinned, not separate clones.
         assert qt_pinned._data.data_ptr() == pinned_param.pinned_state.data.data_ptr()
         assert qt_pinned._scale.data_ptr() == pinned_param.pinned_state.scale.data_ptr()
+
+    def test_adoption_retains_data_and_scale(self) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols = 4, 8
+        data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1, dtype=torch.bfloat16)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+        )
+
+        pageable_param = PinnedParam(
+            nn.Parameter(qt, requires_grad=False),
+            pin_memory=False,
+        )
+        pageable = pageable_param.make_cpu_param().data
+
+        assert isinstance(pageable, WeightQBytesTensor)
+        assert not pageable._data.is_pinned()
+        assert not pageable._scale.is_pinned()
+        assert pageable_param.pinned_state.data.data_ptr() == qt._data.data_ptr()
+        assert pageable_param.pinned_state.scale.data_ptr() == qt._scale.data_ptr()
+        torch.testing.assert_close(pageable._data, data)
+        torch.testing.assert_close(pageable._scale, scale)
 
     @CUDA
     def test_allocate_copy_make_gpu_param_quanto_round_trip(self) -> None:

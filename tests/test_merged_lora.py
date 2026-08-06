@@ -8,7 +8,9 @@ Most lifecycle tests run on CPU (the merge math is device-agnostic);
 CUDA-only tests gate on availability.
 """
 
+from array import array
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 import torch
@@ -377,6 +379,91 @@ class TestLoRAConstruction:
             a, b = _factor_tensors(factor)
             assert a.is_pinned()
             assert b.is_pinned()
+
+    def test_adopted_factors_retain_source_storage(self) -> None:
+        sd = _make_lora_sd(num_blocks=1, dim=16, rank=4)
+        a_source = sd["transformer_blocks.0.attn.lora_A.weight"]
+        b_source = sd["transformer_blocks.0.attn.lora_B.weight"]
+
+        lora = LoRA.from_state_dict(
+            state_dict=sd,
+            dtype=torch.float32,
+            host_backing="adopt",
+        )
+        a, b = _factor_tensors(
+            lora.targets["transformer_blocks.0.attn.weight"]
+        )
+
+        assert not a.is_pinned()
+        assert not b.is_pinned()
+        assert a.data_ptr() == a_source.data_ptr()
+        assert b.data_ptr() == b_source.data_ptr()
+
+    def test_adopted_factors_preserve_mmap_storage(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        rank, dim = 2, 4
+        factor_elements = rank * dim
+        mapped_elements = factor_elements * 2 + 7
+        path = tmp_path / "lora.bin"
+        path.write_bytes(
+            array("f", map(float, range(mapped_elements))).tobytes()
+        )
+        mapped = torch.from_file(
+            str(path),
+            shared=False,
+            size=mapped_elements,
+            dtype=torch.float32,
+        )
+        a_source = mapped[:factor_elements].view(rank, dim)
+        b_source = mapped[
+            factor_elements : factor_elements * 2
+        ].view(dim, rank)
+
+        lora = LoRA.from_state_dict(
+            state_dict={
+                "target.lora_A.weight": a_source,
+                "target.lora_B.weight": b_source,
+            },
+            host_backing="adopt",
+        )
+        a, b = _factor_tensors(lora.targets["target.weight"])
+
+        assert a.data_ptr() == a_source.data_ptr()
+        assert b.data_ptr() == b_source.data_ptr()
+        assert lora.cache_bytes == a_source.nbytes + b_source.nbytes
+
+    def test_adoption_rejects_dtype_conversion(self) -> None:
+        sd = _make_lora_sd(num_blocks=1, dim=16, rank=4)
+
+        with pytest.raises(ValueError, match="cannot convert factor dtype"):
+            LoRA.from_state_dict(
+                state_dict=sd,
+                dtype=torch.bfloat16,
+                host_backing="adopt",
+            )
+
+    def test_rejects_invalid_host_backing(self) -> None:
+        sd = _make_lora_sd(num_blocks=1, dim=16, rank=4)
+
+        with pytest.raises(ValueError, match="host_backing"):
+            LoRA.from_state_dict(
+                state_dict=sd,
+                host_backing="invalid",
+            )
+
+    def test_adoption_rejects_non_contiguous_factor(self) -> None:
+        sd = {
+            "target.lora_A.weight": torch.randn(16, 4).t(),
+            "target.lora_B.weight": torch.randn(16, 4),
+        }
+
+        with pytest.raises(ValueError, match="non-contiguous"):
+            LoRA.from_state_dict(
+                state_dict=sd,
+                host_backing="adopt",
+            )
 
     def test_factor_pinned_params_build_instance_without_repin(self) -> None:
         """Pinned factors can be consumed without cloning or re-pinning."""
@@ -821,6 +908,44 @@ class TestLifecycle:
 
 
 class TestMergeCorrectness:
+    @CUDA
+    @pytest.mark.parametrize("mode", ["merge", "routed"])
+    def test_adopted_lora_matches_pinned_lora(
+        self,
+        mode: LoRAMode,
+    ) -> None:
+        torch.manual_seed(42)
+        pinned_model = _make_bf16_model(num_blocks=2, dim=16)
+        pageable_model = _make_bf16_model(num_blocks=2, dim=16)
+        pageable_model.load_state_dict(pinned_model.state_dict())
+        sd = _make_lora_sd(num_blocks=2, dim=16, rank=4, seed=7)
+        pinned_lora = LoRA.from_state_dict(state_dict=sd)
+        pageable_lora = LoRA.from_state_dict(
+            state_dict=sd,
+            host_backing="adopt",
+        )
+        x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+
+        def run(model: nn.Module, lora: LoRA) -> torch.Tensor:
+            strategy = _make_strategy(model)
+            _request_loras(strategy, [(lora, 0.75)], mode=mode)
+            _activate(
+                strategy,
+                "cuda",
+                stream_config=_strategy_stream_config(model),
+            )
+            try:
+                output = model(x)
+                torch.cuda.synchronize()
+                return output.detach().cpu()
+            finally:
+                strategy.deactivate()
+
+        torch.testing.assert_close(
+            run(pageable_model, pageable_lora),
+            run(pinned_model, pinned_lora),
+        )
+
     @CUDA
     def test_merged_weights_match_manual_baseline(self) -> None:
         m = _make_bf16_model(num_blocks=4, dim=16)
@@ -2718,6 +2843,28 @@ class TestLoRAResource:
             assert len(lora.targets) == 2
         with cache.lease("lora:test") as lora2:
             assert lora2 is lora
+
+    def test_lora_spec_propagates_adopted_host_backing(self) -> None:
+        sd = _make_lora_sd(num_blocks=1, dim=8, rank=2)
+        spec = LoRASpec(
+            key="lora:adopted",
+            estimated_cache_bytes=1000,
+            factory=lambda: sd,
+            host_backing="adopt",
+        )
+
+        lora = spec.build_store()
+        factor = lora.targets["transformer_blocks.0.attn.weight"]
+        a, b = _factor_tensors(factor)
+
+        assert not a.is_pinned()
+        assert not b.is_pinned()
+        assert a.data_ptr() == sd[
+            "transformer_blocks.0.attn.lora_A.weight"
+        ].data_ptr()
+        assert b.data_ptr() == sd[
+            "transformer_blocks.0.attn.lora_B.weight"
+        ].data_ptr()
 
     def test_model_cache_applies_loras_and_holds_leases(
         self,

@@ -39,6 +39,7 @@ Selected by :mod:`tensor_adapter_registry`. Importing fails silently if
 optimum-quanto is not installed — quanto support is optional.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,7 +60,7 @@ from ._quanto import (
     require_qbytes_tensor,
     validate_layout,
 )
-from .tensor_adapters import clone_to_pinned_cpu
+from .tensor_adapters import adopt_cpu_storage, clone_to_pinned_cpu
 
 try:
     from ._triton_quanto_lora import (
@@ -245,6 +246,25 @@ class QuantoAdapter:
 
     @staticmethod
     def clone_pin(t: torch.Tensor) -> _QuantoPinned:
+        return QuantoAdapter._host_state(t, clone_to_pinned_cpu)
+
+    @staticmethod
+    def adopt_host(t: torch.Tensor) -> _QuantoPinned:
+        qt = require_qbytes_tensor(t)
+        canonical = canonicalize_qbytes_tensor(t)
+        if canonical is not qt:
+            raise ValueError(
+                "adopted host backing cannot retain an optimized Quanto "
+                "representation that requires canonicalization. Convert it "
+                "to WeightQBytesTensor before constructing the offloader."
+            )
+        return QuantoAdapter._host_state(canonical, adopt_cpu_storage)
+
+    @staticmethod
+    def _host_state(
+        t: torch.Tensor,
+        clone: Callable[..., torch.Tensor],
+    ) -> _QuantoPinned:
         qt = canonicalize_qbytes_tensor(t)
         # contiguous_format clone: fp8-quanto leaves some _data buffers
         # strided via internal transposes; the default preserve_format
@@ -253,11 +273,11 @@ class QuantoAdapter:
         # stride is captured separately and reapplied when rebuilding the
         # canonical WeightQBytesTensor wrapper.
         return _QuantoPinned(
-            data=clone_to_pinned_cpu(
+            data=clone(
                 qt._data,
                 memory_format=torch.contiguous_format,
             ),
-            scale=clone_to_pinned_cpu(
+            scale=clone(
                 qt._scale,
                 memory_format=torch.contiguous_format,
             ),

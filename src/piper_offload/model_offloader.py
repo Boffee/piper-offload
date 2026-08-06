@@ -15,6 +15,7 @@ from torch import nn
 from ._devices import canonical_device
 from .block_compile import BlockCompileConfig
 from .composite_component import CompositeComponent, CompositeComponentStore
+from .host_backing import HostBacking, validate_host_backing
 from .lora import (
     LoRA,
     LoRAMode,
@@ -38,7 +39,7 @@ __all__ = [
 
 
 class ModelOffloader:
-    """Move a whole model or streamed block groups between pinned CPU and
+    """Move a whole model or streamed block groups between host RAM and
     CUDA, with optional LoRA merge and trainable-parameter support.
 
     Construct with :meth:`from_module`. One offloader owns one model and may
@@ -51,7 +52,7 @@ class ModelOffloader:
     streams the selected block groups plus component-level movement for
     non-streamed state. Supplying ``block_compile`` at construction opts those
     streamed block forwards into Inductor during CUDA inference. CPU activation
-    is pass-through over the pinned host-backed module state and remains eager.
+    is pass-through over the host-backed module state and remains eager.
 
     Composes :class:`PinnedComponent` (non-streamed params and buffers)
     and one or more :class:`StreamedComponent`\\ s internally. LoRA requests
@@ -135,15 +136,35 @@ class ModelOffloader:
         blocks_attr: Sequence[str] = (),
         stream_trainable_weights: bool = False,
         block_compile: BlockCompileConfig | None = None,
+        host_backing: HostBacking = "pinned",
     ) -> Self:
-        """Pin and bind ``model`` as one reusable cached runtime.
+        """Clone and bind ``model`` as one reusable cached runtime.
 
         The intermediate component store exists only during construction.
-        Bound component instances retain the pinned state afterward, so the
+        Bound component instances retain the host state afterward, so the
         model is never rebound on subsequent uses. ``block_compile`` applies
         one forward-only compile policy to every ``blocks_attr`` group and is
-        invalid when no block group is declared.
+        invalid when no block group is declared. ``host_backing`` defaults to
+        a pinned copy; ``"adopt"`` strictly retains frozen state already in
+        CPU RAM and uses direct CUDA copies without an application-owned
+        staging pool. It never silently materializes an incompatible source,
+        and adoption failures occur before binding mutates model registries.
+        Retained source tensors and writable mmap contents must remain
+        immutable for the offloader's lifetime.
         """
+        backing = validate_host_backing(host_backing)
+        if backing == "adopt":
+            trainable_names = [
+                name
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            ]
+            if trainable_names:
+                raise ValueError(
+                    "adopted host backing is inference-only; freeze all "
+                    "parameters before constructing the offloader. Trainable "
+                    f"parameters: {trainable_names!r}."
+                )
         if block_compile is not None and not blocks_attr:
             raise ValueError(
                 "block_compile requires at least one blocks_attr path."
@@ -152,6 +173,7 @@ class ModelOffloader:
             model,
             blocks_attr=blocks_attr,
             stream_trainable_weights=stream_trainable_weights,
+            host_backing=backing,
         )
         cache_bytes = composite_store.cache_bytes
         composite = composite_store.bind(model, block_compile=block_compile)
@@ -291,7 +313,7 @@ class ModelOffloader:
 
     @property
     def cache_bytes(self) -> int:
-        """Stable pinned host bytes charged to :class:`ResourceCache`."""
+        """Stable host-backing bytes charged to :class:`ResourceCache`."""
         return self._cache_bytes
 
     @property
@@ -385,7 +407,7 @@ class ModelOffloader:
     def deactivate(self) -> None:
         if self._active_device is None:
             return
-        # Remove LoRA hooks before returning the model to pinned storage. The
+        # Remove LoRA hooks before returning the model to host storage. The
         # composite teardown and activation-lock release still run if a custom
         # hook remover unexpectedly raises.
         try:

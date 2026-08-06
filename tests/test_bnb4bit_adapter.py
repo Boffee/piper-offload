@@ -156,6 +156,26 @@ class TestBnb4bitAdapter:
         assert pinned_param.compute_dtype is torch.bfloat16
         assert torch.equal(Bnb4bitAdapter.dequantize(pinned), Bnb4bitAdapter.dequantize(p))
 
+    def test_adopted_backing_retains_storage_and_metadata(self) -> None:
+        p = _make_nf4()
+        data_ptr = p.data.data_ptr()
+        absmax_ptr = p.quant_state.absmax.data_ptr()
+        pageable_param = PinnedParam(p, pin_memory=False)
+        pageable = pageable_param.make_cpu_param()
+
+        assert not pageable.data.is_pinned()
+        assert not pageable.quant_state.absmax.is_pinned()
+        assert pageable_param.pinned_state.data.data_ptr() == data_ptr
+        assert (
+            pageable_param.pinned_state.buffers["absmax"].data_ptr()
+            == absmax_ptr
+        )
+        assert pageable.quant_state.quant_type == p.quant_state.quant_type
+        assert torch.equal(
+            Bnb4bitAdapter.dequantize(pageable),
+            Bnb4bitAdapter.dequantize(p),
+        )
+
     def test_tensor_id_tracks_packed_and_scales(self) -> None:
         p = _make_nf4()
         key = tensor_id(p)

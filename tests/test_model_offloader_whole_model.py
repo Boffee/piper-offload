@@ -110,6 +110,30 @@ class TestPinnedComponentStoreBind:
         finally:
             component.deactivate()
 
+    def test_adopted_store_defers_registry_install_until_bind(self) -> None:
+        module = nn.Module()
+        module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
+        module.register_buffer("running", torch.randn(2))
+        original_weight = module.weight
+        original_buffer = module.running
+
+        store = PinnedComponentStore.from_module(
+            module,
+            host_backing="adopt",
+        )
+
+        assert module.weight is original_weight
+        assert module.running is original_buffer
+
+        component = store.bind(module)
+        try:
+            assert module.weight is not original_weight
+            assert module.weight.data_ptr() == original_weight.data_ptr()
+            assert module.running is not original_buffer
+            assert module.running.data_ptr() == original_buffer.data_ptr()
+        finally:
+            component.deactivate()
+
     def test_binds_existing_store_to_multiple_components(self) -> None:
         prototype = nn.Module()
         prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
@@ -349,6 +373,32 @@ class TestLifecycle:
             for p in m.parameters():
                 assert not p.is_cuda
                 assert p.is_pinned()
+        finally:
+            pw.deactivate()
+
+    @CUDA
+    def test_adopted_bulk_activation_matches_eager_model(self) -> None:
+        torch.manual_seed(42)
+        eager = _make_simple_model()
+        offloaded = _make_simple_model()
+        offloaded.load_state_dict(eager.state_dict())
+        x = torch.randn(4, 8)
+        with torch.no_grad():
+            expected = eager(x).cuda()
+
+        pw = ModelOffloader.from_module(
+            offloaded,
+            host_backing="adopt",
+        )
+        try:
+            assert all(not param.is_pinned() for param in offloaded.parameters())
+            with activated_model(pw, "cuda") as active:
+                with torch.no_grad():
+                    actual = active(x.cuda())
+                torch.cuda.synchronize()
+
+            torch.testing.assert_close(actual, expected)
+            assert all(not param.is_pinned() for param in offloaded.parameters())
         finally:
             pw.deactivate()
 

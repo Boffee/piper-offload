@@ -151,6 +151,23 @@ class TestPiperConvRotInt8Adapter:
         assert torch.equal(pinned.qdata, source.qdata)
         assert torch.equal(pinned.scale, source.scale)
 
+    def test_adopted_backing_retains_storage_and_metadata(self) -> None:
+        source = _make_convrot(dtype=torch.float16)
+        pageable_param = PinnedParam(
+            nn.Parameter(source, requires_grad=False),
+            pin_memory=False,
+        )
+        pageable = pageable_param.make_cpu_param().data
+
+        assert not pageable.qdata.is_pinned()
+        assert not pageable.scale.is_pinned()
+        assert pageable.qdata.data_ptr() == source.qdata.data_ptr()
+        assert pageable.scale.data_ptr() == source.scale.data_ptr()
+        assert pageable.group_size == source.group_size
+        assert pageable.dtype is source.dtype
+        assert torch.equal(pageable.qdata, source.qdata)
+        assert torch.equal(pageable.scale, source.scale)
+
     def test_tensor_id_tracks_storage_group_size_and_logical_dtype(self) -> None:
         qdata = torch.randint(-127, 128, (8, 64), dtype=torch.int8)
         scale = torch.rand(8, 1)

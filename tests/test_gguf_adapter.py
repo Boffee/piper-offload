@@ -76,3 +76,14 @@ class TestAdapter:
 
         assert key[1] == w.as_subclass(torch.Tensor).device
         assert key == GgufAdapter.tensor_id(w)
+
+    def test_adopted_backing_retains_packed_storage(self, w: GGUFWeight) -> None:
+        pytest.importorskip("gguf")
+
+        raw = w.as_subclass(torch.Tensor)
+        state = GgufAdapter.adopt_host(w)
+
+        assert not state.data.is_pinned()
+        assert state.data.data_ptr() == raw.data_ptr()
+        assert state.quant_type == QUANT_TYPE
+        assert torch.equal(state.data, raw)

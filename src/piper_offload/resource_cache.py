@@ -26,8 +26,8 @@ Design highlights
   mean re-pinning the just-released weights, which can OOM the host
   allocator). The cache stays internally consistent; the cost is
   some warm cached entries disappearing.
-- **No runtime or GPU lifecycle.** The cache only enforces
-  ``max_cache_bytes`` (typically pinned host memory). Activation and GPU
+- **No runtime or GPU lifecycle.** The cache only enforces logical
+  ``max_cache_bytes`` for cached host backing. Activation and GPU
   residency belong to resources and consumers such as
   :class:`~piper_offload.ModelOffloader` and
   :class:`~piper_offload.ModelCache`.
