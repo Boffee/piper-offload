@@ -219,6 +219,7 @@ class TestPinnedParamQuanto:
 
     def test_quanto_adapter_conversion_and_merge_capabilities(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.optimizers import AbsmaxOptimizer
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
         rows, cols = 4, 8
@@ -237,23 +238,44 @@ class TestPinnedParamQuanto:
         assert dense.dtype == qt.dtype
         assert dense.shape == qt.shape
 
+        expected_scale = AbsmaxOptimizer()(
+            dense,
+            qtype=quanto.qint8,
+            axis=0,
+        ).to(scale.dtype)
+        expected = WeightQBytesTensor.quantize(
+            dense,
+            quanto.qint8,
+            0,
+            expected_scale,
+            optimized=False,
+        )
         requantized = adapter.requantize(dense, like=qt)
         assert isinstance(requantized, WeightQBytesTensor)
         assert requantized.qtype is quanto.qint8
         assert requantized.axis == 0
         assert tuple(requantized.size()) == (rows, cols)
-        torch.testing.assert_close(requantized._data, data)
-        torch.testing.assert_close(requantized._scale, scale)
+        torch.testing.assert_close(requantized._data, expected._data)
+        torch.testing.assert_close(requantized._scale, expected._scale)
 
         updated = dense + 1
-        expected_packed = (
-            updated / scale.to(updated.dtype)
-        ).round().clamp(-128, 127).to(torch.int8)
+        updated_scale = AbsmaxOptimizer()(
+            updated,
+            qtype=quanto.qint8,
+            axis=0,
+        ).to(scale.dtype)
+        expected_updated = WeightQBytesTensor.quantize(
+            updated,
+            quanto.qint8,
+            0,
+            updated_scale,
+            optimized=False,
+        )
         updated_qt = adapter.requantize(updated, like=qt)
         original_scale_ptr = qt._scale.data_ptr()
         adapter.copy_into(updated_qt, target=qt)
-        torch.testing.assert_close(qt._data, expected_packed)
-        torch.testing.assert_close(qt._scale, scale)
+        torch.testing.assert_close(qt._data, expected_updated._data)
+        torch.testing.assert_close(qt._scale, expected_updated._scale)
         assert qt._scale.data_ptr() == original_scale_ptr
 
     def test_pin_decomposes_data_and_scale(self) -> None:

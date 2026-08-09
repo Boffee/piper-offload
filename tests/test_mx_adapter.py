@@ -1,6 +1,5 @@
 """Tests for TorchAO MX (MXFP8 / MXFP4) adapter integration."""
 
-
 import pytest
 import torch
 from torch import nn
@@ -492,9 +491,11 @@ class TestMxAdapter:
         _assert_mx_merge_close(target, expected)
 
     @CUDA
+    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
     @pytest.mark.parametrize("scaling_mode_name", ["CEIL", "EVEN"])
     def test_triton_merge_supports_additional_scale_modes(
         self,
+        elem_dtype: torch.dtype,
         scaling_mode_name: str,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -503,7 +504,7 @@ class TestMxAdapter:
         scaling_mode = _scale_mode(scaling_mode_name)
         base = _quantize_mx(
             torch.randn(rows, cols, device="cuda", dtype=torch.float32),
-            elem_dtype=torch.float8_e4m3fn,
+            elem_dtype=elem_dtype,
             dynamic_activation=True,
             scaling_mode=scaling_mode,
         )

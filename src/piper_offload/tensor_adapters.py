@@ -42,6 +42,7 @@ __all__ = [
     "CpuRoundTripTensorAdapter",
     "DequantRequantTensorAdapter",
     "LoRAMergeTensorAdapter",
+    "LoRAMergeValidationTensorAdapter",
     "LogicalShapeTensorAdapter",
     "ParameterDataSwapTensorAdapter",
     "PostLoadRearmTensorAdapter",
@@ -252,6 +253,27 @@ class LoRAMergeTensorAdapter[PinnedStateT, GpuStateT](
 
 
 @runtime_checkable
+class LoRAMergeValidationTensorAdapter(Protocol):
+    """Optional non-mutating validation for an advertised LoRA merge.
+
+    Some representations support merge only for a subset of otherwise valid
+    tensor layouts or staged factor values. Implementations expose those
+    constraints here so permanent merge can reject every unsupported operation
+    before mutating any model parameter.
+    """
+
+    @staticmethod
+    def validate_lora_merge(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Raise if the staged update cannot be safely merged in place."""
+        ...
+
+
+@runtime_checkable
 class DequantRequantTensorAdapter[PinnedStateT, GpuStateT](
     TensorAdapter[PinnedStateT, GpuStateT],
     Protocol,
@@ -264,10 +286,9 @@ class DequantRequantTensorAdapter[PinnedStateT, GpuStateT](
     as ``like``. Device follows the dense input tensor; callers can move
     tensors explicitly before calling.
 
-    Scale strategy is implementation-defined: an adapter may reuse
-    ``like``'s quantization scales (quanto) or recompute them from the
-    new dense values (float8). Both satisfy this contract; callers must
-    not assume scale bytes survive a dequantize/requantize round trip.
+    Data-dependent weight quantization parameters are recomputed from the new
+    dense values. Callers must not assume scale bytes survive a
+    dequantize/requantize round trip.
     This conversion capability does not by itself advertise in-place copy or
     LoRA merge support.
     """

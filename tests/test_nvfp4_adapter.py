@@ -1,5 +1,6 @@
 """Tests for TorchAO NVFP4 adapter integration."""
 
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -395,6 +396,7 @@ class TestNvfp4Adapter:
         dtype: torch.dtype,
         swizzled: bool,
         two_level: bool,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # NVFP4 requires K divisible by 16. Odd M and rank exercise both
         # Triton tail masks while retaining a valid packed representation.
@@ -412,6 +414,14 @@ class TestNvfp4Adapter:
         qdata_ptr = nv.qdata.data_ptr()
         scale_ptr = nv.scale.data_ptr()
         global_scale_ptr = nv.per_tensor_scale.data_ptr() if nv.per_tensor_scale is not None else None
+        triton_merge = nvfp4_adapter_module._triton_merge_nvfp4_lora
+        assert triton_merge is not None
+        tracked_triton = Mock(wraps=triton_merge)
+        monkeypatch.setattr(
+            nvfp4_adapter_module,
+            "_triton_merge_nvfp4_lora",
+            tracked_triton,
+        )
 
         assert not a.is_contiguous()
         assert not b.is_contiguous()
@@ -423,6 +433,7 @@ class TestNvfp4Adapter:
         if nv.per_tensor_scale is not None:
             assert nv.per_tensor_scale.data_ptr() == global_scale_ptr
         assert nv.is_swizzled_scales is swizzled
+        assert tracked_triton.call_count == 1
         _assert_triton_nvfp4_close(nv, expected)
 
     @CUDA

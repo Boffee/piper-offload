@@ -1,8 +1,8 @@
-"""Triton kernel for fixed-scale Quanto qint8 and qfloat8 LoRA merges."""
+"""Triton kernels for absmax-requantized Quanto qint8/qfloat8 LoRA merges."""
 
 # Triton JIT kernel signatures intentionally use untyped pointer parameters
 # and upper-case constexpr names.
-# ruff: noqa: ANN001, ANN202, N803, PLR0912, PLR0913
+# ruff: noqa: ANN001, ANN202, N803, PLR0913
 # pyright: reportCallIssue=false
 
 import torch
@@ -19,7 +19,7 @@ _COMPUTE_FP32 = 2
 
 
 @triton.jit
-def _merge_qbytes_kernel(
+def _merge_dense_kernel(
     qdata_ptr,
     scale_ptr,
     b_ptr,
@@ -31,9 +31,6 @@ def _merge_qbytes_kernel(
     K: tl.constexpr,
     SCALE_AXIS: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
-    INTEGER_STORAGE: tl.constexpr,
-    QMIN: tl.constexpr,
-    QMAX: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -82,7 +79,11 @@ def _merge_qbytes_kernel(
     else:
         scale = tl.load(scale_ptr)
 
-    base = qdata * scale.to(tl.float32)
+    scale_f32 = scale.to(tl.float32)
+    # Quanto's FP8 quantizer stores NaN qbytes for an exact-zero scale
+    # (0 / 0). The represented block is nevertheless exactly zero; select it
+    # explicitly so a later nonzero LoRA update can recover the block.
+    base = tl.where(scale_f32 == 0.0, 0.0, qdata * scale_f32)
     if COMPUTE_DTYPE == 0:
         base = base.to(tl.float16)
     elif COMPUTE_DTYPE == 1:
@@ -93,20 +94,41 @@ def _merge_qbytes_kernel(
         merged = merged.to(tl.float16)
     elif COMPUTE_DTYPE == 1:
         merged = merged.to(tl.bfloat16)
+    tl.store(output_ptr + offsets, merged, mask=mask)
 
-    scale_f32 = scale.to(tl.float32)
-    safe_scale = tl.where(scale_f32 == 0.0, 1.0, scale_f32)
-    scaled = merged.to(tl.float32) / safe_scale
+
+@triton.jit
+def _quantize_qbytes_kernel(
+    dense_ptr,
+    scale_ptr,
+    output_ptr,
+    M,
+    N,
+    SCALE_AXIS: tl.constexpr,
+    COMPUTE_DTYPE: tl.constexpr,
+    INTEGER_STORAGE: tl.constexpr,
+    QMIN: tl.constexpr,
+    QMAX: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(axis=0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < M * N
+    offsets_m = offsets // N
+    offsets_n = offsets % N
+    merged = tl.load(dense_ptr + offsets, mask=mask, other=0.0)
+
+    if SCALE_AXIS == 1:
+        scale = tl.load(scale_ptr + offsets_m, mask=mask, other=1.0)
+    elif SCALE_AXIS == 2:
+        scale = tl.load(scale_ptr + offsets_n, mask=mask, other=1.0)
+    else:
+        scale = tl.load(scale_ptr)
+
+    scaled = merged.to(tl.float32) / scale.to(tl.float32)
     if COMPUTE_DTYPE == 0:
         scaled = scaled.to(tl.float16).to(tl.float32)
     elif COMPUTE_DTYPE == 1:
         scaled = scaled.to(tl.bfloat16).to(tl.float32)
-    zero_scale_value = tl.where(
-        merged.to(tl.float32) > 0.0,
-        QMAX,
-        tl.where(merged.to(tl.float32) < 0.0, QMIN, 0.0),
-    )
-    scaled = tl.where(scale_f32 == 0.0, zero_scale_value, scaled)
     if INTEGER_STORAGE:
         scaled = libdevice.rint(scaled)
     quantized = tl.minimum(tl.maximum(scaled, QMIN), QMAX)
@@ -144,6 +166,24 @@ def _scale_axis_id(
     )
 
 
+def _absmax_scale(
+    dense: torch.Tensor,
+    scale: torch.Tensor,
+    scale_axis: int,
+    qmax: float,
+) -> torch.Tensor:
+    """Recompute Quanto's data-dependent scale without leaving CUDA."""
+    if scale_axis == _AXIS_ROW:
+        amax = dense.abs().amax(dim=1, keepdim=True)
+    elif scale_axis == _AXIS_COLUMN:
+        amax = dense.abs().amax(dim=0, keepdim=True)
+    else:
+        amax = dense.abs().amax()
+    output = (amax / qmax).to(dtype=scale.dtype).reshape(scale.shape)
+    eps = torch.finfo(torch.float32).eps
+    return torch.where(output == 0, torch.full_like(output, eps), output)
+
+
 def _merge_quanto_qbytes_lora(
     qdata: torch.Tensor,
     scale: torch.Tensor,
@@ -155,8 +195,8 @@ def _merge_quanto_qbytes_lora(
     integer_storage: bool,
     qmin: float,
     qmax: float,
-) -> torch.Tensor:
-    """Return qbytes storage after one fixed-scale Quanto LoRA merge."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return qbytes data and a fresh absmax scale after one LoRA merge."""
     if qdata.device.type != "cuda":
         raise ValueError("Triton Quanto qbytes merge requires CUDA tensors.")
     if scale.dtype is not b.dtype or b.dtype is not a.dtype:
@@ -197,28 +237,43 @@ def _merge_quanto_qbytes_lora(
         ((rows + block_m - 1) // block_m)
         * ((cols + block_n - 1) // block_n),
     )
-    output = torch.empty_like(qdata)
-    _merge_qbytes_kernel[grid](
+    dense = torch.empty(qdata.shape, device=qdata.device, dtype=b.dtype)
+    _merge_dense_kernel[grid](
         qdata,
         scale,
         b,
         a,
-        output,
+        dense,
         strength,
         M=rows,
         N=cols,
         K=rank,
         SCALE_AXIS=scale_axis,
         COMPUTE_DTYPE=compute_dtype,
-        INTEGER_STORAGE=integer_storage,
-        QMIN=qmin,
-        QMAX=qmax,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         num_warps=4,
     )
-    return output
+    output_scale = _absmax_scale(dense, scale, scale_axis, qmax)
+    output = torch.empty_like(qdata)
+    quant_block = 1024
+    quant_grid = (triton.cdiv(qdata.numel(), quant_block),)
+    _quantize_qbytes_kernel[quant_grid](
+        dense,
+        output_scale,
+        output,
+        M=rows,
+        N=cols,
+        SCALE_AXIS=scale_axis,
+        COMPUTE_DTYPE=compute_dtype,
+        INTEGER_STORAGE=integer_storage,
+        QMIN=qmin,
+        QMAX=qmax,
+        BLOCK_SIZE=quant_block,
+        num_warps=8,
+    )
+    return output, output_scale
 
 
 def merge_quanto_qint8_lora(
@@ -228,8 +283,8 @@ def merge_quanto_qint8_lora(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
-) -> torch.Tensor:
-    """Return qint8 storage after one fixed-scale Quanto LoRA merge."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return qint8 storage and its recomputed absmax scale."""
     if qdata.dtype is not torch.int8:
         raise ValueError("Triton Quanto qint8 merge expects int8 storage.")
     return _merge_quanto_qbytes_lora(
@@ -252,8 +307,8 @@ def merge_quanto_qfloat8_lora(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
-) -> torch.Tensor:
-    """Return qfloat8 storage after one fixed-scale Quanto LoRA merge."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return qfloat8 storage and its recomputed absmax scale."""
     if qdata.dtype not in (
         torch.float8_e4m3fn,
         torch.float8_e5m2,

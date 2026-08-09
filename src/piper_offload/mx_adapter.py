@@ -240,6 +240,23 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
         return requantize_mx_tensor(t, like=like)
 
     @staticmethod
+    def validate_lora_merge(
+        target: torch.Tensor,
+        _b: torch.Tensor,
+        _a: torch.Tensor,
+        _strength: float,
+    ) -> None:
+        """Reject layouts the standard MX re-encode cannot refill."""
+        mx = require_mx_tensor(target)
+        if not mx.qdata.is_contiguous():
+            raise ValueError(
+                "Cannot merge LoRA into a non-contiguous (e.g. transposed) MX "
+                "weight: requantization produces the standard packed layout, "
+                "which cannot fill a transposed target. Use routed LoRA for "
+                "this weight."
+            )
+
+    @staticmethod
     def merge_lora_(
         target: torch.Tensor,
         b: torch.Tensor,
@@ -247,6 +264,7 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
         strength: float,
     ) -> None:
         """Merge a staged LoRA update while preserving target storage."""
+        MxAdapter.validate_lora_merge(target, b, a, strength)
         mx = require_mx_tensor(target)
         if _can_use_triton_merge(mx, b, a):
             assert _triton_merge_mx_lora_ is not None

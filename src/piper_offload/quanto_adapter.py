@@ -31,9 +31,9 @@ repo depends on. If quanto refactors the wrapper class, the
 :meth:`matches` (validates the expected attributes exist on first
 match).
 
-CUDA qint8 and qfloat8 merges use one fixed-scale Triton pipeline when
-available. Unsupported layouts and installations without Triton keep the
-same dequantize/GEMM/requantize fallback.
+CUDA qint8 and qfloat8 merges use a Triton merge/reduction/requantize pipeline
+when available. Both it and the generic dequantize/GEMM/requantize fallback
+recompute Quanto's data-dependent absmax weight scale from the merged values.
 
 Selected by :mod:`tensor_adapter_registry`. Importing fails silently if
 optimum-quanto is not installed — quanto support is optional.
@@ -171,6 +171,7 @@ def _has_triton_compatible_layout(
     return (
         data.device.type == "cuda"
         and data.ndim == 2
+        and data.numel() != 0
         and tuple(data.shape) == tuple(qt.size())
         and _has_supported_scale_layout(qt)
         and scale.dtype in (torch.float16, torch.bfloat16, torch.float32)
@@ -350,6 +351,38 @@ class QuantoAdapter:
         return requantize_qbytes_tensor(t, like=like)
 
     @staticmethod
+    def validate_lora_merge(
+        target: torch.Tensor,
+        _b: torch.Tensor,
+        a: torch.Tensor,
+        _strength: float,
+    ) -> None:
+        """Validate canonicalization and absmax-requantization layout."""
+        qt = canonicalize_qbytes_tensor(target)
+        if qt._data.ndim != 2 or tuple(qt._data.shape) != tuple(qt.size()):
+            raise ValueError(
+                "Quanto LoRA merge requires a rank-two weight whose qbytes storage matches its logical shape."
+            )
+        if getattr(qt.qtype, "bits", None) != 8:
+            raise ValueError("Quanto qbytes LoRA merge requires an 8-bit qtype.")
+        qmax = getattr(qt.qtype, "qmax", None)
+        if not isinstance(qmax, (int, float)) or qmax <= 0:
+            raise ValueError("Quanto qbytes LoRA merge requires a qtype with a positive qmax.")
+        if getattr(qt.qtype, "dtype", None) is not qt._data.dtype:
+            raise ValueError("Quanto qbytes storage dtype does not match its qtype metadata.")
+        if not qt._scale.dtype.is_floating_point:
+            raise ValueError("Quanto qbytes LoRA merge requires floating-point scales.")
+        if qt._data.device != qt._scale.device:
+            raise ValueError("Quanto qbytes data and scales must be on the same device.")
+        if not _has_supported_scale_layout(qt):
+            raise ValueError(
+                "Quanto LoRA merge expects a scalar scale, shape (rows, 1) "
+                "for axis 0, or shape (1, columns) for the last axis."
+            )
+        if a.shape[0] == 0:
+            raise ValueError("Quanto LoRA merge requires a positive LoRA rank.")
+
+    @staticmethod
     def merge_lora_(
         target: torch.Tensor,
         b: torch.Tensor,
@@ -357,6 +390,7 @@ class QuantoAdapter:
         strength: float,
     ) -> None:
         """Merge with Triton when possible, except for packed Marlin targets."""
+        QuantoAdapter.validate_lora_merge(target, b, a, strength)
         target_qt = require_qbytes_tensor(target)
         qt = canonicalize_qbytes_tensor(target_qt)
         triton_merge = None
@@ -367,7 +401,7 @@ class QuantoAdapter:
                 triton_merge = _triton_merge_quanto_qfloat8_lora
 
         if triton_merge is not None and _has_triton_compatible_layout(qt, b, a):
-            data = triton_merge(
+            data, scale = triton_merge(
                 qt._data,
                 qt._scale,
                 qt.axis,
@@ -381,7 +415,7 @@ class QuantoAdapter:
                 qt.size(),
                 qt.stride(),
                 data,
-                qt._scale,
+                scale,
                 qbytes_activation_qtype(qt),
             )
             copy_qbytes_tensor_(merged, target_qt)

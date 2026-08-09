@@ -214,6 +214,30 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
         return requantize_nvfp4_tensor(t, like=like)
 
     @staticmethod
+    def validate_lora_merge(
+        target: torch.Tensor,
+        _b: torch.Tensor,
+        _a: torch.Tensor,
+        _strength: float,
+    ) -> None:
+        """Reject layouts whose weight quantizers cannot be preserved."""
+        nv = require_nvfp4_tensor(target)
+        if not nv.qdata.is_contiguous():
+            raise ValueError(
+                "Cannot merge LoRA into a non-contiguous (e.g. transposed) "
+                "NVFP4 weight: requantization produces the standard packed "
+                "layout, which cannot fill a transposed target. Use routed "
+                "LoRA for this weight."
+            )
+        if nv.per_tensor_scale is not None and nv.per_tensor_scale.numel() != 1:
+            raise ValueError(
+                "Cannot merge LoRA into an NVFP4 weight with a non-scalar "
+                "per_tensor_scale (e.g. per-expert grouped/MoE scales); the "
+                "merge recomputes a single global scale and would drop "
+                "per-group precision. Use routed LoRA for this weight."
+            )
+
+    @staticmethod
     def merge_lora_(
         target: torch.Tensor,
         b: torch.Tensor,
@@ -221,6 +245,7 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
         strength: float,
     ) -> None:
         """Merge a staged LoRA update while preserving target storage."""
+        Nvfp4Adapter.validate_lora_merge(target, b, a, strength)
         nv = require_nvfp4_tensor(target)
         if _is_triton_nvfp4_layout(nv, b, a):
             assert _triton_merge_nvfp4_lora is not None

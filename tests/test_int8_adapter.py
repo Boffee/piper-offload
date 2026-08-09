@@ -1,5 +1,7 @@
 """Tests for TorchAO Int8 (``Int8Tensor``) adapter integration."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 from torch import nn
@@ -132,6 +134,30 @@ def _make_affine_int8(
     )
 
 
+def _with_act_pre_scale(
+    qt: torch.Tensor,
+    act_pre_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Clone an INT8 test tensor and attach independent pre-scale storage."""
+    int8_cls = _int8_tensor_cls()
+
+    def cloned(t: torch.Tensor | None) -> torch.Tensor | None:
+        return None if t is None else t.clone()
+
+    return int8_cls(
+        qt.qdata.clone(),
+        qt.scale.clone(),
+        list(qt.block_size),
+        qt.dtype,
+        zero_point=cloned(qt.zero_point),
+        act_quant_scale=cloned(qt.act_quant_scale),
+        act_quant_zero_point=cloned(qt.act_quant_zero_point),
+        act_pre_scale=act_pre_scale.clone(),
+        act_quant_kwargs=qt.act_quant_kwargs,
+        reduce_range=qt.reduce_range,
+    )
+
+
 def _expected_int8_merge(
     qt: torch.Tensor,
     b: torch.Tensor,
@@ -139,7 +165,15 @@ def _expected_int8_merge(
     strength: float,
 ) -> torch.Tensor:
     dense = Int8Adapter.dequantize(qt)
-    dense.addmm_(b, a, alpha=strength)
+    pre_scale = qt.act_pre_scale
+    if pre_scale is None:
+        stored_a = a
+        stored_strength = strength
+    else:
+        divisor = pre_scale.reshape(1, 1) if pre_scale.numel() == 1 else pre_scale.reshape(1, a.shape[1])
+        stored_a = a.to(torch.float64).mul(strength).div(divisor.to(device=a.device, dtype=torch.float64)).to(a.dtype)
+        stored_strength = 1.0
+    dense.addmm_(b, stored_a, alpha=stored_strength)
     return Int8Adapter.requantize(dense, like=qt)
 
 
@@ -417,6 +451,301 @@ class TestInt8Adapter:
         assert merged == 1
         assert not torch.equal(model.lin.weight.data.qdata, original_qdata)
 
+    @pytest.mark.parametrize(
+        "shape",
+        [(), (1,), (16,), (1, 16), (1, 1, 16)],
+    )
+    def test_lora_merge_accepts_scalar_and_per_input_act_pre_scale(
+        self,
+        shape: tuple[int, ...],
+    ) -> None:
+        base = _make_affine_int8(torch.randn(8, 16))
+        pre_scale = torch.full(shape, 0.75)
+        qt = _with_act_pre_scale(base, pre_scale)
+
+        Int8Adapter.validate_lora_merge(
+            qt,
+            torch.ones(8, 1),
+            torch.ones(1, 16),
+            1.0,
+        )
+
+    @pytest.mark.parametrize(
+        ("kind", "match"),
+        [
+            ("integer", "floating-point"),
+            ("wrong-features", "scalar or one value per input feature"),
+            ("batch-dependent", "scalar or one value per input feature"),
+            ("zero", "non-zero"),
+            ("nan", "finite"),
+            ("infinite", "finite"),
+        ],
+    )
+    def test_lora_merge_rejects_invalid_act_pre_scale_before_mutation(
+        self,
+        kind: str,
+        match: str,
+    ) -> None:
+        rows, cols, rank = 8, 16, 3
+        base = _make_affine_int8(torch.randn(rows, cols))
+        if kind == "integer":
+            pre_scale = torch.ones(cols, dtype=torch.int32)
+        elif kind == "wrong-features":
+            pre_scale = torch.ones(cols - 1)
+        elif kind == "batch-dependent":
+            pre_scale = torch.ones(2, cols)
+        else:
+            pre_scale = torch.ones(cols)
+            pre_scale[3] = {
+                "zero": 0.0,
+                "nan": float("nan"),
+                "infinite": float("inf"),
+            }[kind]
+        qt = _with_act_pre_scale(base, pre_scale)
+        qdata_before = qt.qdata.clone()
+
+        with pytest.raises(ValueError, match=match):
+            Int8Adapter.validate_lora_merge(
+                qt,
+                torch.randn(rows, rank),
+                torch.randn(rank, cols),
+                0.5,
+            )
+        with pytest.raises(ValueError, match=match):
+            Int8Adapter.merge_lora_(
+                qt,
+                torch.randn(rows, rank),
+                torch.randn(rank, cols),
+                0.5,
+            )
+
+        assert torch.equal(qt.qdata, qdata_before)
+
+    @pytest.mark.parametrize(
+        ("pre_scale", "a_value", "strength"),
+        [
+            (1e-40, 1.0, 0.0),
+            (1e-40, 1.0, 1e-40),
+            (1e30, 1e10, 1e30),
+        ],
+    )
+    def test_act_pre_scale_validation_uses_strength_before_division(
+        self,
+        pre_scale: float,
+        a_value: float,
+        strength: float,
+    ) -> None:
+        rows, cols, rank = 8, 16, 3
+        qt = _with_act_pre_scale(
+            _make_affine_int8(torch.randn(rows, cols)),
+            torch.full((cols,), pre_scale),
+        )
+        b = torch.randn(rows, rank)
+        a = torch.full((rank, cols), a_value)
+        expected = _expected_int8_merge(qt, b, a, strength)
+
+        Int8Adapter.validate_lora_merge(qt, b, a, strength)
+        Int8Adapter.merge_lora_(qt, b, a, strength)
+
+        assert torch.equal(qt.qdata, expected.qdata)
+        assert torch.equal(qt.scale, expected.scale)
+        assert torch.isfinite(qt.dequantize()).all()
+
+    def test_merge_lora_preflights_factor_dependent_overflow_before_mutation(
+        self,
+    ) -> None:
+        rows, cols, rank = 8, 16, 3
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.first = nn.Linear(cols, rows, bias=False)
+                self.second = nn.Linear(cols, rows, bias=False)
+
+        model = M()
+        model.first.weight = nn.Parameter(
+            _make_affine_int8(torch.randn(rows, cols)),
+            requires_grad=False,
+        )
+        model.second.weight = nn.Parameter(
+            _with_act_pre_scale(
+                _make_affine_int8(torch.randn(rows, cols)),
+                torch.full((cols,), 1e-40),
+            ),
+            requires_grad=False,
+        )
+        before = {
+            name: (
+                param.data.qdata.clone(),
+                param.data.scale.clone(),
+            )
+            for name, param in model.named_parameters()
+        }
+        lora = LoRA.from_state_dict(
+            {
+                "first.lora_A.weight": torch.ones(rank, cols),
+                "first.lora_B.weight": torch.ones(rows, rank),
+                "second.lora_A.weight": torch.ones(rank, cols),
+                "second.lora_B.weight": torch.ones(rows, rank),
+            }
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="second.weight.*non-finite stored-coordinate LoRA factors",
+        ):
+            merge_lora(model, [(lora, 1.0)])
+
+        for name, param in model.named_parameters():
+            qdata, scale = before[name]
+            assert torch.equal(param.data.qdata, qdata)
+            assert torch.equal(param.data.scale, scale)
+
+    def test_generic_merge_with_nonuniform_act_pre_scale_matches_routed_forward(
+        self,
+    ) -> None:
+        torch.manual_seed(123)
+        rows, cols, rank = 7, 8, 3
+        pre_scale = torch.tensor(
+            [0.5, 0.75, 1.0, 1.5, 2.0, 0.625, 1.25, 1.75],
+        )
+        qt = _with_act_pre_scale(
+            _make_affine_int8(torch.randn(rows, cols) * 0.3),
+            pre_scale,
+        )
+        x = torch.randn(13, cols)
+        a = torch.randn(rank, cols) * 0.12
+        b = torch.randn(rows, rank) * 0.12
+        strength = 0.7
+        expected_storage = _expected_int8_merge(qt, b, a, strength)
+        routed_output = torch.nn.functional.linear(x, qt) + ((x @ a.T) * strength) @ b.T
+        pre_scale_ptr = qt.act_pre_scale.data_ptr()
+        pre_scale_before = qt.act_pre_scale.clone()
+
+        Int8Adapter.merge_lora_(qt, b, a, strength)
+        merged_output = torch.nn.functional.linear(x, qt)
+
+        assert torch.equal(qt.qdata, expected_storage.qdata)
+        assert torch.equal(qt.scale, expected_storage.scale)
+        assert qt.act_pre_scale.data_ptr() == pre_scale_ptr
+        assert torch.equal(qt.act_pre_scale, pre_scale_before)
+        torch.testing.assert_close(
+            merged_output,
+            routed_output,
+            rtol=0.01,
+            atol=0.025,
+        )
+
+    @pytest.mark.parametrize(
+        ("device", "expects_triton"),
+        [
+            ("cpu", False),
+            pytest.param("cuda", True, marks=CUDA),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("a_value", "b_value", "strength", "pre_scale", "x_value"),
+        [
+            (1e10, 1e-10, 1e30, 1e30, 1e-30),
+            (1e-20, 1e20, 1e-30, 1e-30, 1e30),
+        ],
+        ids=["multiply-would-overflow", "multiply-would-underflow"],
+    )
+    def test_packed_extreme_strengths_stage_before_low_precision_cast(
+        self,
+        device: str,
+        expects_triton: bool,
+        a_value: float,
+        b_value: float,
+        strength: float,
+        pre_scale: float,
+        x_value: float,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Packed factors keep strength boundaries through p-coordinate mapping."""
+        torch.manual_seed(125)
+        rows, cols = 4, 8
+        base = _make_affine_int8(
+            torch.randn(rows, cols, device=device) * 0.05,
+        )
+        qt = _with_act_pre_scale(
+            base,
+            torch.tensor(pre_scale, device=device),
+        )
+        param = nn.Parameter(qt, requires_grad=False)
+        a = torch.full((1, cols), a_value)
+        b = torch.full((rows, 1), b_value)
+        factors = [ScaledLoRAFactor.from_tensors(a.clone(), b.clone(), strength) for _ in range(2)]
+        x = torch.full((3, cols), x_value, device=device)
+
+        # Independent logical-coordinate reference. The old packed path cast
+        # A first and then multiplied strength, producing inf or zero before
+        # the adapter had a chance to cancel strength against pre_scale.
+        routed_output = torch.nn.functional.linear(x, qt)
+        for _ in factors:
+            routed_output = routed_output + ((x @ a.to(device).T) * strength) @ b.to(device).T
+
+        prepared_a: list[torch.Tensor] = []
+        original_prepared_merge = Int8Adapter.merge_prepared_lora_
+
+        def record_prepared_merge(
+            target: torch.Tensor,
+            packed_b: torch.Tensor,
+            packed_a: torch.Tensor,
+            packed_strength: float,
+        ) -> None:
+            prepared_a.append(packed_a.detach().clone())
+            original_prepared_merge(
+                target,
+                packed_b,
+                packed_a,
+                packed_strength,
+            )
+
+        monkeypatch.setattr(
+            Int8Adapter,
+            "merge_prepared_lora_",
+            staticmethod(record_prepared_merge),
+        )
+
+        triton_calls = 0
+        original_triton_merge = int8_adapter_module._triton_merge_int8_lora
+
+        if original_triton_merge is not None:
+
+            def record_triton_merge(*args: object, **kwargs: object):
+                nonlocal triton_calls
+                triton_calls += 1
+                return original_triton_merge(*args, **kwargs)
+
+            monkeypatch.setattr(
+                int8_adapter_module,
+                "_triton_merge_int8_lora",
+                record_triton_merge,
+            )
+
+        pre_scale_ptr = qt.act_pre_scale.data_ptr()
+        LoRATransform(factors).apply(param)
+        if device == "cuda":
+            torch.cuda.synchronize()
+
+        assert len(prepared_a) == 1
+        assert torch.isfinite(prepared_a[0]).all()
+        torch.testing.assert_close(
+            prepared_a[0],
+            torch.full_like(prepared_a[0], a_value),
+        )
+        assert triton_calls == int(expects_triton)
+        assert param.data.act_pre_scale.data_ptr() == pre_scale_ptr
+        assert torch.isfinite(param.data.dequantize(torch.float32)).all()
+        merged_output = torch.nn.functional.linear(x, param.data)
+        torch.testing.assert_close(
+            merged_output,
+            routed_output,
+            rtol=0.01,
+            atol=0.05,
+        )
+
     @CUDA
     @pytest.mark.parametrize(
         "dtype",
@@ -425,6 +754,7 @@ class TestInt8Adapter:
     def test_triton_merge_matches_eager_for_compute_dtypes(
         self,
         dtype: torch.dtype,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         rows, cols, rank = 35, 69, 7
         qt = _make_affine_int8(
@@ -437,6 +767,14 @@ class TestInt8Adapter:
         qdata_ptr = qt.qdata.data_ptr()
         scale_ptr = qt.scale.data_ptr()
         zero_point_ptr = qt.zero_point.data_ptr()
+        triton_merge = int8_adapter_module._triton_merge_int8_lora
+        assert triton_merge is not None
+        tracked_triton = Mock(wraps=triton_merge)
+        monkeypatch.setattr(
+            int8_adapter_module,
+            "_triton_merge_int8_lora",
+            tracked_triton,
+        )
 
         assert not a.is_contiguous()
         assert not b.is_contiguous()
@@ -446,6 +784,7 @@ class TestInt8Adapter:
         assert qt.qdata.data_ptr() == qdata_ptr
         assert qt.scale.data_ptr() == scale_ptr
         assert qt.zero_point.data_ptr() == zero_point_ptr
+        assert tracked_triton.call_count == 1
         _assert_triton_int8_close(qt, expected)
 
     @CUDA
@@ -464,6 +803,7 @@ class TestInt8Adapter:
         self,
         layout: str,
         asymmetric: bool,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         rows, cols, rank = 35, 69, 19
         dtype = torch.bfloat16
@@ -477,10 +817,19 @@ class TestInt8Adapter:
         b = torch.randn(rows, rank, device="cuda", dtype=dtype)
         strength = 0.1875
         expected = _expected_int8_merge(qt, b, a, strength)
+        triton_merge = int8_adapter_module._triton_merge_int8_lora
+        assert triton_merge is not None
+        tracked_triton = Mock(wraps=triton_merge)
+        monkeypatch.setattr(
+            int8_adapter_module,
+            "_triton_merge_int8_lora",
+            tracked_triton,
+        )
 
         Int8Adapter.merge_lora_(qt, b, a, strength)
         torch.cuda.synchronize()
 
+        assert tracked_triton.call_count == 1
         _assert_triton_int8_close(qt, expected)
 
     @CUDA
@@ -561,17 +910,20 @@ class TestInt8Adapter:
             ),
         ]
         factors = [ScaledLoRAFactor.from_tensors(a, b, strength) for a, b, strength in factor_inputs]
-        dense = Int8Adapter.dequantize(qt)
         packed_a = torch.cat(
-            [a.to(device="cuda", dtype=dtype).mul_(strength) for a, _b, strength in factor_inputs],
+            [
+                a.to(device="cuda", dtype=torch.float64).mul(strength).div(act_pre_scale.to(torch.float64)).to(dtype)
+                for a, _b, strength in factor_inputs
+            ],
             dim=0,
         )
         packed_b = torch.cat(
             [b.to(device="cuda", dtype=dtype) for _a, b, _strength in factor_inputs],
             dim=1,
         )
-        dense.addmm_(packed_b, packed_a)
-        expected = Int8Adapter.requantize(dense, like=qt)
+        expected_dense = Int8Adapter.dequantize(qt)
+        expected_dense.addmm_(packed_b, packed_a)
+        expected = Int8Adapter.requantize(expected_dense, like=qt)
         storage = (
             qt.qdata,
             qt.scale,
@@ -639,10 +991,60 @@ class TestInt8Adapter:
         _assert_triton_int8_close(merged, expected)
 
     @CUDA
+    def test_nonuniform_act_pre_scale_generic_and_triton_merges_match(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        torch.manual_seed(124)
+        rows, cols, rank = 19, 64, 5
+        dtype = torch.bfloat16
+        base = _make_affine_int8(
+            torch.randn(rows, cols, device="cuda", dtype=dtype) * 0.3,
+        )
+        pre_scale = torch.linspace(
+            0.5,
+            2.0,
+            cols,
+            device="cuda",
+            dtype=dtype,
+        ).reshape(1, cols)
+        generic = _with_act_pre_scale(base, pre_scale)
+        fused = _with_act_pre_scale(base, pre_scale)
+        a = torch.randn(rank, cols, device="cuda", dtype=dtype) * 0.1
+        b = torch.randn(rows, rank, device="cuda", dtype=dtype) * 0.1
+        strength = -0.375
+        triton_merge = int8_adapter_module._triton_merge_int8_lora
+        assert triton_merge is not None
+
+        monkeypatch.setattr(int8_adapter_module, "_triton_merge_int8_lora", None)
+        Int8Adapter.merge_lora_(generic, b, a, strength)
+
+        calls = 0
+
+        def tracked_triton_merge(*args: object, **kwargs: object):
+            nonlocal calls
+            calls += 1
+            return triton_merge(*args, **kwargs)
+
+        monkeypatch.setattr(
+            int8_adapter_module,
+            "_triton_merge_int8_lora",
+            tracked_triton_merge,
+        )
+        Int8Adapter.merge_lora_(fused, b, a, strength)
+        torch.cuda.synchronize()
+
+        assert calls == 1
+        assert torch.equal(generic.act_pre_scale, pre_scale)
+        assert torch.equal(fused.act_pre_scale, pre_scale)
+        _assert_triton_int8_close(fused, generic)
+
+    @CUDA
     @pytest.mark.parametrize("asymmetric", [False, True])
     def test_triton_merge_preserves_reduced_range(
         self,
         asymmetric: bool,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         rows, cols, rank = 35, 69, 7
         dtype = torch.bfloat16
@@ -655,6 +1057,14 @@ class TestInt8Adapter:
         a = torch.randn(rank, cols, device="cuda", dtype=dtype)
         b = torch.randn(rows, rank, device="cuda", dtype=dtype)
         expected = _expected_int8_merge(qt, b, a, 0.25)
+        triton_merge = int8_adapter_module._triton_merge_int8_lora
+        assert triton_merge is not None
+        tracked_triton = Mock(wraps=triton_merge)
+        monkeypatch.setattr(
+            int8_adapter_module,
+            "_triton_merge_int8_lora",
+            tracked_triton,
+        )
 
         assert qt.scale.dtype is torch.float32
         Int8Adapter.merge_lora_(qt, b, a, 0.25)
@@ -663,6 +1073,7 @@ class TestInt8Adapter:
         assert qt.reduce_range is True
         assert qt.qdata.min().item() >= -64
         assert qt.qdata.max().item() <= 63
+        assert tracked_triton.call_count == 1
         _assert_triton_int8_close(qt, expected)
 
     @CUDA

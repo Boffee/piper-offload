@@ -68,6 +68,33 @@ def _factor_tensors(factor: LoRAFactor) -> tuple[torch.Tensor, torch.Tensor]:
     return factor.a.make_cpu_param().data, factor.b.make_cpu_param().data
 
 
+def _quanto_absmax_oracle(
+    dense: torch.Tensor,
+    *,
+    like: torch.Tensor,
+) -> torch.Tensor:
+    """Quantize with Quanto's optimizer/operator, independent of the adapter."""
+    from optimum.quanto.tensor.optimizers import AbsmaxOptimizer
+    from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+    canonical = like if type(like) is WeightQBytesTensor else like.weight_qbytes_tensor()
+    axis = canonical.axis
+    optimizer_axis = -1 if axis == dense.ndim - 1 else axis
+    scale = AbsmaxOptimizer()(dense, qtype=canonical.qtype, axis=optimizer_axis)
+    scale = scale.to(dtype=canonical._scale.dtype).reshape(canonical._scale.shape)
+    zero = scale == 0
+    eps = torch.finfo(torch.float32).eps
+    scale = torch.where(zero, torch.full_like(scale, eps), scale)
+    return WeightQBytesTensor.quantize(
+        dense,
+        canonical.qtype,
+        optimizer_axis,
+        scale,
+        getattr(canonical, "activation_qtype", None),
+        optimized=False,
+    )
+
+
 def _make_model_offloader(
     model: nn.Module,
     *,
@@ -1283,6 +1310,7 @@ class TestLoRATransform:
         transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
         original_param = param
         original_packed_ptr = param.data._data.data_ptr()
+        original_scale_ptr = param.data._scale.data_ptr()
         expected_dense = qt.dequantize()
         merge_calls: list[tuple[str, tuple[int, ...], tuple[int, ...], float]] = []
         original_merge = QuantoAdapter.merge_lora_
@@ -1316,18 +1344,14 @@ class TestLoRATransform:
             a.to(expected_dense.dtype),
             alpha=0.5,
         )
-        expected_packed = (
-            (expected_dense / scale.to(expected_dense.dtype))
-            .round()
-            .clamp(-128, 127)
-            .to(torch.int8)
-        )
+        expected = _quanto_absmax_oracle(expected_dense, like=qt)
         assert param is original_param
         assert param.data._data.data_ptr() == original_packed_ptr
+        assert param.data._scale.data_ptr() == original_scale_ptr
         assert isinstance(param.data, WeightQBytesTensor)
         assert merge_calls == [("cpu", (rows, rank), (rank, cols), 0.5)]
-        torch.testing.assert_close(param.data._data, expected_packed)
-        torch.testing.assert_close(param.data._scale, scale)
+        torch.testing.assert_close(param.data._data, expected._data)
+        torch.testing.assert_close(param.data._scale, expected._scale)
 
     def test_quanto_validation_reads_shape_without_dequantizing(
         self,
@@ -1369,13 +1393,388 @@ class TestLoRATransform:
 
         transform.validate_target(nn.Parameter(qt, requires_grad=False))
 
+    @pytest.mark.parametrize("axis", [0, -1, 1, None])
+    @pytest.mark.parametrize("shape", [(0, 4), (4, 0)])
+    @pytest.mark.parametrize(
+        "qtype_name",
+        ["qint8", "qfloat8_e4m3fn", "qfloat8_e5m2"],
+    )
+    def test_quanto_empty_merge_is_scale_preserving_noop(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        axis: int | None,
+        shape: tuple[int, int],
+        qtype_name: str,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols = shape
+        qtype = getattr(quanto, qtype_name)
+        scale_shape = (
+            (rows, 1)
+            if axis == 0
+            else ((1, cols) if axis in (-1, 1) else ())
+        )
+        scale_numel = rows if axis == 0 else (cols if axis in (-1, 1) else 1)
+        scale = torch.arange(scale_numel, dtype=torch.float32).reshape(scale_shape)
+        assert scale.numel() == 0 or torch.any(scale == 0)
+        data = torch.empty(shape, dtype=qtype.dtype)
+        qt = WeightQBytesTensor(
+            qtype,
+            axis,
+            shape,
+            data.stride(),
+            data,
+            scale,
+            quanto.qint8,
+        )
+        b = torch.randn(rows, 2)
+        a = torch.randn(2, cols)
+        data_before = qt._data.clone()
+        scale_before = qt._scale.clone()
+        data_ptr = qt._data.data_ptr()
+        scale_ptr = qt._scale.data_ptr()
+        generic_calls = 0
+        original_generic = quanto_adapter_impl._torch_merge_quanto_lora
+
+        def tracked_generic(
+            target: torch.Tensor,
+            staged_b: torch.Tensor,
+            staged_a: torch.Tensor,
+            strength: float,
+        ) -> torch.Tensor:
+            nonlocal generic_calls
+            generic_calls += 1
+            return original_generic(target, staged_b, staged_a, strength)
+
+        monkeypatch.setattr(
+            quanto_adapter_impl,
+            "_torch_merge_quanto_lora",
+            tracked_generic,
+        )
+
+        QuantoAdapter.validate_lora_merge(qt, b, a, 0.5)
+        QuantoAdapter.merge_lora_(qt, b, a, 0.5)
+
+        assert generic_calls == 1
+        assert qt._data.data_ptr() == data_ptr
+        assert qt._scale.data_ptr() == scale_ptr
+        assert qt.qtype is qtype
+        assert qt.activation_qtype is quanto.qint8
+        torch.testing.assert_close(qt._data, data_before)
+        torch.testing.assert_close(qt._scale, scale_before)
+
+    @pytest.mark.parametrize(
+        ("axis", "shape", "scale_shape"),
+        [
+            (0, (0, 4), (1, 4)),
+            (-1, (4, 0), (4, 1)),
+            (1, (4, 0), (4, 1)),
+            (None, (0, 4), (0,)),
+        ],
+    )
+    def test_quanto_empty_merge_still_rejects_malformed_scale_layout(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        axis: int | None,
+        shape: tuple[int, int],
+        scale_shape: tuple[int, ...],
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols = shape
+        data = torch.empty(shape, dtype=torch.int8)
+        qt = WeightQBytesTensor(
+            quanto.qint8,
+            axis,
+            shape,
+            data.stride(),
+            data,
+            torch.empty(scale_shape),
+            None,
+        )
+        b = torch.randn(rows, 2)
+        a = torch.randn(2, cols)
+
+        def fail_generic(*_args: object) -> torch.Tensor:
+            raise AssertionError("malformed empty layout reached generic merge")
+
+        monkeypatch.setattr(
+            quanto_adapter_impl,
+            "_torch_merge_quanto_lora",
+            fail_generic,
+        )
+
+        with pytest.raises(ValueError, match="Quanto LoRA merge expects"):
+            QuantoAdapter.merge_lora_(qt, b, a, 0.5)
+
+    def test_quanto_empty_requantize_rejects_malformed_reference(
+        self,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols = 4, 0
+        data = torch.empty(rows, cols, dtype=torch.int8)
+        malformed = WeightQBytesTensor(
+            quanto.qint8,
+            0,
+            (rows, cols),
+            data.stride(),
+            data,
+            torch.ones(1, rows),
+            None,
+        )
+
+        with pytest.raises(ValueError, match="scale storage does not match"):
+            QuantoAdapter.requantize(torch.empty(rows, cols), like=malformed)
+
+        unsupported_qtype = WeightQBytesTensor(
+            quanto.qint4,
+            0,
+            (rows, cols),
+            data.stride(),
+            data,
+            torch.ones(rows, 1),
+            None,
+        )
+        with pytest.raises(ValueError, match="8-bit qtype"):
+            QuantoAdapter.requantize(
+                torch.empty(rows, cols),
+                like=unsupported_qtype,
+            )
+
+    def test_quanto_zero_rank_is_rejected_before_merge(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols = 4, 6
+        data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1).add_(0.25)
+        qt = WeightQBytesTensor(
+            quanto.qint8,
+            0,
+            (rows, cols),
+            data.stride(),
+            data,
+            scale,
+            None,
+        )
+        b = torch.empty(rows, 0)
+        a = torch.empty(0, cols)
+        data_before = data.clone()
+        scale_before = scale.clone()
+
+        def fail_merge(*_args: object) -> torch.Tensor:
+            raise AssertionError("zero-rank Quanto factors reached merge math")
+
+        monkeypatch.setattr(
+            quanto_adapter_impl,
+            "_torch_merge_quanto_lora",
+            fail_merge,
+        )
+        monkeypatch.setattr(
+            quanto_adapter_impl,
+            "_triton_merge_quanto_qint8_lora",
+            fail_merge,
+        )
+
+        with pytest.raises(ValueError, match="positive LoRA rank"):
+            QuantoAdapter.validate_lora_merge(qt, b, a, 1.0)
+        with pytest.raises(ValueError, match="positive LoRA rank"):
+            QuantoAdapter.merge_lora_(qt, b, a, 1.0)
+
+        torch.testing.assert_close(qt._data, data_before)
+        torch.testing.assert_close(qt._scale, scale_before)
+
     @CUDA
-    @pytest.mark.parametrize("axis", [0, -1, None])
+    def test_quanto_empty_cuda_layout_falls_back_from_triton(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        pytest.importorskip("triton")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols, rank = 4, 0, 2
+        data = torch.empty(rows, cols, device="cuda", dtype=torch.int8)
+        scale = torch.tensor(
+            [[0.0], [0.25], [0.5], [1.0]],
+            device="cuda",
+        )
+        qt = WeightQBytesTensor(
+            quanto.qint8,
+            0,
+            (rows, cols),
+            data.stride(),
+            data,
+            scale,
+            None,
+        )
+        scale_before = scale.clone()
+        generic_calls = 0
+        original_generic = quanto_adapter_impl._torch_merge_quanto_lora
+
+        def fail_triton(*_args: object) -> tuple[torch.Tensor, torch.Tensor]:
+            raise AssertionError("empty Quanto layout reached Triton")
+
+        def tracked_generic(
+            target: torch.Tensor,
+            b: torch.Tensor,
+            a: torch.Tensor,
+            strength: float,
+        ) -> torch.Tensor:
+            nonlocal generic_calls
+            generic_calls += 1
+            return original_generic(target, b, a, strength)
+
+        monkeypatch.setattr(
+            quanto_adapter_impl,
+            "_triton_merge_quanto_qint8_lora",
+            fail_triton,
+        )
+        monkeypatch.setattr(
+            quanto_adapter_impl,
+            "_torch_merge_quanto_lora",
+            tracked_generic,
+        )
+
+        QuantoAdapter.merge_lora_(
+            qt,
+            torch.randn(rows, rank, device="cuda"),
+            torch.randn(rank, cols, device="cuda"),
+            0.5,
+        )
+
+        assert generic_calls == 1
+        torch.testing.assert_close(qt._scale, scale_before)
+
+    @pytest.mark.parametrize("axis", [0, -1, 1, None])
+    @pytest.mark.parametrize(
+        "qtype_name",
+        ["qint8", "qfloat8_e4m3fn", "qfloat8_e5m2"],
+    )
+    def test_quanto_generic_requantize_matches_absmax_oracle_and_repairs_zero(
+        self,
+        axis: int | None,
+        qtype_name: str,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols = 4, 6
+        qtype = getattr(quanto, qtype_name)
+        scale_shape = (
+            (rows, 1)
+            if axis == 0
+            else ((1, cols) if axis in (-1, 1) else ())
+        )
+        like = WeightQBytesTensor(
+            qtype,
+            axis,
+            (rows, cols),
+            (cols, 1),
+            torch.zeros(rows, cols, dtype=qtype.dtype),
+            torch.full(scale_shape, 1.0 / qtype.qmax),
+            None,
+        )
+        dense = torch.linspace(-9.0, 12.0, rows * cols).reshape(rows, cols)
+        if axis == 0:
+            dense[0].zero_()
+        elif axis in (-1, 1):
+            dense[:, 0].zero_()
+
+        expected = _quanto_absmax_oracle(dense, like=like)
+        actual = QuantoAdapter.requantize(dense, like=like)
+
+        assert actual.qtype is qtype
+        assert actual.axis == axis
+        assert actual._scale.max() > like._scale.max()
+        torch.testing.assert_close(actual._scale, expected._scale)
+        torch.testing.assert_close(actual._data.float(), expected._data.float())
+
+        # Quanto's raw AbsmaxOptimizer produces scale zero for an exact-zero
+        # block; qfloat8's subsequent 0/0 quantization produces NaNs. The
+        # adapter deliberately floors only those scales and stores zero codes.
+        all_zero = QuantoAdapter.requantize(torch.zeros_like(dense), like=like)
+        assert torch.all(all_zero._scale == torch.finfo(torch.float32).eps)
+        assert torch.count_nonzero(all_zero._data.float()).item() == 0
+        assert torch.isfinite(all_zero.dequantize()).all()
+
+    @pytest.mark.parametrize(
+        "qtype_name",
+        ["qfloat8_e4m3fn", "qfloat8_e5m2"],
+    )
+    @pytest.mark.parametrize("axis", [0, -1, 1, None])
+    def test_quanto_generic_merge_recovers_real_zero_scale_qfloat8(
+        self,
+        qtype_name: str,
+        axis: int | None,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.optimizers import AbsmaxOptimizer
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols, rank = 4, 6, 2
+        qtype = getattr(quanto, qtype_name)
+        base = torch.linspace(-3.0, 4.0, rows * cols).reshape(rows, cols)
+        if axis == 0:
+            base[0].zero_()
+        elif axis in (-1, 1):
+            base[:, 0].zero_()
+        else:
+            base.zero_()
+        optimizer_axis = -1 if axis == base.ndim - 1 else axis
+        scale = AbsmaxOptimizer()(base, qtype=qtype, axis=optimizer_axis)
+        quantized = WeightQBytesTensor.quantize(
+            base,
+            qtype,
+            optimizer_axis,
+            scale,
+            None,
+            optimized=False,
+        )
+        qt = (
+            WeightQBytesTensor(
+                qtype,
+                axis,
+                quantized.size(),
+                quantized.stride(),
+                quantized._data,
+                quantized._scale,
+                quantized.activation_qtype,
+            )
+            if axis != optimizer_axis
+            else quantized
+        )
+        assert torch.isnan(qt._data.float()).any()
+        safe_base = QuantoAdapter.dequantize(qt)
+        assert torch.isfinite(safe_base).all()
+        b = torch.ones(rows, rank)
+        a = torch.ones(rank, cols)
+        expected = _quanto_absmax_oracle(
+            safe_base.addmm(b, a),
+            like=qt,
+        )
+
+        QuantoAdapter.merge_lora_(qt, b, a, 1.0)
+
+        torch.testing.assert_close(qt._scale, expected._scale)
+        torch.testing.assert_close(qt._data.float(), expected._data.float())
+        assert torch.isfinite(qt.dequantize()).all()
+
+    @CUDA
+    @pytest.mark.parametrize("axis", [0, -1, 1, None])
     @pytest.mark.parametrize(
         "dtype",
         [torch.float16, torch.bfloat16, torch.float32],
     )
-    def test_triton_quanto_qint8_matches_fixed_scale_round_trip(
+    def test_triton_quanto_qint8_matches_absmax_oracle(
         self,
         monkeypatch: pytest.MonkeyPatch,
         axis: int | None,
@@ -1385,11 +1784,12 @@ class TestLoRATransform:
         pytest.importorskip("triton")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
+        torch.manual_seed(41)
         rows, cols, rank = 70, 130, 7
         scale_shape = (
             (rows, 1)
             if axis == 0
-            else ((1, cols) if axis == -1 else ())
+            else ((1, cols) if axis in (-1, 1) else ())
         )
         data = torch.randint(
             -32,
@@ -1428,15 +1828,9 @@ class TestLoRATransform:
         assert not b.is_contiguous()
         expected_dense = qt.dequantize()
         expected_dense.addmm_(b, a, alpha=0.375)
-        expected_data = (
-            (expected_dense / scale)
-            .round()
-            .clamp(-128, 127)
-            .to(torch.int8)
-        )
+        expected = _quanto_absmax_oracle(expected_dense, like=qt)
         data_ptr = qt._data.data_ptr()
         scale_ptr = qt._scale.data_ptr()
-        scale_before = qt._scale.clone()
 
         def fail_fallback(
             _target: torch.Tensor,
@@ -1458,9 +1852,15 @@ class TestLoRATransform:
         assert qt._scale.data_ptr() == scale_ptr
         assert qt.qtype is quanto.qint8
         assert qt.axis == axis
-        assert torch.equal(qt._scale, scale_before)
-        difference = (qt._data.to(torch.int16) - expected_data).abs()
-        assert difference.max().item() <= 1
+        torch.testing.assert_close(
+            qt._scale,
+            expected._scale,
+            rtol=0.02,
+            atol=torch.finfo(dtype).eps,
+        )
+        difference = (qt._data.to(torch.int16) - expected._data.to(torch.int16)).abs()
+        max_qbyte_error = 2 if dtype is torch.bfloat16 else 1
+        assert difference.max().item() <= max_qbyte_error
 
     @CUDA
     def test_quanto_qint8_falls_back_when_triton_is_unavailable(
@@ -1496,7 +1896,7 @@ class TestLoRATransform:
         b = torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16)
         expected_dense = qt.dequantize()
         expected_dense.addmm_(b, a, alpha=-0.25)
-        expected = QuantoAdapter.requantize(expected_dense, like=qt)
+        expected = _quanto_absmax_oracle(expected_dense, like=qt)
 
         monkeypatch.setattr(
             quanto_adapter_impl,
@@ -1509,27 +1909,32 @@ class TestLoRATransform:
         assert torch.equal(qt._scale, expected._scale)
 
     @CUDA
-    @pytest.mark.parametrize("axis", [0, -1, None])
+    @pytest.mark.parametrize("axis", [0, -1, 1, None])
     @pytest.mark.parametrize(
         "qtype_name",
         ["qfloat8_e4m3fn", "qfloat8_e5m2"],
     )
-    def test_triton_quanto_qfloat8_matches_fixed_scale_round_trip(
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float16, torch.bfloat16, torch.float32],
+    )
+    def test_triton_quanto_qfloat8_matches_absmax_oracle(
         self,
         monkeypatch: pytest.MonkeyPatch,
         axis: int | None,
         qtype_name: str,
+        dtype: torch.dtype,
     ) -> None:
         quanto = pytest.importorskip("optimum.quanto")
         pytest.importorskip("triton")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
-        rows, cols, rank = 8, 12, 3
+        rows, cols, rank = 70, 130, 7
         qtype = getattr(quanto, qtype_name)
         scale_shape = (
             (rows, 1)
             if axis == 0
-            else ((1, cols) if axis == -1 else ())
+            else ((1, cols) if axis in (-1, 1) else ())
         )
         qt = WeightQBytesTensor.create(
             qtype,
@@ -1540,22 +1945,17 @@ class TestLoRATransform:
             torch.rand(
                 scale_shape,
                 device="cuda",
-                dtype=torch.bfloat16,
+                dtype=dtype,
             ).add_(0.25),
-            None,
+            quanto.qint8,
         )
-        a = torch.randn(rank, cols, device="cuda", dtype=torch.bfloat16)
-        b = torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16)
+        a = torch.randn(rank, cols, device="cuda", dtype=dtype)
+        b = torch.randn(rows, rank, device="cuda", dtype=dtype)
         expected_dense = qt.dequantize()
         expected_dense.addmm_(b, a, alpha=0.5)
-        limits = torch.finfo(qt._data.dtype)
-        expected_data = (expected_dense / qt._scale).clamp(
-            limits.min,
-            limits.max,
-        ).to(qt._data.dtype)
+        expected = _quanto_absmax_oracle(expected_dense, like=qt)
         data_ptr = qt._data.data_ptr()
         scale_ptr = qt._scale.data_ptr()
-        scale_before = qt._scale.clone()
 
         def fail_fallback(
             _target: torch.Tensor,
@@ -1577,13 +1977,89 @@ class TestLoRATransform:
         assert qt._scale.data_ptr() == scale_ptr
         assert qt.qtype is qtype
         assert qt.axis == axis
-        assert torch.equal(qt._scale, scale_before)
+        assert qt.activation_qtype is quanto.qint8
         torch.testing.assert_close(
-            qt._data.float(),
-            expected_data.float(),
-            rtol=0.15,
-            atol=1.0,
+            qt._scale,
+            expected._scale,
+            rtol=0.02,
+            atol=torch.finfo(dtype).eps,
         )
+        differing_codes = torch.count_nonzero(
+            qt._data.view(torch.uint8) != expected._data.view(torch.uint8)
+        ).item()
+        # BF16 tiled accumulation can move values across an adjacent FP8
+        # quantization boundary more often than FP16/FP32, but the affected
+        # fraction must remain small and the reconstructed weight must still
+        # match the independent Quanto round trip below.
+        assert differing_codes <= qt._data.numel() // 20 + 1
+        torch.testing.assert_close(
+            qt.dequantize().float(),
+            expected.dequantize().float(),
+            rtol=0.3 if qtype.dtype is torch.float8_e5m2 else 0.13,
+            atol=0.15 if qtype.dtype is torch.float8_e5m2 else 0.05,
+        )
+
+    @CUDA
+    @pytest.mark.parametrize(
+        "qtype_name",
+        ["qfloat8_e4m3fn", "qfloat8_e5m2"],
+    )
+    @pytest.mark.parametrize("nonzero_update", [False, True])
+    def test_triton_quanto_qfloat8_recovers_real_zero_scale(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        qtype_name: str,
+        nonzero_update: bool,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        pytest.importorskip("triton")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols, rank = 8, 12, 3
+        qtype = getattr(quanto, qtype_name)
+        base = torch.zeros(rows, cols, device="cuda", dtype=torch.bfloat16)
+        scale = torch.zeros(rows, 1, device="cuda", dtype=torch.bfloat16)
+        qt = WeightQBytesTensor.quantize(
+            base,
+            qtype,
+            0,
+            scale,
+            None,
+            optimized=False,
+        )
+        assert torch.isnan(qt._data.float()).all()
+        data_ptr = qt._data.data_ptr()
+        scale_ptr = qt._scale.data_ptr()
+        b = torch.full(
+            (rows, rank),
+            float(nonzero_update),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        a = torch.ones(rank, cols, device="cuda", dtype=torch.bfloat16)
+        expected = _quanto_absmax_oracle(b @ a, like=qt)
+
+        def fail_fallback(*_args: object) -> torch.Tensor:
+            raise AssertionError("supported CUDA Quanto qfloat8 must use Triton")
+
+        monkeypatch.setattr(
+            quanto_adapter_impl,
+            "_torch_merge_quanto_lora",
+            fail_fallback,
+        )
+        QuantoAdapter.merge_lora_(
+            qt,
+            b,
+            a,
+            1.0,
+        )
+        torch.cuda.synchronize()
+
+        assert qt._data.data_ptr() == data_ptr
+        assert qt._scale.data_ptr() == scale_ptr
+        torch.testing.assert_close(qt._scale, expected._scale)
+        torch.testing.assert_close(qt._data.float(), expected._data.float())
+        assert torch.isfinite(qt.dequantize()).all()
 
     @CUDA
     @pytest.mark.parametrize("fallback", ["unavailable", "unsupported-storage"])
@@ -1619,7 +2095,7 @@ class TestLoRATransform:
         b = torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16)
         expected_dense = qt.dequantize()
         expected_dense.addmm_(b, a, alpha=-0.25)
-        expected = QuantoAdapter.requantize(expected_dense, like=qt)
+        expected = _quanto_absmax_oracle(expected_dense, like=qt)
 
         if fallback == "unavailable":
             monkeypatch.setattr(
@@ -1642,13 +2118,15 @@ class TestLoRATransform:
         assert torch.equal(qt._scale, expected._scale)
 
     @CUDA
-    def test_triton_quanto_qint8_handles_zero_and_saturation(self) -> None:
+    def test_triton_quanto_qint8_repairs_zero_scale_and_tracks_range_growth(
+        self,
+    ) -> None:
         quanto = pytest.importorskip("optimum.quanto")
         pytest.importorskip("triton")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
         rows, cols, rank = 18, 23, 3
-        scale = torch.ones(
+        scale = torch.zeros(
             rows,
             1,
             device="cuda",
@@ -1668,25 +2146,28 @@ class TestLoRATransform:
             scale.clone(),
             None,
         )
-        QuantoAdapter.merge_lora_(
-            zero,
-            torch.zeros(
-                rows,
-                rank,
-                device="cuda",
-                dtype=torch.float16,
-            ),
-            torch.zeros(
-                rank,
-                cols,
-                device="cuda",
-                dtype=torch.float16,
-            ),
-            1.0,
+        zero_scale_ptr = zero._scale.data_ptr()
+        zero_data_ptr = zero._data.data_ptr()
+        zero_b = torch.zeros(
+            rows,
+            rank,
+            device="cuda",
+            dtype=torch.float16,
         )
+        zero_a = torch.zeros(
+            rank,
+            cols,
+            device="cuda",
+            dtype=torch.float16,
+        )
+        QuantoAdapter.merge_lora_(zero, zero_b, zero_a, 1.0)
         assert torch.count_nonzero(zero._data).item() == 0
+        assert zero._data.data_ptr() == zero_data_ptr
+        assert zero._scale.data_ptr() == zero_scale_ptr
+        assert torch.all(zero._scale == torch.finfo(torch.float32).eps)
+        assert torch.isfinite(zero.dequantize()).all()
 
-        saturated = WeightQBytesTensor.create(
+        grown = WeightQBytesTensor.create(
             quanto.qint8,
             0,
             (rows, cols),
@@ -1702,22 +2183,31 @@ class TestLoRATransform:
         )
         b = torch.full(
             (rows, rank),
-            400.0,
+            20.0,
             device="cuda",
             dtype=torch.float16,
         )
         b[rows // 2 :] *= -1
         a = torch.full(
             (rank, cols),
-            400.0,
+            20.0,
             device="cuda",
             dtype=torch.float16,
         )
-        QuantoAdapter.merge_lora_(saturated, b, a, 1000.0)
+        expected_dense = grown.dequantize()
+        expected_dense.addmm_(b, a)
+        expected = _quanto_absmax_oracle(expected_dense, like=grown)
+        grown_scale_ptr = grown._scale.data_ptr()
+        grown_data_ptr = grown._data.data_ptr()
 
-        assert torch.all(saturated._data[: rows // 2] == 127)
-        assert torch.all(saturated._data[rows // 2 :] == -128)
-        assert torch.equal(saturated._scale, scale)
+        QuantoAdapter.merge_lora_(grown, b, a, 1.0)
+
+        assert grown._data.data_ptr() == grown_data_ptr
+        assert grown._scale.data_ptr() == grown_scale_ptr
+        assert torch.all(grown._scale > 1.0)
+        torch.testing.assert_close(grown._scale, expected._scale)
+        assert (grown._data.to(torch.int16) - expected._data.to(torch.int16)).abs().max().item() <= 1
+        assert torch.isfinite(grown.dequantize()).all()
 
     @CUDA
     def test_non_block_quanto_merge_requantizes_on_activate(self) -> None:
@@ -1757,12 +2247,7 @@ class TestLoRATransform:
             a.cuda().to(expected_dense.dtype),
             alpha=0.5,
         )
-        expected_packed = (
-            (expected_dense / scale.cuda().to(expected_dense.dtype))
-            .round()
-            .clamp(-128, 127)
-            .to(torch.int8)
-        )
+        expected = _quanto_absmax_oracle(expected_dense, like=qt_cuda)
 
         s = _make_strategy(m)
         _request_loras(s, [(lora, 0.5)], mode="merge")
@@ -1773,8 +2258,14 @@ class TestLoRATransform:
         try:
             merged_qt = m.embed.weight.data
             assert isinstance(merged_qt, WeightQBytesTensor)
-            torch.testing.assert_close(merged_qt._data, expected_packed)
-            torch.testing.assert_close(merged_qt._scale.cpu(), scale)
+            difference = (merged_qt._data.to(torch.int16) - expected._data.to(torch.int16)).abs()
+            assert difference.max().item() <= 2
+            torch.testing.assert_close(
+                merged_qt._scale,
+                expected._scale,
+                rtol=0.02,
+                atol=torch.finfo(torch.float32).eps,
+            )
         finally:
             s.deactivate()
 
@@ -1786,7 +2277,6 @@ class TestLoRATransform:
         m = _make_bf16_model(num_blocks=2, dim=16)
         rows = cols = 16
         rank = 4
-        scales: list[torch.Tensor] = []
         original_qt: WeightQBytesTensor | None = None
         for block in m.transformer_blocks:
             data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
@@ -1802,7 +2292,6 @@ class TestLoRATransform:
             )
             if original_qt is None:
                 original_qt = qt
-            scales.append(scale)
             block.attn.weight = nn.Parameter(qt, requires_grad=False)
         assert original_qt is not None
 
@@ -1813,18 +2302,14 @@ class TestLoRATransform:
         lora = LoRA.from_state_dict(state_dict=sd)
         factor = lora.targets["transformer_blocks.0.attn.weight"]
         a, b = _factor_tensors(factor)
-        expected_dense = original_qt.dequantize()
+        original_cuda = original_qt.cuda()
+        expected_dense = original_cuda.dequantize()
         expected_dense.addmm_(
-            b.to(expected_dense.dtype),
-            a.to(expected_dense.dtype),
+            b.cuda().to(expected_dense.dtype),
+            a.cuda().to(expected_dense.dtype),
             alpha=0.5,
         )
-        expected_packed = (
-            (expected_dense / scales[0].to(expected_dense.dtype))
-            .round()
-            .clamp(-128, 127)
-            .to(torch.int8)
-        )
+        expected = _quanto_absmax_oracle(expected_dense, like=original_cuda)
 
         s = _make_strategy(m)
         _request_loras(s, [(lora, 0.5)], mode="merge")
@@ -1837,8 +2322,14 @@ class TestLoRATransform:
             streamer._load_block(0)
             merged_qt = m.transformer_blocks[0].attn.weight.data
             assert isinstance(merged_qt, WeightQBytesTensor)
-            torch.testing.assert_close(merged_qt._data.cpu(), expected_packed)
-            torch.testing.assert_close(merged_qt._scale.cpu(), scales[0])
+            difference = (merged_qt._data.to(torch.int16) - expected._data.to(torch.int16)).abs()
+            assert difference.max().item() <= 2
+            torch.testing.assert_close(
+                merged_qt._scale,
+                expected._scale,
+                rtol=0.02,
+                atol=torch.finfo(torch.float32).eps,
+            )
         finally:
             s.deactivate()
 
@@ -2001,6 +2492,7 @@ class TestPermanentMerge:
         m = M(qt)
         original_param = m.target.weight
         original_packed_ptr = original_param.data._data.data_ptr()
+        original_scale_ptr = original_param.data._scale.data_ptr()
         sd = {
             "target.lora_A.weight": torch.randn(rank, cols),
             "target.lora_B.weight": torch.randn(rows, rank),
@@ -2015,12 +2507,7 @@ class TestPermanentMerge:
             a.to(expected_dense.dtype),
             alpha=0.5,
         )
-        expected_packed = (
-            (expected_dense / scale.to(expected_dense.dtype))
-            .round()
-            .clamp(-128, 127)
-            .to(torch.int8)
-        )
+        expected = _quanto_absmax_oracle(expected_dense, like=qt)
 
         merged = merge_lora(m, [(lora, 0.5)])
 
@@ -2029,11 +2516,177 @@ class TestPermanentMerge:
         merged_qt = m.target.weight.data
         assert isinstance(merged_qt, WeightQBytesTensor)
         assert merged_qt._data.data_ptr() == original_packed_ptr
+        assert merged_qt._scale.data_ptr() == original_scale_ptr
         assert merged_qt.qtype is quanto.qint8
         assert merged_qt.axis == 0
         assert tuple(merged_qt.size()) == (rows, cols)
-        torch.testing.assert_close(merged_qt._data, expected_packed)
-        torch.testing.assert_close(merged_qt._scale, scale)
+        torch.testing.assert_close(merged_qt._data, expected._data)
+        torch.testing.assert_close(merged_qt._scale, expected._scale)
+
+    def test_permanent_quanto_merge_supports_empty_second_target(self) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        class M(nn.Module):
+            def __init__(
+                self,
+                first_weight: torch.Tensor,
+                empty_weight: torch.Tensor,
+            ) -> None:
+                super().__init__()
+                self.first = nn.Module()
+                self.empty = nn.Module()
+                self.first.weight = nn.Parameter(
+                    first_weight,
+                    requires_grad=False,
+                )
+                self.empty.weight = nn.Parameter(
+                    empty_weight,
+                    requires_grad=False,
+                )
+
+        rows, cols, rank = 3, 4, 2
+        first_data = torch.zeros(rows, cols, dtype=torch.int8)
+        first_scale = torch.ones(rows, 1)
+        first_qt = WeightQBytesTensor(
+            quanto.qint8,
+            0,
+            (rows, cols),
+            first_data.stride(),
+            first_data,
+            first_scale,
+            None,
+        )
+        empty_data = torch.empty(rows, 0, dtype=torch.int8)
+        empty_scale = torch.tensor([[0.0], [0.25], [1.0]])
+        empty_qt = WeightQBytesTensor(
+            quanto.qint8,
+            0,
+            (rows, 0),
+            empty_data.stride(),
+            empty_data,
+            empty_scale,
+            quanto.qint8,
+        )
+        model = M(first_qt, empty_qt)
+        lora = LoRA.from_state_dict(
+            {
+                "first.lora_A.weight": torch.ones(rank, cols),
+                "first.lora_B.weight": torch.ones(rows, rank),
+                "empty.lora_A.weight": torch.empty(rank, 0),
+                "empty.lora_B.weight": torch.ones(rows, rank),
+            }
+        )
+        expected_dense = first_qt.dequantize().addmm(
+            torch.ones(rows, rank),
+            torch.ones(rank, cols),
+        )
+        expected_first = _quanto_absmax_oracle(
+            expected_dense,
+            like=first_qt,
+        )
+        first_data_ptr = model.first.weight.data._data.data_ptr()
+        first_scale_ptr = model.first.weight.data._scale.data_ptr()
+        empty_data_ptr = model.empty.weight.data._data.data_ptr()
+        empty_scale_ptr = model.empty.weight.data._scale.data_ptr()
+        empty_scale_before = model.empty.weight.data._scale.clone()
+
+        merged = merge_lora(model, [(lora, 1.0)])
+
+        assert merged == 2
+        assert model.first.weight.data._data.data_ptr() == first_data_ptr
+        assert model.first.weight.data._scale.data_ptr() == first_scale_ptr
+        torch.testing.assert_close(
+            model.first.weight.data._data,
+            expected_first._data,
+        )
+        torch.testing.assert_close(
+            model.first.weight.data._scale,
+            expected_first._scale,
+        )
+        assert model.empty.weight.data._data.data_ptr() == empty_data_ptr
+        assert model.empty.weight.data._scale.data_ptr() == empty_scale_ptr
+        assert model.empty.weight.data.activation_qtype is quanto.qint8
+        assert model.empty.weight.data.numel() == 0
+        torch.testing.assert_close(
+            model.empty.weight.data._scale,
+            empty_scale_before,
+        )
+
+    def test_permanent_quanto_zero_rank_preflight_prevents_partial_merge(
+        self,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        class M(nn.Module):
+            def __init__(
+                self,
+                first_weight: torch.Tensor,
+                second_weight: torch.Tensor,
+            ) -> None:
+                super().__init__()
+                self.first = nn.Module()
+                self.second = nn.Module()
+                self.first.weight = nn.Parameter(
+                    first_weight,
+                    requires_grad=False,
+                )
+                self.second.weight = nn.Parameter(
+                    second_weight,
+                    requires_grad=False,
+                )
+
+        rows, cols, rank = 3, 4, 2
+
+        def make_weight() -> torch.Tensor:
+            data = torch.zeros(rows, cols, dtype=torch.int8)
+            return WeightQBytesTensor(
+                quanto.qint8,
+                0,
+                (rows, cols),
+                data.stride(),
+                data,
+                torch.ones(rows, 1),
+                None,
+            )
+
+        model = M(make_weight(), make_weight())
+        lora = LoRA.from_state_dict(
+            {
+                "first.lora_A.weight": torch.ones(rank, cols),
+                "first.lora_B.weight": torch.ones(rows, rank),
+                "second.lora_A.weight": torch.empty(0, cols),
+                "second.lora_B.weight": torch.empty(rows, 0),
+            }
+        )
+        first_data_before = model.first.weight.data._data.clone()
+        first_scale_before = model.first.weight.data._scale.clone()
+        second_data_before = model.second.weight.data._data.clone()
+        second_scale_before = model.second.weight.data._scale.clone()
+
+        with pytest.raises(
+            ValueError,
+            match="second.weight.*positive LoRA rank",
+        ):
+            merge_lora(model, [(lora, 1.0)])
+
+        torch.testing.assert_close(
+            model.first.weight.data._data,
+            first_data_before,
+        )
+        torch.testing.assert_close(
+            model.first.weight.data._scale,
+            first_scale_before,
+        )
+        torch.testing.assert_close(
+            model.second.weight.data._data,
+            second_data_before,
+        )
+        torch.testing.assert_close(
+            model.second.weight.data._scale,
+            second_scale_before,
+        )
 
     def test_multiple_loras_requantize_shared_target_once(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
@@ -2071,11 +2724,11 @@ class TestPermanentMerge:
 
         assert merge_lora(m, [(first, 1.0), (second, 1.0)]) == 1
         # Both 0.6 deltas are accumulated in dense space before the one
-        # unit-scale int8 requantization: round(0.6 + 0.6) == 1. Requantizing
-        # after each contribution instead would incorrectly produce 2.
+        # absmax requantization. Quantizing after each contribution would add
+        # an avoidable intermediate loss and choose two different grids.
         torch.testing.assert_close(
             m.target.weight.data.dequantize(),
-            torch.ones(2, 2),
+            torch.full((2, 2), 1.2),
         )
 
     def test_tied_alias_target_merges_shared_storage(self) -> None:

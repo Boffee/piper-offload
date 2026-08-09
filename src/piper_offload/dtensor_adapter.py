@@ -50,8 +50,9 @@ and CUDA-resident forms compare equal. The resident GPU parameter is rebuilt
 on the original CUDA mesh in :meth:`gpu_param`.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -69,6 +70,7 @@ from .tensor_adapters import (
     BindLayoutTensorAdapter,
     LogicalShapeTensorAdapter,
     LoRAMergeTensorAdapter,
+    LoRAMergeValidationTensorAdapter,
     TensorAdapter,
     adapter_name,
 )
@@ -199,17 +201,11 @@ def _merge_context(target: torch.Tensor) -> _DTensorMergeContext:
     dt = require_dtensor(target)
     global_shape = tuple(dt.shape)
     if len(global_shape) != 2:
-        raise ValueError(
-            "DTensor LoRA merge requires a rank-two weight, "
-            f"got global shape {global_shape}."
-        )
+        raise ValueError(f"DTensor LoRA merge requires a rank-two weight, got global shape {global_shape}.")
 
     coordinate = dt.device_mesh.get_coordinate()
     if coordinate is None:
-        raise ValueError(
-            "DTensor LoRA merge cannot run on a rank outside the target "
-            "device mesh."
-        )
+        raise ValueError("DTensor LoRA merge cannot run on a rank outside the target device mesh.")
     local_shape, offsets = _local_shape_and_offsets(
         global_shape,
         tuple(dt.device_mesh.shape),
@@ -241,6 +237,56 @@ def _merge_context(target: torch.Tensor) -> _DTensorMergeContext:
         local=local,
         inner=inner,
     )
+
+
+def _validate_local_prepared_factors(
+    context: _DTensorMergeContext,
+    b: torch.Tensor,
+    a: torch.Tensor,
+) -> None:
+    """Require factors prepared for exactly this rank's local shard."""
+    if b.ndim != 2 or a.ndim != 2 or b.shape[1] != a.shape[0]:
+        raise ValueError(
+            "DTensor prepared LoRA factors must be rank two with matching "
+            f"inner dimensions, got B={tuple(b.shape)}, A={tuple(a.shape)}."
+        )
+    if (b.shape[0], a.shape[1]) != context.local_shape:
+        raise ValueError(
+            "DTensor prepared LoRA factors must match the local weight "
+            f"shape {context.local_shape}, got B={tuple(b.shape)}, "
+            f"A={tuple(a.shape)}."
+        )
+
+
+def _local_lora_factors(
+    context: _DTensorMergeContext,
+    b: torch.Tensor,
+    a: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accept global or already-local factors and return this rank's slices."""
+    if b.ndim != 2 or a.ndim != 2 or b.shape[1] != a.shape[0]:
+        raise ValueError(
+            "DTensor LoRA factors must be rank two with matching inner "
+            f"dimensions, got B={tuple(b.shape)}, A={tuple(a.shape)}."
+        )
+
+    factor_shape = (b.shape[0], a.shape[1])
+    if factor_shape == context.local_shape:
+        local_b = b
+        local_a = a
+    elif factor_shape == context.global_shape:
+        out_offset, in_offset = context.offsets
+        out_size, in_size = context.local_shape
+        local_b = b.narrow(0, out_offset, out_size)
+        local_a = a.narrow(1, in_offset, in_size)
+    else:
+        raise ValueError(
+            "DTensor LoRA factors must match either the global or local "
+            f"weight shape: global={context.global_shape}, "
+            f"local={context.local_shape}, B={tuple(b.shape)}, "
+            f"A={tuple(a.shape)}."
+        )
+    return local_b.contiguous(), local_a.contiguous()
 
 
 class DTensorAdapter:
@@ -335,9 +381,7 @@ class DTensorAdapter:
         )
 
     @staticmethod
-    def cpu_param(
-        state: _DTensorPinned, *, requires_grad: bool = False
-    ) -> nn.Parameter:
+    def cpu_param(state: _DTensorPinned, *, requires_grad: bool = False) -> nn.Parameter:
         # The resting weight stays a DTensor (so its adapter/layout matches the
         # store and a deactivated block is still a DTensor), but on a CPU mesh
         # so the local shard stays on the host — a CUDA mesh would move the
@@ -369,12 +413,8 @@ class DTensorAdapter:
         # replay the distributed wrapper. run_check=False: pure local rebuild,
         # never a collective. The local already lives on the mesh device, so
         # from_local aliases it (no copy) — the reused wrapper sees refills.
-        local = pinned.inner.gpu_param(
-            pinned.inner_state, gpu_state.inner_gpu, requires_grad=False
-        ).data
-        dt = rebuild_dtensor(
-            local, pinned.mesh, pinned.placements, pinned.shape, pinned.stride
-        )
+        local = pinned.inner.gpu_param(pinned.inner_state, gpu_state.inner_gpu, requires_grad=False).data
+        dt = rebuild_dtensor(local, pinned.mesh, pinned.placements, pinned.shape, pinned.stride)
         return nn.Parameter(dt, requires_grad=requires_grad)
 
     @staticmethod
@@ -398,6 +438,95 @@ class DTensorAdapter:
         return (out_offset, out_size), (in_offset, in_size)
 
     @staticmethod
+    def validate_lora_merge(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Validate both DTensor placement and inner shard merge operation."""
+        context = _merge_context(target)
+        if isinstance(context.inner, LoRAMergeValidationTensorAdapter):
+            local_b, local_a = _local_lora_factors(context, b, a)
+            context.inner.validate_lora_merge(
+                context.local,
+                local_b,
+                local_a,
+                strength,
+            )
+
+    @staticmethod
+    def stage_lora_factors(
+        target: torch.Tensor,
+        factors: Sequence[tuple[float, torch.Tensor, torch.Tensor]],
+        *,
+        logical_shape: tuple[int, ...],
+        compute_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
+        """Delegate factor-aware staging to the local-shard adapter.
+
+        LoRATransform has already sliced each host factor to this rank before
+        entering this method. Keeping the original factor boundaries here lets
+        an inner quant adapter combine per-factor strengths with any
+        stored-coordinate transform before the packed buffer is cast to its
+        lower compute precision.
+        """
+        context = _merge_context(target)
+        stage = getattr(context.inner, "stage_lora_factors", None)
+        validate = getattr(context.inner, "validate_prepared_lora_merge", None)
+        merge = getattr(context.inner, "merge_prepared_lora_", None)
+        if not (callable(stage) and callable(validate) and callable(merge)):
+            return None
+        if tuple(logical_shape) != context.local_shape:
+            raise ValueError(
+                "DTensor factor-aware LoRA staging requires the localized "
+                f"factor shape {context.local_shape}, got {logical_shape}."
+            )
+        return cast(
+            tuple[torch.Tensor, torch.Tensor, float] | None,
+            stage(
+                context.local,
+                factors,
+                logical_shape=context.local_shape,
+                compute_dtype=compute_dtype,
+            ),
+        )
+
+    @staticmethod
+    def validate_prepared_lora_merge(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Validate a prepared update with the local-shard adapter."""
+        context = _merge_context(target)
+        _validate_local_prepared_factors(context, b, a)
+        validate = getattr(context.inner, "validate_prepared_lora_merge", None)
+        if not callable(validate):
+            raise ValueError(
+                f"DTensor local shard adapter {adapter_name(context.inner)} does not support prepared LoRA validation."
+            )
+        validate(context.local, b, a, strength)
+
+    @staticmethod
+    def merge_prepared_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Apply a prepared update with the local-shard adapter."""
+        context = _merge_context(target)
+        _validate_local_prepared_factors(context, b, a)
+        merge = getattr(context.inner, "merge_prepared_lora_", None)
+        if not callable(merge):
+            raise ValueError(
+                f"DTensor local shard adapter {adapter_name(context.inner)} does not support prepared LoRA merge."
+            )
+        merge(context.local, b.contiguous(), a.contiguous(), strength)
+
+    @staticmethod
     def merge_lora_(
         target: torch.Tensor,
         b: torch.Tensor,
@@ -413,33 +542,12 @@ class DTensorAdapter:
         collective is needed because the LoRA rank dimension is not sharded.
         """
         context = _merge_context(target)
-        if b.ndim != 2 or a.ndim != 2 or b.shape[1] != a.shape[0]:
-            raise ValueError(
-                "DTensor LoRA factors must be rank two with matching inner "
-                f"dimensions, got B={tuple(b.shape)}, A={tuple(a.shape)}."
-            )
-
-        factor_shape = (b.shape[0], a.shape[1])
-        if factor_shape == context.local_shape:
-            local_b = b
-            local_a = a
-        elif factor_shape == context.global_shape:
-            out_offset, in_offset = context.offsets
-            out_size, in_size = context.local_shape
-            local_b = b.narrow(0, out_offset, out_size)
-            local_a = a.narrow(1, in_offset, in_size)
-        else:
-            raise ValueError(
-                "DTensor LoRA factors must match either the global or local "
-                f"weight shape: global={context.global_shape}, "
-                f"local={context.local_shape}, B={tuple(b.shape)}, "
-                f"A={tuple(a.shape)}."
-            )
+        local_b, local_a = _local_lora_factors(context, b, a)
 
         context.inner.merge_lora_(
             context.local,
-            local_b.contiguous(),
-            local_a.contiguous(),
+            local_b,
+            local_a,
             strength,
         )
 

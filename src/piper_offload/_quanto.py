@@ -212,22 +212,42 @@ def validate_layout(qt: torch.Tensor) -> None:
 
 
 def dequantize_qbytes_tensor(qt: torch.Tensor) -> torch.Tensor:
-    """Return the dense logical value in the wrapper's compute dtype."""
-    qbytes = require_qbytes_tensor(qt)
-    return qbytes.dequantize()
+    """Return the dense logical value in the wrapper's compute dtype.
+
+    Quanto's FP8 operator emits NaN qbytes for an exact-zero block because it
+    evaluates ``0 / 0``. A zero scale nevertheless represents an exact-zero
+    block, so repair those logical values after dequantization. This also lets
+    a later nonzero LoRA update recover a weight originally quantized from
+    zeros instead of propagating the encoding NaNs.
+    """
+    canonical = canonicalize_qbytes_tensor(qt)
+    dense = canonical.dequantize()
+    scale = _broadcast_scale(
+        canonical._scale,
+        axis=canonical.axis,
+        ndim=dense.ndim,
+    )
+    return dense.masked_fill_(scale == 0, 0)
 
 
 def requantize_qbytes_tensor(
     t: torch.Tensor, *, like: torch.Tensor,
 ) -> torch.Tensor:
-    """Encode dense ``t`` using the quanto layout and scale from ``like``."""
+    """Encode dense ``t`` using ``like``'s Quanto quantization recipe.
+
+    Quanto's 8-bit weight scale is an absmax statistic of the represented
+    values, not fixed calibration metadata. Recompute it for ``t`` while
+    preserving the reference qtype, axis, scale dtype/shape, stride, and
+    activation qtype. Exact-zero blocks receive a small positive scale so
+    their zero qbytes dequantize finitely instead of taking a ``0 / 0`` path.
+    """
     qbytes = canonicalize_qbytes_tensor(like)
     if tuple(t.shape) != tuple(qbytes.size()):
         raise ValueError(
             f"Cannot requantize tensor with shape {tuple(t.shape)} like "
             f"WeightQBytesTensor with shape {tuple(qbytes.size())}."
         )
-    scale = qbytes._scale.to(device=t.device).clone()
+    scale = _absmax_scale(t, reference=qbytes)
     return create_qbytes_tensor(
         qbytes.qtype, qbytes.axis, qbytes.size(), qbytes.stride(),
         _quantize_to_qbytes(t, qbytes, scale),
@@ -236,17 +256,100 @@ def requantize_qbytes_tensor(
     )
 
 
+def _validate_absmax_reference(
+    float_data: torch.Tensor,
+    *,
+    reference: Any,  # noqa: ANN401
+) -> tuple[int | None, int | float]:
+    """Validate metadata needed to recompute or retain an absmax scale."""
+    if getattr(reference.qtype, "bits", None) != 8:
+        raise ValueError("Quanto qbytes requantization requires an 8-bit qtype.")
+    if getattr(reference.qtype, "dtype", None) is not reference._data.dtype:
+        raise ValueError(
+            "Quanto qbytes storage dtype does not match its qtype metadata."
+        )
+    if not reference._scale.dtype.is_floating_point:
+        raise ValueError("Quanto qbytes requantization requires floating-point scales.")
+
+    axis = reference.axis
+    if axis is None:
+        valid_scale_layout = reference._scale.numel() == 1
+        expected_scale = "one scale value"
+    elif axis == 0 and float_data.ndim > 0:
+        expected_shape = (float_data.shape[0], *([1] * (float_data.ndim - 1)))
+        valid_scale_layout = tuple(reference._scale.shape) == expected_shape
+        expected_scale = f"shape {expected_shape}"
+    elif float_data.ndim > 0 and axis in (-1, float_data.ndim - 1):
+        expected_shape = (*([1] * (float_data.ndim - 1)), float_data.shape[-1])
+        valid_scale_layout = tuple(reference._scale.shape) == expected_shape
+        expected_scale = f"shape {expected_shape}"
+    else:
+        raise ValueError(
+            "Quanto qbytes requantization supports per-tensor, first-axis, "
+            f"or last-axis scales, got axis {axis}."
+        )
+    if not valid_scale_layout:
+        raise ValueError(
+            "Quanto qbytes scale storage does not match its quantization axis: "
+            f"expected {expected_scale}, stored {tuple(reference._scale.shape)}."
+        )
+
+    qmax = getattr(reference.qtype, "qmax", None)
+    if not isinstance(qmax, (int, float)) or qmax <= 0:
+        raise ValueError(
+            "Quanto qbytes requantization requires a qtype with a positive qmax."
+        )
+    return axis, qmax
+
+
+def _absmax_scale(
+    float_data: torch.Tensor,
+    *,
+    reference: Any,  # noqa: ANN401
+) -> torch.Tensor:
+    """Return Quanto's absmax scale in ``reference``'s storage layout."""
+    axis, qmax = _validate_absmax_reference(float_data, reference=reference)
+
+    if float_data.numel() == 0:
+        # An empty logical shard has no quantization blocks from which to
+        # derive a new statistic. Retain its existing scale layout and values,
+        # including exact zeros, while placing the result beside the new data.
+        return reference._scale.to(device=float_data.device).clone()
+
+    if axis is None:
+        amax = float_data.abs().amax()
+    elif axis == 0:
+        amax = float_data.abs().amax(
+            dim=tuple(range(1, float_data.ndim)),
+            keepdim=True,
+        )
+    else:
+        amax = float_data.abs().amax(
+            dim=tuple(range(float_data.ndim - 1)),
+            keepdim=True,
+        )
+    scale = (amax / qmax).to(dtype=reference._scale.dtype)
+    if scale.numel() != reference._scale.numel():
+        raise ValueError(
+            "Quanto qbytes scale storage does not match its quantization axis: "
+            f"computed {tuple(scale.shape)}, stored {tuple(reference._scale.shape)}."
+        )
+    scale = scale.reshape(reference._scale.shape)
+    zero = scale == 0
+    eps = torch.finfo(torch.float32).eps
+    return torch.where(zero, torch.full_like(scale, eps), scale)
+
+
 def _quantize_to_qbytes(
     float_data: torch.Tensor,
     reference: Any,  # noqa: ANN401
     scale: torch.Tensor,
 ) -> torch.Tensor:
-    """Quantize float data using the same scale as ``reference``."""
-    axis = reference.axis
-    scaled = (
-        float_data / scale.view(-1, *([1] * (float_data.dim() - 1)))
-        if axis == 0
-        else float_data / scale
+    """Quantize float data with a scale shaped like ``reference._scale``."""
+    scaled = float_data / _broadcast_scale(
+        scale,
+        axis=reference.axis,
+        ndim=float_data.dim(),
     )
     storage_dtype = reference._data.dtype
     if storage_dtype.is_floating_point:
@@ -255,3 +358,15 @@ def _quantize_to_qbytes(
         scaled = scaled.round()
         limits = torch.iinfo(storage_dtype)
     return scaled.clamp(limits.min, limits.max).to(storage_dtype)
+
+
+def _broadcast_scale(
+    scale: torch.Tensor,
+    *,
+    axis: int | None,
+    ndim: int,
+) -> torch.Tensor:
+    """Shape a Quanto scale for elementwise dense-value operations."""
+    if axis == 0:
+        return scale.view(-1, *([1] * (ndim - 1)))
+    return scale

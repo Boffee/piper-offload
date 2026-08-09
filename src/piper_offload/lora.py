@@ -33,7 +33,7 @@ on deactivate.
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Literal, Self
+from typing import Any, Literal, Protocol, Self, runtime_checkable
 
 import torch
 from torch import nn
@@ -45,7 +45,11 @@ from .host_backing import (
 )
 from .pinned_param import PinnedParam
 from .tensor_adapter_registry import param_representation, select_adapter
-from .tensor_adapters import LoRAMergeTensorAdapter, adapter_name
+from .tensor_adapters import (
+    LoRAMergeTensorAdapter,
+    LoRAMergeValidationTensorAdapter,
+    adapter_name,
+)
 
 __all__ = [
     "LoRA",
@@ -56,6 +60,49 @@ __all__ = [
 ]
 
 type LoRAMode = Literal["merge", "routed"]
+type _RawLoRAFactor = tuple[float, torch.Tensor, torch.Tensor]
+
+
+@runtime_checkable
+class _FactorAwareLoRAMergeAdapter(Protocol):
+    """Optional staging path for formats that transform individual factors.
+
+    The ordinary packer folds each strength into an already-low-precision
+    ``A`` slice. Formats whose stored-weight coordinates require another
+    transform can instead stage every factor atomically, before packing loses
+    the original strength boundaries.
+    """
+
+    @staticmethod
+    def stage_lora_factors(
+        target: torch.Tensor,
+        factors: Sequence[_RawLoRAFactor],
+        *,
+        logical_shape: tuple[int, ...],
+        compute_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
+        """Return a prepared ``(B, A, strength)`` or defer to normal staging."""
+        ...
+
+    @staticmethod
+    def validate_prepared_lora_merge(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Validate a prepared update without transforming it again."""
+        ...
+
+    @staticmethod
+    def merge_prepared_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Apply a prepared update without transforming it again."""
+        ...
 
 
 @dataclass(slots=True, frozen=True)
@@ -108,14 +155,9 @@ class ScaledLoRAFactor:
     strength: float
 
     def __post_init__(self) -> None:
-        if (
-            len(self.a.shape) != 2
-            or len(self.b.shape) != 2
-            or self.a.shape[0] != self.b.shape[1]
-        ):
+        if len(self.a.shape) != 2 or len(self.b.shape) != 2 or self.a.shape[0] != self.b.shape[1]:
             raise ValueError(
-                f"LoRA factor shape mismatch: A shape is {tuple(self.a.shape)}, "
-                f"B shape is {tuple(self.b.shape)}."
+                f"LoRA factor shape mismatch: A shape is {tuple(self.a.shape)}, B shape is {tuple(self.b.shape)}."
             )
 
     @classmethod
@@ -175,9 +217,7 @@ class LoRA:
 
     def __init__(self, targets: Mapping[str, LoRAFactor]) -> None:
         self._targets = MappingProxyType(dict(targets))
-        self._cache_bytes = sum(
-            factor.cache_bytes for factor in self._targets.values()
-        )
+        self._cache_bytes = sum(factor.cache_bytes for factor in self._targets.values())
 
     @classmethod
     def from_state_dict(
@@ -251,13 +291,31 @@ class LoRATransform:
             self._factors,
             logical_shape,
         )
-        factor_tensors, _ = self._localize_factor_tensors(
+        factor_tensors, staging_shape = self._localize_factor_tensors(
             representation,
             adapter,
             self._factor_tensors(),
             logical_shape=logical_shape,
         )
-        self._validate_staged_factors(factor_tensors)
+        if not isinstance(adapter, LoRAMergeValidationTensorAdapter):
+            self._validate_staged_factors(factor_tensors)
+            return
+        staged, prepared = self._stage_update_for_adapter(
+            representation,
+            adapter,
+            factor_tensors,
+            logical_shape=staging_shape,
+            compute_dtype=adapter.compute_dtype(representation),
+        )
+        b, a, strength = staged
+        _validate_lora_merge(
+            adapter,
+            representation,
+            b,
+            a,
+            strength,
+            prepared=prepared,
+        )
 
     def apply(self, param: nn.Parameter) -> None:
         # Operate on the representation tensor: ``param.data`` for plain and
@@ -302,27 +360,33 @@ class LoRATransform:
             factor_tensors,
             logical_shape=logical_shape,
         )
-        staged = self._stage_single_or_packed_update(
+        staged, prepared = self._stage_update_for_adapter(
             data,
+            adapter,
             factor_tensors,
             logical_shape=staging_shape,
             compute_dtype=compute_dtype,
         )
         b, a, strength = staged
-        adapter.merge_lora_(
+        _validate_lora_merge(
+            adapter,
             data,
             b,
             a,
             strength,
+            prepared=prepared,
         )
+        if prepared:
+            assert isinstance(adapter, _FactorAwareLoRAMergeAdapter)
+            adapter.merge_prepared_lora_(data, b, a, strength)
+        else:
+            adapter.merge_lora_(data, b, a, strength)
 
     @staticmethod
     def _localize_factor_tensors(
         data: torch.Tensor,
         adapter: LoRAMergeTensorAdapter[Any, Any],
-        factor_tensors: Sequence[
-            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
-        ],
+        factor_tensors: Sequence[tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]],
         *,
         logical_shape: tuple[int, ...],
     ) -> tuple[
@@ -333,9 +397,7 @@ class LoRATransform:
         if not isinstance(adapter, DTensorAdapter):
             return list(factor_tensors), logical_shape
 
-        (out_offset, out_size), (in_offset, in_size) = (
-            adapter.lora_factor_ranges(data)
-        )
+        (out_offset, out_size), (in_offset, in_size) = adapter.lora_factor_ranges(data)
         localized = [
             (
                 factor,
@@ -350,9 +412,7 @@ class LoRATransform:
     def _stage_single_or_packed_update(
         cls,
         data: torch.Tensor,
-        factor_tensors: Sequence[
-            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
-        ],
+        factor_tensors: Sequence[tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]],
         *,
         logical_shape: tuple[int, ...],
         compute_dtype: torch.dtype,
@@ -383,39 +443,60 @@ class LoRATransform:
         return b, a, 1.0
 
     @classmethod
+    def _stage_update_for_adapter(
+        cls,
+        data: torch.Tensor,
+        adapter: LoRAMergeTensorAdapter[Any, Any],
+        factor_tensors: Sequence[tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]],
+        *,
+        logical_shape: tuple[int, ...],
+        compute_dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, float], bool]:
+        """Let an adapter preserve factor boundaries before normal packing."""
+        cls._validate_staged_factors(factor_tensors)
+        if isinstance(adapter, _FactorAwareLoRAMergeAdapter):
+            prepared = adapter.stage_lora_factors(
+                data,
+                tuple((factor.strength, a, b) for factor, a, b in factor_tensors),
+                logical_shape=logical_shape,
+                compute_dtype=compute_dtype,
+            )
+            if prepared is not None:
+                return prepared, True
+        return (
+            cls._stage_single_or_packed_update(
+                data,
+                factor_tensors,
+                logical_shape=logical_shape,
+                compute_dtype=compute_dtype,
+            ),
+            False,
+        )
+
+    @classmethod
     def _validate_staged_factors(
         cls,
-        factor_tensors: Sequence[
-            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
-        ],
+        factor_tensors: Sequence[tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]],
     ) -> None:
         if cls._are_plain_cpu_factors(factor_tensors):
             return
         raise ValueError(
-            "LoRA merge requires plain CPU torch.Tensor "
-            "factors; wrapped factor representations are unsupported."
+            "LoRA merge requires plain CPU torch.Tensor factors; wrapped factor representations are unsupported."
         )
 
     @staticmethod
     def _are_plain_cpu_factors(
-        factor_tensors: Sequence[
-            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
-        ],
+        factor_tensors: Sequence[tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]],
     ) -> bool:
         return all(
-            type(a) is torch.Tensor
-            and type(b) is torch.Tensor
-            and a.device.type == "cpu"
-            and b.device.type == "cpu"
+            type(a) is torch.Tensor and type(b) is torch.Tensor and a.device.type == "cpu" and b.device.type == "cpu"
             for _factor, a, b in factor_tensors
         )
 
     @staticmethod
     def _pack_factors(
         data: torch.Tensor,
-        factor_tensors: Sequence[
-            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
-        ],
+        factor_tensors: Sequence[tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]],
         *,
         logical_shape: tuple[int, ...],
         compute_dtype: torch.dtype,
@@ -465,8 +546,7 @@ def _validate_factor_shapes(
     for factor in factors:
         if factor.produced_shape != target_shape:
             raise ValueError(
-                "LoRA factor shape mismatch: B@A produces "
-                f"{factor.produced_shape}, target shape is {target_shape}."
+                f"LoRA factor shape mismatch: B@A produces {factor.produced_shape}, target shape is {target_shape}."
             )
 
 
@@ -482,18 +562,29 @@ def _select_lora_merge_adapter(
         ) from exc
 
     if not isinstance(adapter, LoRAMergeTensorAdapter):
-        raise ValueError(
-            f"{adapter_name(adapter)} does not support LoRA merge. "
-            "Use routed LoRA for this tensor type."
-        )
+        raise ValueError(f"{adapter_name(adapter)} does not support LoRA merge. Use routed LoRA for this tensor type.")
 
     compute_dtype = adapter.compute_dtype(data)
     if not compute_dtype.is_floating_point:
-        raise ValueError(
-            "LoRA merge requires a floating-point compute dtype, "
-            f"got {compute_dtype}."
-        )
+        raise ValueError(f"LoRA merge requires a floating-point compute dtype, got {compute_dtype}.")
     return adapter
+
+
+def _validate_lora_merge(
+    adapter: LoRAMergeTensorAdapter[Any, Any],
+    target: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+    *,
+    prepared: bool = False,
+) -> None:
+    """Run adapter-specific staged-merge checks without mutation."""
+    if prepared:
+        assert isinstance(adapter, _FactorAwareLoRAMergeAdapter)
+        adapter.validate_prepared_lora_merge(target, b, a, strength)
+    elif isinstance(adapter, LoRAMergeValidationTensorAdapter):
+        adapter.validate_lora_merge(target, b, a, strength)
 
 
 @dataclass(slots=True, frozen=True)
@@ -542,14 +633,10 @@ def _linear_input(
             x = kwargs["input"]
         except KeyError as exc:
             raise TypeError(
-                "Routed LoRA expected the Linear input as either the first "
-                "positional argument or the 'input' keyword"
+                "Routed LoRA expected the Linear input as either the first positional argument or the 'input' keyword"
             ) from exc
     if not isinstance(x, torch.Tensor):
-        raise TypeError(
-            "Routed LoRA requires the Linear input to be a torch.Tensor; "
-            f"got {type(x).__name__}"
-        )
+        raise TypeError(f"Routed LoRA requires the Linear input to be a torch.Tensor; got {type(x).__name__}")
     return x
 
 
@@ -651,16 +738,8 @@ def _build_lora_targets(
     factors: dict[str, LoRAFactor] = {}
     for base, a_source in a_tensors.items():
         b_source = b_tensors[base]
-        a_tensor = (
-            a_source
-            if dtype is None or a_source.dtype is dtype
-            else a_source.to(dtype=dtype)
-        )
-        b_tensor = (
-            b_source
-            if dtype is None or b_source.dtype is dtype
-            else b_source.to(dtype=dtype)
-        )
+        a_tensor = a_source if dtype is None or a_source.dtype is dtype else a_source.to(dtype=dtype)
+        b_tensor = b_source if dtype is None or b_source.dtype is dtype else b_source.to(dtype=dtype)
         factors[f"{base}.weight"] = LoRAFactor(
             a=PinnedParam(
                 nn.Parameter(a_tensor, requires_grad=False),
@@ -742,8 +821,7 @@ def _validate_factor_pair(
 ) -> None:
     if not a.is_floating_point() or not b.is_floating_point():
         raise ValueError(
-            f"LoRA factors for {target_key!r}: must be floating-point; "
-            f"got A.dtype={a.dtype}, B.dtype={b.dtype}."
+            f"LoRA factors for {target_key!r}: must be floating-point; got A.dtype={a.dtype}, B.dtype={b.dtype}."
         )
     if a.dim() != 2 or b.dim() != 2 or a.shape[0] != b.shape[1]:
         raise ValueError(
