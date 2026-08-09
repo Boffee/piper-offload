@@ -1,6 +1,5 @@
 """Tests for TorchAO scaled-fp8 (``Float8Tensor``) adapter integration."""
 
-
 import pytest
 import torch
 from torch import nn
@@ -223,6 +222,35 @@ class TestFloat8Adapter:
         assert not torch.isnan(deq).any()
         assert torch.count_nonzero(deq[3]).item() == 0
         assert torch.count_nonzero(deq[[0, 1, 2, 4]]).item() > 0
+
+    @pytest.mark.parametrize(
+        "float8_dtype",
+        [torch.float8_e4m3fn, torch.float8_e5m2],
+    )
+    def test_requantize_zero_group_does_not_nan(
+        self,
+        float8_dtype: torch.dtype,
+    ) -> None:
+        rows, cols, group_size = 7, 32, 8
+        f8 = _make_float8(
+            rows=rows,
+            cols=cols,
+            dtype=torch.float32,
+            float8_dtype=float8_dtype,
+            group_size=group_size,
+            dynamic_activation=False,
+        )
+        dense = Float8Adapter.dequantize(f8)
+        dense[3, 16:24] = 0
+
+        again = Float8Adapter.requantize(dense, like=f8)
+
+        dequantized = again.dequantize().to(torch.float32)
+        assert torch.isfinite(dequantized).all()
+        assert torch.count_nonzero(dequantized[3, 16:24]).item() == 0
+        assert again.scale[3, 2].item() == torch.finfo(torch.float32).eps
+        assert torch.count_nonzero(dequantized[3, :16]).item() > 0
+        assert torch.count_nonzero(dequantized[3, 24:]).item() > 0
 
     def test_requantize_all_zero_does_not_nan(self) -> None:
         # Per-tensor scaling: a fully cancelled weight gives a scalar scale
@@ -577,14 +605,81 @@ class TestFloat8Adapter:
         assert torch.equal(f8.scale, expected.scale)
 
     @CUDA
-    def test_lora_merge_rejects_transposed_group_layout_clearly(self) -> None:
-        rows, cols, rank = 16, 32, 4
+    @pytest.mark.parametrize(
+        "float8_dtype",
+        [torch.float8_e4m3fn, torch.float8_e5m2],
+    )
+    def test_group_lora_fallback_repairs_cancelled_block(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        float8_dtype: torch.dtype,
+    ) -> None:
+        rows, cols, group_size = 7, 32, 8
         f8 = _make_float8(
             rows=rows,
             cols=cols,
-            group_size=4,
+            dtype=torch.float32,
+            float8_dtype=float8_dtype,
+            group_size=group_size,
             dynamic_activation=False,
-        ).cuda().t()
+        ).cuda()
+        dense = Float8Adapter.dequantize(f8)
+        a = torch.zeros(1, cols, device="cuda", dtype=f8.dtype)
+        b = torch.zeros(rows, 1, device="cuda", dtype=f8.dtype)
+        a[0, 16:24] = -dense[3, 16:24]
+        b[3, 0] = 1
+        expected_dense = dense.clone()
+        expected_dense.addmm_(b, a)
+        assert torch.count_nonzero(expected_dense[3, 16:24]).item() == 0
+        expected = Float8Adapter.requantize(expected_dense, like=f8)
+        fallback_calls = 0
+        original_fallback = float8_adapter_module._torch_merge_float8_lora_
+
+        def tracked_fallback(
+            target: torch.Tensor,
+            staged_b: torch.Tensor,
+            staged_a: torch.Tensor,
+            strength: float,
+        ) -> None:
+            nonlocal fallback_calls
+            fallback_calls += 1
+            original_fallback(target, staged_b, staged_a, strength)
+
+        monkeypatch.setattr(
+            float8_adapter_module,
+            "_triton_merge_float8_lora",
+            None,
+        )
+        monkeypatch.setattr(
+            float8_adapter_module,
+            "_torch_merge_float8_lora_",
+            tracked_fallback,
+        )
+
+        Float8Adapter.merge_lora_(f8, b, a, 1.0)
+
+        assert fallback_calls == 1
+        assert torch.equal(
+            f8.qdata.view(torch.uint8),
+            expected.qdata.view(torch.uint8),
+        )
+        assert torch.equal(f8.scale, expected.scale)
+        assert torch.isfinite(f8.dequantize()).all()
+        assert torch.count_nonzero(f8.dequantize()[3, 16:24]).item() == 0
+
+    @CUDA
+    def test_lora_merge_rejects_transposed_group_layout_clearly(self) -> None:
+        rows, cols, rank = 16, 32, 4
+        f8 = (
+            _make_float8(
+                rows=rows,
+                cols=cols,
+                group_size=4,
+                dynamic_activation=False,
+            )
+            .cuda()
+            .t()
+        )
         assert tuple(f8.block_size) == (4, 1)
         assert not f8.qdata.is_contiguous()
         a = torch.randn(rank, rows, device="cuda", dtype=f8.dtype)
@@ -650,6 +745,10 @@ class TestFloat8Adapter:
         ).cuda()
         f8.qdata[3, 16:24].zero_()
         f8.scale[3, 2].fill_(torch.finfo(torch.float32).eps)
+        expected = Float8Adapter.requantize(
+            Float8Adapter.dequantize(f8),
+            like=f8,
+        )
         a = torch.zeros(rank, cols, device="cuda", dtype=f8.dtype)
         b = torch.zeros(rows, rank, device="cuda", dtype=f8.dtype)
 
@@ -661,6 +760,11 @@ class TestFloat8Adapter:
         assert torch.count_nonzero(dequantized[3, 16:24]).item() == 0
         assert f8.scale[3, 2].item() == torch.finfo(torch.float32).eps
         assert torch.count_nonzero(dequantized[3, :16]).item() > 0
+        assert torch.equal(
+            f8.qdata.view(torch.uint8),
+            expected.qdata.view(torch.uint8),
+        )
+        torch.testing.assert_close(f8.scale, expected.scale, rtol=0.02, atol=0)
 
     def test_lora_transform_requantizes_param_in_place(self) -> None:
         float8_tensor_cls, _, _, per_row_cls, _ = _float8_modules()
@@ -718,6 +822,59 @@ class TestFloat8Adapter:
 
         assert merged == 1
         assert not torch.equal(model.lin.weight.data.qdata.view(torch.uint8), original_qdata)
+
+    def test_merge_lora_preflights_transposed_group_before_mutation(self) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.first = nn.Linear(16, 16, bias=False, dtype=torch.float32)
+                self.second = nn.Linear(16, 16, bias=False, dtype=torch.float32)
+
+        model = M()
+        model.first.weight = nn.Parameter(
+            _make_float8(
+                dtype=torch.float32,
+                dynamic_activation=False,
+            ),
+            requires_grad=False,
+        )
+        model.second.weight = nn.Parameter(
+            _make_float8(
+                dtype=torch.float32,
+                group_size=4,
+                dynamic_activation=False,
+            ).t(),
+            requires_grad=False,
+        )
+        first_qdata = model.first.weight.data.qdata.view(torch.uint8).clone()
+        first_scale = model.first.weight.data.scale.clone()
+        second_qdata = model.second.weight.data.qdata.view(torch.uint8).clone()
+        second_scale = model.second.weight.data.scale.clone()
+        lora = LoRA.from_state_dict(
+            state_dict={
+                "first.lora_A.weight": torch.randn(4, 16),
+                "first.lora_B.weight": torch.randn(16, 4),
+                "second.lora_A.weight": torch.randn(4, 16),
+                "second.lora_B.weight": torch.randn(16, 4),
+            }
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="second.weight.*transposed PerGroup.*routed LoRA",
+        ):
+            merge_lora(model, [(lora, 1.0)])
+
+        assert torch.equal(
+            model.first.weight.data.qdata.view(torch.uint8),
+            first_qdata,
+        )
+        assert torch.equal(model.first.weight.data.scale, first_scale)
+        assert torch.equal(
+            model.second.weight.data.qdata.view(torch.uint8),
+            second_qdata,
+        )
+        assert torch.equal(model.second.weight.data.scale, second_scale)
 
     @CUDA
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:

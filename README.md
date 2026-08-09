@@ -756,6 +756,10 @@ existing CPU storage. The existing `cache_bytes()` method accounts for either
 pinned or adopted state. LoRA dispatch uses either dense in-place
 `addmm_` for plain bases or the staged merge capability for structured bases;
 conversion and copy capabilities do not implicitly advertise merge support.
+Adapters whose merge supports only certain layouts or staged factor values can
+also implement `LoRAMergeValidationTensorAdapter.validate_lora_merge`. Permanent
+merge stages and validates every requested operation through this hook before
+mutating any weight; DTensor delegates validation to its local-shard adapter.
 
 Downstream tensor subclasses can provide their adapter without adding a
 format-specific dependency to piper-offload:
@@ -888,7 +892,7 @@ dtype, no merge capability required.
 | Weight type | Offload | LoRA merge (`mode="merge"` / `merge_lora`) |
 |---|---|---|
 | Plain floating-point tensor | ✓ | native in-place `addmm_` |
-| optimum-quanto qint8 / qfloat8 | ✓ | fixed-scale Triton merge on CUDA; dequant / requant fallback |
+| optimum-quanto qint8 / qfloat8 | ✓ | absmax-requantized Triton merge on CUDA; dequant / requant fallback |
 | bitsandbytes NF4 / FP4 | ✓ | blockwise Triton merge on CUDA; dequant / requant fallback |
 | bitsandbytes int8 | ✓ | rowwise Triton merge on CUDA; dequant / requant fallback |
 | TorchAO scaled-FP8 | ✓ | Triton merge on CUDA; dequant / requant fallback |
@@ -906,10 +910,10 @@ Notes:
 - **Merging into a quantized base is lossy** because the updated value is
   re-encoded onto the quantization grid; choosing merge vs routed is the caller's
   accuracy/latency tradeoff, and is coarser the fewer bits the format has
-  (e.g. MXFP4 / NVFP4 at 4 bits). Most formats recompute scales from the
-  merged values and floor zero-amax blocks where their encoding requires a
-  positive scale. Quanto instead preserves its fixed scale, and bitsandbytes
-  int8 retains an exact zero scale for an all-zero row.
+  (e.g. MXFP4 / NVFP4 at 4 bits). Data-dependent weight scales are recomputed
+  from the merged values. Formats that cannot safely encode with a zero scale,
+  including Quanto qint8/qfloat8, floor exact-zero blocks to a small positive
+  value; bitsandbytes int8 retains an exact zero scale for an all-zero row.
 - **Triton dispatch is layout-conservative.** Each adapter checks its raw
   storage, scale metadata, compute dtype, and device before launching. A valid
   but nonstandard representation uses the reference merge when that format can
@@ -954,9 +958,12 @@ A naive `param.data.clone()` on a quanto tensor silently
 *dequantizes* it via the dispatch fallback — the explicit decomposition
 is required for correctness.
 
-LoRA on qint8 and the common E4M3/E5M2 qfloat8 bases uses a fixed-scale
-Triton merge on CUDA. Other layouts, including qfloat8 E4M3FNUZ, use the equivalent
-dequantize/addmm/requantize path. Both update the existing inner storage;
+LoRA on qint8 and the common E4M3/E5M2 qfloat8 bases uses a Triton merge on
+CUDA that recomputes Quanto's absmax weight scale from the merged values.
+Other layouts, including qfloat8 E4M3FNUZ, use the equivalent
+dequantize/addmm/requantize path with the same scale policy. Exact-zero scale
+blocks are repaired to a small positive value so qfloat8 never encodes a
+`0 / 0` NaN. Both paths update the existing inner data and scale storage;
 neither attempts native in-place `addmm_` on a `WeightQBytesTensor`. Use
 `lora_mode="routed"` when the base must remain untouched or adapters need
 to switch without reloading it.

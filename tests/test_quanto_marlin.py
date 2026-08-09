@@ -63,6 +63,34 @@ def _assert_qbytes_close(
     )
 
 
+def _quanto_absmax_oracle(
+    dense: torch.Tensor,
+    *,
+    like: torch.Tensor,
+) -> torch.Tensor:
+    """Use Quanto's optimizer and quantizer as the merge oracle."""
+    from optimum.quanto.tensor.optimizers import AbsmaxOptimizer
+
+    assert WeightQBytesTensor is not None
+    canonical = like.weight_qbytes_tensor()
+    scale = AbsmaxOptimizer()(
+        dense,
+        qtype=canonical.qtype,
+        axis=canonical.axis,
+    ).to(canonical._scale.dtype)
+    zero = scale == 0
+    eps = torch.finfo(torch.float32).eps
+    scale = torch.where(zero, torch.full_like(scale, eps), scale)
+    return WeightQBytesTensor.quantize(
+        dense,
+        canonical.qtype,
+        canonical.axis,
+        scale,
+        canonical.activation_qtype,
+        optimized=False,
+    )
+
+
 class TestQuantoMarlin:
     @CUDA
     def test_tensor_id_uses_marlin_physical_backing(self) -> None:
@@ -175,7 +203,7 @@ class TestQuantoMarlin:
         )
         expected_dense = target.dequantize()
         expected_dense.addmm_(b, a, alpha=-0.1875)
-        expected = QuantoAdapter.requantize(expected_dense, like=target)
+        expected = _quanto_absmax_oracle(expected_dense, like=target)
         packed_ptr = target._data._data.data_ptr()
         scale_ptr = target._scale.data_ptr()
         workspace_ptr = target._workspace.data_ptr()
@@ -217,7 +245,7 @@ class TestQuantoMarlin:
             a.cuda().to(expected_dense.dtype),
             alpha=strength,
         )
-        expected = QuantoAdapter.requantize(expected_dense, like=target)
+        expected = _quanto_absmax_oracle(expected_dense, like=target)
         lora = LoRA.from_state_dict(
             state_dict={
                 "0.lora_A.weight": a,
@@ -269,7 +297,7 @@ class TestQuantoMarlin:
 
 class TestQuantoScaleLayout:
     @CUDA
-    def test_reordered_axis_zero_scale_uses_generic_fallback(
+    def test_reordered_axis_zero_scale_is_rejected_before_merge(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -323,6 +351,7 @@ class TestQuantoScaleLayout:
             use_fallback,
         )
 
-        QuantoAdapter.merge_lora_(target, b, a, 0.25)
+        with pytest.raises(ValueError, match=r"shape \(rows, 1\)"):
+            QuantoAdapter.merge_lora_(target, b, a, 0.25)
 
-        assert fallback_called
+        assert not fallback_called

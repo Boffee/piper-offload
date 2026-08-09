@@ -37,6 +37,7 @@ from ._torchao_float8 import (
     is_float8_tensor,
     requantize_float8_tensor,
     require_float8_tensor,
+    validate_float8_requantize_layout,
     validate_layout,
 )
 from .tensor_adapters import metadata_key
@@ -215,6 +216,15 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
         return requantize_float8_tensor(t, like=like)
 
     @staticmethod
+    def validate_lora_merge(
+        target: torch.Tensor,
+        _b: torch.Tensor,
+        _a: torch.Tensor,
+        _strength: float,
+    ) -> None:
+        validate_float8_requantize_layout(target)
+
+    @staticmethod
     def merge_lora_(
         target: torch.Tensor,
         b: torch.Tensor,
@@ -222,6 +232,7 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
         strength: float,
     ) -> None:
         """Merge a staged LoRA update while preserving the target wrapper."""
+        Float8Adapter.validate_lora_merge(target, b, a, strength)
         f8 = require_float8_tensor(target)
         if _is_triton_float8_layout(f8, b, a):
             assert _triton_merge_float8_lora is not None

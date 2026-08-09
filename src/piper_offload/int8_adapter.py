@@ -28,6 +28,7 @@ wrapper object, not its bytes, so int8 weights stay frozen for
 streaming/training. Routed LoRA remains the non-destructive alternative.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +54,76 @@ except ModuleNotFoundError as exc:
 
 
 _TRITON_COMPUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _normalized_act_pre_scale(qt: Any) -> torch.Tensor | None:  # noqa: ANN401
+    """Return ``act_pre_scale`` in scalar or per-input LoRA shape.
+
+    TorchAO applies this tensor to the activation before its weight matmul.
+    A permanent logical-weight update must therefore be divided by the same
+    scale along the input dimension. Restrict accepted layouts to forms whose
+    meaning does not depend on the activation rank: one scalar, or one value
+    per input feature with singleton leading dimensions.
+    """
+    pre_scale = qt.act_pre_scale
+    if pre_scale is None:
+        return None
+    if not pre_scale.dtype.is_floating_point:
+        raise ValueError(f"TorchAO INT8 act_pre_scale must be floating-point for LoRA merge, got {pre_scale.dtype}.")
+    if pre_scale.device != qt.qdata.device:
+        raise ValueError(
+            "TorchAO INT8 act_pre_scale must be on the weight device for LoRA "
+            f"merge, got {pre_scale.device} and {qt.qdata.device}."
+        )
+
+    input_features = qt.shape[-1]
+    if pre_scale.numel() == 1:
+        normalized = pre_scale.reshape(1, 1)
+    elif (
+        pre_scale.ndim >= 1
+        and pre_scale.shape[-1] == input_features
+        and all(size == 1 for size in pre_scale.shape[:-1])
+    ):
+        normalized = pre_scale.reshape(1, input_features)
+    else:
+        raise ValueError(
+            "TorchAO INT8 act_pre_scale must be a scalar or one value per "
+            "input feature with only singleton leading dimensions for LoRA "
+            f"merge; got shape {tuple(pre_scale.shape)} for {input_features} "
+            "input features."
+        )
+
+    if not bool(torch.isfinite(normalized).all()):
+        raise ValueError("TorchAO INT8 act_pre_scale must contain only finite values for LoRA merge.")
+    if bool((normalized == 0).any()):
+        raise ValueError("TorchAO INT8 act_pre_scale must contain only non-zero values for LoRA merge.")
+    return normalized
+
+
+def _lora_a_in_stored_weight_coordinates(
+    qt: Any,  # noqa: ANN401
+    a: torch.Tensor,
+    strength: float,
+) -> tuple[torch.Tensor, float]:
+    """Map logical LoRA ``A`` through TorchAO's activation pre-scaling."""
+    pre_scale = _normalized_act_pre_scale(qt)
+    if pre_scale is None:
+        return a, strength
+
+    # Base execution is (x * p) @ W_stored.T, while routed LoRA is
+    # strength * x @ (B @ A).T. Thus delta(W_stored) is
+    # B @ ((strength * A) / p). Fold strength into A before division so a
+    # tiny/zero strength can keep the actual update finite even when A / p
+    # alone would overflow. Both backends then receive unit strength.
+    # Float64 avoids choosing between multiply-first overflow for large
+    # strengths and divide-first overflow for tiny pre-scales. Only tensors
+    # carrying act_pre_scale take this one-time merge/preflight path.
+    stored_a = (
+        a.to(torch.float64).mul(strength).div(pre_scale.to(device=a.device, dtype=torch.float64)).to(dtype=a.dtype)
+    )
+    if not bool(torch.isfinite(stored_a).all()):
+        raise ValueError("TorchAO INT8 act_pre_scale produces non-finite stored-coordinate LoRA factors.")
+    return stored_a.contiguous(), 1.0
 
 
 def _triton_int8_layout_supported(
@@ -209,6 +280,65 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
         return requantize_int8_tensor(t, like=like)
 
     @staticmethod
+    def stage_lora_factors(
+        target: torch.Tensor,
+        factors: Sequence[tuple[float, torch.Tensor, torch.Tensor]],
+        *,
+        logical_shape: tuple[int, ...],
+        compute_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
+        """Transform each logical ``A`` before low-precision factor packing."""
+        qt = require_int8_tensor(target)
+        pre_scale = _normalized_act_pre_scale(qt)
+        if pre_scale is None:
+            # Keep the ordinary zero-overhead staging path for INT8 tensors
+            # whose stored and logical weight coordinates are identical.
+            return None
+        if tuple(logical_shape) != tuple(qt.shape):
+            raise ValueError(
+                "TorchAO INT8 factor-aware LoRA staging shape does not match "
+                f"the target: staged={logical_shape}, target={tuple(qt.shape)}."
+            )
+        if compute_dtype is not qt.dtype:
+            raise ValueError(
+                "TorchAO INT8 factor-aware LoRA staging dtype does not match "
+                f"the target: staged={compute_dtype}, target={qt.dtype}."
+            )
+
+        total_rank = sum(a.shape[0] for _strength, a, _b in factors)
+        a_packed = torch.empty(
+            (total_rank, logical_shape[1]),
+            device=qt.device,
+            dtype=compute_dtype,
+        )
+        b_packed = torch.empty(
+            (logical_shape[0], total_rank),
+            device=qt.device,
+            dtype=compute_dtype,
+        )
+        pre_scale_f64 = pre_scale.to(device=qt.device, dtype=torch.float64)
+
+        rank_offset = 0
+        for strength, a, b in factors:
+            next_offset = rank_offset + a.shape[0]
+            stored_a_f64 = (
+                a.to(
+                    device=qt.device,
+                    dtype=torch.float64,
+                    non_blocking=True,
+                )
+                .mul(strength)
+                .div(pre_scale_f64)
+            )
+            a_packed[rank_offset:next_offset].copy_(stored_a_f64)
+            b_packed[:, rank_offset:next_offset].copy_(b, non_blocking=True)
+            rank_offset = next_offset
+
+        if not bool(torch.isfinite(a_packed).all()):
+            raise ValueError("TorchAO INT8 act_pre_scale produces non-finite stored-coordinate LoRA factors.")
+        return b_packed, a_packed, 1.0
+
+    @staticmethod
     def merge_lora_(
         target: torch.Tensor,
         b: torch.Tensor,
@@ -217,6 +347,17 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
     ) -> None:
         """Merge a staged LoRA update while preserving target storage."""
         qt = require_int8_tensor(target)
+        a, strength = _lora_a_in_stored_weight_coordinates(qt, a, strength)
+        Int8Adapter._merge_stored_lora_(qt, b, a, strength)
+
+    @staticmethod
+    def _merge_stored_lora_(
+        qt: Any,  # noqa: ANN401
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Merge factors already expressed in stored-weight coordinates."""
         if _triton_int8_layout_supported(qt, b, a):
             assert _triton_merge_int8_lora is not None
             asymmetric = qt.zero_point is not None and bool(qt.zero_point.any())
@@ -237,10 +378,50 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
                 qt.zero_point.copy_(zero_point)
             return
 
-        dense = dequantize_int8_tensor(target)
+        dense = dequantize_int8_tensor(qt)
         dense.addmm_(b, a, alpha=strength)
-        new_data = requantize_int8_tensor(dense, like=target)
-        Int8Adapter.copy_into(new_data, target=target)
+        new_data = requantize_int8_tensor(dense, like=qt)
+        Int8Adapter.copy_into(new_data, target=qt)
+
+    @staticmethod
+    def validate_lora_merge(
+        target: torch.Tensor,
+        _b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Validate activation pre-scale and transformed factor range."""
+        _lora_a_in_stored_weight_coordinates(
+            require_int8_tensor(target),
+            a,
+            strength,
+        )
+
+    @staticmethod
+    def validate_prepared_lora_merge(
+        target: torch.Tensor,
+        _b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Validate factor-aware staging without applying pre-scale twice."""
+        _normalized_act_pre_scale(require_int8_tensor(target))
+        if strength != 1.0:
+            raise ValueError(f"TorchAO INT8 prepared LoRA merge requires unit strength, got {strength}.")
+        if not bool(torch.isfinite(a).all()):
+            raise ValueError("TorchAO INT8 prepared stored-coordinate LoRA factors must be finite.")
+
+    @staticmethod
+    def merge_prepared_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+    ) -> None:
+        """Merge factor-aware staged data without applying pre-scale twice."""
+        qt = require_int8_tensor(target)
+        Int8Adapter.validate_prepared_lora_merge(qt, b, a, strength)
+        Int8Adapter._merge_stored_lora_(qt, b, a, strength)
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:

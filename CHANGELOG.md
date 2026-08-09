@@ -5,6 +5,15 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- Recompute data-dependent Quanto qint8/qfloat8 weight scales after LoRA merges in both
+  generic and CUDA paths, including safe exact-zero blocks.
+- Merge TorchAO INT8 LoRA factors in the stored SmoothQuant/AWQ weight coordinates while
+  preserving activation pre-scales and calibration metadata.
+- Repair exact-zero TorchAO FP8 PerGroup blocks in the generic requantization path.
+- Preflight adapter-specific quantized merge constraints before mutating any model weight.
+
 ## [0.1.0] - 2026-08-03
 
 ### Added

@@ -279,6 +279,7 @@ class TestBnb8bitAdapter:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         pytest.importorskip("triton")
+        torch.manual_seed(23)
         rows, cols, rank = 70, 130, 7
         target = _make_int8(rows=rows, cols=cols, device="cuda")
         a = torch.randn(
@@ -320,13 +321,22 @@ class TestBnb8bitAdapter:
 
         assert target.CB.data_ptr() == cb_ptr
         assert target.SCB.data_ptr() == scb_ptr
+        torch.testing.assert_close(
+            target.SCB,
+            expected.SCB,
+            rtol=0.02,
+            atol=0.02,
+        )
         difference = (target.CB.to(torch.int16) - expected.CB).abs()
         assert difference.max().item() <= 1
+        max_quant_step = (
+            torch.maximum(target.SCB, expected.SCB).max().item() / 127
+        )
         torch.testing.assert_close(
             Bnb8bitAdapter.dequantize(target),
             Bnb8bitAdapter.dequantize(expected),
             rtol=0.02,
-            atol=0.02,
+            atol=max(1.5 * max_quant_step, torch.finfo(torch.float32).eps),
         )
 
     @CUDA

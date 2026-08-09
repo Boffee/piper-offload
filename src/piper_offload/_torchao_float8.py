@@ -92,8 +92,34 @@ def dequantize_float8_tensor(t: torch.Tensor) -> torch.Tensor:
     return f8.dequantize()
 
 
+def validate_float8_requantize_layout(t: torch.Tensor) -> object:
+    """Return the recoverable granularity or reject an unencodable layout.
+
+    This is also the adapter's LoRA-merge preflight: the generic fallback can
+    only rebuild layouts that TorchAO's public ``from_hp`` constructor can
+    express. In particular, transposing a PerGroup weight moves its groups off
+    the last axis and cannot be represented by ``PerGroup`` on re-encode.
+    """
+    f8 = require_float8_tensor(t)
+    try:
+        return granularity_from_block_size(
+            tuple(f8.block_size),
+            tuple(f8.shape),
+            label="Float8Tensor",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "Cannot re-encode this Float8Tensor layout. TorchAO can rebuild "
+            "PerTensor, PerRow, and last-axis PerGroup weights, but not a "
+            "transposed PerGroup layout. Use routed LoRA instead of merging "
+            "into this weight."
+        ) from exc
+
+
 def requantize_float8_tensor(
-    t: torch.Tensor, *, like: torch.Tensor,
+    t: torch.Tensor,
+    *,
+    like: torch.Tensor,
 ) -> torch.Tensor:
     """Encode dense ``t`` using the fp8 layout and metadata from ``like``.
 
@@ -105,27 +131,15 @@ def requantize_float8_tensor(
 
     Zero blocks are repaired afterwards: ``from_hp`` computes
     ``scale = amax / fp8_max`` with no epsilon floor, so an all-zero block
-    (a zeroed row under per-row scaling, or a fully cancelled weight under
-    per-tensor) gets ``scale = 0`` and ``qdata = 0 / 0 = NaN``. See
-    :func:`_repair_zero_scale_blocks`.
+    (a zeroed group or row, or a fully cancelled weight) gets ``scale = 0``
+    and ``qdata = 0 / 0 = NaN``. See :func:`_repair_zero_scale_blocks`.
     """
     f8 = require_float8_tensor(like)
     if tuple(t.shape) != tuple(f8.shape):
         raise ValueError(
-            f"Cannot requantize tensor with shape {tuple(t.shape)} like "
-            f"Float8Tensor with shape {tuple(f8.shape)}."
+            f"Cannot requantize tensor with shape {tuple(t.shape)} like Float8Tensor with shape {tuple(f8.shape)}."
         )
-    try:
-        granularity = granularity_from_block_size(
-            tuple(f8.block_size), tuple(f8.shape), label="Float8Tensor",
-        )
-    except ValueError as exc:
-        raise ValueError(
-            "Cannot re-encode this Float8Tensor layout. TorchAO can rebuild "
-            "PerTensor, PerRow, and last-axis PerGroup weights, but not a "
-            "transposed PerGroup layout. Use routed LoRA instead of merging "
-            "into this weight."
-        ) from exc
+    granularity = validate_float8_requantize_layout(f8)
     out = Float8Tensor.from_hp(
         t.to(dtype=f8.dtype),
         float8_dtype=f8.qdata.dtype,
@@ -154,7 +168,12 @@ def _repair_zero_scale_blocks(f8: Any) -> torch.Tensor:  # noqa: ANN401
         return f8
     eps = torch.finfo(torch.float32).eps
     scale = torch.where(zero, torch.full_like(f8.scale, eps), f8.scale)
-    qdata = torch.where(zero, torch.zeros_like(f8.qdata), f8.qdata)
+    qdata_zero = _expand_block_mask(
+        zero,
+        block_size=tuple(f8.block_size),
+        shape=tuple(f8.qdata.shape),
+    )
+    qdata = torch.where(qdata_zero, torch.zeros_like(f8.qdata), f8.qdata)
     return create_float8_tensor(
         qdata,
         scale,
@@ -164,3 +183,40 @@ def _repair_zero_scale_blocks(f8: Any) -> torch.Tensor:  # noqa: ANN401
         f8.kernel_preference,
         f8.dtype,
     )
+
+
+def _expand_block_mask(
+    mask: torch.Tensor,
+    *,
+    block_size: tuple[int, ...],
+    shape: tuple[int, ...],
+) -> torch.Tensor:
+    """Expand one boolean value per quantization block to logical elements."""
+    if len(block_size) != len(shape) or any(
+        block <= 0 or size % block != 0 for size, block in zip(shape, block_size, strict=True)
+    ):
+        raise RuntimeError(
+            "Float8Tensor has an invalid block_size for zero-scale repair: "
+            f"block_size={block_size!r}, qdata shape={shape!r}."
+        )
+
+    block_grid = tuple(size // block for size, block in zip(shape, block_size, strict=True))
+    expected_numel = 1
+    for size in block_grid:
+        expected_numel *= size
+    if mask.numel() != expected_numel:
+        raise RuntimeError(
+            "Float8Tensor scale layout does not match its quantization blocks: "
+            f"scale shape={tuple(mask.shape)!r}, expected block grid={block_grid!r}."
+        )
+
+    expanded = mask.reshape(block_grid)
+    for dim, repeat in enumerate(block_size):
+        if repeat != 1:
+            expanded = expanded.repeat_interleave(repeat, dim=dim)
+    if tuple(expanded.shape) != shape:
+        raise RuntimeError(
+            "Float8Tensor zero-scale mask did not expand to qdata shape: "
+            f"expanded={tuple(expanded.shape)!r}, qdata={shape!r}."
+        )
+    return expanded

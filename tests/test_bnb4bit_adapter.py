@@ -359,18 +359,23 @@ class TestBnb4bitAdapter:
     @CUDA
     @pytest.mark.parametrize("quant_type", ["nf4", "fp4"])
     @pytest.mark.parametrize("double_quant", [False, True])
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float16, torch.bfloat16, torch.float32],
+    )
     def test_triton_merge_matches_bnb_round_trip_and_preserves_metadata(
         self,
         monkeypatch: pytest.MonkeyPatch,
         quant_type: str,
         double_quant: bool,
+        dtype: torch.dtype,
     ) -> None:
         pytest.importorskip("triton")
         rows, cols, rank = 65, 128, 7
         target = _make_nf4(
             rows=rows,
             cols=cols,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             quant_type=quant_type,
             double_quant=double_quant,
             device="cuda",
@@ -379,13 +384,13 @@ class TestBnb4bitAdapter:
             cols,
             rank,
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=dtype,
         ).t()
         b = torch.randn(
             rank,
             rows,
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=dtype,
         ).t()
         assert not a.is_contiguous()
         assert not b.is_contiguous()
