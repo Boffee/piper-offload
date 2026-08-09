@@ -640,10 +640,18 @@ class TestFloat8Adapter:
             staged_b: torch.Tensor,
             staged_a: torch.Tensor,
             strength: float,
+            *,
+            rounding_seed: int | None = None,
         ) -> None:
             nonlocal fallback_calls
             fallback_calls += 1
-            original_fallback(target, staged_b, staged_a, strength)
+            original_fallback(
+                target,
+                staged_b,
+                staged_a,
+                strength,
+                rounding_seed=rounding_seed,
+            )
 
         monkeypatch.setattr(
             float8_adapter_module,

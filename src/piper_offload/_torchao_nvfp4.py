@@ -13,6 +13,8 @@ from typing import Any
 
 import torch
 
+from ._stochastic_quantization import _stochastic_codebook_indices
+
 LAYOUT_ATTRS = (
     "qdata",
     "scale",
@@ -28,6 +30,11 @@ LAYOUT_ATTRS = (
 
 
 try:
+    from torchao.prototype.mx_formats.kernels import (
+        f4_unpacked_to_f32,
+        pack_uint4,
+        unpack_uint4,
+    )
     from torchao.prototype.mx_formats.nvfp4_tensor import (
         NVFP4Tensor,
         per_tensor_amax_to_scale,
@@ -37,7 +44,10 @@ try:
 except ImportError:
     TORCHAO_NVFP4_AVAILABLE = False
     NVFP4Tensor: Any = None
+    f4_unpacked_to_f32: Any = None
+    pack_uint4: Any = None
     per_tensor_amax_to_scale: Any = None
+    unpack_uint4: Any = None
 
 
 def is_nvfp4_tensor(t: object) -> bool:
@@ -100,7 +110,10 @@ def dequantize_nvfp4_tensor(t: torch.Tensor) -> torch.Tensor:
 
 
 def requantize_nvfp4_tensor(
-    t: torch.Tensor, *, like: torch.Tensor,
+    t: torch.Tensor,
+    *,
+    like: torch.Tensor,
+    rounding_seed: int | None = None,
 ) -> torch.Tensor:
     """Encode dense ``t`` using the NVFP4 layout and metadata from ``like``.
 
@@ -118,6 +131,10 @@ def requantize_nvfp4_tensor(
     layout without NVFP4's optional Triton/mslk dependency, and
     ``copy_into`` writes the bytes into ``like``'s wrapper, which keeps its
     own ``use_triton_kernel`` flag for the forward matmul.
+
+    When ``rounding_seed`` is provided, that deterministic re-encode still
+    establishes the final global/block scales and metadata first. Only the
+    terminal E2M1 codes are then replaced in place using stochastic rounding.
     """
     nv = require_nvfp4_tensor(like)
     if tuple(t.shape) != tuple(nv.shape):
@@ -166,7 +183,7 @@ def requantize_nvfp4_tensor(
         per_tensor_scale = per_tensor_amax_to_scale(
             t.detach().abs().max()
         ).clamp_min(torch.finfo(torch.float32).eps)
-    return NVFP4Tensor.to_nvfp4(
+    out = NVFP4Tensor.to_nvfp4(
         t.to(dtype=nv.orig_dtype),
         block_size=nv.block_size,
         per_tensor_scale=per_tensor_scale,
@@ -175,3 +192,40 @@ def requantize_nvfp4_tensor(
         use_triton_kernel=False,
         act_quant_kwargs=nv.act_quant_kwargs,
     )
+    if rounding_seed is not None:
+        _stochastic_recode_nvfp4_(out, t, rounding_seed=rounding_seed)
+    return out
+
+
+def _stochastic_recode_nvfp4_(
+    out: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    rounding_seed: int,
+) -> None:
+    """Replace only ``out``'s terminal codes using its finalized scales."""
+    nv = require_nvfp4_tensor(out)
+    hp_scale = nv.get_hp_scales()
+    element_scale = hp_scale.repeat_interleave(nv.block_size, dim=-1)
+    valid_scale = torch.isfinite(element_scale) & (element_scale > 0)
+    normalized = torch.where(
+        valid_scale,
+        source.to(torch.float32) / element_scale.to(torch.float32),
+        torch.zeros_like(source, dtype=torch.float32),
+    )
+    deterministic_codes = unpack_uint4(nv.qdata.contiguous().view(torch.uint8))
+    codebook = f4_unpacked_to_f32(
+        torch.arange(16, device=source.device, dtype=torch.uint8)
+    )
+    codes = _stochastic_codebook_indices(
+        normalized,
+        codebook,
+        seed=rounding_seed,
+        deterministic=deterministic_codes,
+    )
+    codes = torch.where(
+        valid_scale,
+        codes,
+        deterministic_codes.to(torch.int64),
+    )
+    nv.qdata.view(torch.uint8).copy_(pack_uint4(codes.to(torch.uint8)))

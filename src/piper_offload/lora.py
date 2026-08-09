@@ -44,6 +44,7 @@ from .host_backing import (
     validate_host_backing,
 )
 from .pinned_param import PinnedParam
+from .seeding import derive_seed
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
     LoRAMergeTensorAdapter,
@@ -90,6 +91,8 @@ class _FactorAwareLoRAMergeAdapter(Protocol):
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Validate a prepared update without transforming it again."""
         ...
@@ -100,6 +103,8 @@ class _FactorAwareLoRAMergeAdapter(Protocol):
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Apply a prepared update without transforming it again."""
         ...
@@ -268,14 +273,36 @@ class LoRATransform:
     pinning happens here. :meth:`apply` copies factors to the target
     parameter's device and delegates the update to its tensor adapter. Multiple
     ordinary factors are packed into transient buffers and applied as one
-    update. The target
-    :class:`~torch.nn.Parameter` object is always preserved.
+    update. The target :class:`~torch.nn.Parameter` object is always preserved.
     """
 
-    __slots__ = ("_factors",)
+    __slots__ = (
+        "_factors",
+        "_merge_index",
+        "_stochastic_rounding",
+        "_target_key",
+    )
 
-    def __init__(self, factors: list[ScaledLoRAFactor]) -> None:
+    def __init__(
+        self,
+        factors: list[ScaledLoRAFactor],
+        *,
+        stochastic_rounding: bool = False,
+        target_key: str = "",
+    ) -> None:
+        if stochastic_rounding and not target_key:
+            raise ValueError(
+                "Stochastic LoRATransform requires a non-empty target_key."
+            )
         self._factors = factors
+        self._stochastic_rounding = stochastic_rounding
+        self._target_key = target_key
+        self._merge_index = 0
+
+    def _rounding_seed(self) -> int | None:
+        if not self._stochastic_rounding:
+            return None
+        return derive_seed(self._target_key, self._merge_index)
 
     def validate_target(self, param: nn.Parameter) -> None:
         """Raise if ``param`` cannot receive this LoRA merge.
@@ -287,6 +314,7 @@ class LoRATransform:
         representation = param_representation(param)
         adapter = _select_lora_merge_adapter(representation)
         logical_shape = adapter.logical_shape(representation)
+        rounding_seed = self._rounding_seed()
         _validate_factor_shapes(
             self._factors,
             logical_shape,
@@ -315,6 +343,7 @@ class LoRATransform:
             a,
             strength,
             prepared=prepared,
+            rounding_seed=rounding_seed,
         )
 
     def apply(self, param: nn.Parameter) -> None:
@@ -324,13 +353,16 @@ class LoRATransform:
         representation = param_representation(param)
         adapter = _select_lora_merge_adapter(representation)
         logical_shape = adapter.logical_shape(representation)
+        rounding_seed = self._rounding_seed()
         _validate_factor_shapes(self._factors, logical_shape)
         self._apply_merge(
             representation,
             adapter,
             logical_shape=logical_shape,
             compute_dtype=adapter.compute_dtype(representation),
+            rounding_seed=rounding_seed,
         )
+        self._merge_index += 1
 
     def _factor_tensors(
         self,
@@ -351,6 +383,7 @@ class LoRATransform:
         *,
         logical_shape: tuple[int, ...],
         compute_dtype: torch.dtype,
+        rounding_seed: int | None,
     ) -> None:
         """Stage one combined update and delegate it to the target adapter."""
         factor_tensors = self._factor_tensors()
@@ -375,12 +408,25 @@ class LoRATransform:
             a,
             strength,
             prepared=prepared,
+            rounding_seed=rounding_seed,
         )
         if prepared:
             assert isinstance(adapter, _FactorAwareLoRAMergeAdapter)
-            adapter.merge_prepared_lora_(data, b, a, strength)
+            adapter.merge_prepared_lora_(
+                data,
+                b,
+                a,
+                strength,
+                rounding_seed=rounding_seed,
+            )
         else:
-            adapter.merge_lora_(data, b, a, strength)
+            adapter.merge_lora_(
+                data,
+                b,
+                a,
+                strength,
+                rounding_seed=rounding_seed,
+            )
 
     @staticmethod
     def _localize_factor_tensors(
@@ -578,13 +624,26 @@ def _validate_lora_merge(
     strength: float,
     *,
     prepared: bool = False,
+    rounding_seed: int | None = None,
 ) -> None:
     """Run adapter-specific staged-merge checks without mutation."""
     if prepared:
         assert isinstance(adapter, _FactorAwareLoRAMergeAdapter)
-        adapter.validate_prepared_lora_merge(target, b, a, strength)
+        adapter.validate_prepared_lora_merge(
+            target,
+            b,
+            a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
     elif isinstance(adapter, LoRAMergeValidationTensorAdapter):
-        adapter.validate_lora_merge(target, b, a, strength)
+        adapter.validate_lora_merge(
+            target,
+            b,
+            a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
 
 
 @dataclass(slots=True, frozen=True)

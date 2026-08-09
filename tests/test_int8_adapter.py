@@ -693,6 +693,8 @@ class TestInt8Adapter:
             packed_b: torch.Tensor,
             packed_a: torch.Tensor,
             packed_strength: float,
+            *,
+            rounding_seed: int | None = None,
         ) -> None:
             prepared_a.append(packed_a.detach().clone())
             original_prepared_merge(
@@ -700,6 +702,7 @@ class TestInt8Adapter:
                 packed_b,
                 packed_a,
                 packed_strength,
+                rounding_seed=rounding_seed,
             )
 
         monkeypatch.setattr(

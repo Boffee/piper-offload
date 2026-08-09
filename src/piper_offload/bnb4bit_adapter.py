@@ -84,11 +84,17 @@ def _torch_merge_bnb4_lora(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> torch.Tensor:
     """Merge through the ordinary dequantize/addmm/requantize path."""
     dense = dequantize_params_4bit(target)
     dense.addmm_(b, a, alpha=strength)
-    return requantize_params_4bit(dense, like=target)
+    return requantize_params_4bit(
+        dense,
+        like=target,
+        rounding_seed=rounding_seed,
+    )
 
 
 def _can_use_triton_merge(
@@ -389,8 +395,13 @@ class Bnb4bitAdapter:
         return dequantize_params_4bit(t)
 
     @staticmethod
-    def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
-        return requantize_params_4bit(t, like=like)
+    def requantize(
+        t: torch.Tensor,
+        *,
+        like: torch.Tensor,
+        rounding_seed: int | None = None,
+    ) -> torch.Tensor:
+        return requantize_params_4bit(t, like=like, rounding_seed=rounding_seed)
 
     @staticmethod
     def merge_lora_(
@@ -398,10 +409,12 @@ class Bnb4bitAdapter:
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Merge into BNB4 storage, preferring the raw Triton path."""
         qt = require_params_4bit(target)
-        if _can_use_triton_merge(qt, b, a):
+        if rounding_seed is None and _can_use_triton_merge(qt, b, a):
             assert _triton_merge_bnb4_lora is not None
             state = qt.quant_state
             state2 = state.state2 if state.nested else None
@@ -429,7 +442,13 @@ class Bnb4bitAdapter:
                 state.offset.copy_(offset)
             return
 
-        merged = _torch_merge_bnb4_lora(target, b, a, strength)
+        merged = _torch_merge_bnb4_lora(
+            target,
+            b,
+            a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
         Bnb4bitAdapter.copy_into(merged, target=target)
 
     @staticmethod

@@ -247,8 +247,10 @@ class LoRAMergeTensorAdapter[PinnedStateT, GpuStateT](
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
-        """Merge the staged update into ``target`` in place."""
+        """Merge the staged update, optionally using stochastic rounding."""
         ...
 
 
@@ -268,8 +270,10 @@ class LoRAMergeValidationTensorAdapter(Protocol):
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
-        """Raise if the staged update cannot be safely merged in place."""
+        """Validate the staged update and optional rounding mode."""
         ...
 
 
@@ -288,7 +292,9 @@ class DequantRequantTensorAdapter[PinnedStateT, GpuStateT](
 
     Data-dependent weight quantization parameters are recomputed from the new
     dense values. Callers must not assume scale bytes survive a
-    dequantize/requantize round trip.
+    dequantize/requantize round trip. Built-in quantized adapters internally
+    compose stochastic terminal-code recoding with this same conversion, but
+    the public structural protocol remains deterministic.
     This conversion capability does not by itself advertise in-place copy or
     LoRA merge support.
     """
@@ -670,7 +676,10 @@ class RegularAdapter:
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
+        del rounding_seed
         target.addmm_(b, a, alpha=strength)
 
     @staticmethod

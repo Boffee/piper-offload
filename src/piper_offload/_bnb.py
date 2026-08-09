@@ -33,6 +33,11 @@ from typing import Any
 
 import torch
 
+from ._stochastic_quantization import (
+    _stochastic_codebook_indices,
+    _stochastic_round_to_int,
+)
+
 LAYOUT_ATTRS = ("quant_state", "blocksize", "quant_type")
 """Attributes this repo reads from a ``Params4bit`` tensor."""
 
@@ -175,7 +180,12 @@ def dequantize_params_4bit(t: torch.Tensor) -> torch.Tensor:
     return dense.reshape(quant_state.shape)
 
 
-def requantize_params_4bit(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # noqa: ANN401
+def requantize_params_4bit(
+    t: torch.Tensor,
+    *,
+    like: torch.Tensor,
+    rounding_seed: int | None = None,
+) -> Any:  # noqa: ANN401
     """Encode dense ``t`` in the same 4-bit layout as ``like``.
 
     Recomputes block scales from ``t``'s values (4-bit absmax is
@@ -185,6 +195,10 @@ def requantize_params_4bit(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # no
     matters: a weight stored as bf16/fp16 (FSDP-oriented checkpoints) packs
     into a different shape than the default uint8, and ``copy_into`` would
     otherwise hit a shape mismatch.
+
+    When ``rounding_seed`` is supplied, final scales and metadata still come from
+    this ordinary BNB quantization. Only the terminal NF4/FP4 codes are then
+    replaced stochastically in the completed representation.
     """
     ref = require_params_4bit(like)
     quant_state = ref.quant_state
@@ -200,11 +214,86 @@ def requantize_params_4bit(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # no
         quant_type=quant_state.quant_type,
         quant_storage=ref.data.dtype,
     )
-    return build_params_4bit(
+    quantized = build_params_4bit(
         qdata,
         new_quant_state.as_dict(packed=True),
         device=qdata.device,
     )
+    if rounding_seed is not None:
+        _stochastic_recode_params_4bit_(
+            t,
+            target=quantized,
+            rounding_seed=rounding_seed,
+        )
+    return quantized
+
+
+def _stochastic_recode_params_4bit_(
+    values: torch.Tensor,
+    *,
+    target: torch.Tensor,
+    rounding_seed: int,
+) -> None:
+    """Stochastically replace finalized NF4/FP4 codes in ``target``."""
+    qt = require_params_4bit(target)
+    state = qt.quant_state
+    numel = values.numel()
+    raw = qt.data.view(torch.uint8).reshape(-1)
+    num_bytes = (numel + 1) // 2
+    packed = raw[:num_bytes]
+
+    deterministic_codes = (
+        torch.stack((packed >> 4, packed & 0x0F), dim=1)
+        .reshape(-1)[:numel]
+        .reshape(values.shape)
+    )
+
+    if state.nested:
+        effective_scale = bnb_functional.dequantize_blockwise(
+            state.absmax,
+            state.state2,
+        )
+        effective_scale.add_(state.offset)
+    else:
+        effective_scale = state.absmax
+    element_scale = (
+        effective_scale.reshape(-1)
+        .repeat_interleave(state.blocksize)[:numel]
+        .reshape(values.shape)
+    )
+    valid_scale = torch.isfinite(element_scale) & (element_scale > 0)
+    normalized = torch.where(
+        valid_scale,
+        values.to(torch.float32) / element_scale.to(torch.float32),
+        torch.zeros_like(values, dtype=torch.float32),
+    )
+    codebook = state.code
+    if state.quant_type == "fp4":
+        # BNB's FP4 table stores the conceptual negative-zero code at index
+        # 8 as numeric +0. Restore its sign solely for bracketing so tiny
+        # negative/positive values choose the corresponding zero code.
+        codebook = codebook.clone()
+        codebook[8] = -0.0
+    codes = _stochastic_codebook_indices(
+        normalized,
+        codebook,
+        seed=rounding_seed,
+        deterministic=deterministic_codes,
+    )
+    codes = torch.where(valid_scale, codes, deterministic_codes.to(torch.int64))
+
+    flat_codes = codes.reshape(-1).to(torch.uint8)
+    new_packed = packed.clone()
+    paired = numel // 2
+    if paired:
+        new_packed[:paired] = (flat_codes[: 2 * paired : 2] << 4) | flat_codes[
+            1 : 2 * paired : 2
+        ]
+    if numel % 2:
+        # BNB stores the even element in the high nibble. The low nibble of
+        # an odd tail is padding owned by upstream; retain it byte-for-byte.
+        new_packed[-1] = (flat_codes[-1] << 4) | (packed[-1] & 0x0F)
+    packed.copy_(new_packed)
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +395,12 @@ def dequantize_int8_params(t: torch.Tensor) -> torch.Tensor:
     return dense
 
 
-def requantize_int8_params(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # noqa: ANN401
+def requantize_int8_params(
+    t: torch.Tensor,
+    *,
+    like: torch.Tensor,
+    rounding_seed: int | None = None,
+) -> Any:  # noqa: ANN401
     """Encode dense ``t`` in the same int8 layout as ``like``.
 
     Recomputes the per-row scale from ``t`` via ``int8_vectorwise_quant``;
@@ -316,6 +410,10 @@ def requantize_int8_params(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # no
     clamped to the fp16 range so a merged value past fp16 max (65504) cannot
     overflow to ``inf`` (which would poison the row's scale to ``inf`` and
     the dequantized row to ``NaN``).
+
+    When ``rounding_seed`` is supplied, the ordinary BNB quantizer still chooses
+    the final row scales. Only the terminal ``CB`` codes are then replaced
+    stochastically in the completed representation.
     """
     ref = require_int8_params(like)
     if tuple(t.shape) != tuple(ref.CB.shape):
@@ -327,4 +425,39 @@ def requantize_int8_params(t: torch.Tensor, *, like: torch.Tensor) -> Any:  # no
     cb, scb, _outliers = bnb_functional.int8_vectorwise_quant(
         t.clamp(-fp16_max, fp16_max).to(torch.float16)
     )
-    return build_int8_params(cb, scb)
+    quantized = build_int8_params(cb, scb)
+    if rounding_seed is not None:
+        _stochastic_recode_int8_params_(
+            t,
+            target=quantized,
+            rounding_seed=rounding_seed,
+        )
+    return quantized
+
+
+def _stochastic_recode_int8_params_(
+    values: torch.Tensor,
+    *,
+    target: torch.Tensor,
+    rounding_seed: int,
+) -> None:
+    """Stochastically replace finalized CB codes in ``target``."""
+    qt = require_int8_params(target)
+    fp16_max = torch.finfo(torch.float16).max
+    quant_input = values.clamp(-fp16_max, fp16_max).to(torch.float16)
+    scale = qt.SCB.to(torch.float32).view(-1, 1)
+    valid_scale = torch.isfinite(scale) & (scale > 0)
+    scaled = torch.where(
+        valid_scale,
+        quant_input.to(torch.float32).mul(127.0).div(scale),
+        torch.zeros_like(quant_input, dtype=torch.float32),
+    )
+    cb = _stochastic_round_to_int(
+        scaled,
+        seed=rounding_seed,
+        quant_min=-127,
+        quant_max=127,
+        deterministic=qt.CB,
+    ).to(torch.int8)
+    cb = torch.where(valid_scale, cb, qt.CB)
+    qt.CB.copy_(cb)

@@ -11,8 +11,12 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 
 import piper_offload.dtensor_adapter as dtensor_adapter_module
 import piper_offload.lora as lora_module
-from piper_offload import LoRATransform, ScaledLoRAFactor
+from piper_offload import (
+    LoRATransform,
+    ScaledLoRAFactor,
+)
 from piper_offload.dtensor_adapter import DTensorAdapter, _local_shape_and_offsets
+from piper_offload import derive_seed
 from piper_offload.tensor_adapters import RegularAdapter
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -242,6 +246,85 @@ def test_transform_localizes_factors_before_staging(
     torch.testing.assert_close(target, expected)
 
 
+def test_stochastic_merge_forwards_seed_to_local_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = nn.Parameter(torch.zeros(4, 3), requires_grad=False)
+    context = dtensor_adapter_module._DTensorMergeContext(
+        global_shape=(6, 8),
+        local_shape=(4, 3),
+        offsets=(2, 5),
+        local=target.data,
+        inner=RegularAdapter(),
+    )
+    monkeypatch.setattr(
+        dtensor_adapter_module,
+        "_merge_context",
+        lambda _target: context,
+    )
+    monkeypatch.setattr(
+        lora_module,
+        "_select_lora_merge_adapter",
+        lambda _target: DTensorAdapter(),
+    )
+
+    captured: list[int] = []
+    original_merge = RegularAdapter.merge_lora_
+
+    def tracked_merge(
+        local_target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        assert rounding_seed is not None
+        captured.append(rounding_seed)
+        original_merge(
+            local_target,
+            b,
+            a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
+
+    monkeypatch.setattr(
+        RegularAdapter,
+        "merge_lora_",
+        staticmethod(tracked_merge),
+    )
+    transform = LoRATransform(
+        [
+            ScaledLoRAFactor.from_tensors(
+                torch.randn(2, 8),
+                torch.randn(6, 2),
+                0.25,
+            )
+        ],
+        stochastic_rounding=True,
+        target_key="sharded.weight",
+    )
+
+    transform.apply(target)
+
+    expected_seed = dtensor_adapter_module._localize_rounding_seed(
+        derive_seed("sharded.weight", 0),
+        context.offsets,
+    )
+    assert captured == [expected_seed]
+
+
+def test_dtensor_rounding_seed_decorrelates_shards_and_aligns_replicas() -> None:
+    seed = derive_seed("sharded.weight", 0)
+    replica = dtensor_adapter_module._localize_rounding_seed(seed, (0, 0))
+
+    assert replica == dtensor_adapter_module._localize_rounding_seed(seed, (0, 0))
+    assert replica != dtensor_adapter_module._localize_rounding_seed(seed, (2, 0))
+    assert replica != dtensor_adapter_module._localize_rounding_seed(seed, (0, 5))
+    assert dtensor_adapter_module._localize_rounding_seed(None, (2, 5)) is None
+
+
 def test_adapter_owned_merge_receives_contiguous_local_factors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -265,7 +348,10 @@ def test_adapter_owned_merge_receives_contiguous_local_factors(
         b: torch.Tensor,
         a: torch.Tensor,
         _strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
+        del rounding_seed
         received.append(
             (
                 tuple(b.shape),

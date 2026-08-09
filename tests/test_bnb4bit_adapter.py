@@ -356,6 +356,83 @@ class TestBnb4bitAdapter:
         assert merged == 1
         assert not torch.equal(model.lin.weight.data.data, original_packed)
 
+    def test_public_stochastic_merge_is_reproducible(self) -> None:
+        generator = torch.Generator().manual_seed(123)
+        weight = torch.randn(
+            64,
+            32,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        state_dict = {
+            "lin.lora_A.weight": torch.randn(4, 32, generator=generator),
+            "lin.lora_B.weight": torch.randn(64, 4, generator=generator),
+        }
+
+        def run() -> tuple[torch.Tensor, torch.Tensor]:
+            model = nn.Module()
+            model.lin = nn.Linear(32, 64, bias=False, dtype=torch.bfloat16)
+            model.lin.weight = _make_nf4(
+                rows=64,
+                cols=32,
+                weight=weight.clone(),
+                double_quant=True,
+            )
+            lora = LoRA.from_state_dict(
+                state_dict={key: value.clone() for key, value in state_dict.items()}
+            )
+            assert (
+                merge_lora(
+                    model,
+                    [(lora, 0.125)],
+                    stochastic_rounding=True,
+                )
+                == 1
+            )
+            return (
+                model.lin.weight.data.view(torch.uint8).clone(),
+                model.lin.weight.quant_state.absmax.clone(),
+            )
+
+        first = run()
+        replay = run()
+        assert torch.equal(first[0], replay[0])
+        assert torch.equal(first[1], replay[1])
+
+    @CUDA
+    def test_activation_stochastic_merge_replays_same_bytes(self) -> None:
+        model = nn.Module()
+        model.lin = nn.Linear(32, 64, bias=False, dtype=torch.bfloat16)
+        model.lin.weight = _make_nf4(
+            rows=64,
+            cols=32,
+            double_quant=True,
+        )
+        offloader = _make_model_offloader(model)
+        generator = torch.Generator().manual_seed(321)
+        lora = LoRA.from_state_dict(
+            state_dict={
+                "lin.lora_A.weight": torch.randn(4, 32, generator=generator),
+                "lin.lora_B.weight": torch.randn(64, 4, generator=generator),
+            }
+        )
+
+        samples: list[torch.Tensor] = []
+        for _ in range(2):
+            with activated_model(
+                offloader,
+                "cuda",
+                loras=[lora],
+                lora_strengths=[0.125],
+                lora_mode="merge",
+                stochastic_rounding=True,
+            ) as active:
+                samples.append(
+                    active.lin.weight.data.view(torch.uint8).cpu().clone()
+                )
+
+        assert torch.equal(samples[0], samples[1])
+
     @CUDA
     @pytest.mark.parametrize("quant_type", ["nf4", "fp4"])
     @pytest.mark.parametrize("double_quant", [False, True])
@@ -591,7 +668,9 @@ class TestBnb4bitAdapter:
             fallback_b: torch.Tensor,
             fallback_a: torch.Tensor,
             fallback_strength: float,
-        ) -> torch.Tensor:
+            *,
+            rounding_seed: int | None = None,
+        ) -> torch.Tensor | None:
             nonlocal fallback_called
             fallback_called = True
             return original_fallback(
@@ -599,6 +678,7 @@ class TestBnb4bitAdapter:
                 fallback_b,
                 fallback_a,
                 fallback_strength,
+                rounding_seed=rounding_seed,
             )
 
         monkeypatch.setattr(
@@ -715,7 +795,9 @@ class TestBnb4bitAdapter:
             fallback_b: torch.Tensor,
             fallback_a: torch.Tensor,
             fallback_strength: float,
-        ) -> torch.Tensor:
+            *,
+            rounding_seed: int | None = None,
+        ) -> torch.Tensor | None:
             nonlocal fallback_called
             fallback_called = True
             return original_fallback(
@@ -723,6 +805,7 @@ class TestBnb4bitAdapter:
                 fallback_b,
                 fallback_a,
                 fallback_strength,
+                rounding_seed=rounding_seed,
             )
 
         monkeypatch.setattr(

@@ -166,6 +166,7 @@ from .resource_cache import (
     ResourceTooLargeError,
 )
 from .resource_specs import LoRASpec, ModelSpec, ObjectSpec
+from .seeding import derive_seed
 from .stream_config import StreamConfig
 from .streamed_component import StreamedComponent, StreamedComponentStore
 from .tensor_adapter_registry import register_adapter
@@ -213,6 +214,7 @@ __all__ = [
     "StreamedComponent",
     "StreamedComponentStore",
     "TensorAdapter",
+    "derive_seed",
     "merge_lora",
     "register_adapter",
 ]

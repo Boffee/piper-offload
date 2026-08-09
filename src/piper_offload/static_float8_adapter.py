@@ -48,56 +48,54 @@ except ModuleNotFoundError as exc:
 
 
 def _torch_merge_static_float8_lora(
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
+    target: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge raw static-FP8 storage with ordinary, compilable Torch ops."""
-    dense = (qdata.to(torch.float32) * scale).to(b.dtype)
-    merged = torch.addmm(dense, b, a, alpha=strength)
+    """Merge static FP8 through its ordinary Torch reference path."""
+    dense = dequantize_static_float8_tensor(target)
+    dense.addmm_(b, a, alpha=strength)
 
-    fp8_limit = torch.finfo(qdata.dtype).max
-    output_scale = (merged.abs().amax() / fp8_limit).to(b.dtype).to(torch.float32)
-    output_scale = torch.where(
-        output_scale == 0,
-        torch.full_like(output_scale, torch.finfo(torch.float32).eps),
-        output_scale,
+    requantized = requantize_static_float8_tensor(
+        dense,
+        like=target,
+        rounding_seed=rounding_seed,
     )
-    output_qdata = (
-        (merged.to(torch.float32) / output_scale)
-        .clamp(min=-fp8_limit, max=fp8_limit)
-        .to(qdata.dtype)
-    )
-    return output_qdata, output_scale.reshape_as(scale)
+    source = require_static_float8_tensor(requantized)
+    return source.qdata, source.scale
 
 
 def _merge_static_float8_lora(
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
+    target: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Prefer Triton, falling back to the pure-Torch raw-storage merge."""
+    """Prefer Triton, falling back to the wrapper-based Torch merge."""
+    f8 = require_static_float8_tensor(target)
     if (
-        _triton_merge_static_float8_lora is not None
-        and qdata.device.type == "cuda"
+        rounding_seed is None
+        and _triton_merge_static_float8_lora is not None
+        and f8.qdata.device.type == "cuda"
     ):
         return _triton_merge_static_float8_lora(
-            qdata,
-            scale,
+            f8.qdata,
+            f8.scale,
             b,
             a,
             strength,
         )
     return _torch_merge_static_float8_lora(
-        qdata,
-        scale,
+        target,
         b,
         a,
         strength,
+        rounding_seed=rounding_seed,
     )
 
 
@@ -205,8 +203,17 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
         return dequantize_static_float8_tensor(t)
 
     @staticmethod
-    def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
-        return requantize_static_float8_tensor(t, like=like)
+    def requantize(
+        t: torch.Tensor,
+        *,
+        like: torch.Tensor,
+        rounding_seed: int | None = None,
+    ) -> torch.Tensor:
+        return requantize_static_float8_tensor(
+            t,
+            like=like,
+            rounding_seed=rounding_seed,
+        )
 
     @staticmethod
     def merge_lora_(
@@ -214,16 +221,19 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Run and install the preferred static-FP8 LoRA merge."""
         f8 = require_static_float8_tensor(target)
-        qdata, scale = _merge_static_float8_lora(
-            f8.qdata,
-            f8.scale,
+        merged = _merge_static_float8_lora(
+            target,
             b,
             a,
             strength,
+            rounding_seed=rounding_seed,
         )
+        qdata, scale = merged
         f8.qdata.copy_(qdata)
         f8.scale.copy_(scale)
 
