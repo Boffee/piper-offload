@@ -19,11 +19,22 @@ pip install piper-offload
 ```
 
 Optional integrations are available individually through the `bnb`, `torchao`,
-`gguf`, `quanto`, and `convrot` extras, or together through `all`:
+`gguf`, `quanto`, and `convrot` extras. Triton acceleration is a separate,
+composable extra, while `all` includes every integration plus Triton:
 
 ```bash
 pip install "piper-offload[all]"
 ```
+
+The `triton` extra selects upstream `triton` on Linux and `triton-windows` on
+64-bit Windows. Combine it with any individual quantization extra whose
+optimized kernels you want; without it, those integrations retain their
+portable fallback paths. The `all` extra includes this acceleration runtime.
+The same installed Triton runtime enables Piper Kernels' ConvRot backend when
+`convrot` is also selected. Windows execution requires Windows 10 or 11, a
+supported NVIDIA GPU with a current driver, and the Visual C++ Redistributable
+for Visual Studio 2015-2022; a separate CUDA toolkit or Visual Studio install
+is not required.
 
 ## What's in here
 
@@ -1072,8 +1083,10 @@ rebuilds the `NVFP4Tensor` wrapper around GPU storage on activation.
 The optional extra requires the package's supported TorchAO release; dynamic
 NVFP4 matmul execution still depends on Blackwell-class CUDA hardware and the
 matching PyTorch CUDA stack.
-For uv-managed installs on Linux/Windows, this repo routes `torch` and
-`torchao` through PyTorch's CUDA 13.0 wheel index. Use
+For uv-managed installs, this repo routes `torch` on Linux/Windows and
+`torchao` on Linux through PyTorch's CUDA 13.0 wheel index. Windows uses
+TorchAO's portable PyPI wheel because the CUDA 13.0 index does not publish a
+Windows TorchAO wheel. Use
 `uv sync --extra torchao --group dev` and then
 `pytest tests/test_nvfp4_adapter.py -q -rs` to exercise the optional
 TorchAO NVFP4 coverage.

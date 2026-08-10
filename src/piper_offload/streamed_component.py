@@ -220,7 +220,7 @@ class _MorphingTargetPool:
         if ev is None:
             return
         if stream is not None and not ev.query():
-            stream.wait_event(ev)
+            ev.wait(stream)
 
 
 # ---------------------------------------------------------------------------
@@ -1558,7 +1558,7 @@ class StreamedComponent:
             future.result()
             ev = self._prefetch_events[idx]
             if not ev.query():
-                torch.cuda.current_stream(self._require_active_device()).wait_event(ev)
+                ev.wait(torch.cuda.current_stream(self._require_active_device()))
             self._tracker.mark_on_gpu(idx)
             return
 
