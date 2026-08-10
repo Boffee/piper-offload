@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-09
+
 ### Added
 
 - Add boolean opt-in stochastic rounding for quantized LoRA merges across Quanto, bitsandbytes,
@@ -44,5 +46,6 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - Python 3.14, PyTorch 2.13, TorchAO 0.18, Apache-2.0 licensing, and the Piper Offload package
   identity.
 
-[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Boffee/piper-offload/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Boffee/piper-offload/releases/tag/v0.1.0

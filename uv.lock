@@ -653,6 +653,86 @@ convrot = [
 ]
 
 [[package]]
+name = "piper-offload"
+version = "0.2.0"
+source = { editable = "." }
+dependencies = [
+    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[package.optional-dependencies]
+all = [
+    { name = "bitsandbytes" },
+    { name = "gguf" },
+    { name = "numpy" },
+    { name = "optimum-quanto" },
+    { name = "piper-kernels", extra = ["convrot"] },
+    { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+bnb = [
+    { name = "bitsandbytes" },
+]
+convrot = [
+    { name = "piper-kernels", extra = ["convrot"] },
+    { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+gguf = [
+    { name = "gguf" },
+]
+quanto = [
+    { name = "optimum-quanto" },
+]
+torchao = [
+    { name = "numpy" },
+    { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "piper-offload", extra = ["all"] },
+    { name = "pre-commit" },
+    { name = "pyright" },
+    { name = "pytest" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "bitsandbytes", marker = "extra == 'all'", specifier = ">=0.49,<0.51" },
+    { name = "bitsandbytes", marker = "extra == 'bnb'", specifier = ">=0.49,<0.51" },
+    { name = "gguf", marker = "extra == 'all'", specifier = ">=0.18,<0.20" },
+    { name = "gguf", marker = "extra == 'gguf'", specifier = ">=0.18,<0.20" },
+    { name = "numpy", marker = "extra == 'all'", specifier = ">=2.3.2,<3" },
+    { name = "numpy", marker = "extra == 'torchao'", specifier = ">=2.3.2,<3" },
+    { name = "optimum-quanto", marker = "extra == 'all'", specifier = ">=0.2.7,<0.3" },
+    { name = "optimum-quanto", marker = "extra == 'quanto'", specifier = ">=0.2.7,<0.3" },
+    { name = "piper-kernels", extras = ["convrot"], marker = "extra == 'all'", specifier = ">=0.1.0,<0.2" },
+    { name = "piper-kernels", extras = ["convrot"], marker = "extra == 'convrot'", specifier = ">=0.1.0,<0.2" },
+    { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.13,<2.14" },
+    { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.13,<2.14", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'all') or (sys_platform == 'win32' and extra == 'all')", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'convrot') or (sys_platform == 'win32' and extra == 'convrot')", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'torchao') or (sys_platform == 'win32' and extra == 'torchao')", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'all'", specifier = ">=0.18,<0.19" },
+    { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'convrot'", specifier = ">=0.18,<0.19" },
+    { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'torchao'", specifier = ">=0.18,<0.19" },
+]
+provides-extras = ["bnb", "torchao", "gguf", "quanto", "convrot", "all"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "piper-offload", extras = ["all"] },
+    { name = "pre-commit", specifier = ">=4.6.1" },
+    { name = "pyright", specifier = ">=1.1.411" },
+    { name = "pytest", specifier = "~=9.1" },
+    { name = "ruff", specifier = ">=0.16.1" },
+]
+
+[[package]]
 name = "platformdirs"
 version = "4.11.0"
 source = { registry = "https://pypi.org/simple" }
@@ -902,86 +982,6 @@ wheels = [
     { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.13.0%2Bcu130-cp315-cp315-manylinux_2_28_x86_64.whl", upload-time = "2026-07-08T11:20:00Z" },
     { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.13.0%2Bcu130-cp315-cp315t-manylinux_2_28_aarch64.whl", upload-time = "2026-07-08T11:20:04Z" },
     { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.13.0%2Bcu130-cp315-cp315t-manylinux_2_28_x86_64.whl", upload-time = "2026-07-08T11:20:04Z" },
-]
-
-[[package]]
-name = "piper-offload"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-
-[package.optional-dependencies]
-all = [
-    { name = "bitsandbytes" },
-    { name = "gguf" },
-    { name = "numpy" },
-    { name = "optimum-quanto" },
-    { name = "piper-kernels", extra = ["convrot"] },
-    { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-bnb = [
-    { name = "bitsandbytes" },
-]
-convrot = [
-    { name = "piper-kernels", extra = ["convrot"] },
-    { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-gguf = [
-    { name = "gguf" },
-]
-quanto = [
-    { name = "optimum-quanto" },
-]
-torchao = [
-    { name = "numpy" },
-    { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
-    { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pre-commit" },
-    { name = "pyright" },
-    { name = "pytest" },
-    { name = "ruff" },
-    { name = "piper-offload", extra = ["all"] },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "bitsandbytes", marker = "extra == 'all'", specifier = ">=0.49,<0.51" },
-    { name = "bitsandbytes", marker = "extra == 'bnb'", specifier = ">=0.49,<0.51" },
-    { name = "gguf", marker = "extra == 'all'", specifier = ">=0.18,<0.20" },
-    { name = "gguf", marker = "extra == 'gguf'", specifier = ">=0.18,<0.20" },
-    { name = "numpy", marker = "extra == 'all'", specifier = ">=2.3.2,<3" },
-    { name = "numpy", marker = "extra == 'torchao'", specifier = ">=2.3.2,<3" },
-    { name = "optimum-quanto", marker = "extra == 'all'", specifier = ">=0.2.7,<0.3" },
-    { name = "optimum-quanto", marker = "extra == 'quanto'", specifier = ">=0.2.7,<0.3" },
-    { name = "piper-kernels", extras = ["convrot"], marker = "extra == 'all'", specifier = ">=0.1.0,<0.2" },
-    { name = "piper-kernels", extras = ["convrot"], marker = "extra == 'convrot'", specifier = ">=0.1.0,<0.2" },
-    { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.13,<2.14" },
-    { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.13,<2.14", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'all') or (sys_platform == 'win32' and extra == 'all')", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'convrot') or (sys_platform == 'win32' and extra == 'convrot')", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchao", marker = "(sys_platform == 'linux' and extra == 'torchao') or (sys_platform == 'win32' and extra == 'torchao')", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'all'", specifier = ">=0.18,<0.19" },
-    { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'convrot'", specifier = ">=0.18,<0.19" },
-    { name = "torchao", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'torchao'", specifier = ">=0.18,<0.19" },
-]
-provides-extras = ["bnb", "torchao", "gguf", "quanto", "convrot", "all"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pre-commit", specifier = ">=4.6.1" },
-    { name = "pyright", specifier = ">=1.1.411" },
-    { name = "pytest", specifier = "~=9.1" },
-    { name = "ruff", specifier = ">=0.16.1" },
-    { name = "piper-offload", extras = ["all"] },
 ]
 
 [[package]]
