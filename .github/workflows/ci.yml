@@ -75,7 +75,7 @@ jobs:
           retention-days: 7
 
   validate-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 45
     env:
       CUDA_VISIBLE_DEVICES: ""
@@ -105,6 +105,16 @@ jobs:
           assert any(r.startswith('triton-windows') for r in requires('piper-offload') or ());
           assert version('triton-windows').startswith('3.7.');
           assert triton.__version__.startswith('3.7.')"
+
+      - name: Report Windows runner hardware
+        shell: pwsh
+        run: |
+          Write-Output "ImageOS=$env:ImageOS"
+          Write-Output "ImageVersion=$env:ImageVersion"
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, Manufacturer, NumberOfCores, NumberOfLogicalProcessors |
+            Format-List
+          uv run --no-sync python -c "import platform, torch; print(platform.platform()); print(f'torch={torch.__version__} cuda={torch.version.cuda} available={torch.cuda.is_available()}')"
 
       - name: Test portable backends
         run: uv run --no-sync pytest
