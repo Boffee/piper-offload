@@ -75,7 +75,7 @@ jobs:
           retention-days: 7
 
   validate-windows:
-    runs-on: windows-2022
+    runs-on: windows-latest
     timeout-minutes: 45
     env:
       CUDA_VISIBLE_DEVICES: ""
