@@ -7,9 +7,10 @@ Piper Offload uses Python's PEP 440 version format and `v<version>` Git tags. Th
 
 The package is pre-1.0 while its memory-management and adapter interfaces are being established:
 
-- Patch releases (`0.1.1`) preserve the documented public API and contain fixes or compatible
-  performance improvements.
-- Minor releases (`0.2.0`) may add capabilities or deliberately change a public pre-1.0 contract.
+- Patch releases (`0.1.1`) preserve existing documented behavior and contain fixes,
+  compatible performance improvements, or backward-compatible capabilities.
+- Minor releases (`0.2.0`) may add larger capabilities or deliberately change a public
+  pre-1.0 contract.
 - Release candidates (`0.2.0rc1`) are used when a change needs integration testing before a
   stable release.
 
@@ -24,9 +25,10 @@ internal.
 ## Dependency policy
 
 Piper Offload declares the PyTorch, Python, and optional-backend versions that each release is
-tested against. Patch releases may widen compatible dependency ranges, but raising a minimum or
-dropping a supported dependency line requires at least a minor release while the package is
-pre-1.0.
+tested against. Patch releases may widen compatible dependency ranges or raise an optional
+backend's minimum when needed by a compatible fix or capability. Raising a core Python or
+PyTorch minimum, or dropping a supported platform or dependency line, requires at least a minor
+release while the package is pre-1.0.
 
 ## Release process
 
