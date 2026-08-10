@@ -288,7 +288,7 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
             rounding_seed=rounding_seed,
         )
         mx = require_mx_tensor(target)
-        if rounding_seed is None and _can_use_triton_merge(mx, b, a):
+        if _can_use_triton_merge(mx, b, a):
             assert _triton_merge_mx_lora_ is not None
             scaling_mode = _scaling_mode_id(mx)
             assert scaling_mode is not None
@@ -303,6 +303,7 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
                 strength,
                 scaling_mode=scaling_mode,
                 swizzled=mx.is_swizzled_scales,
+                rounding_seed=rounding_seed,
             )
             return
         _torch_merge_mx_lora_(

@@ -10,6 +10,12 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from ._triton_stochastic_quantization import (
+    _seed_argument,
+    _stochastic_float8,
+    _stochastic_round_to_int,
+)
+
 _AXIS_TENSOR = 0
 _AXIS_ROW = 1
 _AXIS_COLUMN = 2
@@ -102,6 +108,7 @@ def _quantize_qbytes_kernel(
     dense_ptr,
     scale_ptr,
     output_ptr,
+    rounding_seed,
     M,
     N,
     SCALE_AXIS: tl.constexpr,
@@ -109,6 +116,8 @@ def _quantize_qbytes_kernel(
     INTEGER_STORAGE: tl.constexpr,
     QMIN: tl.constexpr,
     QMAX: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
+    E4M3: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     offsets = tl.program_id(axis=0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -124,13 +133,37 @@ def _quantize_qbytes_kernel(
     else:
         scale = tl.load(scale_ptr)
 
-    scaled = merged.to(tl.float32) / scale.to(tl.float32)
+    stochastic_scaled = merged.to(tl.float32) / scale.to(tl.float32)
+    scaled = stochastic_scaled
     if COMPUTE_DTYPE == 0:
         scaled = scaled.to(tl.float16).to(tl.float32)
     elif COMPUTE_DTYPE == 1:
         scaled = scaled.to(tl.bfloat16).to(tl.float32)
     if INTEGER_STORAGE:
-        scaled = libdevice.rint(scaled)
+        deterministic = libdevice.rint(scaled)
+        if STOCHASTIC:
+            scaled = _stochastic_round_to_int(
+                stochastic_scaled,
+                deterministic,
+                rounding_seed,
+                offsets,
+                QMIN,
+                QMAX,
+            )
+        else:
+            scaled = deterministic
+    if STOCHASTIC and not INTEGER_STORAGE:
+        stochastic_scaled = tl.minimum(
+            tl.maximum(stochastic_scaled, QMIN),
+            QMAX,
+        )
+        scaled = _stochastic_float8(
+            stochastic_scaled,
+            rounding_seed,
+            offsets,
+            E4M3,
+            QMAX,
+        )
     quantized = tl.minimum(tl.maximum(scaled, QMIN), QMAX)
     tl.store(output_ptr + offsets, quantized, mask=mask)
 
@@ -195,6 +228,8 @@ def _merge_quanto_qbytes_lora(
     integer_storage: bool,
     qmin: float,
     qmax: float,
+    rounding_seed: int | None,
+    e4m3: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return qbytes data and a fresh absmax scale after one LoRA merge."""
     if qdata.device.type != "cuda":
@@ -263,6 +298,7 @@ def _merge_quanto_qbytes_lora(
         dense,
         output_scale,
         output,
+        _seed_argument(rounding_seed),
         M=rows,
         N=cols,
         SCALE_AXIS=scale_axis,
@@ -270,6 +306,8 @@ def _merge_quanto_qbytes_lora(
         INTEGER_STORAGE=integer_storage,
         QMIN=qmin,
         QMAX=qmax,
+        STOCHASTIC=rounding_seed is not None,
+        E4M3=e4m3,
         BLOCK_SIZE=quant_block,
         num_warps=8,
     )
@@ -283,6 +321,8 @@ def merge_quanto_qint8_lora(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return qint8 storage and its recomputed absmax scale."""
     if qdata.dtype is not torch.int8:
@@ -297,6 +337,8 @@ def merge_quanto_qint8_lora(
         integer_storage=True,
         qmin=-128.0,
         qmax=127.0,
+        rounding_seed=rounding_seed,
+        e4m3=False,
     )
 
 
@@ -307,6 +349,8 @@ def merge_quanto_qfloat8_lora(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return qfloat8 storage and its recomputed absmax scale."""
     if qdata.dtype not in (
@@ -328,4 +372,6 @@ def merge_quanto_qfloat8_lora(
         integer_storage=False,
         qmin=limits.min,
         qmax=limits.max,
+        rounding_seed=rounding_seed,
+        e4m3=qdata.dtype is torch.float8_e4m3fn,
     )

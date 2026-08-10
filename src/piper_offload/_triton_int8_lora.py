@@ -10,6 +10,11 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from ._triton_stochastic_quantization import (
+    _seed_argument,
+    _stochastic_round_to_int,
+)
+
 _COMPUTE_FP16 = 0
 _COMPUTE_BF16 = 1
 _COMPUTE_FP32 = 2
@@ -187,11 +192,13 @@ def _quantize_kernel(
     scale_ptr,
     zero_point_ptr,
     output_ptr,
+    rounding_seed,
     NUMEL,
     BLOCK_NUMEL: tl.constexpr,
     QPARAM_DTYPE: tl.constexpr,
     QUANT_MIN: tl.constexpr,
     QUANT_MAX: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     offsets = tl.program_id(axis=0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -199,6 +206,7 @@ def _quantize_kernel(
     qparam_offsets = offsets // BLOCK_NUMEL
     values = tl.load(dense_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     scale = tl.load(scale_ptr + qparam_offsets, mask=mask, other=1.0).to(tl.float32)
+    stochastic_scaled = values / scale
     inverse_scale = 1.0 / scale
     if QPARAM_DTYPE == 0:
         inverse_scale = inverse_scale.to(tl.float16).to(tl.float32)
@@ -209,13 +217,21 @@ def _quantize_kernel(
         scaled = scaled.to(tl.float16).to(tl.float32)
     elif QPARAM_DTYPE == 1:
         scaled = scaled.to(tl.bfloat16).to(tl.float32)
-    quantized = libdevice.llrint(scaled)
     zero_point = tl.load(
         zero_point_ptr + qparam_offsets,
         mask=mask,
         other=0,
     )
-    quantized += zero_point
+    quantized = libdevice.llrint(scaled) + zero_point
+    if STOCHASTIC:
+        quantized = _stochastic_round_to_int(
+            stochastic_scaled + zero_point,
+            quantized,
+            rounding_seed,
+            offsets,
+            QUANT_MIN,
+            QUANT_MAX,
+        )
     quantized = tl.minimum(tl.maximum(quantized, QUANT_MIN), QUANT_MAX)
     tl.store(output_ptr + offsets, quantized, mask=mask)
 
@@ -259,6 +275,7 @@ def merge_int8_lora(
     *,
     asymmetric: bool,
     reduce_range: bool,
+    rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return raw affine-INT8 buffers after one LoRA merge."""
     if qdata.device.type != "cuda":
@@ -377,11 +394,13 @@ def merge_int8_lora(
         output_scale,
         output_zero_point,
         output_qdata,
+        _seed_argument(rounding_seed),
         NUMEL=qdata.numel(),
         BLOCK_NUMEL=block_numel,
         QPARAM_DTYPE=qparam_dtype,
         QUANT_MIN=quant_min,
         QUANT_MAX=quant_max,
+        STOCHASTIC=rounding_seed is not None,
         BLOCK_SIZE=quant_block,
         num_warps=8,
     )

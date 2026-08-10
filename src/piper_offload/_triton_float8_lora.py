@@ -9,6 +9,11 @@ import torch
 import triton
 import triton.language as tl
 
+from ._triton_stochastic_quantization import (
+    _seed_argument,
+    _stochastic_float8,
+)
+
 _COMPUTE_FP16 = 0
 _COMPUTE_BF16 = 1
 _COMPUTE_FP32 = 2
@@ -108,12 +113,15 @@ def _merge_group_kernel(
     output_qdata_ptr,
     output_scale_ptr,
     strength,
+    rounding_seed,
     M,
     N,
     K: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     FP8_LIMIT: tl.constexpr,
+    E4M3: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -185,6 +193,14 @@ def _merge_group_kernel(
 
     scaled = merged.to(tl.float32) / output_scale[:, None]
     scaled = tl.minimum(tl.maximum(scaled, -FP8_LIMIT), FP8_LIMIT)
+    if STOCHASTIC:
+        scaled = _stochastic_float8(
+            scaled,
+            rounding_seed,
+            offsets,
+            E4M3,
+            FP8_LIMIT,
+        )
     tl.store(output_qdata_ptr + offsets, scaled, mask=mask)
 
 
@@ -260,10 +276,13 @@ def _quantize_kernel(
     dense_ptr,
     scale_ptr,
     output_ptr,
+    rounding_seed,
     NUMEL,
     N,
     PER_ROW: tl.constexpr,
     FP8_LIMIT: tl.constexpr,
+    E4M3: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     offsets = tl.program_id(axis=0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -278,6 +297,14 @@ def _quantize_kernel(
         tl.maximum(scaled, -FP8_LIMIT),
         FP8_LIMIT,
     )
+    if STOCHASTIC:
+        scaled = _stochastic_float8(
+            scaled,
+            rounding_seed,
+            offsets,
+            E4M3,
+            FP8_LIMIT,
+        )
     tl.store(output_ptr + offsets, scaled, mask=mask)
 
 
@@ -365,6 +392,7 @@ def _merge_group_lora(
     rank: int,
     group_size: int,
     compute_dtype: int,
+    rounding_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge and requantize independent row groups without a dense buffer."""
     output_qdata = torch.empty_like(qdata)
@@ -382,12 +410,15 @@ def _merge_group_lora(
         output_qdata,
         output_scale,
         strength,
+        _seed_argument(rounding_seed),
         M=rows,
         N=cols,
         K=rank,
         NUM_GROUPS=num_groups,
         GROUP_SIZE=group_size,
         FP8_LIMIT=torch.finfo(qdata.dtype).max,
+        E4M3=qdata.dtype is torch.float8_e4m3fn,
+        STOCHASTIC=rounding_seed is not None,
         COMPUTE_DTYPE=compute_dtype,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
@@ -459,6 +490,8 @@ def merge_float8_lora(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return raw scaled-FP8 buffers after one supported-layout merge."""
     rows, cols, rank, compute_dtype, per_row, group_size = _validate_inputs(
@@ -486,6 +519,7 @@ def merge_float8_lora(
             rank=rank,
             group_size=group_size,
             compute_dtype=compute_dtype,
+            rounding_seed=rounding_seed,
         )
 
     block_m = 64
@@ -541,10 +575,13 @@ def merge_float8_lora(
         dense,
         output_scale,
         output_qdata,
+        _seed_argument(rounding_seed),
         NUMEL=qdata.numel(),
         N=cols,
         PER_ROW=per_row,
         FP8_LIMIT=fp8_limit,
+        E4M3=qdata.dtype is torch.float8_e4m3fn,
+        STOCHASTIC=rounding_seed is not None,
         BLOCK_SIZE=quant_block,
         num_warps=8,
     )

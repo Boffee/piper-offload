@@ -411,10 +411,7 @@ class QuantoAdapter:
         target_qt = require_qbytes_tensor(target)
         qt = canonicalize_qbytes_tensor(target_qt)
         triton_merge = None
-        if (
-            rounding_seed is None
-            and not is_marlin_f8_qbytes_tensor(target_qt)
-        ):
+        if not is_marlin_f8_qbytes_tensor(target_qt):
             if _is_qint8_layout(qt):
                 triton_merge = _triton_merge_quanto_qint8_lora
             elif _is_qfloat8_layout(qt):
@@ -428,6 +425,7 @@ class QuantoAdapter:
                 b,
                 a,
                 strength,
+                rounding_seed=rounding_seed,
             )
             merged = create_qbytes_tensor(
                 qt.qtype,

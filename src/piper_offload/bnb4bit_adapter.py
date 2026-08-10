@@ -414,7 +414,9 @@ class Bnb4bitAdapter:
     ) -> None:
         """Merge into BNB4 storage, preferring the raw Triton path."""
         qt = require_params_4bit(target)
-        if rounding_seed is None and _can_use_triton_merge(qt, b, a):
+        if _can_use_triton_merge(qt, b, a) and (
+            rounding_seed is None or not qt.quant_state.nested
+        ):
             assert _triton_merge_bnb4_lora is not None
             state = qt.quant_state
             state2 = state.state2 if state.nested else None
@@ -431,6 +433,7 @@ class Bnb4bitAdapter:
                 b,
                 a,
                 strength,
+                rounding_seed=rounding_seed,
             )
             qt.data.view(torch.uint8).reshape(-1).copy_(packed)
             state.absmax.copy_(absmax)

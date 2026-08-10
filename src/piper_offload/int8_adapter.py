@@ -391,7 +391,7 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
         rounding_seed: int | None = None,
     ) -> None:
         """Merge factors already expressed in stored-weight coordinates."""
-        if rounding_seed is None and _triton_int8_layout_supported(qt, b, a):
+        if _triton_int8_layout_supported(qt, b, a):
             assert _triton_merge_int8_lora is not None
             asymmetric = qt.zero_point is not None and bool(qt.zero_point.any())
             qdata, scale, zero_point = _triton_merge_int8_lora(
@@ -404,6 +404,7 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
                 strength,
                 asymmetric=asymmetric,
                 reduce_range=bool(qt.reduce_range),
+                rounding_seed=rounding_seed,
             )
             qt.qdata.copy_(qdata)
             qt.scale.copy_(scale)

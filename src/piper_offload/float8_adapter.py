@@ -256,7 +256,7 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
             rounding_seed=rounding_seed,
         )
         f8 = require_float8_tensor(target)
-        if rounding_seed is None and _is_triton_float8_layout(f8, b, a):
+        if _is_triton_float8_layout(f8, b, a):
             assert _triton_merge_float8_lora is not None
             qdata, scale = _triton_merge_float8_lora(
                 f8.qdata,
@@ -265,6 +265,7 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
                 b,
                 a,
                 strength,
+                rounding_seed=rounding_seed,
             )
             f8.qdata.copy_(qdata)
             f8.scale.copy_(scale)

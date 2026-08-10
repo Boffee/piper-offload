@@ -952,6 +952,7 @@ class TestInt8Adapter:
             *,
             asymmetric: bool,
             reduce_range: bool,
+            rounding_seed: int | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             calls.append((tuple(b.shape), tuple(a.shape), strength))
             return triton_merge(
@@ -964,6 +965,7 @@ class TestInt8Adapter:
                 strength,
                 asymmetric=asymmetric,
                 reduce_range=reduce_range,
+                rounding_seed=rounding_seed,
             )
 
         monkeypatch.setattr(

@@ -26,6 +26,8 @@ Selected by :mod:`tensor_adapter_registry`. Import fails silently if the
 ``gguf`` package is not installed — GGUF support is optional.
 """
 
+from __future__ import annotations
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast

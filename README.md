@@ -411,8 +411,8 @@ offload.activate(
 ```
 
 Sampling is an internal LoRA-merge detail. A scalar seed is derived from the
-full parameter path and that transform's merge count, then used by a local
-generator without consuming PyTorch's global RNG. Reapplying a streamed merge
+full parameter path and that transform's merge count, then used by backend-local
+randomness without consuming PyTorch's global RNG. Reapplying a streamed merge
 therefore uses a fresh deterministic sample each time. DTensor additionally
 derives a seed from each shard's global offsets, while replicated ranks retain
 matching samples. All LoRAs for a target are accumulated and rounded once.
@@ -503,10 +503,15 @@ compute the final data-dependent scales and other quantization parameters,
 then samples only the terminal weight code between the two neighboring values
 on that finalized grid. Exact endpoints and saturation retain the upstream
 code. Exact-zero strengths are discarded before target lookup or factor
-staging. The initial implementation deliberately uses the correctness/reference path;
-fused stochastic Triton kernels are a separate optimization. Piper ConvRot
-INT8 remains deterministic-only until `piper-kernels` exposes a stochastic
-rounding hook; requesting stochastic merge for it fails during preflight.
+staging. Standard CUDA layouts use the same format-specific Triton merge kernels
+for deterministic and stochastic rounding. Random samples are keyed by logical
+element index, so launch geometry does not change the result. The Torch and
+Triton backends replay independently for a fixed seed but do not promise
+byte-identical samples across implementations or Triton versions. Nested
+bitsandbytes 4-bit scales still use the reference path because their final
+effective scale is known only after double quantization. Piper ConvRot INT8
+remains deterministic-only until `piper-kernels` exposes a stochastic rounding
+hook; requesting stochastic merge for it fails during preflight.
 
 This is one composable requantization pipeline per format rather than parallel
 deterministic and stochastic implementations. Each concrete adapter's existing
@@ -968,11 +973,12 @@ dtype, no merge capability required.
 Notes:
 
 - **Stochastic rounding** is supported by every merge-capable built-in
-  quantized adapter in the table except Piper ConvRot INT8. It currently uses
-  each adapter's dequantize/requantize reference path while preserving the
-  same scale, calibration, packing, and wrapper metadata contract. Plain
-  floating-point and DTensor-wrapped dense weights accept the option but have
-  no quantization code to randomize.
+  quantized adapter in the table except Piper ConvRot INT8. Standard CUDA
+  layouts use fused Triton terminal-code selection; unsupported layouts and
+  nested bitsandbytes 4-bit scales retain the dequantize/requantize reference
+  path. Both preserve the same scale, calibration, packing, and wrapper
+  metadata contract. Plain floating-point and DTensor-wrapped dense weights
+  accept the option but have no quantization code to randomize.
 
 - **Merging into a quantized base is lossy** because the updated value is
   re-encoded onto the quantization grid; choosing merge vs routed is the caller's

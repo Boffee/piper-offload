@@ -269,7 +269,7 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
             rounding_seed=rounding_seed,
         )
         nv = require_nvfp4_tensor(target)
-        if rounding_seed is None and _is_triton_nvfp4_layout(nv, b, a):
+        if _is_triton_nvfp4_layout(nv, b, a):
             assert _triton_merge_nvfp4_lora is not None
             qdata, scale, per_tensor_scale = _triton_merge_nvfp4_lora(
                 nv.qdata,
@@ -280,6 +280,7 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
                 b,
                 a,
                 strength,
+                rounding_seed=rounding_seed,
             )
             nv.qdata.copy_(qdata)
             nv.scale.copy_(scale)

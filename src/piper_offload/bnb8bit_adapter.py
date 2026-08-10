@@ -292,7 +292,7 @@ class Bnb8bitAdapter:
     ) -> None:
         """Merge into BNB8 storage, preferring the raw Triton path."""
         qt = require_int8_params(target)
-        if rounding_seed is None and _can_use_triton_merge(qt.CB, qt.SCB, b, a):
+        if _can_use_triton_merge(qt.CB, qt.SCB, b, a):
             assert _triton_merge_bnb8_lora is not None
             merged = _triton_merge_bnb8_lora(
                 qt.CB,
@@ -300,6 +300,7 @@ class Bnb8bitAdapter:
                 b,
                 a,
                 strength,
+                rounding_seed=rounding_seed,
             )
         else:
             merged = _torch_merge_bnb8_lora(

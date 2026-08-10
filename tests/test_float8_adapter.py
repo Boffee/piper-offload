@@ -528,6 +528,8 @@ class TestFloat8Adapter:
             b: torch.Tensor,
             a: torch.Tensor,
             strength: float,
+            *,
+            rounding_seed: int | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             calls.append((tuple(b.shape), tuple(a.shape), strength))
             return triton_merge(
@@ -537,6 +539,7 @@ class TestFloat8Adapter:
                 b,
                 a,
                 strength,
+                rounding_seed=rounding_seed,
             )
 
         def fail_dequantize(_tensor: torch.Tensor) -> torch.Tensor:

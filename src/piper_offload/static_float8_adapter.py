@@ -79,8 +79,7 @@ def _merge_static_float8_lora(
     """Prefer Triton, falling back to the wrapper-based Torch merge."""
     f8 = require_static_float8_tensor(target)
     if (
-        rounding_seed is None
-        and _triton_merge_static_float8_lora is not None
+        _triton_merge_static_float8_lora is not None
         and f8.qdata.device.type == "cuda"
     ):
         return _triton_merge_static_float8_lora(
@@ -89,6 +88,7 @@ def _merge_static_float8_lora(
             b,
             a,
             strength,
+            rounding_seed=rounding_seed,
         )
     return _torch_merge_static_float8_lora(
         target,

@@ -9,6 +9,11 @@ import torch
 import triton
 import triton.language as tl
 
+from ._triton_stochastic_quantization import (
+    _seed_argument,
+    _stochastic_e2m1_code,
+)
+
 _COMPUTE_BF16 = 0
 _COMPUTE_FP32 = 1
 _BLOCK_SIZE = 16
@@ -272,6 +277,7 @@ def _quantize_kernel(
     output_qdata_ptr,
     output_scale_ptr,
     strength,
+    rounding_seed,
     M,
     PACKED_N,
     NUM_SWIZZLE_COL_BLOCKS,
@@ -280,6 +286,7 @@ def _quantize_kernel(
     HAS_GLOBAL_SCALE: tl.constexpr,
     SWIZZLED: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
@@ -337,6 +344,16 @@ def _quantize_kernel(
         normalized = merged_f32 / fp8_scale[:, None]
     normalized = tl.minimum(tl.maximum(normalized, -6.0), 6.0)
     code = _encode_fp4(normalized)
+    if STOCHASTIC:
+        logical_offsets = offsets_m[:, None] * (PACKED_N * 2) + (
+            tl.program_id(axis=1) * 16 + tl.arange(0, 16)
+        )[None, :]
+        code = _stochastic_e2m1_code(
+            normalized,
+            code,
+            rounding_seed,
+            logical_offsets,
+        )
     code_pairs = code.reshape(BLOCK_M, 8, 2)
     shifts = (tl.arange(0, 2) * 4)[None, None, :]
     packed = tl.sum(code_pairs << shifts, axis=2)
@@ -504,6 +521,8 @@ def merge_nvfp4_lora(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Return packed NVFP4 buffers after one raw LoRA merge."""
     rows, cols, rank, compute_dtype = _validate_inputs(
@@ -559,6 +578,7 @@ def merge_nvfp4_lora(
         output_qdata,
         output_scale,
         strength,
+        _seed_argument(rounding_seed),
         M=rows,
         PACKED_N=cols // 2,
         NUM_SWIZZLE_COL_BLOCKS=num_swizzle_col_blocks,
@@ -567,6 +587,7 @@ def merge_nvfp4_lora(
         HAS_GLOBAL_SCALE=per_tensor_scale is not None,
         SWIZZLED=is_swizzled_scales,
         COMPUTE_DTYPE=compute_dtype,
+        STOCHASTIC=rounding_seed is not None,
         BLOCK_M=block_m,
         BLOCK_R=block_r,
         num_warps=4,
