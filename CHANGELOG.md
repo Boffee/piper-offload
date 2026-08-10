@@ -5,6 +5,20 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-10
+
+### Added
+
+- Add a composable `triton` acceleration extra that selects `triton-windows`
+  on Windows and upstream `triton` on Linux. Individual quantization extras and
+  Piper ConvRot remain portable without it, while `all` includes the accelerated
+  backends. Exercise the Windows selection and portable test suite on Windows CI.
+
+### Fixed
+
+- Resolve TorchAO from its portable PyPI wheel on Windows, where PyTorch's CUDA
+  13.0 index does not publish a compatible TorchAO wheel.
+
 ## [0.2.1] - 2026-08-10
 
 ### Added
@@ -53,7 +67,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - Python 3.14, PyTorch 2.13, TorchAO 0.18, Apache-2.0 licensing, and the Piper Offload package
   identity.
 
-[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/Boffee/piper-offload/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Boffee/piper-offload/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Boffee/piper-offload/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Boffee/piper-offload/releases/tag/v0.1.0
