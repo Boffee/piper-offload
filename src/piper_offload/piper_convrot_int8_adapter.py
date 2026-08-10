@@ -5,6 +5,8 @@ Piper Offload owns the movement and merge integration: pin the public ``qdata``
 and ``scale`` storage tensors, move those bytes, reconstruct the wrapper with
 its ``group_size`` and logical ``dtype`` metadata, and delegate staged LoRA
 updates to the public in-place ``ConvRotInt8Tensor.addmm_`` operation.
+When stochastic rounding is requested, Piper Offload forwards its stable
+per-target seed to the kernel-owned terminal INT8 code selection.
 
 The adapter remains frozen-only: it does not advertise CPU round-trip or
 trainable ``Parameter.data`` swap. Permanent and activation-time LoRA merge
@@ -106,7 +108,12 @@ class PiperConvRotInt8Adapter(
             strength,
             rounding_seed=rounding_seed,
         )
-        require_convrot_int8_tensor(target).addmm_(b, a, alpha=strength)
+        require_convrot_int8_tensor(target).addmm_(
+            b,
+            a,
+            alpha=strength,
+            rounding_seed=rounding_seed,
+        )
 
     @staticmethod
     def validate_lora_merge(
@@ -117,9 +124,5 @@ class PiperConvRotInt8Adapter(
         *,
         rounding_seed: int | None = None,
     ) -> None:
+        del rounding_seed
         require_convrot_int8_tensor(target)
-        if rounding_seed is not None:
-            raise ValueError(
-                "Piper ConvRot INT8 does not support stochastic LoRA merge; "
-                "use deterministic or routed LoRA."
-            )

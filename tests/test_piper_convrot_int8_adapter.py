@@ -14,6 +14,7 @@ from piper_offload import (
     ModelOffloader,
     ScaledLoRAFactor,
     StreamConfig,
+    derive_seed,
     merge_lora,
 )
 from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
@@ -293,8 +294,34 @@ class TestPiperConvRotInt8Adapter:
         assert isinstance(model.lin.weight.data, convrot_cls)
         assert not torch.equal(model.lin.weight.data.qdata, original_qdata)
 
-    def test_stochastic_merge_is_rejected_before_mutation(self) -> None:
+    def test_stochastic_merge_forwards_seed_to_piper_addmm(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         convrot_cls = _convrot_cls()
+        rounding_seeds: list[int | None] = []
+        original_addmm = convrot_cls.addmm_
+
+        def recording_addmm(
+            target: torch.Tensor,
+            mat1: torch.Tensor,
+            mat2: torch.Tensor,
+            *,
+            beta: float = 1,
+            alpha: float = 1,
+            rounding_seed: int | None = None,
+        ) -> torch.Tensor:
+            rounding_seeds.append(rounding_seed)
+            return original_addmm(
+                target,
+                mat1,
+                mat2,
+                beta=beta,
+                alpha=alpha,
+                rounding_seed=rounding_seed,
+            )
+
+        monkeypatch.setattr(convrot_cls, "addmm_", recording_addmm)
         model = nn.Module()
         model.lin = nn.Linear(64, 8, bias=False, dtype=torch.bfloat16)
         model.lin.weight = nn.Parameter(
@@ -304,8 +331,6 @@ class TestPiperConvRotInt8Adapter:
             ),
             requires_grad=False,
         )
-        qdata_before = model.lin.weight.data.qdata.clone()
-        scale_before = model.lin.weight.data.scale.clone()
         lora = LoRA.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.ones(4, 64),
@@ -313,48 +338,64 @@ class TestPiperConvRotInt8Adapter:
             }
         )
 
-        with pytest.raises(ValueError, match="does not support stochastic"):
-            merge_lora(
-                model,
-                [(lora, 1.0)],
-                stochastic_rounding=True,
-            )
+        merged = merge_lora(
+            model,
+            [(lora, 1.0)],
+            stochastic_rounding=True,
+        )
 
-        assert torch.equal(model.lin.weight.data.qdata, qdata_before)
-        assert torch.equal(model.lin.weight.data.scale, scale_before)
+        assert merged == 1
+        assert rounding_seeds == [derive_seed("lin.weight", 0)]
 
-    def test_stochastic_preflight_checks_all_targets_before_mutation(self) -> None:
+    def test_stochastic_merge_replays(self) -> None:
         convrot_cls = _convrot_cls()
-        model = nn.Module()
-        model.dense = nn.Linear(64, 8, bias=False, dtype=torch.bfloat16)
-        model.convrot = nn.Linear(64, 8, bias=False, dtype=torch.bfloat16)
-        model.convrot.weight = nn.Parameter(
-            convrot_cls.from_hp(
-                torch.zeros(8, 64, dtype=torch.bfloat16),
-                group_size=64,
-            ),
-            requires_grad=False,
+        generator = torch.Generator().manual_seed(123)
+        weight = torch.randn(
+            8,
+            64,
+            dtype=torch.bfloat16,
+            generator=generator,
         )
-        dense_before = model.dense.weight.detach().clone()
-        convrot_before = model.convrot.weight.data.qdata.clone()
-        lora = LoRA.from_state_dict(
-            state_dict={
-                "dense.lora_A.weight": torch.ones(4, 64),
-                "dense.lora_B.weight": torch.ones(8, 4),
-                "convrot.lora_A.weight": torch.ones(4, 64),
-                "convrot.lora_B.weight": torch.ones(8, 4),
-            }
-        )
+        state_dict = {
+            "lin.lora_A.weight": torch.randn(8, 64, generator=generator),
+            "lin.lora_B.weight": torch.randn(8, 8, generator=generator),
+        }
 
-        with pytest.raises(ValueError, match="does not support stochastic"):
-            merge_lora(
-                model,
-                [(lora, 1.0)],
-                stochastic_rounding=True,
+        def run() -> tuple[torch.Tensor, torch.Tensor]:
+            model = nn.Module()
+            model.lin = nn.Linear(
+                64,
+                8,
+                bias=False,
+                dtype=torch.bfloat16,
+            )
+            model.lin.weight = nn.Parameter(
+                convrot_cls.from_hp(weight.clone(), group_size=64),
+                requires_grad=False,
+            )
+            lora = LoRA.from_state_dict(
+                state_dict={
+                    key: value.clone()
+                    for key, value in state_dict.items()
+                }
+            )
+            assert (
+                merge_lora(
+                    model,
+                    [(lora, 0.125)],
+                    stochastic_rounding=True,
+                )
+                == 1
+            )
+            return (
+                model.lin.weight.data.qdata.clone(),
+                model.lin.weight.data.scale.clone(),
             )
 
-        torch.testing.assert_close(model.dense.weight, dense_before)
-        assert torch.equal(model.convrot.weight.data.qdata, convrot_before)
+        first = run()
+        replay = run()
+        assert torch.equal(first[0], replay[0])
+        assert torch.equal(first[1], replay[1])
 
     def test_advertises_merge_but_not_training_capabilities(self) -> None:
         adapter = PiperConvRotInt8Adapter()
@@ -514,7 +555,7 @@ class TestPiperConvRotInt8Adapter:
             offloader.deactivate()
 
     @CUDA
-    def test_activation_stochastic_merge_rejects_and_releases_lock(
+    def test_activation_stochastic_merge_replays_and_releases_lock(
         self,
     ) -> None:
         convrot_cls = _convrot_cls()
@@ -545,19 +586,27 @@ class TestPiperConvRotInt8Adapter:
         )
         offloader = ModelOffloader.from_module(model, blocks_attr=["blocks"])
 
-        with pytest.raises(ValueError, match="does not support stochastic"):
+        samples: list[torch.Tensor] = []
+        for _ in range(2):
             with activated_model(
                 offloader,
                 "cuda",
                 loras=[lora],
                 stochastic_rounding=True,
-            ):
-                pass
+            ) as active:
+                samples.append(
+                    active.blocks[0].weight.data.qdata.cpu().clone()
+                )
+                output = active(
+                    torch.randn(
+                        2,
+                        64,
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                    )
+                )
+                assert output.shape == (2, 64)
 
+        assert torch.equal(samples[0], samples[1])
         assert offloader.active_device is None
         assert offloader._lora_hook_removers == []
-        with activated_model(offloader, "cuda") as active:
-            output = active(
-                torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
-            )
-            assert output.shape == (2, 64)

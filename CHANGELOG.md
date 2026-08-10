@@ -5,6 +5,11 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Forward Piper Offload's reproducible per-target stochastic-rounding seed to
+  Piper ConvRot INT8 `addmm_` LoRA merges.
+
 ## [0.2.0] - 2026-08-09
 
 ### Added

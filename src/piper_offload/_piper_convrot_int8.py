@@ -3,7 +3,8 @@
 ``piper-kernels`` owns the :class:`ConvRotInt8Tensor` representation and its
 linear and in-place ``addmm_`` execution backends. Piper Offload uses the
 public wrapper constructor and storage fields to preserve the representation
-during movement; its adapter delegates LoRA merges to the public ``addmm_``.
+during movement; its adapter delegates LoRA merges, including optional
+stochastic rounding, to the public ``addmm_``.
 
 The dependency remains optional: importing :mod:`piper_offload` succeeds when
 ``piper-kernels`` (or its ``convrot`` extra) is absent.

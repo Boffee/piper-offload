@@ -30,7 +30,7 @@ torchao = ["numpy>=2.3.2,<3", "torchao>=0.18,<0.19"]
 gguf = ["gguf>=0.18,<0.20"]
 quanto = ["optimum-quanto>=0.2.7,<0.3"]
 convrot = [
-    "piper-kernels[convrot]>=0.1.0,<0.2",
+    "piper-kernels[convrot]>=0.2.0,<0.3",
     "torchao>=0.18,<0.19",
 ]
 all = [
@@ -38,7 +38,7 @@ all = [
     "gguf>=0.18,<0.20",
     "numpy>=2.3.2,<3",
     "optimum-quanto>=0.2.7,<0.3",
-    "piper-kernels[convrot]>=0.1.0,<0.2",
+    "piper-kernels[convrot]>=0.2.0,<0.3",
     "torchao>=0.18,<0.19",
 ]
 

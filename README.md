@@ -510,8 +510,7 @@ Triton backends replay independently for a fixed seed but do not promise
 byte-identical samples across implementations or Triton versions. Nested
 bitsandbytes 4-bit scales still use the reference path because their final
 effective scale is known only after double quantization. Piper ConvRot INT8
-remains deterministic-only until `piper-kernels` exposes a stochastic rounding
-hook; requesting stochastic merge for it fails during preflight.
+forwards the derived seed to `piper-kernels`' public `addmm_`.
 
 This is one composable requantization pipeline per format rather than parallel
 deterministic and stochastic implementations. Each concrete adapter's existing
@@ -967,14 +966,14 @@ dtype, no merge capability required.
 | TorchAO NVFP4 | ✓ | blockwise Triton merge on CUDA; dequant / requant fallback † |
 | GGUF (k-quants) | ✓ | — routed only |
 | TorchAO INT4 tile-packed | ✓ | — routed only |
-| Piper ConvRot INT8 | ✓ | Piper in-place `addmm_` (Triton on supported CUDA; deterministic only) |
+| Piper ConvRot INT8 | ✓ | Piper in-place `addmm_` (Triton on supported CUDA; deterministic or stochastic) |
 | DTensor (tensor-parallel shard) | ✓ | shard-local delegation to the inner adapter ‡ |
 
 Notes:
 
 - **Stochastic rounding** is supported by every merge-capable built-in
-  quantized adapter in the table except Piper ConvRot INT8. Standard CUDA
-  layouts use fused Triton terminal-code selection; unsupported layouts and
+  quantized adapter in the table. Standard CUDA layouts use fused Triton
+  terminal-code selection; unsupported layouts and
   nested bitsandbytes 4-bit scales retain the dequantize/requantize reference
   path. Both preserve the same scale, calibration, packing, and wrapper
   metadata contract. Plain floating-point and DTensor-wrapped dense weights
@@ -1052,10 +1051,11 @@ float32 per-output `scale`, preserves `group_size` and the logical floating
 
 The adapter remains frozen-only: it does not expose CPU round-trip or
 trainable `Parameter.data` swap. Merge-mode LoRA delegates the staged low-rank
-update to Piper's public in-place `ConvRotInt8Tensor.addmm_`, preserving the
-wrapper and its storage identities. Piper uses its optimized Triton backend on
-supported CUDA devices and its portable reference backend elsewhere. Use
-routed LoRA when the base must remain untouched. The base package remains
+update and optional reproducible stochastic-rounding seed to Piper's public
+in-place `ConvRotInt8Tensor.addmm_`, preserving the wrapper and its storage
+identities. Piper uses its optimized Triton backend on supported CUDA devices
+and its portable reference backend elsewhere. Use routed LoRA when the base
+must remain untouched. The base package remains
 importable without `piper-kernels`; use
 `uv sync --extra convrot --group dev` and then
 `pytest tests/test_piper_convrot_int8_adapter.py -q -rs` to exercise the
