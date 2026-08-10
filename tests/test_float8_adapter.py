@@ -528,6 +528,8 @@ class TestFloat8Adapter:
             b: torch.Tensor,
             a: torch.Tensor,
             strength: float,
+            *,
+            rounding_seed: int | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             calls.append((tuple(b.shape), tuple(a.shape), strength))
             return triton_merge(
@@ -537,6 +539,7 @@ class TestFloat8Adapter:
                 b,
                 a,
                 strength,
+                rounding_seed=rounding_seed,
             )
 
         def fail_dequantize(_tensor: torch.Tensor) -> torch.Tensor:
@@ -640,10 +643,18 @@ class TestFloat8Adapter:
             staged_b: torch.Tensor,
             staged_a: torch.Tensor,
             strength: float,
+            *,
+            rounding_seed: int | None = None,
         ) -> None:
             nonlocal fallback_calls
             fallback_calls += 1
-            original_fallback(target, staged_b, staged_a, strength)
+            original_fallback(
+                target,
+                staged_b,
+                staged_a,
+                strength,
+                rounding_seed=rounding_seed,
+            )
 
         monkeypatch.setattr(
             float8_adapter_module,

@@ -207,7 +207,11 @@ class ModelOffloader:
                 "ModelOffloader.activate() does not accept the same LoRA "
                 "instance more than once"
             )
-        return list(zip(lora_list, strength_list, strict=True))
+        return [
+            (lora, strength)
+            for lora, strength in zip(lora_list, strength_list, strict=True)
+            if strength != 0.0
+        ]
 
     def _require_managed_target(self, target_key: str) -> str:
         """Validate that ``target_key`` names a parameter this offloader
@@ -242,6 +246,8 @@ class ModelOffloader:
         self,
         active_device: torch.device,
         targets: _LoraParamMap,
+        *,
+        stochastic_rounding: bool = False,
     ) -> None:
         if active_device.type != "cuda":
             raise ValueError(
@@ -251,7 +257,11 @@ class ModelOffloader:
             )
 
         for param_name, factors in targets.items():
-            transform = LoRATransform(factors)
+            transform = LoRATransform(
+                factors,
+                stochastic_rounding=stochastic_rounding,
+                target_key=param_name,
+            )
             remove_hook = self._register_post_copy_hook(
                 param_name,
                 transform.apply,
@@ -347,13 +357,16 @@ class ModelOffloader:
         loras: Sequence[LoRA] = (),
         lora_strengths: Sequence[float] | None = None,
         lora_mode: LoRAMode = "merge",
+        stochastic_rounding: bool = False,
         **kwargs: object,
     ) -> None:
         """Make the owned model usable on ``device``.
 
         ``loras`` and their optional ``lora_strengths`` apply only to this
-        activation. ``lora_mode`` selects in-place merge hooks or routed
-        residual hooks. Because the offloader owns one model runtime, a
+        activation. Exact-zero strengths are inactive and install no hooks.
+        ``lora_mode`` selects in-place merge hooks or routed residual hooks.
+        ``stochastic_rounding`` optionally enables stochastic requantization
+        for merge mode. Because the offloader owns one model runtime, a
         second activation before :meth:`deactivate` raises
         :class:`ModelRuntimeInUseError` immediately.
         """
@@ -380,7 +393,11 @@ class ModelOffloader:
             if active_loras:
                 targets = self._group_lora_factors_by_param_name(active_loras)
                 if lora_mode == "merge":
-                    self._register_merge_lora_hooks(active_device, targets)
+                    self._register_merge_lora_hooks(
+                        active_device,
+                        targets,
+                        stochastic_rounding=stochastic_rounding,
+                    )
                 else:
                     self._register_routed_lora_hooks(targets)
             # The composite self-cleans its components if activation fails midway.

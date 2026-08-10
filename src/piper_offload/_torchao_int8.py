@@ -21,7 +21,11 @@ from typing import Any
 
 import torch
 
-from ._torchao_granularity import granularity_from_block_size
+from ._stochastic_quantization import _stochastic_round_to_int
+from ._torchao_granularity import (
+    expand_block_parameter,
+    granularity_from_block_size,
+)
 
 LAYOUT_ATTRS = (
     "qdata",
@@ -116,6 +120,7 @@ def requantize_int8_tensor(
     t: torch.Tensor,
     *,
     like: torch.Tensor,
+    rounding_seed: int | None = None,
 ) -> torch.Tensor:
     """Encode dense ``t`` using the int8 layout and metadata from ``like``.
 
@@ -136,6 +141,9 @@ def requantize_int8_tensor(
     all-zero tensor) and for ordinary asymmetric weights; it would only
     misread an asymmetric weight whose zero points happen to all be zero —
     a case TorchAO's stock configs do not produce.
+
+    When ``rounding_seed`` is supplied, scales and zero points are finalized by
+    this ordinary path before only the terminal INT8 codes are replaced.
     """
     qt = require_int8_tensor(like)
     if tuple(t.shape) != tuple(qt.shape):
@@ -150,7 +158,7 @@ def requantize_int8_tensor(
         tuple(qt.shape),
         label="Int8Tensor",
     )
-    return Int8Tensor.from_hp(
+    out = Int8Tensor.from_hp(
         t.to(dtype=qt.dtype),
         granularity,
         mapping_type,
@@ -160,3 +168,46 @@ def requantize_int8_tensor(
         act_pre_scale=qt.act_pre_scale,
         reduce_range=qt.reduce_range,
     )
+    if rounding_seed is not None:
+        _stochastic_recode_int8_(t, target=out, rounding_seed=rounding_seed)
+    return out
+
+
+def _stochastic_recode_int8_(
+    t: torch.Tensor,
+    *,
+    target: torch.Tensor,
+    rounding_seed: int,
+) -> None:
+    """Replace only finalized TorchAO INT8 terminal codes in place."""
+    out = require_int8_tensor(target)
+    shape = tuple(out.shape)
+    block_size = tuple(out.block_size)
+    scale = expand_block_parameter(
+        out.scale,
+        block_size=block_size,
+        shape=shape,
+    )
+    if out.zero_point is None:
+        zero_point = torch.zeros_like(scale)
+    else:
+        zero_point = expand_block_parameter(
+            out.zero_point,
+            block_size=block_size,
+            shape=shape,
+        )
+    valid_scale = torch.isfinite(scale) & (scale > 0)
+    scaled = torch.where(
+        valid_scale,
+        t.to(torch.float32) / scale.to(torch.float32) + zero_point.to(torch.float32),
+        torch.zeros_like(t, dtype=torch.float32),
+    )
+    quant_min, quant_max = (-64, 63) if out.reduce_range else (-128, 127)
+    qdata = _stochastic_round_to_int(
+        scaled,
+        seed=rounding_seed,
+        quant_min=quant_min,
+        quant_max=quant_max,
+        deterministic=out.qdata,
+    ).to(torch.int8)
+    out.qdata.copy_(torch.where(valid_scale, qdata, out.qdata))

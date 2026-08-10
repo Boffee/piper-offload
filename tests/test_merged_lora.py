@@ -577,6 +577,38 @@ class TestActivationLoraValidation:
             (lora, 0.25),
         ]
 
+    @pytest.mark.parametrize("zero", [0.0, -0.0])
+    def test_zero_strengths_are_inactive(self, zero: float) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        inactive = _make_lora(4, 16, seed=1)
+        active = _make_lora(4, 16, seed=2)
+
+        assert s._normalize_loras(
+            [inactive, active],
+            lora_strengths=[zero, 0.25],
+        ) == [(active, 0.25)]
+
+    def test_zero_strength_merge_activation_installs_no_hooks(self) -> None:
+        m = _make_bf16_model().to(torch.float32)
+        s = _make_strategy(m)
+        lora = _make_lora(4, 16)
+        x = torch.randn(2, 16)
+        expected = m(x)
+
+        s.activate(
+            "cpu",
+            loras=[lora],
+            lora_strengths=[0.0],
+            lora_mode="merge",
+            stochastic_rounding=True,
+        )
+        try:
+            assert s._lora_hook_removers == []
+            torch.testing.assert_close(m(x), expected)
+        finally:
+            s.deactivate()
+
     def test_rejects_lora_strength_length_mismatch(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
@@ -608,6 +640,20 @@ class TestActivationLoraValidation:
             s.activate("cpu", lora_mode="invalid")  # type: ignore[arg-type]
 
         with activated_model(s, "cpu") as active:
+            assert active is m
+
+    def test_routed_mode_ignores_stochastic_rounding(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        lora = _make_lora(4, 16)
+
+        with activated_model(
+            s,
+            "cpu",
+            loras=[lora],
+            lora_mode="routed",
+            stochastic_rounding=True,
+        ) as active:
             assert active is m
 
     def test_target_shape_mismatch_is_deferred_until_apply(self) -> None:
@@ -1097,6 +1143,16 @@ class TestMergeCorrectness:
 
 
 class TestLoRATransform:
+    def test_stochastic_rounding_requires_target_key(self) -> None:
+        factor = ScaledLoRAFactor.from_tensors(
+            torch.randn(2, 8),
+            torch.randn(4, 2),
+            0.5,
+        )
+
+        with pytest.raises(ValueError, match="non-empty target_key"):
+            LoRATransform([factor], stochastic_rounding=True)
+
     def test_validate_target_accepts_regular_tensor_without_mutation(self) -> None:
         param = nn.Parameter(torch.randn(4, 8), requires_grad=False)
         before = param.detach().clone()
@@ -1162,10 +1218,18 @@ class TestLoRATransform:
             b: torch.Tensor,
             a: torch.Tensor,
             strength: float,
+            *,
+            rounding_seed: int | None = None,
         ) -> None:
             nonlocal merge_calls
             merge_calls += 1
-            original(target, b, a, strength)
+            original(
+                target,
+                b,
+                a,
+                strength,
+                rounding_seed=rounding_seed,
+            )
 
         monkeypatch.setattr(
             RegularAdapter,
@@ -1320,6 +1384,8 @@ class TestLoRATransform:
             staged_b: torch.Tensor,
             staged_a: torch.Tensor,
             strength: float,
+            *,
+            rounding_seed: int | None = None,
         ) -> None:
             merge_calls.append(
                 (
@@ -1329,7 +1395,13 @@ class TestLoRATransform:
                     strength,
                 )
             )
-            original_merge(target, staged_b, staged_a, strength)
+            original_merge(
+                target,
+                staged_b,
+                staged_a,
+                strength,
+                rounding_seed=rounding_seed,
+            )
 
         monkeypatch.setattr(
             QuantoAdapter,
@@ -1443,10 +1515,18 @@ class TestLoRATransform:
             staged_b: torch.Tensor,
             staged_a: torch.Tensor,
             strength: float,
-        ) -> torch.Tensor:
+            *,
+            rounding_seed: int | None = None,
+        ) -> torch.Tensor | None:
             nonlocal generic_calls
             generic_calls += 1
-            return original_generic(target, staged_b, staged_a, strength)
+            return original_generic(
+                target,
+                staged_b,
+                staged_a,
+                strength,
+                rounding_seed=rounding_seed,
+            )
 
         monkeypatch.setattr(
             quanto_adapter_impl,
@@ -1628,10 +1708,18 @@ class TestLoRATransform:
             b: torch.Tensor,
             a: torch.Tensor,
             strength: float,
-        ) -> torch.Tensor:
+            *,
+            rounding_seed: int | None = None,
+        ) -> torch.Tensor | None:
             nonlocal generic_calls
             generic_calls += 1
-            return original_generic(target, b, a, strength)
+            return original_generic(
+                target,
+                b,
+                a,
+                strength,
+                rounding_seed=rounding_seed,
+            )
 
         monkeypatch.setattr(
             quanto_adapter_impl,
@@ -2335,6 +2423,28 @@ class TestLoRATransform:
 
 
 class TestPermanentMerge:
+    @pytest.mark.parametrize("zero", [0.0, -0.0])
+    def test_zero_strength_is_absent(self, zero: float) -> None:
+        m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
+        before = {
+            name: param.detach().clone()
+            for name, param in m.named_parameters()
+        }
+        # Inactive LoRAs do not even require their target names to exist.
+        lora = _make_lora(
+            num_blocks=2,
+            dim=16,
+            prefix="missing.",
+        )
+
+        assert merge_lora(
+            m,
+            [(lora, zero)],
+            stochastic_rounding=True,
+        ) == 0
+        for name, param in m.named_parameters():
+            assert torch.equal(param, before[name])
+
     def test_can_share_lora_with_an_active_routed_use(self) -> None:
         m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
         routed_model = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
@@ -3571,6 +3681,77 @@ class TestLoRAResource:
             expected = _expected_routed_output(model, x, [(expected_lora, 1.0)])
             assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-5)
         assert factory_calls["lora"] == 1
+
+    def test_model_cache_forwards_stochastic_rounding(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cache = ModelCache(10**9)
+        model_spec = ModelSpec(
+            key="model:rounding-forward",
+            estimated_cache_bytes=10**6,
+            factory=lambda: _make_bf16_model(num_blocks=2, dim=8),
+        )
+        captured: list[bool] = []
+        original_activate = ModelOffloader.activate
+
+        def tracked_activate(
+            offloader: ModelOffloader,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            captured.append(bool(kwargs.get("stochastic_rounding")))
+            original_activate(offloader, *args, **kwargs)
+
+        monkeypatch.setattr(ModelOffloader, "activate", tracked_activate)
+        with cache.use(
+            model_spec,
+            device="cpu",
+            stochastic_rounding=True,
+        ):
+            pass
+
+        assert captured == [True]
+
+    @pytest.mark.parametrize("zero", [0.0, -0.0])
+    def test_model_cache_does_not_lease_zero_strength_lora(
+        self,
+        zero: float,
+    ) -> None:
+        factory_calls = {"lora": 0, "model": 0}
+
+        def lora_factory() -> dict[str, torch.Tensor]:
+            factory_calls["lora"] += 1
+            return _make_lora_sd(num_blocks=2, dim=8, rank=2)
+
+        def model_factory() -> nn.Module:
+            factory_calls["model"] += 1
+            return _make_bf16_model(num_blocks=2, dim=8).to(torch.float32)
+
+        cache = ModelCache(10**9)
+        lora_spec = LoRASpec(
+            key="lora:inactive",
+            estimated_cache_bytes=1000,
+            factory=lora_factory,
+        )
+        model_spec = ModelSpec(
+            key="model:zero-strength",
+            estimated_cache_bytes=10**6,
+            factory=model_factory,
+        )
+
+        with cache.use(
+            model_spec,
+            device="cpu",
+            lora_specs=[lora_spec],
+            lora_strengths=[zero],
+            lora_mode="merge",
+        ) as model:
+            assert model(torch.randn(2, 8)).shape == (2, 8)
+
+        assert factory_calls == {"lora": 0, "model": 1}
+        with pytest.raises(ResourceNotRegisteredError):
+            cache.info("lora:inactive")
 
     def test_cached_lora_can_overlap_across_model_runtimes(self) -> None:
         cache = ModelCache(10**9)

@@ -73,12 +73,18 @@ def _torch_merge_bnb8_lora(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge through the ordinary dequantize/addmm/requantize path."""
     dense = dequantize_int8_params(target)
     dense.addmm_(b, a, alpha=strength)
     merged = require_int8_params(
-        requantize_int8_params(dense, like=target)
+        requantize_int8_params(
+            dense,
+            like=target,
+            rounding_seed=rounding_seed,
+        )
     )
     return merged.CB, merged.SCB
 
@@ -267,8 +273,13 @@ class Bnb8bitAdapter:
         return dequantize_int8_params(t)
 
     @staticmethod
-    def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
-        return requantize_int8_params(t, like=like)
+    def requantize(
+        t: torch.Tensor,
+        *,
+        like: torch.Tensor,
+        rounding_seed: int | None = None,
+    ) -> torch.Tensor:
+        return requantize_int8_params(t, like=like, rounding_seed=rounding_seed)
 
     @staticmethod
     def merge_lora_(
@@ -276,25 +287,30 @@ class Bnb8bitAdapter:
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Merge into BNB8 storage, preferring the raw Triton path."""
         qt = require_int8_params(target)
         if _can_use_triton_merge(qt.CB, qt.SCB, b, a):
             assert _triton_merge_bnb8_lora is not None
-            cb, scb = _triton_merge_bnb8_lora(
+            merged = _triton_merge_bnb8_lora(
                 qt.CB,
                 qt.SCB,
                 b,
                 a,
                 strength,
+                rounding_seed=rounding_seed,
             )
         else:
-            cb, scb = _torch_merge_bnb8_lora(
+            merged = _torch_merge_bnb8_lora(
                 target,
                 b,
                 a,
                 strength,
+                rounding_seed=rounding_seed,
             )
+        cb, scb = merged
         qt.CB.copy_(cb)
         qt.SCB.copy_(scb)
 

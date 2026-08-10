@@ -37,13 +37,16 @@ class ModelCache(ResourceCache):
         lora_specs: Sequence[LoRASpec] = (),
         lora_strengths: Sequence[float] | None = None,
         lora_mode: LoRAMode = "merge",
+        stochastic_rounding: bool = False,
         stream_config: StreamConfig | None = None,
     ) -> Iterator[M]:
         """Lease dependencies and activate a cached model runtime.
 
         ``lora_strengths`` defaults to one for each LoRA and, when supplied,
         must have the same length as ``lora_specs``. A LoRA resource key may
-        appear only once in a use.
+        appear only once in a use. Exact-zero strengths are inactive and their
+        LoRA resources are not leased. ``stochastic_rounding`` is forwarded
+        to the model activation's merge path.
         """
         specs = tuple(lora_specs)
         strengths = None if lora_strengths is None else tuple(lora_strengths)
@@ -56,6 +59,18 @@ class ModelCache(ResourceCache):
                 "lora_specs must not contain the same LoRA resource key more than once"
             )
 
+        # A zero-strength LoRA is absent from this activation. Filter it
+        # before leasing so its factory, cache admission, and host backing are
+        # never needed merely to produce a no-op.
+        if strengths is not None:
+            active = tuple(
+                (spec, strength)
+                for spec, strength in zip(specs, strengths, strict=True)
+                if strength != 0.0
+            )
+            specs = tuple(spec for spec, _strength in active)
+            strengths = tuple(strength for _spec, strength in active)
+
         # Dependencies are leased first, so admitting the model cannot evict a
         # LoRA selected for this same runtime.
         with self.lease_many((*specs, model)) as resources:
@@ -67,6 +82,7 @@ class ModelCache(ResourceCache):
                 loras=loras,
                 lora_strengths=strengths,
                 lora_mode=lora_mode,
+                stochastic_rounding=stochastic_rounding,
                 stream_config=config,
             )
             try:

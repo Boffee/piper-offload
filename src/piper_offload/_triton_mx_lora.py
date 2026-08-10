@@ -9,6 +9,12 @@ import torch
 import triton
 import triton.language as tl
 
+from ._triton_stochastic_quantization import (
+    _seed_argument,
+    _stochastic_e2m1_code,
+    _stochastic_float8,
+)
+
 _COMPUTE_BF16 = 0
 _COMPUTE_FP32 = 1
 _FORMAT_E4M3 = 0
@@ -160,6 +166,7 @@ def _merge_mx_kernel(
     b_ptr,
     a_ptr,
     strength,
+    rounding_seed,
     M,
     N,
     NUM_SCALE_BLOCKS,
@@ -171,6 +178,7 @@ def _merge_mx_kernel(
     TARGET_MAX_POW2: tl.constexpr,
     MAX_POS: tl.constexpr,
     MBITS: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -255,6 +263,14 @@ def _merge_mx_kernel(
     )
     if FORMAT == 2:
         codes = _encode_fp4(normalized)
+        if STOCHASTIC:
+            logical_offsets = offsets_m[:, None] * N + offsets_n[None, :]
+            codes = _stochastic_e2m1_code(
+                normalized,
+                codes,
+                rounding_seed,
+                logical_offsets,
+            )
         low, high = tl.split(codes.reshape(BLOCK_M, 16, 2))
         packed = low | (high << 4)
         tl.store(
@@ -263,6 +279,15 @@ def _merge_mx_kernel(
             mask=row_mask[:, None],
         )
     else:
+        if STOCHASTIC:
+            logical_offsets = offsets_m[:, None] * N + offsets_n[None, :]
+            normalized = _stochastic_float8(
+                normalized,
+                rounding_seed,
+                logical_offsets,
+                FORMAT == 0,
+                MAX_POS,
+            )
         tl.store(
             qdata_ptr + qdata_offsets,
             normalized,
@@ -317,6 +342,7 @@ def merge_mx_lora_(
     *,
     scaling_mode: int,
     swizzled: bool,
+    rounding_seed: int | None = None,
 ) -> None:
     """Merge one staged LoRA update directly into raw MX storage."""
     if qdata.device.type != "cuda":
@@ -380,6 +406,7 @@ def merge_mx_lora_(
         b,
         a,
         strength,
+        _seed_argument(rounding_seed),
         M=rows,
         N=cols,
         NUM_SCALE_BLOCKS=cols // _MX_BLOCK_SIZE,
@@ -391,6 +418,7 @@ def merge_mx_lora_(
         TARGET_MAX_POW2=target_max_pow2,
         MAX_POS=max_pos,
         MBITS=mbits,
+        STOCHASTIC=rounding_seed is not None,
         BLOCK_M=block_m,
         BLOCK_K=block_k,
         num_warps=4,

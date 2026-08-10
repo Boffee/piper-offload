@@ -244,7 +244,10 @@ class TestDTensorAdapter:
                 b: torch.Tensor,
                 a: torch.Tensor,
                 _strength: float,
+                *,
+                rounding_seed: int | None = None,
             ) -> None:
+                del rounding_seed
                 calls.append((b, a))
 
         local = torch.empty(3, 4, device="cuda")
@@ -674,6 +677,8 @@ class TestDTensorAdapter:
             packed_b: torch.Tensor,
             packed_a: torch.Tensor,
             packed_strength: float,
+            *,
+            rounding_seed: int | None = None,
         ) -> None:
             prepared_targets.append(target)
             assert torch.isfinite(packed_a).all()
@@ -686,6 +691,7 @@ class TestDTensorAdapter:
                 packed_b,
                 packed_a,
                 packed_strength,
+                rounding_seed=rounding_seed,
             )
 
         monkeypatch.setattr(
@@ -758,9 +764,17 @@ class TestDTensorAdapter:
             b: torch.Tensor,
             a: torch.Tensor,
             strength: float,
+            *,
+            rounding_seed: int | None = None,
         ) -> None:
             calls.append((type(target), tuple(b.shape), tuple(a.shape)))
-            original_merge(target, b, a, strength)
+            original_merge(
+                target,
+                b,
+                a,
+                strength,
+                rounding_seed=rounding_seed,
+            )
 
         monkeypatch.setattr(
             Float8Adapter,

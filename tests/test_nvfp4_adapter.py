@@ -509,6 +509,8 @@ class TestNvfp4Adapter:
             b: torch.Tensor,
             a: torch.Tensor,
             strength: float,
+            *,
+            rounding_seed: int | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
             calls.append((tuple(b.shape), tuple(a.shape), strength))
             return triton_merge(
@@ -520,6 +522,7 @@ class TestNvfp4Adapter:
                 b,
                 a,
                 strength,
+                rounding_seed=rounding_seed,
             )
 
         def fail_dequantize(_tensor: torch.Tensor) -> torch.Tensor:

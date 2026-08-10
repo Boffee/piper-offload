@@ -121,11 +121,17 @@ def _torch_merge_quanto_lora(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> torch.Tensor:
     """Merge through the ordinary dequantize/addmm/requantize path."""
     dense = dequantize_qbytes_tensor(target)
     dense.addmm_(b, a, alpha=strength)
-    return requantize_qbytes_tensor(dense, like=target)
+    return requantize_qbytes_tensor(
+        dense,
+        like=target,
+        rounding_seed=rounding_seed,
+    )
 
 
 def _is_qint8_layout(qt: Any) -> bool:  # noqa: ANN401
@@ -347,8 +353,13 @@ class QuantoAdapter:
         return dequantize_qbytes_tensor(t)
 
     @staticmethod
-    def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
-        return requantize_qbytes_tensor(t, like=like)
+    def requantize(
+        t: torch.Tensor,
+        *,
+        like: torch.Tensor,
+        rounding_seed: int | None = None,
+    ) -> torch.Tensor:
+        return requantize_qbytes_tensor(t, like=like, rounding_seed=rounding_seed)
 
     @staticmethod
     def validate_lora_merge(
@@ -356,8 +367,11 @@ class QuantoAdapter:
         _b: torch.Tensor,
         a: torch.Tensor,
         _strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Validate canonicalization and absmax-requantization layout."""
+        del rounding_seed
         qt = canonicalize_qbytes_tensor(target)
         if qt._data.ndim != 2 or tuple(qt._data.shape) != tuple(qt.size()):
             raise ValueError(
@@ -381,16 +395,19 @@ class QuantoAdapter:
             )
         if a.shape[0] == 0:
             raise ValueError("Quanto LoRA merge requires a positive LoRA rank.")
-
     @staticmethod
     def merge_lora_(
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Merge with Triton when possible, except for packed Marlin targets."""
-        QuantoAdapter.validate_lora_merge(target, b, a, strength)
+        QuantoAdapter.validate_lora_merge(
+            target, b, a, strength, rounding_seed=rounding_seed
+        )
         target_qt = require_qbytes_tensor(target)
         qt = canonicalize_qbytes_tensor(target_qt)
         triton_merge = None
@@ -408,6 +425,7 @@ class QuantoAdapter:
                 b,
                 a,
                 strength,
+                rounding_seed=rounding_seed,
             )
             merged = create_qbytes_tensor(
                 qt.qtype,
@@ -421,9 +439,14 @@ class QuantoAdapter:
             copy_qbytes_tensor_(merged, target_qt)
             return
 
-        merged = require_qbytes_tensor(
-            _torch_merge_quanto_lora(qt, b, a, strength)
+        merged = _torch_merge_quanto_lora(
+            qt,
+            b,
+            a,
+            strength,
+            rounding_seed=rounding_seed,
         )
+        merged = require_qbytes_tensor(merged)
         copy_qbytes_tensor_(merged, target_qt)
 
     @staticmethod

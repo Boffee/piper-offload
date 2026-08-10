@@ -693,6 +693,8 @@ class TestInt8Adapter:
             packed_b: torch.Tensor,
             packed_a: torch.Tensor,
             packed_strength: float,
+            *,
+            rounding_seed: int | None = None,
         ) -> None:
             prepared_a.append(packed_a.detach().clone())
             original_prepared_merge(
@@ -700,6 +702,7 @@ class TestInt8Adapter:
                 packed_b,
                 packed_a,
                 packed_strength,
+                rounding_seed=rounding_seed,
             )
 
         monkeypatch.setattr(
@@ -949,6 +952,7 @@ class TestInt8Adapter:
             *,
             asymmetric: bool,
             reduce_range: bool,
+            rounding_seed: int | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             calls.append((tuple(b.shape), tuple(a.shape), strength))
             return triton_merge(
@@ -961,6 +965,7 @@ class TestInt8Adapter:
                 strength,
                 asymmetric=asymmetric,
                 reduce_range=reduce_range,
+                rounding_seed=rounding_seed,
             )
 
         monkeypatch.setattr(

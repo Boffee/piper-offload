@@ -38,37 +38,55 @@ class _MergeOp:
     group: _MergeParamGroup
     target_key: str
     factors: list[ScaledLoRAFactor]
+    stochastic_rounding: bool
 
     @property
     def transform(self) -> LoRATransform:
-        return LoRATransform(self.factors)
+        return LoRATransform(
+            self.factors,
+            stochastic_rounding=self.stochastic_rounding,
+            target_key=self.target_key,
+        )
 
 
 def merge_lora(
     model: nn.Module,
     loras: Sequence[tuple[LoRA, float]],
+    *,
+    stochastic_rounding: bool = False,
 ) -> int:
     """Merge one or more LoRAs into model parameters in-place.
 
-    Returns the number of unique parameters that were modified. Merge reads
+    Returns the number of unique parameters that were modified. Exact-zero
+    strengths are inactive and do not create merge operations. Merge reads
     immutable host factor backing, so the same LoRA may also serve other
-    merge or routed uses. All target names and merge capabilities are
-    validated before any parameter is modified.
+    merge or routed uses. All active target names and merge capabilities are
+    validated before any parameter is modified. ``stochastic_rounding=True``
+    enables terminal-code sampling where the adapter supports it.
     """
     if len({id(lora) for lora, _strength in loras}) != len(loras):
-        raise ValueError(
-            "merge_lora() does not accept the same LoRA instance more than once"
-        )
+        raise ValueError("merge_lora() does not accept the same LoRA instance more than once")
 
     for lora, _strength in loras:
         if not isinstance(lora, LoRA):
             raise TypeError("merge_lora() expects LoRA instances")
-    return _merge_loras(model, loras)
+
+    # Validate the request structure above before treating exact-zero
+    # contributors as absent. Filtering here avoids target lookup, staging,
+    # validation, and requantization for work that cannot modify a parameter.
+    active_loras = [(lora, strength) for lora, strength in loras if strength != 0.0]
+    return _merge_loras(
+        model,
+        active_loras,
+        stochastic_rounding=stochastic_rounding,
+    )
 
 
 def _merge_loras(
     model: nn.Module,
     loras: Sequence[tuple[LoRA, float]],
+    *,
+    stochastic_rounding: bool,
 ) -> int:
     params_by_target = _collect_params_by_target(model)
 
@@ -97,7 +115,7 @@ def _merge_loras(
             )
             op = merge_ops_by_tensor_id.get(group.tensor_id)
             if op is None:
-                op = _MergeOp(group, target_key, [])
+                op = _MergeOp(group, target_key, [], stochastic_rounding)
                 merge_ops_by_tensor_id[group.tensor_id] = op
             elif op.target_key != target_key:
                 raise ValueError(

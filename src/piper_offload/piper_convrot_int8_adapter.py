@@ -96,5 +96,30 @@ class PiperConvRotInt8Adapter(
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
+        PiperConvRotInt8Adapter.validate_lora_merge(
+            target,
+            b,
+            a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
         require_convrot_int8_tensor(target).addmm_(b, a, alpha=strength)
+
+    @staticmethod
+    def validate_lora_merge(
+        target: torch.Tensor,
+        _b: torch.Tensor,
+        _a: torch.Tensor,
+        _strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        require_convrot_int8_tensor(target)
+        if rounding_seed is not None:
+            raise ValueError(
+                "Piper ConvRot INT8 does not support stochastic LoRA merge; "
+                "use deterministic or routed LoRA."
+            )

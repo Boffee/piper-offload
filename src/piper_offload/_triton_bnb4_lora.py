@@ -9,6 +9,12 @@ import torch
 import triton
 import triton.language as tl
 
+from ._triton_stochastic_quantization import (
+    _random,
+    _seed_argument,
+    _stochastic_sorted_code,
+)
+
 _COMPUTE_FP16 = 0
 _COMPUTE_BF16 = 1
 _COMPUTE_FP32 = 2
@@ -70,6 +76,91 @@ def _nearest_fp4_code(values):
 
 
 @triton.jit
+def _fp4_level_value(level):
+    """Decode one ordered magnitude level from bitsandbytes FP4."""
+    return tl.where(
+        level == 0,
+        0.0,
+        tl.where(
+            level == 1,
+            0.0052083334885537624,
+            tl.where(
+                level == 2,
+                0.1666666716337204,
+                tl.where(
+                    level == 3,
+                    0.25,
+                    tl.where(
+                        level == 4,
+                        0.3333333432674408,
+                        tl.where(
+                            level == 5,
+                            0.5,
+                            tl.where(level == 6, 0.6666666865348816, 1.0),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+@triton.jit
+def _fp4_storage_to_level(code):
+    """Map bitsandbytes' shuffled magnitude code to its ordered level."""
+    code &= 7
+    return tl.where(
+        code < 2,
+        code,
+        tl.where(
+            code == 6,
+            2,
+            tl.where(
+                code == 7,
+                3,
+                tl.where(
+                    code == 4,
+                    4,
+                    tl.where(
+                        code == 5,
+                        5,
+                        tl.where(code == 2, 6, 7),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+@triton.jit
+def _stochastic_fp4_code(values, deterministic, seed, offsets):
+    """Select adjacent entries from bitsandbytes' fixed FP4 codebook."""
+    magnitude = tl.abs(values.to(tl.float32))
+    nearest_level = _fp4_storage_to_level(deterministic.to(tl.int32))
+    nearest = _fp4_level_value(nearest_level)
+    rounded_down = nearest > magnitude
+    lower_level = tl.where(rounded_down, nearest_level - 1, nearest_level)
+    upper_level = tl.where(rounded_down, nearest_level, nearest_level + 1)
+    lower = _fp4_level_value(lower_level)
+    upper = _fp4_level_value(upper_level)
+    probability = tl.where(upper > lower, (magnitude - lower) / (upper - lower), 0.0)
+    level = tl.where(_random(seed, offsets) < probability, upper_level, lower_level)
+    positive_code = tl.where(
+        level < 2,
+        level,
+        tl.where(
+            level < 4,
+            level + 4,
+            tl.where(level < 6, level, level - 4),
+        ),
+    )
+    sign = tl.where((values < 0.0) & (level != 0), 8, 0)
+    chosen = positive_code + sign
+    interior = (magnitude > 0.0) & (magnitude < 1.0) & (probability > 0.0)
+    return tl.where(interior, chosen, deterministic)
+
+
+@triton.jit
 def _merge_quantize_kernel(
     packed_ptr,
     absmax_ptr,
@@ -82,12 +173,14 @@ def _merge_quantize_kernel(
     output_absmax_ptr,
     output_packed_ptr,
     strength,
+    rounding_seed,
     M,
     N,
     K: tl.constexpr,
     QUANT_TYPE: tl.constexpr,
     NESTED: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     QUANT_BLOCK: tl.constexpr,
@@ -178,8 +271,27 @@ def _merge_quantize_kernel(
             15,
             4,
         )
+        if STOCHASTIC:
+            logical_offsets = offsets_m[:, None] * N + offsets_n[None, :]
+            output_codes = _stochastic_sorted_code(
+                normalized,
+                output_codes,
+                code_ptr,
+                rounding_seed,
+                logical_offsets,
+                15,
+                4,
+            )
     else:
         output_codes = _nearest_fp4_code(normalized)
+        if STOCHASTIC:
+            logical_offsets = offsets_m[:, None] * N + offsets_n[None, :]
+            output_codes = _stochastic_fp4_code(
+                normalized,
+                output_codes,
+                rounding_seed,
+                logical_offsets,
+            )
 
     high, low = tl.split(
         output_codes.reshape(
@@ -332,6 +444,8 @@ def merge_bnb4_lora(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -406,6 +520,12 @@ def merge_bnb4_lora(
     elif absmax.dtype is not torch.float32:
         raise ValueError("Non-nested BNB4 merge expects float32 absmax values.")
 
+    if nested and rounding_seed is not None:
+        raise ValueError(
+            "Triton BNB4 stochastic merge does not support nested scales because "
+            "their final effective values are unavailable during terminal-code selection."
+        )
+
     packed = packed.contiguous()
     absmax = absmax.contiguous()
     code = code.contiguous()
@@ -443,12 +563,14 @@ def merge_bnb4_lora(
         raw_absmax,
         output_packed,
         strength,
+        _seed_argument(rounding_seed),
         M=rows,
         N=cols,
         K=rank,
         QUANT_TYPE=quant_type_id,
         NESTED=nested,
         COMPUTE_DTYPE=compute_dtype,
+        STOCHASTIC=rounding_seed is not None,
         BLOCK_M=block_m,
         BLOCK_K=block_k,
         QUANT_BLOCK=_QUANT_BLOCK,

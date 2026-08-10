@@ -39,6 +39,7 @@ pip install "piper-offload[all]"
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
 | `lora.py` | `LoRA`, `LoRATransform` — cached host-backed factors plus merge and routed application hooks |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights |
+| `seeding.py` | `derive_seed()` — canonical stable unsigned 64-bit seed derivation from typed identity parts |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, Piper ConvRot INT8, DTensor, and TorchAO dynamic/static scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
 | `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `piper_convrot_int8_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `static_float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / Piper ConvRot / torchao / DTensor support |
@@ -396,6 +397,38 @@ finally:
     offload.deactivate()
 ```
 
+Quantized merge uses deterministic rounding by default. Opt into stochastic
+rounding with a boolean:
+
+```python
+offload.activate(
+    device,
+    loras=[lora_a],
+    lora_strengths=[0.8],
+    lora_mode="merge",
+    stochastic_rounding=True,
+)
+```
+
+Sampling is an internal LoRA-merge detail. A scalar seed is derived from the
+full parameter path and that transform's merge count, then used by backend-local
+randomness without consuming PyTorch's global RNG. Reapplying a streamed merge
+therefore uses a fresh deterministic sample each time. DTensor additionally
+derives a seed from each shard's global offsets, while replicated ranks retain
+matching samples. All LoRAs for a target are accumulated and rounded once.
+Dense targets still use their exact `addmm_` update. Routed mode ignores the
+option because it never requantizes the base.
+
+`derive_seed(*parts)` is the public canonical derivation utility used by this
+path. It accepts strings and unsigned 64-bit integers and is useful when an
+external adapter needs a deterministic sub-seed:
+
+```python
+from piper_offload import derive_seed
+
+local_seed = derive_seed(parent_seed, shard_offset)
+```
+
 LoRA factors use pinned storage by default. To retain existing anonymous
 pageable or mmap/file-backed CPU tensors without copying them, use strict
 adoption:
@@ -450,6 +483,7 @@ from piper_offload import merge_lora, LoRA
 merge_lora(
     model,
     [(LoRA.from_state_dict(state_dict=load_file("lora.safetensors")), 0.8)],
+    stochastic_rounding=True,  # optional
 )
 ```
 
@@ -463,6 +497,30 @@ raise, and all target names, factor shapes, and advertised merge
 capabilities are preflighted before mutation. Multiple LoRAs for one
 quantized parameter are packed into one staged low-rank update and the
 weight is re-encoded once.
+
+For stochastic merge, each adapter first uses its existing upstream recipe to
+compute the final data-dependent scales and other quantization parameters,
+then samples only the terminal weight code between the two neighboring values
+on that finalized grid. Exact endpoints and saturation retain the upstream
+code. Exact-zero strengths are discarded before target lookup or factor
+staging. Standard CUDA layouts use the same format-specific Triton merge kernels
+for deterministic and stochastic rounding. Random samples are keyed by logical
+element index, so launch geometry does not change the result. The Torch and
+Triton backends replay independently for a fixed seed but do not promise
+byte-identical samples across implementations or Triton versions. Nested
+bitsandbytes 4-bit scales still use the reference path because their final
+effective scale is known only after double quantization. Piper ConvRot INT8
+remains deterministic-only until `piper-kernels` exposes a stochastic rounding
+hook; requesting stochastic merge for it fails during preflight.
+
+This is one composable requantization pipeline per format rather than parallel
+deterministic and stochastic implementations. Each concrete adapter's existing
+`requantize(t, like=..., rounding_seed=None)` first constructs its normal
+finalized representation; when `rounding_seed` is supplied, it then recodes
+only terminal weight data against those stored parameters. Omitting the keyword
+preserves the original deterministic bytes. The public structural conversion
+protocol retains its deterministic minimum signature for downstream static
+compatibility.
 
 ### Heterogeneous block lists
 
@@ -627,9 +685,11 @@ The model cache leases LoRA resources before admitting the model resource. An
 adapter selected for a use therefore cannot be evicted by that same model admission.
 All leases unwind in reverse order if construction or activation
 fails. `lora_strengths` defaults to `1.0` per LoRA; when supplied, it must
-have the same length as `lora_specs`. Merge and routed uses may share one
-cached LoRA across model runtimes because each runtime owns its own hooks and
-temporary device copies.
+have the same length as `lora_specs`. Exact `0.0` and `-0.0` strengths are
+inactive: they are filtered before target grouping or hook installation, and
+`ModelCache` does not construct or lease their LoRA resources. Merge and routed
+uses may share one cached LoRA across model runtimes because each runtime owns
+its own hooks and temporary device copies.
 
 For direct resource access, use a cache lease:
 
@@ -760,6 +820,11 @@ Adapters whose merge supports only certain layouts or staged factor values can
 also implement `LoRAMergeValidationTensorAdapter.validate_lora_merge`. Permanent
 merge stages and validates every requested operation through this hook before
 mutating any weight; DTensor delegates validation to its local-shard adapter.
+The merge and validation protocols include an optional
+`rounding_seed: int | None = None` keyword. Downstream adapters should accept
+that keyword even when they only implement deterministic rounding; omitting it
+or passing `None` preserves deterministic behavior. An adapter that needs a
+reproducible substream can derive one with the public `derive_seed()` utility.
 
 Downstream tensor subclasses can provide their adapter without adding a
 format-specific dependency to piper-offload:
@@ -902,10 +967,18 @@ dtype, no merge capability required.
 | TorchAO NVFP4 | ✓ | blockwise Triton merge on CUDA; dequant / requant fallback † |
 | GGUF (k-quants) | ✓ | — routed only |
 | TorchAO INT4 tile-packed | ✓ | — routed only |
-| Piper ConvRot INT8 | ✓ | Piper in-place `addmm_` (Triton on supported CUDA) |
+| Piper ConvRot INT8 | ✓ | Piper in-place `addmm_` (Triton on supported CUDA; deterministic only) |
 | DTensor (tensor-parallel shard) | ✓ | shard-local delegation to the inner adapter ‡ |
 
 Notes:
+
+- **Stochastic rounding** is supported by every merge-capable built-in
+  quantized adapter in the table except Piper ConvRot INT8. Standard CUDA
+  layouts use fused Triton terminal-code selection; unsupported layouts and
+  nested bitsandbytes 4-bit scales retain the dequantize/requantize reference
+  path. Both preserve the same scale, calibration, packing, and wrapper
+  metadata contract. Plain floating-point and DTensor-wrapped dense weights
+  accept the option but have no quantization code to randomize.
 
 - **Merging into a quantized base is lossy** because the updated value is
   re-encoded onto the quantization grid; choosing merge vs routed is the caller's

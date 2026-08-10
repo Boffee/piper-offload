@@ -23,7 +23,11 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from ._torchao_granularity import granularity_from_block_size
+from ._stochastic_quantization import _stochastic_cast_float8
+from ._torchao_granularity import (
+    expand_block_parameter,
+    granularity_from_block_size,
+)
 
 LAYOUT_ATTRS = (
     "qdata",
@@ -262,13 +266,18 @@ def dequantize_static_float8_tensor(t: torch.Tensor) -> torch.Tensor:
 
 
 def requantize_static_float8_tensor(
-    t: torch.Tensor, *, like: torch.Tensor
+    t: torch.Tensor,
+    *,
+    like: torch.Tensor,
+    rounding_seed: int | None = None,
 ) -> torch.Tensor:
     """Re-encode weight values while preserving activation calibration.
 
     The weight scale is intentionally recomputed because a LoRA merge can
     increase the weight range.  ``act_quant_scale`` is weight-independent
     calibration state, so it is attached unchanged to the new wrapper.
+    When ``rounding_seed`` is supplied, the normal representation is finalized
+    first and then only its terminal FP8 codes are replaced stochastically.
     """
     f8 = require_static_float8_tensor(like)
     if tuple(t.shape) != tuple(f8.shape):
@@ -291,7 +300,38 @@ def requantize_static_float8_tensor(
         act_quant_kwargs=f8.act_quant_kwargs,
         act_quant_scale=f8.act_quant_scale.to(device=t.device),
     )
-    return _repair_zero_scale_blocks(out)
+    out = _repair_zero_scale_blocks(out)
+    if rounding_seed is not None:
+        _stochastic_recode_static_float8_(t, target=out, rounding_seed=rounding_seed)
+    return out
+
+
+def _stochastic_recode_static_float8_(
+    t: torch.Tensor,
+    *,
+    target: torch.Tensor,
+    rounding_seed: int,
+) -> None:
+    """Replace only finalized static-FP8 terminal codes in place."""
+    out = require_static_float8_tensor(target)
+    expanded_scale = expand_block_parameter(
+        out.scale,
+        block_size=tuple(out.block_size),
+        shape=tuple(out.shape),
+    )
+    valid_scale = torch.isfinite(expanded_scale) & (expanded_scale > 0)
+    scaled = torch.where(
+        valid_scale,
+        t.to(torch.float32) / expanded_scale.to(torch.float32),
+        torch.zeros_like(t, dtype=torch.float32),
+    )
+    qdata = _stochastic_cast_float8(
+        scaled,
+        out.qdata.dtype,
+        seed=rounding_seed,
+        deterministic=out.qdata,
+    )
+    out.qdata.copy_(torch.where(valid_scale, qdata, out.qdata))
 
 
 def _repair_zero_scale_blocks(f8: Any) -> torch.Tensor:  # noqa: ANN401

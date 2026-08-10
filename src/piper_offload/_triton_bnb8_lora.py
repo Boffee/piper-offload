@@ -10,6 +10,11 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from ._triton_stochastic_quantization import (
+    _seed_argument,
+    _stochastic_round_to_int,
+)
+
 
 @triton.jit
 def _merge_dense_kernel(
@@ -97,8 +102,10 @@ def _quantize_kernel(
     dense_ptr,
     scb_ptr,
     output_cb_ptr,
+    rounding_seed,
     M,
     N,
+    STOCHASTIC: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -122,6 +129,15 @@ def _quantize_kernel(
     scaled = dense / safe_scb[:, None] * 127.0
     scaled = tl.where(scb[:, None] == 0.0, 0.0, scaled)
     quantized = libdevice.rint(scaled)
+    if STOCHASTIC:
+        quantized = _stochastic_round_to_int(
+            scaled,
+            quantized,
+            rounding_seed,
+            offsets,
+            -127,
+            127,
+        )
     quantized = tl.minimum(tl.maximum(quantized, -127.0), 127.0)
     tl.store(output_cb_ptr + offsets, quantized, mask=mask)
 
@@ -132,6 +148,8 @@ def merge_bnb8_lora(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return raw ``CB`` and ``SCB`` buffers after one LoRA merge."""
     if cb.device.type != "cuda":
@@ -213,8 +231,10 @@ def merge_bnb8_lora(
         dense,
         output_scb,
         output_cb,
+        _seed_argument(rounding_seed),
         M=rows,
         N=cols,
+        STOCHASTIC=rounding_seed is not None,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         num_warps=4,

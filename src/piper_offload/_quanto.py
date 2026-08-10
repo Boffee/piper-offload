@@ -23,6 +23,11 @@ from typing import Any
 
 import torch
 
+from ._stochastic_quantization import (
+    _stochastic_cast_float8,
+    _stochastic_round_to_int,
+)
+
 LAYOUT_ATTRS = ("_data", "_scale", "qtype", "axis")
 """Attributes this repo reads from a ``WeightQBytesTensor``.
 
@@ -231,7 +236,10 @@ def dequantize_qbytes_tensor(qt: torch.Tensor) -> torch.Tensor:
 
 
 def requantize_qbytes_tensor(
-    t: torch.Tensor, *, like: torch.Tensor,
+    t: torch.Tensor,
+    *,
+    like: torch.Tensor,
+    rounding_seed: int | None = None,
 ) -> torch.Tensor:
     """Encode dense ``t`` using ``like``'s Quanto quantization recipe.
 
@@ -240,6 +248,8 @@ def requantize_qbytes_tensor(
     preserving the reference qtype, axis, scale dtype/shape, stride, and
     activation qtype. Exact-zero blocks receive a small positive scale so
     their zero qbytes dequantize finitely instead of taking a ``0 / 0`` path.
+    When ``rounding_seed`` is supplied, finalize that ordinary representation first
+    and then stochastically replace only its terminal qbytes.
     """
     qbytes = canonicalize_qbytes_tensor(like)
     if tuple(t.shape) != tuple(qbytes.size()):
@@ -248,12 +258,58 @@ def requantize_qbytes_tensor(
             f"WeightQBytesTensor with shape {tuple(qbytes.size())}."
         )
     scale = _absmax_scale(t, reference=qbytes)
-    return create_qbytes_tensor(
-        qbytes.qtype, qbytes.axis, qbytes.size(), qbytes.stride(),
+    out = create_qbytes_tensor(
+        qbytes.qtype,
+        qbytes.axis,
+        qbytes.size(),
+        qbytes.stride(),
         _quantize_to_qbytes(t, qbytes, scale),
         scale,
         qbytes_activation_qtype(qbytes),
     )
+    if rounding_seed is not None:
+        _stochastic_recode_qbytes_(t, target=out, rounding_seed=rounding_seed)
+    return out
+
+
+def _stochastic_recode_qbytes_(
+    t: torch.Tensor,
+    *,
+    target: torch.Tensor,
+    rounding_seed: int,
+) -> None:
+    """Replace only finalized Quanto terminal codes in place."""
+    qbytes = require_qbytes_tensor(target)
+    scale = qbytes._scale
+    broadcast_scale = _broadcast_scale(
+        scale,
+        axis=qbytes.axis,
+        ndim=t.dim(),
+    )
+    valid_scale = torch.isfinite(broadcast_scale) & (broadcast_scale > 0)
+    scaled = torch.where(
+        valid_scale,
+        t.to(torch.float32) / broadcast_scale.to(torch.float32),
+        torch.zeros_like(t, dtype=torch.float32),
+    )
+    storage_dtype = qbytes._data.dtype
+    if storage_dtype.is_floating_point:
+        qdata = _stochastic_cast_float8(
+            scaled,
+            storage_dtype,
+            seed=rounding_seed,
+            deterministic=qbytes._data,
+        )
+    else:
+        limits = torch.iinfo(storage_dtype)
+        qdata = _stochastic_round_to_int(
+            scaled,
+            seed=rounding_seed,
+            quant_min=limits.min,
+            quant_max=limits.max,
+            deterministic=qbytes._data,
+        ).to(storage_dtype)
+    qbytes._data.copy_(torch.where(valid_scale, qdata, qbytes._data))
 
 
 def _validate_absmax_reference(

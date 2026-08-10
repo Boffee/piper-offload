@@ -141,11 +141,17 @@ def _torch_merge_mx_lora_(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> None:
     """Apply the established wrapper-based MX merge in place."""
     dense = dequantize_mx_tensor(target)
     dense.addmm_(b, a, alpha=strength)
-    requantized = requantize_mx_tensor(dense, like=target)
+    requantized = requantize_mx_tensor(
+        dense,
+        like=target,
+        rounding_seed=rounding_seed,
+    )
     copy_storage_into(
         MxAdapter._storage_of(require_mx_tensor(requantized)),
         MxAdapter._storage_of(require_mx_tensor(target)),
@@ -236,8 +242,13 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
         return dequantize_mx_tensor(t)
 
     @staticmethod
-    def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
-        return requantize_mx_tensor(t, like=like)
+    def requantize(
+        t: torch.Tensor,
+        *,
+        like: torch.Tensor,
+        rounding_seed: int | None = None,
+    ) -> torch.Tensor:
+        return requantize_mx_tensor(t, like=like, rounding_seed=rounding_seed)
 
     @staticmethod
     def validate_lora_merge(
@@ -245,8 +256,11 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
         _b: torch.Tensor,
         _a: torch.Tensor,
         _strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Reject layouts the standard MX re-encode cannot refill."""
+        del rounding_seed
         mx = require_mx_tensor(target)
         if not mx.qdata.is_contiguous():
             raise ValueError(
@@ -262,9 +276,17 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Merge a staged LoRA update while preserving target storage."""
-        MxAdapter.validate_lora_merge(target, b, a, strength)
+        MxAdapter.validate_lora_merge(
+            target,
+            b,
+            a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
         mx = require_mx_tensor(target)
         if _can_use_triton_merge(mx, b, a):
             assert _triton_merge_mx_lora_ is not None
@@ -281,9 +303,16 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
                 strength,
                 scaling_mode=scaling_mode,
                 swizzled=mx.is_swizzled_scales,
+                rounding_seed=rounding_seed,
             )
             return
-        _torch_merge_mx_lora_(target, b, a, strength)
+        _torch_merge_mx_lora_(
+            target,
+            b,
+            a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:

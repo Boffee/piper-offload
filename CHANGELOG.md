@@ -5,6 +5,20 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add boolean opt-in stochastic rounding for quantized LoRA merges across Quanto, bitsandbytes,
+  TorchAO FP8/INT8/MX/NVFP4, and DTensor-composed weights. Automatic per-target, per-merge seed
+  selection remains internal to LoRA merge; deterministic rounding remains the default and Piper ConvRot
+  INT8 reports stochastic merge as unsupported. Each quantized adapter composes both modes
+  through its existing requantization method: deterministic representation construction followed
+  by optional stochastic terminal-code recoding. Standard CUDA layouts perform that terminal
+  selection in their existing Triton kernels; nested bitsandbytes 4-bit scales retain the reference path.
+- Add public `derive_seed(*parts)` as the canonical stable unsigned 64-bit seed derivation
+  utility for Piper Offload and downstream adapters.
+- Treat exact-zero LoRA strengths as inactive before target lookup, factor staging, hook
+  installation, or cache leasing.
+
 ### Fixed
 
 - Recompute data-dependent Quanto qint8/qfloat8 weight scales after LoRA merges in both

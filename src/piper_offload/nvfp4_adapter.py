@@ -121,11 +121,17 @@ def _torch_merge_nvfp4_lora_(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> None:
     """Apply the established wrapper-based NVFP4 merge in place."""
     dense = dequantize_nvfp4_tensor(target)
     dense.addmm_(b, a, alpha=strength)
-    requantized = requantize_nvfp4_tensor(dense, like=target)
+    requantized = requantize_nvfp4_tensor(
+        dense,
+        like=target,
+        rounding_seed=rounding_seed,
+    )
     Nvfp4Adapter.copy_into(requantized, target=target)
 
 
@@ -210,8 +216,13 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
         return dequantize_nvfp4_tensor(t)
 
     @staticmethod
-    def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
-        return requantize_nvfp4_tensor(t, like=like)
+    def requantize(
+        t: torch.Tensor,
+        *,
+        like: torch.Tensor,
+        rounding_seed: int | None = None,
+    ) -> torch.Tensor:
+        return requantize_nvfp4_tensor(t, like=like, rounding_seed=rounding_seed)
 
     @staticmethod
     def validate_lora_merge(
@@ -219,8 +230,11 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
         _b: torch.Tensor,
         _a: torch.Tensor,
         _strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Reject layouts whose weight quantizers cannot be preserved."""
+        del rounding_seed
         nv = require_nvfp4_tensor(target)
         if not nv.qdata.is_contiguous():
             raise ValueError(
@@ -243,9 +257,17 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Merge a staged LoRA update while preserving target storage."""
-        Nvfp4Adapter.validate_lora_merge(target, b, a, strength)
+        Nvfp4Adapter.validate_lora_merge(
+            target,
+            b,
+            a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
         nv = require_nvfp4_tensor(target)
         if _is_triton_nvfp4_layout(nv, b, a):
             assert _triton_merge_nvfp4_lora is not None
@@ -258,6 +280,7 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
                 b,
                 a,
                 strength,
+                rounding_seed=rounding_seed,
             )
             nv.qdata.copy_(qdata)
             nv.scale.copy_(scale)
@@ -265,7 +288,13 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
                 assert per_tensor_scale is not None
                 nv.per_tensor_scale.copy_(per_tensor_scale)
             return
-        _torch_merge_nvfp4_lora_(target, b, a, strength)
+        _torch_merge_nvfp4_lora_(
+            target,
+            b,
+            a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:

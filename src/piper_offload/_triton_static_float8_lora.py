@@ -9,6 +9,11 @@ import torch
 import triton
 import triton.language as tl
 
+from ._triton_stochastic_quantization import (
+    _seed_argument,
+    _stochastic_float8,
+)
+
 _COMPUTE_FP16 = 0
 _COMPUTE_BF16 = 1
 _COMPUTE_FP32 = 2
@@ -126,8 +131,11 @@ def _quantize_kernel(
     dense_ptr,
     scale_ptr,
     output_ptr,
+    rounding_seed,
     NUMEL,
     FP8_LIMIT: tl.constexpr,
+    E4M3: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     offsets = tl.program_id(axis=0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -139,6 +147,14 @@ def _quantize_kernel(
         tl.maximum(scaled, -FP8_LIMIT),
         FP8_LIMIT,
     )
+    if STOCHASTIC:
+        scaled = _stochastic_float8(
+            scaled,
+            rounding_seed,
+            offsets,
+            E4M3,
+            FP8_LIMIT,
+        )
     tl.store(output_ptr + offsets, scaled, mask=mask)
 
 
@@ -161,6 +177,8 @@ def merge_static_float8_lora(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return raw FP8 buffers after one static-per-tensor LoRA merge."""
     if qdata.device.type != "cuda":
@@ -266,8 +284,11 @@ def merge_static_float8_lora(
         dense,
         output_scale,
         output_qdata,
+        _seed_argument(rounding_seed),
         NUMEL=qdata.numel(),
         FP8_LIMIT=fp8_limit,
+        E4M3=qdata.dtype is torch.float8_e4m3fn,
+        STOCHASTIC=rounding_seed is not None,
         BLOCK_SIZE=quant_block,
         num_warps=8,
     )

@@ -103,11 +103,17 @@ def _torch_merge_float8_lora_(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    rounding_seed: int | None = None,
 ) -> None:
     """Apply the established wrapper-based Float8 merge in place."""
     dense = dequantize_float8_tensor(target)
     dense.addmm_(b, a, alpha=strength)
-    requantized = requantize_float8_tensor(dense, like=target)
+    requantized = requantize_float8_tensor(
+        dense,
+        like=target,
+        rounding_seed=rounding_seed,
+    )
     target_f8 = require_float8_tensor(target)
     source_f8 = require_float8_tensor(requantized)
     target_f8.qdata.copy_(source_f8.qdata)
@@ -212,8 +218,13 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
         return dequantize_float8_tensor(t)
 
     @staticmethod
-    def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
-        return requantize_float8_tensor(t, like=like)
+    def requantize(
+        t: torch.Tensor,
+        *,
+        like: torch.Tensor,
+        rounding_seed: int | None = None,
+    ) -> torch.Tensor:
+        return requantize_float8_tensor(t, like=like, rounding_seed=rounding_seed)
 
     @staticmethod
     def validate_lora_merge(
@@ -221,7 +232,10 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
         _b: torch.Tensor,
         _a: torch.Tensor,
         _strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
+        del rounding_seed
         validate_float8_requantize_layout(target)
 
     @staticmethod
@@ -230,9 +244,17 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Merge a staged LoRA update while preserving the target wrapper."""
-        Float8Adapter.validate_lora_merge(target, b, a, strength)
+        Float8Adapter.validate_lora_merge(
+            target,
+            b,
+            a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
         f8 = require_float8_tensor(target)
         if _is_triton_float8_layout(f8, b, a):
             assert _triton_merge_float8_lora is not None
@@ -243,11 +265,18 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
                 b,
                 a,
                 strength,
+                rounding_seed=rounding_seed,
             )
             f8.qdata.copy_(qdata)
             f8.scale.copy_(scale)
             return
-        _torch_merge_float8_lora_(target, b, a, strength)
+        _torch_merge_float8_lora_(
+            target,
+            b,
+            a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:

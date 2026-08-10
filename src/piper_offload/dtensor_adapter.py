@@ -66,6 +66,7 @@ from ._dtensor import (
     rebuild_dtensor,
     require_dtensor,
 )
+from .seeding import derive_seed
 from .tensor_adapters import (
     BindLayoutTensorAdapter,
     LogicalShapeTensorAdapter,
@@ -194,6 +195,16 @@ class _DTensorMergeContext:
     offsets: tuple[int, ...]
     local: torch.Tensor
     inner: LoRAMergeTensorAdapter[Any, Any]
+
+
+def _localize_rounding_seed(
+    seed: int | None,
+    offsets: tuple[int, ...],
+) -> int | None:
+    """Keep replicas aligned while giving distinct shards distinct samples."""
+    if seed is None:
+        return None
+    return derive_seed(seed, *offsets)
 
 
 def _merge_context(target: torch.Tensor) -> _DTensorMergeContext:
@@ -443,16 +454,22 @@ class DTensorAdapter:
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Validate both DTensor placement and inner shard merge operation."""
         context = _merge_context(target)
+        local_b, local_a = _local_lora_factors(context, b, a)
         if isinstance(context.inner, LoRAMergeValidationTensorAdapter):
-            local_b, local_a = _local_lora_factors(context, b, a)
             context.inner.validate_lora_merge(
                 context.local,
                 local_b,
                 local_a,
                 strength,
+                rounding_seed=_localize_rounding_seed(
+                    rounding_seed,
+                    context.offsets,
+                ),
             )
 
     @staticmethod
@@ -498,6 +515,8 @@ class DTensorAdapter:
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Validate a prepared update with the local-shard adapter."""
         context = _merge_context(target)
@@ -507,7 +526,16 @@ class DTensorAdapter:
             raise ValueError(
                 f"DTensor local shard adapter {adapter_name(context.inner)} does not support prepared LoRA validation."
             )
-        validate(context.local, b, a, strength)
+        validate(
+            context.local,
+            b,
+            a,
+            strength,
+            rounding_seed=_localize_rounding_seed(
+                rounding_seed,
+                context.offsets,
+            ),
+        )
 
     @staticmethod
     def merge_prepared_lora_(
@@ -515,6 +543,8 @@ class DTensorAdapter:
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Apply a prepared update with the local-shard adapter."""
         context = _merge_context(target)
@@ -524,7 +554,16 @@ class DTensorAdapter:
             raise ValueError(
                 f"DTensor local shard adapter {adapter_name(context.inner)} does not support prepared LoRA merge."
             )
-        merge(context.local, b.contiguous(), a.contiguous(), strength)
+        merge(
+            context.local,
+            b.contiguous(),
+            a.contiguous(),
+            strength,
+            rounding_seed=_localize_rounding_seed(
+                rounding_seed,
+                context.offsets,
+            ),
+        )
 
     @staticmethod
     def merge_lora_(
@@ -532,6 +571,8 @@ class DTensorAdapter:
         b: torch.Tensor,
         a: torch.Tensor,
         strength: float,
+        *,
+        rounding_seed: int | None = None,
     ) -> None:
         """Merge local or global LoRA factors into this rank's weight shard.
 
@@ -543,12 +584,15 @@ class DTensorAdapter:
         """
         context = _merge_context(target)
         local_b, local_a = _local_lora_factors(context, b, a)
-
         context.inner.merge_lora_(
             context.local,
             local_b,
             local_a,
             strength,
+            rounding_seed=_localize_rounding_seed(
+                rounding_seed,
+                context.offsets,
+            ),
         )
 
     @staticmethod

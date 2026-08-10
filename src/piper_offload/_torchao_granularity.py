@@ -12,6 +12,8 @@ per-format layout — so it lives here once instead of in each
 
 from typing import Any
 
+import torch
+
 try:
     from torchao.quantization.granularity import PerGroup, PerRow, PerTensor
 
@@ -60,3 +62,36 @@ def granularity_from_block_size(
         "no PerTensor / PerRow / PerGroup granularity; TorchAO likely added "
         "a granularity this adapter does not support yet."
     )
+
+
+def expand_block_parameter(
+    parameter: torch.Tensor,
+    *,
+    block_size: tuple[int, ...],
+    shape: tuple[int, ...],
+) -> torch.Tensor:
+    """Expand one quantization parameter per block to logical elements."""
+    if len(block_size) != len(shape) or any(
+        block <= 0 or size % block != 0
+        for size, block in zip(shape, block_size, strict=True)
+    ):
+        raise ValueError(
+            f"Invalid quantization block layout: shape={shape}, "
+            f"block_size={block_size}."
+        )
+    grid = tuple(
+        size // block for size, block in zip(shape, block_size, strict=True)
+    )
+    expected = 1
+    for size in grid:
+        expected *= size
+    if parameter.numel() != expected:
+        raise ValueError(
+            "Quantization parameter storage does not match its block grid: "
+            f"parameter={tuple(parameter.shape)}, expected={grid}."
+        )
+    expanded = parameter.reshape(grid)
+    for dim, repeat in enumerate(block_size):
+        if repeat != 1:
+            expanded = expanded.repeat_interleave(repeat, dim=dim)
+    return expanded

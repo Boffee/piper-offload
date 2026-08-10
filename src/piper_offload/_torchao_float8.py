@@ -13,7 +13,11 @@ from typing import Any
 
 import torch
 
-from ._torchao_granularity import granularity_from_block_size
+from ._stochastic_quantization import _stochastic_cast_float8
+from ._torchao_granularity import (
+    expand_block_parameter,
+    granularity_from_block_size,
+)
 
 LAYOUT_ATTRS = (
     "qdata",
@@ -120,6 +124,7 @@ def requantize_float8_tensor(
     t: torch.Tensor,
     *,
     like: torch.Tensor,
+    rounding_seed: int | None = None,
 ) -> torch.Tensor:
     """Encode dense ``t`` using the fp8 layout and metadata from ``like``.
 
@@ -133,6 +138,8 @@ def requantize_float8_tensor(
     ``scale = amax / fp8_max`` with no epsilon floor, so an all-zero block
     (a zeroed group or row, or a fully cancelled weight) gets ``scale = 0``
     and ``qdata = 0 / 0 = NaN``. See :func:`_repair_zero_scale_blocks`.
+    When ``rounding_seed`` is supplied, that finalized representation keeps its
+    scales and metadata while only its terminal FP8 codes are replaced.
     """
     f8 = require_float8_tensor(like)
     if tuple(t.shape) != tuple(f8.shape):
@@ -148,7 +155,38 @@ def requantize_float8_tensor(
         kernel_preference=f8.kernel_preference,
         act_quant_kwargs=f8.act_quant_kwargs,
     )
-    return _repair_zero_scale_blocks(out)
+    out = _repair_zero_scale_blocks(out)
+    if rounding_seed is not None:
+        _stochastic_recode_float8_(t, target=out, rounding_seed=rounding_seed)
+    return out
+
+
+def _stochastic_recode_float8_(
+    t: torch.Tensor,
+    *,
+    target: torch.Tensor,
+    rounding_seed: int,
+) -> None:
+    """Replace only finalized TorchAO FP8 terminal codes in place."""
+    out = require_float8_tensor(target)
+    expanded_scale = expand_block_parameter(
+        out.scale,
+        block_size=tuple(out.block_size),
+        shape=tuple(out.shape),
+    )
+    valid_scale = torch.isfinite(expanded_scale) & (expanded_scale > 0)
+    scaled = torch.where(
+        valid_scale,
+        t.to(torch.float32) / expanded_scale.to(torch.float32),
+        torch.zeros_like(t, dtype=torch.float32),
+    )
+    qdata = _stochastic_cast_float8(
+        scaled,
+        out.qdata.dtype,
+        seed=rounding_seed,
+        deterministic=out.qdata,
+    )
+    out.qdata.copy_(torch.where(valid_scale, qdata, out.qdata))
 
 
 def _repair_zero_scale_blocks(f8: Any) -> torch.Tensor:  # noqa: ANN401
