@@ -37,7 +37,7 @@ class ModelCache(ResourceCache):
         lora_specs: Sequence[LoRASpec] = (),
         lora_strengths: Sequence[float] | None = None,
         lora_mode: LoRAMode = "merge",
-        stochastic_rounding: bool = False,
+        stochastic_rounding: bool = True,
         stream_config: StreamConfig | None = None,
     ) -> Iterator[M]:
         """Lease dependencies and activate a cached model runtime.
@@ -46,7 +46,9 @@ class ModelCache(ResourceCache):
         must have the same length as ``lora_specs``. A LoRA resource key may
         appear only once in a use. Exact-zero strengths are inactive and their
         LoRA resources are not leased. ``stochastic_rounding`` is forwarded
-        to the model activation's merge path.
+        to the model activation's merge path and defaults to stochastic
+        requantization for quantized targets; dense and routed targets are
+        unaffected.
         """
         specs = tuple(lora_specs)
         strengths = None if lora_strengths is None else tuple(lora_strengths)

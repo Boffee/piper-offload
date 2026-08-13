@@ -247,7 +247,7 @@ class ModelOffloader:
         active_device: torch.device,
         targets: _LoraParamMap,
         *,
-        stochastic_rounding: bool = False,
+        stochastic_rounding: bool = True,
     ) -> None:
         if active_device.type != "cuda":
             raise ValueError(
@@ -357,7 +357,7 @@ class ModelOffloader:
         loras: Sequence[LoRA] = (),
         lora_strengths: Sequence[float] | None = None,
         lora_mode: LoRAMode = "merge",
-        stochastic_rounding: bool = False,
+        stochastic_rounding: bool = True,
         **kwargs: object,
     ) -> None:
         """Make the owned model usable on ``device``.
@@ -365,8 +365,10 @@ class ModelOffloader:
         ``loras`` and their optional ``lora_strengths`` apply only to this
         activation. Exact-zero strengths are inactive and install no hooks.
         ``lora_mode`` selects in-place merge hooks or routed residual hooks.
-        ``stochastic_rounding`` optionally enables stochastic requantization
-        for merge mode. Because the offloader owns one model runtime, a
+        ``stochastic_rounding`` uses stochastic requantization for quantized
+        merge targets by default; pass ``False`` for deterministic rounding.
+        Dense targets always use their ordinary exact ``addmm_``, and routed
+        mode never requantizes. Because the offloader owns one model runtime, a
         second activation before :meth:`deactivate` raises
         :class:`ModelRuntimeInUseError` immediately.
         """

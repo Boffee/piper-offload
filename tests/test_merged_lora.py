@@ -36,6 +36,7 @@ from piper_offload import (
     ScaledLoRAFactor,
     StreamConfig,
     StreamedComponent,
+    derive_seed,
     merge_lora,
 )
 from piper_offload.gguf_adapter import GgufAdapter
@@ -2577,7 +2578,10 @@ class TestPermanentMerge:
         torch.testing.assert_close(m.first.weight, first_before)
         torch.testing.assert_close(m.second.weight, second_before)
 
-    def test_quanto_target_uses_dequant_requant_strategy(self) -> None:
+    def test_quanto_target_defaults_to_stochastic_dequant_requant(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
@@ -2618,10 +2622,36 @@ class TestPermanentMerge:
             alpha=0.5,
         )
         expected = _quanto_absmax_oracle(expected_dense, like=qt)
+        rounding_seeds: list[int | None] = []
+        original_merge = QuantoAdapter.merge_lora_
+
+        def tracked_merge(
+            target: torch.Tensor,
+            staged_b: torch.Tensor,
+            staged_a: torch.Tensor,
+            strength: float,
+            *,
+            rounding_seed: int | None = None,
+        ) -> None:
+            rounding_seeds.append(rounding_seed)
+            original_merge(
+                target,
+                staged_b,
+                staged_a,
+                strength,
+                rounding_seed=rounding_seed,
+            )
+
+        monkeypatch.setattr(
+            QuantoAdapter,
+            "merge_lora_",
+            staticmethod(tracked_merge),
+        )
 
         merged = merge_lora(m, [(lora, 0.5)])
 
         assert merged == 1
+        assert rounding_seeds == [derive_seed("target.weight", 0)]
         assert m.target.weight is original_param
         merged_qt = m.target.weight.data
         assert isinstance(merged_qt, WeightQBytesTensor)
@@ -2630,7 +2660,11 @@ class TestPermanentMerge:
         assert merged_qt.qtype is quanto.qint8
         assert merged_qt.axis == 0
         assert tuple(merged_qt.size()) == (rows, cols)
-        torch.testing.assert_close(merged_qt._data, expected._data)
+        code_difference = (
+            merged_qt._data.to(torch.int16)
+            - expected._data.to(torch.int16)
+        ).abs()
+        assert code_difference.max().item() <= 1
         torch.testing.assert_close(merged_qt._scale, expected._scale)
 
     def test_permanent_quanto_merge_supports_empty_second_target(self) -> None:
@@ -3682,9 +3716,15 @@ class TestLoRAResource:
             assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-5)
         assert factory_calls["lora"] == 1
 
-    def test_model_cache_forwards_stochastic_rounding(
+    @pytest.mark.parametrize(
+        ("stochastic_rounding", "expected"),
+        [(None, True), (False, False)],
+    )
+    def test_model_cache_stochastic_rounding_default_and_opt_out(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        stochastic_rounding: bool | None,
+        expected: bool,
     ) -> None:
         cache = ModelCache(10**9)
         model_spec = ModelSpec(
@@ -3704,14 +3744,15 @@ class TestLoRAResource:
             original_activate(offloader, *args, **kwargs)
 
         monkeypatch.setattr(ModelOffloader, "activate", tracked_activate)
-        with cache.use(
-            model_spec,
-            device="cpu",
-            stochastic_rounding=True,
-        ):
+        use_kwargs = (
+            {}
+            if stochastic_rounding is None
+            else {"stochastic_rounding": stochastic_rounding}
+        )
+        with cache.use(model_spec, device="cpu", **use_kwargs):
             pass
 
-        assert captured == [True]
+        assert captured == [expected]
 
     @pytest.mark.parametrize("zero", [0.0, -0.0])
     def test_model_cache_does_not_lease_zero_strength_lora(

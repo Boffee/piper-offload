@@ -587,6 +587,7 @@ class TestPiperConvRotInt8Adapter:
                 loras=[lora],
                 lora_strengths=[0.5],
                 lora_mode="merge",
+                stochastic_rounding=False,
                 stream_config=StreamConfig(
                     num_resident_blocks=1,
                     num_prefetch_blocks=0,
@@ -603,7 +604,7 @@ class TestPiperConvRotInt8Adapter:
             offloader.deactivate()
 
     @CUDA
-    def test_activation_stochastic_merge_replays_and_releases_lock(
+    def test_activation_defaults_to_stochastic_merge_and_releases_lock(
         self,
     ) -> None:
         convrot_cls = _convrot_cls()
@@ -640,7 +641,6 @@ class TestPiperConvRotInt8Adapter:
                 offloader,
                 "cuda",
                 loras=[lora],
-                stochastic_rounding=True,
             ) as active:
                 samples.append(
                     active.blocks[0].weight.data.qdata.cpu().clone()

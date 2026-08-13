@@ -5,6 +5,13 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Use stochastic rounding by default when merging LoRA updates into quantized
+  weights so sub-step updates are not systematically rounded away. Dense
+  merges remain exact, routed LoRA is unaffected, and callers can pass
+  `stochastic_rounding=False` for deterministic requantization.
+
 ## [0.2.3] - 2026-08-13
 
 ### Fixed

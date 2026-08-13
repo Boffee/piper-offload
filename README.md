@@ -408,8 +408,9 @@ finally:
     offload.deactivate()
 ```
 
-Quantized merge uses deterministic rounding by default. Opt into stochastic
-rounding with a boolean:
+Quantized merge uses stochastic rounding by default so LoRA updates smaller
+than one quantization step are not systematically rounded away. Opt into
+deterministic round-to-nearest when exact deterministic codes are required:
 
 ```python
 offload.activate(
@@ -417,7 +418,7 @@ offload.activate(
     loras=[lora_a],
     lora_strengths=[0.8],
     lora_mode="merge",
-    stochastic_rounding=True,
+    stochastic_rounding=False,
 )
 ```
 
@@ -494,7 +495,7 @@ from piper_offload import merge_lora, LoRA
 merge_lora(
     model,
     [(LoRA.from_state_dict(state_dict=load_file("lora.safetensors")), 0.8)],
-    stochastic_rounding=True,  # optional
+    stochastic_rounding=False,  # optional deterministic opt-out
 )
 ```
 
@@ -509,14 +510,15 @@ capabilities are preflighted before mutation. Multiple LoRAs for one
 quantized parameter are packed into one staged low-rank update and the
 weight is re-encoded once.
 
-For stochastic merge, each adapter first uses its existing upstream recipe to
-compute the final data-dependent scales and other quantization parameters,
-then samples only the terminal weight code between the two neighboring values
-on that finalized grid. Exact endpoints and saturation retain the upstream
-code. Exact-zero strengths are discarded before target lookup or factor
-staging. Standard CUDA layouts use the same format-specific Triton merge kernels
-for deterministic and stochastic rounding. Random samples are keyed by logical
-element index, so launch geometry does not change the result. The Torch and
+For the default stochastic merge, each adapter first uses its existing upstream
+recipe to compute the final data-dependent scales and other quantization
+parameters, then samples only the terminal weight code between the two
+neighboring values on that finalized grid. Exact endpoints and saturation
+retain the upstream code. Exact-zero strengths are discarded before target
+lookup or factor staging. Standard CUDA layouts use the same format-specific
+Triton merge kernels for deterministic and stochastic rounding. Random samples
+are keyed by logical element index, so launch geometry does not change the
+result. The Torch and
 Triton backends replay independently for a fixed seed but do not promise
 byte-identical samples across implementations or Triton versions. Nested
 bitsandbytes 4-bit scales still use the reference path because their final

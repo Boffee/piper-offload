@@ -53,7 +53,7 @@ def merge_lora(
     model: nn.Module,
     loras: Sequence[tuple[LoRA, float]],
     *,
-    stochastic_rounding: bool = False,
+    stochastic_rounding: bool = True,
 ) -> int:
     """Merge one or more LoRAs into model parameters in-place.
 
@@ -61,8 +61,11 @@ def merge_lora(
     strengths are inactive and do not create merge operations. Merge reads
     immutable host factor backing, so the same LoRA may also serve other
     merge or routed uses. All active target names and merge capabilities are
-    validated before any parameter is modified. ``stochastic_rounding=True``
-    enables terminal-code sampling where the adapter supports it.
+    validated before any parameter is modified. Quantized targets use
+    terminal-code stochastic rounding by default so sub-step LoRA updates are
+    not systematically rounded away; pass ``stochastic_rounding=False`` for
+    deterministic rounding. Dense targets always use their ordinary exact
+    ``addmm_`` update.
     """
     if len({id(lora) for lora, _strength in loras}) != len(loras):
         raise ValueError("merge_lora() does not accept the same LoRA instance more than once")
