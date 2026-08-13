@@ -29,6 +29,7 @@ capability protocols, and plain tensor implementation live here; built-in and
 external adapter selection lives in :mod:`tensor_adapter_registry`.
 """
 
+import sys
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -412,23 +413,35 @@ def clone_to_pinned_cpu(
     memory_format: torch.memory_format = torch.preserve_format,
 ) -> torch.Tensor:
     """Clone ``t`` into pinned CPU memory from any source device."""
+    if sys.platform == "win32" and not torch.cuda.is_available():
+        # CUDA PyTorch wheels can terminate the process with a native access
+        # violation when their pinned allocator is entered on a GPU-less
+        # Windows host. Fail in Python before calling an allocation factory.
+        raise RuntimeError(
+            "CUDA pinned memory is unavailable on this Windows host."
+        )
     source = t.detach()
-    if source.device.type == "cpu":
-        return source.clone(memory_format=memory_format).pin_memory()
-
-    if memory_format == torch.preserve_format:
+    # Allocate the final destination in pinned memory. ``clone().pin_memory()``
+    # first materializes a complete pageable clone and then copies it again
+    # into a pinned allocation, adding one source-tensor-sized construction
+    # temporary. Preserve the existing exact-stride behavior for CUDA sources;
+    # the CPU path follows ``clone(memory_format=...)`` normalization via
+    # ``empty_like``.
+    if source.device.type != "cpu" and memory_format == torch.preserve_format:
         pinned = torch.empty_strided(
             tuple(source.shape),
             source.stride(),
             dtype=source.dtype,
             device="cpu",
-        ).pin_memory()
+            pin_memory=True,
+        )
     else:
         pinned = torch.empty_like(
             source,
             device="cpu",
             memory_format=memory_format,
-        ).pin_memory()
+            pin_memory=True,
+        )
     pinned.copy_(source)
     return pinned
 

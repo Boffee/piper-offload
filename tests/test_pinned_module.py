@@ -315,12 +315,12 @@ class TestPinnedModuleInstance:
 
         def fake_empty_like(
             tensor: torch.Tensor,
-            *,
-            device: torch.device | None = None,
+            **kwargs: object,
         ) -> torch.Tensor:
-            if device is not None:
-                assert device == torch.device("cuda")
-            return original_empty_like(tensor)
+            device = kwargs.get("device")
+            if device is not None and torch.device(device).type == "cuda":
+                kwargs["device"] = "cpu"
+            return original_empty_like(tensor, **kwargs)
 
         monkeypatch.setattr(torch, "empty_like", fake_empty_like)
         pinned_param = _FakePinnedParam(torch.empty(2, 2))

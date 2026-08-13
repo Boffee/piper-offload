@@ -1,5 +1,7 @@
 """Tests for ``piper_offload.pinned_param.PinnedParam``."""
 
+import sys
+
 import pytest
 import torch
 from torch import nn
@@ -10,6 +12,7 @@ from piper_offload.tensor_adapters import (
     DequantRequantTensorAdapter,
     LoRAMergeTensorAdapter,
     TensorCopyIntoAdapter,
+    clone_to_pinned_cpu,
 )
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 
@@ -22,6 +25,60 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 class TestPinnedParam:
+    def test_clone_to_pinned_cpu_rejects_gpu_less_windows_before_allocation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def unexpected_allocation(*args: object, **kwargs: object) -> None:
+            raise AssertionError("native pinned allocator was entered")
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr(torch, "empty_like", unexpected_allocation)
+        monkeypatch.setattr(torch, "empty_strided", unexpected_allocation)
+
+        with pytest.raises(RuntimeError, match="CUDA pinned memory"):
+            clone_to_pinned_cpu(torch.zeros(1))
+
+    def test_clone_to_pinned_cpu_allocates_final_destination_directly(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source = torch.arange(12, dtype=torch.float32).reshape(3, 4).t()
+        expected = source.clone(memory_format=torch.preserve_format)
+        real_empty_like = torch.empty_like
+        allocations: list[dict[str, object]] = []
+
+        def tracked_empty_like(
+            source_tensor: torch.Tensor,
+            *args: object,
+            **kwargs: object,
+        ) -> torch.Tensor:
+            allocations.append(dict(kwargs))
+            return real_empty_like(source_tensor, *args, **kwargs)
+
+        monkeypatch.setattr(torch, "empty_like", tracked_empty_like)
+
+        pinned = clone_to_pinned_cpu(source)
+
+        assert len(allocations) == 1
+        assert allocations[0]["device"] == "cpu"
+        assert allocations[0]["pin_memory"] is True
+        assert allocations[0]["memory_format"] is torch.preserve_format
+        assert pinned.is_pinned()
+        assert pinned.stride() == expected.stride()
+        torch.testing.assert_close(pinned, expected)
+
+    @CUDA
+    def test_clone_to_pinned_cpu_preserves_cuda_source_stride(self) -> None:
+        source = torch.arange(24, device="cuda").reshape(4, 6)[:, ::2]
+
+        pinned = clone_to_pinned_cpu(source)
+
+        assert pinned.stride() == source.stride()
+        assert pinned.is_pinned()
+        torch.testing.assert_close(pinned, source.cpu())
+
     def test_select_adapter_returns_adapter_for_plain_tensor(self) -> None:
         first = select_adapter(torch.randn(1))
         second = select_adapter(torch.randn(2))
