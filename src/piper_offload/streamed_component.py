@@ -252,47 +252,56 @@ def _param_target_layout(p: nn.Parameter) -> tuple[object, object]:
     return PinnedParam.target_layout_for(p)
 
 
-def _collect_streamed_entries(
+def _collect_streamed_schemas(
     blocks: list[nn.Module],
     stream_param_names: set[str] | None,
     stream_buffer_names: set[str] | None,
-) -> tuple[list[dict[str, nn.Parameter]], list[dict[str, torch.Tensor]]]:
-    block_params: list[dict[str, nn.Parameter]] = []
-    block_buffers: list[dict[str, torch.Tensor]] = []
+) -> tuple[list[dict[str, bool]], list[set[str]]]:
+    """Snapshot the cross-block contract without retaining tensor objects.
+
+    Pinned construction replaces each completed block's source wrappers so
+    their pageable/file-backed storage can be released before the next block
+    is copied. Keeping ``Parameter`` or buffer objects in this pre-validation
+    snapshot would extend every source storage's lifetime until the complete
+    block list finished pinning, producing an approximately 2x model-sized
+    peak for structured tensor adapters.
+    """
+    block_param_schemas: list[dict[str, bool]] = []
+    block_buffer_schemas: list[set[str]] = []
 
     for block in blocks:
-        params, buffers = _select_streamed_entries(
+        params, buffers = _select_streamed_schema(
             block,
             stream_param_names,
             stream_buffer_names,
         )
-        block_params.append(params)
-        block_buffers.append(buffers)
+        block_param_schemas.append(params)
+        block_buffer_schemas.append(buffers)
 
-    return block_params, block_buffers
+    return block_param_schemas, block_buffer_schemas
 
 
-def _select_streamed_entries(
+def _select_streamed_schema(
     block: nn.Module,
     stream_param_names: set[str] | None,
     stream_buffer_names: set[str] | None,
-) -> tuple[dict[str, nn.Parameter], dict[str, torch.Tensor]]:
-    params: dict[str, nn.Parameter] = {}
+) -> tuple[dict[str, bool], set[str]]:
+    params: dict[str, bool] = {}
     all_param_names: set[str] = set()
     for name, param in block.named_parameters(remove_duplicate=False):
         all_param_names.add(name)
         if stream_param_names is not None and name not in stream_param_names:
             continue
-        params[name] = param
+        params[name] = param.requires_grad
     _validate_streamed_names_known(stream_param_names, all_param_names)
 
-    buffers: dict[str, torch.Tensor] = {}
+    buffers: set[str] = set()
     all_buffer_names: set[str] = set()
-    for name, buffer in block.named_buffers(remove_duplicate=False):
+    for name, _buffer in block.named_buffers(remove_duplicate=False):
         all_buffer_names.add(name)
         if stream_buffer_names is not None and name not in stream_buffer_names:
             continue
-        buffers[name] = buffer
+        buffers.add(name)
     _validate_streamed_names_known(stream_buffer_names, all_buffer_names)
 
     return params, buffers
@@ -317,7 +326,7 @@ def _format_names(names: Sequence[str]) -> str:
 
 
 def _check_block_requires_grad_consistent(
-    block_params: Sequence[dict[str, nn.Parameter]],
+    block_param_schemas: Sequence[dict[str, bool]],
 ) -> None:
     """Reject blocks that disagree on ``requires_grad`` for a shared name.
 
@@ -329,20 +338,20 @@ def _check_block_requires_grad_consistent(
     group has no coherent optimizer-step / checkpointing contract.
     Validated before pinning so a mismatch leaves the model unmutated.
     """
-    if len(block_params) <= 1:
+    if len(block_param_schemas) <= 1:
         return
-    ref = block_params[0]
-    for i in range(1, len(block_params)):
-        for name, param in block_params[i].items():
-            ref_param = ref.get(name)
+    ref = block_param_schemas[0]
+    for i in range(1, len(block_param_schemas)):
+        for name, requires_grad in block_param_schemas[i].items():
+            ref_requires_grad = ref.get(name)
             if (
-                ref_param is not None
-                and param.requires_grad != ref_param.requires_grad
+                ref_requires_grad is not None
+                and requires_grad != ref_requires_grad
             ):
                 raise ValueError(
                     f"Block {i} param {name!r} requires_grad="
-                    f"{param.requires_grad} differs from block 0 "
-                    f"(requires_grad={ref_param.requires_grad}). All blocks "
+                    f"{requires_grad} differs from block 0 "
+                    f"(requires_grad={ref_requires_grad}). All blocks "
                     "in a StreamedComponent group must agree on requires_grad "
                     "per parameter; quantization formats, shapes, and dtypes "
                     "may differ, but trainable and frozen weights cannot be "
@@ -364,32 +373,45 @@ def _pin_block_module_stores(
     low-peak ``Parameter.data`` repointing optimization; recovery from
     a pin-time failure is unsupported, matching :class:`PinnedComponent`.
     """
-    # Walk each block to collect selected param/buffer names WITHOUT
-    # pinning anything. Cross-block name consistency is enforced upstream
+    # Walk each block to snapshot selected names and requires_grad flags
+    # WITHOUT retaining the Parameter/buffer objects or pinning anything.
+    # Cross-block name consistency is enforced upstream
     # (``_streamed_param_names_for_blocks`` / ``_streamed_buffer_names_for_blocks``);
     # per-block tensor *layouts* may differ (heterogeneous quantization),
     # since the streamer's morphing target pool keys reusable GPU targets
     # by per-block layout signature so blocks of different formats never
     # share a target.
-    block_params, block_buffers = _collect_streamed_entries(
+    block_param_schemas, block_buffer_schemas = _collect_streamed_schemas(
         list(blocks),
         stream_param_names,
         stream_buffer_names,
     )
-    _check_block_requires_grad_consistent(block_params)
+    _check_block_requires_grad_consistent(block_param_schemas)
 
-    return [
-        PinnedModuleStore.from_module(
-            block,
-            include_param_names=params,
-            include_buffer_names=buffers,
-            pin_memory=pin_memory,
-            install_backing=pin_memory,
+    # Only lightweight name collections cross into pinning. Pin and install
+    # each block before resolving the next block's live tensors so structured
+    # source wrappers from completed blocks can be reclaimed immediately.
+    param_names_by_block = [set(schema) for schema in block_param_schemas]
+    buffer_names_by_block = block_buffer_schemas
+    del block_param_schemas, block_buffer_schemas
+
+    stores: list[PinnedModuleStore] = []
+    for block, param_names, buffer_names in zip(
+        blocks,
+        param_names_by_block,
+        buffer_names_by_block,
+        strict=True,
+    ):
+        stores.append(
+            PinnedModuleStore.from_module(
+                block,
+                include_param_names=param_names,
+                include_buffer_names=buffer_names,
+                pin_memory=pin_memory,
+                install_backing=pin_memory,
+            )
         )
-        for block, params, buffers in zip(
-            blocks, block_params, block_buffers, strict=True,
-        )
-    ]
+    return stores
 
 
 def _build_param_name_index(

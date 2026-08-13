@@ -5,6 +5,13 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- Reduce peak host memory while pinning streamed structured-tensor models by
+  retaining only lightweight pre-validation metadata, releasing replaced
+  source wrappers block by block, and allocating final pinned destinations
+  directly without intermediate pageable clones.
+
 ## [0.2.2] - 2026-08-10
 
 ### Added

@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+import weakref
 from typing import Any
 
 import pytest
@@ -21,7 +22,10 @@ from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from piper_offload.dtensor_adapter import DTensorAdapter
 from piper_offload.pinned_module import PinnedModuleStore
 from piper_offload.pinned_param import PinnedParam
-from piper_offload.streamed_component import _param_target_layout
+from piper_offload.streamed_component import (
+    _param_target_layout,
+    _pin_block_module_stores,
+)
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
     CpuRoundTripTensorAdapter,
@@ -152,6 +156,50 @@ class TestPiperConvRotInt8Adapter:
         assert pinned_param.cache_bytes == source.qdata.nbytes + source.scale.nbytes
         assert torch.equal(pinned.qdata, source.qdata)
         assert torch.equal(pinned.scale, source.scale)
+
+    def test_streamed_prevalidation_does_not_retain_source_wrappers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class Block(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(
+                    _make_convrot(),
+                    requires_grad=False,
+                )
+
+        blocks = [Block(), Block()]
+        first_source_ref = weakref.ref(blocks[0].weight)
+        original_from_module = PinnedModuleStore.from_module
+        calls = 0
+
+        @classmethod
+        def tracked_from_module(
+            cls: type[PinnedModuleStore],
+            module: nn.Module,
+            **kwargs: object,
+        ) -> PinnedModuleStore:
+            nonlocal calls
+            if calls == 1:
+                # The first block has already installed its pinned wrapper.
+                # Pre-validation must not keep the replaced source wrapper
+                # (and therefore its original qdata/scale storage) alive.
+                assert first_source_ref() is None
+            calls += 1
+            return original_from_module(module, **kwargs)
+
+        monkeypatch.setattr(
+            PinnedModuleStore,
+            "from_module",
+            tracked_from_module,
+        )
+
+        stores = _pin_block_module_stores(blocks)
+
+        assert len(stores) == 2
+        assert calls == 2
+        assert first_source_ref() is None
 
     def test_adopted_backing_retains_storage_and_metadata(self) -> None:
         source = _make_convrot(dtype=torch.float16)
