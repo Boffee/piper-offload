@@ -1,5 +1,7 @@
 """Tests for ``piper_offload.pinned_param.PinnedParam``."""
 
+import sys
+
 import pytest
 import torch
 from torch import nn
@@ -23,6 +25,21 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 class TestPinnedParam:
+    def test_clone_to_pinned_cpu_rejects_gpu_less_windows_before_allocation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def unexpected_allocation(*args: object, **kwargs: object) -> None:
+            raise AssertionError("native pinned allocator was entered")
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr(torch, "empty_like", unexpected_allocation)
+        monkeypatch.setattr(torch, "empty_strided", unexpected_allocation)
+
+        with pytest.raises(RuntimeError, match="CUDA pinned memory"):
+            clone_to_pinned_cpu(torch.zeros(1))
+
     def test_clone_to_pinned_cpu_allocates_final_destination_directly(
         self,
         monkeypatch: pytest.MonkeyPatch,

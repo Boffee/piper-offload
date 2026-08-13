@@ -25,14 +25,6 @@ from piper_offload import ModelOffloader
 _CUDA_UNAVAILABLE_ERROR_FRAGMENTS = ("CUDA", "NVIDIA driver")
 
 
-def _windows_pin_memory_unavailable(
-    _tensor: torch.Tensor,
-    _device: object | None = None,
-) -> torch.Tensor:
-    """Keep GPU-less Windows tests out of PyTorch's native pin allocator."""
-    raise RuntimeError("CUDA pinned memory is unavailable on this Windows runner.")
-
-
 def _windows_cuda_current_device_unavailable() -> int:
     """Keep GPU-less Windows tests out of PyTorch's native CUDA initializer."""
     raise RuntimeError("CUDA is unavailable on this Windows runner.")
@@ -40,10 +32,9 @@ def _windows_cuda_current_device_unavailable() -> int:
 
 if sys.platform == "win32" and not torch.cuda.is_available():
     # CUDA PyTorch wheels can terminate the process with a native access
-    # violation when pin_memory() or current_device() enters CUDA internals on
-    # GPU-less Windows hosts. Raise Python CUDA-unavailable errors so the hook
-    # below can skip only the tests that actually require those operations.
-    torch.Tensor.pin_memory = _windows_pin_memory_unavailable
+    # violation when current_device() enters CUDA internals on GPU-less
+    # Windows hosts. Pinned allocation is guarded in clone_to_pinned_cpu;
+    # guard this remaining direct CUDA entry point for tests as well.
     torch.cuda.current_device = _windows_cuda_current_device_unavailable
 
 
