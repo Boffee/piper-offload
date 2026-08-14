@@ -15,7 +15,7 @@ parameter copies.
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from torch import nn
@@ -33,77 +33,32 @@ logger = logging.getLogger(__name__)
 __all__ = ["merge_lora"]
 
 
+type _FactorGroup = tuple[str, nn.Parameter, list[ScaledLoRAFactor]]
+
+
 @dataclass(slots=True, frozen=True)
-class _MergeTarget:
-    key: str
-    param: nn.Parameter
-    tensor_id: tuple[Any, ...]
-
-
-@dataclass(slots=True)
 class _MergeOp:
-    weight: _MergeTarget
-    factors: list[ScaledLoRAFactor]
-    stochastic_rounding: bool
-    bias: _MergeTarget | None = field(init=False, default=None)
-
-    @property
-    def transform(self) -> LoRATransform:
-        return LoRATransform(
-            self.factors,
-            stochastic_rounding=self.stochastic_rounding,
-            target_key=self.weight.key,
-        )
-
-    def resolve_bias(
-        self,
-        params_by_target: dict[str, nn.Parameter],
-        bias_owner_by_tensor_id: dict[tuple[Any, ...], str],
-    ) -> None:
-        """Bind the optional base bias and reject tied-bias ambiguity."""
-        if not self.transform.has_bias:
-            return
-
-        bias_key = _lora_bias_target_key(self.weight.key)
-        bias_param = params_by_target.get(bias_key)
-        if bias_param is None:
-            raise ValueError(
-                f"Cannot merge legacy LoRA bias for {self.weight.key!r}: "
-                f"the model has no base bias parameter {bias_key!r}. "
-                "Use routed LoRA for a bias-less base layer."
-            )
-
-        tensor_id = param_tensor_id(bias_param)
-        previous_owner = bias_owner_by_tensor_id.setdefault(
-            tensor_id,
-            self.weight.key,
-        )
-        if previous_owner != self.weight.key:
-            raise ValueError(
-                f"LoRA targets {previous_owner!r} and {self.weight.key!r} "
-                "resolve to the same tied base-bias backing. Apply only "
-                "one logical target for a tied bias."
-            )
-        self.bias = _MergeTarget(bias_key, bias_param, tensor_id)
+    target_key: str
+    weight: nn.Parameter
+    bias: nn.Parameter | None
+    transform: LoRATransform
 
     def validate(self) -> None:
         """Preflight this operation's weight and optional bias."""
-        bias_param = None if self.bias is None else self.bias.param
         try:
-            self.transform.validate_target(self.weight.param, bias_param)
+            self.transform.validate_target(self.weight, self.bias)
         except ValueError as exc:
             raise ValueError(
-                f"Cannot merge LoRA into {self.weight.key!r}: {exc}",
+                f"Cannot merge LoRA into {self.target_key!r}: {exc}",
             ) from exc
 
     def apply(self) -> None:
         """Apply this operation's weight and optional bias updates."""
-        bias_param = None if self.bias is None else self.bias.param
         try:
-            self.transform.apply(self.weight.param, bias_param)
+            self.transform.apply(self.weight, self.bias)
         except ValueError as exc:
             raise ValueError(
-                f"Cannot merge LoRA into {self.weight.key!r}: {exc}",
+                f"Cannot merge LoRA into {self.target_key!r}: {exc}",
             ) from exc
 
 
@@ -165,33 +120,11 @@ def _merge_loras(
             f"Sample model parameter keys: {sample} ..."
         )
 
-    merge_ops_by_tensor_id: dict[tuple[Any, ...], _MergeOp] = {}
-    for lora, strength in loras:
-        for target_key, factor in lora.targets.items():
-            param = params_by_target[target_key]
-            tensor_id = param_tensor_id(param)
-            op = merge_ops_by_tensor_id.get(tensor_id)
-            if op is None:
-                op = _MergeOp(
-                    _MergeTarget(target_key, param, tensor_id),
-                    [],
-                    stochastic_rounding,
-                )
-                merge_ops_by_tensor_id[tensor_id] = op
-            elif op.weight.key != target_key:
-                raise ValueError(
-                    f"LoRA targets {op.weight.key!r} and {target_key!r} "
-                    f"resolve to the same tied parameter backing. Apply "
-                    f"only one name for a tied weight in a single "
-                    f"merge_lora() call; otherwise the same base weight "
-                    f"would receive multiple logical updates."
-                )
-            op.factors.append(factor.scaled(strength))
-
-    merge_ops = list(merge_ops_by_tensor_id.values())
-    bias_owner_by_tensor_id: dict[tuple[Any, ...], str] = {}
-    for op in merge_ops:
-        op.resolve_bias(params_by_target, bias_owner_by_tensor_id)
+    merge_ops = _build_merge_ops(
+        params_by_target,
+        loras,
+        stochastic_rounding=stochastic_rounding,
+    )
 
     # Preflight every operation before applying any of them. This catches all
     # expected name, shape, and adapter-capability errors without leaving a
@@ -203,9 +136,9 @@ def _merge_loras(
         op.apply()
 
     bias_count = sum(op.bias is not None for op in merge_ops)
-    modified_tensor_ids = {op.weight.tensor_id for op in merge_ops}
+    modified_tensor_ids = {param_tensor_id(op.weight) for op in merge_ops}
     modified_tensor_ids.update(
-        op.bias.tensor_id
+        param_tensor_id(op.bias)
         for op in merge_ops
         if op.bias is not None
     )
@@ -225,3 +158,68 @@ def _collect_params_by_target(model: nn.Module) -> dict[str, nn.Parameter]:
     for name, param in model.named_parameters(remove_duplicate=False):
         params_by_target[name] = param
     return params_by_target
+
+
+def _build_merge_ops(
+    params_by_target: dict[str, nn.Parameter],
+    loras: Sequence[tuple[LoRA, float]],
+    *,
+    stochastic_rounding: bool,
+) -> list[_MergeOp]:
+    """Group factors, resolve targets, and reject ambiguous parameter ties."""
+    factor_groups_by_tensor_id: dict[tuple[Any, ...], _FactorGroup] = {}
+    for lora, strength in loras:
+        for target_key, factor in lora.targets.items():
+            weight = params_by_target[target_key]
+            tensor_id = param_tensor_id(weight)
+            group = factor_groups_by_tensor_id.get(tensor_id)
+            if group is None:
+                factors: list[ScaledLoRAFactor] = []
+                group = (target_key, weight, factors)
+                factor_groups_by_tensor_id[tensor_id] = group
+            else:
+                existing_target_key, _existing_weight, factors = group
+                if existing_target_key != target_key:
+                    raise ValueError(
+                        f"LoRA targets {existing_target_key!r} and "
+                        f"{target_key!r} resolve to the same tied parameter "
+                        "backing. Apply only one name for a tied weight in a "
+                        "single merge_lora() call; otherwise the same base "
+                        "weight would receive multiple logical updates."
+                    )
+            factors.append(factor.scaled(strength))
+
+    merge_ops: list[_MergeOp] = []
+    bias_owner_by_tensor_id: dict[tuple[Any, ...], str] = {}
+    for target_key, weight, factors in factor_groups_by_tensor_id.values():
+        transform = LoRATransform(
+            factors,
+            stochastic_rounding=stochastic_rounding,
+            target_key=target_key,
+        )
+        bias: nn.Parameter | None = None
+        if transform.has_bias:
+            bias_key = _lora_bias_target_key(target_key)
+            bias = params_by_target.get(bias_key)
+            if bias is None:
+                raise ValueError(
+                    f"Cannot merge legacy LoRA bias for {target_key!r}: "
+                    f"the model has no base bias parameter {bias_key!r}. "
+                    "Use routed LoRA for a bias-less base layer."
+                )
+
+            bias_tensor_id = param_tensor_id(bias)
+            previous_owner = bias_owner_by_tensor_id.setdefault(
+                bias_tensor_id,
+                target_key,
+            )
+            if previous_owner != target_key:
+                raise ValueError(
+                    f"LoRA targets {previous_owner!r} and {target_key!r} "
+                    "resolve to the same tied base-bias backing. Apply only "
+                    "one logical target for a tied bias."
+                )
+
+        merge_ops.append(_MergeOp(target_key, weight, bias, transform))
+
+    return merge_ops
