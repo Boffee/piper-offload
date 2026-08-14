@@ -38,28 +38,17 @@ type _FactorGroup = tuple[str, nn.Parameter, list[ScaledLoRAFactor]]
 
 @dataclass(slots=True, frozen=True)
 class _MergeOp:
-    target_key: str
     weight: nn.Parameter
     bias: nn.Parameter | None
     transform: LoRATransform
 
     def validate(self) -> None:
         """Preflight this operation's weight and optional bias."""
-        try:
-            self.transform.validate_target(self.weight, self.bias)
-        except ValueError as exc:
-            raise ValueError(
-                f"Cannot merge LoRA into {self.target_key!r}: {exc}",
-            ) from exc
+        self.transform.validate_target(self.weight, self.bias)
 
     def apply(self) -> None:
         """Apply this operation's weight and optional bias updates."""
-        try:
-            self.transform.apply(self.weight, self.bias)
-        except ValueError as exc:
-            raise ValueError(
-                f"Cannot merge LoRA into {self.target_key!r}: {exc}",
-            ) from exc
+        self.transform.apply(self.weight, self.bias)
 
 
 def merge_lora(
@@ -220,6 +209,6 @@ def _build_merge_ops(
                     "one logical target for a tied bias."
                 )
 
-        merge_ops.append(_MergeOp(target_key, weight, bias, transform))
+        merge_ops.append(_MergeOp(weight, bias, transform))
 
     return merge_ops

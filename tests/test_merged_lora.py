@@ -2948,7 +2948,7 @@ class TestPermanentMerge:
             }
         )
 
-        with pytest.raises(ValueError, match="second.weight.*shape mismatch"):
+        with pytest.raises(ValueError, match="LoRA factor shape mismatch"):
             merge_lora(m, [(lora, 1.0)])
 
         torch.testing.assert_close(m.first.weight, first_before)
@@ -2980,7 +2980,7 @@ class TestPermanentMerge:
 
         with pytest.raises(
             ValueError,
-            match="second.weight.*floating-point compute dtype",
+            match="floating-point compute dtype",
         ):
             merge_lora(m, [(lora, 1.0)])
 
@@ -3289,7 +3289,7 @@ class TestPermanentMerge:
 
         with pytest.raises(
             ValueError,
-            match="second.weight.*positive LoRA rank",
+            match="positive LoRA rank",
         ):
             merge_lora(model, [(lora, 1.0)])
 
