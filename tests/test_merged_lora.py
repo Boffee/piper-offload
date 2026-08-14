@@ -834,7 +834,7 @@ class TestActivationLoraValidation:
         )
 
         _request_loras(s, [(lora, 0.5)], mode="merge")
-        with pytest.raises(ValueError, match="no base bias parameter"):
+        with pytest.raises(ValueError, match="attn.bias.*is not managed"):
             _activate_loras_for_test(s)
 
         assert s._lora_hook_removers == []

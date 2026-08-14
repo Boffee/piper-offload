@@ -1077,12 +1077,3 @@ def _validate_factor_pair(
             f"bias.shape={tuple(bias.shape)}, B.shape={tuple(b.shape)}. "
             "Expected bias=(out_dim,) with bias.shape[0] == B.shape[0]."
         )
-
-
-def _lora_bias_target_key(weight_target_key: str) -> str:
-    """Return the sibling base-bias key for a canonical LoRA weight target."""
-    if not weight_target_key.endswith(".weight"):
-        raise ValueError(
-            f"LoRA target {weight_target_key!r} does not end in '.weight'."
-        )
-    return f"{weight_target_key.removesuffix('.weight')}.bias"

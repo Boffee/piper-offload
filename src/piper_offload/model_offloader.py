@@ -21,11 +21,9 @@ from .lora import (
     LoRAMode,
     LoRATransform,
     ScaledLoRAFactor,
-    _lora_bias_target_key,
     install_routed_residual_hook,
 )
-from .module_names import resolve_parent_leaf
-from .tensor_adapter_registry import param_tensor_id
+from .module_names import resolve_parent_leaf, sibling_parameter_name
 
 type _LoraParamMap = dict[str, list[ScaledLoRAFactor]]
 
@@ -258,20 +256,6 @@ class ModelOffloader:
                 "for CPU activation."
             )
 
-        params_by_name = dict(
-            self._model.named_parameters(remove_duplicate=False),
-        )
-        operations: list[
-            tuple[
-                str,
-                LoRATransform,
-                str | None,
-            ]
-        ] = []
-        bias_targets_by_tensor_id: dict[tuple[object, ...], str] = {}
-
-        # Resolve and validate every legacy base-bias target before installing
-        # any hooks. Ordinary A/B-only LoRAs never enter this path.
         for param_name, factors in targets.items():
             transform = LoRATransform(
                 factors,
@@ -280,32 +264,10 @@ class ModelOffloader:
             )
             bias_name: str | None = None
             if transform.has_bias:
-                bias_name = _lora_bias_target_key(param_name)
-                if bias_name not in params_by_name:
-                    raise ValueError(
-                        f"Cannot merge legacy LoRA bias for {param_name!r}: "
-                        f"the model has no base bias parameter {bias_name!r}. "
-                        "Use lora_mode='routed' for a bias-less base layer."
-                    )
-                self._require_managed_target(bias_name)
-                bias_param = params_by_name[bias_name]
-                transform.validate_bias_target(bias_param)
-                tensor_id = param_tensor_id(bias_param)
-                previous_target = bias_targets_by_tensor_id.setdefault(
-                    tensor_id,
-                    param_name,
+                bias_name = self._require_managed_target(
+                    sibling_parameter_name(param_name, "bias"),
                 )
-                if previous_target != param_name:
-                    raise ValueError(
-                        f"LoRA targets {previous_target!r} and {param_name!r} "
-                        "resolve to the same tied base-bias backing. Apply "
-                        "only one logical target for a tied bias."
-                    )
-            operations.append(
-                (param_name, transform, bias_name),
-            )
 
-        for param_name, transform, bias_name in operations:
             remove_hook = self._register_post_copy_hook(
                 param_name,
                 transform.apply_weight,

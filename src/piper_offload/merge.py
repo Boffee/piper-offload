@@ -24,8 +24,8 @@ from .lora import (
     LoRA,
     LoRATransform,
     ScaledLoRAFactor,
-    _lora_bias_target_key,
 )
+from .module_names import sibling_parameter_name
 from .tensor_adapter_registry import param_tensor_id
 
 logger = logging.getLogger(__name__)
@@ -188,7 +188,7 @@ def _build_merge_ops(
         )
         bias: nn.Parameter | None = None
         if transform.has_bias:
-            bias_key = _lora_bias_target_key(target_key)
+            bias_key = sibling_parameter_name(target_key, "bias")
             bias = params_by_target.get(bias_key)
             if bias is None:
                 raise ValueError(
