@@ -1,6 +1,6 @@
 [project]
 name = "piper-offload"
-version = "0.2.3"
+version = "0.2.4"
 description = "Model-agnostic GPU/CPU memory management for PyTorch — pinned-host offloading, block streaming, and LRU model caching."
 readme = "README.md"
 license = "Apache-2.0"
