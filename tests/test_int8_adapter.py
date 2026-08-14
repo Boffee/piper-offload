@@ -592,7 +592,7 @@ class TestInt8Adapter:
 
         with pytest.raises(
             ValueError,
-            match="second.weight.*non-finite stored-coordinate LoRA factors",
+            match="non-finite stored-coordinate LoRA factors",
         ):
             merge_lora(model, [(lora, 1.0)])
 

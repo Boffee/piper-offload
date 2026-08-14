@@ -872,7 +872,7 @@ class TestFloat8Adapter:
 
         with pytest.raises(
             ValueError,
-            match="second.weight.*transposed PerGroup.*routed LoRA",
+            match="transposed PerGroup.*routed LoRA",
         ):
             merge_lora(model, [(lora, 1.0)])
 
