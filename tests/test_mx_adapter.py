@@ -391,6 +391,7 @@ class TestMxAdapter:
         )
         expected = MxAdapter.requantize(expected_dense, like=mx)
 
+        transform.validate_target(param)
         transform.apply(param)
 
         # copy_into mutates the existing wrapper's storage in place, so the
@@ -708,7 +709,9 @@ class TestMxAdapter:
         param_id = id(target)
         qdata_ptr = target.data.qdata.data_ptr()
         scale_ptr = target.data.scale.data_ptr()
-        LoRATransform(factors).apply(target)
+        transform = LoRATransform(factors)
+        transform.validate_target(target)
+        transform.apply(target)
         torch.cuda.synchronize()
 
         assert calls == 1

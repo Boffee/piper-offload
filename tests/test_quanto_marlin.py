@@ -299,7 +299,6 @@ class TestQuantoScaleLayout:
     @CUDA
     def test_reordered_axis_zero_scale_is_rejected_before_merge(
         self,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         assert WeightQBytesTensor is not None
         rows = cols = 8
@@ -325,33 +324,6 @@ class TestQuantoScaleLayout:
         )
         a = torch.randn(3, cols, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(rows, 3, device="cuda", dtype=torch.bfloat16)
-        fallback_called = False
-
-        def fail_triton(*_args: object) -> torch.Tensor:
-            raise AssertionError("malformed axis-zero scale reached Triton")
-
-        def use_fallback(
-            qt: torch.Tensor,
-            _b: torch.Tensor,
-            _a: torch.Tensor,
-            _strength: float,
-        ) -> torch.Tensor:
-            nonlocal fallback_called
-            fallback_called = True
-            return qt
-
-        monkeypatch.setattr(
-            quanto_adapter_module,
-            "_triton_merge_quanto_qint8_lora",
-            fail_triton,
-        )
-        monkeypatch.setattr(
-            quanto_adapter_module,
-            "_torch_merge_quanto_lora",
-            use_fallback,
-        )
 
         with pytest.raises(ValueError, match=r"shape \(rows, 1\)"):
-            QuantoAdapter.merge_lora_(target, b, a, 0.25)
-
-        assert not fallback_called
+            QuantoAdapter.validate_lora_merge(target, b, a, 0.25)

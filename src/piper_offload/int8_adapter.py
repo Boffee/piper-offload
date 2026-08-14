@@ -307,23 +307,13 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
         logical_shape: tuple[int, ...],
         compute_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
-        """Transform each logical ``A`` before low-precision factor packing."""
+        """Transform validated logical ``A`` factors before packing."""
         qt = require_int8_tensor(target)
         pre_scale = _normalized_act_pre_scale(qt)
         if pre_scale is None:
             # Keep the ordinary zero-overhead staging path for INT8 tensors
             # whose stored and logical weight coordinates are identical.
             return None
-        if tuple(logical_shape) != tuple(qt.shape):
-            raise ValueError(
-                "TorchAO INT8 factor-aware LoRA staging shape does not match "
-                f"the target: staged={logical_shape}, target={tuple(qt.shape)}."
-            )
-        if compute_dtype is not qt.dtype:
-            raise ValueError(
-                "TorchAO INT8 factor-aware LoRA staging dtype does not match "
-                f"the target: staged={compute_dtype}, target={qt.dtype}."
-            )
 
         total_rank = sum(a.shape[0] for _strength, a, _b in factors)
         a_packed = torch.empty(
@@ -354,8 +344,6 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
             b_packed[:, rank_offset:next_offset].copy_(b, non_blocking=True)
             rank_offset = next_offset
 
-        if not bool(torch.isfinite(a_packed).all()):
-            raise ValueError("TorchAO INT8 act_pre_scale produces non-finite stored-coordinate LoRA factors.")
         return b_packed, a_packed, 1.0
 
     @staticmethod
@@ -465,15 +453,8 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        """Merge factor-aware staged data without applying pre-scale twice."""
+        """Merge validated factor-aware data without pre-scaling twice."""
         qt = require_int8_tensor(target)
-        Int8Adapter.validate_prepared_lora_merge(
-            qt,
-            b,
-            a,
-            strength,
-            rounding_seed=rounding_seed,
-        )
         Int8Adapter._merge_stored_lora_(
             qt,
             b,

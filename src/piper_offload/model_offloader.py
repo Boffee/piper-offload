@@ -256,6 +256,9 @@ class ModelOffloader:
                 "for CPU activation."
             )
 
+        params_by_name = dict(
+            self._model.named_parameters(remove_duplicate=False)
+        )
         for param_name, factors in targets.items():
             transform = LoRATransform(
                 factors,
@@ -263,10 +266,14 @@ class ModelOffloader:
                 target_key=param_name,
             )
             bias_name: str | None = None
+            bias: nn.Parameter | None = None
             if transform.has_bias:
                 bias_name = self._require_managed_target(
                     sibling_parameter_name(param_name, "bias"),
                 )
+                bias = params_by_name[bias_name]
+
+            transform.validate_target(params_by_name[param_name], bias)
 
             remove_hook = self._register_post_copy_hook(
                 param_name,

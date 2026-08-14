@@ -309,6 +309,7 @@ class TestPiperConvRotInt8Adapter:
             alpha=0.5,
         )
 
+        transform.validate_target(param)
         transform.apply(param)
 
         assert param is original_param

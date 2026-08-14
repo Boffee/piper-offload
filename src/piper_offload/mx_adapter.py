@@ -279,14 +279,7 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        """Merge a staged LoRA update while preserving target storage."""
-        MxAdapter.validate_lora_merge(
-            target,
-            b,
-            a,
-            strength,
-            rounding_seed=rounding_seed,
-        )
+        """Merge a validated staged update while preserving target storage."""
         mx = require_mx_tensor(target)
         if _can_use_triton_merge(mx, b, a):
             assert _triton_merge_mx_lora_ is not None

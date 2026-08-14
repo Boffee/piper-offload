@@ -770,7 +770,7 @@ class TestActivationLoraValidation:
         ) as active:
             assert active is m
 
-    def test_target_shape_mismatch_is_deferred_until_apply(self) -> None:
+    def test_target_shape_mismatch_is_rejected_before_hooks(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         sd = {
@@ -778,8 +778,12 @@ class TestActivationLoraValidation:
             "transformer_blocks.0.attn.lora_B.weight": torch.randn(8, 4),
         }
         _request_loras(s, [(LoRA.from_state_dict(state_dict=sd), 1.0)])
-        _activate_loras_for_test(s)
-        assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
+        with pytest.raises(ValueError, match="B@A produces"):
+            _activate_loras_for_test(s)
+        assert not _has_post_copy_hook(
+            s,
+            "transformer_blocks.0.attn.weight",
+        )
 
     def test_accepts_fp32_lora_target(self) -> None:
         m = _make_bf16_model().to(torch.float32)
@@ -841,6 +845,35 @@ class TestActivationLoraValidation:
         assert not _has_post_copy_hook(
             s,
             "transformer_blocks.0.attn.weight",
+        )
+
+    def test_legacy_bias_merge_rejects_invalid_base_bias_before_hooks(
+        self,
+    ) -> None:
+        m = _make_bf16_model(num_blocks=1, attn_bias=True)
+        m.transformer_blocks[0].attn.bias = nn.Parameter(
+            torch.randn(1, 16, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        s = _make_strategy(m)
+        lora = _make_lora(
+            num_blocks=1,
+            dim=16,
+            legacy_bias=True,
+        )
+
+        _request_loras(s, [(lora, 0.5)], mode="merge")
+        with pytest.raises(ValueError, match="rank-one base bias"):
+            _activate_loras_for_test(s)
+
+        assert s._lora_hook_removers == []
+        assert not _has_post_copy_hook(
+            s,
+            "transformer_blocks.0.attn.weight",
+        )
+        assert not _has_post_copy_hook(
+            s,
+            "transformer_blocks.0.attn.bias",
         )
 
     def test_non_block_tied_alias_target_matched(self) -> None:
@@ -983,7 +1016,7 @@ class TestActivationLoraValidation:
         route_count = _activate_loras_for_test(s)
         assert route_count == 1
 
-    def test_merge_mode_defers_non_floating_dtype_until_apply(self) -> None:
+    def test_merge_mode_rejects_non_floating_dtype_before_hooks(self) -> None:
         m = _make_bf16_model()
         m.embed.weight = nn.Parameter(
             torch.zeros(16, 16, dtype=torch.int32),
@@ -995,8 +1028,9 @@ class TestActivationLoraValidation:
             "embed.lora_B.weight": torch.randn(16, 4),
         }
         _request_loras(s, [(LoRA.from_state_dict(state_dict=sd), 1.0)], mode="merge")
-        _activate_loras_for_test(s)
-        assert _has_post_copy_hook(s, "embed.weight")
+        with pytest.raises(ValueError, match="floating-point compute dtype"):
+            _activate_loras_for_test(s)
+        assert not _has_post_copy_hook(s, "embed.weight")
 
     def test_accepts_fp16_base(self) -> None:
         m = _make_bf16_model().to(torch.float16)
@@ -1395,6 +1429,59 @@ class TestLoRATransform:
         with pytest.raises(ValueError, match="B@A produces"):
             transform.validate_target(param)
 
+    def test_weight_application_requires_validation(self) -> None:
+        param = nn.Parameter(torch.randn(4, 8), requires_grad=False)
+        transform = LoRATransform(
+            [
+                ScaledLoRAFactor.from_tensors(
+                    torch.randn(2, 8),
+                    torch.randn(4, 2),
+                    0.5,
+                )
+            ]
+        )
+
+        with pytest.raises(RuntimeError, match="validated before application"):
+            transform.apply_weight(param)
+
+    def test_weight_application_reuses_validation_plan(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        param = nn.Parameter(torch.randn(4, 8), requires_grad=False)
+        before = param.detach().clone()
+        a = torch.randn(2, 8)
+        b = torch.randn(4, 2)
+        transform = LoRATransform(
+            [ScaledLoRAFactor.from_tensors(a, b, 0.5)]
+        )
+        transform.validate_weight_target(param)
+
+        def fail_validation(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("application repeated validation")
+
+        monkeypatch.setattr(
+            lora_impl,
+            "_select_lora_merge_adapter",
+            fail_validation,
+        )
+        monkeypatch.setattr(
+            lora_impl,
+            "_validate_factor_shapes",
+            fail_validation,
+        )
+        monkeypatch.setattr(
+            lora_impl,
+            "_validate_lora_merge",
+            fail_validation,
+        )
+
+        transform.apply_weight(param)
+
+        expected = before.clone()
+        expected.addmm_(b, a, alpha=0.5)
+        torch.testing.assert_close(param, expected)
+
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
     def test_regular_transform_mutates_param_in_place(
         self,
@@ -1406,6 +1493,7 @@ class TestLoRATransform:
         b = torch.randn(4, 2, dtype=dtype)
         transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
 
+        transform.validate_target(param)
         transform.apply(param)
 
         expected = before.clone()
@@ -1509,6 +1597,7 @@ class TestLoRATransform:
             staticmethod(tracked_merge),
         )
 
+        transform.validate_target(param)
         transform.apply(param)
 
         expected = before.clone()
@@ -1552,7 +1641,7 @@ class TestLoRATransform:
 
         staged = transform._stage_single_or_packed_update(
             packed_representation,
-            transform._factor_tensors(),
+            transform._materialize_weight_factors(),
             logical_shape=(rows, cols),
             compute_dtype=torch.float16,
         )
@@ -1612,14 +1701,14 @@ class TestLoRATransform:
         with pytest.raises(ValueError, match="does not support LoRA merge"):
             transform.validate_target(param)
 
-    def test_non_floating_compute_dtype_raises_on_apply(self) -> None:
+    def test_non_floating_compute_dtype_raises_on_validation(self) -> None:
         param = nn.Parameter(torch.zeros(4, 8, dtype=torch.int32), requires_grad=False)
         a = torch.randn(2, 8)
         b = torch.randn(4, 2)
         transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
 
         with pytest.raises(ValueError, match="floating-point compute dtype"):
-            transform.apply(param)
+            transform.validate_target(param)
 
     def test_quanto_transform_delegates_cpu_merge_in_place(
         self,
@@ -1681,6 +1770,7 @@ class TestLoRATransform:
             staticmethod(tracked_merge),
         )
 
+        transform.validate_target(param)
         transform.apply(param)
 
         expected_dense.addmm_(
@@ -1826,9 +1916,8 @@ class TestLoRATransform:
             (None, (0, 4), (0,)),
         ],
     )
-    def test_quanto_empty_merge_still_rejects_malformed_scale_layout(
+    def test_quanto_empty_validation_rejects_malformed_scale_layout(
         self,
-        monkeypatch: pytest.MonkeyPatch,
         axis: int | None,
         shape: tuple[int, int],
         scale_shape: tuple[int, ...],
@@ -1850,17 +1939,8 @@ class TestLoRATransform:
         b = torch.randn(rows, 2)
         a = torch.randn(2, cols)
 
-        def fail_generic(*_args: object) -> torch.Tensor:
-            raise AssertionError("malformed empty layout reached generic merge")
-
-        monkeypatch.setattr(
-            quanto_adapter_impl,
-            "_torch_merge_quanto_lora",
-            fail_generic,
-        )
-
         with pytest.raises(ValueError, match="Quanto LoRA merge expects"):
-            QuantoAdapter.merge_lora_(qt, b, a, 0.5)
+            QuantoAdapter.validate_lora_merge(qt, b, a, 0.5)
 
     def test_quanto_empty_requantize_rejects_malformed_reference(
         self,
@@ -1938,8 +2018,6 @@ class TestLoRATransform:
 
         with pytest.raises(ValueError, match="positive LoRA rank"):
             QuantoAdapter.validate_lora_merge(qt, b, a, 1.0)
-        with pytest.raises(ValueError, match="positive LoRA rank"):
-            QuantoAdapter.merge_lora_(qt, b, a, 1.0)
 
         torch.testing.assert_close(qt._data, data_before)
         torch.testing.assert_close(qt._scale, scale_before)

@@ -45,7 +45,9 @@ def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
 
         for shard_dim in (0, 1):
             target = distribute_tensor(weight.clone(), mesh, [Shard(shard_dim)])
-            transform.apply(nn.Parameter(target, requires_grad=False))
+            param = nn.Parameter(target, requires_grad=False)
+            transform.validate_target(param)
+            transform.apply(param)
             torch.testing.assert_close(target.full_tensor(), expected)
 
             direct_target = distribute_tensor(
@@ -78,9 +80,9 @@ def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
                 [Shard(shard_dim)],
             )
 
-            empty_transform.apply(
-                nn.Parameter(empty_target, requires_grad=False)
-            )
+            empty_param = nn.Parameter(empty_target, requires_grad=False)
+            empty_transform.validate_target(empty_param)
+            empty_transform.apply(empty_param)
 
             torch.testing.assert_close(
                 empty_target.full_tensor(),
@@ -189,9 +191,7 @@ def test_transform_localizes_factors_before_staging(
     def record_stage(
         cls: type[LoRATransform],
         data: torch.Tensor,
-        factor_tensors: list[
-            tuple[ScaledLoRAFactor, torch.Tensor, torch.Tensor]
-        ],
+        factors: list[lora_module._MaterializedWeightFactor],
         *,
         logical_shape: tuple[int, ...],
         compute_dtype: torch.dtype,
@@ -199,8 +199,8 @@ def test_transform_localizes_factors_before_staging(
         staged_inputs.append(
             (
                 [
-                    (tuple(a.shape), tuple(b.shape))
-                    for _factor, a, b in factor_tensors
+                    (tuple(factor.a.shape), tuple(factor.b.shape))
+                    for factor in factors
                 ],
                 logical_shape,
             )
@@ -208,7 +208,7 @@ def test_transform_localizes_factors_before_staging(
         return original_stage(
             cls,
             data,
-            factor_tensors,
+            factors,
             logical_shape=logical_shape,
             compute_dtype=compute_dtype,
         )
@@ -232,13 +232,16 @@ def test_transform_localizes_factors_before_staging(
         for a, b, strength in factor_inputs
     ])
 
+    transform.validate_target(target)
     transform.apply(target)
 
+    expected_staging = (
+        [((rank, 3), (4, rank)) for rank in range(2, 2 + factor_count)],
+        (4, 3),
+    )
     assert staged_inputs == [
-        (
-            [((rank, 3), (4, rank)) for rank in range(2, 2 + factor_count)],
-            (4, 3),
-        )
+        expected_staging,  # validation
+        expected_staging,  # application
     ]
     expected = torch.zeros_like(target)
     for a, b, strength in factor_inputs:
@@ -306,6 +309,7 @@ def test_stochastic_merge_forwards_seed_to_local_adapter(
         target_key="sharded.weight",
     )
 
+    transform.validate_target(target)
     transform.apply(target)
 
     expected_seed = dtensor_adapter_module._localize_rounding_seed(

@@ -416,6 +416,7 @@ class TestInt8Adapter:
         )
         expected = Int8Adapter.requantize(expected_dense, like=qt)
 
+        transform.validate_target(param)
         transform.apply(param)
 
         assert param is original_param
@@ -592,7 +593,7 @@ class TestInt8Adapter:
 
         with pytest.raises(
             ValueError,
-            match="non-finite stored-coordinate LoRA factors",
+            match="stored-coordinate LoRA factors must be finite",
         ):
             merge_lora(model, [(lora, 1.0)])
 
@@ -728,7 +729,9 @@ class TestInt8Adapter:
             )
 
         pre_scale_ptr = qt.act_pre_scale.data_ptr()
-        LoRATransform(factors).apply(param)
+        transform = LoRATransform(factors)
+        transform.validate_target(param)
+        transform.apply(param)
         if device == "cuda":
             torch.cuda.synchronize()
 
@@ -973,7 +976,9 @@ class TestInt8Adapter:
             "_triton_merge_int8_lora",
             tracked_triton_merge,
         )
-        LoRATransform(factors).apply(param)
+        transform = LoRATransform(factors)
+        transform.validate_target(param)
+        transform.apply(param)
         torch.cuda.synchronize()
 
         assert calls == [((rows, 8), (8, cols), 1.0)]
@@ -1119,7 +1124,11 @@ class TestInt8Adapter:
                 fail_triton_merge,
             )
 
-        LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)]).apply(param)
+        transform = LoRATransform(
+            [ScaledLoRAFactor.from_tensors(a, b, 0.5)]
+        )
+        transform.validate_target(param)
+        transform.apply(param)
 
         assert param.data.qdata.data_ptr() == qdata_ptr
         assert torch.equal(param.data.qdata, expected.qdata)

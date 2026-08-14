@@ -260,14 +260,7 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        """Merge a staged LoRA update while preserving target storage."""
-        Nvfp4Adapter.validate_lora_merge(
-            target,
-            b,
-            a,
-            strength,
-            rounding_seed=rounding_seed,
-        )
+        """Merge a validated staged update while preserving target storage."""
         nv = require_nvfp4_tensor(target)
         if _is_triton_nvfp4_layout(nv, b, a):
             assert _triton_merge_nvfp4_lora is not None

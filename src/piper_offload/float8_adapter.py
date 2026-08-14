@@ -247,14 +247,7 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        """Merge a staged LoRA update while preserving the target wrapper."""
-        Float8Adapter.validate_lora_merge(
-            target,
-            b,
-            a,
-            strength,
-            rounding_seed=rounding_seed,
-        )
+        """Merge a validated staged update while preserving the wrapper."""
         f8 = require_float8_tensor(target)
         if _is_triton_float8_layout(f8, b, a):
             assert _triton_merge_float8_lora is not None

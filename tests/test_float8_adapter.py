@@ -361,6 +361,7 @@ class TestFloat8Adapter:
             "piper_offload.float8_adapter._triton_merge_float8_lora",
             None,
         )
+        transform.validate_target(param)
         transform.apply(param)
 
         assert torch.equal(
@@ -555,7 +556,9 @@ class TestFloat8Adapter:
             "dequantize_float8_tensor",
             fail_dequantize,
         )
-        LoRATransform(factors).apply(param)
+        transform = LoRATransform(factors)
+        transform.validate_target(param)
+        transform.apply(param)
         torch.cuda.synchronize()
 
         assert calls == [((rows, 8), (8, cols), 1.0)]
@@ -799,6 +802,7 @@ class TestFloat8Adapter:
             granularity=per_row_cls(),
         )
 
+        transform.validate_target(param)
         transform.apply(param)
 
         assert param is original_param

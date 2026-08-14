@@ -101,13 +101,7 @@ class PiperConvRotInt8Adapter(
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        PiperConvRotInt8Adapter.validate_lora_merge(
-            target,
-            b,
-            a,
-            strength,
-            rounding_seed=rounding_seed,
-        )
+        """Merge a validated staged update into ConvRot INT8 storage."""
         require_convrot_int8_tensor(target).addmm_(
             b,
             a,

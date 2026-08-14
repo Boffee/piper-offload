@@ -349,6 +349,7 @@ class TestNvfp4Adapter:
         )
         expected = Nvfp4Adapter.requantize(expected_dense, like=nv)
 
+        transform.validate_target(param)
         transform.apply(param)
 
         # copy_into mutates the existing wrapper's storage in place, so the
@@ -538,7 +539,9 @@ class TestNvfp4Adapter:
             "dequantize_nvfp4_tensor",
             fail_dequantize,
         )
-        LoRATransform(factors).apply(param)
+        transform = LoRATransform(factors)
+        transform.validate_target(param)
+        transform.apply(param)
         torch.cuda.synchronize()
 
         assert calls == [((rows, 8), (8, cols), 1.0)]
@@ -591,7 +594,11 @@ class TestNvfp4Adapter:
             "_triton_merge_nvfp4_lora",
             None,
         )
-        LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)]).apply(param)
+        transform = LoRATransform(
+            [ScaledLoRAFactor.from_tensors(a, b, 0.5)]
+        )
+        transform.validate_target(param)
+        transform.apply(param)
 
         assert torch.equal(param.data.qdata, expected.qdata)
         assert torch.equal(

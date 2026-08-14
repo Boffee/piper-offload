@@ -382,9 +382,8 @@ def test_affine_int8_factor_aware_transform_advances_rounding_seed(
 
     first_seed = _seed(key="int8.prepared.weight")
     second_seed = _seed(key="int8.prepared.weight", merge_index=1)
-    assert validated
+    assert validated == [first_seed]
     assert merged == [first_seed, second_seed]
-    assert set(validated) == {first_seed, second_seed}
     assert torch.isfinite(param.data.dequantize()).all()
     assert torch.equal(param.data.act_pre_scale, pre_scale)
 

@@ -413,6 +413,7 @@ class TestStaticFloat8Adapter:
         )
         expected = StaticFloat8Adapter.requantize(expected_dense, like=f8)
 
+        transform.validate_target(param)
         transform.apply(param)
 
         assert param.data.qdata.data_ptr() == original_qdata_ptr
@@ -464,6 +465,7 @@ class TestStaticFloat8Adapter:
             "piper_offload.static_float8_adapter._triton_merge_static_float8_lora",
             None,
         )
+        transform.validate_target(param)
         transform.apply(param)
 
         assert torch.equal(
@@ -532,6 +534,7 @@ class TestStaticFloat8Adapter:
             staticmethod(fail_dequantize),
         )
         transform = LoRATransform(factors)
+        transform.validate_target(param)
         transform.apply(param)
         torch.cuda.synchronize()
 
@@ -564,6 +567,7 @@ class TestStaticFloat8Adapter:
             ]
         )
 
+        transform.validate_target(param)
         transform.apply(param)
         torch.cuda.synchronize()
 
