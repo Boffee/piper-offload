@@ -502,7 +502,9 @@ class TestBnb8bitAdapter:
             "_torch_merge_bnb8_lora",
             fail_fallback,
         )
-        LoRATransform(factors).apply(target)
+        transform = LoRATransform(factors)
+        transform.validate_target(target)
+        transform.apply(target)
         torch.cuda.synchronize()
 
         assert target.CB.data_ptr() == cb_ptr

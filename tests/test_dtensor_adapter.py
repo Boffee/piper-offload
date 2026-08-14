@@ -477,7 +477,7 @@ class TestDTensorAdapter:
 
         with pytest.raises(
             ValueError,
-            match="second.weight.*transposed PerGroup.*routed LoRA",
+            match="transposed PerGroup.*routed LoRA",
         ):
             merge_lora(model, [(lora, 0.25)])
 
@@ -701,7 +701,9 @@ class TestDTensorAdapter:
         )
 
         pre_scale_ptr = local.act_pre_scale.data_ptr()
-        LoRATransform(factors).apply(param)
+        transform = LoRATransform(factors)
+        transform.validate_target(param)
+        transform.apply(param)
         torch.cuda.synchronize()
 
         assert len(prepared_targets) == 1

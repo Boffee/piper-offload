@@ -23,7 +23,7 @@ from .lora import (
     ScaledLoRAFactor,
     install_routed_residual_hook,
 )
-from .module_names import resolve_parent_leaf
+from .module_names import resolve_parent_leaf, sibling_parameter_name
 
 type _LoraParamMap = dict[str, list[ScaledLoRAFactor]]
 
@@ -256,17 +256,36 @@ class ModelOffloader:
                 "for CPU activation."
             )
 
+        params_by_name = dict(
+            self._model.named_parameters(remove_duplicate=False)
+        )
         for param_name, factors in targets.items():
             transform = LoRATransform(
                 factors,
                 stochastic_rounding=stochastic_rounding,
                 target_key=param_name,
             )
+            bias_name: str | None = None
+            bias: nn.Parameter | None = None
+            if transform.has_bias:
+                bias_name = self._require_managed_target(
+                    sibling_parameter_name(param_name, "bias"),
+                )
+                bias = params_by_name[bias_name]
+
+            transform.validate_target(params_by_name[param_name], bias)
+
             remove_hook = self._register_post_copy_hook(
                 param_name,
-                transform.apply,
+                transform.apply_weight,
             )
             self._lora_hook_removers.append(remove_hook)
+            if bias_name is not None:
+                remove_bias_hook = self._register_post_copy_hook(
+                    bias_name,
+                    transform.apply_bias,
+                )
+                self._lora_hook_removers.append(remove_bias_hook)
 
     def _register_routed_lora_hooks(
         self,

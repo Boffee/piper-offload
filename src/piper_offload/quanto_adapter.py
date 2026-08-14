@@ -404,10 +404,7 @@ class QuantoAdapter:
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        """Merge with Triton when possible, except for packed Marlin targets."""
-        QuantoAdapter.validate_lora_merge(
-            target, b, a, strength, rounding_seed=rounding_seed
-        )
+        """Merge a validated update, except via Triton for Marlin targets."""
         target_qt = require_qbytes_tensor(target)
         qt = canonicalize_qbytes_tensor(target_qt)
         triton_merge = None

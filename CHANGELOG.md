@@ -5,6 +5,16 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-08-14
+
+### Added
+
+- Support optional legacy PEFT `<module>.lora_B.bias` vectors in cached LoRA
+  resources, activation-scoped resident and block-streamed merge, permanent
+  merge, and routed residuals. Modern A/B-only LoRAs retain their existing
+  path; merge requires an existing plain dense base bias, while routed mode
+  remains valid for bias-less `nn.Linear` targets.
+
 ### Changed
 
 - Use stochastic rounding by default when merging LoRA updates into quantized
@@ -83,7 +93,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - Python 3.14, PyTorch 2.13, TorchAO 0.18, Apache-2.0 licensing, and the Piper Offload package
   identity.
 
-[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/Boffee/piper-offload/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/Boffee/piper-offload/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Boffee/piper-offload/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Boffee/piper-offload/compare/v0.2.0...v0.2.1

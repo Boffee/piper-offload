@@ -6,11 +6,17 @@ from torch import nn
 from piper_offload.module_names import (
     named_buffer_entries,
     named_parameter_entries,
+    sibling_parameter_name,
 )
 from piper_offload.tensor_adapter_registry import (
     buffer_tensor_id,
     param_tensor_id,
 )
+
+
+def test_sibling_parameter_name_replaces_leaf() -> None:
+    assert sibling_parameter_name("block.proj.weight", "bias") == "block.proj.bias"
+    assert sibling_parameter_name("weight", "bias") == "bias"
 
 
 def test_named_parameter_entries_return_duplicate_module_paths() -> None:
