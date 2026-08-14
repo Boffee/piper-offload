@@ -7,19 +7,25 @@ format-specific kernel or a dequantize/requantize fallback; requantized
 merges are lossy but standard practice for permanent LoRA merges into
 quantized bases.
 
-This uses the same per-parameter :class:`LoRATransform` as activation
-merge; the permanence comes from applying it to the model's resident
-parameter instead of a freshly loaded activation parameter.
+This uses the same :class:`LoRATransform` as activation merge. Permanent merge
+applies its complete weight-and-optional-bias operation to resident model
+parameters; activation merge invokes its partial operations after individual
+parameter copies.
 """
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from torch import nn
 
-from .lora import LoRA, LoRATransform, ScaledLoRAFactor
+from .lora import (
+    LoRA,
+    LoRATransform,
+    ScaledLoRAFactor,
+    _lora_bias_target_key,
+)
 from .tensor_adapter_registry import param_tensor_id
 
 logger = logging.getLogger(__name__)
@@ -27,26 +33,78 @@ logger = logging.getLogger(__name__)
 __all__ = ["merge_lora"]
 
 
-@dataclass(slots=True)
-class _MergeParamGroup:
+@dataclass(slots=True, frozen=True)
+class _MergeTarget:
+    key: str
     param: nn.Parameter
     tensor_id: tuple[Any, ...]
 
 
 @dataclass(slots=True)
 class _MergeOp:
-    group: _MergeParamGroup
-    target_key: str
+    weight: _MergeTarget
     factors: list[ScaledLoRAFactor]
     stochastic_rounding: bool
+    bias: _MergeTarget | None = field(init=False, default=None)
 
     @property
     def transform(self) -> LoRATransform:
         return LoRATransform(
             self.factors,
             stochastic_rounding=self.stochastic_rounding,
-            target_key=self.target_key,
+            target_key=self.weight.key,
         )
+
+    def resolve_bias(
+        self,
+        params_by_target: dict[str, nn.Parameter],
+        bias_owner_by_tensor_id: dict[tuple[Any, ...], str],
+    ) -> None:
+        """Bind the optional base bias and reject tied-bias ambiguity."""
+        if not self.transform.has_bias:
+            return
+
+        bias_key = _lora_bias_target_key(self.weight.key)
+        bias_param = params_by_target.get(bias_key)
+        if bias_param is None:
+            raise ValueError(
+                f"Cannot merge legacy LoRA bias for {self.weight.key!r}: "
+                f"the model has no base bias parameter {bias_key!r}. "
+                "Use routed LoRA for a bias-less base layer."
+            )
+
+        tensor_id = param_tensor_id(bias_param)
+        previous_owner = bias_owner_by_tensor_id.setdefault(
+            tensor_id,
+            self.weight.key,
+        )
+        if previous_owner != self.weight.key:
+            raise ValueError(
+                f"LoRA targets {previous_owner!r} and {self.weight.key!r} "
+                "resolve to the same tied base-bias backing. Apply only "
+                "one logical target for a tied bias."
+            )
+        self.bias = _MergeTarget(bias_key, bias_param, tensor_id)
+
+    def validate(self) -> None:
+        """Preflight this operation's weight and optional bias."""
+        bias_param = None if self.bias is None else self.bias.param
+        try:
+            self.transform.validate_target(self.weight.param, bias_param)
+        except ValueError as exc:
+            raise ValueError(
+                f"Cannot merge LoRA into {self.weight.key!r}: {exc}",
+            ) from exc
+
+    def apply(self) -> None:
+        """Apply this operation's weight and optional bias updates."""
+        bias_param = None if self.bias is None else self.bias.param
+        try:
+            self.transform.apply(self.weight.param, bias_param)
+        except ValueError as exc:
+            raise ValueError(
+                f"Cannot merge LoRA into {self.weight.key!r}: {exc}",
+            ) from exc
 
 
 def merge_lora(
@@ -107,22 +165,22 @@ def _merge_loras(
             f"Sample model parameter keys: {sample} ..."
         )
 
-    param_groups_by_tensor_id: dict[tuple[Any, ...], _MergeParamGroup] = {}
     merge_ops_by_tensor_id: dict[tuple[Any, ...], _MergeOp] = {}
     for lora, strength in loras:
         for target_key, factor in lora.targets.items():
             param = params_by_target[target_key]
-            group = _param_group_for_param(
-                param,
-                param_groups_by_tensor_id,
-            )
-            op = merge_ops_by_tensor_id.get(group.tensor_id)
+            tensor_id = param_tensor_id(param)
+            op = merge_ops_by_tensor_id.get(tensor_id)
             if op is None:
-                op = _MergeOp(group, target_key, [], stochastic_rounding)
-                merge_ops_by_tensor_id[group.tensor_id] = op
-            elif op.target_key != target_key:
+                op = _MergeOp(
+                    _MergeTarget(target_key, param, tensor_id),
+                    [],
+                    stochastic_rounding,
+                )
+                merge_ops_by_tensor_id[tensor_id] = op
+            elif op.weight.key != target_key:
                 raise ValueError(
-                    f"LoRA targets {op.target_key!r} and {target_key!r} "
+                    f"LoRA targets {op.weight.key!r} and {target_key!r} "
                     f"resolve to the same tied parameter backing. Apply "
                     f"only one name for a tied weight in a single "
                     f"merge_lora() call; otherwise the same base weight "
@@ -131,28 +189,35 @@ def _merge_loras(
             op.factors.append(factor.scaled(strength))
 
     merge_ops = list(merge_ops_by_tensor_id.values())
+    bias_owner_by_tensor_id: dict[tuple[Any, ...], str] = {}
+    for op in merge_ops:
+        op.resolve_bias(params_by_target, bias_owner_by_tensor_id)
 
     # Preflight every operation before applying any of them. This catches all
     # expected name, shape, and adapter-capability errors without leaving a
     # permanently half-merged model.
     for op in merge_ops:
-        try:
-            op.transform.validate_target(op.group.param)
-        except ValueError as exc:
-            raise ValueError(f"Cannot merge LoRA into {op.target_key!r}: {exc}") from exc
+        op.validate()
 
     for op in merge_ops:
-        try:
-            op.transform.apply(op.group.param)
-        except ValueError as exc:
-            raise ValueError(f"Cannot merge LoRA into {op.target_key!r}: {exc}") from exc
+        op.apply()
+
+    bias_count = sum(op.bias is not None for op in merge_ops)
+    modified_tensor_ids = {op.weight.tensor_id for op in merge_ops}
+    modified_tensor_ids.update(
+        op.bias.tensor_id
+        for op in merge_ops
+        if op.bias is not None
+    )
 
     logger.info(
-        "merge_lora: merged %d unique parameters from %d LoRA targets",
+        "merge_lora: merged %d unique parameters (%d weights, %d biases) from %d LoRA targets",
+        len(modified_tensor_ids),
         len(merge_ops),
+        bias_count,
         sum(len(lora.targets) for lora, _ in loras),
     )
-    return len(merge_ops)
+    return len(modified_tensor_ids)
 
 
 def _collect_params_by_target(model: nn.Module) -> dict[str, nn.Parameter]:
@@ -160,17 +225,3 @@ def _collect_params_by_target(model: nn.Module) -> dict[str, nn.Parameter]:
     for name, param in model.named_parameters(remove_duplicate=False):
         params_by_target[name] = param
     return params_by_target
-
-
-def _param_group_for_param(
-    target_param: nn.Parameter,
-    param_groups_by_tensor_id: dict[tuple[Any, ...], _MergeParamGroup],
-) -> _MergeParamGroup:
-    tensor_id = param_tensor_id(target_param)
-    group = param_groups_by_tensor_id.get(tensor_id)
-    if group is not None:
-        return group
-
-    group = _MergeParamGroup(target_param, tensor_id)
-    param_groups_by_tensor_id[tensor_id] = group
-    return group

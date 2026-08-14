@@ -1,20 +1,24 @@
 """LoRA types and per-weight merge / routed transforms.
 
 :class:`LoRA` pairs and validates factor matrices from a flat safetensors state
-dict at construction. By default it owns pinned copies; strict adoption mode
-instead adopts existing CPU allocations, including mmap-backed storage. Merge
-and routed consumers may share either immutable host backing.
+dict at construction. Legacy PEFT ``lora_B.bias`` vectors are retained as an
+optional third tensor on their factor pair. By default the resource owns pinned
+copies; strict adoption mode instead adopts existing CPU allocations, including
+mmap-backed storage. Merge and routed consumers may share either immutable host
+backing.
 
 Two application paths apply the resource's factors:
 
-- :class:`LoRATransform` (merge mode) — applied to the GPU parameter
-  after DMA; integrates with block streaming. Stages the factors and delegates
-  the in-place update to the target tensor's adapter.
+- :class:`LoRATransform` (merge mode) — represents the joint weight and
+  optional bias update. Permanent merge applies it as one logical operation;
+  block streaming invokes its partial weight and bias operations after each
+  parameter's DMA. Weight updates delegate to the target tensor's adapter.
 - routed mode (:func:`install_routed_residual_hook`) — a forward-PRE hook
   copies the target's factors from pinned CPU storage to the input device for
   that invocation; a forward-POST hook adds
-  ``strength * (x @ A.T) @ B.T`` to the layer's output and drops those device
-  copies. The base weight is not touched in place. Restricted to ``nn.Linear``
+  ``strength * ((x @ A.T) @ B.T + bias)`` to the layer's output and
+  drops those device copies. The base weight is not touched in place.
+  Restricted to ``nn.Linear``
   parents (other layer types raise); shared weight storage is allowed (the
   hook targets the matched module, not the weight bytes). Factors are cast to
   the layer's output dtype before the residual, so quantized bases work as
@@ -24,10 +28,9 @@ Two application paths apply the resource's factors:
 
 :class:`~piper_offload.ModelOffloader` is the consumer-facing API; its
 ``activate(..., loras=..., lora_mode=...)`` receives the requested path once
-the device is known. The merge path runs
-:class:`LoRATransform` from an activation-scoped post-copy hook; the
-routed path lives as forward hooks installed on activate and removed
-on deactivate.
+the device is known. The merge path runs :class:`LoRATransform` partial
+operations from activation-scoped post-copy hooks; the routed path lives as
+forward hooks installed on activate and removed on deactivate.
 """
 
 from collections.abc import Callable, Mapping, Sequence
@@ -112,10 +115,12 @@ class _FactorAwareLoRAMergeAdapter(Protocol):
 
 @dataclass(slots=True, frozen=True)
 class LoRAFactor:
-    """A LoRA's host-backed factor pair for one target weight.
+    """A LoRA's host-backed tensors for one target weight.
 
     ``a`` is the ``(rank, in_dim)`` down-projection and ``b`` the
     ``(out_dim, rank)`` up-projection, each held as a :class:`PinnedParam`.
+    ``bias`` optionally carries a legacy PEFT ``lora_B.bias`` vector of
+    length ``out_dim``. Modern A/B-only LoRAs leave it as ``None``.
     Strength is *not* part of the pair — it is extrinsic and supplied when the
     LoRA is bound to a target. Per-pair shape
     validity is checked before capture (in :func:`_validate_factor_pair`); the
@@ -129,26 +134,29 @@ class LoRAFactor:
 
     a: PinnedParam
     b: PinnedParam
+    bias: PinnedParam | None = None
 
     @property
     def cache_bytes(self) -> int:
-        """Host-backing bytes held by this factor pair."""
-        return self.a.cache_bytes + self.b.cache_bytes
+        """Host-backing bytes held by this target's adapter tensors."""
+        bias_bytes = 0 if self.bias is None else self.bias.cache_bytes
+        return self.a.cache_bytes + self.b.cache_bytes + bias_bytes
 
     def scaled(self, strength: float) -> ScaledLoRAFactor:
         """Bind this host-backed factor pair to ``strength``."""
-        return ScaledLoRAFactor(self.a, self.b, strength)
+        return ScaledLoRAFactor(self.a, self.b, strength, self.bias)
 
 
 @dataclass(slots=True, frozen=True)
 class ScaledLoRAFactor:
-    """A host-backed factor pair bound to an application ``strength``.
+    """Host-backed LoRA tensors bound to an application ``strength``.
 
     The application-side carrier used by :class:`LoRATransform` and routed
     hooks. Keeping :class:`PinnedParam` rather than CPU tensor views preserves
     adapter-specific reconstruction metadata such as a ``DTensor``'s original
     device mesh. The contribution to the base weight is
-    ``strength * (b @ a)``.
+    ``strength * (b @ a)``. When ``bias`` is present, the corresponding
+    output contribution is ``strength * bias``.
 
     Use :meth:`from_tensors` when constructing a standalone transform from
     unpinned tensors. LoRA resources normally create this through
@@ -158,11 +166,25 @@ class ScaledLoRAFactor:
     a: PinnedParam
     b: PinnedParam
     strength: float
+    bias: PinnedParam | None = None
 
     def __post_init__(self) -> None:
-        if len(self.a.shape) != 2 or len(self.b.shape) != 2 or self.a.shape[0] != self.b.shape[1]:
+        if (
+            len(self.a.shape) != 2
+            or len(self.b.shape) != 2
+            or self.a.shape[0] != self.b.shape[1]
+        ):
             raise ValueError(
                 f"LoRA factor shape mismatch: A shape is {tuple(self.a.shape)}, B shape is {tuple(self.b.shape)}."
+            )
+        if self.bias is not None and (
+            len(self.bias.shape) != 1
+            or self.bias.shape[0] != self.b.shape[0]
+        ):
+            raise ValueError(
+                "LoRA bias shape mismatch: "
+                f"bias shape is {tuple(self.bias.shape)}, "
+                f"B shape is {tuple(self.b.shape)}. Expected bias=(out_dim,)."
             )
 
     @classmethod
@@ -171,12 +193,16 @@ class ScaledLoRAFactor:
         a: torch.Tensor,
         b: torch.Tensor,
         strength: float,
+        bias: torch.Tensor | None = None,
     ) -> Self:
-        """Pin an unbound tensor pair and bind it to ``strength``."""
+        """Pin unbound adapter tensors and bind them to ``strength``."""
         return cls(
             PinnedParam(nn.Parameter(a, requires_grad=False)),
             PinnedParam(nn.Parameter(b, requires_grad=False)),
             strength,
+            None
+            if bias is None
+            else PinnedParam(nn.Parameter(bias, requires_grad=False)),
         )
 
     @property
@@ -267,13 +293,19 @@ class LoRA:
 
 
 class LoRATransform:
-    """Per-weight LoRA factors applied to one base parameter.
+    """LoRA factors applied to a base weight and optional base bias.
 
     Holds references to LoRA-owned host factor matrices — no cloning or
-    pinning happens here. :meth:`apply` copies factors to the target
-    parameter's device and delegates the update to its tensor adapter. Multiple
-    ordinary factors are packed into transient buffers and applied as one
-    update. The target :class:`~torch.nn.Parameter` object is always preserved.
+    pinning happens here. :meth:`apply` performs the complete logical update
+    across the weight and optional bias. Multiple ordinary factors are packed
+    into transient buffers and applied as one weight update. The explicit
+    :meth:`apply_weight` and :meth:`apply_bias` partial operations support
+    offload paths where those parameters are copied independently. Target
+    :class:`~torch.nn.Parameter` objects are always preserved.
+
+    Validation is an explicit phase: call :meth:`validate_target` before a
+    joint :meth:`apply`, or the corresponding partial validation method before
+    a partial application when the caller requires non-mutating preflight.
     """
 
     __slots__ = (
@@ -304,12 +336,31 @@ class LoRATransform:
             return None
         return derive_seed(self._target_key, self._merge_index)
 
-    def validate_target(self, param: nn.Parameter) -> None:
-        """Raise if ``param`` cannot receive this LoRA merge.
+    def validate_target(
+        self,
+        weight: nn.Parameter,
+        bias: nn.Parameter | None = None,
+    ) -> None:
+        """Preflight the complete weight and optional bias update.
 
-        This is an optional preflight for callers that want an earlier
-        error. :meth:`apply` uses the same validation path immediately
-        before mutating the target parameter.
+        A transform containing adapter bias requires an explicit base ``bias``
+        target. Modern weight-only transforms continue to accept only
+        ``weight``.
+        """
+        self.validate_weight_target(weight)
+        if not self.has_bias:
+            return
+        if bias is None:
+            raise ValueError(
+                "LoRA transform contains a bias but no base bias target was provided."
+            )
+        self.validate_bias_target(bias)
+
+    def validate_weight_target(self, param: nn.Parameter) -> None:
+        """Raise if ``param`` cannot receive this LoRA weight update.
+
+        This is an optional preflight for callers that need validation to be
+        separate from application.
         """
         representation = param_representation(param)
         adapter = _select_lora_merge_adapter(representation)
@@ -346,7 +397,23 @@ class LoRATransform:
             rounding_seed=rounding_seed,
         )
 
-    def apply(self, param: nn.Parameter) -> None:
+    def apply(
+        self,
+        weight: nn.Parameter,
+        bias: nn.Parameter | None = None,
+    ) -> None:
+        """Apply the complete update after any caller-required preflight."""
+        has_bias = self.has_bias
+        if has_bias and bias is None:
+            raise ValueError(
+                "LoRA transform contains a bias but no base bias target was provided."
+            )
+        self.apply_weight(weight)
+        if has_bias and bias is not None:
+            self.apply_bias(bias)
+
+    def apply_weight(self, param: nn.Parameter) -> None:
+        """Apply only this transform's weight update to ``param``."""
         # Operate on the representation tensor: ``param.data`` for plain and
         # wrapped-quant parameters, but the param itself for a Parameter
         # subclass whose ``.data`` is lossy (bitsandbytes Params4bit).
@@ -363,6 +430,65 @@ class LoRATransform:
             rounding_seed=rounding_seed,
         )
         self._merge_index += 1
+
+    @property
+    def has_bias(self) -> bool:
+        """Whether any factor includes a legacy ``lora_B.bias`` vector."""
+        return any(factor.bias is not None for factor in self._factors)
+
+    def validate_bias_target(self, param: nn.Parameter) -> None:
+        """Raise unless ``param`` can receive this transform's bias update."""
+        if not self.has_bias:
+            raise ValueError("LoRA bias merge requires at least one bias")
+
+        target = param_representation(param)
+        if type(target) is not torch.Tensor:
+            raise ValueError(
+                "LoRA bias merge requires a plain dense base bias; "
+                f"got {type(target).__name__}."
+            )
+        if not target.is_floating_point():
+            raise ValueError(
+                "LoRA bias merge requires a floating-point base bias; "
+                f"got {target.dtype}."
+            )
+        if target.dim() != 1:
+            raise ValueError(
+                "LoRA bias merge requires a rank-one base bias; "
+                f"got shape {tuple(target.shape)}."
+            )
+
+        for factor in self._factors:
+            if factor.bias is None:
+                continue
+            source = param_representation(factor.bias.make_cpu_param())
+            if type(source) is not torch.Tensor or source.device.type != "cpu":
+                raise ValueError(
+                    "LoRA bias merge requires a plain CPU adapter bias; "
+                    f"got {type(source).__name__} on {source.device}."
+                )
+            if tuple(source.shape) != tuple(target.shape):
+                raise ValueError(
+                    "LoRA bias shape mismatch: "
+                    f"adapter bias shape is {tuple(source.shape)}, "
+                    f"base bias shape is {tuple(target.shape)}."
+                )
+
+    def apply_bias(self, param: nn.Parameter) -> None:
+        """Apply only the bias update to a previously validated base bias."""
+        target = param_representation(param)
+        delta = torch.zeros_like(target)
+        for factor in self._factors:
+            if factor.bias is None:
+                continue
+            source = param_representation(factor.bias.make_cpu_param())
+            staged = source.to(
+                device=target.device,
+                dtype=target.dtype,
+                non_blocking=True,
+            )
+            delta.add_(staged, alpha=factor.strength)
+        target.add_(delta)
 
     def _factor_tensors(
         self,
@@ -648,11 +774,12 @@ def _validate_lora_merge(
 
 @dataclass(slots=True, frozen=True)
 class _StagedLoRAFactor:
-    """Adapter-materialized factor pair owned for one forward invocation."""
+    """Adapter tensors materialized for one forward invocation."""
 
     a: nn.Parameter
     b: nn.Parameter
     strength: float
+    bias: nn.Parameter | None = None
 
 
 def _routed_residual(
@@ -660,7 +787,7 @@ def _routed_residual(
     factors: Sequence[_StagedLoRAFactor],
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Routed contribution ``Σ strength_i · (x @ A_i.T) @ B_i.T``.
+    """Routed contribution ``Σ strength_i · ((x @ A_i.T) @ B_i.T + bias_i)``.
 
     Strength scales the intermediate ``M·r`` projection (cheaper than scaling
     the ``M·out`` result, and keeps it extrinsic to the stored factors rather
@@ -675,6 +802,11 @@ def _routed_residual(
         a = param_representation(factor.a).to(dtype=output_dtype)
         b = param_representation(factor.b).to(dtype=output_dtype)
         part = ((x_compute @ a.T) * factor.strength) @ b.T
+        if factor.bias is not None:
+            bias = param_representation(factor.bias).to(
+                dtype=output_dtype,
+            )
+            part = part + bias * factor.strength
         total = part if total is None else total + part
     if total is None:
         raise ValueError("Routed LoRA residual requires at least one factor")
@@ -709,6 +841,9 @@ def _stage_routed_factors(
             factor.a.materialize(x.device, non_blocking=True),
             factor.b.materialize(x.device, non_blocking=True),
             factor.strength,
+            None
+            if factor.bias is None
+            else factor.bias.materialize(x.device, non_blocking=True),
         )
         for factor in factors
     )
@@ -792,13 +927,19 @@ def _build_lora_targets(
     dtype: torch.dtype | None = None,
     pin_memory: bool = True,
 ) -> Mapping[str, LoRAFactor]:
-    """Build each validated factor pair without a module hierarchy."""
-    a_tensors, b_tensors = _split_factor_tensors(state_dict)
+    """Build each validated adapter target without a module hierarchy."""
+    a_tensors, b_tensors, bias_tensors = _split_factor_tensors(state_dict)
     factors: dict[str, LoRAFactor] = {}
     for base, a_source in a_tensors.items():
         b_source = b_tensors[base]
+        bias_source = bias_tensors.get(base)
         a_tensor = a_source if dtype is None or a_source.dtype is dtype else a_source.to(dtype=dtype)
         b_tensor = b_source if dtype is None or b_source.dtype is dtype else b_source.to(dtype=dtype)
+        bias_tensor = (
+            bias_source
+            if bias_source is None or dtype is None or bias_source.dtype is dtype
+            else bias_source.to(dtype=dtype)
+        )
         factors[f"{base}.weight"] = LoRAFactor(
             a=PinnedParam(
                 nn.Parameter(a_tensor, requires_grad=False),
@@ -806,6 +947,12 @@ def _build_lora_targets(
             ),
             b=PinnedParam(
                 nn.Parameter(b_tensor, requires_grad=False),
+                pin_memory=pin_memory,
+            ),
+            bias=None
+            if bias_tensor is None
+            else PinnedParam(
+                nn.Parameter(bias_tensor, requires_grad=False),
                 pin_memory=pin_memory,
             ),
         )
@@ -820,10 +967,15 @@ def _validate_adopted_lora_dtype(
     """Reject a requested conversion that would defeat source adoption."""
     if dtype is None:
         return
-    a_tensors, b_tensors = _split_factor_tensors(state_dict)
+    a_tensors, b_tensors, bias_tensors = _split_factor_tensors(state_dict)
+    tensors_by_suffix = (
+        ("A.weight", a_tensors),
+        ("B.weight", b_tensors),
+        ("B.bias", bias_tensors),
+    )
     incompatible = [
-        f"{base}.lora_{side}.weight"
-        for side, tensors in (("A", a_tensors), ("B", b_tensors))
+        f"{base}.lora_{suffix}"
+        for suffix, tensors in tensors_by_suffix
         for base, tensor in tensors.items()
         if tensor.dtype is not dtype
     ]
@@ -840,9 +992,11 @@ def _validate_lora_state_dict(state_dict: dict[str, torch.Tensor]) -> None:
     """Check ``state_dict`` is a well-formed LoRA before it is built.
 
     Every target needs a paired ``lora_A`` / ``lora_B`` and each factor must be
-    a 2-D floating-point matrix with a matching inner rank.
+    a 2-D floating-point matrix with a matching inner rank. A legacy
+    ``lora_B.bias`` is optional, but must accompany a complete pair and match
+    B's output dimension.
     """
-    a_tensors, b_tensors = _split_factor_tensors(state_dict)
+    a_tensors, b_tensors, bias_tensors = _split_factor_tensors(state_dict)
 
     if not a_tensors and not b_tensors:
         raise ValueError("LoRA state_dict contains no factor pairs")
@@ -856,27 +1010,48 @@ def _validate_lora_state_dict(state_dict: dict[str, torch.Tensor]) -> None:
             f".lora_A.weight and .lora_B.weight."
         )
 
+    bias_only = set(bias_tensors) - set(a_tensors)
+    if bias_only:
+        raise ValueError(
+            "Unpaired LoRA biases: "
+            f"{sorted(bias_only)}. Each .lora_B.bias must accompany "
+            "a complete .lora_A.weight / .lora_B.weight pair."
+        )
+
     for base_key, a in a_tensors.items():
-        _validate_factor_pair(f"{base_key}.weight", a, b_tensors[base_key])
+        _validate_factor_pair(
+            f"{base_key}.weight",
+            a,
+            b_tensors[base_key],
+            bias_tensors.get(base_key),
+        )
 
 
 def _split_factor_tensors(
     state_dict: dict[str, torch.Tensor],
-) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+) -> tuple[
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+]:
     a_tensors: dict[str, torch.Tensor] = {}
     b_tensors: dict[str, torch.Tensor] = {}
+    bias_tensors: dict[str, torch.Tensor] = {}
     for key, tensor in state_dict.items():
         if key.endswith(".lora_A.weight"):
             a_tensors[key[: -len(".lora_A.weight")]] = tensor
         elif key.endswith(".lora_B.weight"):
             b_tensors[key[: -len(".lora_B.weight")]] = tensor
-    return a_tensors, b_tensors
+        elif key.endswith(".lora_B.bias"):
+            bias_tensors[key[: -len(".lora_B.bias")]] = tensor
+    return a_tensors, b_tensors, bias_tensors
 
 
 def _validate_factor_pair(
     target_key: str,
     a: torch.Tensor,
     b: torch.Tensor,
+    bias: torch.Tensor | None = None,
 ) -> None:
     if not a.is_floating_point() or not b.is_floating_point():
         raise ValueError(
@@ -889,3 +1064,25 @@ def _validate_factor_pair(
             f"Expected A=(rank, in_dim), B=(out_dim, rank) with "
             f"A.shape[0] == B.shape[1]."
         )
+    if bias is None:
+        return
+    if not bias.is_floating_point():
+        raise ValueError(
+            f"LoRA bias for {target_key!r} must be floating-point; "
+            f"got dtype={bias.dtype}."
+        )
+    if bias.dim() != 1 or bias.shape[0] != b.shape[0]:
+        raise ValueError(
+            f"LoRA bias shape mismatch for {target_key!r}: "
+            f"bias.shape={tuple(bias.shape)}, B.shape={tuple(b.shape)}. "
+            "Expected bias=(out_dim,) with bias.shape[0] == B.shape[0]."
+        )
+
+
+def _lora_bias_target_key(weight_target_key: str) -> str:
+    """Return the sibling base-bias key for a canonical LoRA weight target."""
+    if not weight_target_key.endswith(".weight"):
+        raise ValueError(
+            f"LoRA target {weight_target_key!r} does not end in '.weight'."
+        )
+    return f"{weight_target_key.removesuffix('.weight')}.bias"

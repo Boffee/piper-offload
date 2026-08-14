@@ -376,6 +376,20 @@ is resolved during activation; target
 compatibility can be preflighted with `LoRATransform.validate_target()`
 or validated when the merge hook applies.
 
+For backward compatibility, older PEFT/Wan adapters may include an optional
+`<module>.lora_B.bias` vector alongside their A/B matrices. `LoRA` detects and
+stores that vector automatically; modern A/B-only adapters keep the existing
+path unchanged. Merge mode applies the vector to the module's existing plain
+dense bias with the same adapter strength. It raises before mutation when the
+legacy vector targets a bias-less module instead of materializing a new model
+parameter. Direct `LoRATransform` use treats this as one logical operation via
+`validate_target(weight, bias)` followed by `apply(weight, bias)`; validation
+and application remain explicit phases. Offloaded activation uses separate
+weight and bias post-copy callbacks so neither update can be overwritten by a
+later parameter copy. Routed mode can apply the vector as part of its output
+residual even when the base `nn.Linear` has no bias. Native Wan/ComfyUI `.diff_b`
+conversion remains the caller's responsibility.
+
 ```python
 import torch
 from piper_offload import ModelOffloader, LoRA
@@ -465,11 +479,12 @@ the previous merge — no explicit unmerge step needed.
 
 Pass `lora_mode="routed"` as an alternative to the default merge mode.
 Routed mode installs a forward hook pair on each matched
-`nn.Linear` parent — `y = base(x) + alpha * B * A * x` — instead of merging
-into the base weight. Its PRE hook copies only that target's factors from
-pinned CPU storage to the invocation's input device; its POST hook applies
-the residual and releases those device tensors. Multiple LoRAs on one target
-are grouped into one hook pair and summed independently. **Routed mode is
+`nn.Linear` parent — `y = base(x) + alpha * (B * A * x + bias)` when a legacy
+bias is present — instead of merging into the base weight. Its PRE hook
+copies only that target's adapter tensors from pinned CPU storage to the
+invocation's input device; its POST hook applies the residual and releases
+those device tensors. Multiple LoRAs on one target are grouped into one hook
+pair and summed independently. **Routed mode is
 inference-only:** factors are frozen (`requires_grad=False`) and no gradient
 flows to them. LoRA backing is immutable, so merge and routed uses may overlap
 across model runtimes. Use routed mode when:

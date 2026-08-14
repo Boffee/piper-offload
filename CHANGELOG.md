@@ -5,6 +5,14 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Support optional legacy PEFT `<module>.lora_B.bias` vectors in cached LoRA
+  resources, activation-scoped resident and block-streamed merge, permanent
+  merge, and routed residuals. Modern A/B-only LoRAs retain their existing
+  path; merge requires an existing plain dense base bias, while routed mode
+  remains valid for bias-less `nn.Linear` targets.
+
 ### Changed
 
 - Use stochastic rounding by default when merging LoRA updates into quantized

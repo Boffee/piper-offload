@@ -69,6 +69,13 @@ def _factor_tensors(factor: LoRAFactor) -> tuple[torch.Tensor, torch.Tensor]:
     return factor.a.make_cpu_param().data, factor.b.make_cpu_param().data
 
 
+def _factor_bias(factor: LoRAFactor) -> torch.Tensor | None:
+    """Materialize a legacy bias, when present, as a CPU tensor."""
+    if factor.bias is None:
+        return None
+    return factor.bias.make_cpu_param().data
+
+
 def _quanto_absmax_oracle(
     dense: torch.Tensor,
     *,
@@ -109,13 +116,18 @@ def _make_model_offloader(
     )
 
 
-def _make_bf16_model(num_blocks: int = 4, dim: int = 16) -> nn.Module:
+def _make_bf16_model(
+    num_blocks: int = 4,
+    dim: int = 16,
+    *,
+    attn_bias: bool = False,
+) -> nn.Module:
     """Tiny block-streaming-shaped model with bf16 frozen params."""
 
     class Block(nn.Module):
         def __init__(self, dim: int) -> None:
             super().__init__()
-            self.attn = nn.Linear(dim, dim, bias=False)
+            self.attn = nn.Linear(dim, dim, bias=attn_bias)
             self.ff = nn.Linear(dim, dim, bias=False)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -180,6 +192,8 @@ def _make_lora_sd(
     rank: int = 4,
     seed: int = 0,
     prefix: str = "",
+    *,
+    legacy_bias: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Build a flat safetensors-style state dict targeting attn.weight."""
     g = torch.Generator().manual_seed(seed)
@@ -198,6 +212,12 @@ def _make_lora_sd(
             generator=g,
             dtype=torch.float32,
         )
+        if legacy_bias:
+            sd[f"{base}.lora_B.bias"] = torch.randn(
+                dim,
+                generator=g,
+                dtype=torch.float32,
+            )
     return sd
 
 
@@ -207,9 +227,18 @@ def _make_lora(
     rank: int = 4,
     seed: int = 0,
     prefix: str = "",
+    *,
+    legacy_bias: bool = False,
 ) -> LoRA:
     """Build a LoRA targeting attn.weight across all blocks."""
-    sd = _make_lora_sd(num_blocks, dim, rank=rank, seed=seed, prefix=prefix)
+    sd = _make_lora_sd(
+        num_blocks,
+        dim,
+        rank=rank,
+        seed=seed,
+        prefix=prefix,
+        legacy_bias=legacy_bias,
+    )
     return LoRA.from_state_dict(state_dict=sd)
 
 
@@ -277,7 +306,12 @@ def _expected_routed_output(
     """Manual routed baseline using F.linear to bypass installed hooks."""
     h = F.linear(x, model.embed.weight.to(x.device))
     for i, blk in enumerate(model.transformer_blocks):
-        base_attn = F.linear(h, blk.attn.weight.to(h.device))
+        base_bias = blk.attn.bias
+        base_attn = F.linear(
+            h,
+            blk.attn.weight.to(h.device),
+            None if base_bias is None else base_bias.to(h.device),
+        )
         target_name = f"transformer_blocks.{i}.attn.weight"
         a_parts = []
         b_parts = []
@@ -290,6 +324,16 @@ def _expected_routed_output(
             b_part = b.to(device=h.device, dtype=h.dtype).clone()
             b_part.mul_(strength)
             b_parts.append(b_part)
+            bias = _factor_bias(factors)
+            if bias is not None:
+                base_attn = (
+                    base_attn
+                    + bias.to(
+                        device=h.device,
+                        dtype=h.dtype,
+                    )
+                    * strength
+                )
         if a_parts:
             a_fused = torch.cat(a_parts, dim=0)
             b_fused = torch.cat(b_parts, dim=1)
@@ -400,6 +444,75 @@ class TestLoRAConstruction:
         }
         with pytest.raises(ValueError, match="shape mismatch"):
             LoRA.from_state_dict(state_dict=sd)
+
+    def test_accepts_optional_legacy_bias(self) -> None:
+        sd = _make_lora_sd(
+            num_blocks=1,
+            dim=16,
+            rank=4,
+            legacy_bias=True,
+        )
+
+        lora = LoRA.from_state_dict(state_dict=sd)
+        factor = lora.targets["transformer_blocks.0.attn.weight"]
+        bias = _factor_bias(factor)
+
+        assert bias is not None
+        assert tuple(bias.shape) == (16,)
+        assert bias.is_pinned()
+        assert lora.cache_bytes == sum(tensor.nbytes for tensor in sd.values())
+
+    def test_rejects_unpaired_legacy_bias(self) -> None:
+        sd = _make_lora_sd(num_blocks=1, dim=16, rank=4)
+        sd["other.lora_B.bias"] = torch.randn(16)
+
+        with pytest.raises(ValueError, match="Unpaired LoRA biases"):
+            LoRA.from_state_dict(state_dict=sd)
+
+    @pytest.mark.parametrize(
+        "bias",
+        [
+            torch.zeros(16, dtype=torch.int32),
+            torch.randn(2, 8),
+            torch.randn(8),
+        ],
+    )
+    def test_rejects_invalid_legacy_bias(
+        self,
+        bias: torch.Tensor,
+    ) -> None:
+        sd = _make_lora_sd(num_blocks=1, dim=16, rank=4)
+        sd["transformer_blocks.0.attn.lora_B.bias"] = bias
+
+        with pytest.raises(ValueError, match="LoRA bias"):
+            LoRA.from_state_dict(state_dict=sd)
+
+    def test_legacy_bias_obeys_dtype_and_adoption_policy(self) -> None:
+        sd = _make_lora_sd(
+            num_blocks=1,
+            dim=16,
+            rank=4,
+            legacy_bias=True,
+        )
+        bias_source = sd["transformer_blocks.0.attn.lora_B.bias"]
+
+        adopted = LoRA.from_state_dict(
+            state_dict=sd,
+            dtype=torch.float32,
+            host_backing="adopt",
+        )
+        adopted_bias = _factor_bias(
+            adopted.targets["transformer_blocks.0.attn.weight"],
+        )
+        assert adopted_bias is not None
+        assert adopted_bias.data_ptr() == bias_source.data_ptr()
+
+        cast = LoRA.from_state_dict(state_dict=sd, dtype=torch.bfloat16)
+        cast_bias = _factor_bias(
+            cast.targets["transformer_blocks.0.attn.weight"],
+        )
+        assert cast_bias is not None
+        assert cast_bias.dtype is torch.bfloat16
 
     def test_factors_are_pinned(self) -> None:
         lora = _make_lora(4, 16)
@@ -688,6 +801,47 @@ class TestActivationLoraValidation:
         _request_loras(s, [(LoRA.from_state_dict(state_dict=sd), 1.0)])
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "embed.weight")
+
+    def test_legacy_bias_registers_separate_base_bias_hook(self) -> None:
+        m = _make_bf16_model(num_blocks=2, attn_bias=True)
+        s = _make_strategy(m)
+        lora = _make_lora(
+            num_blocks=2,
+            dim=16,
+            legacy_bias=True,
+        )
+
+        _request_loras(s, [(lora, 0.5)], mode="merge")
+        _activate_loras_for_test(s)
+
+        for block_idx in range(2):
+            assert _has_post_copy_hook(
+                s,
+                f"transformer_blocks.{block_idx}.attn.weight",
+            )
+            assert _has_post_copy_hook(
+                s,
+                f"transformer_blocks.{block_idx}.attn.bias",
+            )
+
+    def test_legacy_bias_merge_rejects_biasless_base_before_hooks(self) -> None:
+        m = _make_bf16_model(num_blocks=2, attn_bias=False)
+        s = _make_strategy(m)
+        lora = _make_lora(
+            num_blocks=2,
+            dim=16,
+            legacy_bias=True,
+        )
+
+        _request_loras(s, [(lora, 0.5)], mode="merge")
+        with pytest.raises(ValueError, match="no base bias parameter"):
+            _activate_loras_for_test(s)
+
+        assert s._lora_hook_removers == []
+        assert not _has_post_copy_hook(
+            s,
+            "transformer_blocks.0.attn.weight",
+        )
 
     def test_non_block_tied_alias_target_matched(self) -> None:
         m = _make_tied_non_block_model(dtype=torch.bfloat16)
@@ -983,6 +1137,73 @@ class TestLifecycle:
 
 class TestMergeCorrectness:
     @CUDA
+    @pytest.mark.parametrize("streamed", [False, True])
+    def test_legacy_bias_merge_resident_and_streamed(
+        self,
+        streamed: bool,
+    ) -> None:
+        m = _make_bf16_model(
+            num_blocks=2,
+            dim=16,
+            attn_bias=True,
+        )
+        base_biases = [
+            block.attn.bias.detach().clone()
+            for block in m.transformer_blocks
+        ]
+        loras = [
+            (
+                _make_lora(
+                    num_blocks=2,
+                    dim=16,
+                    seed=10,
+                    legacy_bias=True,
+                ),
+                0.5,
+            ),
+            (
+                _make_lora(
+                    num_blocks=2,
+                    dim=16,
+                    seed=20,
+                    legacy_bias=True,
+                ),
+                -0.25,
+            ),
+        ]
+        strategy = _make_model_offloader(
+            m,
+            blocks_attr=["transformer_blocks"] if streamed else [],
+        )
+        _request_loras(strategy, loras, mode="merge")
+        activation_kwargs: dict[str, object] = {}
+        if streamed:
+            activation_kwargs["stream_config"] = StreamConfig(
+                num_resident_blocks=1,
+            )
+        _activate(strategy, "cuda", **activation_kwargs)
+        try:
+            streamer = streamed_components(strategy)[0] if streamed else None
+            for block_idx, block in enumerate(m.transformer_blocks):
+                if streamer is not None:
+                    streamer._load_block(block_idx)
+                actual = block.attn.bias
+                assert actual is not None
+                expected = base_biases[block_idx].to(actual.device)
+                delta = torch.zeros_like(expected)
+                target_name = f"transformer_blocks.{block_idx}.attn.weight"
+                for lora, strength in loras:
+                    bias = _factor_bias(lora.targets[target_name])
+                    assert bias is not None
+                    delta.add_(
+                        bias.to(device=actual.device, dtype=actual.dtype),
+                        alpha=strength,
+                    )
+                torch.testing.assert_close(actual, expected + delta)
+        finally:
+            strategy.deactivate()
+
+    @CUDA
     @pytest.mark.parametrize("mode", ["merge", "routed"])
     def test_adopted_lora_matches_pinned_lora(
         self,
@@ -1190,6 +1411,56 @@ class TestLoRATransform:
         expected = before.clone()
         expected.addmm_(b, a, alpha=0.5)
         torch.testing.assert_close(param, expected)
+
+    def test_joint_transform_applies_weight_and_bias(self) -> None:
+        weight = nn.Parameter(torch.randn(4, 8), requires_grad=False)
+        bias = nn.Parameter(torch.randn(4), requires_grad=False)
+        weight_before = weight.detach().clone()
+        bias_before = bias.detach().clone()
+        a = torch.randn(2, 8)
+        b = torch.randn(4, 2)
+        adapter_bias = torch.randn(4)
+        strength = -0.75
+        transform = LoRATransform(
+            [
+                ScaledLoRAFactor.from_tensors(
+                    a,
+                    b,
+                    strength,
+                    bias=adapter_bias,
+                )
+            ]
+        )
+
+        transform.validate_target(weight, bias)
+        transform.apply(weight, bias)
+
+        expected_weight = weight_before.clone()
+        expected_weight.addmm_(b, a, alpha=strength)
+        torch.testing.assert_close(weight, expected_weight)
+        torch.testing.assert_close(
+            bias,
+            bias_before + adapter_bias * strength,
+        )
+
+    def test_joint_transform_requires_bias_before_weight_mutation(self) -> None:
+        weight = nn.Parameter(torch.randn(4, 8), requires_grad=False)
+        weight_before = weight.detach().clone()
+        transform = LoRATransform(
+            [
+                ScaledLoRAFactor.from_tensors(
+                    torch.randn(2, 8),
+                    torch.randn(4, 2),
+                    0.5,
+                    bias=torch.randn(4),
+                )
+            ]
+        )
+
+        with pytest.raises(ValueError, match="no base bias target"):
+            transform.apply(weight)
+
+        torch.testing.assert_close(weight, weight_before)
 
     @CUDA
     def test_multiple_cuda_factors_use_one_packed_merge(
@@ -2519,6 +2790,144 @@ class TestPermanentMerge:
         assert merge_lora(m, [(first, 1.0), (second, 1.0)]) == 1
         torch.testing.assert_close(m.target.weight, expected)
 
+    def test_legacy_bias_merges_with_same_adapter_strength(self) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.target = nn.Linear(3, 4, bias=True)
+
+        m = M()
+        m.requires_grad_(False)
+        base_weight = m.target.weight.detach().clone()
+        base_bias = m.target.bias.detach().clone()
+        bias_param = m.target.bias
+
+        def make_lora(seed: int, *, with_bias: bool) -> LoRA:
+            generator = torch.Generator().manual_seed(seed)
+            state_dict = {
+                "target.lora_A.weight": torch.randn(
+                    2,
+                    3,
+                    generator=generator,
+                ),
+                "target.lora_B.weight": torch.randn(
+                    4,
+                    2,
+                    generator=generator,
+                ),
+            }
+            if with_bias:
+                state_dict["target.lora_B.bias"] = torch.randn(
+                    4,
+                    generator=generator,
+                )
+            return LoRA.from_state_dict(state_dict)
+
+        loras = [
+            (make_lora(1, with_bias=True), 0.5),
+            (make_lora(2, with_bias=False), 1.25),
+            (make_lora(3, with_bias=True), -0.75),
+        ]
+        expected_weight = base_weight.clone()
+        expected_bias = base_bias.clone()
+        bias_delta = torch.zeros_like(expected_bias)
+        for lora, strength in loras:
+            factor = lora.targets["target.weight"]
+            a, b = _factor_tensors(factor)
+            expected_weight.addmm_(b, a, alpha=strength)
+            bias = _factor_bias(factor)
+            if bias is not None:
+                bias_delta.add_(bias, alpha=strength)
+        expected_bias.add_(bias_delta)
+
+        assert merge_lora(m, loras) == 2
+        torch.testing.assert_close(m.target.weight, expected_weight)
+        torch.testing.assert_close(m.target.bias, expected_bias)
+        assert m.target.bias is bias_param
+
+    def test_legacy_bias_merge_rejects_biasless_base_without_mutation(
+        self,
+    ) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.target = nn.Linear(3, 4, bias=False)
+
+        m = M()
+        m.requires_grad_(False)
+        before = m.target.weight.detach().clone()
+        lora = LoRA.from_state_dict(
+            {
+                "target.lora_A.weight": torch.randn(2, 3),
+                "target.lora_B.weight": torch.randn(4, 2),
+                "target.lora_B.bias": torch.randn(4),
+            },
+        )
+
+        with pytest.raises(ValueError, match="no base bias parameter"):
+            merge_lora(m, [(lora, 0.5)])
+
+        torch.testing.assert_close(m.target.weight, before)
+
+    def test_legacy_bias_shape_preflight_prevents_weight_mutation(
+        self,
+    ) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.target = nn.Module()
+                self.target.weight = nn.Parameter(torch.randn(4, 3))
+                self.target.bias = nn.Parameter(torch.randn(3))
+
+        m = M()
+        m.requires_grad_(False)
+        weight_before = m.target.weight.detach().clone()
+        bias_before = m.target.bias.detach().clone()
+        lora = LoRA.from_state_dict(
+            {
+                "target.lora_A.weight": torch.randn(2, 3),
+                "target.lora_B.weight": torch.randn(4, 2),
+                "target.lora_B.bias": torch.randn(4),
+            },
+        )
+
+        with pytest.raises(ValueError, match="base bias shape"):
+            merge_lora(m, [(lora, 0.5)])
+
+        torch.testing.assert_close(m.target.weight, weight_before)
+        torch.testing.assert_close(m.target.bias, bias_before)
+
+    def test_legacy_bias_rejects_tied_base_bias_without_mutation(self) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.first = nn.Linear(3, 4, bias=True)
+                self.second = nn.Linear(3, 4, bias=False)
+                self.second.bias = self.first.bias
+
+        m = M()
+        m.requires_grad_(False)
+        first_weight_before = m.first.weight.detach().clone()
+        second_weight_before = m.second.weight.detach().clone()
+        bias_before = m.first.bias.detach().clone()
+        lora = LoRA.from_state_dict(
+            {
+                "first.lora_A.weight": torch.randn(2, 3),
+                "first.lora_B.weight": torch.randn(4, 2),
+                "first.lora_B.bias": torch.randn(4),
+                "second.lora_A.weight": torch.randn(2, 3),
+                "second.lora_B.weight": torch.randn(4, 2),
+                "second.lora_B.bias": torch.randn(4),
+            },
+        )
+
+        with pytest.raises(ValueError, match="same tied base-bias backing"):
+            merge_lora(m, [(lora, 0.5)])
+
+        torch.testing.assert_close(m.first.weight, first_weight_before)
+        torch.testing.assert_close(m.second.weight, second_weight_before)
+        torch.testing.assert_close(m.first.bias, bias_before)
+
     def test_shape_preflight_prevents_partial_merge(self) -> None:
         class M(nn.Module):
             def __init__(self) -> None:
@@ -2666,6 +3075,75 @@ class TestPermanentMerge:
         ).abs()
         assert code_difference.max().item() <= 1
         torch.testing.assert_close(merged_qt._scale, expected._scale)
+
+    def test_legacy_bias_merges_separately_from_quantized_weight(self) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols, rank = 4, 8, 2
+        data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25)
+        quantized = WeightQBytesTensor.create(
+            quanto.qint8,
+            0,
+            (rows, cols),
+            (cols, 1),
+            data,
+            scale,
+            None,
+        )
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.target = nn.Linear(cols, rows, bias=True)
+                self.target.weight = nn.Parameter(
+                    quantized,
+                    requires_grad=False,
+                )
+
+        m = M()
+        m.requires_grad_(False)
+        original_bias = m.target.bias
+        bias_before = m.target.bias.detach().clone()
+        lora = LoRA.from_state_dict(
+            {
+                "target.lora_A.weight": torch.randn(rank, cols),
+                "target.lora_B.weight": torch.randn(rows, rank),
+                "target.lora_B.bias": torch.randn(rows),
+            },
+        )
+        factor = lora.targets["target.weight"]
+        a, b = _factor_tensors(factor)
+        bias = _factor_bias(factor)
+        assert bias is not None
+        strength = 0.5
+        expected_dense = quantized.dequantize()
+        expected_dense.addmm_(
+            b.to(expected_dense.dtype),
+            a.to(expected_dense.dtype),
+            alpha=strength,
+        )
+        expected_weight = _quanto_absmax_oracle(
+            expected_dense,
+            like=quantized,
+        )
+
+        assert merge_lora(m, [(lora, strength)]) == 2
+
+        merged_weight = m.target.weight.data
+        assert isinstance(merged_weight, WeightQBytesTensor)
+        code_difference = (
+            merged_weight._data.to(torch.int16)
+            - expected_weight._data.to(torch.int16)
+        ).abs()
+        assert code_difference.max().item() <= 1
+        assert m.target.bias is original_bias
+        assert type(m.target.bias.data) is torch.Tensor
+        torch.testing.assert_close(
+            m.target.bias,
+            bias_before + strength * bias.to(bias_before.dtype),
+        )
 
     def test_permanent_quanto_merge_supports_empty_second_target(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
@@ -3005,6 +3483,45 @@ class TestRoutedMode:
             expected = F.linear(x, m.target.weight)
             expected += ((x @ a.T) * strength) @ b.T
             torch.testing.assert_close(actual, expected)
+        finally:
+            offloader.deactivate()
+
+    def test_legacy_bias_routes_on_biasless_base(self) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.target = nn.Linear(3, 4, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.target(x)
+
+        m = M()
+        m.requires_grad_(False)
+        lora = LoRA.from_state_dict(
+            {
+                "target.lora_A.weight": torch.randn(2, 3),
+                "target.lora_B.weight": torch.randn(4, 2),
+                "target.lora_B.bias": torch.randn(4),
+            },
+        )
+        factor = lora.targets["target.weight"]
+        a, b = _factor_tensors(factor)
+        bias = _factor_bias(factor)
+        assert bias is not None
+        strength = -0.75
+        x = torch.randn(5, 3)
+        expected = F.linear(x, m.target.weight)
+        expected = expected + strength * (x @ a.T @ b.T + bias)
+        offloader = _make_model_offloader(m)
+
+        offloader.activate(
+            "cpu",
+            loras=[lora],
+            lora_strengths=[strength],
+            lora_mode="routed",
+        )
+        try:
+            torch.testing.assert_close(m(x), expected)
         finally:
             offloader.deactivate()
 
