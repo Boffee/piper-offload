@@ -38,10 +38,8 @@ class _PiperConvRotInt8Meta:
     dtype: torch.dtype
 
 
-class PiperConvRotInt8Adapter(
-    TorchaoStructuredAdapter[_PiperConvRotInt8Meta]
-):
-    """Adapter for ``piper_kernels.convrot.ConvRotInt8Tensor`` weights."""
+class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
+    """Adapter for ``piper_kernels.linear.convrot.ConvRotInt8Tensor`` weights."""
 
     _TAG = "piper-kernels-convrot-int8"
     _STORAGE_NAMES = ("qdata", "scale")

@@ -24,7 +24,7 @@ LAYOUT_ATTRS = (
 
 
 try:
-    from piper_kernels.convrot import ConvRotInt8Tensor
+    from piper_kernels.linear.convrot import ConvRotInt8Tensor
 
     PIPER_CONVROT_AVAILABLE = True
 except ImportError:
@@ -40,10 +40,7 @@ def is_convrot_int8_tensor(t: object) -> bool:
 def require_convrot_int8_tensor(t: torch.Tensor) -> Any:  # noqa: ANN401
     """Return ``t`` as a validated ConvRot tensor, or raise."""
     if not is_convrot_int8_tensor(t):
-        raise TypeError(
-            f"expected piper_kernels.convrot.ConvRotInt8Tensor, "
-            f"got {type(t).__name__}"
-        )
+        raise TypeError(f"expected piper_kernels.linear.convrot.ConvRotInt8Tensor, got {type(t).__name__}")
     validate_layout(t)
     return t
 
@@ -56,11 +53,13 @@ def create_convrot_int8_tensor(
 ) -> torch.Tensor:
     """Rebuild a ConvRot wrapper from its public storage and metadata."""
     if not PIPER_CONVROT_AVAILABLE:
-        raise RuntimeError(
-            "piper-kernels[convrot] is required to create a "
-            "ConvRotInt8Tensor"
-        )
-    return ConvRotInt8Tensor(qdata, scale, group_size, dtype)
+        raise RuntimeError("piper-kernels[convrot] is required to create a ConvRotInt8Tensor")
+    return ConvRotInt8Tensor.from_quantized(
+        qdata,
+        scale,
+        group_size=group_size,
+        logical_dtype=dtype,
+    )
 
 
 def validate_layout(t: torch.Tensor) -> None:

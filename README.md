@@ -284,6 +284,7 @@ runtime construction:
 
 ```python
 from piper_offload import BlockCompileConfig, ModelOffloader
+from piper_kernels.linear.convrot import convrot_int8_compile_options
 
 offload = ModelOffloader.from_module(
     model,
@@ -291,15 +292,20 @@ offload = ModelOffloader.from_module(
     block_compile=BlockCompileConfig(
         dynamic=True,
         fullgraph=False,
+        options=convrot_int8_compile_options({"max_autotune": True}),
     ),
 )
 ```
 
 `block_compile=None` (the default) preserves eager behavior. One configuration
 applies to every `blocks_attr` group, and supplying a compile configuration
-without `blocks_attr` raises. The initial API fixes the backend to Inductor's
-default mode; CUDA Graph modes and backend-specific options are intentionally
-not exposed.
+without `blocks_attr` raises. The backend remains fixed to Inductor. Optional
+backend settings can be supplied through `options`; the mapping is copied for
+each block before it is forwarded to `torch.compile`. This is also the boundary
+for compiler extensions such as Piper Kernels' ConvRot preparation-sharing and
+activation-folding pass shown above. When no options are provided, compilation
+uses Inductor's default mode. Piper Offload does not pass `mode` because PyTorch
+treats `mode` and `options` as mutually exclusive.
 
 Only each distinct block module's `forward` is compiled. Its module
 `__call__` and Piper Offload's forward-pre hook stay eager, so block
@@ -1070,10 +1076,11 @@ to switch without reloading it.
 
 ## Piper ConvRot INT8 support
 
-Piper ConvRot weights (`piper_kernels.convrot.ConvRotInt8Tensor`) are handled
-when the `convrot` optional extra is installed. `piper-kernels` owns the tensor
-semantics plus reference and optimized execution backends; Piper Offload owns
-only the built-in `PiperConvRotInt8Adapter`. `PinnedParam` pins the INT8 `qdata` and
+Piper ConvRot weights
+(`piper_kernels.linear.convrot.ConvRotInt8Tensor`) are handled when the
+`convrot` optional extra is installed. `piper-kernels` owns the tensor semantics
+plus reference and optimized execution backends; Piper Offload owns only the
+built-in `PiperConvRotInt8Adapter`. `PinnedParam` pins the INT8 `qdata` and
 float32 per-output `scale`, preserves `group_size` and the logical floating
 `dtype`, and reconstructs the same wrapper around CUDA storage on activation.
 
