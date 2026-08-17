@@ -5,6 +5,19 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-08-17
+
+### Added
+
+- Allow `BlockCompileConfig` to forward a copied Inductor `options` mapping to
+  every streamed block's `torch.compile` call, including Piper Kernels'
+  `convrot_int8_compile_options()` graph-pass configuration.
+
+### Changed
+
+- Update Piper ConvRot INT8 integration for Piper Kernels 0.3: use the new
+  `piper_kernels.linear.convrot` package and `from_quantized` factory.
+
 ## [0.2.4] - 2026-08-14
 
 ### Added
@@ -93,7 +106,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - Python 3.14, PyTorch 2.13, TorchAO 0.18, Apache-2.0 licensing, and the Piper Offload package
   identity.
 
-[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/Boffee/piper-offload/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/Boffee/piper-offload/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/Boffee/piper-offload/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Boffee/piper-offload/compare/v0.2.1...v0.2.2

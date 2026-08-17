@@ -1,6 +1,6 @@
 """Opt-in ``torch.compile`` policy for streamed model blocks."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Self, cast
 
@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 type _BlockForward = Callable[..., object]
+type _TorchCompileOption = str | int | bool | Callable[..., object]
 _NO_INSTANCE_FORWARD = object()
 
 
@@ -19,7 +20,8 @@ class BlockCompileConfig:
     supplied to :meth:`piper_offload.ModelOffloader.from_module` (directly or
     through :class:`piper_offload.ModelSpec`). The initial API intentionally
     fixes the backend to Inductor's default mode and exposes only the two
-    graph-capture controls needed by supported inference workloads.
+    graph-capture controls needed by supported inference workloads, plus an
+    optional mapping for target-specific compiler extensions.
 
     Attributes
     ----------
@@ -31,16 +33,23 @@ class BlockCompileConfig:
     fullgraph:
         Forwarded to :func:`torch.compile`. The default permits graph breaks;
         ``True`` requires the complete block forward to form one graph.
+    options:
+        Optional Inductor options forwarded to :func:`torch.compile`. The
+        mapping is copied for every compiled block so compiler setup cannot
+        mutate shared configuration state.
     """
 
     dynamic: bool | None = True
     fullgraph: bool = False
+    options: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.dynamic is not None and not isinstance(self.dynamic, bool):
             raise TypeError(f"BlockCompileConfig.dynamic must be bool or None; got {type(self.dynamic).__name__}.")
         if not isinstance(self.fullgraph, bool):
             raise TypeError(f"BlockCompileConfig.fullgraph must be bool; got {type(self.fullgraph).__name__}.")
+        if self.options is not None and not isinstance(self.options, Mapping):
+            raise TypeError(f"BlockCompileConfig.options must be a mapping or None; got {type(self.options).__name__}.")
 
 
 @dataclass(slots=True)
@@ -89,14 +98,19 @@ class _BlockCompileState:
                 "forward",
                 _NO_INSTANCE_FORWARD,
             )
+            compile_options = None if config.options is None else dict(config.options)
+            torch_compile_options = cast(
+                dict[str, _TorchCompileOption] | None,
+                compile_options,
+            )
             compiled = cast(
                 _BlockForward,
                 torch.compile(
                     block.forward,
                     backend="inductor",
-                    mode="default",
                     dynamic=config.dynamic,
                     fullgraph=config.fullgraph,
+                    options=torch_compile_options,
                 ),
             )
             forwards.append(

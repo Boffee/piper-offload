@@ -41,7 +41,7 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def _convrot_cls() -> type:
-    module = pytest.importorskip("piper_kernels.convrot")
+    module = pytest.importorskip("piper_kernels.linear.convrot")
     return module.ConvRotInt8Tensor
 
 
@@ -71,11 +71,11 @@ def _make_convrot(
             dtype=torch.float32,
             device=device,
         )
-    return convrot_cls.from_packed(
+    return convrot_cls.from_quantized(
         qdata,
         scale,
         group_size=group_size,
-        dtype=dtype,
+        logical_dtype=dtype,
     )
 
 

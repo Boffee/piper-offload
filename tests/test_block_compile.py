@@ -109,6 +109,7 @@ class TestBlockCompileConfig:
 
         assert config.dynamic is True
         assert config.fullgraph is False
+        assert config.options is None
 
     @pytest.mark.parametrize("dynamic", [0, "yes", object()])
     def test_dynamic_must_be_bool_or_none(self, dynamic: object) -> None:
@@ -119,6 +120,11 @@ class TestBlockCompileConfig:
     def test_fullgraph_must_be_bool(self, fullgraph: object) -> None:
         with pytest.raises(TypeError, match="fullgraph must be bool"):
             BlockCompileConfig(fullgraph=fullgraph)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("options", [[], "yes", object()])
+    def test_options_must_be_mapping_or_none(self, options: object) -> None:
+        with pytest.raises(TypeError, match="options must be a mapping or None"):
+            BlockCompileConfig(options=options)  # type: ignore[arg-type]
 
     def test_compile_requires_blocks_attr(self) -> None:
         model = nn.Linear(4, 4, bias=False)
@@ -138,7 +144,12 @@ class TestBlockCompileConfig:
     ) -> None:
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
-        config = BlockCompileConfig(dynamic=None, fullgraph=True)
+        compiler_options = {"max_autotune": True}
+        config = BlockCompileConfig(
+            dynamic=None,
+            fullgraph=True,
+            options=compiler_options,
+        )
         spec = ModelSpec(
             key="compiled",
             estimated_cache_bytes=1024,
@@ -156,12 +167,15 @@ class TestBlockCompileConfig:
                 kwargs
                 == {
                     "backend": "inductor",
-                    "mode": "default",
                     "dynamic": None,
                     "fullgraph": True,
+                    "options": compiler_options,
                 }
                 for _fn, kwargs in spy.calls
             )
+            forwarded_options = [kwargs["options"] for _fn, kwargs in spy.calls]
+            assert all(options is not compiler_options for options in forwarded_options)
+            assert len({id(options) for options in forwarded_options}) == len(forwarded_options)
         finally:
             offloader.deactivate()
 
@@ -180,6 +194,40 @@ class TestBlockCompileConfig:
         finally:
             compiled.deactivate()
             eager.deactivate()
+
+    def test_real_torch_compile_accepts_options_without_a_mode_conflict(self) -> None:
+        offloader = _make_offloader(
+            _BlockModel(num_blocks=1),
+            block_compile=BlockCompileConfig(options={"max_autotune": False}),
+        )
+        try:
+            assert streamed_components(offloader)[0].block_compile is not None
+        finally:
+            offloader.deactivate()
+
+    def test_piper_convrot_compile_options_reach_every_block(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        convrot = pytest.importorskip("piper_kernels.linear.convrot")
+        compiler_options = convrot.convrot_int8_compile_options({"max_autotune": True})
+        spy = _CompileSpy()
+        monkeypatch.setattr(torch, "compile", spy)
+
+        offloader = _make_offloader(
+            _BlockModel(),
+            block_compile=BlockCompileConfig(options=compiler_options),
+        )
+        try:
+            assert len(spy.calls) == 2
+            assert all(
+                kwargs["options"] == compiler_options
+                and kwargs["options"] is not compiler_options
+                and "mode" not in kwargs
+                for _fn, kwargs in spy.calls
+            )
+        finally:
+            offloader.deactivate()
 
 
 class TestCompiledForwardConstruction:
