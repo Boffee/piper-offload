@@ -140,6 +140,68 @@ class TestConstruction:
         assert cache.available_cache_bytes == 0
 
 
+class TestResize:
+    def test_grow_preserves_cached_entries(self) -> None:
+        cache = ResourceCache(50)
+        with cache.lease(_spec("a", 50)):
+            pass
+
+        cache.resize(100)
+
+        assert cache.max_cache_bytes == 100
+        assert cache.used_cache_bytes == 50
+        assert cache.available_cache_bytes == 50
+        assert _is_cached(cache, "a")
+
+    def test_shrink_evicts_by_configured_policy(self) -> None:
+        cache = ResourceCache(100)
+        for key in ("a", "b"):
+            with cache.lease(_spec(key, 50)):
+                pass
+
+        cache.resize(50)
+
+        assert cache.max_cache_bytes == 50
+        assert cache.used_cache_bytes == 50
+        assert cache.available_cache_bytes == 0
+        assert not _is_cached(cache, "a")
+        assert _is_cached(cache, "b")
+
+    def test_property_assignment_resizes(self) -> None:
+        cache = ResourceCache(100)
+        with cache.lease(_spec("a", 75)):
+            pass
+
+        cache.max_cache_bytes = 50
+
+        assert cache.max_cache_bytes == 50
+        assert cache.used_cache_bytes == 0
+        assert not _is_cached(cache, "a")
+
+    def test_shrink_blocked_by_lease_is_atomic(self) -> None:
+        cache = ResourceCache(100)
+        with cache.lease(_spec("inactive", 40)):
+            pass
+
+        with cache.lease(_spec("leased", 60)):
+            with pytest.raises(ResourceTooLargeError):
+                cache.resize(50)
+
+            assert cache.max_cache_bytes == 100
+            assert cache.used_cache_bytes == 100
+            assert cache.available_cache_bytes == 0
+            assert _is_cached(cache, "inactive")
+            assert _is_cached(cache, "leased")
+
+    def test_negative_resize_rejected_without_changing_budget(self) -> None:
+        cache = ResourceCache(100)
+
+        with pytest.raises(ValueError, match="max_cache_bytes"):
+            cache.resize(-1)
+
+        assert cache.max_cache_bytes == 100
+
+
 class TestRegistration:
     def test_register_is_lazy(self) -> None:
         cache = ResourceCache(100)

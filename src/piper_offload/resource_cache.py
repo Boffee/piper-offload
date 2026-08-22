@@ -295,7 +295,12 @@ class ResourceCache:
 
     @property
     def max_cache_bytes(self) -> int:
-        return self._max_cache_bytes
+        with self._lock:
+            return self._max_cache_bytes
+
+    @max_cache_bytes.setter
+    def max_cache_bytes(self, value: int) -> None:
+        self.resize(value)
 
     @property
     def used_cache_bytes(self) -> int:
@@ -311,6 +316,37 @@ class ResourceCache:
     @property
     def _available_cache_bytes(self) -> int:
         return self._max_cache_bytes - self._used_bytes
+
+    def resize(self, max_cache_bytes: int) -> None:
+        """Change the cache budget at runtime.
+
+        Growing the budget preserves every cached entry. Shrinking evicts
+        inactive entries according to the configured eviction policy until
+        usage fits the new budget. If leased entries prevent the cache from
+        reaching the requested size, the resize fails atomically with
+        :class:`ResourceTooLargeError`: the previous budget remains in effect
+        and no entries are evicted.
+
+        Assigning :attr:`max_cache_bytes` is equivalent to calling this
+        method.
+        """
+        if max_cache_bytes < 0:
+            raise ValueError(f"max_cache_bytes must be >= 0, got {max_cache_bytes}")
+
+        with self._lock:
+            previous_max_cache_bytes = self._max_cache_bytes
+            if max_cache_bytes == previous_max_cache_bytes:
+                return
+
+            self._max_cache_bytes = max_cache_bytes
+            try:
+                # A zero-byte admission asks the existing policy machinery to
+                # evict only enough inactive storage to bring current usage
+                # under the new limit.
+                self._evict_to_fit(0)
+            except BaseException:
+                self._max_cache_bytes = previous_max_cache_bytes
+                raise
 
     def register(self, spec: ResourceSpec[Any], *, replace: bool = False) -> None:
         """Register a lazy store factory without building it.

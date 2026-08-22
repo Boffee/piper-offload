@@ -1226,6 +1226,19 @@ Use `cache.used_cache_bytes` and `cache.available_cache_bytes` for
 current cache accounting. Use `cache.info(key)` for per-key state when
 needed.
 
+The budget can be changed while the cache is running:
+
+```python
+cache.resize(40 * 1024**3)
+# Equivalently:
+cache.max_cache_bytes = 40 * 1024**3
+```
+
+Growing the budget preserves cached entries. Shrinking evicts inactive entries
+according to the configured eviction policy. If leased entries make the target
+size impossible, resizing raises `ResourceTooLargeError` without changing the
+previous budget or evicting entries.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
