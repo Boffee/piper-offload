@@ -5,6 +5,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Allow `ResourceCache` and `ModelCache` budgets to be resized at runtime via
+  `resize()` or `max_cache_bytes` assignment, with policy-driven eviction and
+  atomic failure when leased entries prevent a shrink.
+
 ## [0.2.5] - 2026-08-17
 
 ### Added
