@@ -1220,7 +1220,7 @@ class TestMergeCorrectness:
             streamer = streamed_components(strategy)[0] if streamed else None
             for block_idx, block in enumerate(m.transformer_blocks):
                 if streamer is not None:
-                    streamer._load_block(block_idx)
+                    streamer._block_runtime._load_block(block_idx)
                 actual = block.attn.bias
                 assert actual is not None
                 expected = base_biases[block_idx].to(actual.device)
@@ -2757,7 +2757,7 @@ class TestLoRATransform:
         )
         try:
             streamer = streamed_components(s)[0]
-            streamer._load_block(0)
+            streamer._block_runtime._load_block(0)
             merged_qt = m.transformer_blocks[0].attn.weight.data
             assert isinstance(merged_qt, WeightQBytesTensor)
             difference = (merged_qt._data.to(torch.int16) - expected._data.to(torch.int16)).abs()

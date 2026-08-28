@@ -11,40 +11,16 @@ from piper_offload import (
     LoRA,
     ModelOffloader,
     ModelSpec,
-    StreamConfig,
+)
+from tests._block_compile_helpers import (
+    _Block,
+    _BlockModel,
+    _make_offloader,
+    _stream_config,
 )
 from tests.conftest import activated_model, streamed_components
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-
-
-class _Block(nn.Module):
-    def __init__(self, width: int = 8) -> None:
-        super().__init__()
-        self.proj = nn.Linear(width, width, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.relu(self.proj(x))
-
-
-class _BlockModel(nn.Module):
-    def __init__(
-        self,
-        *,
-        num_blocks: int = 2,
-        width: int = 8,
-        blocks: list[nn.Module] | None = None,
-    ) -> None:
-        super().__init__()
-        if blocks is None:
-            blocks = [_Block(width) for _ in range(num_blocks)]
-        self.blocks = nn.ModuleList(blocks)
-        self.requires_grad_(False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for block in self.blocks:
-            x = block(x)
-        return x
 
 
 class _TwoGroupModel(nn.Module):
@@ -86,23 +62,6 @@ class _CompileSpy:
         return compiled
 
 
-def _make_offloader(
-    model: nn.Module,
-    *,
-    blocks_attr: list[str] | None = None,
-    block_compile: BlockCompileConfig | None = None,
-) -> ModelOffloader:
-    return ModelOffloader.from_module(
-        model,
-        blocks_attr=["blocks"] if blocks_attr is None else blocks_attr,
-        block_compile=block_compile,
-    )
-
-
-def _stream_config() -> StreamConfig:
-    return StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0)
-
-
 class TestBlockCompileConfig:
     def test_defaults(self) -> None:
         config = BlockCompileConfig()
@@ -110,6 +69,7 @@ class TestBlockCompileConfig:
         assert config.dynamic is True
         assert config.fullgraph is False
         assert config.options is None
+        assert config.rolling is False
 
     @pytest.mark.parametrize("dynamic", [0, "yes", object()])
     def test_dynamic_must_be_bool_or_none(self, dynamic: object) -> None:
@@ -125,6 +85,18 @@ class TestBlockCompileConfig:
     def test_options_must_be_mapping_or_none(self, options: object) -> None:
         with pytest.raises(TypeError, match="options must be a mapping or None"):
             BlockCompileConfig(options=options)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("rolling", [0, "yes", object()])
+    def test_rolling_must_be_bool(self, rolling: object) -> None:
+        with pytest.raises(TypeError, match="rolling must be bool"):
+            BlockCompileConfig(rolling=rolling)  # type: ignore[arg-type]
+
+    def test_rolling_requires_fullgraph(self) -> None:
+        with pytest.raises(ValueError, match="requires fullgraph=True"):
+            _make_offloader(
+                _BlockModel(),
+                block_compile=BlockCompileConfig(rolling=True),
+            )
 
     def test_compile_requires_blocks_attr(self) -> None:
         model = nn.Linear(4, 4, bias=False)
@@ -308,23 +280,26 @@ class TestCompiledForwardLifecycle:
             block_compile=BlockCompileConfig(),
         )
         streamer = streamed_components(offloader)[0]
-        original_before = streamer._before_block_forward
+        runtime = streamer._block_runtime
+        original_before = runtime._before_block_forward
 
         def record_before(*args: object, **kwargs: object) -> None:
             events.append("stream")
             original_before(*args, **kwargs)
 
-        monkeypatch.setattr(streamer, "_before_block_forward", record_before)
+        monkeypatch.setattr(runtime, "_before_block_forward", record_before)
         try:
             with activated_model(
                 offloader,
                 "cuda",
                 stream_config=_stream_config(),
             ):
+                assert streamer._active_runtime is runtime
                 assert all("forward" in block.__dict__ for block in model.blocks)
                 with torch.inference_mode():
                     model(torch.randn(2, 8, device="cuda"))
             assert events == ["stream", "compiled", "stream", "compiled"]
+            assert streamer._active_runtime is None
             assert all("forward" not in block.__dict__ for block in model.blocks)
         finally:
             offloader.deactivate()

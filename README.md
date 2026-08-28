@@ -283,7 +283,7 @@ Repeated streamed blocks can opt into forward-only Inductor compilation at
 runtime construction:
 
 ```python
-from piper_offload import BlockCompileConfig, ModelOffloader
+from piper_offload import BlockCompileConfig, ModelOffloader, StreamConfig
 from piper_kernels.linear.convrot import convrot_int8_compile_options
 
 offload = ModelOffloader.from_module(
@@ -326,6 +326,63 @@ hooks stage parameters inside the block forward. The bypass is temporary:
 a later activation with no routed LoRA uses compiled forwards again.
 Selecting `lora_mode="routed"` without supplying a LoRA does not bypass
 compilation.
+
+An experimental rolling mode can replace the ordinary resident/prefetch block
+targets with one shared parameter target:
+
+```python
+offload = ModelOffloader.from_module(
+    model,
+    blocks_attr=["transformer_blocks"],
+    block_compile=BlockCompileConfig(rolling=True, fullgraph=True),
+)
+
+with offload.use(
+    "cuda",
+    stream_config=StreamConfig(
+        num_resident_blocks=1,
+        num_prefetch_blocks=0,
+        cyclic=True,
+    ),
+):
+    output = model(inputs)
+```
+
+After a parameter's final compiled-graph reader launches, a CUDA event lets a
+private stream refill that same storage from the next block while the remainder
+of the current block computes. Immediately before that parameter's first reader
+in the next block, the compiled graph waits only for its corresponding refill;
+it does not stall for every parameter in the block. The rollover pass is
+appended after user/Piper Kernels post-grad graph passes, so its first/last-use
+analysis sees their rewritten graph. Waits and refills are non-mutating ordered
+host effects with late scheduler-only ordering edges. They neither consume
+reader tensors nor model an immutable parameter as mutated, avoiding forced
+intermediate materialization while preserving the ordinary fusion, memory
+coalescing, and kernel-autotuning plan. For adapters that support merge-mode
+LoRA, merge hooks run after every base refill on the copy stream. GGUF and
+TorchAO INT4 tile-packed weights retain their existing no-merge restriction.
+
+Rolling deliberately fails closed outside its tested contract: `fullgraph=True`,
+frozen regular dense, TorchAO-family, Quanto, GGUF, or Piper ConvRot INT8
+parameters, homogeneous block layouts, distinct block modules, no tied streamed
+parameters, no streamed buffers, and exactly one resident target with ordinary
+prefetch disabled. Bitsandbytes, DTensor, unreviewed external adapters, and
+heterogeneous block layouts continue to use the existing morphing block-target
+pool. Structured logical weights are tracked across every AOT-flattened storage
+input, and the refill is placed after the last reader of any storage tensor.
+Non-cyclic repeated or out-of-order traversal is correct through a
+foreground-refill fallback; `cyclic=True` also rolls the final block directly
+into block zero.
+
+For the supported contract, the scheduler-only lifecycle edges preserve the
+ordinary compiled compute kernels and their autotuning identity. The benchmark
+checks output equivalence in addition to latency and memory; model-level
+validation remains prudent after changing PyTorch, compiler extensions, or
+custom kernels.
+
+Use `python benchmarks/benchmark_rolling_compile.py` to compare steady-state
+latency and CUDA allocator residency against ordinary compiled block prefetch
+on the current GPU. The benchmark also checks output equivalence.
 
 Compiler and backend failures propagate normally. Piper Offload never catches
 a failed compiled invocation and retries that same block eagerly: with graph
@@ -945,7 +1002,9 @@ This is a low-level library; we don't guard against caller misuse.
   remainder, and compiled streamed training remain unsupported. Routed LoRA
   temporarily bypasses compiled blocks. Compiler code/artifact caches and
   compiler-owned workspace are outside `ResourceCache.cache_bytes`; model
-  eviction does not call process-global `torch.compiler.reset()`.
+  eviction does not call process-global `torch.compiler.reset()`. Experimental
+  `rolling=True` compilation has the additional homogeneous/full-graph and
+  adapter restrictions documented above.
 - **Wrap before DDP/FSDP**, not after. Those wrappers manage parameter
   storage themselves and conflict with the registry-replacement pattern.
 - **One runtime per cached model.** `ResourceCache` serializes resource

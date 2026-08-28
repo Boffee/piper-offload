@@ -10,6 +10,14 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - Allow `ResourceCache` and `ModelCache` budgets to be resized at runtime via
   `resize()` or `max_cache_bytes` assignment, with policy-driven eviction and
   atomic failure when leased entries prevent a shrink.
+- Add experimental `BlockCompileConfig(rolling=True)` inference for homogeneous
+  dense, TorchAO-family, Quanto, GGUF, and Piper ConvRot INT8 blocks. Inductor
+  inserts per-parameter refills after final graph use and waits at first use so
+  resident and prefetched state share one GPU target without a whole-block
+  readiness stall; the mode composes after Piper Kernels graph passes, models
+  lifecycle callbacks as non-mutating ordered effects with late scheduler-only
+  dependencies to preserve compute kernel autotuning without forced reader
+  materialization, and preserves supported merge-mode LoRA hooks.
 
 ## [0.2.5] - 2026-08-17
 

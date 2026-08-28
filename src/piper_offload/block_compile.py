@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 type _BlockForward = Callable[..., object]
+type CompileBackend = str | Callable[..., object]
 type _TorchCompileOption = str | int | bool | Callable[..., object]
 _NO_INSTANCE_FORWARD = object()
 
@@ -37,11 +38,20 @@ class BlockCompileConfig:
         Optional Inductor options forwarded to :func:`torch.compile`. The
         mapping is copied for every compiled block so compiler setup cannot
         mutate shared configuration state.
+    rolling:
+        Experimental inference-only single-target streaming. Inductor inserts
+        a target-refill operation after each supported parameter's final graph
+        use, allowing the next block to reuse that storage while the current
+        block continues computing. Supported adapters are regular dense,
+        TorchAO-family, Quanto, GGUF, and Piper ConvRot INT8. Requires one
+        resident block and no ordinary block prefetch targets, plus
+        ``fullgraph=True``.
     """
 
     dynamic: bool | None = True
     fullgraph: bool = False
     options: Mapping[str, object] | None = None
+    rolling: bool = False
 
     def __post_init__(self) -> None:
         if self.dynamic is not None and not isinstance(self.dynamic, bool):
@@ -50,6 +60,10 @@ class BlockCompileConfig:
             raise TypeError(f"BlockCompileConfig.fullgraph must be bool; got {type(self.fullgraph).__name__}.")
         if self.options is not None and not isinstance(self.options, Mapping):
             raise TypeError(f"BlockCompileConfig.options must be a mapping or None; got {type(self.options).__name__}.")
+        if not isinstance(self.rolling, bool):
+            raise TypeError(f"BlockCompileConfig.rolling must be bool; got {type(self.rolling).__name__}.")
+        if self.rolling and not self.fullgraph:
+            raise ValueError("BlockCompileConfig(rolling=True) requires fullgraph=True.")
 
 
 @dataclass(slots=True)
@@ -83,6 +97,8 @@ class _BlockCompileState:
         cls,
         blocks: Sequence[nn.Module],
         config: BlockCompileConfig | None,
+        *,
+        backend: CompileBackend,
     ) -> Self:
         if config is None:
             return cls(config=None, _forwards=())
@@ -107,7 +123,7 @@ class _BlockCompileState:
                 _BlockForward,
                 torch.compile(
                     block.forward,
-                    backend="inductor",
+                    backend=backend,
                     dynamic=config.dynamic,
                     fullgraph=config.fullgraph,
                     options=torch_compile_options,

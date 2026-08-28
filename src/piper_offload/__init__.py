@@ -123,6 +123,9 @@ Compatibility
   configured through :class:`BlockCompileConfig` are supported, and only for
   CUDA inference. External whole-model compilation, the pinned remainder,
   routed-LoRA activations, and compiled streamed training remain unsupported.
+  Experimental rolling compilation additionally requires frozen homogeneous
+  blocks using a reviewed dense or quantized adapter, a full graph, and one
+  shared target.
 - **Wrap before DDP/FSDP**, not after.
 - **Coarse cache concurrency.** :class:`ResourceCache` serializes cache
   metadata and lease operations and releases its lock while caller code

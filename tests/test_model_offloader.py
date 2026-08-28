@@ -414,7 +414,7 @@ class TestLifecycle:
             ) as cpu_model:
                 assert strategy._active_device == torch.device("cpu")
                 assert all(s._active_device == torch.device("cpu") for s in streamed_components(strategy))
-                assert all(s._executor is None for s in streamed_components(strategy))
+                assert all(not s._block_runtime.active for s in streamed_components(strategy))
                 assert all(
                     block.weight is pinned
                     for block, pinned in zip(
@@ -594,7 +594,7 @@ class TestStreamedComponentBackendActivation:
                 stream_config=StreamConfig(num_resident_blocks=2),
             ):
                 assert streamer._active_device == torch.device("cpu")
-                assert streamer._executor is None
+                assert not streamer._block_runtime.active
                 assert all(
                     block.weight is pinned
                     for block, pinned in zip(
@@ -846,16 +846,17 @@ class TestCyclicPrefetch:
         self,
         streamer: StreamedComponent,
     ) -> tuple[list[int], object]:
-        """Wrap streamer._submit_prefetch to record idx without disabling
+        """Wrap the block runtime's prefetch submission to record its index without disabling
         the actual prefetch (so on-GPU residency stays consistent)."""
         recorded: list[int] = []
-        original = streamer._submit_prefetch
+        runtime = streamer._block_runtime
+        original = runtime._submit_prefetch
 
         def record(idx: int, max_on_gpu: int) -> None:
             recorded.append(idx)
             original(idx, max_on_gpu)
 
-        streamer._submit_prefetch = record  # type: ignore[method-assign]
+        runtime._submit_prefetch = record  # type: ignore[method-assign]
         return recorded, original
 
     @CUDA
@@ -1366,13 +1367,14 @@ class TestActivateFailureCleanup:
             blocks_attr=["transformer_blocks"],
         )
         streamer = streamed_components(strategy)[0]
-        original_register_hooks = streamer._register_hooks
+        runtime = streamer._block_runtime
+        original_register_hooks = runtime._register_hooks
 
         def broken_register_hooks(*args, **kwargs):
             original_register_hooks(*args, **kwargs)
             raise RuntimeError("simulated activate failure")
 
-        monkeypatch.setattr(streamer, "_register_hooks", broken_register_hooks)
+        monkeypatch.setattr(runtime, "_register_hooks", broken_register_hooks)
 
         with pytest.raises(RuntimeError, match="simulated activate failure"):
             strategy.activate(
@@ -1383,7 +1385,7 @@ class TestActivateFailureCleanup:
         assert strategy._composite._teardown_stack is None
         assert strategy.active_device is None
 
-        monkeypatch.setattr(streamer, "_register_hooks", original_register_hooks)
+        monkeypatch.setattr(runtime, "_register_hooks", original_register_hooks)
         with activated_model(strategy,
             "cuda",
             stream_config=StreamConfig(num_resident_blocks=2),
@@ -1471,14 +1473,14 @@ class TestPrefetchFailureOnDeactivate:
         # Inject a pre-failed Future so deactivate's drain loop hits it.
         bad_future: Future[None] = Future()
         bad_future.set_exception(RuntimeError("simulated prefetch failure"))
-        streamer._pending[0] = bad_future
+        streamer._block_runtime._pending[0] = bad_future
 
         with pytest.raises(RuntimeError, match="simulated prefetch failure"):
             strategy.deactivate()
 
         # Even though we raised, cleanup completed.
-        assert not streamer._hooks
-        assert streamer._executor is None
+        assert not streamer._block_runtime._hooks
+        assert streamer._block_runtime._executor is None
         assert strategy.active_device is None
 
         with activated_model(strategy,
@@ -1912,10 +1914,11 @@ class TestActivatePoolIdempotency:
         streamer = _make_streamed_component(
             list(m.transformer_blocks),
         )
-        streamer._activate_pool(2, torch.device("cuda"))
-        pool_first = streamer._pool
-        streamer._activate_pool(2, torch.device("cuda"))
-        assert streamer._pool is pool_first
+        runtime = streamer._block_runtime
+        runtime._activate_pool(2, torch.device("cuda"))
+        pool_first = runtime._pool
+        runtime._activate_pool(2, torch.device("cuda"))
+        assert runtime._pool is pool_first
 
     @CUDA
     def test_mismatched_config_raises(self) -> None:
@@ -1923,11 +1926,12 @@ class TestActivatePoolIdempotency:
         streamer = _make_streamed_component(
             list(m.transformer_blocks),
         )
-        streamer._activate_pool(2, torch.device("cuda"))
+        runtime = streamer._block_runtime
+        runtime._activate_pool(2, torch.device("cuda"))
         with pytest.raises(ValueError, match="already activated"):
-            streamer._activate_pool(3, torch.device("cuda"))
+            runtime._activate_pool(3, torch.device("cuda"))
         with pytest.raises(ValueError, match="already activated"):
-            streamer._activate_pool(2, torch.device("cpu"))
+            runtime._activate_pool(2, torch.device("cpu"))
 
 
 # ---------------------------------------------------------------------------
@@ -1946,7 +1950,7 @@ class TestBlockLayoutCompatibility:
 
     @staticmethod
     def _signatures(component: object) -> list[object]:
-        return component._block_signatures  # type: ignore[attr-defined]
+        return component._block_runtime._signatures  # type: ignore[attr-defined]
 
     def test_shape_mismatch_is_supported(self) -> None:
         # Different weight shapes → distinct pool signatures, not a reject.
@@ -2180,7 +2184,7 @@ class TestMultiComponentCleanup:
             # PinnedComponent restored registry entries before raising, and streamers
             # were already unwound in LIFO order.
             assert m.embed.weight.is_pinned()  # type: ignore[union-attr]
-            assert not streamed_components(strategy)[0]._hooks
+            assert not streamed_components(strategy)[0]._block_runtime._hooks
             assert strategy._composite._teardown_stack is None
         finally:
             strategy.deactivate()
