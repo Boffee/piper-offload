@@ -113,15 +113,21 @@ class CompositeComponent:
             name, hook,
         )
 
-    def activate(self, device: torch.device, **kwargs: object) -> None:
+    def activate(
+        self,
+        device: torch.device,
+        *,
+        compile_blocks: bool = True,
+    ) -> None:
         """Activate every component, in order, on ``device``.
 
         Self-cleaning on failure: if a component's ``activate`` raises, the
         already-activated components are deactivated before the exception
-        propagates. Extra keyword arguments (e.g. a streamed member's
-        ``stream_config``) are forwarded to every component; members that
-        don't use them ignore them.
+        propagates. ``compile_blocks`` lets the owning model runtime temporarily
+        select eager block execution, such as for routed LoRA.
         """
+        if not isinstance(compile_blocks, bool):
+            raise TypeError(f"compile_blocks must be bool; got {type(compile_blocks).__name__}.")
         if self._teardown_stack is not None:
             raise RuntimeError(
                 "CompositeComponent.activate() called while already active; "
@@ -130,7 +136,7 @@ class CompositeComponent:
         with contextlib.ExitStack() as stack:
             for component in self._components():
                 stack.callback(component.deactivate)
-                component.activate(device, **kwargs)
+                component.activate(device, compile_blocks=compile_blocks)
             self._teardown_stack = stack.pop_all()
 
     def deactivate(self) -> None:

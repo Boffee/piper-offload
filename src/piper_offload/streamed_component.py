@@ -5,9 +5,9 @@ storage for a single block list whose blocks share the same parameter
 layout (names, shapes, dtypes, and any tensor-adapter wrapper metadata).
 Binding that store to a compatible model creates a
 :class:`StreamedComponent` that streams the resolved blocks to GPU on
-demand via forward-pre hooks, and uses a reusable GPU target pool plus
-a background prefetcher to overlap DMA with compute. On CPU, the
-host-backed pinned state is used directly without streaming.
+demand. Ordinary streaming uses a reusable GPU target pool and background
+prefetcher; rolling compilation selects a single-target parameter runtime.
+On CPU, the host-backed pinned state is used directly without streaming.
 
 Blocks in one list may be heterogeneously quantized (mixed dtypes or
 quant formats on the same-named weights): the GPU target pool keys its
@@ -45,12 +45,8 @@ when you need bespoke composition (e.g., multiple block lists like Flux's
 """
 
 import contextlib
-import functools
-import logging
 import weakref
-from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Self, cast
 
@@ -63,38 +59,15 @@ from .host_backing import (
     HostBacking,
     validate_host_backing,
 )
-from .module_names import group_names, walk_attr_path
+from .module_names import walk_attr_path
 from .pinned_module import (
     PinnedModuleInstance,
     PinnedModuleStore,
-    PinnedModuleTarget,
     PostCopyHook,
 )
 from .pinned_param import PinnedParam
-from .stream_config import DEFAULT_STREAM_CONFIG, StreamConfig
-
-logger = logging.getLogger(__name__)
-
-type _LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
-
-
-def _stream_config_from_kwargs(kwargs: dict[str, object]) -> StreamConfig:
-    """Extract the optional ``stream_config`` activation kwarg.
-
-    :meth:`StreamedComponent.activate` accepts ``**kwargs`` to satisfy the
-    open component lifecycle contract; the streamer is the one component
-    that consumes a ``stream_config``. Absent (or ``None``) falls back to
-    the default policy.
-    """
-    stream_config = kwargs.get("stream_config")
-    if stream_config is None:
-        return DEFAULT_STREAM_CONFIG
-    if not isinstance(stream_config, StreamConfig):
-        raise TypeError(
-            "stream_config must be a StreamConfig; got "
-            f"{type(stream_config).__name__}."
-        )
-    return stream_config
+from .rolling_runtime import create_rolling_runtime
+from .streaming_runtime import BlockStreamingRuntime, StreamingRuntime
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -115,115 +88,6 @@ def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Morphing GPU target pool
-# ---------------------------------------------------------------------------
-
-
-type BlockSignature = tuple[object, ...]
-
-
-def _instance_target_signature(instance: PinnedModuleInstance) -> BlockSignature:
-    r"""Layout-equivalence key for one block's GPU targets.
-
-    Two block instances with equal signatures allocate structurally
-    identical :class:`PinnedModuleTarget`\ s, so a target freed by one can
-    be refilled by the other with a plain ``copy_`` — matching names,
-    storage grouping, ``requires_grad``, and per-tensor target layouts
-    (shapes, dtypes, and any tensor-adapter wrapper metadata). Blocks with
-    *different* signatures — e.g. an int4 layer next to an int8 layer in
-    one block list — get their own pooled targets, so heterogeneous
-    quantization streams correctly without a cross-format ``copy_``.
-    """
-    params = instance.params
-    param_sig = tuple(
-        (
-            tuple(names),
-            params[names[0]].requires_grad,
-            params[names[0]].target_layout,
-        )
-        for names in group_names(params.keys(), lambda name: id(params[name]))
-    )
-    buffers = instance.buffers
-    buffer_sig = tuple(
-        (tuple(names), buffers[names[0]].target_layout)
-        for names in group_names(buffers.keys(), lambda name: id(buffers[name]))
-    )
-    return (param_sig, buffer_sig)
-
-
-class _MorphingTargetPool:
-    r"""Signature-keyed pool of reusable :class:`PinnedModuleTarget`\ s.
-
-    A single pool serves a block list whose blocks may be heterogeneously
-    quantized. Targets are keyed by per-block layout signature
-    (:func:`_instance_target_signature`): :meth:`acquire` returns a free
-    target matching the requested signature, lazily allocating one from
-    the requesting block instance on first demand. Targets are retained in
-    per-signature free lists and released to the CUDA allocator only when
-    the pool is dropped at deactivate — never mid-stream.
-
-    That retain-until-deactivate lifecycle is deliberate. Eagerly freeing
-    a target the instant a block of a different format reuses its slot
-    would hand mid-stream-freed bytes back to the caching allocator while
-    a different stream might still read them (targets are filled on the
-    prefetch stream and read by compute on the default stream); the
-    allocator segregates free blocks by their allocation stream and would
-    reuse them without the cross-stream event the homogeneous pool never
-    needed. Keeping targets parked in free lists matches the homogeneous
-    pool exactly — allocate, reuse, free only under the full stream sync
-    that deactivate performs.
-
-    Total resident targets self-size to the actual interleaving: the sum
-    over signatures of each signature's peak concurrent residency. For
-    clustered mixed-precision layouts (contiguous runs per format, the
-    common case) that is close to the homogeneous
-    ``num_resident + num_prefetch``; strict per-block alternation across
-    ``k`` formats can approach ``k`` times that, still a handful of small
-    targets.
-
-    Compute events key on target identity, not a slot index, so the load
-    that refills a target waits on exactly the compute that last read
-    *that* target's bytes.
-    """
-
-    def __init__(self, device: torch.device) -> None:
-        self._device = device
-        self._free: dict[BlockSignature, list[PinnedModuleTarget]] = {}
-        self._events: dict[int, torch.cuda.Event] = {}
-
-    def acquire(
-        self,
-        signature: BlockSignature,
-        instance: PinnedModuleInstance,
-    ) -> PinnedModuleTarget:
-        free = self._free.get(signature)
-        if free:
-            return free.pop()
-        return instance.allocate_target(self._device)
-
-    def release(
-        self,
-        signature: BlockSignature,
-        target: PinnedModuleTarget,
-    ) -> None:
-        self._free.setdefault(signature, []).append(target)
-
-    def set_compute_event(
-        self, target: PinnedModuleTarget, event: torch.cuda.Event,
-    ) -> None:
-        self._events[id(target)] = event
-
-    def wait_if_needed(
-        self, target: PinnedModuleTarget, stream: torch.cuda.Stream | None,
-    ) -> None:
-        ev = self._events.pop(id(target), None)
-        if ev is None:
-            return
-        if stream is not None and not ev.query():
-            ev.wait(stream)
-
-
-# ---------------------------------------------------------------------------
 # Streamed block instances
 # ---------------------------------------------------------------------------
 
@@ -238,9 +102,9 @@ def _param_target_layout(p: nn.Parameter) -> tuple[object, object]:
     axis, activation_qtype, quant_type) is similarly invisible to it.
 
     This is the standalone form of the same value
-    :func:`_instance_target_signature` reads from each pinned param's
-    :attr:`PinnedParam.target_layout` to key the streamer's pool; it is
-    not called on the streaming path. Kept as the package's documented
+    :attr:`PinnedParam.target_layout` supplies the same value to the block
+    runtime's target-pool signature; this helper is not called on the
+    streaming path. Kept as the package's documented
     way to compare two params' target compatibility directly (e.g. in
     adapter tests) without pinning either.
 
@@ -315,10 +179,7 @@ def _validate_streamed_names_known(
         return
     missing = sorted(names - known_names)
     if missing:
-        raise ValueError(
-            "StreamedComponent cannot select unknown block-local names: "
-            f"{_format_names(missing)}."
-        )
+        raise ValueError(f"StreamedComponent cannot select unknown block-local names: {_format_names(missing)}.")
 
 
 def _format_names(names: Sequence[str]) -> str:
@@ -344,10 +205,7 @@ def _check_block_requires_grad_consistent(
     for i in range(1, len(block_param_schemas)):
         for name, requires_grad in block_param_schemas[i].items():
             ref_requires_grad = ref.get(name)
-            if (
-                ref_requires_grad is not None
-                and requires_grad != ref_requires_grad
-            ):
+            if ref_requires_grad is not None and requires_grad != ref_requires_grad:
                 raise ValueError(
                     f"Block {i} param {name!r} requires_grad="
                     f"{requires_grad} differs from block 0 "
@@ -428,9 +286,7 @@ def _build_param_name_index(
         for local_name in instance.params:
             name = _streamed_param_name(prefix, true_idx, local_name)
             if name in index:
-                raise ValueError(
-                    f"duplicate streamed parameter name {name!r}"
-                )
+                raise ValueError(f"duplicate streamed parameter name {name!r}")
             index[name] = (compact_idx, local_name)
     return index
 
@@ -446,9 +302,7 @@ def _build_buffer_name_index(
         for local_name in instance.buffers:
             name = _streamed_param_name(prefix, true_idx, local_name)
             if name in index:
-                raise ValueError(
-                    f"duplicate streamed buffer name {name!r}"
-                )
+                raise ValueError(f"duplicate streamed buffer name {name!r}")
             index[name] = (compact_idx, local_name)
     return index
 
@@ -471,10 +325,8 @@ def _streamed_log_label(name: str | None, block_count: int) -> str:
 def _resolve_blocks(module: nn.Module, blocks_path: str) -> list[nn.Module]:
     obj = walk_attr_path(module, blocks_path)
     if not isinstance(obj, nn.ModuleList):
-        raise TypeError(
-            f"Expected nn.ModuleList at '{blocks_path}', got {type(obj).__name__}"
-        )
-    blocks = list(obj)
+        raise TypeError(f"Expected nn.ModuleList at '{blocks_path}', got {type(obj).__name__}")
+    blocks = list(cast(nn.ModuleList, obj))
     if not blocks:
         raise ValueError(f"blocks_attr = {blocks_path!r} resolved to empty list")
     return blocks
@@ -525,10 +377,7 @@ def _block_param_names(
 
 
 def _block_buffer_names(block: nn.Module) -> set[str]:
-    return {
-        name
-        for name, _buffer in block.named_buffers(remove_duplicate=False)
-    }
+    return {name for name, _buffer in block.named_buffers(remove_duplicate=False)}
 
 
 def _block_is_empty(block: nn.Module) -> bool:
@@ -538,48 +387,7 @@ def _block_is_empty(block: nn.Module) -> bool:
     :meth:`StreamedComponentStore.from_module` while later blocks retain their
     true externally-visible indices.
     """
-    return (
-        next(block.parameters(), None) is None
-        and next(block.buffers(), None) is None
-    )
-
-
-# ---------------------------------------------------------------------------
-# LRU tracker
-# ---------------------------------------------------------------------------
-
-
-class _BlockTracker:
-    def __init__(self) -> None:
-        self._on_gpu: set[int] = set()
-        self._lru: OrderedDict[int, None] = OrderedDict()
-        self.peak_gpu_blocks = 0
-
-    def is_on_gpu(self, idx: int) -> bool:
-        return idx in self._on_gpu
-
-    def touch(self, idx: int) -> None:
-        if idx in self._lru:
-            self._lru.move_to_end(idx)
-
-    def mark_on_gpu(self, idx: int) -> None:
-        self._on_gpu.add(idx)
-        self._lru.pop(idx, None)
-        self._lru[idx] = None
-
-    def mark_on_cpu(self, idx: int) -> None:
-        self._on_gpu.discard(idx)
-        self._lru.pop(idx, None)
-
-    def pick_victim(self, protected: set[int]) -> int:
-        for idx in self._lru:
-            if idx not in protected:
-                return idx
-        raise RuntimeError("no evictable block")
-
-    def clear(self) -> None:
-        self._on_gpu.clear()
-        self._lru.clear()
+    return next(block.parameters(), None) is None and next(block.buffers(), None) is None
 
 
 @dataclass(frozen=True, slots=True)
@@ -618,15 +426,10 @@ class StreamedComponentStore:
         """
         backing = validate_host_backing(host_backing)
         all_blocks = _resolve_blocks(model, blocks_path)
-        kept = [
-            (idx, block)
-            for idx, block in enumerate(all_blocks)
-            if not _block_is_empty(block)
-        ]
+        kept = [(idx, block) for idx, block in enumerate(all_blocks) if not _block_is_empty(block)]
         if not kept:
             raise ValueError(
-                f"blocks_attr = {blocks_path!r} has no streamable blocks "
-                "(every block is structurally empty)."
+                f"blocks_attr = {blocks_path!r} has no streamable blocks (every block is structurally empty)."
             )
         block_indices = tuple(idx for idx, _ in kept)
         blocks = [block for _, block in kept]
@@ -669,7 +472,9 @@ class StreamedComponentStore:
         names = {
             _streamed_param_name(self.blocks_path, true_idx, local_name)
             for true_idx, store in zip(
-                self.block_indices, self._block_stores, strict=True,
+                self.block_indices,
+                self._block_stores,
+                strict=True,
             )
             for local_name in store.params
         }
@@ -681,7 +486,9 @@ class StreamedComponentStore:
         names = {
             _streamed_param_name(self.blocks_path, true_idx, local_name)
             for true_idx, store in zip(
-                self.block_indices, self._block_stores, strict=True,
+                self.block_indices,
+                self._block_stores,
+                strict=True,
             )
             for local_name in store.buffers
         }
@@ -722,11 +529,7 @@ class StreamedComponentStore:
                 f"{len(bind_blocks)}."
             )
         occupied = set(self.block_indices)
-        unmanaged = [
-            pos
-            for pos, block in enumerate(bind_blocks)
-            if pos not in occupied and not _block_is_empty(block)
-        ]
+        unmanaged = [pos for pos, block in enumerate(bind_blocks) if pos not in occupied and not _block_is_empty(block)]
         if unmanaged:
             raise ValueError(
                 f"StreamedComponentStore.bind() bind model has non-empty "
@@ -736,8 +539,7 @@ class StreamedComponentStore:
                 "whose only non-empty blocks are the occupied ones."
             )
         instances = [
-            store.bind(bind_blocks[idx])
-            for store, idx in zip(self._block_stores, self.block_indices, strict=True)
+            store.bind(bind_blocks[idx]) for store, idx in zip(self._block_stores, self.block_indices, strict=True)
         ]
         return StreamedComponent(
             instances,
@@ -778,11 +580,10 @@ class StreamedComponent:
     ``activate`` brings to CUDA or marks CPU active, ``deactivate`` returns state to
     pinned CPU, removes hooks, and restores eager forwards. Optional
     ``block_compile`` policy belongs to this bound runtime and installs lazy
-    compiled forwards only for eligible CUDA inference activations. The
-    residency/prefetch policy
-    (``num_resident_blocks``, ``num_prefetch_blocks``, ``cyclic``) is supplied
-    per activation via :class:`~piper_offload.stream_config.StreamConfig` passed
-    to :meth:`activate` — a runtime concern, not part of the pinned backing.
+    compiled forwards only for eligible CUDA inference activations. Ordinary
+    streaming owns one active block and one lookahead target; rolling
+    compilation owns one shared parameter target. Iteration wraparound is an
+    internal scheduling detail of both strategies.
     There is no ``close()``; pinned memory in module state is freed when the
     caller drops the binding and model references.
 
@@ -842,18 +643,24 @@ class StreamedComponent:
                 f"{len(self._block_instances)} blocks."
             )
         self._blocks = [instance.module for instance in self._block_instances]
+        self._log_label = _streamed_log_label(name, len(self._block_instances))
+        self._block_runtime = BlockStreamingRuntime(
+            self._block_instances,
+            log_label=self._log_label,
+        )
+        self._rolling_runtime = create_rolling_runtime(
+            self._block_instances,
+            block_compile,
+            log_label=self._log_label,
+        )
+        compile_runtime: StreamingRuntime = self._rolling_runtime or self._block_runtime
         self._block_compile = _BlockCompileState.create(
             self._blocks,
             block_compile,
+            backend=compile_runtime.compile_backend,
         )
-        # Per-block layout signature: blocks with equal signatures share
-        # pooled GPU targets, so a block list may mix quant formats.
-        self._block_signatures = [
-            _instance_target_signature(instance)
-            for instance in self._block_instances
-        ]
         self._active_device: torch.device | None = None
-        self._log_label = _streamed_log_label(name, len(self._block_instances))
+        self._active_runtime: StreamingRuntime | None = None
         self._param_name_to_block_param = _build_param_name_index(
             self._block_instances,
             name,
@@ -866,24 +673,7 @@ class StreamedComponent:
         )
         self._param_names = frozenset(self._param_name_to_block_param)
         self._buffer_names = frozenset(self._buffer_name_to_block_buffer)
-        self._move_trainable_grads_to(torch.device("cpu"))
-
-        # Active resources allocated on CUDA activate().
-        self._pool: _MorphingTargetPool | None = None
-        self._block_to_target: dict[int, PinnedModuleTarget] = {}
-        self._pool_config: tuple[int, torch.device] | None = None
-        self._tracker: _BlockTracker | None = None
-        self._hooks: list[torch.utils.hooks.RemovableHandle] = []
-        self._executor: ThreadPoolExecutor | None = None
-        self._stream: torch.cuda.Stream | None = None
-        self._pending: dict[int, Future[None]] = {}
-        self._prefetch_events: dict[int, torch.cuda.Event] = {}
-        self._last_idx: int = -1
-        # Single-active-step invariant: nested optimizer_step()
-        # would scatter outer state on top of inner updates, silently
-        # discarding the outer optimizer step. Reentrant entry is
-        # rejected at optimizer_step() entry.
-        self._optimizer_step_active: bool = False
+        self._cpu_optimizer_step_active = False
 
         # Auto-flush the CUDA allocator cache when the streamer is GC'd,
         # so callers don't need to remember an explicit empty_cache() at
@@ -908,18 +698,12 @@ class StreamedComponent:
     @property
     def streamed_param_names_by_block(self) -> list[list[str]]:
         """Per-block streamed parameter names."""
-        return [
-            list(instance.params)
-            for instance in self._block_instances
-        ]
+        return [list(instance.params) for instance in self._block_instances]
 
     @property
     def streamed_buffer_names_by_block(self) -> list[list[str]]:
         """Per-block streamed buffer names."""
-        return [
-            list(instance.buffers)
-            for instance in self._block_instances
-        ]
+        return [list(instance.buffers) for instance in self._block_instances]
 
     @property
     def param_names(self) -> frozenset[str]:
@@ -974,14 +758,10 @@ class StreamedComponent:
         name: str,
     ) -> tuple[PinnedModuleInstance, str]:
         if block_idx < 0 or block_idx >= len(self._block_instances):
-            raise ValueError(
-                f"streamed block index {block_idx} is out of range"
-            )
+            raise ValueError(f"streamed block index {block_idx} is out of range")
         instance = self._block_instances[block_idx]
         if name not in instance.params:
-            raise ValueError(
-                f"param name {name!r} is not owned by streamed block {block_idx}"
-            )
+            raise ValueError(f"param name {name!r} is not owned by streamed block {block_idx}")
         return instance, name
 
     def _resolve_block_buffer(
@@ -990,33 +770,27 @@ class StreamedComponent:
         name: str,
     ) -> tuple[PinnedModuleInstance, str]:
         if block_idx < 0 or block_idx >= len(self._block_instances):
-            raise ValueError(
-                f"streamed block index {block_idx} is out of range"
-            )
+            raise ValueError(f"streamed block index {block_idx} is out of range")
         instance = self._block_instances[block_idx]
         if name not in instance.buffers:
-            raise ValueError(
-                f"buffer name {name!r} is not owned by streamed block {block_idx}"
-            )
+            raise ValueError(f"buffer name {name!r} is not owned by streamed block {block_idx}")
         return instance, name
-
-    def _require_active_device(self) -> torch.device:
-        device = self._active_device
-        if device is None:
-            raise RuntimeError("StreamedComponent has no active device")
-        return device
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def activate(self, device: torch.device, **kwargs: object) -> None:
+    def activate(
+        self,
+        device: torch.device,
+        *,
+        compile_blocks: bool = True,
+    ) -> None:
         """Activate the block list on ``device``.
 
-        CUDA activation uses the streaming path: GPU target pool, CUDA
-        stream/events, prefetch executor, forward hooks, and optional compiled
-        block forwards. CPU
-        activation is pass-through over the pinned host-backed state.
+        CUDA activation selects either the resident-pool block runtime or the
+        single-target rolling runtime, then installs optional compiled block
+        forwards. CPU activation is pass-through over pinned host-backed state.
         The composite's :meth:`activate` returns the model — this
         method returns ``None`` because the streamer doesn't own one.
 
@@ -1039,23 +813,17 @@ class StreamedComponent:
                 "active. Deactivate first, or check for a leaked "
                 "context manager."
             )
+        if not isinstance(compile_blocks, bool):
+            raise TypeError(f"compile_blocks must be bool; got {type(compile_blocks).__name__}.")
         active_device = canonical_device(device)
         if active_device.type == "cpu":
             self._activate_cpu_resolved()
             return
         if active_device.type != "cuda":
-            raise ValueError(
-                "StreamedComponent.activate() supports CUDA or CPU; "
-                f"got {active_device}."
-            )
-        active_block_compile = cast(
-            BlockCompileConfig | None,
-            kwargs.get("block_compile", self._block_compile.config),
-        )
+            raise ValueError(f"StreamedComponent.activate() supports CUDA or CPU; got {active_device}.")
         self._activate_cuda_resolved(
             active_device,
-            _stream_config_from_kwargs(kwargs),
-            block_compile=active_block_compile,
+            compile_blocks=compile_blocks,
         )
 
     def _activate_cpu_resolved(self) -> None:
@@ -1064,64 +832,50 @@ class StreamedComponent:
     def _activate_cuda_resolved(
         self,
         active_device: torch.device,
-        stream_config: StreamConfig,
         *,
-        block_compile: BlockCompileConfig | None,
+        compile_blocks: bool,
     ) -> None:
-        num_blocks = len(self._block_instances)
-        num_resident = min(stream_config.num_resident_blocks, num_blocks)
-        num_gpu_targets = num_resident + stream_config.num_prefetch_blocks
+        runtime: StreamingRuntime = (
+            self._rolling_runtime
+            if compile_blocks and self._rolling_runtime is not None
+            else self._block_runtime
+        )
 
+        # Record the selected runtime before activation so deactivate() can
+        # clean up a partially-created pool, stream, or hook set if activation
+        # raises midway through its lifecycle.
         self._active_device = active_device
-        self._tracker = _BlockTracker()
-        self._executor = ThreadPoolExecutor(max_workers=1)
-        self._stream = torch.cuda.Stream(device=active_device, priority=-1)
-        self._pending = {}
-        self._prefetch_events = {i: torch.cuda.Event() for i in range(num_blocks)}
-        self._last_idx = -1
-
-        self._activate_pool(num_gpu_targets, active_device)
-        self._move_trainable_grads_to(active_device)
-
-        for block_idx in range(num_resident):
-            self._load_block(block_idx)
-            self._tracker.mark_on_gpu(block_idx)
-
-        self._register_hooks(
-            num_resident,
-            stream_config.num_prefetch_blocks,
-            stream_config.cyclic,
-        )
-        self._block_compile.install(block_compile)
-        self.reset_peak()
-
-        logger.info(
-            f"{self._log_label} active: {num_resident}/{num_blocks} resident "
-            f"on GPU, prefetch={stream_config.num_prefetch_blocks}, "
-            f"max_gpu_resident={num_gpu_targets}"
-        )
+        self._active_runtime = runtime
+        runtime.activate(active_device)
+        self._block_compile.install(compile_blocks)
 
     def deactivate(self) -> None:
         """Tear down active resources idempotently — safe to call
-        before activate or multiple times. Every step in
-        ``_teardown_active_resources`` null-checks; partial state
-        from a failed activate cleans up correctly. Drop the
-        binding reference after deactivate to release pinned
-        memory."""
+        before activate or multiple times. The selected runtime owns cleanup
+        of any partial activation state. Drop the binding reference after
+        deactivate to release pinned memory."""
+        self._block_compile.restore()
         if self._active_device == torch.device("cpu"):
-            self._block_compile.restore()
             self._active_device = None
             return
-        prefetch_exc = self._teardown_active_resources()
-        if prefetch_exc is not None:
-            raise prefetch_exc
+
+        runtime = self._active_runtime
+        try:
+            if runtime is not None:
+                runtime.deactivate()
+        finally:
+            self._active_runtime = None
+            self._active_device = None
 
     @contextlib.contextmanager
     def use(
-        self, device: torch.device | str, **kwargs: object,
+        self,
+        device: torch.device | str,
+        *,
+        compile_blocks: bool = True,
     ) -> Iterator[None]:
         """Activate on ``device`` for the duration of the context."""
-        self.activate(canonical_device(device), **kwargs)
+        self.activate(canonical_device(device), compile_blocks=compile_blocks)
         try:
             yield
         finally:
@@ -1133,563 +887,32 @@ class StreamedComponent:
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:
-        """Context manager for the streamed-trainable optimizer boundary.
+        """Materialize streamed trainables around an optimizer step."""
+        if self._active_device == torch.device("cpu"):
+            if self._cpu_optimizer_step_active:
+                raise RuntimeError("StreamedComponent.optimizer_step() does not support reentrant entry.")
+            self._cpu_optimizer_step_active = True
+            try:
+                yield
+            finally:
+                self._cpu_optimizer_step_active = False
+            return
 
-        On CUDA activation, this brings trainable ``.data`` to GPU
-        around the optimizer-step boundary. On CPU activation, it is a
-        guarded no-op because trainable ``.data`` is already resident in
-        the pinned host-backed module state.
-
-        On CUDA, gradients live on GPU throughout backward via
-        PyTorch's native ``AccumulateGrad`` — we don't D2H them inside
-        this context. Only ``.data`` is materialized: streamed
-        trainables are on pinned CPU after backward (the streamer's
-        eviction path restores them) and the optimizer needs them on
-        GPU.
-
-        CUDA lifecycle:
-
-        Enter:
-          1. Quiesce streaming via :meth:`_drain_and_evict_all`
-             (drain pending prefetch, sync prefetch stream, evict
-             every allocated target). Raises if a prefetch errored —
-             eviction still ran first so the streamer is in a
-             consistent baseline.
-          2. On the streamer's private ``self._stream``, H2D each
-             trainable's pinned ``.data`` to fresh instance-owned GPU
-             target. Each H2D registers a rollback (repoint ``.data`` at
-             pinned) on an :class:`~contextlib.ExitStack`.
-          3. Have the user's current CUDA stream wait on
-             ``self._stream`` so the optimizer (running on the user's
-             stream) sees the materialized bytes.
-
-        Exit (clean OR body exception):
-          1. Have ``self._stream`` wait on the user's current stream
-             so D2H sees the optimizer's writes.
-          2. Blocking D2H of updated ``.data`` to the pinned clone
-             on ``self._stream``, then sync. Blocking + sync so the
-             next iteration's prefetch can't race against an
-             unfinished D2H to the same pinned bytes.
-          3. ExitStack unwinds: each materialized param's ``.data`` is
-             repointed at its pinned clone, releasing the optimizer-step
-             GPU allocation.
-
-        CUDA failure modes:
-
-        - **Enter raises mid-loop** (e.g., OOM on H2D for one
-          trainable): ExitStack unwinds the rollbacks already
-          registered, restoring ``.data`` to pinned for previously
-          materialized params. No scatter (the data was never modified
-          on GPU). Streamer is left in a clean post-quiesce state.
-        - **Body raises after yield** (e.g., optimizer.step OOMs
-          mid-iteration): scatter still runs, preserving whatever
-          partial state the optimizer mutated, then the exception
-          propagates. The pinned clones reflect the partial step;
-          the user's exception handler sees the actual failure
-          rather than a silent rollback to stale bytes.
-        - **Reentrant entry**: rejected at top of the context
-          manager. A nested optimizer-step boundary would discard the
-          outer update.
-
-        ``param.grad`` is untouched throughout: autograd manages it
-        natively. ``optimizer.zero_grad()``, ``clip_grad_norm_``,
-        ``GradScaler.unscale_``, and other grad-walking tools work
-        orthogonally to the CUDA optimizer-step materialization window.
-
-        Typical loop::
-
-            loss.backward()
-            with offloader.optimizer_step():
-                optimizer.step()
-            optimizer.zero_grad()  # can be inside or outside
-
-        On CUDA, the target pool's pre-warmed state is lost (next forward
-        re-loads from pinned), but that cost is dominated by the
-        forward + backward of the next iteration.
-        """
-        if self._executor is None:
-            if self._active_device is not None and self._active_device.type == "cpu":
-                if self._optimizer_step_active:
-                    raise RuntimeError(
-                        "StreamedComponent.optimizer_step() does not support "
-                        "reentrant entry."
-                    )
-                self._optimizer_step_active = True
-                try:
-                    yield
-                finally:
-                    self._optimizer_step_active = False
-                return
+        runtime = self._active_runtime
+        if runtime is None:
             raise RuntimeError(
                 "StreamedComponent.optimizer_step() called on inactive "
                 "streamer. Use it inside the offloader's context "
                 "manager, between backward and the next forward."
             )
-        if self._optimizer_step_active:
-            raise RuntimeError(
-                "StreamedComponent.optimizer_step() does not support "
-                "reentrant entry. A nested optimizer-step boundary would "
-                "scatter the outer step's stale pinned bytes on top of "
-                "the inner update."
-            )
-        if not self.has_trainables:
+        with runtime.optimizer_step():
             yield
-            return
-
-        # Quiesce streaming via the unified drain+sync+evict path.
-        # Raises if any pending prefetch errored — eviction still
-        # runs first inside _drain_and_evict_all so the streamer
-        # stays in a consistent state on the way out.
-        first_prefetch_exc = self._drain_and_evict_all()
-        if first_prefetch_exc is not None:
-            raise first_prefetch_exc
-
-        # Stream choreography: H2D runs on self._stream so it can
-        # proceed without contention against work the user has on
-        # the default stream. After H2D enqueueing, we have the
-        # user's current_stream wait on self._stream before yielding,
-        # so the optimizer (which runs on user's stream) sees the
-        # materialized bytes. _drain_and_evict_all already synced
-        # self._stream so it is safe to reuse here.
-        target = self._require_active_device()
-        step_stream = self._stream
-        assert step_stream is not None, "stream allocated in activate()"
-
-        self._optimizer_step_active = True
-        try:
-            with contextlib.ExitStack() as stack:
-                loaded = self._load_trainables_for_step(
-                    target, step_stream, stack,
-                )
-
-                try:
-                    yield
-                finally:
-                    self._scatter_trainables_after_step(
-                        loaded, step_stream, target,
-                    )
-        finally:
-            self._optimizer_step_active = False
 
     @contextlib.contextmanager
     def gather_for_step(self) -> Iterator[None]:
         """Backward-compatible alias for :meth:`optimizer_step`."""
         with self.optimizer_step():
             yield
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
-
-    @property
-    def peak_gpu_blocks(self) -> int:
-        return self._tracker.peak_gpu_blocks if self._tracker is not None else 0
-
-    def reset_peak(self) -> None:
-        if self._tracker is not None:
-            self._tracker.peak_gpu_blocks = len(self._tracker._on_gpu) + len(self._pending)
-
-    # ------------------------------------------------------------------
-    # Trainable helpers
-    # ------------------------------------------------------------------
-
-    def _load_trainables_for_step(
-        self,
-        device: torch.device,
-        step_stream: torch.cuda.Stream,
-        stack: contextlib.ExitStack,
-    ) -> list[_LoadedTrainableBlock]:
-        """Move trainable ``.data`` to ``device`` for optimizer.step()."""
-        # Each block load registers a rollback that restores the block
-        # instance to pinned host storage. ExitStack unwinds
-        # these on the way out whether enter failed mid-loop, the body
-        # exited cleanly, or the body raised after yield.
-        loaded: list[_LoadedTrainableBlock] = []
-        with torch.cuda.stream(step_stream):
-            for instance in self._block_instances:
-                if not instance.has_trainables:
-                    continue
-                stack.callback(instance.install_pinned)
-                trainable_target = instance.allocate_target(
-                    device,
-                    param_names=instance.trainable_param_names,
-                    buffer_names=(),
-                )
-                instance.load_to_target(trainable_target, non_blocking=True)
-                instance.move_trainable_grads_to(device)
-                loaded.append((instance, trainable_target))
-        # User's current stream now waits for step_stream's H2D. After
-        # this point the optimizer can safely read param.data on its own
-        # stream.
-        torch.cuda.current_stream(device).wait_stream(step_stream)
-        return loaded
-
-    def _scatter_trainables_after_step(
-        self,
-        loaded: list[_LoadedTrainableBlock],
-        step_stream: torch.cuda.Stream,
-        device: torch.device,
-    ) -> None:
-        """Copy optimizer-updated trainable ``.data`` back to pinned CPU."""
-        # Scatter on body-exit (clean OR exception). On body exception
-        # the optimizer may have mutated some params before raising;
-        # preserve that partial state rather than silently rolling back
-        # to pre-step pinned bytes. The blocking copy + sync guarantees
-        # the next prefetch reads stable bytes.
-        step_stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(step_stream):
-            for instance, trainable_target in loaded:
-                instance.copy_trainables_from_target(
-                    trainable_target,
-                    non_blocking=False,
-                )
-        step_stream.synchronize()
-        # ExitStack unwinds after this returns: each materialized
-        # block instance restores trainable .data to pinned CPU storage,
-        # releasing the optimizer-step GPU allocation.
-
-    def _move_trainable_grads_to(self, device: torch.device) -> None:
-        """Move each trainable's ``.grad`` (if any) to ``device``.
-
-        During backward, PyTorch's native ``AccumulateGrad`` writes
-        grads on the param's data device, which is GPU at that point
-        because :meth:`PinnedModuleInstance.load_to_target` swapped ``.data``
-        onto the target storage. Eviction restores ``.data`` to pinned CPU,
-        but ``.grad`` keeps living wherever AccumulateGrad placed it.
-
-        Frozen instances yield no trainables, so this is a no-op for them.
-        """
-        for instance in self._block_instances:
-            instance.move_trainable_grads_to(device)
-
-    # ------------------------------------------------------------------
-    # Pool and block movement
-    # ------------------------------------------------------------------
-
-    def _activate_pool(self, num_gpu_targets: int, device: torch.device) -> None:
-        if self._pool_config is not None:
-            existing = self._pool_config
-            if existing != (num_gpu_targets, device):
-                raise ValueError(
-                    f"StreamedComponent pool already activated with "
-                    f"{existing}; cannot re-activate with ({num_gpu_targets}, "
-                    f"{device}). Call _deactivate_pool() first."
-                )
-            return
-        if num_gpu_targets <= 0:
-            raise ValueError(
-                f"num_gpu_targets must be > 0, got {num_gpu_targets}. "
-                "num_resident is always >= 1 by construction; this only "
-                "fires when num_prefetch_blocks is negative."
-            )
-
-        # Targets are allocated lazily per block-layout signature, so one
-        # pool serves heterogeneously quantized blocks. ``num_gpu_targets``
-        # bounds concurrent residency (enforced by the residency/prefetch
-        # logic), not a fixed pre-allocation.
-        self._pool = _MorphingTargetPool(device)
-        self._pool_config = (num_gpu_targets, device)
-
-    def _deactivate_pool(self) -> None:
-        self._pool = None
-        self._block_to_target.clear()
-        self._pool_config = None
-
-    def _load_block(
-        self,
-        block_idx: int,
-        *,
-        non_blocking: bool = False,
-        stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        assert self._pool is not None, "_activate_pool not called"
-
-        instance = self._block_instances[block_idx]
-
-        target = self._block_to_target.get(block_idx)
-        if target is None:
-            target = self._pool.acquire(
-                self._block_signatures[block_idx], instance,
-            )
-            self._block_to_target[block_idx] = target
-
-        self._pool.wait_if_needed(target, stream)
-        instance.load_to_target(
-            target,
-            run_post_copy_hooks=True,
-            non_blocking=non_blocking,
-        )
-
-    def _release_block(self, block_idx: int) -> None:
-        self._block_instances[block_idx].install_pinned()
-        if self._pool is None:
-            return
-        target = self._block_to_target.pop(block_idx, None)
-        if target is not None:
-            self._pool.release(self._block_signatures[block_idx], target)
-
-    def _evict_allocated_blocks(self) -> None:
-        """Evict every block that currently holds a pool target.
-
-        ``_block_to_target`` is the source of truth for target allocation:
-        a block is recorded there as soon as :meth:`_load_block`
-        (foreground or prefetch) acquires its target, and removed only
-        by :meth:`_release_block`. Iterating it catches both
-        currently-resident blocks and pending-prefetch blocks whose H2D
-        may still be in flight, so teardown and optimizer_step don't
-        need to reconcile tracker and pending-future state.
-
-        Caller is responsible for stream/event synchronization before
-        the eviction so in-flight DMA into the target bytes has settled.
-        """
-        for block_idx in list(self._block_to_target.keys()):
-            self._release_block(block_idx)
-
-    def _mark_compute_done(
-        self, block_idx: int, event: torch.cuda.Event,
-    ) -> None:
-        assert self._pool is not None, "_activate_pool not called"
-        target = self._block_to_target.get(block_idx)
-        if target is not None:
-            self._pool.set_compute_event(target, event)
-
-    # ------------------------------------------------------------------
-    # Drain and teardown
-    # ------------------------------------------------------------------
-
-    def _drain_and_evict_all(self) -> BaseException | None:
-        """Quiesce streaming back to a baseline state.
-
-        Drains pending prefetch futures (waits for completion),
-        synchronizes the prefetch stream so any in-flight H2D has
-        settled device-side, then evicts every block currently holding
-        a pool target via the streamer's ``_block_to_target`` source of
-        truth, and clears tracker + pending bookkeeping.
-
-        Idempotent — safe to call when no resources are active and
-        safe to call multiple times. Returns the first prefetch
-        exception encountered (or ``None``) so the caller can choose
-        to surface it. We don't raise here so eviction still runs
-        after a failed prefetch; without this, a transient prefetch
-        error would leak the GPU target it had partially populated.
-
-        Used by both :meth:`_teardown_active_resources` (full
-        deactivate) and :meth:`optimizer_step` (mid-cycle quiesce
-        before optimizer step). Centralizing it removes the bug
-        class where the two paths' bookkeeping diverged — optimizer_step
-        used to walk ``_tracker._on_gpu`` and miss pending prefetch
-        targets, leaking them across step boundaries.
-        """
-        first_prefetch_exc: BaseException | None = None
-        for future in list(self._pending.values()):
-            try:
-                future.result()
-            except BaseException as e:
-                if first_prefetch_exc is None:
-                    first_prefetch_exc = e
-        self._pending.clear()
-
-        if self._stream is not None:
-            try:
-                self._stream.synchronize()
-            except BaseException as e:
-                if first_prefetch_exc is None:
-                    first_prefetch_exc = e
-
-        self._evict_allocated_blocks()
-
-        if self._tracker is not None:
-            self._tracker.clear()
-
-        return first_prefetch_exc
-
-    def _teardown_active_resources(self) -> BaseException | None:
-        """Idempotent cleanup of all active resources. Returns the
-        first prefetch exception encountered (or None) so the caller
-        can surface it after cleanup completes."""
-        self._block_compile.restore()
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
-
-        # Shutdown executor first — shutdown(wait=True) waits for
-        # already-submitted prefetches to finish. After that, no
-        # background work can run, so the subsequent quiesce only
-        # has to drain the futures' results (no in-flight risk).
-        if self._executor is not None:
-            self._executor.shutdown(wait=True)
-            self._executor = None
-
-        first_prefetch_exc = self._drain_and_evict_all()
-
-        self._prefetch_events.clear()
-
-        if self._stream is not None:
-            self._stream = None
-
-        # Move trainable grads to CPU so deactivate's contract
-        # (model on CPU after deactivate) holds for in-block
-        # trainables. Backward leaves grads GPU-resident via
-        # AccumulateGrad — this is the symmetric counterpart to
-        # the ``.data`` restoration that already happened in
-        # ``evict_allocated_blocks``.
-        active_device = self._active_device
-        self._move_trainable_grads_to(torch.device("cpu"))
-        if active_device is None or active_device.type == "cuda":
-            self._deactivate_pool()
-
-        self._tracker = None
-        self._last_idx = -1
-        self._active_device = None
-
-        return first_prefetch_exc
-
-    # ------------------------------------------------------------------
-    # Prefetch and forward hooks
-    # ------------------------------------------------------------------
-
-    def _evict_one(self, protected: set[int], compute_event: object | None = None) -> None:
-        assert self._tracker is not None
-        victim = self._tracker.pick_victim(protected=protected)
-        if compute_event is not None:
-            self._mark_compute_done(victim, cast(torch.cuda.Event, compute_event))
-        self._release_block(victim)
-        self._tracker.mark_on_cpu(victim)
-
-    def _do_prefetch(self, idx: int) -> None:
-        assert self._stream is not None
-        with torch.cuda.stream(self._stream):
-            self._load_block(idx, non_blocking=True, stream=self._stream)
-            self._prefetch_events[idx].record(self._stream)
-
-    def _submit_prefetch(self, idx: int, max_on_gpu: int) -> None:
-        assert self._tracker is not None
-        assert self._executor is not None
-        if idx < 0 or idx >= len(self._block_instances):
-            return
-        if self._tracker.is_on_gpu(idx) or idx in self._pending:
-            return
-        if len(self._tracker._on_gpu) + len(self._pending) >= max_on_gpu:
-            return
-        self._pending[idx] = self._executor.submit(self._do_prefetch, idx)
-
-    def _ensure_on_gpu(self, idx: int) -> None:
-        assert self._tracker is not None
-        future = self._pending.pop(idx, None)
-        if future is not None:
-            future.result()
-            ev = self._prefetch_events[idx]
-            if not ev.query():
-                ev.wait(torch.cuda.current_stream(self._require_active_device()))
-            self._tracker.mark_on_gpu(idx)
-            return
-
-        if not self._tracker.is_on_gpu(idx):
-            self._load_block(idx)
-            self._tracker.mark_on_gpu(idx)
-
-    def _before_block_forward(
-        self,
-        idx: int,
-        *,
-        num_resident: int,
-        max_on_gpu: int,
-        num_prefetch_blocks: int,
-        cyclic: bool,
-        num_blocks: int,
-        wrap_threshold: int,
-    ) -> None:
-        tracker = self._tracker
-        if tracker is None:
-            return
-
-        pending = self._pending
-        if tracker.is_on_gpu(idx):
-            tracker.touch(idx)
-        else:
-            compute_event = torch.cuda.current_stream(
-                self._require_active_device()
-            ).record_event()
-            while len(tracker._on_gpu) >= num_resident:
-                protected = {idx} | set(pending.keys())
-                self._evict_one(protected, compute_event)
-            self._ensure_on_gpu(idx)
-
-        # Direction inference. In cyclic mode, a large index jump
-        # (|Delta| > num_blocks/2) is iteration wraparound, not a
-        # reversal: keep the same forward/backward sense and let
-        # prefetch indices wrap modulo num_blocks so the next
-        # iteration's leading blocks get streamed proactively.
-        last = self._last_idx
-        self._last_idx = idx
-        if last < 0:
-            direction = 1
-        else:
-            diff = idx - last
-            direction = (
-                (-1 if diff > 0 else 1)
-                if cyclic and abs(diff) > wrap_threshold
-                else 1 if diff >= 0 else -1
-            )
-        for offset in range(1, num_prefetch_blocks + 1):
-            target = idx + direction * offset
-            if cyclic:
-                target %= num_blocks
-            self._submit_prefetch(target, max_on_gpu)
-
-        total = len(tracker._on_gpu) + len(pending)
-        tracker.peak_gpu_blocks = max(tracker.peak_gpu_blocks, total)
-
-    def _register_hooks(
-        self, num_resident: int, num_prefetch_blocks: int, cyclic: bool,
-    ) -> None:
-        # Each block's forward-pre hook loads its own streamed instance.
-        # num_prefetch_blocks / cyclic come from activate's StreamConfig, so
-        # the closures capture no policy state.
-        max_on_gpu = num_resident + num_prefetch_blocks
-        num_blocks = len(self._block_instances)
-        wrap_threshold = num_blocks // 2  # |Δidx| > this counts as wraparound
-        # weakref breaks the cycle: block → hook → closure → streamer
-        # → block_instances → block. Without it, dropping the binding without
-        # first calling deactivate() would keep everything alive until
-        # Python's cycle collector runs (not refcount-based GC). The
-        # weak ref lets refcount immediately free the binding when the
-        # caller drops it; orphaned hooks no-op safely.
-        self_ref = weakref.ref(self)
-
-        def _pre_hook(_module: nn.Module, _args: tuple[object, ...], *, idx: int) -> None:
-            streamer = self_ref()
-            if streamer is None:
-                # Strategy was dropped without deactivate. Hook is
-                # orphaned — no-op. Forward through this block uses
-                # whatever the registry currently holds: GPU param if it
-                # was resident at drop-time, instance cpu_param if it
-                # had been evicted. Both are functional (CPU forward
-                # is slower but works on pinned tensors).
-                return
-            streamer._before_block_forward(
-                idx,
-                num_resident=num_resident,
-                max_on_gpu=max_on_gpu,
-                num_prefetch_blocks=num_prefetch_blocks,
-                cyclic=cyclic,
-                num_blocks=num_blocks,
-                wrap_threshold=wrap_threshold,
-            )
-
-        # One pre-hook per DISTINCT trigger module. A module aliased across
-        # blocks (a weight-shared layer appearing multiple times in the trigger
-        # list) gets a single hook keyed to its last block index; installing one
-        # hook per alias would fire them all on a single shared forward and churn
-        # the GPU pool (load then immediately evict each aliased block in turn).
-        last_idx_by_module: dict[int, int] = {
-            id(module): idx for idx, module in enumerate(self._blocks)
-        }
-        for idx in last_idx_by_module.values():
-            h = self._blocks[idx].register_forward_pre_hook(
-                functools.partial(_pre_hook, idx=idx)
-            )
-            self._hooks.append(h)
 
 
 __all__ = [

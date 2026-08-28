@@ -94,7 +94,7 @@ This library gives you:
 | Situation | Use |
 |---|---|
 | Most application code, especially multiple models or repeated calls | Use **`ModelCache`** with **`ModelSpec`** |
-| Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., blocks_attr=...)`** and pass a **`StreamConfig`** to `ModelCache.use()` |
+| Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., blocks_attr=...)`** for automatic block streaming |
 | LoRA adapters reused across calls | Pass **`LoRASpec`** entries through **`ModelCache.use()`** |
 | Low-level/manual lifecycle for one model | Use **`ModelOffloader.from_module(model)`** directly |
 | Component or resource development | Use the lower-level store/binding protocols and component stores directly |
@@ -230,24 +230,17 @@ and a CUDA-stream-based async prefetcher.
 
 ```python
 import torch
-from piper_offload import ModelOffloader, StreamConfig
+from piper_offload import ModelOffloader
 
 # Construction pins and binds once; cache_bytes is final immediately.
-# blocks_attr selects what streams; the residency policy is supplied per
-# activation via StreamConfig, not at construction.
+# blocks_attr selects what streams.
 offload = ModelOffloader.from_module(
     model,
     blocks_attr=["transformer_blocks"],  # path(s) to the nn.ModuleList
 )
 device = torch.device("cuda")
 
-offload.activate(
-    device,
-    stream_config=StreamConfig(
-        num_resident_blocks=1,   # blocks kept on GPU; rest stream in
-        num_prefetch_blocks=2,   # GPU pool = resident + prefetch
-    ),
-)
+offload.activate(device)
 try:
     output = offload.value(input_tensor)
 finally:
@@ -256,18 +249,15 @@ finally:
 del offload, model  # drop refs to free pinned host memory
 ```
 
-The residency policy lives on `StreamConfig`, supplied per activation
-(`offload.activate(device, stream_config=...)` or
-`cache.use(..., stream_config=...)`) — it governs GPU residency, a
-runtime concern, and is not part of the pinned backing. `num_resident_blocks=1`
-(the default) is right for almost all workloads: eviction is LRU, so a
-sequential pass through the blocks reloads every block each iteration
-regardless of residency — extra resident slots cost GPU memory without
-reducing transfer volume. Spend spare VRAM on `num_prefetch_blocks` instead.
-Values above the block count clamp to it, so one config works across models
-of different depths. Streaming itself is selected by `blocks_attr`; with no
-`blocks_attr` (the default) nothing streams — the whole model is one
-bulk-pinned component that activation copies to the GPU.
+Ordinary streaming owns one active block and one asynchronous lookahead target.
+That fixed two-target window overlaps the next whole-block copy without
+retaining blocks that a sequential traversal will reload anyway. Direction
+changes and iteration wraparound are detected internally. Streaming itself is
+selected by `blocks_attr`; with no `blocks_attr` (the default) nothing streams —
+the whole model is one bulk-pinned component that activation copies to the GPU.
+For heterogeneous block lists, execution still limits concurrency to the active
+and lookahead blocks, while the morphing pool may park one reusable target per
+distinct tensor-layout signature.
 
 `ModelOffloader` only streams on CUDA. Activating the binding on
 `cpu` is a pass-through over the already-installed pinned CPU storage:
@@ -326,6 +316,57 @@ hooks stage parameters inside the block forward. The bypass is temporary:
 a later activation with no routed LoRA uses compiled forwards again.
 Selecting `lora_mode="routed"` without supplying a LoRA does not bypass
 compilation.
+
+An experimental rolling mode can replace the ordinary resident/prefetch block
+targets with one shared parameter target:
+
+```python
+offload = ModelOffloader.from_module(
+    model,
+    blocks_attr=["transformer_blocks"],
+    block_compile=BlockCompileConfig(rolling=True, fullgraph=True),
+)
+
+offload.activate("cuda")
+try:
+    output = model(inputs)
+finally:
+    offload.deactivate()
+```
+
+After a parameter's final compiled-graph reader launches, a CUDA event lets a
+private stream refill that same storage from the next block while the remainder
+of the current block computes. Immediately before that parameter's first reader
+in the next block, the compiled graph waits only for its corresponding refill;
+it does not stall for every parameter in the block. The rollover pass is
+appended after user/Piper Kernels post-grad graph passes, so its first/last-use
+analysis sees their rewritten graph. Waits and refills are non-mutating ordered
+host effects with late scheduler-only ordering edges. They neither consume
+reader tensors nor model an immutable parameter as mutated, avoiding forced
+intermediate materialization while preserving the ordinary fusion, memory
+coalescing, and kernel-autotuning plan. For adapters that support merge-mode
+LoRA, merge hooks run after every base refill on the copy stream. GGUF and
+TorchAO INT4 tile-packed weights retain their existing no-merge restriction.
+
+Rolling deliberately fails closed outside its tested contract: `fullgraph=True`,
+frozen regular dense, TorchAO-family, Quanto, GGUF, or Piper ConvRot INT8
+parameters, homogeneous block layouts, distinct block modules, no tied streamed
+parameters, and no streamed buffers. Bitsandbytes, DTensor, unreviewed external adapters, and
+heterogeneous block layouts continue to use the existing morphing block-target
+pool. Structured logical weights are tracked across every AOT-flattened storage
+input, and the refill is placed after the last reader of any storage tensor.
+Repeated traversal rolls the final block directly into block zero. Skipped or
+out-of-order traversal remains correct through a foreground-refill fallback.
+
+For the supported contract, the scheduler-only lifecycle edges preserve the
+ordinary compiled compute kernels and their autotuning identity. The benchmark
+checks output equivalence in addition to latency and memory; model-level
+validation remains prudent after changing PyTorch, compiler extensions, or
+custom kernels.
+
+Use `python benchmarks/benchmark_rolling_compile.py` to compare steady-state
+latency and CUDA allocator residency against ordinary compiled block prefetch
+on the current GPU. The benchmark also checks output equivalence.
 
 Compiler and backend failures propagate normally. Piper Offload never catches
 a failed compiled invocation and retries that same block eagerly: with graph
@@ -560,20 +601,17 @@ compatibility.
 `blocks_attr` accepts a list of dotted paths for models with
 multiple kinds of blocks (e.g. Flux's `transformer_blocks` +
 `single_transformer_blocks`). Each path becomes its own streaming
-group with its own target pool; the streaming settings are shared by
-all groups. Blocks within a group must share the same parameter
-layout (names/shapes/dtypes/quant-metadata) — split heterogeneous
-block lists into separate `blocks_attr` entries. For per-group
-streaming settings, compose `StreamedComponentStore` instances
-directly:
+group with its own target pool. Blocks within a group must share parameter and
+buffer names plus trainability structure, but their shapes, dtypes, quantization
+formats, alias topology, and buffer layouts may differ. The morphing pool keys
+reusable targets by those layouts. For bespoke grouping, compose
+`StreamedComponentStore` instances directly:
 
 ```python
 offload = ModelOffloader.from_module(
     model,
     blocks_attr=["transformer_blocks", "single_transformer_blocks"],
 )
-# One StreamConfig at activation is shared by all groups, e.g.:
-#   offload.activate(device, stream_config=StreamConfig(num_resident_blocks=1))
 ```
 
 ### Training streamed blocks
@@ -675,7 +713,6 @@ from piper_offload import (
     LoRASpec,
     ModelCache,
     ModelSpec,
-    StreamConfig,
 )
 from safetensors.torch import load_file
 
@@ -709,7 +746,6 @@ with cache.use(
     lora_specs=[style_lora],
     lora_strengths=[0.8],
     lora_mode="routed",
-    stream_config=StreamConfig(num_resident_blocks=1),
 ) as model:
     latent = model(...)
 ```
@@ -945,7 +981,9 @@ This is a low-level library; we don't guard against caller misuse.
   remainder, and compiled streamed training remain unsupported. Routed LoRA
   temporarily bypasses compiled blocks. Compiler code/artifact caches and
   compiler-owned workspace are outside `ResourceCache.cache_bytes`; model
-  eviction does not call process-global `torch.compiler.reset()`.
+  eviction does not call process-global `torch.compiler.reset()`. Experimental
+  `rolling=True` compilation has the additional homogeneous/full-graph and
+  adapter restrictions documented above.
 - **Wrap before DDP/FSDP**, not after. Those wrappers manage parameter
   storage themselves and conflict with the registry-replacement pattern.
 - **One runtime per cached model.** `ResourceCache` serializes resource

@@ -87,10 +87,7 @@ class PinnedModuleStore:
         source allocations incrementally.
         """
         if pin_memory and not install_backing:
-            raise ValueError(
-                "deferred host-backing installation is only supported for "
-                "host adoption."
-            )
+            raise ValueError("deferred host-backing installation is only supported for host adoption.")
         all_params = _named_parameters(module)
         params = _select_known_names(
             all_params,
@@ -104,9 +101,7 @@ class PinnedModuleStore:
         )
 
         if not pin_memory:
-            trainable_names = [
-                name for name, param in params.items() if param.requires_grad
-            ]
+            trainable_names = [name for name, param in params.items() if param.requires_grad]
             if trainable_names:
                 raise ValueError(
                     "adopted host backing is inference-only; freeze the "
@@ -126,10 +121,7 @@ class PinnedModuleStore:
 
     @property
     def cache_bytes(self) -> int:
-        return (
-            _unique_cache_bytes(self.params)
-            + _unique_cache_bytes(self.buffers)
-        )
+        return _unique_cache_bytes(self.params) + _unique_cache_bytes(self.buffers)
 
     @property
     def has_trainables(self) -> bool:
@@ -137,11 +129,7 @@ class PinnedModuleStore:
 
     @property
     def trainable_param_names(self) -> tuple[str, ...]:
-        return tuple(
-            name
-            for name, pinned in self.params.items()
-            if pinned.requires_grad
-        )
+        return tuple(name for name, pinned in self.params.items() if pinned.requires_grad)
 
     def bind(self, module: nn.Module) -> PinnedModuleInstance:
         """Validate ``module`` and bind this store's backing bytes to it.
@@ -191,11 +179,7 @@ class PinnedModuleInstance:
 
     @property
     def trainable_param_names(self) -> tuple[str, ...]:
-        return tuple(
-            name
-            for name, pinned in self.params.items()
-            if pinned.requires_grad
-        )
+        return tuple(name for name, pinned in self.params.items() if pinned.requires_grad)
 
     def install_pinned(self) -> None:
         """Install the pinned host bytes onto :attr:`module`'s attributes.
@@ -207,6 +191,38 @@ class PinnedModuleInstance:
         """
         _install_pinned_params(self.module, self.params)
         _install_pinned_buffers(self.module, self.buffers)
+
+    def install_target(self, target: PinnedModuleTarget) -> None:
+        """Install already-filled active storage without copying into it."""
+        _validate_target_names_known(self.params, self.buffers, target)
+        _set_params(
+            self.module,
+            {name: param_target.param for name, param_target in target.param_targets.items()},
+        )
+        _set_buffers(
+            self.module,
+            {name: buffer_target.tensor for name, buffer_target in target.buffer_targets.items()},
+        )
+
+    def refill_param_target(
+        self,
+        name: str,
+        target: PinnedParamTarget,
+    ) -> None:
+        """Refill one existing parameter target without module mutation.
+
+        This is the copy primitive used by compiled rolling streaming. The
+        target wrapper remains installed on every homogeneous block while its
+        backing bytes are replaced in place.
+        """
+        pinned = self.params.get(name)
+        if pinned is None:
+            raise ValueError(f"param name {name!r} is not owned by this PinnedModuleInstance")
+        pinned.copy_to_gpu(target._state, non_blocking=True)
+        pinned.rearm_after_load(target.param, target._state)
+        hook = self._post_copy_hooks.get(id(pinned))
+        if hook is not None:
+            hook(target.param)
 
     def allocate_target(
         self,
@@ -225,7 +241,9 @@ class PinnedModuleInstance:
         )
 
     def register_post_copy_hook(
-        self, name: str, hook: PostCopyHook,
+        self,
+        name: str,
+        hook: PostCopyHook,
     ) -> Callable[[], None]:
         """Register a post-copy hook and return a callable that removes it."""
         key = self.post_copy_hook_key(name)
@@ -251,9 +269,7 @@ class PinnedModuleInstance:
     def post_copy_hook_key(self, name: str) -> int:
         """Stable hook/dedup key for a managed parameter name."""
         if name not in self.params:
-            raise ValueError(
-                f"param name {name!r} is not owned by this PinnedModuleInstance"
-            )
+            raise ValueError(f"param name {name!r} is not owned by this PinnedModuleInstance")
         return id(self.params[name])
 
     def load_to_target(
@@ -292,20 +308,7 @@ class PinnedModuleInstance:
             non_blocking=non_blocking,
         )
 
-        _set_params(
-            self.module,
-            {
-                name: param_target.param
-                for name, param_target in target.param_targets.items()
-            },
-        )
-        _set_buffers(
-            self.module,
-            {
-                name: buffer_target.tensor
-                for name, buffer_target in target.buffer_targets.items()
-            },
-        )
+        self.install_target(target)
 
     def copy_trainables_from_target(
         self,
@@ -381,9 +384,7 @@ def _pin_params(
     return pinned_by_name
 
 
-def _validate_param_storage_group_tieable(
-    names: Sequence[str], pinned: PinnedParam
-) -> None:
+def _validate_param_storage_group_tieable(names: Sequence[str], pinned: PinnedParam) -> None:
     """Reject tied weights whose adapter migrates wrapper state on forward.
 
     A migrate-state adapter (bitsandbytes int8) shares one reconstructed
@@ -472,8 +473,7 @@ def _validate_module_matches(
         layout = PinnedParam.bind_layout_for(param)
         if layout != pinned.bind_layout:
             raise ValueError(
-                f"Param {name!r} layout mismatch: store has "
-                f"{pinned.bind_layout!r}, module has {layout!r}."
+                f"Param {name!r} layout mismatch: store has {pinned.bind_layout!r}, module has {layout!r}."
             )
 
     for name, pinned in pinned_buffers.items():
@@ -494,10 +494,7 @@ def _validate_target_has_trainable_params(
     actual_names = set(target.param_targets)
     missing = sorted(expected_names - actual_names)
     if missing:
-        raise ValueError(
-            "PinnedModuleTarget trainable param target names mismatch: "
-            f"missing {_format_names(missing)}."
-        )
+        raise ValueError(f"PinnedModuleTarget trainable param target names mismatch: missing {_format_names(missing)}.")
 
 
 def _validate_target_names_known(
@@ -515,10 +512,7 @@ def _validate_target_names_known(
         details.append(f"params {_format_names(extra_params)}")
     if extra_buffers:
         details.append(f"buffers {_format_names(extra_buffers)}")
-    raise ValueError(
-        "PinnedModuleTarget contains entries outside the store: "
-        f"{'; '.join(details)}."
-    )
+    raise ValueError(f"PinnedModuleTarget contains entries outside the store: {'; '.join(details)}.")
 
 
 def _validate_param_storage_group_requires_grad(
@@ -529,10 +523,7 @@ def _validate_param_storage_group_requires_grad(
     requires_grad = {params[name].requires_grad for name in names}
     if len(requires_grad) <= 1:
         return
-    raise ValueError(
-        "PinnedModuleStore cannot group params with mixed requires_grad: "
-        f"{_format_names(names)}."
-    )
+    raise ValueError(f"PinnedModuleStore cannot group params with mixed requires_grad: {_format_names(names)}.")
 
 
 def _validate_trainable_param_data_swaps(
@@ -549,9 +540,7 @@ def _validate_trainable_param_data_swaps(
         try:
             pinned.validate_parameter_data_swap_target()
         except NotImplementedError as exc:
-            raise NotImplementedError(
-                f"Trainable param {name!r} cannot use Parameter.data swap: {exc}"
-            ) from exc
+            raise NotImplementedError(f"Trainable param {name!r} cannot use Parameter.data swap: {exc}") from exc
 
 
 def _validate_names_present(
@@ -595,20 +584,13 @@ def _allocate_param_targets(
 
 def _validate_cuda_device(device: torch.device) -> None:
     if device.type != "cuda":
-        raise ValueError(
-            "PinnedModuleTarget requires a CUDA device; "
-            f"got {device}."
-        )
+        raise ValueError(f"PinnedModuleTarget requires a CUDA device; got {device}.")
 
 
 def _trainable_params(
     params: Mapping[str, PinnedParam],
 ) -> dict[str, PinnedParam]:
-    return {
-        name: pinned
-        for name, pinned in params.items()
-        if pinned.requires_grad
-    }
+    return {name: pinned for name, pinned in params.items() if pinned.requires_grad}
 
 
 def _allocate_buffer_targets(

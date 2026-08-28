@@ -20,7 +20,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from piper_offload import HostBacking, ModelOffloader, StreamConfig
+from piper_offload import HostBacking, ModelOffloader
 
 GIB = 1024**3
 
@@ -66,8 +66,6 @@ def _parse_args() -> argparse.Namespace:
         choices=("float16", "bfloat16", "float32"),
         default="float16",
     )
-    parser.add_argument("--resident-blocks", type=int, default=1)
-    parser.add_argument("--prefetch-blocks", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1234)
@@ -84,7 +82,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         "blocks": args.blocks,
         "width": args.width,
         "batch_size": args.batch_size,
-        "resident_blocks": args.resident_blocks,
         "repeats": args.repeats,
     }
     for name, value in positive.items():
@@ -92,11 +89,6 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 f"--{name.replace('_', '-')} must be positive, got {value}"
             )
-    if args.prefetch_blocks < 0:
-        raise ValueError(
-            "--prefetch-blocks must be non-negative, "
-            f"got {args.prefetch_blocks}"
-        )
     if args.warmup < 0:
         raise ValueError(f"--warmup must be non-negative, got {args.warmup}")
 
@@ -162,15 +154,10 @@ def _run_mode(
         dtype=dtype,
         seed=args.seed,
     )
-    config = StreamConfig(
-        num_resident_blocks=args.resident_blocks,
-        num_prefetch_blocks=args.prefetch_blocks,
-        cyclic=True,
-    )
     values: list[float] = []
     output: torch.Tensor | None = None
     try:
-        offloader.activate(device, stream_config=config)
+        offloader.activate(device)
         for _ in range(args.warmup):
             output = offloader.value(input_tensor)
             torch.cuda.synchronize(device)
@@ -235,8 +222,7 @@ def _main() -> None:
     print(
         "Configuration: "
         f"{args.blocks} blocks, {args.width}x{args.width} {args.dtype} weights, "
-        f"batch={args.batch_size}, resident={args.resident_blocks}, "
-        f"prefetch={args.prefetch_blocks}"
+        f"batch={args.batch_size}"
     )
 
     results: dict[HostBacking, _Result] = {}
