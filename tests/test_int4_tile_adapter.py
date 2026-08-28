@@ -14,7 +14,6 @@ from torch import nn
 from piper_offload import (
     LoRA,
     ModelOffloader,
-    StreamConfig,
     merge_lora,
 )
 from piper_offload.int4_tile_adapter import Int4TilePackedAdapter
@@ -239,7 +238,6 @@ class TestInt4TilePackedAdapter:
                 loras=[lora],
                 lora_strengths=[0.25],
                 lora_mode="routed",
-                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 y = active(x)
                 torch.cuda.synchronize()

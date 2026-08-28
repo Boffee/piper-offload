@@ -6,7 +6,6 @@ from torch import nn
 from piper_offload import (
     BlockCompileConfig,
     ModelOffloader,
-    StreamConfig,
 )
 
 
@@ -52,8 +51,4 @@ def _make_offloader(
     )
 
 
-def _stream_config() -> StreamConfig:
-    return StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0)
-
-
-__all__ = ["_Block", "_BlockModel", "_make_offloader", "_stream_config"]
+__all__ = ["_Block", "_BlockModel", "_make_offloader"]

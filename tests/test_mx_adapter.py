@@ -10,7 +10,6 @@ from piper_offload import (
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
-    StreamConfig,
     merge_lora,
 )
 from piper_offload._torchao_mx import is_supported_mx_elem_dtype
@@ -885,7 +884,6 @@ class TestMxAdapter:
                 loras=[lora],
                 lora_strengths=[0.25],
                 lora_mode="routed",
-                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 y = active(x)
                 torch.cuda.synchronize()
@@ -961,7 +959,6 @@ class TestMxAdapter:
                 lora_strengths=[0.5],
                 lora_mode="merge",
                 stochastic_rounding=False,
-                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 merged = active.blocks[0].weight.data
                 assert isinstance(merged, mx_cls)

@@ -14,7 +14,7 @@ import pytest
 import torch
 from torch import nn
 
-from piper_offload import ModelOffloader, StreamConfig
+from piper_offload import ModelOffloader
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -119,10 +119,7 @@ def test_cuda_streams_mixed_dtype_blocks_matches_reference() -> None:
         blocks_attr=["blocks"],
     )
 
-    with torch.no_grad(), activated_model(offloader,
-        "cuda",
-        stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=2),
-    ) as bound:
+    with torch.no_grad(), activated_model(offloader, "cuda") as bound:
         streamed = bound(x.cuda()).cpu()
 
     # Tolerant: ref and streamed share dtypes, so the only delta is
@@ -138,19 +135,12 @@ def test_cuda_morphing_pool_handles_repeated_iterations() -> None:
     model = _frozen_model(dim, dtypes)
     x = torch.randn(2, dim)
 
-    num_resident, num_prefetch = 1, 2
     offloader = ModelOffloader.from_module(
         model,
         blocks_attr=["blocks"],
     )
 
-    with torch.no_grad(), activated_model(offloader,
-        "cuda",
-        stream_config=StreamConfig(
-            num_resident_blocks=num_resident,
-            num_prefetch_blocks=num_prefetch,
-        ),
-    ) as bound:
+    with torch.no_grad(), activated_model(offloader, "cuda") as bound:
         first = bound(x.cuda()).cpu()
         second = bound(x.cuda()).cpu()
 
@@ -220,10 +210,7 @@ def test_cuda_streams_mixed_quant_and_plain_blocks() -> None:
     )
     assert len(set(_streamed_component(offloader)._block_runtime._signatures)) == 2
 
-    with torch.no_grad(), activated_model(offloader,
-        "cuda",
-        stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=2),
-    ) as bound:
+    with torch.no_grad(), activated_model(offloader, "cuda") as bound:
         streamed = bound(x.cuda()).cpu()
 
     torch.testing.assert_close(streamed, reference, atol=5e-2, rtol=5e-2)

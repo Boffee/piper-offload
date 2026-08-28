@@ -108,8 +108,6 @@ class ModelOffloader:
         and streamed offload components.
     cache_bytes:
         Stable host-cache bytes owned by the bound components.
-    block_compile:
-        Construction-scoped compile policy for streamed block groups.
     """
 
     def __init__(
@@ -118,13 +116,11 @@ class ModelOffloader:
         *,
         composite: CompositeComponent,
         cache_bytes: int,
-        block_compile: BlockCompileConfig | None = None,
     ) -> None:
         self._model = model
         self._active_device: torch.device | None = None
         self._composite = composite
         self._cache_bytes = cache_bytes
-        self._block_compile = block_compile
         self._activation_lock = threading.Lock()
         self._lora_hook_removers: list[Callable[[], None]] = []
 
@@ -181,7 +177,6 @@ class ModelOffloader:
             model,
             composite=composite,
             cache_bytes=cache_bytes,
-            block_compile=block_compile,
         )
 
     # ------------------------------------------------------------------ API
@@ -377,7 +372,6 @@ class ModelOffloader:
         lora_strengths: Sequence[float] | None = None,
         lora_mode: LoRAMode = "merge",
         stochastic_rounding: bool = True,
-        **kwargs: object,
     ) -> None:
         """Make the owned model usable on ``device``.
 
@@ -422,14 +416,10 @@ class ModelOffloader:
                 else:
                     self._register_routed_lora_hooks(targets)
             # The composite self-cleans its components if activation fails midway.
-            active_block_compile = (
-                None
-                if active_loras and lora_mode == "routed"
-                else self._block_compile
+            self._composite.activate(
+                active_device,
+                compile_blocks=not (active_loras and lora_mode == "routed"),
             )
-            component_kwargs = dict(kwargs)
-            component_kwargs["block_compile"] = active_block_compile
-            self._composite.activate(active_device, **component_kwargs)
         except BaseException:
             try:
                 self._clear_active_lora_hooks()

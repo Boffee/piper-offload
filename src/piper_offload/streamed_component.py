@@ -67,24 +67,7 @@ from .pinned_module import (
 )
 from .pinned_param import PinnedParam
 from .rolling_runtime import create_rolling_runtime
-from .stream_config import DEFAULT_STREAM_CONFIG, StreamConfig
 from .streaming_runtime import BlockStreamingRuntime, StreamingRuntime
-
-
-def _stream_config_from_kwargs(kwargs: dict[str, object]) -> StreamConfig:
-    """Extract the optional ``stream_config`` activation kwarg.
-
-    :meth:`StreamedComponent.activate` accepts ``**kwargs`` to satisfy the
-    open component lifecycle contract; the streamer is the one component
-    that consumes a ``stream_config``. Absent (or ``None``) falls back to
-    the default policy.
-    """
-    stream_config = kwargs.get("stream_config")
-    if stream_config is None:
-        return DEFAULT_STREAM_CONFIG
-    if not isinstance(stream_config, StreamConfig):
-        raise TypeError(f"stream_config must be a StreamConfig; got {type(stream_config).__name__}.")
-    return stream_config
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -597,11 +580,10 @@ class StreamedComponent:
     ``activate`` brings to CUDA or marks CPU active, ``deactivate`` returns state to
     pinned CPU, removes hooks, and restores eager forwards. Optional
     ``block_compile`` policy belongs to this bound runtime and installs lazy
-    compiled forwards only for eligible CUDA inference activations. The
-    residency/prefetch policy
-    (``num_resident_blocks``, ``num_prefetch_blocks``, ``cyclic``) is supplied
-    per activation via :class:`~piper_offload.stream_config.StreamConfig` passed
-    to :meth:`activate` — a runtime concern, not part of the pinned backing.
+    compiled forwards only for eligible CUDA inference activations. Ordinary
+    streaming owns one active block and one lookahead target; rolling
+    compilation owns one shared parameter target. Iteration wraparound is an
+    internal scheduling detail of both strategies.
     There is no ``close()``; pinned memory in module state is freed when the
     caller drops the binding and model references.
 
@@ -798,7 +780,12 @@ class StreamedComponent:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def activate(self, device: torch.device, **kwargs: object) -> None:
+    def activate(
+        self,
+        device: torch.device,
+        *,
+        compile_blocks: bool = True,
+    ) -> None:
         """Activate the block list on ``device``.
 
         CUDA activation selects either the resident-pool block runtime or the
@@ -826,20 +813,17 @@ class StreamedComponent:
                 "active. Deactivate first, or check for a leaked "
                 "context manager."
             )
+        if not isinstance(compile_blocks, bool):
+            raise TypeError(f"compile_blocks must be bool; got {type(compile_blocks).__name__}.")
         active_device = canonical_device(device)
         if active_device.type == "cpu":
             self._activate_cpu_resolved()
             return
         if active_device.type != "cuda":
             raise ValueError(f"StreamedComponent.activate() supports CUDA or CPU; got {active_device}.")
-        active_block_compile = cast(
-            BlockCompileConfig | None,
-            kwargs.get("block_compile", self._block_compile.config),
-        )
         self._activate_cuda_resolved(
             active_device,
-            _stream_config_from_kwargs(kwargs),
-            block_compile=active_block_compile,
+            compile_blocks=compile_blocks,
         )
 
     def _activate_cpu_resolved(self) -> None:
@@ -848,29 +832,22 @@ class StreamedComponent:
     def _activate_cuda_resolved(
         self,
         active_device: torch.device,
-        stream_config: StreamConfig,
         *,
-        block_compile: BlockCompileConfig | None,
+        compile_blocks: bool,
     ) -> None:
-        if block_compile is not None and block_compile.rolling != (self._rolling_runtime is not None):
-            raise ValueError(
-                "the activation block_compile policy cannot change rolling "
-                "mode from the policy used to construct the streamer"
-            )
-        runtime: StreamingRuntime
-        if block_compile is not None and block_compile.rolling:
-            assert self._rolling_runtime is not None
-            runtime = self._rolling_runtime
-        else:
-            runtime = self._block_runtime
+        runtime: StreamingRuntime = (
+            self._rolling_runtime
+            if compile_blocks and self._rolling_runtime is not None
+            else self._block_runtime
+        )
 
         # Record the selected runtime before activation so deactivate() can
         # clean up a partially-created pool, stream, or hook set if activation
         # raises midway through its lifecycle.
         self._active_device = active_device
         self._active_runtime = runtime
-        runtime.activate(active_device, stream_config)
-        self._block_compile.install(block_compile)
+        runtime.activate(active_device)
+        self._block_compile.install(compile_blocks)
 
     def deactivate(self) -> None:
         """Tear down active resources idempotently — safe to call
@@ -894,10 +871,11 @@ class StreamedComponent:
     def use(
         self,
         device: torch.device | str,
-        **kwargs: object,
+        *,
+        compile_blocks: bool = True,
     ) -> Iterator[None]:
         """Activate on ``device`` for the duration of the context."""
-        self.activate(canonical_device(device), **kwargs)
+        self.activate(canonical_device(device), compile_blocks=compile_blocks)
         try:
             yield
         finally:

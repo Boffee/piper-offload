@@ -15,8 +15,7 @@ Lower-level resource bindings:
 
 - :class:`ModelOffloader` -- whole-model host-RAM bulk cache when
   created by ``ModelOffloader.from_module(model)``, or per-block streaming
-  when it is constructed with ``blocks_attr``
-  and activation receives a :class:`StreamConfig`. Streaming mode supports optional LoRA merge,
+  when it is constructed with ``blocks_attr``. Streaming mode supports optional LoRA merge,
   opt-in forward-only block compilation for CUDA inference,
   trainable-parameter support, CUDA prefetch on a secondary stream, and
   activation checkpointing through autograd backward when block compilation
@@ -170,7 +169,6 @@ from .resource_cache import (
 )
 from .resource_specs import LoRASpec, ModelSpec, ObjectSpec
 from .seeding import derive_seed
-from .stream_config import StreamConfig
 from .streamed_component import StreamedComponent, StreamedComponentStore
 from .tensor_adapter_registry import register_adapter
 from .tensor_adapters import (
@@ -213,7 +211,6 @@ __all__ = [
     "ResourceStore",
     "ResourceTooLargeError",
     "ScaledLoRAFactor",
-    "StreamConfig",
     "StreamedComponent",
     "StreamedComponentStore",
     "TensorAdapter",

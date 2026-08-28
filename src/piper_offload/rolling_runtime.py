@@ -28,7 +28,6 @@ from .rolling_compile import (
     unregister_rolling_target,
 )
 from .static_float8_adapter import StaticFloat8Adapter
-from .stream_config import StreamConfig
 from .tensor_adapters import RegularAdapter
 
 logger = logging.getLogger(__name__)
@@ -68,7 +67,6 @@ class _RollingTargetRuntime:
         self._ready_events: tuple[torch.cuda.Event, ...] = ()
         self._fallback_event: torch.cuda.Event | None = None
         self._owners: list[int] | None = None
-        self._cyclic = False
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
 
     @property
@@ -79,16 +77,9 @@ class _RollingTargetRuntime:
     def compile_backend(self) -> CompileBackend:
         return rolling_inductor_backend
 
-    def activate(self, device: torch.device, config: StreamConfig) -> None:
+    def activate(self, device: torch.device) -> None:
         if self.active:
             raise RuntimeError("rolling target runtime is already active")
-        if config.num_resident_blocks != 1 or config.num_prefetch_blocks != 0:
-            raise ValueError(
-                "rolling compilation uses exactly one shared target and "
-                "requires StreamConfig(num_resident_blocks=1, "
-                "num_prefetch_blocks=0)"
-            )
-        self._cyclic = config.cyclic
         self._stream = torch.cuda.Stream(device=device, priority=-1)
         self._events = tuple(torch.cuda.Event() for _ in self._param_names)
         self._ready_events = tuple(torch.cuda.Event() for _ in self._param_names)
@@ -146,9 +137,9 @@ class _RollingTargetRuntime:
         if not missing:
             return
 
-        # Handles skipped/out-of-order blocks and the first block of a new
-        # non-cyclic invocation. The sequential hot path arrives with every
-        # refill enqueued; compiled waits provide per-parameter readiness.
+        # Handles skipped or out-of-order blocks. The sequential hot path
+        # arrives with every refill enqueued; compiled waits provide
+        # per-parameter readiness.
         fallback_event.record(torch.cuda.current_stream(device))
         with torch.cuda.stream(prefetch_stream):
             prefetch_stream.wait_event(fallback_event)
@@ -175,8 +166,6 @@ class _RollingTargetRuntime:
 
         next_idx = block_idx + 1
         if next_idx == len(self._instances):
-            if not self._cyclic:
-                return
             next_idx = 0
 
         name = self._param_names[param_idx]

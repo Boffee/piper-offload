@@ -19,7 +19,6 @@ from torch import nn
 from piper_offload import (
     BlockCompileConfig,
     ModelOffloader,
-    StreamConfig,
 )
 
 MIB = 1024**2
@@ -73,7 +72,6 @@ def _parse_args() -> argparse.Namespace:
         choices=("float16", "bfloat16", "float32"),
         default="bfloat16",
     )
-    parser.add_argument("--prefetch-blocks", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1234)
@@ -85,8 +83,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if value <= 0:
             raise ValueError(f"--{name} must be positive, got {value}")
-    if args.prefetch_blocks < 0:
-        raise ValueError("--prefetch-blocks must be non-negative")
     if args.warmup < 0:
         raise ValueError("--warmup must be non-negative")
 
@@ -117,16 +113,10 @@ def _run(
             fullgraph=True,
         ),
     )
-    stream_config = StreamConfig(
-        num_resident_blocks=1,
-        num_prefetch_blocks=(0 if rolling else args.prefetch_blocks),
-        cyclic=True,
-    )
-
     milliseconds: list[float] = []
     output: torch.Tensor | None = None
     try:
-        offloader.activate(device, stream_config=stream_config)
+        offloader.activate(device)
         with torch.inference_mode():
             for _ in range(args.warmup):
                 output = model(input_tensor)

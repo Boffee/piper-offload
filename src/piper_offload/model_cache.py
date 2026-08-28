@@ -17,7 +17,6 @@ from .lora import LoRA, LoRAMode
 from .model_offloader import ModelOffloader
 from .resource_cache import ResourceCache
 from .resource_specs import LoRASpec, ModelSpec
-from .stream_config import StreamConfig
 
 
 class ModelCache(ResourceCache):
@@ -38,7 +37,6 @@ class ModelCache(ResourceCache):
         lora_strengths: Sequence[float] | None = None,
         lora_mode: LoRAMode = "merge",
         stochastic_rounding: bool = True,
-        stream_config: StreamConfig | None = None,
     ) -> Iterator[M]:
         """Lease dependencies and activate a cached model runtime.
 
@@ -78,14 +76,12 @@ class ModelCache(ResourceCache):
         with self.lease_many((*specs, model)) as resources:
             loras = cast(tuple[LoRA, ...], resources[:-1])
             offloader = cast(ModelOffloader, resources[-1])
-            config = stream_config if stream_config is not None else StreamConfig()
             offloader.activate(
                 device,
                 loras=loras,
                 lora_strengths=strengths,
                 lora_mode=lora_mode,
                 stochastic_rounding=stochastic_rounding,
-                stream_config=config,
             )
             try:
                 yield cast(M, offloader.value)

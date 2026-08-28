@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch import nn
 
-from piper_offload import BlockCompileConfig, LoRA, StreamConfig, register_adapter
+from piper_offload import BlockCompileConfig, LoRA, register_adapter
 from piper_offload.rolling_compile import (
     register_rolling_target,
     unregister_rolling_target,
@@ -16,7 +16,6 @@ from tests._block_compile_helpers import (
     _Block,
     _BlockModel,
     _make_offloader,
-    _stream_config,
 )
 from tests.conftest import activated_model, streamed_components
 
@@ -246,7 +245,7 @@ class TestRollingCompile:
         assert (rolling_width, rolling_dtype) == (width, dtype)
         torch.manual_seed(15)
         x = torch.randn(32, width, device="cuda", dtype=dtype)
-        activation: dict[str, object] = {"stream_config": _stream_config()}
+        activation: dict[str, object] = {}
         if quant_kind not in ("torchao-int4-tile", "gguf-q4-0"):
             activation.update(
                 loras=[_lora(3, width)],
@@ -309,7 +308,6 @@ class TestRollingCompile:
             lora_strengths=[0.125],
             lora_mode="merge",
             stochastic_rounding=False,
-            stream_config=_stream_config(),
         )
 
         rolling_offloader = _make_offloader(
@@ -329,7 +327,6 @@ class TestRollingCompile:
                 lora_strengths=[0.125],
                 lora_mode="merge",
                 stochastic_rounding=False,
-                stream_config=_stream_config(),
             ):
                 assert len({id(block.proj.weight) for block in rolling_model.blocks}) == 1
                 with torch.inference_mode():
@@ -374,15 +371,7 @@ class TestRollingCompile:
         monkeypatch.setattr(runtime_type, "wait_param", tracked_wait)
         monkeypatch.setattr(runtime_type, "rollover_param", tracked_rollover)
         try:
-            with activated_model(
-                offloader,
-                "cuda",
-                stream_config=StreamConfig(
-                    num_resident_blocks=1,
-                    num_prefetch_blocks=0,
-                    cyclic=True,
-                ),
-            ):
+            with activated_model(offloader, "cuda"):
                 x = torch.randn(2, 8, device="cuda")
                 _ORDER_EVENTS.append(events)
                 with torch.inference_mode():
@@ -418,17 +407,10 @@ class TestRollingCompile:
             torch.randn(2, 8, device="cuda"),
             torch.randn(3, 8, device="cuda"),
         ]
-        stream_config = StreamConfig(
-            num_resident_blocks=1,
-            num_prefetch_blocks=0,
-            cyclic=True,
-        )
-
         expected = _compiled_output(
             baseline_model,
             BlockCompileConfig(fullgraph=True),
             lambda: [baseline_model(x).clone() for x in inputs],
-            stream_config=stream_config,
         )
 
         rolling_offloader = _make_offloader(
@@ -440,11 +422,7 @@ class TestRollingCompile:
         )
         streamer = streamed_components(rolling_offloader)[0]
         try:
-            with activated_model(
-                rolling_offloader,
-                "cuda",
-                stream_config=stream_config,
-            ):
+            with activated_model(rolling_offloader, "cuda"):
                 assert streamer._active_runtime is streamer._rolling_runtime
                 assert not streamer._block_runtime.active
                 assert len({id(block.proj.weight) for block in rolling_model.blocks}) == 1
@@ -455,29 +433,6 @@ class TestRollingCompile:
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert all(block.proj.weight.device.type == "cpu" for block in rolling_model.blocks)
-
-    @CUDA
-    def test_rejects_ordinary_resident_or_prefetch_targets(self) -> None:
-        model = _BlockModel()
-        offloader = _make_offloader(
-            model,
-            block_compile=BlockCompileConfig(
-                rolling=True,
-                fullgraph=True,
-            ),
-        )
-        try:
-            with pytest.raises(ValueError, match="exactly one shared target"):
-                offloader.activate(
-                    "cuda",
-                    stream_config=StreamConfig(
-                        num_resident_blocks=2,
-                        num_prefetch_blocks=0,
-                    ),
-                )
-            assert offloader.active_device is None
-        finally:
-            offloader.deactivate()
 
     @CUDA
     def test_routed_lora_selects_block_runtime_for_activation(self) -> None:
@@ -493,7 +448,6 @@ class TestRollingCompile:
                 "cuda",
                 loras=[_lora(len(model.blocks), 8)],
                 lora_mode="routed",
-                stream_config=_stream_config(),
             ):
                 assert streamer._active_runtime is streamer._block_runtime
                 assert streamer._block_runtime.active
@@ -521,7 +475,6 @@ class TestRollingCompile:
                 options=compile_options,
             ),
             lambda: baseline_model(x).clone(),
-            stream_config=_stream_config(),
         )
 
         actual = _compiled_output(
@@ -532,7 +485,6 @@ class TestRollingCompile:
                 options=compile_options,
             ),
             lambda: rolling_model(x).clone(),
-            stream_config=_stream_config(),
         )
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -552,7 +504,6 @@ class TestRollingCompile:
             loras=[lora],
             lora_strengths=[0.25],
             lora_mode="merge",
-            stream_config=_stream_config(),
         )
 
         actual = _compiled_output(
@@ -565,7 +516,6 @@ class TestRollingCompile:
             loras=[lora],
             lora_strengths=[0.25],
             lora_mode="merge",
-            stream_config=_stream_config(),
         )
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)

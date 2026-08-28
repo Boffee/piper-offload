@@ -43,8 +43,7 @@ class BlockCompileConfig:
         a target-refill operation after each supported parameter's final graph
         use, allowing the next block to reuse that storage while the current
         block continues computing. Supported adapters are regular dense,
-        TorchAO-family, Quanto, GGUF, and Piper ConvRot INT8. Requires one
-        resident block and no ordinary block prefetch targets, plus
+        TorchAO-family, Quanto, GGUF, and Piper ConvRot INT8. Requires
         ``fullgraph=True``.
     """
 
@@ -142,8 +141,8 @@ class _BlockCompileState:
     def installed(self) -> bool:
         return self._installed
 
-    def install(self, active_config: BlockCompileConfig | None) -> None:
-        if active_config is None or not self._forwards:
+    def install(self, enabled: bool) -> None:
+        if not enabled or not self._forwards:
             return
         if self._installed:
             raise RuntimeError("compiled block forwards are already installed")

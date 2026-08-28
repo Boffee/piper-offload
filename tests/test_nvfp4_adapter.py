@@ -12,7 +12,6 @@ from piper_offload import (
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
-    StreamConfig,
     merge_lora,
 )
 from piper_offload.nvfp4_adapter import Nvfp4Adapter
@@ -820,7 +819,6 @@ class TestNvfp4Adapter:
                 loras=[lora],
                 lora_strengths=[0.5],
                 lora_mode="merge",
-                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 merged = active.blocks[0].weight.data
                 assert isinstance(merged, nvfp4_cls)
@@ -889,7 +887,6 @@ class TestNvfp4Adapter:
                 loras=[lora],
                 lora_strengths=[0.25],
                 lora_mode="routed",
-                stream_config=StreamConfig(num_resident_blocks=1, num_prefetch_blocks=0),
             ) as active:
                 y = active(x)
                 torch.cuda.synchronize()

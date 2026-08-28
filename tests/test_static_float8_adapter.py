@@ -10,7 +10,6 @@ from piper_offload import (
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
-    StreamConfig,
     merge_lora,
 )
 from piper_offload.float8_adapter import Float8Adapter
@@ -706,11 +705,6 @@ class TestStaticFloat8Adapter:
                 "blocks.0.lora_B.weight": torch.randn(64, 4),
             }
         )
-        stream_config = StreamConfig(
-            num_resident_blocks=1,
-            num_prefetch_blocks=0,
-        )
-
         for mode in ("merge", "routed"):
             model = make_model()
             calibrated_scale = model.blocks[0].weight.data.act_quant_scale.clone()
@@ -723,7 +717,6 @@ class TestStaticFloat8Adapter:
                     loras=[lora],
                     lora_strengths=[0.25],
                     lora_mode=mode,
-                    stream_config=stream_config,
                 ) as active:
                     assert torch.equal(
                         active.blocks[0].weight.data.act_quant_scale.cpu(),
@@ -769,22 +762,13 @@ class TestStaticFloat8Adapter:
             torch.randn(2, 8, 64, dtype=torch.bfloat16),
             torch.randn(2, 12, 64, dtype=torch.bfloat16),
         ]
-        stream_config = StreamConfig(
-            num_resident_blocks=1,
-            num_prefetch_blocks=0,
-        )
-
         eager_model = M(weights)
         eager_offloader = _make_model_offloader(
             eager_model,
             blocks_attr=["blocks"],
         )
         try:
-            with activated_model(
-                eager_offloader,
-                "cuda",
-                stream_config=stream_config,
-            ):
+            with activated_model(eager_offloader, "cuda"):
                 with torch.inference_mode():
                     expected = [eager_model(x.cuda()).cpu() for x in inputs]
         finally:
@@ -797,11 +781,7 @@ class TestStaticFloat8Adapter:
             block_compile=BlockCompileConfig(),
         )
         try:
-            with activated_model(
-                compiled_offloader,
-                "cuda",
-                stream_config=stream_config,
-            ):
+            with activated_model(compiled_offloader, "cuda"):
                 with torch.inference_mode():
                     actual = [compiled_model(x.cuda()).cpu() for x in inputs]
         finally:

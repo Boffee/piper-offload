@@ -4,10 +4,9 @@ import contextlib
 import functools
 import logging
 import weakref
-from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Protocol, cast
+from typing import Protocol
 
 import torch
 from torch import nn
@@ -15,7 +14,6 @@ from torch import nn
 from .block_compile import CompileBackend
 from .module_names import group_names
 from .pinned_module import PinnedModuleInstance, PinnedModuleTarget
-from .stream_config import StreamConfig
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +39,7 @@ class StreamingRuntime(Protocol):
         """The ``torch.compile`` backend required by this strategy."""
         ...
 
-    def activate(self, device: torch.device, config: StreamConfig) -> None:
+    def activate(self, device: torch.device) -> None:
         """Allocate resources and install hooks for one CUDA activation."""
         ...
 
@@ -113,40 +111,8 @@ class _MorphingTargetPool:
             event.wait(stream)
 
 
-class _BlockTracker:
-    def __init__(self) -> None:
-        self._on_gpu: set[int] = set()
-        self._lru: OrderedDict[int, None] = OrderedDict()
-
-    def is_on_gpu(self, idx: int) -> bool:
-        return idx in self._on_gpu
-
-    def touch(self, idx: int) -> None:
-        if idx in self._lru:
-            self._lru.move_to_end(idx)
-
-    def mark_on_gpu(self, idx: int) -> None:
-        self._on_gpu.add(idx)
-        self._lru.pop(idx, None)
-        self._lru[idx] = None
-
-    def mark_on_cpu(self, idx: int) -> None:
-        self._on_gpu.discard(idx)
-        self._lru.pop(idx, None)
-
-    def pick_victim(self, protected: set[int]) -> int:
-        for idx in self._lru:
-            if idx not in protected:
-                return idx
-        raise RuntimeError("no evictable block")
-
-    def clear(self) -> None:
-        self._on_gpu.clear()
-        self._lru.clear()
-
-
 class BlockStreamingRuntime:
-    """Resident-pool and whole-block prefetch execution strategy."""
+    """One active block plus one whole-block lookahead target."""
 
     def __init__(
         self,
@@ -161,8 +127,7 @@ class BlockStreamingRuntime:
         self._device: torch.device | None = None
         self._pool: _MorphingTargetPool | None = None
         self._block_to_target: dict[int, PinnedModuleTarget] = {}
-        self._pool_config: tuple[int, torch.device] | None = None
-        self._tracker: _BlockTracker | None = None
+        self._active_idx: int | None = None
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._executor: ThreadPoolExecutor | None = None
         self._stream: torch.cuda.Stream | None = None
@@ -180,46 +145,27 @@ class BlockStreamingRuntime:
     def compile_backend(self) -> CompileBackend:
         return "inductor"
 
-    def activate(self, device: torch.device, config: StreamConfig) -> None:
+    def activate(self, device: torch.device) -> None:
         if self.active:
             raise RuntimeError("block streaming runtime is already active")
 
         num_blocks = len(self._instances)
-        num_resident = min(config.num_resident_blocks, num_blocks)
-        num_gpu_targets = num_resident + config.num_prefetch_blocks
-        if num_gpu_targets <= 0:
-            raise ValueError(
-                f"num_gpu_targets must be > 0, got {num_gpu_targets}. "
-                "num_resident is always >= 1 by construction; this only "
-                "fires when num_prefetch_blocks is negative."
-            )
-
         self._device = device
-        self._tracker = _BlockTracker()
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._stream = torch.cuda.Stream(device=device, priority=-1)
         self._pending = {}
         self._prefetch_events = {i: torch.cuda.Event() for i in range(num_blocks)}
         self._last_idx = -1
 
-        self._activate_pool(num_gpu_targets, device)
+        self._pool = _MorphingTargetPool(device)
         self._move_trainable_grads_to(device)
 
-        for block_idx in range(num_resident):
-            self._load_block(block_idx)
-            self._tracker.mark_on_gpu(block_idx)
+        self._load_block(0)
+        self._active_idx = 0
 
-        self._register_hooks(
-            num_resident,
-            config.num_prefetch_blocks,
-            config.cyclic,
-        )
+        self._register_hooks()
 
-        logger.info(
-            f"{self._log_label} active: {num_resident}/{num_blocks} resident "
-            f"on GPU, prefetch={config.num_prefetch_blocks}, "
-            f"max_gpu_resident={num_gpu_targets}"
-        )
+        logger.info(f"{self._log_label} active: one block on GPU plus one lookahead target across {num_blocks} blocks")
 
     def deactivate(self) -> None:
         for handle in self._hooks:
@@ -234,8 +180,9 @@ class BlockStreamingRuntime:
         self._prefetch_events.clear()
         self._stream = None
         self._move_trainable_grads_to(torch.device("cpu"))
-        self._deactivate_pool()
-        self._tracker = None
+        self._pool = None
+        self._block_to_target.clear()
+        self._active_idx = None
         self._last_idx = -1
         self._device = None
 
@@ -325,26 +272,6 @@ class BlockStreamingRuntime:
         for instance in self._instances:
             instance.move_trainable_grads_to(device)
 
-    def _activate_pool(self, num_gpu_targets: int, device: torch.device) -> None:
-        if self._pool_config is not None:
-            existing = self._pool_config
-            if existing != (num_gpu_targets, device):
-                raise ValueError(
-                    f"StreamedComponent pool already activated with "
-                    f"{existing}; cannot re-activate with ({num_gpu_targets}, "
-                    f"{device}). Call _deactivate_pool() first."
-                )
-            return
-        if num_gpu_targets <= 0:
-            raise ValueError(f"num_gpu_targets must be > 0, got {num_gpu_targets}")
-        self._pool = _MorphingTargetPool(device)
-        self._pool_config = (num_gpu_targets, device)
-
-    def _deactivate_pool(self) -> None:
-        self._pool = None
-        self._block_to_target.clear()
-        self._pool_config = None
-
     def _load_block(
         self,
         block_idx: int,
@@ -352,7 +279,7 @@ class BlockStreamingRuntime:
         non_blocking: bool = False,
         stream: torch.cuda.Stream | None = None,
     ) -> None:
-        assert self._pool is not None, "_activate_pool not called"
+        assert self._pool is not None, "runtime is not active"
         instance = self._instances[block_idx]
         target = self._block_to_target.get(block_idx)
         if target is None:
@@ -367,21 +294,10 @@ class BlockStreamingRuntime:
 
     def _release_block(self, block_idx: int) -> None:
         self._instances[block_idx].install_pinned()
-        if self._pool is None:
-            return
+        assert self._pool is not None, "runtime is not active"
         target = self._block_to_target.pop(block_idx, None)
         if target is not None:
             self._pool.release(self._signatures[block_idx], target)
-
-    def _evict_allocated_blocks(self) -> None:
-        for block_idx in list(self._block_to_target):
-            self._release_block(block_idx)
-
-    def _mark_compute_done(self, block_idx: int, event: torch.cuda.Event) -> None:
-        assert self._pool is not None, "_activate_pool not called"
-        target = self._block_to_target.get(block_idx)
-        if target is not None:
-            self._pool.set_compute_event(target, event)
 
     def _drain_and_evict_all(self) -> BaseException | None:
         first_prefetch_exc: BaseException | None = None
@@ -400,18 +316,22 @@ class BlockStreamingRuntime:
                 if first_prefetch_exc is None:
                     first_prefetch_exc = exc
 
-        self._evict_allocated_blocks()
-        if self._tracker is not None:
-            self._tracker.clear()
+        for block_idx in list(self._block_to_target):
+            self._release_block(block_idx)
+        self._active_idx = None
         return first_prefetch_exc
 
-    def _evict_one(self, protected: set[int], compute_event: object | None = None) -> None:
-        assert self._tracker is not None
-        victim = self._tracker.pick_victim(protected=protected)
+    def _evict_active(self, compute_event: torch.cuda.Event | None = None) -> None:
+        victim = self._active_idx
+        if victim is None:
+            return
         if compute_event is not None:
-            self._mark_compute_done(victim, cast(torch.cuda.Event, compute_event))
+            assert self._pool is not None, "runtime is not active"
+            target = self._block_to_target.get(victim)
+            if target is not None:
+                self._pool.set_compute_event(target, compute_event)
         self._release_block(victim)
-        self._tracker.mark_on_cpu(victim)
+        self._active_idx = None
 
     def _do_prefetch(self, idx: int) -> None:
         assert self._stream is not None
@@ -419,91 +339,56 @@ class BlockStreamingRuntime:
             self._load_block(idx, non_blocking=True, stream=self._stream)
             self._prefetch_events[idx].record(self._stream)
 
-    def _submit_prefetch(self, idx: int, max_on_gpu: int) -> None:
-        assert self._tracker is not None
+    def _submit_prefetch(self, idx: int) -> None:
         assert self._executor is not None
-        if idx < 0 or idx >= len(self._instances):
+        if idx == self._active_idx or idx in self._pending:
             return
-        if self._tracker.is_on_gpu(idx) or idx in self._pending:
-            return
-        if len(self._tracker._on_gpu) + len(self._pending) >= max_on_gpu:
+        if self._pending:
             return
         self._pending[idx] = self._executor.submit(self._do_prefetch, idx)
 
     def _ensure_on_gpu(self, idx: int) -> None:
-        assert self._tracker is not None
         future = self._pending.pop(idx, None)
         if future is not None:
             future.result()
             event = self._prefetch_events[idx]
             if not event.query():
                 event.wait(torch.cuda.current_stream(self._require_device()))
-            self._tracker.mark_on_gpu(idx)
+            self._active_idx = idx
             return
-        if not self._tracker.is_on_gpu(idx):
-            self._load_block(idx)
-            self._tracker.mark_on_gpu(idx)
+        self._load_block(idx)
+        self._active_idx = idx
 
     def _before_block_forward(
         self,
         idx: int,
-        *,
-        num_resident: int,
-        max_on_gpu: int,
-        num_prefetch_blocks: int,
-        cyclic: bool,
-        num_blocks: int,
-        wrap_threshold: int,
     ) -> None:
-        tracker = self._tracker
-        if tracker is None:
+        if not self.active:
             return
 
-        pending = self._pending
-        if tracker.is_on_gpu(idx):
-            tracker.touch(idx)
-        else:
-            compute_event = torch.cuda.current_stream(self._require_device()).record_event()
-            while len(tracker._on_gpu) >= num_resident:
-                self._evict_one({idx} | set(pending), compute_event)
+        if idx != self._active_idx:
+            compute_event = torch.cuda.Event()
+            compute_event.record(torch.cuda.current_stream(self._require_device()))
+            self._evict_active(compute_event)
             self._ensure_on_gpu(idx)
 
         last = self._last_idx
         self._last_idx = idx
+        num_blocks = len(self._instances)
         if last < 0:
             direction = 1
         else:
             diff = idx - last
-            direction = (-1 if diff > 0 else 1) if cyclic and abs(diff) > wrap_threshold else 1 if diff >= 0 else -1
-        for offset in range(1, num_prefetch_blocks + 1):
-            target = idx + direction * offset
-            if cyclic:
-                target %= num_blocks
-            self._submit_prefetch(target, max_on_gpu)
+            direction = (-1 if diff > 0 else 1) if abs(diff) > num_blocks // 2 else 1 if diff >= 0 else -1
+        self._submit_prefetch((idx + direction) % num_blocks)
 
-    def _register_hooks(
-        self,
-        num_resident: int,
-        num_prefetch_blocks: int,
-        cyclic: bool,
-    ) -> None:
-        max_on_gpu = num_resident + num_prefetch_blocks
-        num_blocks = len(self._instances)
-        wrap_threshold = num_blocks // 2
+    def _register_hooks(self) -> None:
         runtime_ref = weakref.ref(self)
 
         def _pre_hook(_module: nn.Module, _args: tuple[object, ...], *, idx: int) -> None:
             runtime = runtime_ref()
             if runtime is not None:
-                runtime._before_block_forward(
-                    idx,
-                    num_resident=num_resident,
-                    max_on_gpu=max_on_gpu,
-                    num_prefetch_blocks=num_prefetch_blocks,
-                    cyclic=cyclic,
-                    num_blocks=num_blocks,
-                    wrap_threshold=wrap_threshold,
-                )
+                runtime._before_block_forward(idx)
 
         last_idx_by_module = {id(module): idx for idx, module in enumerate(self._blocks)}
         for idx in last_idx_by_module.values():

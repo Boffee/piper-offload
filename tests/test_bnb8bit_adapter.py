@@ -13,7 +13,6 @@ from piper_offload import (
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
-    StreamConfig,
     merge_lora,
 )
 from piper_offload.bnb8bit_adapter import Bnb8bitAdapter
@@ -637,9 +636,7 @@ class TestBnb8bitAdapter:
         )
         try:
             for _ in range(3):
-                with activated_model(offloader,
-                    "cuda", stream_config=StreamConfig(num_prefetch_blocks=0)
-                ) as active:
+                with activated_model(offloader, "cuda") as active:
                     y = active(x)
                     torch.cuda.synchronize()
                 torch.testing.assert_close(y, reference)

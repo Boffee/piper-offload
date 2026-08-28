@@ -19,6 +19,14 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   dependencies to preserve compute kernel autotuning without forced reader
   materialization, and preserves supported merge-mode LoRA hooks.
 
+### Changed
+
+- Make streamed scheduling strategy-owned: ordinary streaming uses one active
+  block plus one asynchronous lookahead target, while rolling compilation uses
+  one shared parameter target. Remove the public `StreamConfig` residency,
+  prefetch-depth, and cyclic-traversal knobs; traversal wraparound is handled
+  internally.
+
 ## [0.2.5] - 2026-08-17
 
 ### Added

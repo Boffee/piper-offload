@@ -16,7 +16,6 @@ from tests._block_compile_helpers import (
     _Block,
     _BlockModel,
     _make_offloader,
-    _stream_config,
 )
 from tests.conftest import activated_model, streamed_components
 
@@ -289,11 +288,7 @@ class TestCompiledForwardLifecycle:
 
         monkeypatch.setattr(runtime, "_before_block_forward", record_before)
         try:
-            with activated_model(
-                offloader,
-                "cuda",
-                stream_config=_stream_config(),
-            ):
+            with activated_model(offloader, "cuda"):
                 assert streamer._active_runtime is runtime
                 assert all("forward" in block.__dict__ for block in model.blocks)
                 with torch.inference_mode():
@@ -325,11 +320,7 @@ class TestCompiledForwardLifecycle:
             block_compile=BlockCompileConfig(),
         )
         try:
-            with activated_model(
-                offloader,
-                "cuda",
-                stream_config=_stream_config(),
-            ):
+            with activated_model(offloader, "cuda"):
                 assert block.__dict__["forward"] is not original_override
             assert block.__dict__["forward"] is original_override
         finally:
@@ -361,20 +352,13 @@ class TestCompiledForwardLifecycle:
         with monkeypatch.context() as install_patch:
             install_patch.setattr(state_type, "install", broken_install)
             with pytest.raises(RuntimeError, match="simulated compiled-forward"):
-                offloader.activate(
-                    "cuda",
-                    stream_config=_stream_config(),
-                )
+                offloader.activate("cuda")
 
         assert offloader.active_device is None
         assert not compile_state.installed
         assert all("forward" not in block.__dict__ for block in model.blocks)
 
-        with activated_model(
-            offloader,
-            "cuda",
-            stream_config=_stream_config(),
-        ):
+        with activated_model(offloader, "cuda"):
             pass
 
     @CUDA
@@ -394,18 +378,10 @@ class TestCompiledForwardLifecycle:
             block_compile=BlockCompileConfig(),
         )
         try:
-            with activated_model(
-                offloader,
-                "cuda",
-                stream_config=_stream_config(),
-            ):
+            with activated_model(offloader, "cuda"):
                 with torch.inference_mode():
                     actual = [model(x.cuda()).cpu() for x in inputs[:2]]
-            with activated_model(
-                offloader,
-                "cuda",
-                stream_config=_stream_config(),
-            ):
+            with activated_model(offloader, "cuda"):
                 with torch.inference_mode():
                     actual.append(model(inputs[2].cuda()).cpu())
 
@@ -454,11 +430,7 @@ class TestCompileFailureSemantics:
             block_compile=BlockCompileConfig(),
         )
         try:
-            with activated_model(
-                offloader,
-                "cuda",
-                stream_config=_stream_config(),
-            ):
+            with activated_model(offloader, "cuda"):
                 with pytest.raises(RuntimeError, match="simulated compiler"):
                     model(torch.randn(2, 8, device="cuda"))
             assert eager_calls == 0
@@ -485,11 +457,7 @@ class TestCompileFailureSemantics:
             block_compile=BlockCompileConfig(),
         )
         try:
-            with activated_model(
-                offloader,
-                "cuda",
-                stream_config=_stream_config(),
-            ):
+            with activated_model(offloader, "cuda"):
                 with pytest.raises(ValueError, match="model forward failed"):
                     model(torch.randn(2, 8, device="cuda"))
             assert eager_calls == 1
@@ -520,7 +488,6 @@ class TestCompiledLoRA:
                 loras=[lora],
                 lora_strengths=[0.25],
                 lora_mode="merge",
-                stream_config=_stream_config(),
             ):
                 with torch.inference_mode():
                     expected = eager_model(x).cpu()
@@ -538,7 +505,6 @@ class TestCompiledLoRA:
                 loras=[lora],
                 lora_strengths=[0.25],
                 lora_mode="merge",
-                stream_config=_stream_config(),
             ):
                 with torch.inference_mode():
                     actual = compiled_model(x).cpu()
@@ -573,7 +539,6 @@ class TestCompiledLoRA:
                 "cuda",
                 loras=[lora],
                 lora_mode="routed",
-                stream_config=_stream_config(),
             ):
                 assert all("forward" not in block.__dict__ for block in (*model.first_blocks, *model.second_blocks))
                 with torch.inference_mode():
@@ -584,7 +549,6 @@ class TestCompiledLoRA:
                 offloader,
                 "cuda",
                 lora_mode="routed",
-                stream_config=_stream_config(),
             ):
                 with torch.inference_mode():
                     model(x)
@@ -595,7 +559,6 @@ class TestCompiledLoRA:
                 "cuda",
                 loras=[lora],
                 lora_mode="merge",
-                stream_config=_stream_config(),
             ):
                 with torch.inference_mode():
                     model(x)

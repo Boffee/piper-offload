@@ -20,7 +20,6 @@ from piper_offload import (
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
-    StreamConfig,
     merge_lora,
 )
 from piper_offload.dtensor_adapter import DTensorAdapter
@@ -289,6 +288,9 @@ class TestDTensorAdapter:
                 super().__init__()
                 self.weight = nn.Parameter(w, requires_grad=False)
 
+            def forward(self) -> torch.Tensor:
+                return self.weight
+
         class Net(nn.Module):
             def __init__(self, blocks: list[nn.Module]) -> None:
                 super().__init__()
@@ -301,12 +303,9 @@ class TestDTensorAdapter:
             resting = net.blocks[0].weight.data
             assert _is_dtensor(resting)
             assert resting.device_mesh.device_type == "cpu"
-            with activated_model(
-                pw,
-                "cuda",
-                stream_config=StreamConfig(num_resident_blocks=2, num_prefetch_blocks=0),
-            ):
+            with activated_model(pw, "cuda"):
                 for blk in net.blocks:
+                    blk()
                     assert _is_dtensor(blk.weight.data)
                     assert blk.weight.data.device_mesh.device_type == "cuda"
                     assert blk.weight.data.to_local().is_cuda
