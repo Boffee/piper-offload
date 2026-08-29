@@ -16,10 +16,7 @@ from .int4_tile_adapter import Int4TilePackedAdapter
 from .int8_adapter import Int8Adapter
 from .mx_adapter import MxAdapter
 from .nvfp4_adapter import Nvfp4Adapter
-from .pinned_module import (
-    PinnedModuleInstance,
-    PinnedModuleTarget,
-)
+from .pinned_module import PinnedModuleInstance
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from .quanto_adapter import QuantoAdapter
 from .rolling_compile import (
@@ -28,6 +25,7 @@ from .rolling_compile import (
     unregister_rolling_target,
 )
 from .static_float8_adapter import StaticFloat8Adapter
+from .target_lease import _CudaTargetLease
 from .tensor_adapters import RegularAdapter
 
 logger = logging.getLogger(__name__)
@@ -61,7 +59,7 @@ class _RollingTargetRuntime:
         self._reset_active_state()
 
     def _reset_active_state(self) -> None:
-        self._target: PinnedModuleTarget | None = None
+        self._lease: _CudaTargetLease | None = None
         self._stream: torch.cuda.Stream | None = None
         self._events: tuple[torch.cuda.Event, ...] = ()
         self._ready_events: tuple[torch.cuda.Event, ...] = ()
@@ -71,7 +69,7 @@ class _RollingTargetRuntime:
 
     @property
     def active(self) -> bool:
-        return self._target is not None or self._stream is not None
+        return self._lease is not None or self._stream is not None
 
     @property
     def compile_backend(self) -> CompileBackend:
@@ -84,25 +82,27 @@ class _RollingTargetRuntime:
         self._events = tuple(torch.cuda.Event() for _ in self._param_names)
         self._ready_events = tuple(torch.cuda.Event() for _ in self._param_names)
         self._fallback_event = torch.cuda.Event()
-        self._target = self._instances[0].allocate_target(device)
+        self._lease = _CudaTargetLease.allocate(self._instances[0], device)
+        target = self._lease.target
         register_rolling_target(
             self,
-            [self._target.param_targets[name].param for name in self._param_names],
+            [target.param_targets[name].param for name in self._param_names],
         )
         self._owners = [-1] * len(self._param_names)
 
+        self._lease.stage(
+            self._instances[0],
+            self._stream,
+            run_post_copy_hooks=True,
+            non_blocking=True,
+        )
         with torch.cuda.stream(self._stream):
-            self._instances[0].load_to_target(
-                self._target,
-                run_post_copy_hooks=True,
-                non_blocking=True,
-            )
             for ready_event in self._ready_events:
                 ready_event.record(self._stream)
-        torch.cuda.current_stream(device).wait_stream(self._stream)
+        self._lease.acquire(torch.cuda.current_stream(device))
         self._owners[:] = [0] * len(self._param_names)
         for instance in self._instances:
-            instance.install_target(self._target)
+            instance.install_target(target)
         self._register_hooks(device)
 
         logger.info(
@@ -130,7 +130,7 @@ class _RollingTargetRuntime:
         prefetch_stream = self._stream
         fallback_event = self._fallback_event
         owners = self._owners
-        if self._target is None or prefetch_stream is None or fallback_event is None or owners is None:
+        if self._lease is None or prefetch_stream is None or fallback_event is None or owners is None:
             return
 
         missing = [idx for idx, owner in enumerate(owners) if owner != block_idx]
@@ -147,18 +147,23 @@ class _RollingTargetRuntime:
                 self._refill(block_idx, param_idx)
 
     def wait_param(self, param_idx: int) -> None:
-        target = self._target
-        if target is None:
+        lease = self._lease
+        if lease is None:
             raise RuntimeError("rolling wait executed while runtime is inactive")
-        device = target.param_targets[self._param_names[param_idx]].param.device
-        torch.cuda.current_stream(device).wait_event(self._ready_events[param_idx])
+        target = lease.target
+        name = self._param_names[param_idx]
+        device = target.param_targets[name].param.device
+        current_stream = torch.cuda.current_stream(device)
+        self._record_param_stream(name, current_stream)
+        current_stream.wait_event(self._ready_events[param_idx])
 
     def rollover_param(self, param_idx: int) -> None:
-        target = self._target
+        lease = self._lease
         prefetch_stream = self._stream
         owners = self._owners
-        if target is None or prefetch_stream is None or owners is None:
+        if lease is None or prefetch_stream is None or owners is None:
             raise RuntimeError("rolling refill executed while runtime is inactive")
+        target = lease.target
         block_idx = owners[param_idx]
         if block_idx < 0:
             name = self._param_names[param_idx]
@@ -171,6 +176,7 @@ class _RollingTargetRuntime:
         name = self._param_names[param_idx]
         device = target.param_targets[name].param.device
         current_stream = torch.cuda.current_stream(device)
+        self._record_param_stream(name, current_stream)
         compute_done = self._events[param_idx]
         compute_done.record(current_stream)
         with torch.cuda.stream(prefetch_stream):
@@ -178,32 +184,51 @@ class _RollingTargetRuntime:
             self._refill(next_idx, param_idx)
 
     def _refill(self, block_idx: int, param_idx: int) -> None:
-        target = self._target
+        lease = self._lease
         prefetch_stream = self._stream
         owners = self._owners
-        assert target is not None
+        assert lease is not None
+        target = lease.target
         assert prefetch_stream is not None
         assert owners is not None
         name = self._param_names[param_idx]
         param_target = target.param_targets[name]
         self._instances[block_idx].refill_param_target(name, param_target)
+        self._record_param_stream(name, prefetch_stream)
         self._ready_events[param_idx].record(prefetch_stream)
         owners[param_idx] = block_idx
+
+    def _record_param_stream(
+        self,
+        name: str,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        lease = self._lease
+        assert lease is not None
+        param_target = lease.target.param_targets[name]
+        if not self._instances[0].params[name].record_stream(
+            param_target._state,
+            stream,
+        ):
+            raise RuntimeError("rolling adapter does not support CUDA stream recording")
 
     def deactivate(self) -> None:
         for handle in self._hooks:
             handle.remove()
+        self._hooks.clear()
         first_error: BaseException | None = None
-        if self._stream is not None:
-            try:
-                self._stream.synchronize()
-            except BaseException as exc:
-                first_error = exc
-        if self._target is not None:
+        lease = self._lease
+        if lease is not None:
             unregister_rolling_target(self)
         for instance in self._instances:
             try:
                 instance.install_pinned()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if lease is not None:
+            try:
+                lease.close()
             except BaseException as exc:
                 if first_error is None:
                     first_error = exc

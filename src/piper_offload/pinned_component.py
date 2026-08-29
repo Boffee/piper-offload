@@ -66,9 +66,9 @@ from .host_backing import (
 from .pinned_module import (
     PinnedModuleInstance,
     PinnedModuleStore,
-    PinnedModuleTarget,
     PostCopyHook,
 )
+from .target_lease import _CudaTargetLease
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,7 +170,8 @@ class PinnedComponent:
         self._buffer_names = frozenset(instance.buffers)
         self._has_trainables = instance.has_trainables
         self._active_device: torch.device | None = None
-        self._active_target: PinnedModuleTarget | None = None
+        self._lease_device: torch.device | None = None
+        self._lease: _CudaTargetLease | None = None
         self._optimizer_step_active: bool = False
 
     # ------------------------------------------------------------------
@@ -231,21 +232,14 @@ class PinnedComponent:
         if active_device.type == "cpu":
             self._instance.install_pinned()
         elif active_device.type == "cuda":
-            # One active-device Parameter per unique pinned parameter.
-            # Tied names all receive the same Parameter object so the
-            # tying invariant survives on device.
-            target = self._instance.allocate_target(active_device)
-            self._instance.load_to_target(
-                target,
-                run_post_copy_hooks=True,
-                non_blocking=True,
-            )
+            current_stream = torch.cuda.current_stream(active_device)
+            self._stage(active_device, current_stream)
+            self._acquire(current_stream)
             torch.cuda.synchronize(active_device)
             # Realign trainable grads with their now-GPU data so the next
             # backward accumulates on-device. A no-op unless a prior CPU
             # optimizer step left a retained CPU grad (set_to_none=False).
             self._instance.move_trainable_grads_to(active_device)
-            self._active_target = target
         else:
             raise ValueError(
                 "PinnedComponent.activate() supports CUDA or CPU; "
@@ -253,43 +247,69 @@ class PinnedComponent:
             )
         self._active_device = active_device
 
-    def _prefetch(
+    def _stage(
         self,
         device: torch.device,
         stream: torch.cuda.Stream,
     ) -> None:
-        """Asynchronously activate on ``stream``.
+        """Asynchronously fill a CUDA target without installing it.
 
-        Package-internal: boundary streaming uses this to stage the next
-        prefix between model calls. The target is installed immediately, but
-        callers must order the consuming stream after ``stream`` before
-        executing the component.
+        Package-internal: boundary streaming stages the next prefix on its
+        copy stream, then installs it on the model thread only after the
+        consuming stream has acquired the target.
         """
-        if self._active_device is not None:
+        if self._active_device is not None or self._lease is not None:
             raise RuntimeError(
-                "PinnedComponent prefetch requested while already active "
-                f"on {self._active_device}."
+                "PinnedComponent stage requested with an active or staged target."
             )
-        active_device = canonical_device(device)
-        if active_device.type != "cuda":
+        lease_device = canonical_device(device)
+        if lease_device.type != "cuda":
             raise ValueError(
-                "PinnedComponent prefetch requires CUDA; "
-                f"got {active_device}."
+                "PinnedComponent staging requires CUDA; "
+                f"got {lease_device}."
             )
-
-        # Allocate from the default-stream pool so repeated boundary staging
-        # does not strand a prefix-sized cache in the private copy stream.
-        with torch.cuda.stream(torch.cuda.default_stream(active_device)):
-            target = self._instance.allocate_target(active_device)
-        with torch.cuda.stream(stream):
-            self._instance.load_to_target(
-                target,
+        lease = _CudaTargetLease.allocate(self._instance, lease_device)
+        self._lease = lease
+        self._lease_device = lease_device
+        try:
+            lease.stage(
+                self._instance,
+                stream,
                 run_post_copy_hooks=True,
                 non_blocking=True,
             )
+        except BaseException:
+            lease.close()
+            self._lease = None
+            self._lease_device = None
+            raise
 
-        self._active_target = target
-        self._active_device = active_device
+    def _acquire(self, stream: torch.cuda.Stream) -> None:
+        """Install the staged target for consumption on ``stream``."""
+        if self._active_device is not None:
+            raise RuntimeError("PinnedComponent staged target is already active.")
+        lease = self._lease
+        device = self._lease_device
+        if lease is None or device is None:
+            raise RuntimeError("PinnedComponent has no staged CUDA target.")
+        target = lease.acquire(stream)
+        self._instance.install_target(target)
+        self._active_device = device
+
+    def _release(self, stream: torch.cuda.Stream | None = None) -> None:
+        """Restore host backing and safely discard any staged CUDA target."""
+        lease = self._lease
+        try:
+            self._instance.install_pinned()
+            self._instance.move_trainable_grads_to(torch.device("cpu"))
+        finally:
+            try:
+                if lease is not None:
+                    lease.close(stream)
+            finally:
+                self._lease = None
+                self._lease_device = None
+                self._active_device = None
 
     def deactivate(self) -> None:
         """Repoint registry entries back at pinned-CPU Parameters. Idempotent —
@@ -305,12 +325,11 @@ class PinnedComponent:
         ``.grad`` both on pinned CPU — so a context-free CPU
         ``optimizer.step()`` works the same for pinned and streamed
         trainables."""
-        try:
-            self._instance.install_pinned()
-            self._instance.move_trainable_grads_to(torch.device("cpu"))
-        finally:
-            self._active_target = None
-            self._active_device = None
+        stream: torch.cuda.Stream | None = None
+        active_device = self._active_device
+        if active_device is not None and active_device.type == "cuda":
+            stream = torch.cuda.current_stream(active_device)
+        self._release(stream)
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:
@@ -338,13 +357,13 @@ class PinnedComponent:
         self._optimizer_step_active = True
         try:
             active_device = self._active_device
-            target = self._active_target
+            lease = self._lease
             if (
                 self._has_trainables
                 and active_device is not None
                 and active_device.type == "cuda"
             ):
-                if target is None:
+                if lease is None:
                     raise RuntimeError(
                         "PinnedComponent optimizer-step state is inconsistent: "
                         "CUDA active without an active target."
@@ -353,7 +372,7 @@ class PinnedComponent:
                     yield
                 finally:
                     self._instance.copy_trainables_from_target(
-                        target,
+                        lease.target,
                         non_blocking=True,
                     )
                     torch.cuda.synchronize(active_device)

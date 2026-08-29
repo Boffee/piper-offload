@@ -290,7 +290,7 @@ class TestCompiledForwardLifecycle:
                 with torch.inference_mode():
                     actual = model(value.cuda()).clone()
                 synchronize_prefix_prefetch(offloader)
-                assert model.prefix.weight.is_cuda
+                assert model.prefix.weight.device.type == "cpu"
                 assert model.suffix.weight.is_pinned()
             torch.testing.assert_close(actual, expected)
         finally:

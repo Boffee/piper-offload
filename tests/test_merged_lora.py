@@ -1089,7 +1089,7 @@ class TestLifecycle:
             torch.testing.assert_close(first, expected)
             torch.testing.assert_close(second, expected)
             synchronize_prefix_prefetch(strategy)
-            assert model.embed.weight.is_cuda
+            assert model.embed.weight.device.type == "cpu"
             assert model.head.weight.is_pinned()
         finally:
             strategy.deactivate()
@@ -1246,7 +1246,7 @@ class TestMergeCorrectness:
             streamer = streamed_components(strategy)[0] if streamed else None
             for block_idx, block in enumerate(m.transformer_blocks):
                 if streamer is not None:
-                    streamer._block_runtime._load_block(block_idx)
+                    streamer._block_runtime._before_block_forward(block_idx)
                 actual = block.attn.bias
                 assert actual is not None
                 expected = base_biases[block_idx].to(actual.device)
@@ -2772,8 +2772,6 @@ class TestLoRATransform:
         _request_loras(s, [(lora, 0.5)], mode="merge")
         _activate(s, "cuda")
         try:
-            streamer = streamed_components(s)[0]
-            streamer._block_runtime._load_block(0)
             merged_qt = m.transformer_blocks[0].attn.weight.data
             assert isinstance(merged_qt, WeightQBytesTensor)
             difference = (merged_qt._data.to(torch.int16) - expected._data.to(torch.int16)).abs()

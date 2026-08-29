@@ -329,6 +329,17 @@ class QuantoAdapter:
         dst.scale.copy_(src.scale, non_blocking=non_blocking)
 
     @staticmethod
+    def record_stream(
+        pinned_state: _QuantoPinned,
+        gpu_state: _QuantoGpu,
+        stream: torch.cuda.Stream,
+    ) -> bool:
+        del pinned_state
+        gpu_state.data.record_stream(stream)
+        gpu_state.scale.record_stream(stream)
+        return True
+
+    @staticmethod
     def copy_to_cpu(
         src: _QuantoGpu, dst: _QuantoPinned, *, non_blocking: bool = False
     ) -> None:

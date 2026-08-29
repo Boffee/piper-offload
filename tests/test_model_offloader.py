@@ -661,9 +661,9 @@ class TestBoundaryPinnedLifecycle:
             assert model.prefix.forward_devices == ["cuda"]
             assert model.suffix.forward_devices == ["cuda"]
             assert hook_devices == [("model", "cuda"), ("blocks", "cpu")]
-            assert model.prefix.weight.device.type == "cuda"
+            assert model.prefix.weight.device.type == "cpu"
             assert model.suffix.weight.device.type == "cpu"
-            assert model.prefix.offset.device.type == "cuda"
+            assert model.prefix.offset.device.type == "cpu"
             assert model.suffix.offset.device.type == "cpu"
             assert model.resident_scale.is_cuda
 
@@ -672,7 +672,7 @@ class TestBoundaryPinnedLifecycle:
             assert model.prefix.forward_devices == ["cuda", "cuda"]
             assert model.suffix.forward_devices == ["cuda", "cuda"]
             assert hook_devices[-2:] == [("model", "cuda"), ("blocks", "cpu")]
-            assert model.prefix.weight.device.type == "cuda"
+            assert model.prefix.weight.device.type == "cpu"
             assert model.suffix.weight.device.type == "cpu"
             assert model.suffix.weight.is_pinned() == (host_backing == "pinned")
         finally:
@@ -718,15 +718,18 @@ class TestBoundaryPinnedLifecycle:
         )
         prefix = prefix_component(strategy)
         assert prefix is not None
-        activate_calls = 0
-        original_activate = prefix.activate
+        stage_calls = 0
+        original_stage = prefix._stage
 
-        def activate(device: torch.device, **kwargs: object) -> None:
-            nonlocal activate_calls
-            activate_calls += 1
-            original_activate(device, **kwargs)
+        def stage(
+            device: torch.device,
+            stream: torch.cuda.Stream,
+        ) -> None:
+            nonlocal stage_calls
+            stage_calls += 1
+            original_stage(device, stream)
 
-        monkeypatch.setattr(prefix, "activate", activate)
+        monkeypatch.setattr(prefix, "_stage", stage)
         try:
             strategy.activate("cuda")
             value = torch.randn(2, 8, device="cuda")
@@ -736,7 +739,8 @@ class TestBoundaryPinnedLifecycle:
             assert boundary._prefix_prefetch is not None
 
             model(value)
-            assert activate_calls == 1
+            synchronize_prefix_prefetch(strategy)
+            assert stage_calls == 3
             assert model.suffix.weight.is_cuda
         finally:
             strategy.deactivate()
@@ -756,15 +760,21 @@ class TestBoundaryPinnedLifecycle:
         )
         prefix = prefix_component(strategy)
         assert prefix is not None
+        original_stage = prefix._stage
+        stage_calls = 0
 
-        def fail_prefetch(
+        def fail_stage(
             device: torch.device,
             stream: torch.cuda.Stream,
         ) -> None:
-            del device, stream
+            nonlocal stage_calls
+            stage_calls += 1
+            if stage_calls == 1:
+                original_stage(device, stream)
+                return
             raise RuntimeError("simulated prefix prefetch failure")
 
-        monkeypatch.setattr(prefix, "_prefetch", fail_prefetch)
+        monkeypatch.setattr(prefix, "_stage", fail_stage)
         strategy.activate("cuda")
         try:
             model(torch.randn(2, 8, device="cuda"))

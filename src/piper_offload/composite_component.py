@@ -170,13 +170,12 @@ class _BoundaryRuntime:
         try:
             future = self._prefix_prefetch
             self._prefix_prefetch = None
+            current_stream = torch.cuda.current_stream(device)
             if future is None:
-                self._prefix.activate(device)
+                self._prefix._stage(device, current_stream)
             else:
                 future.result()
-                stream = self._prefetch_stream
-                assert stream is not None
-                torch.cuda.current_stream(device).wait_stream(stream)
+            self._prefix._acquire(current_stream)
         except BaseException:
             self._prefix.deactivate()
             self._in_forward = False
@@ -185,7 +184,9 @@ class _BoundaryRuntime:
     def _before_blocks(self) -> None:
         if not self._in_forward or self._prefix is None:
             return
-        self._prefix.deactivate()
+        device = self._device
+        assert device is not None
+        self._prefix._release(torch.cuda.current_stream(device))
 
     def _after_blocks(self) -> None:
         if not self._in_forward or self._suffix is None or self._suffix_active:
@@ -193,22 +194,26 @@ class _BoundaryRuntime:
         device = self._device
         assert device is not None
         try:
-            self._suffix.activate(device)
+            current_stream = torch.cuda.current_stream(device)
+            self._suffix._stage(device, current_stream)
+            self._suffix._acquire(current_stream)
             self._suffix_active = True
         except BaseException:
             self._suffix.deactivate()
             raise
 
     def _after_model(self) -> None:
-        done: torch.cuda.Event | None = None
-        if self._prefix is not None:
+        current_stream: torch.cuda.Stream | None = None
+        if self._prefix is not None or self._suffix is not None:
             device = self._device
             assert device is not None
-            done = torch.cuda.Event()
-            done.record(torch.cuda.current_stream(device))
-        self._deactivate_scopes()
-        if done is not None:
-            self._submit_prefix_prefetch(done)
+            current_stream = torch.cuda.current_stream(device)
+        self._deactivate_scopes(current_stream)
+        if self._prefix is not None:
+            assert current_stream is not None
+            event = torch.cuda.Event()
+            event.record(current_stream)
+            self._submit_prefix_prefetch(event)
         self._in_forward = False
 
     def _submit_prefix_prefetch(self, done: torch.cuda.Event) -> None:
@@ -225,16 +230,19 @@ class _BoundaryRuntime:
             # Delay target allocation until the model has released its peak
             # forward allocations, then overlap the copy with caller work.
             done.synchronize()
-            prefix._prefetch(device, stream)
+            prefix._stage(device, stream)
 
         self._prefix_prefetch = executor.submit(prefetch)
 
-    def _deactivate_scopes(self) -> None:
+    def _deactivate_scopes(
+        self,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
         try:
             with contextlib.ExitStack() as stack:
                 for component in (self._prefix, self._suffix):
                     if component is not None:
-                        stack.callback(component.deactivate)
+                        stack.callback(component._release, stream)
         finally:
             self._suffix_active = False
 
@@ -255,14 +263,7 @@ class _BoundaryRuntime:
                 future.result()
             except BaseException as exc:
                 first_error = exc
-        stream = self._prefetch_stream
         self._prefetch_stream = None
-        if stream is not None:
-            try:
-                stream.synchronize()
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
         try:
             self._deactivate_scopes()
         except BaseException as exc:

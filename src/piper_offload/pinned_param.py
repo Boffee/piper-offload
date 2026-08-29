@@ -27,6 +27,7 @@ from .tensor_adapters import (
     CpuRoundTripTensorAdapter,
     ParameterDataSwapTensorAdapter,
     PostLoadRearmTensorAdapter,
+    RecordStreamTensorAdapter,
     TensorAdapter,
     adapter_name,
 )
@@ -218,6 +219,28 @@ class PinnedParam:
     def copy_to_gpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk DMA pinned host bytes into pre-allocated GPU storage."""
         self.adapter.copy_to_gpu(self.pinned_state, gpu_state, non_blocking=non_blocking)
+
+    def record_stream(
+        self,
+        gpu_state: object,
+        stream: torch.cuda.Stream,
+    ) -> bool:
+        """Record the target's physical CUDA storage on ``stream``.
+
+        Returns ``False`` when an external adapter lacks the optional
+        capability, allowing the target lease to use its safe event fallback.
+        """
+        adapter = self.adapter
+        if not isinstance(adapter, RecordStreamTensorAdapter):
+            return False
+        return cast(
+            "RecordStreamTensorAdapter[Any, Any]",
+            adapter,
+        ).record_stream(
+            self.pinned_state,
+            gpu_state,
+            stream,
+        )
 
     def copy_to_cpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk D2H GPU bytes back into the pinned host state.

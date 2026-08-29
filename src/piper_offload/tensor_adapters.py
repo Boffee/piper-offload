@@ -47,6 +47,7 @@ __all__ = [
     "LogicalShapeTensorAdapter",
     "ParameterDataSwapTensorAdapter",
     "PostLoadRearmTensorAdapter",
+    "RecordStreamTensorAdapter",
     "TensorAdapter",
     "TensorCopyIntoAdapter",
     "adapter_name",
@@ -402,6 +403,26 @@ class PostLoadRearmTensorAdapter[PinnedStateT, GpuStateT](
         ...
 
 
+@runtime_checkable
+class RecordStreamTensorAdapter[PinnedStateT, GpuStateT](Protocol):
+    """Optional CUDA allocator stream-recording capability.
+
+    Implementations record every physical CUDA tensor owned by ``gpu_state``.
+    Returning ``False`` asks the caller to use an allocation-stream event
+    handoff instead, which lets composing adapters remain safe when their
+    inner adapter does not implement this optimization.
+    """
+
+    @staticmethod
+    def record_stream(
+        pinned_state: PinnedStateT,
+        gpu_state: GpuStateT,
+        stream: torch.cuda.Stream,
+    ) -> bool:
+        """Record all GPU storage in ``gpu_state`` on ``stream``."""
+        ...
+
+
 # ---------------------------------------------------------------------------
 # RegularAdapter — plain torch.Tensor (bf16/fp16/fp32, etc.)
 # ---------------------------------------------------------------------------
@@ -668,6 +689,16 @@ class RegularAdapter:
         src: _RegularPinned, dst: _RegularGpu, *, non_blocking: bool = False
     ) -> None:
         dst.data.copy_(src.data, non_blocking=non_blocking)
+
+    @staticmethod
+    def record_stream(
+        pinned_state: _RegularPinned,
+        gpu_state: _RegularGpu,
+        stream: torch.cuda.Stream,
+    ) -> bool:
+        del pinned_state
+        gpu_state.data.record_stream(stream)
+        return True
 
     @staticmethod
     def copy_to_cpu(
