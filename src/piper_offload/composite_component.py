@@ -198,7 +198,9 @@ class _BoundaryRuntime:
         current_stream = torch.cuda.current_stream(device)
         self._release_scopes(current_stream)
         if self._prefix is not None:
-            self._submit_prefix_prefetch(current_stream.record_event())
+            self._submit_prefix_prefetch(
+                cast(torch.cuda.Event, current_stream.record_event())
+            )
         self._in_forward = False
 
     def _submit_prefix_prefetch(self, done: torch.cuda.Event) -> None:

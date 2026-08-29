@@ -1,5 +1,7 @@
 """Stream-aware ownership for reusable CUDA module targets."""
 
+from typing import cast
+
 import torch
 
 from .pinned_module import PinnedModuleInstance, PinnedModuleTarget
@@ -83,7 +85,7 @@ class _CudaTargetLease:
                 # A hook or later tensor copy can fail after earlier async
                 # copies were enqueued. Preserve a completion marker so
                 # cleanup still hands the allocation back safely.
-                self._event = stream.record_event()
+                self._event = cast(torch.cuda.Event, stream.record_event())
 
     def acquire(self, stream: torch.cuda.Stream) -> PinnedModuleTarget:
         """Order ``stream`` after staging and mark it as the consumer."""
@@ -107,7 +109,7 @@ class _CudaTargetLease:
         if self._consumer_stream is None:
             return
         consumer = stream or self._consumer_stream
-        self._event = consumer.record_event()
+        self._event = cast(torch.cuda.Event, consumer.record_event())
         self._consumer_stream = None
 
     def close(self, stream: torch.cuda.Stream | None = None) -> None:
