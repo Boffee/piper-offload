@@ -78,11 +78,14 @@ construction raises after pinning has started, recovery of the partially
 constructed resource/model is unsupported; drop those references and rebuild
 from a fresh model instance.
 
-:class:`ModelOffloader` composes (in order):
-  1. A :class:`PinnedComponent` for every non-streamed parameter and
-     buffer, including trainables skipped by block streaming.
-  2. One :class:`StreamedComponent` per ``blocks_attr`` path when
-     streaming is configured.
+:class:`ModelOffloader` composes:
+  1. A resident :class:`PinnedComponent` for non-streamed state, including
+     trainables skipped by block streaming.
+  2. Optional prefix and suffix :class:`PinnedComponent` instances selected
+     by ``prefix_attr`` / ``suffix_attr`` and loaded only around the central
+     block span. A successful forward asynchronously stages the next prefix.
+  3. One :class:`StreamedComponent` per ``blocks_attr`` path when streaming
+     is configured.
 
 Optional LoRA merging is requested directly on :meth:`ModelOffloader.activate`
 and resolved by installing post-copy hooks for managed parameter targets.

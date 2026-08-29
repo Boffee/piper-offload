@@ -25,16 +25,20 @@ class ModelSpec[M: nn.Module]:
 
     ``factory`` runs once to construct the cached :class:`ModelOffloader`.
     Every lease reuses that same model runtime sequentially; overlapping uses
-    are rejected by the offloader. ``block_compile`` is an opt-in construction
-    policy for every streamed group named by ``blocks_attr``. ``host_backing``
-    selects pinned copies (the default) or strict zero-copy adoption of
-    existing CPU model backing.
+    are rejected by the offloader. ``prefix_attr`` and ``suffix_attr`` select
+    frozen module state that is resident only around the central streamed
+    block span. ``block_compile`` is an opt-in construction policy for every
+    streamed group named by ``blocks_attr``. ``host_backing`` selects pinned
+    copies (the default) or strict zero-copy adoption of existing CPU model
+    backing.
     """
 
     key: str
     estimated_cache_bytes: int
     factory: Callable[[], M]
     blocks_attr: tuple[str, ...] = ()
+    prefix_attr: tuple[str, ...] = ()
+    suffix_attr: tuple[str, ...] = ()
     stream_trainable_weights: bool = False
     block_compile: BlockCompileConfig | None = None
     host_backing: HostBacking = "pinned"
@@ -44,6 +48,8 @@ class ModelSpec[M: nn.Module]:
         return ModelOffloader.from_module(
             self.factory(),
             blocks_attr=self.blocks_attr,
+            prefix_attr=self.prefix_attr,
+            suffix_attr=self.suffix_attr,
             stream_trainable_weights=self.stream_trainable_weights,
             block_compile=self.block_compile,
             host_backing=self.host_backing,

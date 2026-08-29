@@ -5,6 +5,15 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Allow callers to select `prefix_attr` and `suffix_attr` module paths whose
+  frozen non-block state is loaded only before or after the central streamed
+  block span. Successful forwards asynchronously prefetch the next prefix
+  after the model-done event, reducing peak CUDA residency and overlapping
+  inter-step work while preserving pinned/adopted backing, quantized adapters,
+  LoRA merge hooks, and compiled block execution.
+
 ## [0.3.0] - 2026-08-28
 
 ### Added

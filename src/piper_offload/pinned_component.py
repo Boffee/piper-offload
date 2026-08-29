@@ -253,6 +253,44 @@ class PinnedComponent:
             )
         self._active_device = active_device
 
+    def _prefetch(
+        self,
+        device: torch.device,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Asynchronously activate on ``stream``.
+
+        Package-internal: boundary streaming uses this to stage the next
+        prefix between model calls. The target is installed immediately, but
+        callers must order the consuming stream after ``stream`` before
+        executing the component.
+        """
+        if self._active_device is not None:
+            raise RuntimeError(
+                "PinnedComponent prefetch requested while already active "
+                f"on {self._active_device}."
+            )
+        active_device = canonical_device(device)
+        if active_device.type != "cuda":
+            raise ValueError(
+                "PinnedComponent prefetch requires CUDA; "
+                f"got {active_device}."
+            )
+
+        # Allocate from the default-stream pool so repeated boundary staging
+        # does not strand a prefix-sized cache in the private copy stream.
+        with torch.cuda.stream(torch.cuda.default_stream(active_device)):
+            target = self._instance.allocate_target(active_device)
+        with torch.cuda.stream(stream):
+            self._instance.load_to_target(
+                target,
+                run_post_copy_hooks=True,
+                non_blocking=True,
+            )
+
+        self._active_target = target
+        self._active_device = active_device
+
     def deactivate(self) -> None:
         """Repoint registry entries back at pinned-CPU Parameters. Idempotent —
         safe to call before activate or multiple times. After
