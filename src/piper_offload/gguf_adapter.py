@@ -275,17 +275,6 @@ class GgufAdapter:
         dst.dequant.copy_(result)
 
     @staticmethod
-    def record_stream(
-        pinned_state: _GgufPinned,
-        gpu_state: _GgufGpu,
-        stream: torch.cuda.Stream,
-    ) -> bool:
-        del pinned_state
-        gpu_state.staging.record_stream(stream)
-        gpu_state.dequant.record_stream(stream)
-        return True
-
-    @staticmethod
     def compute_dtype(t: torch.Tensor) -> torch.dtype:
         _require_gguf_weight(t)
         return torch.bfloat16

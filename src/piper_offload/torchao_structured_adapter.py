@@ -296,19 +296,6 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         copy_storage(src.storage, dst.storage, non_blocking=non_blocking)
 
     @classmethod
-    def record_stream(
-        cls,
-        pinned_state: TorchaoPinned[MetaT],
-        gpu_state: TorchaoGpu,
-        stream: torch.cuda.Stream,
-    ) -> bool:
-        del cls, pinned_state
-        for tensor in gpu_state.storage:
-            if tensor is not None:
-                tensor.record_stream(stream)
-        return True
-
-    @classmethod
     def cache_bytes(cls, state: TorchaoPinned[MetaT]) -> int:
         return sum(s.nbytes for s in state.storage if s is not None)
 

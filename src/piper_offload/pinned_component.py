@@ -170,7 +170,6 @@ class PinnedComponent:
         self._buffer_names = frozenset(instance.buffers)
         self._has_trainables = instance.has_trainables
         self._active_device: torch.device | None = None
-        self._lease_device: torch.device | None = None
         self._lease: _CudaTargetLease | None = None
         self._optimizer_step_active: bool = False
 
@@ -231,6 +230,7 @@ class PinnedComponent:
         active_device = canonical_device(device)
         if active_device.type == "cpu":
             self._instance.install_pinned()
+            self._active_device = active_device
         elif active_device.type == "cuda":
             current_stream = torch.cuda.current_stream(active_device)
             self._stage(active_device, current_stream)
@@ -245,7 +245,6 @@ class PinnedComponent:
                 "PinnedComponent.activate() supports CUDA or CPU; "
                 f"got {active_device}."
             )
-        self._active_device = active_device
 
     def _stage(
         self,
@@ -269,8 +268,6 @@ class PinnedComponent:
                 f"got {lease_device}."
             )
         lease = _CudaTargetLease.allocate(self._instance, lease_device)
-        self._lease = lease
-        self._lease_device = lease_device
         try:
             lease.stage(
                 self._instance,
@@ -280,21 +277,19 @@ class PinnedComponent:
             )
         except BaseException:
             lease.close()
-            self._lease = None
-            self._lease_device = None
             raise
+        self._lease = lease
 
     def _acquire(self, stream: torch.cuda.Stream) -> None:
         """Install the staged target for consumption on ``stream``."""
         if self._active_device is not None:
             raise RuntimeError("PinnedComponent staged target is already active.")
         lease = self._lease
-        device = self._lease_device
-        if lease is None or device is None:
+        if lease is None:
             raise RuntimeError("PinnedComponent has no staged CUDA target.")
         target = lease.acquire(stream)
         self._instance.install_target(target)
-        self._active_device = device
+        self._active_device = lease.device
 
     def _release(self, stream: torch.cuda.Stream | None = None) -> None:
         """Restore host backing and safely discard any staged CUDA target."""
@@ -308,7 +303,6 @@ class PinnedComponent:
                     lease.close(stream)
             finally:
                 self._lease = None
-                self._lease_device = None
                 self._active_device = None
 
     def deactivate(self) -> None:

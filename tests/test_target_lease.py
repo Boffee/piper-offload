@@ -1,4 +1,4 @@
-"""CUDA target lease ordering and fallback behavior."""
+"""CUDA target lease ordering and stream lifetime."""
 
 from typing import cast
 
@@ -51,22 +51,29 @@ def test_stage_is_registry_pure_and_reuse_waits_for_consumer() -> None:
     torch.testing.assert_close(actual_second, expected_second)
 
 
-def test_close_hands_release_back_to_allocation_stream() -> None:
+def test_close_hands_target_work_back_to_allocation_stream() -> None:
     class Stream:
         def __init__(self) -> None:
-            self.waited: list[object] = []
+            self.waited_events: list[object] = []
+            self.waited_streams: list[object] = []
 
         def wait_event(self, event: object) -> None:
-            self.waited.append(event)
+            self.waited_events.append(event)
+
+        def wait_stream(self, stream: object) -> None:
+            self.waited_streams.append(stream)
 
     allocation_stream = Stream()
+    tracked_stream = Stream()
     ready = object()
     lease = _CudaTargetLease(
         cast(PinnedModuleTarget, object()),
         cast(torch.cuda.Stream, allocation_stream),
     )
-    lease._ready_event = cast(torch.cuda.Event, ready)
+    lease._event = cast(torch.cuda.Event, ready)
+    lease.track_stream(cast(torch.cuda.Stream, tracked_stream))
 
     lease.close()
 
-    assert allocation_stream.waited == [ready]
+    assert allocation_stream.waited_events == [ready]
+    assert allocation_stream.waited_streams == [tracked_stream]

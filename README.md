@@ -1032,9 +1032,13 @@ This is a low-level library; we don't guard against caller misuse.
 distinct quanto wrappers around shared inner `_data` storage.
 
 `ModelOffloader` is intended for ordinary transformer block lists where
-the streamed block weights are independent. It does not prevalidate
-unusual shared-storage layouts that cross block/non-block boundaries;
-use whole-model `ModelOffloader` if that sharing must be preserved.
+the streamed block weights are independent. Shared storage is preserved
+within one streamed block and within pinned state, including the standard
+tied input-embedding/output-head pattern. It is unsupported across offload
+ownership boundaries: between streamed and pinned state, or between distinct
+streamed blocks or block groups. `ModelOffloader` does not prevalidate these
+unusual layouts; omit `blocks_attr` and use whole-model offloading if that
+sharing must be preserved.
 
 ## Quantized weight support
 

@@ -83,6 +83,7 @@ class _RollingTargetRuntime:
         self._ready_events = tuple(torch.cuda.Event() for _ in self._param_names)
         self._fallback_event = torch.cuda.Event()
         self._lease = _CudaTargetLease.allocate(self._instances[0], device)
+        self._lease.track_stream(self._stream)
         target = self._lease.target
         register_rolling_target(
             self,
@@ -154,7 +155,7 @@ class _RollingTargetRuntime:
         name = self._param_names[param_idx]
         device = target.param_targets[name].param.device
         current_stream = torch.cuda.current_stream(device)
-        self._record_param_stream(name, current_stream)
+        lease.track_stream(current_stream)
         current_stream.wait_event(self._ready_events[param_idx])
 
     def rollover_param(self, param_idx: int) -> None:
@@ -176,7 +177,6 @@ class _RollingTargetRuntime:
         name = self._param_names[param_idx]
         device = target.param_targets[name].param.device
         current_stream = torch.cuda.current_stream(device)
-        self._record_param_stream(name, current_stream)
         compute_done = self._events[param_idx]
         compute_done.record(current_stream)
         with torch.cuda.stream(prefetch_stream):
@@ -194,23 +194,8 @@ class _RollingTargetRuntime:
         name = self._param_names[param_idx]
         param_target = target.param_targets[name]
         self._instances[block_idx].refill_param_target(name, param_target)
-        self._record_param_stream(name, prefetch_stream)
         self._ready_events[param_idx].record(prefetch_stream)
         owners[param_idx] = block_idx
-
-    def _record_param_stream(
-        self,
-        name: str,
-        stream: torch.cuda.Stream,
-    ) -> None:
-        lease = self._lease
-        assert lease is not None
-        param_target = lease.target.param_targets[name]
-        if not self._instances[0].params[name].record_stream(
-            param_target._state,
-            stream,
-        ):
-            raise RuntimeError("rolling adapter does not support CUDA stream recording")
 
     def deactivate(self) -> None:
         for handle in self._hooks:

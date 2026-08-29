@@ -47,12 +47,10 @@ def _resolve_attr_state(
             )
         module = cast(nn.Module, resolved)
         params.update(
-            f"{path}.{name}"
-            for name, _param in module.named_parameters(remove_duplicate=False)
+            name for name, _param in module.named_parameters(prefix=path, remove_duplicate=False)
         )
         buffers.update(
-            f"{path}.{name}"
-            for name, _buffer in module.named_buffers(remove_duplicate=False)
+            name for name, _buffer in module.named_buffers(prefix=path, remove_duplicate=False)
         )
     return paths, params, buffers
 
@@ -78,10 +76,9 @@ def _keep_scope_local_storage(
     """Keep aliases crossing a temporal scope in the resident remainder."""
     for names in groups:
         group = set(names)
-        if group & prefix and not group <= prefix:
-            prefix.difference_update(group)
-        if group & suffix and not group <= suffix:
-            suffix.difference_update(group)
+        for scope in (prefix, suffix):
+            if group & scope and not group <= scope:
+                scope.difference_update(group)
 
 
 class _BoundaryRuntime:
@@ -123,38 +120,40 @@ class _BoundaryRuntime:
             )
         runtime_ref = weakref.ref(self)
 
-        def hook(method: str) -> Callable[..., None]:
+        def hook(
+            method: Callable[[_BoundaryRuntime], None],
+        ) -> Callable[..., None]:
             def call(*_args: object) -> None:
                 runtime = runtime_ref()
                 if runtime is not None:
-                    getattr(runtime, method)()
+                    method(runtime)
 
             return call
 
-        try:
+        self._hooks.append(
+            self._model.register_forward_pre_hook(
+                hook(_BoundaryRuntime._before_model),
+                prepend=True,
+            )
+        )
+        if self._prefix is not None:
             self._hooks.append(
-                self._model.register_forward_pre_hook(
-                    hook("_before_model"),
+                self._first_block.register_forward_pre_hook(
+                    hook(_BoundaryRuntime._before_blocks),
                     prepend=True,
                 )
             )
-            if self._prefix is not None:
-                self._hooks.append(
-                    self._first_block.register_forward_pre_hook(
-                        hook("_before_blocks"),
-                        prepend=True,
-                    )
-                )
-            if self._suffix is not None:
-                self._hooks.append(
-                    self._last_block.register_forward_hook(hook("_after_blocks"))
-                )
+        if self._suffix is not None:
             self._hooks.append(
-                self._model.register_forward_hook(hook("_after_model"))
+                self._last_block.register_forward_hook(
+                    hook(_BoundaryRuntime._after_blocks)
+                )
             )
-        except BaseException:
-            self.deactivate()
-            raise
+        self._hooks.append(
+            self._model.register_forward_hook(
+                hook(_BoundaryRuntime._after_model)
+            )
+        )
 
     def _before_model(self) -> None:
         if self._in_forward:
@@ -167,19 +166,14 @@ class _BoundaryRuntime:
             return
         device = self._device
         assert device is not None
-        try:
-            future = self._prefix_prefetch
-            self._prefix_prefetch = None
-            current_stream = torch.cuda.current_stream(device)
-            if future is None:
-                self._prefix._stage(device, current_stream)
-            else:
-                future.result()
-            self._prefix._acquire(current_stream)
-        except BaseException:
-            self._prefix.deactivate()
-            self._in_forward = False
-            raise
+        future = self._prefix_prefetch
+        self._prefix_prefetch = None
+        current_stream = torch.cuda.current_stream(device)
+        if future is None:
+            self._prefix._stage(device, current_stream)
+        else:
+            future.result()
+        self._prefix._acquire(current_stream)
 
     def _before_blocks(self) -> None:
         if not self._in_forward or self._prefix is None:
@@ -193,27 +187,18 @@ class _BoundaryRuntime:
             return
         device = self._device
         assert device is not None
-        try:
-            current_stream = torch.cuda.current_stream(device)
-            self._suffix._stage(device, current_stream)
-            self._suffix._acquire(current_stream)
-            self._suffix_active = True
-        except BaseException:
-            self._suffix.deactivate()
-            raise
+        current_stream = torch.cuda.current_stream(device)
+        self._suffix._stage(device, current_stream)
+        self._suffix._acquire(current_stream)
+        self._suffix_active = True
 
     def _after_model(self) -> None:
-        current_stream: torch.cuda.Stream | None = None
-        if self._prefix is not None or self._suffix is not None:
-            device = self._device
-            assert device is not None
-            current_stream = torch.cuda.current_stream(device)
-        self._deactivate_scopes(current_stream)
+        device = self._device
+        assert device is not None
+        current_stream = torch.cuda.current_stream(device)
+        self._release_scopes(current_stream)
         if self._prefix is not None:
-            assert current_stream is not None
-            event = torch.cuda.Event()
-            event.record(current_stream)
-            self._submit_prefix_prefetch(event)
+            self._submit_prefix_prefetch(current_stream.record_event())
         self._in_forward = False
 
     def _submit_prefix_prefetch(self, done: torch.cuda.Event) -> None:
@@ -234,7 +219,7 @@ class _BoundaryRuntime:
 
         self._prefix_prefetch = executor.submit(prefetch)
 
-    def _deactivate_scopes(
+    def _release_scopes(
         self,
         stream: torch.cuda.Stream | None = None,
     ) -> None:
@@ -265,7 +250,7 @@ class _BoundaryRuntime:
                 first_error = exc
         self._prefetch_stream = None
         try:
-            self._deactivate_scopes()
+            self._release_scopes()
         except BaseException as exc:
             if first_error is None:
                 first_error = exc
@@ -409,7 +394,7 @@ class CompositeComponentStore:
     prefix_store: PinnedComponentStore | None
     suffix_store: PinnedComponentStore | None
     streamed_stores: tuple[StreamedComponentStore, ...]
-    boundary_streamed_indices: tuple[int, ...] = ()
+    boundary_streamed_span: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if not any(
@@ -424,6 +409,18 @@ class CompositeComponentStore:
                 "Offloading requires at least one parameter, registered "
                 "buffer, or streamed block to manage."
             )
+
+    def _stores(
+        self,
+    ) -> Iterator[PinnedComponentStore | StreamedComponentStore]:
+        for store in (
+            self.resident_store,
+            self.prefix_store,
+            self.suffix_store,
+        ):
+            if store is not None:
+                yield store
+        yield from self.streamed_stores
 
     @classmethod
     def from_module(
@@ -465,7 +462,7 @@ class CompositeComponentStore:
                         f"boundary path {scope!r} cannot be nested inside "
                         f"blocks_attr path {blocks_path!r}"
                     )
-        boundary_streamed_indices = tuple(
+        central_streamed_indices = tuple(
             idx
             for idx, blocks_path in enumerate(blocks_attr)
             if not any(
@@ -473,7 +470,7 @@ class CompositeComponentStore:
                 for scope in (*prefix_attr, *suffix_attr)
             )
         )
-        if has_boundary_state and not boundary_streamed_indices:
+        if has_boundary_state and not central_streamed_indices:
             raise ValueError(
                 "prefix_attr and suffix_attr leave no central blocks_attr group"
             )
@@ -503,6 +500,11 @@ class CompositeComponentStore:
         # source allocations can be reclaimed promptly.
         del all_params_by_name, all_buffers_by_name
 
+        # A store preserves aliases within its own ownership boundary. Storage
+        # shared with pinned state or another streamed block/group is unsupported;
+        # whole-model offloading is required for those unusual layouts. Resolve
+        # streamers first so the ordinary independent-block case retains its
+        # existing low-peak construction path. See README: "Tied weights".
         streamed_stores = tuple(
             StreamedComponentStore.from_module(
                 model,
@@ -543,35 +545,20 @@ class CompositeComponentStore:
             prefix_store=pinned_store(prefix_params, prefix_buffers),
             suffix_store=pinned_store(suffix_params, suffix_buffers),
             streamed_stores=streamed_stores,
-            boundary_streamed_indices=(
-                boundary_streamed_indices if has_boundary_state else ()
+            boundary_streamed_span=(
+                (central_streamed_indices[0], central_streamed_indices[-1])
+                if has_boundary_state
+                else None
             ),
         )
 
     @property
     def cache_bytes(self) -> int:
-        pinned = sum(
-            store.cache_bytes
-            for store in (
-                self.resident_store,
-                self.prefix_store,
-                self.suffix_store,
-            )
-            if store is not None
-        )
-        return pinned + sum(store.cache_bytes for store in self.streamed_stores)
+        return sum(store.cache_bytes for store in self._stores())
 
     @property
     def has_trainables(self) -> bool:
-        pinned = any(
-            store is not None and store.has_trainables
-            for store in (
-                self.resident_store,
-                self.prefix_store,
-                self.suffix_store,
-            )
-        )
-        return pinned or any(store.has_trainables for store in self.streamed_stores)
+        return any(store.has_trainables for store in self._stores())
 
     def bind(
         self,
@@ -588,14 +575,16 @@ class CompositeComponentStore:
         )
         boundary = None
         if prefix is not None or suffix is not None:
-            first = streamed[self.boundary_streamed_indices[0]].blocks[0]
-            last = streamed[self.boundary_streamed_indices[-1]].blocks[-1]
+            span = self.boundary_streamed_span
+            if span is None:
+                raise RuntimeError("boundary stores require a streamed block span")
+            first_idx, last_idx = span
             boundary = _BoundaryRuntime(
                 model,
                 prefix=prefix,
                 suffix=suffix,
-                first_block=first,
-                last_block=last,
+                first_block=streamed[first_idx].blocks[0],
+                last_block=streamed[last_idx].blocks[-1],
             )
         return CompositeComponent(
             resident=resident,

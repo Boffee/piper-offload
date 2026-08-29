@@ -153,8 +153,9 @@ class BlockStreamingRuntime:
         self._pool = _MorphingTargetPool(device)
         self._move_trainable_grads_to(device)
 
-        self._load_block(0)
-        self._install_block(0, torch.cuda.current_stream(device))
+        current_stream = torch.cuda.current_stream(device)
+        self._stage_block(0, current_stream)
+        self._acquire_block(0, current_stream)
         self._active_idx = 0
 
         self._register_hooks()
@@ -267,32 +268,31 @@ class BlockStreamingRuntime:
         for instance in self._instances:
             instance.move_trainable_grads_to(device)
 
-    def _load_block(
+    def _stage_block(
         self,
         block_idx: int,
+        stream: torch.cuda.Stream,
         *,
         non_blocking: bool = False,
-        stream: torch.cuda.Stream | None = None,
     ) -> None:
         assert self._pool is not None, "runtime is not active"
         instance = self._instances[block_idx]
-        copy_stream = stream or torch.cuda.current_stream(self._require_device())
         lease = self._block_to_lease.get(block_idx)
         if lease is None:
             lease = self._pool.acquire(
                 self._signatures[block_idx],
                 instance,
-                copy_stream,
+                stream,
             )
             self._block_to_lease[block_idx] = lease
         lease.stage(
             instance,
-            copy_stream,
+            stream,
             run_post_copy_hooks=True,
             non_blocking=non_blocking,
         )
 
-    def _install_block(
+    def _acquire_block(
         self,
         block_idx: int,
         stream: torch.cuda.Stream,
@@ -327,24 +327,17 @@ class BlockStreamingRuntime:
         self._active_idx = None
         return first_prefetch_exc
 
-    def _evict_active(self, stream: torch.cuda.Stream) -> None:
-        victim = self._active_idx
-        if victim is None:
-            return
-        self._release_block(victim, stream)
-        self._active_idx = None
-
-    def _do_prefetch(self, idx: int) -> None:
-        assert self._stream is not None
-        self._load_block(idx, non_blocking=True, stream=self._stream)
-
     def _submit_prefetch(self, idx: int) -> None:
         assert self._executor is not None
-        if idx == self._active_idx or idx in self._pending:
+        assert self._stream is not None
+        if idx == self._active_idx or self._pending:
             return
-        if self._pending:
-            return
-        self._pending[idx] = self._executor.submit(self._do_prefetch, idx)
+        self._pending[idx] = self._executor.submit(
+            self._stage_block,
+            idx,
+            self._stream,
+            non_blocking=True,
+        )
 
     def _ensure_on_gpu(self, idx: int) -> None:
         current_stream = torch.cuda.current_stream(self._require_device())
@@ -352,8 +345,8 @@ class BlockStreamingRuntime:
         if future is not None:
             future.result()
         else:
-            self._load_block(idx, stream=current_stream)
-        self._install_block(idx, current_stream)
+            self._stage_block(idx, current_stream)
+        self._acquire_block(idx, current_stream)
         self._active_idx = idx
 
     def _before_block_forward(
@@ -365,7 +358,9 @@ class BlockStreamingRuntime:
 
         current_stream = torch.cuda.current_stream(self._require_device())
         if idx != self._active_idx:
-            self._evict_active(current_stream)
+            if self._active_idx is not None:
+                self._release_block(self._active_idx, current_stream)
+                self._active_idx = None
             self._ensure_on_gpu(idx)
 
         last = self._last_idx
