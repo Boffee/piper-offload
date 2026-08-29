@@ -237,6 +237,8 @@ from piper_offload import ModelOffloader
 offload = ModelOffloader.from_module(
     model,
     blocks_attr=["transformer_blocks"],  # path(s) to the nn.ModuleList
+    prefix_attr=["token_refiner", "proj_in"],
+    suffix_attr=["norm_out", "proj_out"],
 )
 device = torch.device("cuda")
 
@@ -258,6 +260,24 @@ the whole model is one bulk-pinned component that activation copies to the GPU.
 For heterogeneous block lists, execution still limits concurrency to the active
 and lookahead blocks, while the morphing pool may park one reusable target per
 distinct tensor-layout signature.
+
+`prefix_attr` and `suffix_attr` are optional dotted paths to modules whose
+frozen parameters and buffers should be CUDA-resident only before or after the
+central streamed block span. Unselected state, all trainable state, and state
+whose storage is shared across the resident/prefix/suffix scopes remains
+resident for the complete activation. Block lists nested under a prefix or
+suffix path belong to that scope; the remaining `blocks_attr` groups define the
+central span. This allows, for example, a streamed token refiner inside the
+prefix without making it the point where the prefix is evicted. Prefix and
+suffix copies use the same pinned component and LoRA-merge machinery as
+resident non-block state. The first forward loads the prefix on demand. After
+each successful top-level forward, the runtime evicts the suffix and stages the
+next prefix on a private CUDA stream. Allocation waits for the model-done event
+so it does not inflate the model's forward peak; the copy can then overlap
+caller work between denoising steps. The next model call waits on the prefix's
+CUDA stream only if the copy is still in flight. A failed forward is fail-stop
+for that activation: use the normal `try`/`finally` or cache lease so
+`deactivate()` can discard partial boundary state before retrying.
 
 `ModelOffloader` only streams on CUDA. Activating the binding on
 `cpu` is a pass-through over the already-installed pinned CPU storage:
@@ -798,8 +818,8 @@ registration / cache admission
         |
         +-- builds/admit --> ModelOffloader (one model, one runtime)
         |                    |
-        |                    +-- PinnedComponent
-        |                    |       |
+        |                    +-- PinnedComponent(s)
+        |                    |       |  resident / prefix / suffix
         |                    |       +-- PinnedParam(s)
         |                    |
         |                    +-- StreamedComponent(s)
@@ -1012,9 +1032,13 @@ This is a low-level library; we don't guard against caller misuse.
 distinct quanto wrappers around shared inner `_data` storage.
 
 `ModelOffloader` is intended for ordinary transformer block lists where
-the streamed block weights are independent. It does not prevalidate
-unusual shared-storage layouts that cross block/non-block boundaries;
-use whole-model `ModelOffloader` if that sharing must be preserved.
+the streamed block weights are independent. Shared storage is preserved
+within one streamed block and within pinned state, including the standard
+tied input-embedding/output-head pattern. It is unsupported across offload
+ownership boundaries: between streamed and pinned state, or between distinct
+streamed blocks or block groups. `ModelOffloader` does not prevalidate these
+unusual layouts; omit `blocks_attr` and use whole-model offloading if that
+sharing must be preserved.
 
 ## Quantized weight support
 

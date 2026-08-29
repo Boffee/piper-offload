@@ -49,13 +49,16 @@ class ModelOffloader:
 
     When ``blocks_attr`` is omitted, CUDA activation bulk-copies every
     managed parameter and buffer to CUDA. When it is set, CUDA activation
-    streams the selected block groups plus component-level movement for
-    non-streamed state. Supplying ``block_compile`` at construction opts those
-    streamed block forwards into Inductor during CUDA inference. CPU activation
-    is pass-through over the host-backed module state and remains eager.
+    streams the selected block groups. Non-streamed state is resident for the
+    activation by default; frozen state selected by ``prefix_attr`` and
+    ``suffix_attr`` instead resides on CUDA only before or after the central
+    block span, with the next prefix prefetched after each successful forward.
+    Supplying ``block_compile`` at construction opts streamed block forwards
+    into Inductor during CUDA inference. CPU activation is pass-through over
+    the host-backed module state and remains eager.
 
-    Composes :class:`PinnedComponent` (non-streamed params and buffers)
-    and one or more :class:`StreamedComponent`\\ s internally. LoRA requests
+    Composes resident, prefix, and suffix :class:`PinnedComponent` instances
+    with one or more :class:`StreamedComponent`\\ s internally. LoRA requests
     are supplied directly to :meth:`activate`; merge mode installs
     activation-scoped post-copy hooks so the merge fires immediately after
     each CPU->GPU weight copy. No separate merge binding is needed.
@@ -130,6 +133,8 @@ class ModelOffloader:
         model: nn.Module,
         *,
         blocks_attr: Sequence[str] = (),
+        prefix_attr: Sequence[str] = (),
+        suffix_attr: Sequence[str] = (),
         stream_trainable_weights: bool = False,
         block_compile: BlockCompileConfig | None = None,
         host_backing: HostBacking = "pinned",
@@ -138,15 +143,19 @@ class ModelOffloader:
 
         The intermediate component store exists only during construction.
         Bound component instances retain the host state afterward, so the
-        model is never rebound on subsequent uses. ``block_compile`` applies
-        one forward-only compile policy to every ``blocks_attr`` group and is
-        invalid when no block group is declared. ``host_backing`` defaults to
-        a pinned copy; ``"adopt"`` strictly retains frozen state already in
-        CPU RAM and uses direct CUDA copies without an application-owned
-        staging pool. It never silently materializes an incompatible source,
-        and adoption failures occur before binding mutates model registries.
-        Retained source tensors and writable mmap contents must remain
-        immutable for the offloader's lifetime.
+        model is never rebound on subsequent uses. ``prefix_attr`` and
+        ``suffix_attr`` select module paths whose frozen state is resident
+        only before or after the central streamed block span; trainable and
+        state shared across pinned scopes remains in the resident remainder.
+        ``block_compile`` applies one forward-only compile policy to every
+        ``blocks_attr`` group and is invalid when no block group is declared.
+        ``host_backing`` defaults to a pinned copy; ``"adopt"`` strictly
+        retains frozen state already in CPU RAM and uses direct CUDA copies
+        without an application-owned staging pool. It never silently
+        materializes an incompatible source, and adoption failures occur
+        before binding mutates model registries. Retained source tensors and
+        writable mmap contents must remain immutable for the offloader's
+        lifetime.
         """
         backing = validate_host_backing(host_backing)
         if backing == "adopt":
@@ -168,6 +177,8 @@ class ModelOffloader:
         composite_store = CompositeComponentStore.from_module(
             model,
             blocks_attr=blocks_attr,
+            prefix_attr=prefix_attr,
+            suffix_attr=suffix_attr,
             stream_trainable_weights=stream_trainable_weights,
             host_backing=backing,
         )
@@ -422,11 +433,11 @@ class ModelOffloader:
             )
         except BaseException:
             try:
-                self._clear_active_lora_hooks()
+                # Idempotent before/after partial composite activation.
+                self._composite.deactivate()
             finally:
                 try:
-                    # Idempotent before/after partial composite activation.
-                    self._composite.deactivate()
+                    self._clear_active_lora_hooks()
                 finally:
                     self._active_device = None
                     self._activation_lock.release()
@@ -435,14 +446,14 @@ class ModelOffloader:
     def deactivate(self) -> None:
         if self._active_device is None:
             return
-        # Remove LoRA hooks before returning the model to host storage. The
-        # composite teardown and activation-lock release still run if a custom
-        # hook remover unexpectedly raises.
+        # Drain asynchronous copies before removing their LoRA merge hooks.
+        # Hook cleanup and activation-lock release still run if component
+        # teardown unexpectedly raises.
         try:
-            self._clear_active_lora_hooks()
+            self._composite.deactivate()
         finally:
             try:
-                self._composite.deactivate()
+                self._clear_active_lora_hooks()
             finally:
                 self._active_device = None
                 self._activation_lock.release()

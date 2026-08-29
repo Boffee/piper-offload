@@ -53,7 +53,11 @@ from piper_offload.tensor_adapters import (
     TensorCopyIntoAdapter,
 )
 
-from tests.conftest import activated_model, streamed_components
+from tests.conftest import (
+    activated_model,
+    streamed_components,
+    synchronize_prefix_prefetch,
+)
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -1044,6 +1048,54 @@ class TestActivationLoraValidation:
 
 class TestLifecycle:
     @CUDA
+    def test_merge_applies_to_prefix_and_suffix_on_every_forward(self) -> None:
+        torch.manual_seed(21)
+        baseline = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
+        model = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
+        model.load_state_dict(baseline.state_dict())
+        state = {
+            "embed.lora_A.weight": torch.randn(4, 16),
+            "embed.lora_B.weight": torch.randn(16, 4),
+            "head.lora_A.weight": torch.randn(4, 16),
+            "head.lora_B.weight": torch.randn(16, 4),
+        }
+        lora = LoRA.from_state_dict(state_dict=state)
+        strength = 0.7
+        with torch.no_grad():
+            for name in ("embed", "head"):
+                factor = lora.targets[f"{name}.weight"]
+                a, b = _factor_tensors(factor)
+                getattr(baseline, name).weight.addmm_(b, a, alpha=strength)
+        baseline.cuda()
+        value = torch.randn(2, 16, device="cuda")
+        with torch.inference_mode():
+            expected = baseline(value)
+
+        strategy = ModelOffloader.from_module(
+            model,
+            blocks_attr=("transformer_blocks",),
+            prefix_attr=("embed",),
+            suffix_attr=("head",),
+        )
+        try:
+            strategy.activate(
+                "cuda",
+                loras=(lora,),
+                lora_strengths=(strength,),
+            )
+            with torch.inference_mode():
+                first = model(value)
+                second = model(value)
+            torch.testing.assert_close(first, expected)
+            torch.testing.assert_close(second, expected)
+            synchronize_prefix_prefetch(strategy)
+            assert model.embed.weight.device.type == "cpu"
+            assert model.head.weight.is_pinned()
+        finally:
+            strategy.deactivate()
+        assert model.embed.weight.is_pinned()
+
+    @CUDA
     def test_activate_runs_components(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
@@ -1194,7 +1246,7 @@ class TestMergeCorrectness:
             streamer = streamed_components(strategy)[0] if streamed else None
             for block_idx, block in enumerate(m.transformer_blocks):
                 if streamer is not None:
-                    streamer._block_runtime._load_block(block_idx)
+                    streamer._block_runtime._before_block_forward(block_idx)
                 actual = block.attn.bias
                 assert actual is not None
                 expected = base_biases[block_idx].to(actual.device)
@@ -2720,8 +2772,6 @@ class TestLoRATransform:
         _request_loras(s, [(lora, 0.5)], mode="merge")
         _activate(s, "cuda")
         try:
-            streamer = streamed_components(s)[0]
-            streamer._block_runtime._load_block(0)
             merged_qt = m.transformer_blocks[0].attn.weight.data
             assert isinstance(merged_qt, WeightQBytesTensor)
             difference = (merged_qt._data.to(torch.int16) - expected._data.to(torch.int16)).abs()

@@ -160,8 +160,8 @@ class PinnedModuleInstance:
     :class:`PinnedModuleTarget`. :meth:`load_to_target` copies into a
     target and installs that active storage onto :attr:`module`;
     :meth:`install_pinned` installs the pinned host bytes onto
-    :attr:`module`. The pure-copy method :meth:`copy_trainables_from_target`
-    touches no module at all.
+    :attr:`module`. :meth:`copy_to_target` and
+    :meth:`copy_trainables_from_target` touch no module at all.
     """
 
     module: nn.Module
@@ -287,6 +287,26 @@ class PinnedModuleInstance:
         complete before any module mutation, so a copy failure does not
         leave :attr:`module` partially active.
         """
+        self.copy_to_target(
+            target,
+            run_post_copy_hooks=run_post_copy_hooks,
+            non_blocking=non_blocking,
+        )
+        self.install_target(target)
+
+    def copy_to_target(
+        self,
+        target: PinnedModuleTarget,
+        *,
+        run_post_copy_hooks: bool = False,
+        non_blocking: bool = False,
+    ) -> None:
+        """Copy selected pinned bytes into ``target`` without installation.
+
+        Post-copy hooks run after their base parameter copies and before this
+        method returns, so a staged target is complete before any instance
+        exposes it through its module registry.
+        """
         _validate_target_names_known(self.params, self.buffers, target)
         params = _items_for_names(self.params, target.param_targets)
         buffers = _items_for_names(self.buffers, target.buffer_targets)
@@ -307,8 +327,6 @@ class PinnedModuleInstance:
             target.buffer_targets,
             non_blocking=non_blocking,
         )
-
-        self.install_target(target)
 
     def copy_trainables_from_target(
         self,

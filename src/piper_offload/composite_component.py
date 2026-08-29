@@ -1,103 +1,324 @@
-"""Composite of offload components, orchestrated as one unit.
-
-A :class:`CompositeComponent` holds a model's offload components — an
-optional pinned remainder
-(:class:`~piper_offload.pinned_component.PinnedComponent`) and zero or more
-streamed block groups
-(:class:`~piper_offload.streamed_component.StreamedComponent`) — and drives
-them together: activate/deactivate as a unit, coordinate the optimizer-step
-boundary, aggregate managed names, and route post-copy hooks to the owning
-component. Like the components it holds, it is a composable
-activate/deactivate lifecycle piece, so a composite is itself composable.
-
-The pinned remainder and the streamed groups are stored as separate fields
-(the package only ever composes these two kinds), but orchestration is
-uniform: every lifecycle and aggregation operation iterates an ordered member
-list — pinned first, then the streamed groups — and calls the same method on
-each, never branching on concrete type.
-"""
+"""Composition and scheduling of one model's offload components."""
 
 import contextlib
+import weakref
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Self
+from typing import Self, cast
 
 import torch
 from torch import nn
 
 from .block_compile import BlockCompileConfig
-from .host_backing import (
-    HostBacking,
-    validate_host_backing,
-)
-from .module_names import buffer_names, parameter_names
+from .host_backing import HostBacking, validate_host_backing
+from .module_names import group_names, walk_attr_path
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .pinned_module import PostCopyHook
 from .streamed_component import StreamedComponent, StreamedComponentStore
+from .tensor_adapter_registry import buffer_tensor_id, param_tensor_id
+
+
+def _is_within(path: str, parent: str) -> bool:
+    return path == parent or path.startswith(f"{parent}.")
+
+
+def _resolve_attr_state(
+    model: nn.Module,
+    paths: Sequence[str],
+    *,
+    argument: str,
+) -> tuple[tuple[str, ...], set[str], set[str]]:
+    """Resolve module paths and return their recursively-owned state names."""
+    paths = tuple(paths)
+    if len(set(paths)) != len(paths):
+        raise ValueError(f"{argument} contains duplicate paths")
+
+    params: set[str] = set()
+    buffers: set[str] = set()
+    for path in paths:
+        if not isinstance(path, str) or not path:
+            raise TypeError(f"{argument} paths must be non-empty strings")
+        resolved = walk_attr_path(model, path)
+        if not isinstance(resolved, nn.Module):
+            raise TypeError(
+                f"{argument} path {path!r} resolved to "
+                f"{type(resolved).__name__}, expected nn.Module"
+            )
+        module = cast(nn.Module, resolved)
+        params.update(
+            name for name, _param in module.named_parameters(prefix=path, remove_duplicate=False)
+        )
+        buffers.update(
+            name for name, _buffer in module.named_buffers(prefix=path, remove_duplicate=False)
+        )
+    return paths, params, buffers
+
+
+def _validate_disjoint_scopes(
+    prefix_attr: Sequence[str],
+    suffix_attr: Sequence[str],
+) -> None:
+    for prefix in prefix_attr:
+        for suffix in suffix_attr:
+            if _is_within(prefix, suffix) or _is_within(suffix, prefix):
+                raise ValueError(
+                    "prefix_attr and suffix_attr must not overlap; "
+                    f"got {prefix!r} and {suffix!r}"
+                )
+
+
+def _keep_scope_local_storage(
+    prefix: set[str],
+    suffix: set[str],
+    groups: Sequence[Sequence[str]],
+) -> None:
+    """Keep aliases crossing a temporal scope in the resident remainder."""
+    for names in groups:
+        group = set(names)
+        for scope in (prefix, suffix):
+            if group & scope and not group <= scope:
+                scope.difference_update(group)
+
+
+class _BoundaryRuntime:
+    """Move prefix/suffix pinned components around one central block span."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        *,
+        prefix: PinnedComponent | None,
+        suffix: PinnedComponent | None,
+        first_block: nn.Module,
+        last_block: nn.Module,
+    ) -> None:
+        self._model = model
+        self._prefix = prefix
+        self._suffix = suffix
+        self._first_block = first_block
+        self._last_block = last_block
+        self._device: torch.device | None = None
+        self._hooks: list[torch.utils.hooks.RemovableHandle] = []
+        self._executor: ThreadPoolExecutor | None = None
+        self._prefetch_stream: torch.cuda.Stream | None = None
+        self._prefix_prefetch: Future[None] | None = None
+        self._in_forward = False
+        self._suffix_active = False
+
+    def activate(self, device: torch.device) -> None:
+        if self._device is not None:
+            raise RuntimeError("boundary runtime is already active")
+        if device.type != "cuda":
+            raise ValueError(f"boundary runtime requires CUDA; got {device}")
+        self._device = device
+        if self._prefix is not None:
+            self._executor = ThreadPoolExecutor(max_workers=1)
+            self._prefetch_stream = torch.cuda.Stream(
+                device=device,
+                priority=-1,
+            )
+        runtime_ref = weakref.ref(self)
+
+        def hook(
+            method: Callable[[_BoundaryRuntime], None],
+        ) -> Callable[..., None]:
+            def call(*_args: object) -> None:
+                runtime = runtime_ref()
+                if runtime is not None:
+                    method(runtime)
+
+            return call
+
+        self._hooks.append(
+            self._model.register_forward_pre_hook(
+                hook(_BoundaryRuntime._before_model),
+                prepend=True,
+            )
+        )
+        if self._prefix is not None:
+            self._hooks.append(
+                self._first_block.register_forward_pre_hook(
+                    hook(_BoundaryRuntime._before_blocks),
+                    prepend=True,
+                )
+            )
+        if self._suffix is not None:
+            self._hooks.append(
+                self._last_block.register_forward_hook(
+                    hook(_BoundaryRuntime._after_blocks)
+                )
+            )
+        self._hooks.append(
+            self._model.register_forward_hook(
+                hook(_BoundaryRuntime._after_model)
+            )
+        )
+
+    def _before_model(self) -> None:
+        if self._in_forward:
+            raise RuntimeError(
+                "prefix/suffix runtime has an unfinished forward; reentrant "
+                "calls and retries after failure require deactivation first"
+            )
+        self._in_forward = True
+        if self._prefix is None:
+            return
+        device = self._device
+        assert device is not None
+        future = self._prefix_prefetch
+        self._prefix_prefetch = None
+        current_stream = torch.cuda.current_stream(device)
+        if future is None:
+            self._prefix._stage(device, current_stream)
+        else:
+            future.result()
+        self._prefix._acquire(current_stream)
+
+    def _before_blocks(self) -> None:
+        if not self._in_forward or self._prefix is None:
+            return
+        self._prefix._release()
+
+    def _after_blocks(self) -> None:
+        if not self._in_forward or self._suffix is None or self._suffix_active:
+            return
+        device = self._device
+        assert device is not None
+        current_stream = torch.cuda.current_stream(device)
+        self._suffix._stage(device, current_stream)
+        self._suffix._acquire(current_stream)
+        self._suffix_active = True
+
+    def _after_model(self) -> None:
+        device = self._device
+        assert device is not None
+        current_stream = torch.cuda.current_stream(device)
+        self._release_scopes()
+        if self._prefix is not None:
+            self._submit_prefix_prefetch(
+                cast(torch.cuda.Event, current_stream.record_event())
+            )
+        self._in_forward = False
+
+    def _submit_prefix_prefetch(self, done: torch.cuda.Event) -> None:
+        prefix = self._prefix
+        executor = self._executor
+        stream = self._prefetch_stream
+        device = self._device
+        assert prefix is not None
+        assert executor is not None
+        assert stream is not None
+        assert device is not None
+
+        def prefetch() -> None:
+            # Delay target allocation until the model has released its peak
+            # forward allocations, then overlap the copy with caller work.
+            done.synchronize()
+            prefix._stage(device, stream)
+
+        self._prefix_prefetch = executor.submit(prefetch)
+
+    def _release_scopes(self) -> None:
+        try:
+            with contextlib.ExitStack() as stack:
+                for component in (self._prefix, self._suffix):
+                    if component is not None:
+                        stack.callback(component._release)
+        finally:
+            self._suffix_active = False
+
+    def deactivate(self) -> None:
+        for handle in self._hooks:
+            handle.remove()
+        self._hooks.clear()
+
+        first_error: BaseException | None = None
+        executor = self._executor
+        self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+        future = self._prefix_prefetch
+        self._prefix_prefetch = None
+        if future is not None:
+            try:
+                future.result()
+            except BaseException as exc:
+                first_error = exc
+        self._prefetch_stream = None
+        try:
+            self._release_scopes()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        finally:
+            self._in_forward = False
+            self._device = None
+        if first_error is not None:
+            raise first_error
 
 
 class CompositeComponent:
-    """An offload component composed of a pinned remainder and streamed groups.
-
-    Created by binding a :class:`CompositeComponentStore`. The optional pinned
-    component and the streamed block groups are kept as separate fields, but
-    every lifecycle and aggregation method drives them uniformly through an
-    ordered member list (pinned first) — it never branches on whether a member
-    is pinned or streamed.
-    """
+    """Resident, boundary-scoped, and block-streamed model state."""
 
     def __init__(
         self,
         *,
-        pinned: PinnedComponent | None,
+        resident: PinnedComponent | None,
+        prefix: PinnedComponent | None,
+        suffix: PinnedComponent | None,
         streamed: Sequence[StreamedComponent],
+        boundary: _BoundaryRuntime | None,
     ) -> None:
-        self._pinned = pinned
+        self._resident = resident
+        self._prefix = prefix
+        self._suffix = suffix
         self._streamed = tuple(streamed)
+        self._boundary = boundary
         self._teardown_stack: contextlib.ExitStack | None = None
 
     @property
-    def pinned(self) -> PinnedComponent | None:
-        """The pinned remainder component, or ``None`` when fully streamed."""
-        return self._pinned
+    def resident(self) -> PinnedComponent | None:
+        return self._resident
+
+    @property
+    def prefix(self) -> PinnedComponent | None:
+        return self._prefix
+
+    @property
+    def suffix(self) -> PinnedComponent | None:
+        return self._suffix
 
     @property
     def streamed(self) -> tuple[StreamedComponent, ...]:
-        """The streamed block-group components, in activation order."""
         return self._streamed
 
     def _components(self) -> Iterator[PinnedComponent | StreamedComponent]:
-        """Members in activation order: the pinned remainder first (when
-        present), then the streamed groups.
-
-        The single definition of member order, derived from ``_pinned`` /
-        ``_streamed`` on demand and never cached — so there is no second copy
-        that can drift from those two fields.
-        """
-        if self._pinned is not None:
-            yield self._pinned
+        for component in (self._resident, self._prefix, self._suffix):
+            if component is not None:
+                yield component
         yield from self._streamed
 
     @property
     def param_names(self) -> frozenset[str]:
-        """Union of every component's managed parameter names."""
-        names: set[str] = set()
-        for component in self._components():
-            names |= component.param_names
-        return frozenset(names)
+        return frozenset(
+            name
+            for component in self._components()
+            for name in component.param_names
+        )
 
     @property
     def buffer_names(self) -> frozenset[str]:
-        """Union of every component's managed buffer names."""
-        names: set[str] = set()
-        for component in self._components():
-            names |= component.buffer_names
-        return frozenset(names)
+        return frozenset(
+            name
+            for component in self._components()
+            for name in component.buffer_names
+        )
 
     def component_for_param_name(
-        self, param_name: str,
+        self,
+        param_name: str,
     ) -> PinnedComponent | StreamedComponent:
-        """The component that manages ``param_name``."""
         for component in self._components():
             if param_name in component.param_names:
                 return component
@@ -106,11 +327,13 @@ class CompositeComponent:
         )
 
     def register_post_copy_hook(
-        self, name: str, hook: PostCopyHook,
+        self,
+        name: str,
+        hook: PostCopyHook,
     ) -> Callable[[], None]:
-        """Register a post-copy hook and return its removal callable."""
         return self.component_for_param_name(name).register_post_copy_hook(
-            name, hook,
+            name,
+            hook,
         )
 
     def activate(
@@ -119,29 +342,34 @@ class CompositeComponent:
         *,
         compile_blocks: bool = True,
     ) -> None:
-        """Activate every component, in order, on ``device``.
-
-        Self-cleaning on failure: if a component's ``activate`` raises, the
-        already-activated components are deactivated before the exception
-        propagates. ``compile_blocks`` lets the owning model runtime temporarily
-        select eager block execution, such as for routed LoRA.
-        """
         if not isinstance(compile_blocks, bool):
-            raise TypeError(f"compile_blocks must be bool; got {type(compile_blocks).__name__}.")
+            raise TypeError(
+                "compile_blocks must be bool; "
+                f"got {type(compile_blocks).__name__}."
+            )
         if self._teardown_stack is not None:
             raise RuntimeError(
                 "CompositeComponent.activate() called while already active; "
                 "deactivate() first."
             )
+
         with contextlib.ExitStack() as stack:
-            for component in self._components():
-                stack.callback(component.deactivate)
-                component.activate(device, compile_blocks=compile_blocks)
+            if device.type != "cuda" or self._boundary is None:
+                for component in self._components():
+                    stack.callback(component.deactivate)
+                    component.activate(device, compile_blocks=compile_blocks)
+            else:
+                if self._resident is not None:
+                    stack.callback(self._resident.deactivate)
+                    self._resident.activate(device)
+                stack.callback(self._boundary.deactivate)
+                self._boundary.activate(device)
+                for component in self._streamed:
+                    stack.callback(component.deactivate)
+                    component.activate(device, compile_blocks=compile_blocks)
             self._teardown_stack = stack.pop_all()
 
     def deactivate(self) -> None:
-        """Deactivate every component. Idempotent — safe before activate or
-        multiple times."""
         stack = self._teardown_stack
         self._teardown_stack = None
         if stack is not None:
@@ -149,11 +377,6 @@ class CompositeComponent:
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:
-        """Optimizer-step boundary spanning every component.
-
-        Each component's own ``optimizer_step`` is a guarded no-op when it has
-        no active trainables, so entering all of them is uniform and correct.
-        """
         with contextlib.ExitStack() as stack:
             for component in self._components():
                 stack.enter_context(component.optimizer_step())
@@ -162,22 +385,39 @@ class CompositeComponent:
 
 @dataclass(frozen=True, slots=True)
 class CompositeComponentStore:
-    """Reusable backing stores for a :class:`CompositeComponent`.
+    """Reusable stores for resident, prefix, suffix, and streamed state."""
 
-    Holds the optional pinned remainder store and the streamed block-group
-    stores separately; :meth:`bind` binds each to a model and wraps the
-    results in a :class:`CompositeComponent`.
-    """
-
-    pinned_store: PinnedComponentStore | None
+    resident_store: PinnedComponentStore | None
+    prefix_store: PinnedComponentStore | None
+    suffix_store: PinnedComponentStore | None
     streamed_stores: tuple[StreamedComponentStore, ...]
+    boundary_streamed_span: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
-        if self.pinned_store is None and not self.streamed_stores:
-            raise ValueError(
-                "CompositeComponentStore requires a pinned store or at least "
-                "one streamed store."
+        if not any(
+            (
+                self.resident_store,
+                self.prefix_store,
+                self.suffix_store,
+                self.streamed_stores,
             )
+        ):
+            raise ValueError(
+                "Offloading requires at least one parameter, registered "
+                "buffer, or streamed block to manage."
+            )
+
+    def _stores(
+        self,
+    ) -> Iterator[PinnedComponentStore | StreamedComponentStore]:
+        for store in (
+            self.resident_store,
+            self.prefix_store,
+            self.suffix_store,
+        ):
+            if store is not None:
+                yield store
+        yield from self.streamed_stores
 
     @classmethod
     def from_module(
@@ -185,20 +425,83 @@ class CompositeComponentStore:
         model: nn.Module,
         *,
         blocks_attr: Sequence[str] = (),
+        prefix_attr: Sequence[str] = (),
+        suffix_attr: Sequence[str] = (),
         stream_trainable_weights: bool = False,
         host_backing: HostBacking = "pinned",
     ) -> Self:
-        """Decompose ``model`` into a pinned remainder + streamed block groups.
-
-        Each ``blocks_attr`` path becomes one
-        :class:`~piper_offload.StreamedComponentStore`; everything those groups
-        do not claim becomes a single
-        :class:`~piper_offload.PinnedComponentStore`. With no ``blocks_attr``
-        (the default), nothing streams — the whole model is one pinned store.
-        """
         backing = validate_host_backing(host_backing)
+        blocks_attr = tuple(blocks_attr)
+        prefix_attr, prefix_params, prefix_buffers = _resolve_attr_state(
+            model,
+            prefix_attr,
+            argument="prefix_attr",
+        )
+        suffix_attr, suffix_params, suffix_buffers = _resolve_attr_state(
+            model,
+            suffix_attr,
+            argument="suffix_attr",
+        )
+        _validate_disjoint_scopes(
+            prefix_attr,
+            suffix_attr,
+        )
 
-        # One streamed store per block path.
+        has_boundary_state = bool(prefix_attr or suffix_attr)
+        if has_boundary_state and not blocks_attr:
+            raise ValueError(
+                "prefix_attr and suffix_attr require at least one blocks_attr path"
+            )
+        for scope in (*prefix_attr, *suffix_attr):
+            for blocks_path in blocks_attr:
+                if scope != blocks_path and _is_within(scope, blocks_path):
+                    raise ValueError(
+                        f"boundary path {scope!r} cannot be nested inside "
+                        f"blocks_attr path {blocks_path!r}"
+                    )
+        central_streamed_indices = tuple(
+            idx
+            for idx, blocks_path in enumerate(blocks_attr)
+            if not any(
+                _is_within(blocks_path, scope)
+                for scope in (*prefix_attr, *suffix_attr)
+            )
+        )
+        if has_boundary_state and not central_streamed_indices:
+            raise ValueError(
+                "prefix_attr and suffix_attr leave no central blocks_attr group"
+            )
+
+        all_params_by_name = dict(model.named_parameters(remove_duplicate=False))
+        all_buffers_by_name = dict(model.named_buffers(remove_duplicate=False))
+        all_params = set(all_params_by_name)
+        all_buffers = set(all_buffers_by_name)
+        trainable_params = {
+            name for name, param in all_params_by_name.items() if param.requires_grad
+        }
+        if has_boundary_state:
+            param_ids = {
+                name: param_tensor_id(param)
+                for name, param in all_params_by_name.items()
+            }
+            buffer_ids = {
+                name: buffer_tensor_id(buffer)
+                for name, buffer in all_buffers_by_name.items()
+            }
+            param_groups = group_names(param_ids, param_ids.__getitem__)
+            buffer_groups = group_names(buffer_ids, buffer_ids.__getitem__)
+        else:
+            param_groups = buffer_groups = ()
+        # Construction may replace source wrappers incrementally. Keep only
+        # names and storage-group metadata across the pinning phase so those
+        # source allocations can be reclaimed promptly.
+        del all_params_by_name, all_buffers_by_name
+
+        # A store preserves aliases within its own ownership boundary. Storage
+        # shared with pinned state or another streamed block/group is unsupported;
+        # whole-model offloading is required for those unusual layouts. Resolve
+        # streamers first so the ordinary independent-block case retains its
+        # existing low-peak construction path. See README: "Tied weights".
         streamed_stores = tuple(
             StreamedComponentStore.from_module(
                 model,
@@ -208,39 +511,51 @@ class CompositeComponentStore:
             )
             for blocks_path in blocks_attr
         )
-
-        # The pinned store manages whatever the streamed groups did not claim.
         streamed_params = {n for s in streamed_stores for n in s.param_names}
         streamed_buffers = {n for s in streamed_stores for n in s.buffer_names}
-        pinned_params = parameter_names(model) - streamed_params
-        pinned_buffers = buffer_names(model) - streamed_buffers
-        pinned_store = (
-            PinnedComponentStore.from_module(
+
+        prefix_params -= streamed_params | trainable_params
+        suffix_params -= streamed_params | trainable_params
+        prefix_buffers -= streamed_buffers
+        suffix_buffers -= streamed_buffers
+        _keep_scope_local_storage(prefix_params, suffix_params, param_groups)
+        _keep_scope_local_storage(prefix_buffers, suffix_buffers, buffer_groups)
+
+        resident_params = all_params - streamed_params - prefix_params - suffix_params
+        resident_buffers = all_buffers - streamed_buffers - prefix_buffers - suffix_buffers
+
+        def pinned_store(
+            params: set[str],
+            buffers: set[str],
+        ) -> PinnedComponentStore | None:
+            if not params and not buffers:
+                return None
+            return PinnedComponentStore.from_module(
                 model,
-                include_param_names=pinned_params,
-                include_buffer_names=pinned_buffers,
+                include_param_names=params,
+                include_buffer_names=buffers,
                 host_backing=backing,
             )
-            if pinned_params or pinned_buffers
-            else None
-        )
 
-        if pinned_store is None and not streamed_stores:
-            raise ValueError(
-                "Offloading requires at least one parameter, registered "
-                "buffer, or streamed block to manage."
-            )
-        return cls(pinned_store=pinned_store, streamed_stores=streamed_stores)
+        return cls(
+            resident_store=pinned_store(resident_params, resident_buffers),
+            prefix_store=pinned_store(prefix_params, prefix_buffers),
+            suffix_store=pinned_store(suffix_params, suffix_buffers),
+            streamed_stores=streamed_stores,
+            boundary_streamed_span=(
+                (central_streamed_indices[0], central_streamed_indices[-1])
+                if has_boundary_state
+                else None
+            ),
+        )
 
     @property
     def cache_bytes(self) -> int:
-        pinned = self.pinned_store.cache_bytes if self.pinned_store else 0
-        return pinned + sum(store.cache_bytes for store in self.streamed_stores)
+        return sum(store.cache_bytes for store in self._stores())
 
     @property
     def has_trainables(self) -> bool:
-        pinned = bool(self.pinned_store and self.pinned_store.has_trainables)
-        return pinned or any(s.has_trainables for s in self.streamed_stores)
+        return any(store.has_trainables for store in self._stores())
 
     def bind(
         self,
@@ -248,19 +563,32 @@ class CompositeComponentStore:
         *,
         block_compile: BlockCompileConfig | None = None,
     ) -> CompositeComponent:
-        """Bind the pinned and streamed stores to ``model``.
-
-        Compile policy belongs to the bound runtime rather than this pinned
-        store: it creates no pinned bytes and does not affect
-        :attr:`cache_bytes`.
-        """
-        pinned = self.pinned_store.bind(model) if self.pinned_store else None
+        resident = self.resident_store.bind(model) if self.resident_store else None
+        prefix = self.prefix_store.bind(model) if self.prefix_store else None
+        suffix = self.suffix_store.bind(model) if self.suffix_store else None
+        streamed = tuple(
+            store.bind(model, block_compile=block_compile)
+            for store in self.streamed_stores
+        )
+        boundary = None
+        if prefix is not None or suffix is not None:
+            span = self.boundary_streamed_span
+            if span is None:
+                raise RuntimeError("boundary stores require a streamed block span")
+            first_idx, last_idx = span
+            boundary = _BoundaryRuntime(
+                model,
+                prefix=prefix,
+                suffix=suffix,
+                first_block=streamed[first_idx].blocks[0],
+                last_block=streamed[last_idx].blocks[-1],
+            )
         return CompositeComponent(
-            pinned=pinned,
-            streamed=[
-                s.bind(model, block_compile=block_compile)
-                for s in self.streamed_stores
-            ],
+            resident=resident,
+            prefix=prefix,
+            suffix=suffix,
+            streamed=streamed,
+            boundary=boundary,
         )
 
 

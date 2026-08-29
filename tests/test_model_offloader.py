@@ -10,6 +10,7 @@ over the host-backed pinned state.
 from collections.abc import Sequence
 from concurrent.futures import Future
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
@@ -26,7 +27,14 @@ from piper_offload import (
 )
 from piper_offload.composite_component import CompositeComponent
 
-from tests.conftest import activated_model, pinned_component, streamed_components
+from tests.conftest import (
+    activated_model,
+    pinned_component,
+    prefix_component,
+    streamed_components,
+    suffix_component,
+    synchronize_prefix_prefetch,
+)
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -35,11 +43,15 @@ def _make_model_offloader(
     model: nn.Module,
     *,
     blocks_attr: list[str] = [],
+    prefix_attr: list[str] = [],
+    suffix_attr: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
         blocks_attr=blocks_attr,
+        prefix_attr=prefix_attr,
+        suffix_attr=suffix_attr,
         stream_trainable_weights=stream_trainable_weights,
     )
 
@@ -99,6 +111,42 @@ def _make_block_model(num_blocks: int = 4, width: int = 8) -> nn.Module:
     for p in m.parameters():
         p.requires_grad = False
     return m
+
+
+def _make_boundary_model(num_blocks: int = 3, width: int = 8) -> nn.Module:
+    class RecordingLinear(nn.Linear):
+        def __init__(self) -> None:
+            super().__init__(width, width, bias=False)
+            self.register_buffer("offset", torch.randn(width))
+            self.forward_devices: list[str] = []
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            self.forward_devices.append(self.weight.device.type)
+            return super().forward(value) + self.offset
+
+    class BoundaryModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prefix = RecordingLinear()
+            self.transformer_blocks = nn.ModuleList(
+                nn.Linear(width, width, bias=False) for _ in range(num_blocks)
+            )
+            self.suffix = RecordingLinear()
+            self.resident_scale = nn.Parameter(torch.randn(width))
+            self.fail_after_blocks = False
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            value = self.prefix(value) * self.resident_scale
+            for block in self.transformer_blocks:
+                value = block(value)
+            if self.fail_after_blocks:
+                raise RuntimeError("after blocks")
+            return self.suffix(value)
+
+    model = BoundaryModel()
+    for param in model.parameters():
+        param.requires_grad = False
+    return model
 
 
 def _make_trainable_block_model(num_blocks: int = 4, width: int = 8) -> nn.Module:
@@ -535,6 +583,359 @@ class TestLifecycle:
             strategy.deactivate()
 
 
+class TestBoundaryPinnedLifecycle:
+    def test_partitions_resident_prefix_suffix_and_streamed_state(self) -> None:
+        model = _make_boundary_model()
+        strategy = _make_model_offloader(
+            model,
+            blocks_attr=["transformer_blocks"],
+            prefix_attr=["prefix"],
+            suffix_attr=["suffix"],
+        )
+        try:
+            resident = pinned_component(strategy)
+            prefix = prefix_component(strategy)
+            suffix = suffix_component(strategy)
+            assert resident is not None
+            assert prefix is not None
+            assert suffix is not None
+            assert resident.param_names == {"resident_scale"}
+            assert prefix.param_names == {"prefix.weight"}
+            assert suffix.param_names == {"suffix.weight"}
+            assert prefix.buffer_names == {"prefix.offset"}
+            assert suffix.buffer_names == {"suffix.offset"}
+            assert streamed_components(strategy)[0].param_names == {
+                f"transformer_blocks.{idx}.weight" for idx in range(3)
+            }
+            assert strategy.param_names == {
+                name for name, _param in model.named_parameters()
+            }
+            assert strategy.buffer_names == {
+                name for name, _buffer in model.named_buffers()
+            }
+        finally:
+            strategy.deactivate()
+
+    @CUDA
+    @pytest.mark.parametrize("host_backing", ["pinned", "adopt"])
+    def test_cuda_forward_loads_only_the_active_boundary_scope(
+        self,
+        host_backing: str,
+    ) -> None:
+        torch.manual_seed(42)
+        eager = _make_boundary_model()
+        model = _make_boundary_model()
+        model.load_state_dict(eager.state_dict())
+        value = torch.randn(2, 8)
+        expected = eager(value).cuda()
+        hook_devices: list[tuple[str, str]] = []
+        model.register_forward_pre_hook(
+            lambda module, _args: hook_devices.append(
+                ("model", module.prefix.weight.device.type)
+            )
+        )
+        model.transformer_blocks[0].register_forward_pre_hook(
+            lambda _module, _args: hook_devices.append(
+                ("blocks", model.prefix.weight.device.type)
+            )
+        )
+
+        strategy = ModelOffloader.from_module(
+            model,
+            blocks_attr=("transformer_blocks",),
+            prefix_attr=("prefix",),
+            suffix_attr=("suffix",),
+            host_backing=host_backing,
+        )
+        try:
+            strategy.activate("cuda")
+            assert model.resident_scale.is_cuda
+            assert model.prefix.weight.device.type == "cpu"
+            assert model.suffix.weight.device.type == "cpu"
+            assert model.prefix.offset.device.type == "cpu"
+            assert model.suffix.offset.device.type == "cpu"
+
+            actual = model(value.cuda())
+            synchronize_prefix_prefetch(strategy)
+
+            torch.testing.assert_close(actual, expected)
+            assert model.prefix.forward_devices == ["cuda"]
+            assert model.suffix.forward_devices == ["cuda"]
+            assert hook_devices == [("model", "cuda"), ("blocks", "cpu")]
+            assert model.prefix.weight.device.type == "cpu"
+            assert model.suffix.weight.device.type == "cpu"
+            assert model.prefix.offset.device.type == "cpu"
+            assert model.suffix.offset.device.type == "cpu"
+            assert model.resident_scale.is_cuda
+
+            model(value.cuda())
+            synchronize_prefix_prefetch(strategy)
+            assert model.prefix.forward_devices == ["cuda", "cuda"]
+            assert model.suffix.forward_devices == ["cuda", "cuda"]
+            assert hook_devices[-2:] == [("model", "cuda"), ("blocks", "cpu")]
+            assert model.prefix.weight.device.type == "cpu"
+            assert model.suffix.weight.device.type == "cpu"
+            assert model.suffix.weight.is_pinned() == (host_backing == "pinned")
+        finally:
+            strategy.deactivate()
+        assert model.prefix.weight.device.type == "cpu"
+        assert model.prefix.weight.is_pinned() == (host_backing == "pinned")
+
+    @CUDA
+    def test_forward_failure_requires_deactivation(self) -> None:
+        model = _make_boundary_model()
+        model.fail_after_blocks = True
+        strategy = _make_model_offloader(
+            model,
+            blocks_attr=["transformer_blocks"],
+            prefix_attr=["prefix"],
+            suffix_attr=["suffix"],
+        )
+        try:
+            strategy.activate("cuda")
+            with pytest.raises(RuntimeError, match="after blocks"):
+                model(torch.randn(2, 8, device="cuda"))
+            assert model.prefix.weight.is_pinned()
+            assert model.suffix.weight.is_cuda
+
+            model.fail_after_blocks = False
+            with pytest.raises(RuntimeError, match="unfinished forward"):
+                model(torch.randn(2, 8, device="cuda"))
+        finally:
+            strategy.deactivate()
+        assert model.prefix.weight.is_pinned()
+        assert model.suffix.weight.is_pinned()
+
+    @CUDA
+    def test_success_prefetches_prefix_without_suffix(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model = _make_boundary_model()
+        strategy = _make_model_offloader(
+            model,
+            blocks_attr=["transformer_blocks"],
+            prefix_attr=["prefix"],
+        )
+        prefix = prefix_component(strategy)
+        assert prefix is not None
+        stage_calls = 0
+        original_stage = prefix._stage
+
+        def stage(
+            device: torch.device,
+            stream: torch.cuda.Stream,
+        ) -> None:
+            nonlocal stage_calls
+            stage_calls += 1
+            original_stage(device, stream)
+
+        monkeypatch.setattr(prefix, "_stage", stage)
+        try:
+            strategy.activate("cuda")
+            value = torch.randn(2, 8, device="cuda")
+            model(value)
+            boundary = strategy._composite._boundary
+            assert boundary is not None
+            assert boundary._prefix_prefetch is not None
+
+            model(value)
+            synchronize_prefix_prefetch(strategy)
+            assert stage_calls == 3
+            assert model.suffix.weight.is_cuda
+        finally:
+            strategy.deactivate()
+        assert model.prefix.weight.is_pinned()
+
+    @CUDA
+    def test_prefix_prefetch_failure_propagates_during_deactivation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model = _make_boundary_model()
+        strategy = _make_model_offloader(
+            model,
+            blocks_attr=["transformer_blocks"],
+            prefix_attr=["prefix"],
+            suffix_attr=["suffix"],
+        )
+        prefix = prefix_component(strategy)
+        assert prefix is not None
+        original_stage = prefix._stage
+        stage_calls = 0
+
+        def fail_stage(
+            device: torch.device,
+            stream: torch.cuda.Stream,
+        ) -> None:
+            nonlocal stage_calls
+            stage_calls += 1
+            if stage_calls == 1:
+                original_stage(device, stream)
+                return
+            raise RuntimeError("simulated prefix prefetch failure")
+
+        monkeypatch.setattr(prefix, "_stage", fail_stage)
+        strategy.activate("cuda")
+        try:
+            model(torch.randn(2, 8, device="cuda"))
+            with pytest.raises(
+                RuntimeError,
+                match="simulated prefix prefetch failure",
+            ):
+                strategy.deactivate()
+        finally:
+            strategy.deactivate()
+
+        assert strategy.active_device is None
+        assert model.prefix.weight.is_pinned()
+        assert model.suffix.weight.is_pinned()
+
+    @CUDA
+    def test_post_copy_hooks_run_on_each_boundary_load(self) -> None:
+        model = _make_boundary_model()
+        strategy = _make_model_offloader(
+            model,
+            blocks_attr=["transformer_blocks"],
+            prefix_attr=["prefix"],
+            suffix_attr=["suffix"],
+        )
+        copies = {"resident": 0, "prefix": 0, "suffix": 0}
+
+        def count(name: str):
+            def hook(_param: nn.Parameter) -> None:
+                copies[name] += 1
+
+            return hook
+
+        removers = [
+            strategy.register_post_copy_hook("resident_scale", count("resident")),
+            strategy.register_post_copy_hook("prefix.weight", count("prefix")),
+            strategy.register_post_copy_hook("suffix.weight", count("suffix")),
+        ]
+        try:
+            strategy.activate("cuda")
+            assert copies == {"resident": 1, "prefix": 0, "suffix": 0}
+            for _ in range(2):
+                model(torch.randn(2, 8, device="cuda"))
+        finally:
+            strategy.deactivate()
+            for remove in removers:
+                remove()
+        assert copies == {"resident": 1, "prefix": 3, "suffix": 2}
+
+    def test_cpu_activation_keeps_all_pinned_scopes_available(self) -> None:
+        torch.manual_seed(42)
+        eager = _make_boundary_model()
+        model = _make_boundary_model()
+        model.load_state_dict(eager.state_dict())
+        value = torch.randn(2, 8)
+        expected = eager(value)
+        strategy = _make_model_offloader(
+            model,
+            blocks_attr=["transformer_blocks"],
+            prefix_attr=["prefix"],
+            suffix_attr=["suffix"],
+        )
+        try:
+            with activated_model(strategy, "cpu"):
+                torch.testing.assert_close(model(value), expected)
+                assert model.prefix.weight.is_pinned()
+                assert model.suffix.weight.is_pinned()
+                assert model.prefix.offset.is_pinned()
+                assert model.suffix.offset.is_pinned()
+        finally:
+            strategy.deactivate()
+
+    def test_trainable_and_cross_scope_tied_state_remains_resident(self) -> None:
+        model = _make_boundary_model()
+        model.prefix.weight.requires_grad_(True)
+        model.suffix.weight = model.prefix.weight
+        strategy = _make_model_offloader(
+            model,
+            blocks_attr=["transformer_blocks"],
+            prefix_attr=["prefix"],
+            suffix_attr=["suffix"],
+        )
+        try:
+            resident = pinned_component(strategy)
+            assert resident is not None
+            assert {"prefix.weight", "suffix.weight"} <= resident.param_names
+            assert not prefix_component(strategy).param_names
+            assert not suffix_component(strategy).param_names
+        finally:
+            strategy.deactivate()
+
+    def test_prefix_nested_streamed_group_is_not_the_boundary(self) -> None:
+        class Prefix(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.proj = nn.Linear(8, 8, bias=False)
+                self.refiner_blocks = nn.ModuleList(
+                    nn.Linear(8, 8, bias=False) for _ in range(2)
+                )
+
+            def forward(self, value: torch.Tensor) -> torch.Tensor:
+                value = self.proj(value)
+                for block in self.refiner_blocks:
+                    value = block(value)
+                return value
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.prefix = Prefix()
+                self.transformer_blocks = nn.ModuleList(
+                    nn.Linear(8, 8, bias=False) for _ in range(2)
+                )
+                self.suffix = nn.Linear(8, 8, bias=False)
+
+        model = Model()
+        for param in model.parameters():
+            param.requires_grad_(False)
+        strategy = _make_model_offloader(
+            model,
+            blocks_attr=["prefix.refiner_blocks", "transformer_blocks"],
+            prefix_attr=["prefix"],
+            suffix_attr=["suffix"],
+        )
+        try:
+            boundary = strategy._composite._boundary
+            assert boundary is not None
+            assert boundary._first_block is model.transformer_blocks[0]
+            assert boundary._last_block is model.transformer_blocks[-1]
+            assert prefix_component(strategy).param_names == {"prefix.proj.weight"}
+        finally:
+            strategy.deactivate()
+
+    def test_boundary_attrs_require_unclaimed_central_blocks(self) -> None:
+        model = _make_boundary_model()
+        with pytest.raises(ValueError, match="require at least one blocks_attr"):
+            ModelOffloader.from_module(model, prefix_attr=["prefix"])
+        with pytest.raises(ValueError, match="leave no central"):
+            ModelOffloader.from_module(
+                model,
+                blocks_attr=["transformer_blocks"],
+                prefix_attr=["transformer_blocks"],
+            )
+        with pytest.raises(ValueError, match="cannot be nested"):
+            ModelOffloader.from_module(
+                model,
+                blocks_attr=["transformer_blocks"],
+                prefix_attr=["transformer_blocks.0"],
+            )
+
+    def test_boundary_attrs_must_be_disjoint_module_paths(self) -> None:
+        model = _make_boundary_model()
+        with pytest.raises(ValueError, match="must not overlap"):
+            ModelOffloader.from_module(
+                model,
+                blocks_attr=["transformer_blocks"],
+                prefix_attr=["prefix"],
+                suffix_attr=["prefix"],
+            )
+
+
 class TestStreamedComponentBackendActivation:
     def test_direct_cpu_activation_uses_host_backed_weights(self) -> None:
         torch.manual_seed(42)
@@ -571,6 +972,41 @@ class TestStreamedComponentBackendActivation:
                 assert block.weight.device == torch.device("cpu")
                 assert block.weight.is_pinned()
         finally:
+            streamer.deactivate()
+
+    def test_already_active_block_tracks_the_forward_stream(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class Lease:
+            def __init__(self) -> None:
+                self.used: list[object] = []
+
+            def mark_used(self, stream: object) -> None:
+                self.used.append(stream)
+
+        streamer = _make_streamed_component(
+            blocks=[nn.Linear(4, 4, bias=False)],
+        )
+        runtime = streamer._block_runtime
+        lease = Lease()
+        forward_stream = object()
+        runtime._device = torch.device("cuda")
+        runtime._active_idx = 0
+        runtime._block_to_lease = {0: cast(Any, lease)}
+        monkeypatch.setattr(runtime, "_submit_prefetch", lambda _idx: None)
+        monkeypatch.setattr(
+            torch.cuda,
+            "current_stream",
+            lambda _device: forward_stream,
+        )
+        try:
+            runtime._before_block_forward(0)
+            assert lease.used == [forward_stream]
+        finally:
+            runtime._block_to_lease.clear()
+            runtime._active_idx = None
+            runtime._device = None
             streamer.deactivate()
 
     def test_direct_cpu_trainable_step_preserves_updates(self) -> None:
@@ -988,6 +1424,8 @@ class TestResourceCacheIntegration:
             estimated_cache_bytes=1024,
             factory=_make_block_model,
             blocks_attr=("transformer_blocks",),
+            prefix_attr=("embed",),
+            suffix_attr=("head",),
             host_backing="adopt",
         )
 
@@ -997,6 +1435,8 @@ class TestResourceCacheIntegration:
                 not param.is_pinned()
                 for param in offloader.value.parameters()
             )
+            assert prefix_component(offloader).param_names == {"embed.weight"}
+            assert suffix_component(offloader).param_names == {"head.weight"}
         finally:
             offloader.deactivate()
 
@@ -1240,12 +1680,15 @@ class TestActivateFailureCleanup:
             blocks_attr=["transformer_blocks"],
         )
         strat._composite = CompositeComponent(
-            pinned=None,
+            resident=None,
+            prefix=None,
+            suffix=None,
             streamed=[
                 _Recorder("A"),
                 _Recorder("B"),
                 _Recorder("C", raise_on_activate=True),
             ],
+            boundary=None,
         )
 
         with pytest.raises(RuntimeError, match="C activate failed"):

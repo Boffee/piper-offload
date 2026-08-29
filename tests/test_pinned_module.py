@@ -393,6 +393,26 @@ class TestPinnedModuleInstance:
         assert module.right.weight is target_param
         torch.testing.assert_close(target_param, torch.full((2, 2), 2.0))
 
+    def test_copy_to_target_does_not_mutate_module_registries(self) -> None:
+        module = nn.Module()
+        module.weight = nn.Parameter(torch.zeros(2), requires_grad=False)
+        original = module.weight
+        pinned = _FakePinnedParam(torch.ones(2))
+        instance = PinnedModuleInstance(
+            module=module,
+            params={"weight": cast(PinnedParam, pinned)},
+            buffers={},
+        )
+        target = instance.allocate_target(torch.device("cuda"))
+        hook_calls: list[nn.Parameter] = []
+        instance.register_post_copy_hook("weight", hook_calls.append)
+
+        instance.copy_to_target(target, run_post_copy_hooks=True)
+
+        assert module.weight is original
+        assert pinned.copied == 1
+        assert hook_calls == [target.param_targets["weight"].param]
+
     def test_load_to_target_skips_registered_hooks_by_default(self) -> None:
         module = nn.Module()
         module.weight = nn.Parameter(torch.zeros(2), requires_grad=False)
