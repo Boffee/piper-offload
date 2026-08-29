@@ -178,9 +178,7 @@ class _BoundaryRuntime:
     def _before_blocks(self) -> None:
         if not self._in_forward or self._prefix is None:
             return
-        device = self._device
-        assert device is not None
-        self._prefix._release(torch.cuda.current_stream(device))
+        self._prefix._release()
 
     def _after_blocks(self) -> None:
         if not self._in_forward or self._suffix is None or self._suffix_active:
@@ -196,7 +194,7 @@ class _BoundaryRuntime:
         device = self._device
         assert device is not None
         current_stream = torch.cuda.current_stream(device)
-        self._release_scopes(current_stream)
+        self._release_scopes()
         if self._prefix is not None:
             self._submit_prefix_prefetch(
                 cast(torch.cuda.Event, current_stream.record_event())
@@ -221,15 +219,12 @@ class _BoundaryRuntime:
 
         self._prefix_prefetch = executor.submit(prefetch)
 
-    def _release_scopes(
-        self,
-        stream: torch.cuda.Stream | None = None,
-    ) -> None:
+    def _release_scopes(self) -> None:
         try:
             with contextlib.ExitStack() as stack:
                 for component in (self._prefix, self._suffix):
                     if component is not None:
-                        stack.callback(component._release, stream)
+                        stack.callback(component._release)
         finally:
             self._suffix_active = False
 

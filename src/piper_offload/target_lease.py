@@ -12,11 +12,11 @@ class _CudaTargetLease:
 
     The caller chooses the allocation-owner stream: short-lived staged
     components use the default allocator pool, while block lookahead targets
-    stay with their copy stream. Copies and consumers may run on other streams;
-    a completion event orders target reuse, and the allocation stream waits
-    for the target's last operation before it is dropped. This event handoff
-    keeps storage in its original allocator pool and works for opaque adapter
-    state without inspecting its physical tensors.
+    stay with their copy stream. A ready event orders consumption after copies;
+    recorded consumer streams order later refills, and the allocation stream
+    waits for all remaining target work before storage is dropped. These stream
+    handoffs keep storage in its original allocator pool and work for opaque
+    adapter state without inspecting its physical tensors.
     """
 
     def __init__(
@@ -26,10 +26,11 @@ class _CudaTargetLease:
     ) -> None:
         self._target: PinnedModuleTarget | None = target
         self._allocation_stream = allocation_stream
-        self._event: torch.cuda.Event | None = None
+        self._ready_event: torch.cuda.Event | None = None
         self._staged = False
-        self._consumer_stream: torch.cuda.Stream | None = None
-        self._tracked_streams: set[torch.cuda.Stream] = set()
+        self._acquired = False
+        self._consumer_streams: set[torch.cuda.Stream] = set()
+        self._lifetime_streams: set[torch.cuda.Stream] = set()
 
     @classmethod
     def allocate(
@@ -66,14 +67,18 @@ class _CudaTargetLease:
         non_blocking: bool = True,
     ) -> None:
         """Refill this target on ``stream`` without changing a module."""
-        if self._consumer_stream is not None:
+        if self._acquired:
             raise RuntimeError("cannot stage a CUDA target while it is in use")
         target = self.target
-        prior = self._event
+        prior = self._ready_event
         self._staged = False
         with torch.cuda.stream(stream):
             if prior is not None:
                 stream.wait_event(prior)
+            for consumer in self._consumer_streams:
+                if consumer != stream:
+                    stream.wait_stream(consumer)
+            self._consumer_streams.clear()
             try:
                 instance.copy_to_target(
                     target,
@@ -85,43 +90,51 @@ class _CudaTargetLease:
                 # A hook or later tensor copy can fail after earlier async
                 # copies were enqueued. Preserve a completion marker so
                 # cleanup still hands the allocation back safely.
-                self._event = cast(torch.cuda.Event, stream.record_event())
+                self._ready_event = cast(
+                    torch.cuda.Event,
+                    stream.record_event(),
+                )
 
     def acquire(self, stream: torch.cuda.Stream) -> PinnedModuleTarget:
         """Order ``stream`` after staging and mark it as the consumer."""
-        if self._consumer_stream is not None:
+        if self._acquired:
             raise RuntimeError("CUDA target is already in use")
-        event = self._event
+        event = self._ready_event
         if not self._staged or event is None:
             raise RuntimeError("CUDA target must be staged before use")
         stream.wait_event(event)
         self._staged = False
-        self._consumer_stream = stream
+        self._acquired = True
+        self.mark_used(stream)
         return self.target
 
-    def track_stream(self, stream: torch.cuda.Stream) -> None:
-        """Protect target work outside the stage/acquire/release cycle."""
+    def mark_used(self, stream: torch.cuda.Stream) -> None:
+        """Record a stream that may read or write the acquired target."""
+        if not self._acquired:
+            raise RuntimeError("CUDA target must be acquired before use")
+        self._consumer_streams.add(stream)
+
+    def track_lifetime_stream(self, stream: torch.cuda.Stream) -> None:
+        """Protect externally ordered target work until the lease closes."""
         if stream != self._allocation_stream:
-            self._tracked_streams.add(stream)
+            self._lifetime_streams.add(stream)
 
-    def release(self, stream: torch.cuda.Stream | None = None) -> None:
-        """Record completion of the current consumer, if any."""
-        if self._consumer_stream is None:
-            return
-        consumer = stream or self._consumer_stream
-        self._event = cast(torch.cuda.Event, consumer.record_event())
-        self._consumer_stream = None
+    def release(self) -> None:
+        """End the acquired state while retaining its stream dependencies."""
+        self._acquired = False
 
-    def close(self, stream: torch.cuda.Stream | None = None) -> None:
+    def close(self) -> None:
         """Release target storage without a device- or host-wide sync."""
         if self._target is None:
             return
-        self.release(stream)
-        if self._event is not None:
-            self._allocation_stream.wait_event(self._event)
-        for tracked in self._tracked_streams:
-            self._allocation_stream.wait_stream(tracked)
+        self.release()
+        if self._ready_event is not None:
+            self._allocation_stream.wait_event(self._ready_event)
+        for tracked in self._lifetime_streams | self._consumer_streams:
+            if tracked != self._allocation_stream:
+                self._allocation_stream.wait_stream(tracked)
         self._target = None
-        self._event = None
+        self._ready_event = None
         self._staged = False
-        self._tracked_streams.clear()
+        self._consumer_streams.clear()
+        self._lifetime_streams.clear()

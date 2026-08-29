@@ -110,6 +110,38 @@ class TestPinnedComponentStoreBind:
         finally:
             component.deactivate()
 
+    def test_cuda_use_hook_tracks_the_forward_stream(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class Lease:
+            def __init__(self) -> None:
+                self.used: list[object] = []
+
+            def mark_used(self, stream: object) -> None:
+                self.used.append(stream)
+
+        model = _make_simple_model()
+        component = PinnedComponentStore.from_module(model).bind(model)
+        lease = Lease()
+        forward_stream = object()
+        component._lease = cast(Any, lease)
+        component._active_device = torch.device("cuda")
+        component._install_use_hook()
+        monkeypatch.setattr(
+            torch.cuda,
+            "current_stream",
+            lambda _device: forward_stream,
+        )
+        try:
+            model(torch.randn(1, 8))
+            assert lease.used == [forward_stream]
+        finally:
+            component._remove_use_hook()
+            component._lease = None
+            component._active_device = None
+            component.deactivate()
+
     def test_adopted_store_defers_registry_install_until_bind(self) -> None:
         module = nn.Module()
         module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)

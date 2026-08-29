@@ -10,6 +10,7 @@ over the host-backed pinned state.
 from collections.abc import Sequence
 from concurrent.futures import Future
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
@@ -971,6 +972,41 @@ class TestStreamedComponentBackendActivation:
                 assert block.weight.device == torch.device("cpu")
                 assert block.weight.is_pinned()
         finally:
+            streamer.deactivate()
+
+    def test_already_active_block_tracks_the_forward_stream(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class Lease:
+            def __init__(self) -> None:
+                self.used: list[object] = []
+
+            def mark_used(self, stream: object) -> None:
+                self.used.append(stream)
+
+        streamer = _make_streamed_component(
+            blocks=[nn.Linear(4, 4, bias=False)],
+        )
+        runtime = streamer._block_runtime
+        lease = Lease()
+        forward_stream = object()
+        runtime._device = torch.device("cuda")
+        runtime._active_idx = 0
+        runtime._block_to_lease = {0: cast(Any, lease)}
+        monkeypatch.setattr(runtime, "_submit_prefetch", lambda _idx: None)
+        monkeypatch.setattr(
+            torch.cuda,
+            "current_stream",
+            lambda _device: forward_stream,
+        )
+        try:
+            runtime._before_block_forward(0)
+            assert lease.used == [forward_stream]
+        finally:
+            runtime._block_to_lease.clear()
+            runtime._active_idx = None
+            runtime._device = None
             streamer.deactivate()
 
     def test_direct_cpu_trainable_step_preserves_updates(self) -> None:

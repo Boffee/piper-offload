@@ -51,6 +51,7 @@ Class-specific caveats
 """
 
 import contextlib
+import weakref
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Self
@@ -171,6 +172,7 @@ class PinnedComponent:
         self._has_trainables = instance.has_trainables
         self._active_device: torch.device | None = None
         self._lease: _CudaTargetLease | None = None
+        self._use_hook: torch.utils.hooks.RemovableHandle | None = None
         self._optimizer_step_active: bool = False
 
     # ------------------------------------------------------------------
@@ -240,6 +242,7 @@ class PinnedComponent:
             # backward accumulates on-device. A no-op unless a prior CPU
             # optimizer step left a retained CPU grad (set_to_none=False).
             self._instance.move_trainable_grads_to(active_device)
+            self._install_use_hook()
         else:
             raise ValueError(
                 "PinnedComponent.activate() supports CUDA or CPU; "
@@ -291,8 +294,35 @@ class PinnedComponent:
         self._instance.install_target(target)
         self._active_device = lease.device
 
-    def _release(self, stream: torch.cuda.Stream | None = None) -> None:
+    def _install_use_hook(self) -> None:
+        """Track the CUDA stream that actually executes the bound module."""
+        if self._use_hook is not None:
+            raise RuntimeError("PinnedComponent CUDA use hook is already installed.")
+        component_ref = weakref.ref(self)
+
+        def mark_used(_module: nn.Module, _args: tuple[object, ...]) -> None:
+            component = component_ref()
+            if component is None:
+                return
+            lease = component._lease
+            device = component._active_device
+            if lease is not None and device is not None and device.type == "cuda":
+                lease.mark_used(torch.cuda.current_stream(device))
+
+        self._use_hook = self._instance.module.register_forward_pre_hook(
+            mark_used,
+            prepend=True,
+        )
+
+    def _remove_use_hook(self) -> None:
+        hook = self._use_hook
+        self._use_hook = None
+        if hook is not None:
+            hook.remove()
+
+    def _release(self) -> None:
         """Restore host backing and safely discard any staged CUDA target."""
+        self._remove_use_hook()
         lease = self._lease
         try:
             self._instance.install_pinned()
@@ -300,7 +330,7 @@ class PinnedComponent:
         finally:
             try:
                 if lease is not None:
-                    lease.close(stream)
+                    lease.close()
             finally:
                 self._lease = None
                 self._active_device = None
@@ -319,11 +349,7 @@ class PinnedComponent:
         ``.grad`` both on pinned CPU — so a context-free CPU
         ``optimizer.step()`` works the same for pinned and streamed
         trainables."""
-        stream: torch.cuda.Stream | None = None
-        active_device = self._active_device
-        if active_device is not None and active_device.type == "cuda":
-            stream = torch.cuda.current_stream(active_device)
-        self._release(stream)
+        self._release()
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:

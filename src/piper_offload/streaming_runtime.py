@@ -303,13 +303,12 @@ class BlockStreamingRuntime:
     def _release_block(
         self,
         block_idx: int,
-        stream: torch.cuda.Stream | None = None,
     ) -> None:
         self._instances[block_idx].install_pinned()
         assert self._pool is not None, "runtime is not active"
         lease = self._block_to_lease.pop(block_idx, None)
         if lease is not None:
-            lease.release(stream)
+            lease.release()
             self._pool.release(self._signatures[block_idx], lease)
 
     def _drain_and_evict_all(self) -> BaseException | None:
@@ -359,9 +358,10 @@ class BlockStreamingRuntime:
         current_stream = torch.cuda.current_stream(self._require_device())
         if idx != self._active_idx:
             if self._active_idx is not None:
-                self._release_block(self._active_idx, current_stream)
+                self._release_block(self._active_idx)
                 self._active_idx = None
             self._ensure_on_gpu(idx)
+        self._block_to_lease[idx].mark_used(current_stream)
 
         last = self._last_idx
         self._last_idx = idx
