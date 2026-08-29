@@ -328,7 +328,7 @@ def _resolve_blocks(module: nn.Module, blocks_path: str) -> list[nn.Module]:
         raise TypeError(f"Expected nn.ModuleList at '{blocks_path}', got {type(obj).__name__}")
     blocks = list(cast(nn.ModuleList, obj))
     if not blocks:
-        raise ValueError(f"blocks_attr = {blocks_path!r} resolved to empty list")
+        raise ValueError(f"Block path {blocks_path!r} resolved to an empty list")
     return blocks
 
 
@@ -345,7 +345,7 @@ def _streamed_param_names_for_blocks(
                 "All blocks in a StreamedComponent group must select the "
                 "same parameter names (their shapes, dtypes, and quant "
                 "formats may differ). Split structurally different block "
-                "kinds across separate `blocks_attr=[...]` groups."
+                "kinds across separate `block_paths=[...]` groups."
             )
     return param_names
 
@@ -359,7 +359,7 @@ def _streamed_buffer_names_for_blocks(blocks: Sequence[nn.Module]) -> set[str]:
                 "All blocks in a StreamedComponent group must select the "
                 "same buffer names (their shapes, dtypes, and layouts may "
                 "differ). Split structurally different block kinds across "
-                "separate `blocks_attr=[...]` groups."
+                "separate `block_paths=[...]` groups."
             )
     return buffer_names
 
@@ -429,7 +429,8 @@ class StreamedComponentStore:
         kept = [(idx, block) for idx, block in enumerate(all_blocks) if not _block_is_empty(block)]
         if not kept:
             raise ValueError(
-                f"blocks_attr = {blocks_path!r} has no streamable blocks (every block is structurally empty)."
+                f"Block path {blocks_path!r} has no streamable blocks "
+                "(every block is structurally empty)."
             )
         block_indices = tuple(idx for idx, _ in kept)
         blocks = [block for _, block in kept]

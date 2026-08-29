@@ -42,16 +42,16 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def _make_model_offloader(
     model: nn.Module,
     *,
-    blocks_attr: list[str] = [],
-    prefix_attr: list[str] = [],
-    suffix_attr: list[str] = [],
+    block_paths: list[str] = [],
+    prefix_paths: list[str] = [],
+    suffix_paths: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
-        blocks_attr=blocks_attr,
-        prefix_attr=prefix_attr,
-        suffix_attr=suffix_attr,
+        block_paths=block_paths,
+        prefix_paths=prefix_paths,
+        suffix_paths=suffix_paths,
         stream_trainable_weights=stream_trainable_weights,
     )
 
@@ -195,7 +195,7 @@ class TestResourceBindingConformance:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             assert isinstance(strategy, ResourceStore)
@@ -207,7 +207,7 @@ class TestResourceBindingConformance:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             assert callable(strategy.activate)
@@ -226,7 +226,7 @@ class TestConstructorPins:
         m = _make_block_model()
         strategy = ModelOffloader.from_module(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             # Block weights are pinned via registry replacement.
@@ -246,7 +246,7 @@ class TestConstructorPins:
         }
         strategy = ModelOffloader.from_module(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             host_backing="adopt",
         )
         try:
@@ -295,7 +295,7 @@ class TestConstructorPins:
         with pytest.raises(ValueError, match="non-contiguous"):
             ModelOffloader.from_module(
                 model,
-                blocks_attr=("blocks",),
+                block_paths=("blocks",),
                 host_backing="adopt",
             )
 
@@ -360,7 +360,7 @@ class TestConstructorPins:
         model = Model(backing)
         strategy = ModelOffloader.from_module(
             model,
-            blocks_attr=("blocks",),
+            block_paths=("blocks",),
             host_backing="adopt",
         )
         try:
@@ -375,7 +375,7 @@ class TestConstructorPins:
         with pytest.raises(ValueError, match="host_backing"):
             ModelOffloader.from_module(
                 m,
-                blocks_attr=["transformer_blocks"],
+                block_paths=["transformer_blocks"],
                 host_backing="invalid",
             )
 
@@ -392,7 +392,7 @@ class TestLifecycle:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             assert strategy.active_device is None
@@ -407,7 +407,7 @@ class TestLifecycle:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             strategy.activate("cuda")
@@ -421,7 +421,7 @@ class TestLifecycle:
         expected = torch.device("cuda", torch.cuda.current_device())
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             strategy.activate("cuda")
@@ -442,7 +442,7 @@ class TestLifecycle:
 
         strategy = _make_model_offloader(
             m_off,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             pinned_block_params = [block.weight for block in m_off.transformer_blocks]
@@ -474,7 +474,7 @@ class TestLifecycle:
         target = torch.device("cuda")
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             strategy.activate("cuda")
@@ -495,7 +495,7 @@ class TestLifecycle:
 
         strategy = ModelOffloader.from_module(
             offloaded,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             host_backing="adopt",
         )
         try:
@@ -515,7 +515,7 @@ class TestLifecycle:
         target = torch.device("cuda")
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             strategy.activate("cuda")
@@ -533,7 +533,7 @@ class TestLifecycle:
         target = torch.device("cuda")
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             strategy.activate("cuda")
@@ -547,7 +547,7 @@ class TestLifecycle:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             strategy.deactivate()  # no error, never activated
@@ -562,7 +562,7 @@ class TestLifecycle:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             strategy.activate("cpu")
@@ -588,9 +588,9 @@ class TestBoundaryPinnedLifecycle:
         model = _make_boundary_model()
         strategy = _make_model_offloader(
             model,
-            blocks_attr=["transformer_blocks"],
-            prefix_attr=["prefix"],
-            suffix_attr=["suffix"],
+            block_paths=["transformer_blocks"],
+            prefix_paths=["prefix"],
+            suffix_paths=["suffix"],
         )
         try:
             resident = pinned_component(strategy)
@@ -642,9 +642,9 @@ class TestBoundaryPinnedLifecycle:
 
         strategy = ModelOffloader.from_module(
             model,
-            blocks_attr=("transformer_blocks",),
-            prefix_attr=("prefix",),
-            suffix_attr=("suffix",),
+            block_paths=("transformer_blocks",),
+            prefix_paths=("prefix",),
+            suffix_paths=("suffix",),
             host_backing=host_backing,
         )
         try:
@@ -687,9 +687,9 @@ class TestBoundaryPinnedLifecycle:
         model.fail_after_blocks = True
         strategy = _make_model_offloader(
             model,
-            blocks_attr=["transformer_blocks"],
-            prefix_attr=["prefix"],
-            suffix_attr=["suffix"],
+            block_paths=["transformer_blocks"],
+            prefix_paths=["prefix"],
+            suffix_paths=["suffix"],
         )
         try:
             strategy.activate("cuda")
@@ -714,8 +714,8 @@ class TestBoundaryPinnedLifecycle:
         model = _make_boundary_model()
         strategy = _make_model_offloader(
             model,
-            blocks_attr=["transformer_blocks"],
-            prefix_attr=["prefix"],
+            block_paths=["transformer_blocks"],
+            prefix_paths=["prefix"],
         )
         prefix = prefix_component(strategy)
         assert prefix is not None
@@ -755,9 +755,9 @@ class TestBoundaryPinnedLifecycle:
         model = _make_boundary_model()
         strategy = _make_model_offloader(
             model,
-            blocks_attr=["transformer_blocks"],
-            prefix_attr=["prefix"],
-            suffix_attr=["suffix"],
+            block_paths=["transformer_blocks"],
+            prefix_paths=["prefix"],
+            suffix_paths=["suffix"],
         )
         prefix = prefix_component(strategy)
         assert prefix is not None
@@ -796,9 +796,9 @@ class TestBoundaryPinnedLifecycle:
         model = _make_boundary_model()
         strategy = _make_model_offloader(
             model,
-            blocks_attr=["transformer_blocks"],
-            prefix_attr=["prefix"],
-            suffix_attr=["suffix"],
+            block_paths=["transformer_blocks"],
+            prefix_paths=["prefix"],
+            suffix_paths=["suffix"],
         )
         copies = {"resident": 0, "prefix": 0, "suffix": 0}
 
@@ -833,9 +833,9 @@ class TestBoundaryPinnedLifecycle:
         expected = eager(value)
         strategy = _make_model_offloader(
             model,
-            blocks_attr=["transformer_blocks"],
-            prefix_attr=["prefix"],
-            suffix_attr=["suffix"],
+            block_paths=["transformer_blocks"],
+            prefix_paths=["prefix"],
+            suffix_paths=["suffix"],
         )
         try:
             with activated_model(strategy, "cpu"):
@@ -853,9 +853,9 @@ class TestBoundaryPinnedLifecycle:
         model.suffix.weight = model.prefix.weight
         strategy = _make_model_offloader(
             model,
-            blocks_attr=["transformer_blocks"],
-            prefix_attr=["prefix"],
-            suffix_attr=["suffix"],
+            block_paths=["transformer_blocks"],
+            prefix_paths=["prefix"],
+            suffix_paths=["suffix"],
         )
         try:
             resident = pinned_component(strategy)
@@ -895,9 +895,9 @@ class TestBoundaryPinnedLifecycle:
             param.requires_grad_(False)
         strategy = _make_model_offloader(
             model,
-            blocks_attr=["prefix.refiner_blocks", "transformer_blocks"],
-            prefix_attr=["prefix"],
-            suffix_attr=["suffix"],
+            block_paths=["prefix.refiner_blocks", "transformer_blocks"],
+            prefix_paths=["prefix"],
+            suffix_paths=["suffix"],
         )
         try:
             boundary = strategy._composite._boundary
@@ -910,19 +910,19 @@ class TestBoundaryPinnedLifecycle:
 
     def test_boundary_attrs_require_unclaimed_central_blocks(self) -> None:
         model = _make_boundary_model()
-        with pytest.raises(ValueError, match="require at least one blocks_attr"):
-            ModelOffloader.from_module(model, prefix_attr=["prefix"])
+        with pytest.raises(ValueError, match="require at least one block path"):
+            ModelOffloader.from_module(model, prefix_paths=["prefix"])
         with pytest.raises(ValueError, match="leave no central"):
             ModelOffloader.from_module(
                 model,
-                blocks_attr=["transformer_blocks"],
-                prefix_attr=["transformer_blocks"],
+                block_paths=["transformer_blocks"],
+                prefix_paths=["transformer_blocks"],
             )
         with pytest.raises(ValueError, match="cannot be nested"):
             ModelOffloader.from_module(
                 model,
-                blocks_attr=["transformer_blocks"],
-                prefix_attr=["transformer_blocks.0"],
+                block_paths=["transformer_blocks"],
+                prefix_paths=["transformer_blocks.0"],
             )
 
     def test_boundary_attrs_must_be_disjoint_module_paths(self) -> None:
@@ -930,9 +930,9 @@ class TestBoundaryPinnedLifecycle:
         with pytest.raises(ValueError, match="must not overlap"):
             ModelOffloader.from_module(
                 model,
-                blocks_attr=["transformer_blocks"],
-                prefix_attr=["prefix"],
-                suffix_attr=["prefix"],
+                block_paths=["transformer_blocks"],
+                prefix_paths=["prefix"],
+                suffix_paths=["prefix"],
             )
 
 
@@ -1066,7 +1066,7 @@ class TestCleanup:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         strategy.activate("cuda")
         strategy.deactivate()
@@ -1079,7 +1079,7 @@ class TestCleanup:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         strategy.deactivate()
         strategy.deactivate()  # no error
@@ -1089,7 +1089,7 @@ class TestCleanup:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         strategy.activate("cuda")
         assert strategy._composite._teardown_stack is not None
@@ -1112,7 +1112,7 @@ class TestCleanup:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         strategy.activate("cuda")  # installs hooks; no deactivate
         streamer = streamed_components(strategy)[0]
@@ -1138,7 +1138,7 @@ class TestCleanup:
         m = _make_block_model(num_blocks=4, width=8)
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         strategy.activate("cuda")
         # Drop without deactivate.
@@ -1173,7 +1173,7 @@ class TestHookLifecycle:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             strategy.activate("cuda")
@@ -1190,7 +1190,7 @@ class TestHookLifecycle:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         strategy.activate("cuda")
         blocks = list(m.transformer_blocks)
@@ -1231,7 +1231,7 @@ class TestTraversalPrefetch:
         m = _make_block_model(num_blocks=4, width=8)
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         streamer: StreamedComponent = streamed_components(strategy)[0]
 
@@ -1255,7 +1255,7 @@ class TestTraversalPrefetch:
         m = _make_block_model(num_blocks=4, width=8)
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         streamer: StreamedComponent = streamed_components(strategy)[0]
 
@@ -1290,7 +1290,7 @@ class TestTraversalPrefetch:
         m_off = _make_block_model(num_blocks=4, width=8)
         strategy = _make_model_offloader(
             m_off,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             with activated_model(strategy, "cuda"):
@@ -1312,7 +1312,7 @@ class TestTraversalPrefetch:
         m = _make_block_model(num_blocks=3, width=8)
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         streamer: StreamedComponent = streamed_components(strategy)[0]
 
@@ -1350,7 +1350,7 @@ class TestForwardCorrectness:
         m_off = _make_block_model(num_blocks=4, width=8)
         strategy = _make_model_offloader(
             m_off,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             strategy.activate("cuda")
@@ -1367,7 +1367,7 @@ class TestForwardCorrectness:
         m = _make_block_model(num_blocks=4, width=8)
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             x = torch.randn(2, 8, device="cuda")
@@ -1393,20 +1393,20 @@ class TestForwardCorrectness:
 
 
 class TestValidation:
-    def test_empty_blocks_attr_disables_streaming(self) -> None:
+    def test_empty_block_paths_disables_streaming(self) -> None:
         m = _make_block_model(num_blocks=4)
-        strategy = _make_model_offloader(m, blocks_attr=[])
+        strategy = _make_model_offloader(m, block_paths=[])
         try:
             assert not streamed_components(strategy)
         finally:
             strategy.deactivate()
 
-    def test_blocks_attr_resolving_to_non_modulelist_raises(self) -> None:
+    def test_block_paths_resolving_to_non_modulelist_raises(self) -> None:
         m = _make_block_model(num_blocks=4)
         with pytest.raises(TypeError, match="nn.ModuleList"):
             _make_model_offloader(
                 m,
-                blocks_attr=["embed"],  # an nn.Linear, not a ModuleList
+                block_paths=["embed"],  # an nn.Linear, not a ModuleList
             )
 
 
@@ -1423,9 +1423,9 @@ class TestResourceCacheIntegration:
             key="adopted",
             estimated_cache_bytes=1024,
             factory=_make_block_model,
-            blocks_attr=("transformer_blocks",),
-            prefix_attr=("embed",),
-            suffix_attr=("head",),
+            block_paths=("transformer_blocks",),
+            prefix_paths=("embed",),
+            suffix_paths=("head",),
             host_backing="adopt",
         )
 
@@ -1456,7 +1456,7 @@ class TestResourceCacheIntegration:
             key="xformer",
             estimated_cache_bytes=1024,
             factory=factory,
-            blocks_attr=("transformer_blocks",),
+            block_paths=("transformer_blocks",),
         )
 
         with cache.use(
@@ -1502,7 +1502,7 @@ class TestResourceCacheIntegration:
             key="xformer",
             estimated_cache_bytes=1024,
             factory=factory,
-            blocks_attr=("transformer_blocks",),
+            block_paths=("transformer_blocks",),
         )
 
         with cache.lease(spec) as first_offloader:
@@ -1522,7 +1522,7 @@ class TestResourceCacheIntegration:
             key="xformer",
             estimated_cache_bytes=1024,
             factory=lambda: _make_block_model(num_blocks=4, width=8),
-            blocks_attr=("transformer_blocks",),
+            block_paths=("transformer_blocks",),
         )
 
         with cache.use(spec, device="cpu"):
@@ -1541,7 +1541,7 @@ class TestResourceCacheIntegration:
             key="xformer",
             estimated_cache_bytes=1024,
             factory=lambda: _make_block_model(num_blocks=4, width=8),
-            blocks_attr=("transformer_blocks",),
+            block_paths=("transformer_blocks",),
         )
 
         with pytest.raises(ValueError, match="caller failed"):
@@ -1625,7 +1625,7 @@ class TestActivateFailureCleanup:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         streamer = streamed_components(strategy)[0]
         runtime = streamer._block_runtime
@@ -1677,7 +1677,7 @@ class TestActivateFailureCleanup:
         m = _make_block_model()
         strat = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         strat._composite = CompositeComponent(
             resident=None,
@@ -1721,7 +1721,7 @@ class TestPrefetchFailureOnDeactivate:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         strategy.activate("cuda")
         streamer = streamed_components(strategy)[0]
@@ -1759,7 +1759,7 @@ class TestConstructedStateIsInactive:
         target = torch.device("cuda")
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             for p in m.parameters():
@@ -1780,7 +1780,7 @@ class TestConstructedStateIsInactive:
             p.requires_grad = False
         strategy = ModelOffloader.from_module(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             # No PinnedComponent component, just StreamedComponent.
@@ -1815,7 +1815,7 @@ class TestBufferOnlyNonBlock:
         target = torch.device("cuda")
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             assert m.rope.table.is_pinned()
@@ -1848,7 +1848,7 @@ class TestSharedStorageLocalBehavior:
 
         strat = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         strat.deactivate()
 
@@ -1874,7 +1874,7 @@ class TestSharedStorageLocalBehavior:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             for block in m.transformer_blocks:
@@ -1903,7 +1903,7 @@ class TestSharedStorageLocalBehavior:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             for block in m.transformer_blocks:
@@ -1931,7 +1931,7 @@ class TestSharedStorageLocalBehavior:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             for block in m.transformer_blocks:
@@ -1959,7 +1959,7 @@ class TestSharedStorageLocalBehavior:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             assert m.embed.weight is m.head.weight
@@ -1989,14 +1989,14 @@ class TestDirectParentStateHandled:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             assert m.scale_shift.is_pinned()
         finally:
             strategy.deactivate()
 
-    def test_nested_blocks_attr_with_direct_root_param(self) -> None:
+    def test_nested_block_paths_with_direct_root_param(self) -> None:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -2009,7 +2009,7 @@ class TestDirectParentStateHandled:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["encoder.blocks"],
+            block_paths=["encoder.blocks"],
         )
         try:
             assert m.root_param.is_pinned()
@@ -2028,7 +2028,7 @@ class TestDirectParentStateHandled:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             assert m.table.is_pinned()
@@ -2083,7 +2083,7 @@ class TestBlockBuffersPinned:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             for block in m.transformer_blocks:
@@ -2114,7 +2114,7 @@ class TestBlockBuffersPinned:
         m = M()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             for block in m.transformer_blocks:
@@ -2128,7 +2128,7 @@ class TestBlockBuffersPinned:
         m = self._make_tied_buffer_model(device="cuda")
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             for block in m.transformer_blocks:
@@ -2373,7 +2373,7 @@ class TestMultiComponentCleanup:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         original_deactivate = PinnedComponent.deactivate
 
@@ -2473,7 +2473,7 @@ class TestStreamedNameSelection:
         model = BufferModel()
         strategy = _make_model_offloader(
             model,
-            blocks_attr=["blocks"],
+            block_paths=["blocks"],
         )
         try:
             assert strategy.param_names == frozenset(
@@ -2549,7 +2549,7 @@ class TestStreamedNameSelection:
         m = _make_block_model()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             streamer = streamed_components(strategy)[0]
@@ -2613,7 +2613,7 @@ class TestMixedGradTieDetection:
         with pytest.raises(ValueError, match="mixed requires_grad"):
             _make_model_offloader(
                 m,
-                blocks_attr=["transformer_blocks"],
+                block_paths=["transformer_blocks"],
             )
 
     def test_all_trainable_distinct_parameter_tie_constructs(self) -> None:
@@ -2638,7 +2638,7 @@ class TestMixedGradTieDetection:
             p.requires_grad = False
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         strategy.deactivate()
 
@@ -2670,7 +2670,7 @@ class TestMixedGradTieDetection:
         optimizer = torch.optim.SGD([a, b], lr=0.1)
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             assert m.alias_a.weight is a
@@ -2721,7 +2721,7 @@ class TestMixedGradTieDetection:
         m = M()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         assert m.transformer_blocks[0]._parameters["a"] is shared
         assert m.transformer_blocks[1]._parameters["a"] is shared
@@ -2757,7 +2757,7 @@ class TestMixedGradTieDetection:
 
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
 
@@ -2783,7 +2783,7 @@ class TestMixedGradTieDetection:
         m = M()
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
         try:
@@ -2831,7 +2831,7 @@ class TestLoRAInBlockRouting:
         m = M([self._make_lora_block() for _ in range(2)])
         strat = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
         try:
@@ -2856,7 +2856,7 @@ class TestLoRAInBlockRouting:
         m = M([self._make_lora_block() for _ in range(2)])
         strat = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             streamers = streamed_components(strat)
@@ -2898,7 +2898,7 @@ class TestLoRAInBlockRouting:
 
         strat = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             pinned = pinned_component(strat)
@@ -2962,7 +2962,7 @@ class TestTrainingWithCheckpointing:
         # four blocks. That reuse is what checkpointing must survive.
         offloader = _make_model_offloader(
             m_streamed,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
         try:
@@ -3024,7 +3024,7 @@ class TestTrainingWithCheckpointing:
         m = M(8, 3)
         offloader = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
         opt = torch.optim.AdamW(m.parameters(), lr=0.1)
@@ -3068,7 +3068,7 @@ class TestTrainingWithCheckpointing:
         m = _make_trainable_block_model(num_blocks=4, width=8)
         offloader = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             with activated_model(offloader, "cuda") as gpu_model:
@@ -3094,7 +3094,7 @@ def _make_offloader_for_warning_test(model: nn.Module) -> ModelOffloader:
     """
     return _make_model_offloader(
         model,
-        blocks_attr=["transformer_blocks"],
+        block_paths=["transformer_blocks"],
     )
 
 
@@ -3151,7 +3151,7 @@ class TestStreamedComponentActivateTwice:
         m = _make_block_model(num_blocks=4)
         offloader = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             offloader.activate("cuda")
@@ -3203,7 +3203,7 @@ class TestInBlockTrainableStreamingEndToEnd:
 
         offloader = _make_model_offloader(
             m_streamed,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
         try:
@@ -3261,7 +3261,7 @@ class TestInBlockTrainableStreamingEndToEnd:
 
         offloader = _make_model_offloader(
             m_offloaded,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         try:
             with activated_model(offloader, "cuda") as gpu_model:
@@ -3317,7 +3317,7 @@ class TestInBlockTrainableStreamingEndToEnd:
 
         offloader = _make_model_offloader(
             m_streamed,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
         try:
@@ -3357,7 +3357,7 @@ class TestInBlockTrainableStreamingEndToEnd:
 
         offloader = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
         try:
@@ -3397,7 +3397,7 @@ class TestInBlockTrainableStreamingEndToEnd:
 
         offloader = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
         try:
@@ -3445,7 +3445,7 @@ class TestRevisedDataOnlyDesign:
 
         offloader = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
         with activated_model(offloader, "cuda") as gpu_model:
@@ -3498,7 +3498,7 @@ class TestRevisedDataOnlyDesign:
 
         offloader = _make_model_offloader(
             m_streamed,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
 
@@ -3537,7 +3537,7 @@ class TestRevisedDataOnlyDesign:
 
         offloader = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
         try:
@@ -3570,7 +3570,7 @@ class TestRevisedDataOnlyDesign:
 
         offloader = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
         sentinel = RuntimeError("simulated optimizer.step failure")
@@ -3627,7 +3627,7 @@ class TestRevisedDataOnlyDesign:
 
         offloader = _make_model_offloader(
             m_streamed,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
         try:
@@ -3686,7 +3686,7 @@ class TestRevisedDataOnlyDesign:
 
         offloader = _make_model_offloader(
             m_streamed,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
         )
         try:

@@ -572,7 +572,7 @@ class TestPiperConvRotInt8Adapter:
 
         offloader = ModelOffloader.from_module(
             model,
-            blocks_attr=["blocks"],
+            block_paths=["blocks"],
         )
         try:
             inputs = torch.randn(
@@ -629,7 +629,7 @@ class TestPiperConvRotInt8Adapter:
                 "blocks.0.lora_B.weight": torch.randn(64, 4),
             }
         )
-        offloader = ModelOffloader.from_module(model, blocks_attr=["blocks"])
+        offloader = ModelOffloader.from_module(model, block_paths=["blocks"])
 
         samples: list[torch.Tensor] = []
         for _ in range(2):

@@ -41,12 +41,12 @@ class _BlockModel(nn.Module):
 def _make_offloader(
     model: nn.Module,
     *,
-    blocks_attr: list[str] | None = None,
+    block_paths: list[str] | None = None,
     block_compile: BlockCompileConfig | None = None,
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
-        blocks_attr=["blocks"] if blocks_attr is None else blocks_attr,
+        block_paths=["blocks"] if block_paths is None else block_paths,
         block_compile=block_compile,
     )
 
