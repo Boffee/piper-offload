@@ -94,7 +94,7 @@ This library gives you:
 | Situation | Use |
 |---|---|
 | Most application code, especially multiple models or repeated calls | Use **`ModelCache`** with **`ModelSpec`** |
-| Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., blocks_attr=...)`** for automatic block streaming |
+| Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., block_paths=...)`** for automatic block streaming |
 | LoRA adapters reused across calls | Pass **`LoRASpec`** entries through **`ModelCache.use()`** |
 | Low-level/manual lifecycle for one model | Use **`ModelOffloader.from_module(model)`** directly |
 | Component or resource development | Use the lower-level store/binding protocols and component stores directly |
@@ -142,14 +142,14 @@ model_spec = ModelSpec(
     key="main-adopted",
     estimated_cache_bytes=12 * 1024**3,
     factory=build_my_model,
-    blocks_attr=("transformer_blocks",),
+    block_paths=("transformer_blocks",),
     host_backing="adopt",
 )
 
 # The same option exists on the low-level API.
 offload = ModelOffloader.from_module(
     model,
-    blocks_attr=("transformer_blocks",),
+    block_paths=("transformer_blocks",),
     host_backing="adopt",
 )
 ```
@@ -233,12 +233,12 @@ import torch
 from piper_offload import ModelOffloader
 
 # Construction pins and binds once; cache_bytes is final immediately.
-# blocks_attr selects what streams.
+# block_paths selects what streams.
 offload = ModelOffloader.from_module(
     model,
-    blocks_attr=["transformer_blocks"],  # path(s) to the nn.ModuleList
-    prefix_attr=["token_refiner", "proj_in"],
-    suffix_attr=["norm_out", "proj_out"],
+    block_paths=["transformer_blocks"],  # path(s) to the nn.ModuleList
+    prefix_paths=["token_refiner", "proj_in"],
+    suffix_paths=["norm_out", "proj_out"],
 )
 device = torch.device("cuda")
 
@@ -255,18 +255,18 @@ Ordinary streaming owns one active block and one asynchronous lookahead target.
 That fixed two-target window overlaps the next whole-block copy without
 retaining blocks that a sequential traversal will reload anyway. Direction
 changes and iteration wraparound are detected internally. Streaming itself is
-selected by `blocks_attr`; with no `blocks_attr` (the default) nothing streams —
+selected by `block_paths`; with no `block_paths` (the default) nothing streams —
 the whole model is one bulk-pinned component that activation copies to the GPU.
 For heterogeneous block lists, execution still limits concurrency to the active
 and lookahead blocks, while the morphing pool may park one reusable target per
 distinct tensor-layout signature.
 
-`prefix_attr` and `suffix_attr` are optional dotted paths to modules whose
+`prefix_paths` and `suffix_paths` are optional dotted paths to modules whose
 frozen parameters and buffers should be CUDA-resident only before or after the
 central streamed block span. Unselected state, all trainable state, and state
 whose storage is shared across the resident/prefix/suffix scopes remains
 resident for the complete activation. Block lists nested under a prefix or
-suffix path belong to that scope; the remaining `blocks_attr` groups define the
+suffix path belong to that scope; the remaining `block_paths` groups define the
 central span. This allows, for example, a streamed token refiner inside the
 prefix without making it the point where the prefix is evicted. Prefix and
 suffix copies use the same pinned component and LoRA-merge machinery as
@@ -298,7 +298,7 @@ from piper_kernels.linear.convrot import convrot_int8_compile_options
 
 offload = ModelOffloader.from_module(
     model,
-    blocks_attr=["transformer_blocks"],
+    block_paths=["transformer_blocks"],
     block_compile=BlockCompileConfig(
         dynamic=True,
         fullgraph=False,
@@ -308,8 +308,8 @@ offload = ModelOffloader.from_module(
 ```
 
 `block_compile=None` (the default) preserves eager behavior. One configuration
-applies to every `blocks_attr` group, and supplying a compile configuration
-without `blocks_attr` raises. The backend remains fixed to Inductor. Optional
+applies to every `block_paths` group, and supplying a compile configuration
+without `block_paths` raises. The backend remains fixed to Inductor. Optional
 backend settings can be supplied through `options`; the mapping is copied for
 each block before it is forwarded to `torch.compile`. This is also the boundary
 for compiler extensions such as Piper Kernels' ConvRot preparation-sharing and
@@ -343,7 +343,7 @@ targets with one shared parameter target:
 ```python
 offload = ModelOffloader.from_module(
     model,
-    blocks_attr=["transformer_blocks"],
+    block_paths=["transformer_blocks"],
     block_compile=BlockCompileConfig(rolling=True, fullgraph=True),
 )
 
@@ -407,7 +407,7 @@ streaming in-block trainable weights:
 ```python
 offload = ModelOffloader.from_module(
     model,
-    blocks_attr=["transformer_blocks"],
+    block_paths=["transformer_blocks"],
     stream_trainable_weights=True,
 )
 ```
@@ -464,7 +464,7 @@ from safetensors.torch import load_file
 
 offload = ModelOffloader.from_module(
     model,
-    blocks_attr=["transformer_blocks"],
+    block_paths=["transformer_blocks"],
     # Default: stream_trainable_weights=False
 )
 device = torch.device("cuda")
@@ -618,7 +618,7 @@ compatibility.
 
 ### Heterogeneous block lists
 
-`blocks_attr` accepts a list of dotted paths for models with
+`block_paths` accepts a list of dotted paths for models with
 multiple kinds of blocks (e.g. Flux's `transformer_blocks` +
 `single_transformer_blocks`). Each path becomes its own streaming
 group with its own target pool. Blocks within a group must share parameter and
@@ -630,7 +630,7 @@ reusable targets by those layouts. For bespoke grouping, compose
 ```python
 offload = ModelOffloader.from_module(
     model,
-    blocks_attr=["transformer_blocks", "single_transformer_blocks"],
+    block_paths=["transformer_blocks", "single_transformer_blocks"],
 )
 ```
 
@@ -669,7 +669,7 @@ from piper_offload import ModelOffloader
 
 offload = ModelOffloader.from_module(
     model,
-    blocks_attr=["transformer_blocks"],
+    block_paths=["transformer_blocks"],
 )
 device = torch.device("cuda")
 
@@ -748,7 +748,7 @@ diffusion_model = ModelSpec(
     key="diffusion_model",
     estimated_cache_bytes=24 * 1024**3,
     factory=build_diffusion_model,
-    blocks_attr=("transformer_blocks",),
+    block_paths=("transformer_blocks",),
 )
 style_lora = LoRASpec(
     key="style-lora",
@@ -1037,7 +1037,7 @@ within one streamed block and within pinned state, including the standard
 tied input-embedding/output-head pattern. It is unsupported across offload
 ownership boundaries: between streamed and pinned state, or between distinct
 streamed blocks or block groups. `ModelOffloader` does not prevalidate these
-unusual layouts; omit `blocks_attr` and use whole-model offloading if that
+unusual layouts; omit `block_paths` and use whole-model offloading if that
 sharing must be preserved.
 
 ## Quantized weight support

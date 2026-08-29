@@ -109,12 +109,12 @@ def _quanto_absmax_oracle(
 def _make_model_offloader(
     model: nn.Module,
     *,
-    blocks_attr: list[str] = [],
+    block_paths: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
-        blocks_attr=blocks_attr,
+        block_paths=block_paths,
         stream_trainable_weights=stream_trainable_weights,
     )
 
@@ -345,7 +345,7 @@ def _expected_routed_output(
 
 def _make_strategy(model: nn.Module) -> ModelOffloader:
     """Shorthand for constructing the strategy."""
-    return _make_model_offloader(model, blocks_attr=["transformer_blocks"])
+    return _make_model_offloader(model, block_paths=["transformer_blocks"])
 
 
 def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
@@ -1073,9 +1073,9 @@ class TestLifecycle:
 
         strategy = ModelOffloader.from_module(
             model,
-            blocks_attr=("transformer_blocks",),
-            prefix_attr=("embed",),
-            suffix_attr=("head",),
+            block_paths=("transformer_blocks",),
+            prefix_paths=("embed",),
+            suffix_paths=("head",),
         )
         try:
             strategy.activate(
@@ -1238,7 +1238,7 @@ class TestMergeCorrectness:
         ]
         strategy = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"] if streamed else [],
+            block_paths=["transformer_blocks"] if streamed else [],
         )
         _request_loras(strategy, loras, mode="merge")
         _activate(strategy, "cuda")
@@ -3755,7 +3755,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         # Build a LoRA targeting attn.weight (LinearLike, not nn.Linear).
         lora = _make_lora(num_blocks=2, dim=16, seed=3)
@@ -3808,7 +3808,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         lora = _make_lora(num_blocks=2, dim=16, seed=99)
         _request_loras(s, [(lora, 1.0)], mode="routed")
@@ -3844,7 +3844,7 @@ class TestRoutedMode:
 
         s = _make_model_offloader(
             model,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         # Build a LoRA that targets either alias of the tied weight.
         sd = {
@@ -3904,7 +3904,7 @@ class TestRoutedMode:
         loras = [(_make_lora(num_blocks=2, dim=16, seed=55), 0.5)]
         s = _make_model_offloader(
             m,
-            blocks_attr=["transformer_blocks"],
+            block_paths=["transformer_blocks"],
         )
         _request_loras(s, loras, mode="routed")
         _activate(s, "cuda")
@@ -3948,7 +3948,7 @@ class TestRoutedStaging:
         x = torch.randn(3, 16)
         lora1 = _make_lora(num_blocks=1, dim=16, seed=1)
         lora2 = _make_lora(num_blocks=1, dim=16, seed=2)
-        s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
+        s = _make_model_offloader(m, block_paths=["transformer_blocks"])
 
         def routed_forward(
             loras: list[tuple[LoRA, float]],
@@ -4090,7 +4090,7 @@ class TestRoutedStaging:
             "transformer_blocks.1.attn.base_layer.weight",
         }
 
-        s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
+        s = _make_model_offloader(m, block_paths=["transformer_blocks"])
         _request_loras(s, [(lora, 0.5)], mode="routed")
         x = torch.randn(2, 16)
         _activate(s, torch.device("cpu"))
@@ -4112,7 +4112,7 @@ class TestRoutedStaging:
     def test_deactivate_removes_staging_hooks(self) -> None:
         m = _make_bf16_model(num_blocks=2, dim=16)
         lora = _make_lora(num_blocks=2, dim=16, seed=4)
-        s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
+        s = _make_model_offloader(m, block_paths=["transformer_blocks"])
 
         _request_loras(s, [(lora, 1.0)], mode="routed")
         _activate(s, torch.device("cpu"))
@@ -4139,7 +4139,7 @@ class TestRoutedStaging:
             state_dict=_make_lora_sd(num_blocks=2, dim=16, seed=7),
         )
         x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
-        s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
+        s = _make_model_offloader(m, block_paths=["transformer_blocks"])
         _request_loras(s, [(lora, 0.5)], mode="merge")
         _activate(s, "cuda")
         try:
@@ -4171,7 +4171,7 @@ class TestRoutedStaging:
             "transformer_blocks.0.absent.lora_B.weight": torch.randn(16, 4),
         }
         bad = LoRA.from_state_dict(state_dict=sd)
-        s = _make_model_offloader(m, blocks_attr=["transformer_blocks"])
+        s = _make_model_offloader(m, block_paths=["transformer_blocks"])
         _request_loras(s, [(bad, 1.0)], mode="routed")
 
         with pytest.raises(ValueError, match="not managed"):

@@ -98,12 +98,12 @@ def _replace_act_scale(t: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 def _make_model_offloader(
     model: nn.Module,
     *,
-    blocks_attr: list[str] = [],
+    block_paths: list[str] = [],
     block_compile: BlockCompileConfig | None = None,
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
-        blocks_attr=blocks_attr,
+        block_paths=block_paths,
         block_compile=block_compile,
     )
 
@@ -708,7 +708,7 @@ class TestStaticFloat8Adapter:
         for mode in ("merge", "routed"):
             model = make_model()
             calibrated_scale = model.blocks[0].weight.data.act_quant_scale.clone()
-            offloader = _make_model_offloader(model, blocks_attr=["blocks"])
+            offloader = _make_model_offloader(model, block_paths=["blocks"])
             try:
                 x = torch.randn(2, 8, 64, dtype=torch.bfloat16, device="cuda")
                 with activated_model(
@@ -765,7 +765,7 @@ class TestStaticFloat8Adapter:
         eager_model = M(weights)
         eager_offloader = _make_model_offloader(
             eager_model,
-            blocks_attr=["blocks"],
+            block_paths=["blocks"],
         )
         try:
             with activated_model(eager_offloader, "cuda"):
@@ -777,7 +777,7 @@ class TestStaticFloat8Adapter:
         compiled_model = M(weights)
         compiled_offloader = _make_model_offloader(
             compiled_model,
-            blocks_attr=["blocks"],
+            block_paths=["blocks"],
             block_compile=BlockCompileConfig(),
         )
         try:

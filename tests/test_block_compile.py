@@ -116,12 +116,12 @@ class TestBlockCompileConfig:
                 block_compile=BlockCompileConfig(rolling=True),
             )
 
-    def test_compile_requires_blocks_attr(self) -> None:
+    def test_compile_requires_block_paths(self) -> None:
         model = nn.Linear(4, 4, bias=False)
 
         with pytest.raises(
             ValueError,
-            match="block_compile requires at least one blocks_attr",
+            match="block_compile requires at least one block path",
         ):
             ModelOffloader.from_module(
                 model,
@@ -144,7 +144,7 @@ class TestBlockCompileConfig:
             key="compiled",
             estimated_cache_bytes=1024,
             factory=_BlockModel,
-            blocks_attr=("blocks",),
+            block_paths=("blocks",),
             block_compile=config,
         )
 
@@ -250,7 +250,7 @@ class TestCompiledForwardConstruction:
 
         offloader = _make_offloader(
             model,
-            blocks_attr=["first_blocks", "second_blocks"],
+            block_paths=["first_blocks", "second_blocks"],
             block_compile=config,
         )
         try:
@@ -276,9 +276,9 @@ class TestCompiledForwardLifecycle:
             expected = model(value).cuda()
         offloader = ModelOffloader.from_module(
             model,
-            blocks_attr=("blocks",),
-            prefix_attr=("prefix",),
-            suffix_attr=("suffix",),
+            block_paths=("blocks",),
+            prefix_paths=("prefix",),
+            suffix_paths=("suffix",),
             block_compile=BlockCompileConfig(
                 dynamic=False,
                 fullgraph=True,
@@ -581,7 +581,7 @@ class TestCompiledLoRA:
         )
         offloader = _make_offloader(
             model,
-            blocks_attr=["first_blocks", "second_blocks"],
+            block_paths=["first_blocks", "second_blocks"],
             block_compile=BlockCompileConfig(),
         )
         x = torch.randn(2, 8, device="cuda")

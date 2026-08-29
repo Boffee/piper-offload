@@ -107,7 +107,7 @@ def _run(
     model = _Model(blocks=args.blocks, width=args.width, dtype=dtype)
     offloader = ModelOffloader.from_module(
         model,
-        blocks_attr=("blocks",),
+        block_paths=("blocks",),
         block_compile=BlockCompileConfig(
             rolling=rolling,
             fullgraph=True,

@@ -27,12 +27,12 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def _make_model_offloader(
     model: nn.Module,
     *,
-    blocks_attr: list[str] = [],
+    block_paths: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
-        blocks_attr=blocks_attr,
+        block_paths=block_paths,
         stream_trainable_weights=stream_trainable_weights,
     )
 
@@ -632,7 +632,7 @@ class TestBnb8bitAdapter:
 
         offloader = _make_model_offloader(
             model,
-            blocks_attr=["blocks"],
+            block_paths=["blocks"],
         )
         try:
             for _ in range(3):

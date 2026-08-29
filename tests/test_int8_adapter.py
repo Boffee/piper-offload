@@ -26,12 +26,12 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def _make_model_offloader(
     model: nn.Module,
     *,
-    blocks_attr: list[str] = [],
+    block_paths: list[str] = [],
     stream_trainable_weights: bool = False,
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
-        blocks_attr=blocks_attr,
+        block_paths=block_paths,
         stream_trainable_weights=stream_trainable_weights,
     )
 
@@ -1272,7 +1272,7 @@ class TestInt8Adapter:
             )
         offloader = _make_model_offloader(
             model,
-            blocks_attr=["blocks"],
+            block_paths=["blocks"],
         )
         lora = LoRA.from_state_dict(
             state_dict={
@@ -1345,7 +1345,7 @@ class TestInt8Adapter:
 
         offloader = _make_model_offloader(
             model,
-            blocks_attr=["blocks"],
+            block_paths=["blocks"],
         )
         try:
             x = torch.randn(8, 32, dtype=torch.bfloat16, device="cuda")

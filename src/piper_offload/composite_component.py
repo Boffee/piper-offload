@@ -23,7 +23,7 @@ def _is_within(path: str, parent: str) -> bool:
     return path == parent or path.startswith(f"{parent}.")
 
 
-def _resolve_attr_state(
+def _resolve_path_state(
     model: nn.Module,
     paths: Sequence[str],
     *,
@@ -56,14 +56,14 @@ def _resolve_attr_state(
 
 
 def _validate_disjoint_scopes(
-    prefix_attr: Sequence[str],
-    suffix_attr: Sequence[str],
+    prefix_paths: Sequence[str],
+    suffix_paths: Sequence[str],
 ) -> None:
-    for prefix in prefix_attr:
-        for suffix in suffix_attr:
+    for prefix in prefix_paths:
+        for suffix in suffix_paths:
             if _is_within(prefix, suffix) or _is_within(suffix, prefix):
                 raise ValueError(
-                    "prefix_attr and suffix_attr must not overlap; "
+                    "prefix_paths and suffix_paths must not overlap; "
                     f"got {prefix!r} and {suffix!r}"
                 )
 
@@ -424,52 +424,52 @@ class CompositeComponentStore:
         cls,
         model: nn.Module,
         *,
-        blocks_attr: Sequence[str] = (),
-        prefix_attr: Sequence[str] = (),
-        suffix_attr: Sequence[str] = (),
+        block_paths: Sequence[str] = (),
+        prefix_paths: Sequence[str] = (),
+        suffix_paths: Sequence[str] = (),
         stream_trainable_weights: bool = False,
         host_backing: HostBacking = "pinned",
     ) -> Self:
         backing = validate_host_backing(host_backing)
-        blocks_attr = tuple(blocks_attr)
-        prefix_attr, prefix_params, prefix_buffers = _resolve_attr_state(
+        block_paths = tuple(block_paths)
+        prefix_paths, prefix_params, prefix_buffers = _resolve_path_state(
             model,
-            prefix_attr,
-            argument="prefix_attr",
+            prefix_paths,
+            argument="prefix_paths",
         )
-        suffix_attr, suffix_params, suffix_buffers = _resolve_attr_state(
+        suffix_paths, suffix_params, suffix_buffers = _resolve_path_state(
             model,
-            suffix_attr,
-            argument="suffix_attr",
+            suffix_paths,
+            argument="suffix_paths",
         )
         _validate_disjoint_scopes(
-            prefix_attr,
-            suffix_attr,
+            prefix_paths,
+            suffix_paths,
         )
 
-        has_boundary_state = bool(prefix_attr or suffix_attr)
-        if has_boundary_state and not blocks_attr:
+        has_boundary_state = bool(prefix_paths or suffix_paths)
+        if has_boundary_state and not block_paths:
             raise ValueError(
-                "prefix_attr and suffix_attr require at least one blocks_attr path"
+                "prefix_paths and suffix_paths require at least one block path"
             )
-        for scope in (*prefix_attr, *suffix_attr):
-            for blocks_path in blocks_attr:
+        for scope in (*prefix_paths, *suffix_paths):
+            for blocks_path in block_paths:
                 if scope != blocks_path and _is_within(scope, blocks_path):
                     raise ValueError(
                         f"boundary path {scope!r} cannot be nested inside "
-                        f"blocks_attr path {blocks_path!r}"
+                        f"block path {blocks_path!r}"
                     )
         central_streamed_indices = tuple(
             idx
-            for idx, blocks_path in enumerate(blocks_attr)
+            for idx, blocks_path in enumerate(block_paths)
             if not any(
                 _is_within(blocks_path, scope)
-                for scope in (*prefix_attr, *suffix_attr)
+                for scope in (*prefix_paths, *suffix_paths)
             )
         )
         if has_boundary_state and not central_streamed_indices:
             raise ValueError(
-                "prefix_attr and suffix_attr leave no central blocks_attr group"
+                "prefix_paths and suffix_paths leave no central block group"
             )
 
         all_params_by_name = dict(model.named_parameters(remove_duplicate=False))
@@ -509,7 +509,7 @@ class CompositeComponentStore:
                 stream_trainable_weights=stream_trainable_weights,
                 host_backing=backing,
             )
-            for blocks_path in blocks_attr
+            for blocks_path in block_paths
         )
         streamed_params = {n for s in streamed_stores for n in s.param_names}
         streamed_buffers = {n for s in streamed_stores for n in s.buffer_names}

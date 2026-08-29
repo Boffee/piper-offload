@@ -25,10 +25,10 @@ class ModelSpec[M: nn.Module]:
 
     ``factory`` runs once to construct the cached :class:`ModelOffloader`.
     Every lease reuses that same model runtime sequentially; overlapping uses
-    are rejected by the offloader. ``prefix_attr`` and ``suffix_attr`` select
+    are rejected by the offloader. ``prefix_paths`` and ``suffix_paths`` select
     frozen module state that is resident only around the central streamed
     block span. ``block_compile`` is an opt-in construction policy for every
-    streamed group named by ``blocks_attr``. ``host_backing`` selects pinned
+    streamed group named by ``block_paths``. ``host_backing`` selects pinned
     copies (the default) or strict zero-copy adoption of existing CPU model
     backing.
     """
@@ -36,9 +36,9 @@ class ModelSpec[M: nn.Module]:
     key: str
     estimated_cache_bytes: int
     factory: Callable[[], M]
-    blocks_attr: tuple[str, ...] = ()
-    prefix_attr: tuple[str, ...] = ()
-    suffix_attr: tuple[str, ...] = ()
+    block_paths: tuple[str, ...] = ()
+    prefix_paths: tuple[str, ...] = ()
+    suffix_paths: tuple[str, ...] = ()
     stream_trainable_weights: bool = False
     block_compile: BlockCompileConfig | None = None
     host_backing: HostBacking = "pinned"
@@ -47,9 +47,9 @@ class ModelSpec[M: nn.Module]:
         """Build, pin, and bind the cached model runtime."""
         return ModelOffloader.from_module(
             self.factory(),
-            blocks_attr=self.blocks_attr,
-            prefix_attr=self.prefix_attr,
-            suffix_attr=self.suffix_attr,
+            block_paths=self.block_paths,
+            prefix_paths=self.prefix_paths,
+            suffix_paths=self.suffix_paths,
             stream_trainable_weights=self.stream_trainable_weights,
             block_compile=self.block_compile,
             host_backing=self.host_backing,

@@ -297,7 +297,7 @@ class TestDTensorAdapter:
                 self.blocks = nn.ModuleList(blocks)
 
         net = Net([Block(_dtensor_weight(tp_mesh)[0]), Block(_dtensor_weight(tp_mesh)[0])])
-        pw = ModelOffloader.from_module(net, blocks_attr=["blocks"])
+        pw = ModelOffloader.from_module(net, block_paths=["blocks"])
         try:
             # resting: a DTensor on a CPU mesh (local on the host)
             resting = net.blocks[0].weight.data

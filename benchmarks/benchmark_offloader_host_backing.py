@@ -118,7 +118,7 @@ def _build_offloader(
     started = time.perf_counter()
     offloader = ModelOffloader.from_module(
         model,
-        blocks_attr=("blocks",),
+        block_paths=("blocks",),
         host_backing=mode,
     )
     construction_ms = (time.perf_counter() - started) * 1000.0

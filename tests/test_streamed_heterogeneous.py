@@ -76,7 +76,7 @@ def test_heterogeneous_block_list_builds_and_partitions_signatures() -> None:
     # differs from block 0 ...") right here.
     offloader = ModelOffloader.from_module(
         model,
-        blocks_attr=["blocks"],
+        block_paths=["blocks"],
     )
 
     signatures = _streamed_component(offloader)._block_runtime._signatures
@@ -92,7 +92,7 @@ def test_signature_distinguishes_each_dtype() -> None:
     model = _frozen_model(16, [torch.float32, torch.float16, torch.bfloat16])
     offloader = ModelOffloader.from_module(
         model,
-        blocks_attr=["blocks"],
+        block_paths=["blocks"],
     )
     signatures = _streamed_component(offloader)._block_runtime._signatures
     assert len(set(signatures)) == 3
@@ -116,7 +116,7 @@ def test_cuda_streams_mixed_dtype_blocks_matches_reference() -> None:
 
     offloader = ModelOffloader.from_module(
         model,
-        blocks_attr=["blocks"],
+        block_paths=["blocks"],
     )
 
     with torch.no_grad(), activated_model(offloader, "cuda") as bound:
@@ -137,7 +137,7 @@ def test_cuda_morphing_pool_handles_repeated_iterations() -> None:
 
     offloader = ModelOffloader.from_module(
         model,
-        blocks_attr=["blocks"],
+        block_paths=["blocks"],
     )
 
     with torch.no_grad(), activated_model(offloader, "cuda") as bound:
@@ -206,7 +206,7 @@ def test_cuda_streams_mixed_quant_and_plain_blocks() -> None:
 
     offloader = ModelOffloader.from_module(
         model,
-        blocks_attr=["blocks"],
+        block_paths=["blocks"],
     )
     assert len(set(_streamed_component(offloader)._block_runtime._signatures)) == 2
 
