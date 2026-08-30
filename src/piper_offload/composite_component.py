@@ -25,10 +25,12 @@ class CompositeComponent:
         resident: PinnedComponent | None,
         streamed: Sequence[StreamedComponent],
         transient: Sequence[tuple[str, PinnedComponent]] = (),
+        transient_streamed: Sequence[StreamedComponent] = (),
     ) -> None:
         self._resident = resident
         self._transient = tuple(transient)
         self._streamed = tuple(streamed)
+        self._transient_streamed = tuple(transient_streamed)
         self._teardown_stack: contextlib.ExitStack | None = None
 
     @property
@@ -42,6 +44,10 @@ class CompositeComponent:
     @property
     def transient(self) -> tuple[tuple[str, PinnedComponent], ...]:
         return self._transient
+
+    @property
+    def transient_streamed(self) -> tuple[StreamedComponent, ...]:
+        return self._transient_streamed
 
     def _components(self) -> Iterator[PinnedComponent | StreamedComponent]:
         if self._resident is not None:
@@ -130,6 +136,7 @@ class CompositeComponentStore:
 
     resident_store: PinnedComponentStore | None
     streamed_stores: tuple[StreamedComponentStore, ...]
+    transient_streamed_stores: tuple[StreamedComponentStore, ...] = ()
     transient_stores: tuple[tuple[str, PinnedComponentStore], ...] = ()
 
     def __post_init__(self) -> None:
@@ -137,6 +144,7 @@ class CompositeComponentStore:
             self.resident_store is None
             and not self.transient_stores
             and not self.streamed_stores
+            and not self.transient_streamed_stores
         ):
             raise ValueError(
                 "Offloading requires at least one parameter, registered "
@@ -151,6 +159,7 @@ class CompositeComponentStore:
         for _path, store in self.transient_stores:
             yield store
         yield from self.streamed_stores
+        yield from self.transient_streamed_stores
 
     @classmethod
     def from_module(
@@ -158,25 +167,43 @@ class CompositeComponentStore:
         model: nn.Module,
         *,
         block_paths: Sequence[str] = (),
+        transient_block_paths: Sequence[str] = (),
         transient_paths: Sequence[str] = (),
         stream_trainable_weights: bool = False,
         host_backing: HostBacking = "pinned",
     ) -> Self:
         backing = validate_host_backing(host_backing)
-        streamed_stores = tuple(
-            StreamedComponentStore.from_module(
+        persistent_paths = tuple(block_paths)
+        transient_streamed_paths = tuple(transient_block_paths)
+        overlap = set(persistent_paths) & set(transient_streamed_paths)
+        if overlap:
+            raise ValueError(
+                "block_paths and transient_block_paths must be disjoint; "
+                f"both contain {sorted(overlap)!r}."
+            )
+
+        def make_streamed_store(blocks_path: str) -> StreamedComponentStore:
+            return StreamedComponentStore.from_module(
                 model,
                 blocks_path=blocks_path,
                 stream_trainable_weights=stream_trainable_weights,
                 host_backing=backing,
             )
-            for blocks_path in block_paths
+
+        streamed_stores = tuple(
+            make_streamed_store(blocks_path)
+            for blocks_path in persistent_paths
         )
+        transient_streamed_stores = tuple(
+            make_streamed_store(blocks_path)
+            for blocks_path in transient_streamed_paths
+        )
+        all_streamed_stores = (*streamed_stores, *transient_streamed_stores)
         streamed_params = {
-            name for store in streamed_stores for name in store.param_names
+            name for store in all_streamed_stores for name in store.param_names
         }
         streamed_buffers = {
-            name for store in streamed_stores for name in store.buffer_names
+            name for store in all_streamed_stores for name in store.buffer_names
         }
         resident_params = parameter_names(model) - streamed_params
         resident_buffers = buffer_names(model) - streamed_buffers
@@ -218,6 +245,7 @@ class CompositeComponentStore:
         return cls(
             resident_store=resident_store,
             streamed_stores=streamed_stores,
+            transient_streamed_stores=transient_streamed_stores,
             transient_stores=tuple(transient_stores),
         )
 
@@ -234,7 +262,6 @@ class CompositeComponentStore:
         model: nn.Module,
         *,
         block_compile: BlockCompileConfig | None = None,
-        wraparound: bool = True,
     ) -> CompositeComponent:
         resident = self.resident_store.bind(model) if self.resident_store else None
         transient = tuple(
@@ -245,14 +272,23 @@ class CompositeComponentStore:
             store.bind(
                 model,
                 block_compile=block_compile,
-                wraparound=wraparound,
+                wraparound=True,
             )
             for store in self.streamed_stores
         )
+        transient_streamed = tuple(
+            store.bind(
+                model,
+                block_compile=block_compile,
+                wraparound=False,
+            )
+            for store in self.transient_streamed_stores
+        )
         return CompositeComponent(
             resident=resident,
-            streamed=streamed,
+            streamed=(*streamed, *transient_streamed),
             transient=transient,
+            transient_streamed=transient_streamed,
         )
 
 

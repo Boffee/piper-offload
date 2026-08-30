@@ -253,7 +253,7 @@ Ordinary streaming owns one active block and one asynchronous lookahead target.
 That fixed two-target window overlaps the next whole-block copy without
 retaining blocks that a sequential traversal will reload anyway. Direction
 changes and iteration wraparound are detected internally. Streaming itself is
-selected by `block_paths`; with no `block_paths` (the default) nothing streams —
+selected by `block_paths` and `transient_block_paths`; with both lists empty,
 the whole model is one bulk-pinned component that activation copies to the GPU.
 For heterogeneous block lists, execution still limits concurrency to the active
 and lookahead blocks, while the morphing pool may park one reusable target per
@@ -275,30 +275,31 @@ their traversals finish:
 ```python
 offload = ModelOffloader.from_module(
     model,
-    block_paths=["transformer_blocks"],
-    transient_streaming=True,
+    transient_block_paths=["transformer_blocks"],
     transient_paths=["input_embedder", "output_head"],
 )
 ```
 
 Each `transient_paths` module recursively owns a separate CUDA working set for
 its non-streamed state. Its successful forward releases that set
-immediately, before later model work. `transient_streaming=True` applies the
-same policy to every declared `block_paths` pool, releasing it after its final
-block. A successful root-model forward reacquires all released components for
-the next invocation. A conditionally skipped component remains acquired.
+immediately, before later model work. Every entry in `transient_block_paths` is a
+streamed block group whose pool releases after its final block. Ordinary
+`block_paths` pools remain resident for the activation. A successful root-model
+forward reacquires all released components for the next invocation. A
+conditionally skipped component remains acquired.
 
-Paths are deliberately narrow: the named module's own `forward` is its release
-boundary, so it cannot run again or have its state used later in the same root
-call. A skipped path simply remains acquired. `ModuleList`/`ModuleDict`
-containers are not expanded, and ModelOffloader does not inspect repeated
+The release boundaries are deliberately explicit. A `transient_block_paths`
+group releases after its final block and therefore cannot traverse that stack
+again later in the same root call. For `transient_paths`, the named module's
+own `forward` is the boundary, so its state cannot be used again afterward. A
+skipped path remains acquired. `ModuleList`/`ModuleDict` containers are not
+expanded for `transient_paths`, and ModelOffloader does not inspect repeated
 calls, functional parameter access, aliases across component boundaries, or
 autograd state. Paths must own disjoint state, and shared-storage aliases must
 not cross component boundaries; these guarantees belong to the caller. CPU
 activation remains eager and installs no scheduling hooks. Ordinary and
-rolling streaming use the same component-level acquire/release contract;
-both stop scheduling at the final block instead of filling block 0 immediately
-before release.
+rolling transient block groups both stop at the final block instead of filling
+block 0 immediately before release.
 
 ### Optional streamed-block compilation
 
@@ -321,7 +322,8 @@ offload = ModelOffloader.from_module(
 ```
 
 `block_compile=None` (the default) preserves eager behavior. One configuration
-applies to every `block_paths` group and has no effect when none are configured.
+applies to every `block_paths` and `transient_block_paths` group and has no
+effect when neither is configured.
 The backend remains fixed to Inductor. Optional
 backend settings can be supplied through `options`; the mapping is copied for
 each block before it is forwarded to `torch.compile`. This is also the boundary
@@ -633,10 +635,11 @@ compatibility.
 
 ### Heterogeneous block lists
 
-`block_paths` accepts a list of dotted paths for models with
+`block_paths` and `transient_block_paths` accept dotted paths for models with
 multiple kinds of blocks (e.g. Flux's `transformer_blocks` +
 `single_transformer_blocks`). Each path becomes its own streaming
-group with its own target pool. Blocks within a group must share parameter and
+group with its own target pool; the two lists are mutually exclusive. Blocks
+within a group must share parameter and
 buffer names plus trainability structure, but their shapes, dtypes, quantization
 formats, alias topology, and buffer layouts may differ. The morphing pool keys
 reusable targets by those layouts. For bespoke grouping, compose

@@ -26,21 +26,22 @@ class ModelSpec[M: nn.Module]:
     ``factory`` runs once to construct the cached :class:`ModelOffloader`.
     Every lease reuses that same model runtime sequentially; overlapping uses
     are rejected by the offloader. ``block_compile`` is an opt-in construction
-    policy for every streamed group named by ``block_paths``.
-    ``transient_streaming`` scopes those groups' CUDA pools to model-forward
-    execution. ``transient_paths`` gives named modules independent CUDA working
-    sets scoped to their forwards. ``host_backing`` selects pinned copies (the
-    default) or strict zero-copy adoption of existing CPU model backing.
+    policy for every streamed group named by ``block_paths`` or
+    ``transient_block_paths``. The latter release their CUDA pools after their
+    final blocks. ``transient_paths`` gives named modules independent CUDA
+    working sets scoped to their forwards. ``host_backing`` selects pinned
+    copies (the default) or strict zero-copy adoption of existing CPU model
+    backing.
     """
 
     key: str
     estimated_cache_bytes: int
     factory: Callable[[], M]
     block_paths: tuple[str, ...] = ()
+    transient_block_paths: tuple[str, ...] = ()
     stream_trainable_weights: bool = False
     block_compile: BlockCompileConfig | None = None
     host_backing: HostBacking = "pinned"
-    transient_streaming: bool = False
     transient_paths: tuple[str, ...] = ()
 
     def build_store(self) -> ModelOffloader:
@@ -48,10 +49,10 @@ class ModelSpec[M: nn.Module]:
         return ModelOffloader.from_module(
             self.factory(),
             block_paths=self.block_paths,
+            transient_block_paths=self.transient_block_paths,
             stream_trainable_weights=self.stream_trainable_weights,
             block_compile=self.block_compile,
             host_backing=self.host_backing,
-            transient_streaming=self.transient_streaming,
             transient_paths=self.transient_paths,
         )
 

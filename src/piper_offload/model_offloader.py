@@ -72,10 +72,11 @@ class ModelOffloader:
     overlapping activations. Concurrent use fails immediately with
     :class:`ModelRuntimeInUseError`.
 
-    When ``block_paths`` is omitted, CUDA activation bulk-copies every
-    managed parameter and buffer to CUDA. When it is set, CUDA activation
-    streams the selected block groups while other state remains resident unless
-    its module is selected by ``transient_paths``.
+    When both block-path lists are omitted, CUDA activation bulk-copies every
+    managed parameter and buffer to CUDA. When either list is set, CUDA
+    activation streams the groups selected by ``block_paths`` and
+    ``transient_block_paths`` while other state remains resident unless its
+    module is selected by ``transient_paths``.
     Supplying ``block_compile`` at construction opts streamed block forwards
     into Inductor during CUDA inference. CPU activation is pass-through over
     the host-backed module state and remains eager.
@@ -134,10 +135,6 @@ class ModelOffloader:
         and streamed offload components.
     cache_bytes:
         Stable host-cache bytes owned by the bound components.
-    transient_streaming:
-        Release each streamed CUDA pool after its final block and reacquire all
-        pools after the root model forward. This opt-in policy is intended for
-        inference and leaves CPU activation unchanged.
     """
 
     def __init__(
@@ -146,13 +143,11 @@ class ModelOffloader:
         *,
         composite: CompositeComponent,
         cache_bytes: int,
-        transient_streaming: bool = False,
     ) -> None:
         self._model = model
         self._active_device: torch.device | None = None
         self._composite = composite
         self._cache_bytes = cache_bytes
-        self._transient_streaming = transient_streaming
         self._activation_lock = threading.Lock()
         self._lora_hook_removers: list[Callable[[], None]] = []
         self._transient_hook_removers: list[Callable[[], None]] = []
@@ -163,10 +158,10 @@ class ModelOffloader:
         model: nn.Module,
         *,
         block_paths: Sequence[str] = (),
+        transient_block_paths: Sequence[str] = (),
         stream_trainable_weights: bool = False,
         block_compile: BlockCompileConfig | None = None,
         host_backing: HostBacking = "pinned",
-        transient_streaming: bool = False,
         transient_paths: Sequence[str] = (),
     ) -> Self:
         """Clone and bind ``model`` as one reusable cached runtime.
@@ -175,11 +170,11 @@ class ModelOffloader:
         Bound component instances retain the host state afterward, so the
         model is never rebound on subsequent uses.
         ``block_compile`` applies one forward-only compile policy to every
-        ``block_paths`` group and is unused when no block group is declared.
-        ``transient_streaming=True`` scopes each streamed CUDA pool from
-        activation or the preceding model completion through its final block;
-        the root model post-forward hook reacquires released pools for the next
-        call.
+        block group and is unused when no block group is declared. Groups named
+        by ``block_paths`` retain their CUDA pools for the activation. Groups
+        named by ``transient_block_paths`` release after their final blocks and
+        reacquire after the root model forward. These groups are inference-only
+        and must not be traversed again later in the same root forward.
         Each module named by ``transient_paths`` similarly owns a separate
         CUDA working set that releases after that module's forward.
         ``host_backing`` defaults to a pinned copy; ``"adopt"`` strictly
@@ -206,6 +201,7 @@ class ModelOffloader:
         composite_store = CompositeComponentStore.from_module(
             model,
             block_paths=block_paths,
+            transient_block_paths=transient_block_paths,
             transient_paths=transient_paths,
             stream_trainable_weights=stream_trainable_weights,
             host_backing=backing,
@@ -214,13 +210,11 @@ class ModelOffloader:
         composite = composite_store.bind(
             model,
             block_compile=block_compile,
-            wraparound=not transient_streaming,
         )
         return cls(
             model,
             composite=composite,
             cache_bytes=cache_bytes,
-            transient_streaming=transient_streaming,
         )
 
     # ------------------------------------------------------------------ API
@@ -383,13 +377,12 @@ class ModelOffloader:
             )
             components.append(component)
 
-        if self._transient_streaming:
-            for streamer in self._composite.streamed:
-                handle = streamer.blocks[-1].register_forward_hook(
-                    _release_after_forward_hook(streamer),
-                )
-                self._transient_hook_removers.append(handle.remove)
-                components.append(streamer)
+        for streamer in self._composite.transient_streamed:
+            handle = streamer.blocks[-1].register_forward_hook(
+                _release_after_forward_hook(streamer),
+            )
+            self._transient_hook_removers.append(handle.remove)
+            components.append(streamer)
 
         component_refs = tuple(weakref.ref(component) for component in components)
 
@@ -442,11 +435,6 @@ class ModelOffloader:
     def active_device(self) -> torch.device | None:
         """Currently active device, or ``None`` when inactive."""
         return self._active_device
-
-    @property
-    def transient_streaming(self) -> bool:
-        """Whether streamed CUDA pools follow model-forward lifetimes."""
-        return self._transient_streaming
 
     @property
     def param_names(self) -> frozenset[str]:
@@ -522,10 +510,7 @@ class ModelOffloader:
                 active_device.type == "cuda"
                 and (
                     bool(self._composite.transient)
-                    or (
-                        self._transient_streaming
-                        and bool(self._composite.streamed)
-                    )
+                    or bool(self._composite.transient_streamed)
                 )
             )
             activation_context = (

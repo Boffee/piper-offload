@@ -42,15 +42,15 @@ def _make_model_offloader(
     model: nn.Module,
     *,
     block_paths: Sequence[str] = (),
+    transient_block_paths: Sequence[str] = (),
     stream_trainable_weights: bool = False,
-    transient_streaming: bool = False,
     transient_paths: Sequence[str] = (),
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
         block_paths=block_paths,
+        transient_block_paths=transient_block_paths,
         stream_trainable_weights=stream_trainable_weights,
-        transient_streaming=transient_streaming,
         transient_paths=transient_paths,
     )
 
@@ -921,8 +921,7 @@ class TestTransientResidency:
         model = _make_block_model()
         offloader = _make_model_offloader(
             model,
-            block_paths=["transformer_blocks"],
-            transient_streaming=True,
+            transient_block_paths=["transformer_blocks"],
             transient_paths=["embed", "head"],
         )
         try:
@@ -941,8 +940,7 @@ class TestTransientResidency:
         model = _make_block_model(num_blocks=3)
         offloader = _make_model_offloader(
             model,
-            block_paths=["transformer_blocks"],
-            transient_streaming=True,
+            transient_block_paths=["transformer_blocks"],
             transient_paths=["embed", "head"],
         )
         components = dict(transient_components(offloader))
@@ -1007,8 +1005,7 @@ class TestTransientResidency:
         model = _make_block_model(num_blocks=3)
         offloader = _make_model_offloader(
             model,
-            block_paths=["transformer_blocks"],
-            transient_streaming=True,
+            transient_block_paths=["transformer_blocks"],
             transient_paths=["embed"],
         )
         embed = dict(transient_components(offloader))["embed"]
@@ -1021,7 +1018,9 @@ class TestTransientResidency:
                 assert runtime.acquired
 
     @CUDA
-    def test_multiple_paths_release_independently_and_reacquire(self) -> None:
+    def test_persistent_and_transient_block_paths_schedule_independently(
+        self,
+    ) -> None:
         class MultiPathModel(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -1046,8 +1045,8 @@ class TestTransientResidency:
         model = MultiPathModel()
         offloader = _make_model_offloader(
             model,
-            block_paths=["first_blocks", "second_blocks"],
-            transient_streaming=True,
+            block_paths=["first_blocks"],
+            transient_block_paths=["second_blocks"],
         )
         first, second = streamed_components(offloader)
         first_runtime = first._block_runtime
@@ -1066,11 +1065,10 @@ class TestTransientResidency:
         )
         try:
             with activated_model(offloader, "cuda"):
-                assert offloader.transient_streaming
                 with torch.inference_mode():
                     model(torch.randn(2, 8, device="cuda"))
-                assert second_entry_states == [(False, True)]
-                assert suffix_states == [(False, False)]
+                assert second_entry_states == [(True, True)]
+                assert suffix_states == [(True, False)]
                 assert first_runtime.acquired
                 assert second_runtime.acquired
 
@@ -1106,8 +1104,7 @@ class TestTransientResidency:
         model.head = FailingHead(8, 8, bias=False).requires_grad_(False)
         offloader = _make_model_offloader(
             model,
-            block_paths=["transformer_blocks"],
-            transient_streaming=True,
+            transient_block_paths=["transformer_blocks"],
             transient_paths=["embed"],
         )
         embed = dict(transient_components(offloader))["embed"]
@@ -1144,8 +1141,7 @@ class TestTransientResidency:
         model = _make_block_model(num_blocks=3)
         offloader = _make_model_offloader(
             model,
-            block_paths=["transformer_blocks"],
-            transient_streaming=True,
+            transient_block_paths=["transformer_blocks"],
             transient_paths=["embed"],
         )
         embed = dict(transient_components(offloader))["embed"]
@@ -1224,12 +1220,11 @@ class TestTraversalPrefetch:
         assert recorded == [1, 2, 3, 0], recorded
 
     @CUDA
-    def test_transient_streaming_stops_prefetch_at_final_block(self) -> None:
+    def test_transient_block_path_stops_prefetch_at_final_block(self) -> None:
         model = _make_block_model(num_blocks=4, width=8)
         offloader = _make_model_offloader(
             model,
-            block_paths=["transformer_blocks"],
-            transient_streaming=True,
+            transient_block_paths=["transformer_blocks"],
         )
         streamer = streamed_components(offloader)[0]
 
@@ -1395,6 +1390,18 @@ class TestValidation:
             assert not streamed_components(strategy)
         finally:
             strategy.deactivate()
+
+    def test_block_path_modes_must_be_disjoint(self) -> None:
+        model = _make_block_model()
+        with pytest.raises(
+            ValueError,
+            match="block_paths and transient_block_paths must be disjoint",
+        ):
+            _make_model_offloader(
+                model,
+                block_paths=["transformer_blocks"],
+                transient_block_paths=["transformer_blocks"],
+            )
 
     def test_block_paths_resolving_to_non_modulelist_raises(self) -> None:
         m = _make_block_model(num_blocks=4)

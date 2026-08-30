@@ -15,9 +15,10 @@ Lower-level resource bindings:
 
 - :class:`ModelOffloader` -- whole-model host-RAM bulk cache when
   created by ``ModelOffloader.from_module(model)``, or per-block streaming
-  when it is constructed with ``block_paths``. Streaming mode supports optional LoRA merge,
+  when it is constructed with ``block_paths`` or ``transient_block_paths``.
+  Streaming mode supports optional LoRA merge,
   opt-in forward-only block compilation for CUDA inference,
-  opt-in transient pool lifetimes, trainable-parameter support,
+  path-selected transient pool lifetimes, trainable-parameter support,
   CUDA prefetch on a secondary stream, and
   activation checkpointing through autograd backward when block compilation
   is disabled. By default,
@@ -83,8 +84,8 @@ from a fresh model instance.
   1. A resident :class:`PinnedComponent` for non-streamed state, including
      trainables skipped by block streaming.
   2. One :class:`PinnedComponent` per stateful path in ``transient_paths``.
-  3. One :class:`StreamedComponent` per path in ``block_paths`` when streaming
-     is configured.
+  3. One :class:`StreamedComponent` per path in ``block_paths`` or
+     ``transient_block_paths`` when streaming is configured.
 
 Optional LoRA merging is requested directly on :meth:`ModelOffloader.activate`
 and resolved by installing post-copy hooks for managed parameter targets.

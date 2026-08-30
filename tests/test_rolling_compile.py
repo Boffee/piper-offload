@@ -482,7 +482,7 @@ class TestRollingCompile:
         torch.testing.assert_close(second, first, rtol=0, atol=0)
 
     @CUDA
-    def test_transient_streaming_reacquires_rolling_target(self) -> None:
+    def test_transient_block_path_reacquires_rolling_target(self) -> None:
         torch.manual_seed(13)
         baseline_model = _BlockModel()
         rolling_model = copy.deepcopy(baseline_model)
@@ -497,7 +497,7 @@ class TestRollingCompile:
                 rolling=True,
                 fullgraph=True,
             ),
-            transient_streaming=True,
+            transient_block_paths=("blocks",),
         )
         runtime = streamed_components(offloader)[0]._rolling_runtime
         assert runtime is not None
@@ -522,7 +522,7 @@ class TestRollingCompile:
         torch.testing.assert_close(second, first, rtol=0, atol=0)
 
     @CUDA
-    def test_transient_streaming_stops_rollover_at_final_block(self) -> None:
+    def test_transient_block_path_stops_rollover_at_final_block(self) -> None:
         model = _BlockModel(num_blocks=3)
         offloader = _make_offloader(
             model,
@@ -531,7 +531,7 @@ class TestRollingCompile:
                 rolling=True,
                 fullgraph=True,
             ),
-            transient_streaming=True,
+            transient_block_paths=("blocks",),
         )
         runtime = streamed_components(offloader)[0]._rolling_runtime
         assert runtime is not None
@@ -569,7 +569,7 @@ class TestRollingCompile:
                 rolling=True,
                 fullgraph=True,
             ),
-            transient_streaming=True,
+            transient_block_paths=("blocks",),
         )
         with torch.inference_mode():
             with activated_model(offloader, "cuda"):

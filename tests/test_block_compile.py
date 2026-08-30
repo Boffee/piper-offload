@@ -127,16 +127,15 @@ class TestBlockCompileConfig:
             key="compiled",
             estimated_cache_bytes=1024,
             factory=_BlockModel,
-            block_paths=("blocks",),
+            transient_block_paths=("blocks",),
             block_compile=config,
-            transient_streaming=True,
         )
 
         offloader = spec.build_store()
         try:
             streamer = streamed_components(offloader)[0]
             assert streamer.block_compile is config
-            assert offloader.transient_streaming
+            assert offloader._composite.transient_streamed == (streamer,)
             assert len(spy.calls) == 2
             assert all(
                 kwargs
@@ -367,7 +366,7 @@ class TestCompiledForwardLifecycle:
             offloader.deactivate()
 
     @CUDA
-    def test_transient_streaming_retains_compiled_forwards(
+    def test_transient_block_path_retains_compiled_forwards(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -377,7 +376,7 @@ class TestCompiledForwardLifecycle:
         offloader = _make_offloader(
             model,
             block_compile=BlockCompileConfig(),
-            transient_streaming=True,
+            transient_block_paths=("blocks",),
         )
         streamer = streamed_components(offloader)[0]
         runtime = streamer._block_runtime

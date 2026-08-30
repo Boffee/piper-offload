@@ -110,15 +110,15 @@ def _make_model_offloader(
     model: nn.Module,
     *,
     block_paths: Sequence[str] = (),
+    transient_block_paths: Sequence[str] = (),
     stream_trainable_weights: bool = False,
-    transient_streaming: bool = False,
     transient_paths: Sequence[str] = (),
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
         block_paths=block_paths,
+        transient_block_paths=transient_block_paths,
         stream_trainable_weights=stream_trainable_weights,
-        transient_streaming=transient_streaming,
         transient_paths=transient_paths,
     )
 
@@ -1190,7 +1190,7 @@ class TestMergeCorrectness:
 
     @CUDA
     @pytest.mark.parametrize("mode", ["merge", "routed"])
-    def test_transient_streaming_preserves_lora_on_reacquire(
+    def test_transient_block_path_preserves_lora_on_reacquire(
         self,
         mode: LoRAMode,
     ) -> None:
@@ -1198,8 +1198,7 @@ class TestMergeCorrectness:
         lora = _make_lora(num_blocks=2, dim=16, seed=9)
         offloader = _make_model_offloader(
             model,
-            block_paths=["transformer_blocks"],
-            transient_streaming=True,
+            transient_block_paths=["transformer_blocks"],
         )
         _request_loras(offloader, [(lora, 0.5)], mode=mode)
         _activate(offloader, "cuda")

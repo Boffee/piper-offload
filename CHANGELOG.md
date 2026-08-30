@@ -15,10 +15,10 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   bulk CUDA working set to cycle independently from its activation session.
 - Add `ModelOffloader.register_forward_hook()` for caller-owned native PyTorch
   hooks addressed by fully-qualified module name.
-- Add opt-in `transient_streaming` scheduling to `ModelOffloader`. Streamed
-  CUDA pools release after their final blocks and reacquire after the root
-  model forward without runtime-specific coordination or a redundant block-0
-  wraparound refill.
+- Add `transient_block_paths` to `ModelOffloader` for streamed CUDA pools that
+  release after their final blocks and reacquire after the root model forward
+  without runtime-specific coordination or a redundant block-0 wraparound
+  refill. Ordinary `block_paths` pools remain resident.
 - Add `transient_paths` for named modules whose independent CUDA working sets
   release after their forwards and reacquire after the root model forward.
 

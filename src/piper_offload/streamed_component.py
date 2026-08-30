@@ -345,7 +345,7 @@ def _streamed_param_names_for_blocks(
                 "All blocks in a StreamedComponent group must select the "
                 "same parameter names (their shapes, dtypes, and quant "
                 "formats may differ). Split structurally different block "
-                "kinds across separate `block_paths=[...]` groups."
+                "kinds across separate block-path groups."
             )
     return param_names
 
@@ -359,7 +359,7 @@ def _streamed_buffer_names_for_blocks(blocks: Sequence[nn.Module]) -> set[str]:
                 "All blocks in a StreamedComponent group must select the "
                 "same buffer names (their shapes, dtypes, and layouts may "
                 "differ). Split structurally different block kinds across "
-                "separate `block_paths=[...]` groups."
+                "separate block-path groups."
             )
     return buffer_names
 
