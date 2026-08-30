@@ -72,7 +72,7 @@ def test_close_synchronizes_target_work_before_drop() -> None:
             self.synchronize_calls += 1
 
     allocation_stream = Stream()
-    tracked_stream = Stream()
+    side_stream = Stream()
     consumer_stream = Stream()
     ready = Event()
     lease = _CudaTargetLease(
@@ -81,15 +81,15 @@ def test_close_synchronizes_target_work_before_drop() -> None:
     )
     lease._ready_event = cast(torch.cuda.Event, ready)
     lease._acquired = True
-    lease.mark_used(cast(torch.cuda.Stream, consumer_stream))
-    lease.track_lifetime_stream(cast(torch.cuda.Stream, tracked_stream))
+    lease.record_stream(cast(torch.cuda.Stream, consumer_stream))
+    lease.record_stream(cast(torch.cuda.Stream, side_stream))
 
     lease.close()
 
     assert ready.synchronize_calls == 1
     assert allocation_stream.synchronize_calls == 1
     assert consumer_stream.synchronize_calls == 1
-    assert tracked_stream.synchronize_calls == 1
+    assert side_stream.synchronize_calls == 1
     with pytest.raises(RuntimeError, match="closed"):
         _ = lease.target
 
@@ -132,7 +132,7 @@ def test_restage_waits_for_every_actual_use_stream(
     lease._ready_event = cast(torch.cuda.Event, ready)
     lease._staged = True
     lease.acquire(cast(torch.cuda.Stream, first_consumer))
-    lease.mark_used(cast(torch.cuda.Stream, second_consumer))
+    lease.record_stream(cast(torch.cuda.Stream, second_consumer))
     lease.release()
     monkeypatch.setattr(
         torch.cuda,

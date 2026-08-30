@@ -118,7 +118,7 @@ class TestPinnedComponentStoreBind:
             def __init__(self) -> None:
                 self.used: list[object] = []
 
-            def mark_used(self, stream: object) -> None:
+            def record_stream(self, stream: object) -> None:
                 self.used.append(stream)
 
         model = _make_simple_model()

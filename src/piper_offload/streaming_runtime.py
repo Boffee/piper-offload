@@ -364,7 +364,7 @@ class BlockStreamingRuntime:
                 self._release_block(self._active_idx)
                 self._active_idx = None
             self._ensure_on_gpu(idx)
-        self._block_to_lease[idx].mark_used(current_stream)
+        self._block_to_lease[idx].record_stream(current_stream)
 
         last = self._last_idx
         self._last_idx = idx

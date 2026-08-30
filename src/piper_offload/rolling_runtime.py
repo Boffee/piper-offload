@@ -83,7 +83,6 @@ class _RollingTargetRuntime:
         self._ready_events = tuple(torch.cuda.Event() for _ in self._param_names)
         self._fallback_event = torch.cuda.Event()
         self._lease = _CudaTargetLease.allocate(self._instances[0], device)
-        self._lease.track_lifetime_stream(self._stream)
         target = self._lease.target
         register_rolling_target(
             self,
@@ -101,6 +100,7 @@ class _RollingTargetRuntime:
             for ready_event in self._ready_events:
                 ready_event.record(self._stream)
         self._lease.acquire(torch.cuda.current_stream(device))
+        self._lease.record_stream(self._stream)
         self._owners[:] = [0] * len(self._param_names)
         for instance in self._instances:
             instance.install_target(target)
@@ -155,7 +155,7 @@ class _RollingTargetRuntime:
         name = self._param_names[param_idx]
         device = target.param_targets[name].param.device
         current_stream = torch.cuda.current_stream(device)
-        lease.mark_used(current_stream)
+        lease.record_stream(current_stream)
         current_stream.wait_event(self._ready_events[param_idx])
 
     def rollover_param(self, param_idx: int) -> None:

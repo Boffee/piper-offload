@@ -283,17 +283,17 @@ class PinnedComponent:
             raise RuntimeError("PinnedComponent CUDA use hook is already installed.")
         component_ref = weakref.ref(self)
 
-        def mark_used(_module: nn.Module, _args: tuple[object, ...]) -> None:
+        def record_stream(_module: nn.Module, _args: tuple[object, ...]) -> None:
             component = component_ref()
             if component is None:
                 return
             lease = component._lease
             device = component._active_device
             if lease is not None and device is not None and device.type == "cuda":
-                lease.mark_used(torch.cuda.current_stream(device))
+                lease.record_stream(torch.cuda.current_stream(device))
 
         self._use_hook = self._instance.module.register_forward_pre_hook(
-            mark_used,
+            record_stream,
             prepend=True,
         )
 
