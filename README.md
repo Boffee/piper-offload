@@ -874,7 +874,11 @@ with cache.lease(spec) as store:
 inside a top-level model runtime rather than acting as one themselves. An
 active `StreamedComponent` may also `release()` and later `acquire()` its CUDA
 working set without ending the activation session; activation acquires it
-immediately by default.
+immediately by default. `ModelOffloader.register_forward_hook()` registers a
+native PyTorch forward hook by fully-qualified module name and returns a
+caller-owned remover. This lets higher-level runtimes coordinate component
+lifetimes at model execution boundaries without adding policy to streaming
+runtimes.
 
 `TensorAdapter` is the per-parameter extension point. Its base contract
 only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,

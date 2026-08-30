@@ -11,6 +11,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   can cycle a block streamer's CUDA working set without ending its activation
   session. Activation still acquires immediately, preserving existing model
   behavior.
+- Add `ModelOffloader.register_forward_hook()` for caller-owned native PyTorch
+  hooks addressed by fully-qualified module name.
 
 ### Removed
 

@@ -335,6 +335,37 @@ class TestCompiledForwardLifecycle:
             offloader.deactivate()
 
     @CUDA
+    def test_named_forward_hook_wraps_compiled_block(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        spy = _CompileSpy()
+        monkeypatch.setattr(torch, "compile", spy)
+        model = _BlockModel()
+        offloader = _make_offloader(
+            model,
+            block_compile=BlockCompileConfig(),
+        )
+        calls: list[nn.Module] = []
+        remove_hook = offloader.register_forward_hook(
+            "blocks.1",
+            lambda module, _args, _output: calls.append(module),
+        )
+        try:
+            with activated_model(offloader, "cuda"):
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+                assert calls == [model.blocks[1]]
+
+                remove_hook()
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+                assert calls == [model.blocks[1]]
+        finally:
+            remove_hook()
+            offloader.deactivate()
+
+    @CUDA
     def test_existing_instance_forward_override_is_restored_verbatim(
         self,
         monkeypatch: pytest.MonkeyPatch,

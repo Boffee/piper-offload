@@ -821,6 +821,43 @@ class TestCleanup:
 
 
 class TestHookLifecycle:
+    def test_named_forward_hook_is_caller_owned(self) -> None:
+        model = _make_block_model()
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["transformer_blocks"],
+        )
+        calls: list[nn.Module] = []
+        remove_hook = offloader.register_forward_hook(
+            "transformer_blocks.3",
+            lambda module, _args, _output: calls.append(module),
+        )
+        try:
+            with torch.no_grad():
+                model(torch.randn(2, 8))
+            assert calls == [model.transformer_blocks[3]]
+
+            remove_hook()
+            remove_hook()
+            with torch.no_grad():
+                model(torch.randn(2, 8))
+            assert calls == [model.transformer_blocks[3]]
+        finally:
+            remove_hook()
+            offloader.deactivate()
+
+    def test_named_forward_hook_requires_module_name(self) -> None:
+        model = _make_block_model()
+        offloader = _make_model_offloader(model)
+        try:
+            with pytest.raises(AttributeError):
+                offloader.register_forward_hook(
+                    "head.weight",
+                    lambda _module, _args, _output: None,
+                )
+        finally:
+            offloader.deactivate()
+
     @CUDA
     def test_hooks_installed_on_activate_removed_on_deactivate(self) -> None:
         m = _make_block_model()

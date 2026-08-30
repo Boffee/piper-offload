@@ -321,6 +321,25 @@ class ModelOffloader:
         """Register a post-copy hook and return a callable that removes it."""
         return self._register_post_copy_hook(param_name, hook)
 
+    def register_forward_hook(
+        self,
+        module_name: str,
+        hook: Callable[
+            [nn.Module, tuple[object, ...], object],
+            object | None,
+        ],
+    ) -> Callable[[], None]:
+        """Register a forward hook on a named module and return its remover.
+
+        ``module_name`` uses the fully-qualified namespace from
+        :meth:`torch.nn.Module.named_modules`; an empty name selects the model
+        itself. The caller owns the hook lifetime.
+        """
+        handle = self._model.get_submodule(module_name).register_forward_hook(
+            hook,
+        )
+        return handle.remove
+
     def _clear_active_lora_hooks(self) -> None:
         remove_hooks = self._lora_hook_removers
         self._lora_hook_removers = []
