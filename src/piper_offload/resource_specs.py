@@ -26,9 +26,10 @@ class ModelSpec[M: nn.Module]:
     ``factory`` runs once to construct the cached :class:`ModelOffloader`.
     Every lease reuses that same model runtime sequentially; overlapping uses
     are rejected by the offloader. ``block_compile`` is an opt-in construction
-    policy for every streamed group named by ``block_paths``. ``host_backing``
-    selects pinned copies (the default) or strict zero-copy adoption of
-    existing CPU model backing.
+    policy for every streamed group named by ``block_paths``.
+    ``transient_streaming`` scopes those groups' CUDA pools to model-forward
+    execution. ``host_backing`` selects pinned copies (the default) or strict
+    zero-copy adoption of existing CPU model backing.
     """
 
     key: str
@@ -38,6 +39,7 @@ class ModelSpec[M: nn.Module]:
     stream_trainable_weights: bool = False
     block_compile: BlockCompileConfig | None = None
     host_backing: HostBacking = "pinned"
+    transient_streaming: bool = False
 
     def build_store(self) -> ModelOffloader:
         """Build, pin, and bind the cached model runtime."""
@@ -47,6 +49,7 @@ class ModelSpec[M: nn.Module]:
             stream_trainable_weights=self.stream_trainable_weights,
             block_compile=self.block_compile,
             host_backing=self.host_backing,
+            transient_streaming=self.transient_streaming,
         )
 
     def value(self, store: ResourceStore) -> ModelOffloader:

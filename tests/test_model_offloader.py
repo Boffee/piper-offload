@@ -42,11 +42,13 @@ def _make_model_offloader(
     *,
     block_paths: list[str] = [],
     stream_trainable_weights: bool = False,
+    transient_streaming: bool = False,
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
         block_paths=block_paths,
         stream_trainable_weights=stream_trainable_weights,
+        transient_streaming=transient_streaming,
     )
 
 
@@ -887,6 +889,189 @@ class TestHookLifecycle:
         strategy.deactivate()
         for block in blocks:
             assert len(block._forward_pre_hooks) == 0
+
+
+# ---------------------------------------------------------------------------
+# ModelOffloader-owned transient streaming schedule
+# ---------------------------------------------------------------------------
+
+
+class TestTransientStreaming:
+    def test_cpu_activation_stays_eager(self) -> None:
+        model = _make_block_model()
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["transformer_blocks"],
+            transient_streaming=True,
+        )
+        try:
+            with activated_model(offloader, "cpu"):
+                with torch.inference_mode():
+                    model(torch.randn(2, 8))
+                assert not model._forward_hooks
+                assert not model.transformer_blocks[-1]._forward_hooks
+        finally:
+            offloader.deactivate()
+
+    @CUDA
+    def test_activation_inside_inference_mode_keeps_targets_mutable(self) -> None:
+        model = _make_block_model(num_blocks=3)
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["transformer_blocks"],
+            transient_streaming=True,
+        )
+        runtime = streamed_components(offloader)[0]._block_runtime
+        with torch.inference_mode():
+            with activated_model(offloader, "cuda"):
+                model(torch.randn(2, 8, device="cuda"))
+                model(torch.randn(2, 8, device="cuda"))
+                assert runtime.acquired
+
+    @CUDA
+    def test_multiple_paths_release_independently_and_reacquire(self) -> None:
+        class MultiPathModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.first_blocks = nn.ModuleList(
+                    [nn.Linear(8, 8, bias=False) for _ in range(2)]
+                )
+                self.second_blocks = nn.ModuleList(
+                    [nn.Linear(8, 8, bias=False) for _ in range(2)]
+                )
+                self.head = nn.Linear(8, 8, bias=False)
+                self.run_first = True
+                self.requires_grad_(False)
+
+            def forward(self, value: torch.Tensor) -> torch.Tensor:
+                if self.run_first:
+                    for block in self.first_blocks:
+                        value = block(value)
+                for block in self.second_blocks:
+                    value = block(value)
+                return self.head(value)
+
+        model = MultiPathModel()
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["first_blocks", "second_blocks"],
+            transient_streaming=True,
+        )
+        first, second = streamed_components(offloader)
+        first_runtime = first._block_runtime
+        second_runtime = second._block_runtime
+        second_entry_states: list[tuple[bool, bool]] = []
+        suffix_states: list[tuple[bool, bool]] = []
+        second_handle = model.second_blocks[0].register_forward_pre_hook(
+            lambda _module, _args: second_entry_states.append(
+                (first_runtime.acquired, second_runtime.acquired)
+            )
+        )
+        suffix_handle = model.head.register_forward_pre_hook(
+            lambda _module, _args: suffix_states.append(
+                (first_runtime.acquired, second_runtime.acquired)
+            )
+        )
+        try:
+            with activated_model(offloader, "cuda"):
+                assert offloader.transient_streaming
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+                assert second_entry_states == [(False, True)]
+                assert suffix_states == [(False, False)]
+                assert first_runtime.acquired
+                assert second_runtime.acquired
+
+                model.run_first = False
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+                assert second_entry_states[-1] == (True, True)
+                assert suffix_states[-1] == (True, False)
+                assert first_runtime.acquired
+                assert second_runtime.acquired
+        finally:
+            second_handle.remove()
+            suffix_handle.remove()
+            offloader.deactivate()
+
+        assert not model._forward_hooks
+        assert not model.first_blocks[-1]._forward_hooks
+        assert not model.second_blocks[-1]._forward_hooks
+
+    @CUDA
+    def test_forward_failure_leaves_released_runtime_safe_to_deactivate(
+        self,
+    ) -> None:
+        class FailingHead(nn.Linear):
+            fail = True
+
+            def forward(self, value: torch.Tensor) -> torch.Tensor:
+                if self.fail:
+                    raise RuntimeError("simulated suffix failure")
+                return super().forward(value)
+
+        model = _make_block_model(num_blocks=3)
+        model.head = FailingHead(8, 8, bias=False).requires_grad_(False)
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["transformer_blocks"],
+            transient_streaming=True,
+        )
+        runtime = streamed_components(offloader)[0]._block_runtime
+        try:
+            offloader.activate("cuda")
+            with pytest.raises(RuntimeError, match="simulated suffix failure"):
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+            assert not runtime.acquired
+        finally:
+            offloader.deactivate()
+
+        assert not model._forward_hooks
+        assert not model.transformer_blocks[-1]._forward_hooks
+
+        model.head.fail = False
+        try:
+            with activated_model(offloader, "cuda"):
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+                assert runtime.acquired
+        finally:
+            offloader.deactivate()
+
+    @CUDA
+    def test_hook_install_failure_rolls_back_activation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model = _make_block_model(num_blocks=3)
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["transformer_blocks"],
+            transient_streaming=True,
+        )
+        runtime = streamed_components(offloader)[0]._block_runtime
+        original_register = model.register_forward_hook
+
+        def fail_register(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("simulated root hook failure")
+
+        monkeypatch.setattr(model, "register_forward_hook", fail_register)
+        with pytest.raises(RuntimeError, match="simulated root hook failure"):
+            offloader.activate("cuda")
+
+        assert offloader.active_device is None
+        assert not runtime.acquired
+        assert not model.transformer_blocks[-1]._forward_hooks
+
+        monkeypatch.setattr(model, "register_forward_hook", original_register)
+        try:
+            with activated_model(offloader, "cuda"):
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+                assert runtime.acquired
+        finally:
+            offloader.deactivate()
 
 
 # ---------------------------------------------------------------------------

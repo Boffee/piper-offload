@@ -110,11 +110,13 @@ def _make_model_offloader(
     *,
     block_paths: list[str] = [],
     stream_trainable_weights: bool = False,
+    transient_streaming: bool = False,
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
         block_paths=block_paths,
         stream_trainable_weights=stream_trainable_weights,
+        transient_streaming=transient_streaming,
     )
 
 
@@ -673,6 +675,15 @@ class TestActivationLoraValidation:
             (lora, 0.25),
         ]
 
+    def test_lora_strengths_do_not_silently_truncate(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        with pytest.raises(ValueError, match="shorter"):
+            s._normalize_loras(
+                [_make_lora(4, 16)],
+                lora_strengths=[],
+            )
+
     @pytest.mark.parametrize("zero", [0.0, -0.0])
     def test_zero_strengths_are_inactive(self, zero: float) -> None:
         m = _make_bf16_model()
@@ -705,29 +716,14 @@ class TestActivationLoraValidation:
         finally:
             s.deactivate()
 
-    def test_rejects_lora_strength_length_mismatch(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        with pytest.raises(ValueError, match="same length"):
-            s._normalize_loras(
-                [_make_lora(4, 16)],
-                lora_strengths=[],
-            )
-
-    def test_rejects_tuple_pairs(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        with pytest.raises(TypeError, match="LoRA instances"):
-            s._normalize_loras(  # type: ignore[list-item]
-                [(_make_lora(4, 16), 1.0)],
-            )
-
-    def test_rejects_duplicate_lora_instance(self) -> None:
+    def test_accepts_duplicate_lora_instance(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         lora = _make_lora(4, 16)
-        with pytest.raises(ValueError, match="same LoRA instance"):
-            s._normalize_loras([lora, lora])
+        assert s._normalize_loras([lora, lora]) == [
+            (lora, 1.0),
+            (lora, 1.0),
+        ]
 
     def test_invalid_lora_mode_releases_activation_claim(self) -> None:
         m = _make_bf16_model()
@@ -1152,6 +1148,37 @@ class TestLifecycle:
 
 
 class TestMergeCorrectness:
+    @CUDA
+    @pytest.mark.parametrize("mode", ["merge", "routed"])
+    def test_transient_streaming_preserves_lora_on_reacquire(
+        self,
+        mode: LoRAMode,
+    ) -> None:
+        model = _make_bf16_model(num_blocks=2, dim=16)
+        lora = _make_lora(num_blocks=2, dim=16, seed=9)
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["transformer_blocks"],
+            transient_streaming=True,
+        )
+        _request_loras(offloader, [(lora, 0.5)], mode=mode)
+        _activate(offloader, "cuda")
+        try:
+            value = torch.randn(
+                2,
+                16,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            with torch.inference_mode():
+                first = model(value).clone()
+                second = model(value).clone()
+            torch.cuda.synchronize()
+        finally:
+            offloader.deactivate()
+
+        torch.testing.assert_close(second, first, rtol=0, atol=0)
+
     @CUDA
     @pytest.mark.parametrize("streamed", [False, True])
     def test_legacy_bias_merge_resident_and_streamed(

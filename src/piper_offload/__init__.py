@@ -17,7 +17,8 @@ Lower-level resource bindings:
   created by ``ModelOffloader.from_module(model)``, or per-block streaming
   when it is constructed with ``block_paths``. Streaming mode supports optional LoRA merge,
   opt-in forward-only block compilation for CUDA inference,
-  trainable-parameter support, CUDA prefetch on a secondary stream, and
+  opt-in transient pool lifetimes, trainable-parameter support,
+  CUDA prefetch on a secondary stream, and
   activation checkpointing through autograd backward when block compilation
   is disabled. By default,
   trainable params are managed by

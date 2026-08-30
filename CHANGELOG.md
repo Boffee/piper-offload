@@ -13,6 +13,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   behavior.
 - Add `ModelOffloader.register_forward_hook()` for caller-owned native PyTorch
   hooks addressed by fully-qualified module name.
+- Add opt-in `transient_streaming` scheduling to `ModelOffloader`. Streamed
+  CUDA pools release after their final blocks and reacquire after the root
+  model forward without runtime-specific coordination.
 
 ### Removed
 

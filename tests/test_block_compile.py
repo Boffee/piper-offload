@@ -100,17 +100,16 @@ class TestBlockCompileConfig:
                 block_compile=BlockCompileConfig(rolling=True),
             )
 
-    def test_compile_requires_block_paths(self) -> None:
+    def test_compile_without_block_paths_is_unused(self) -> None:
         model = nn.Linear(4, 4, bias=False)
-
-        with pytest.raises(
-            ValueError,
-            match="block_compile requires at least one block path",
-        ):
-            ModelOffloader.from_module(
-                model,
-                block_compile=BlockCompileConfig(),
-            )
+        offloader = ModelOffloader.from_module(
+            model,
+            block_compile=BlockCompileConfig(),
+        )
+        try:
+            assert not streamed_components(offloader)
+        finally:
+            offloader.deactivate()
 
     def test_model_spec_passes_config_to_bound_streamer(
         self,
@@ -130,12 +129,14 @@ class TestBlockCompileConfig:
             factory=_BlockModel,
             block_paths=("blocks",),
             block_compile=config,
+            transient_streaming=True,
         )
 
         offloader = spec.build_store()
         try:
             streamer = streamed_components(offloader)[0]
             assert streamer.block_compile is config
+            assert offloader.transient_streaming
             assert len(spy.calls) == 2
             assert all(
                 kwargs
@@ -363,6 +364,42 @@ class TestCompiledForwardLifecycle:
                 assert calls == [model.blocks[1]]
         finally:
             remove_hook()
+            offloader.deactivate()
+
+    @CUDA
+    def test_transient_streaming_retains_compiled_forwards(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        spy = _CompileSpy()
+        monkeypatch.setattr(torch, "compile", spy)
+        model = _BlockModel()
+        offloader = _make_offloader(
+            model,
+            block_compile=BlockCompileConfig(),
+            transient_streaming=True,
+        )
+        streamer = streamed_components(offloader)[0]
+        runtime = streamer._block_runtime
+        root_states: list[bool] = []
+        remove_observer = offloader.register_forward_hook(
+            "",
+            lambda _module, _args, _output: root_states.append(runtime.acquired),
+        )
+        try:
+            with activated_model(offloader, "cuda"):
+                for _ in range(2):
+                    with torch.inference_mode():
+                        model(torch.randn(2, 8, device="cuda"))
+                    assert runtime.acquired
+                    assert all(
+                        "forward" in block.__dict__
+                        for block in model.blocks
+                    )
+                assert root_states == [False, False]
+            assert all("forward" not in block.__dict__ for block in model.blocks)
+        finally:
+            remove_observer()
             offloader.deactivate()
 
     @CUDA

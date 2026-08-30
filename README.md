@@ -267,6 +267,34 @@ CPU activation. Routed LoRA installs target-Linear hooks: a forward-PRE
 hook copies that target's host-backed factors to the input device, and a
 forward-POST hook applies the residual and releases those device copies.
 
+### Optional transient streaming
+
+Inference workloads can scope streamed CUDA pools to their block traversals:
+
+```python
+offload = ModelOffloader.from_module(
+    model,
+    block_paths=["transformer_blocks"],
+    transient_streaming=True,
+)
+```
+
+CUDA activation initially acquires every streamed pool. After a group's final
+block succeeds, its pool is released before later groups or resident suffix
+modules execute. A successful root-model forward then reacquires all pools for
+the next invocation. This is the latency-oriented policy: the next block-0
+load is prefetched after the model completes, so those pools remain allocated
+during the following prefix. A conditionally skipped group remains acquired.
+
+The option is off by default and has no effect without a `block_paths` group.
+It is intended for inference models whose final block uniquely marks one
+completed traversal. ModelOffloader deliberately does not inspect call counts,
+module aliases, or autograd state; those execution-boundary guarantees belong
+to the caller. CPU activation remains eager and installs no scheduling hooks.
+Both ordinary and rolling streaming use the same component-level
+acquire/release contract; rolling retains its normal block-0 wraparound refill
+before release.
+
 ### Optional streamed-block compilation
 
 Repeated streamed blocks can opt into forward-only Inductor compilation at
@@ -288,8 +316,8 @@ offload = ModelOffloader.from_module(
 ```
 
 `block_compile=None` (the default) preserves eager behavior. One configuration
-applies to every `block_paths` group, and supplying a compile configuration
-without `block_paths` raises. The backend remains fixed to Inductor. Optional
+applies to every `block_paths` group and has no effect when none are configured.
+The backend remains fixed to Inductor. Optional
 backend settings can be supplied through `options`; the mapping is copied for
 each block before it is forwarded to `torch.compile`. This is also the boundary
 for compiler extensions such as Piper Kernels' ConvRot preparation-sharing and

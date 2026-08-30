@@ -43,11 +43,13 @@ def _make_offloader(
     *,
     block_paths: list[str] | None = None,
     block_compile: BlockCompileConfig | None = None,
+    transient_streaming: bool = False,
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
         block_paths=["blocks"] if block_paths is None else block_paths,
         block_compile=block_compile,
+        transient_streaming=transient_streaming,
     )
 
 

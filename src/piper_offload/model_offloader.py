@@ -6,6 +6,7 @@ per-weight LoRA application in both modes.
 
 import contextlib
 import threading
+import weakref
 from collections.abc import Callable, Iterator, Sequence
 from typing import Self
 
@@ -24,8 +25,30 @@ from .lora import (
     install_routed_residual_hook,
 )
 from .module_names import resolve_parent_leaf, sibling_parameter_name
+from .streamed_component import StreamedComponent
 
 type _LoraParamMap = dict[str, list[ScaledLoRAFactor]]
+type _ForwardHook = Callable[
+    [nn.Module, tuple[object, ...], object],
+    object | None,
+]
+
+
+def _release_after_forward_hook(
+    streamer: StreamedComponent,
+) -> _ForwardHook:
+    streamer_ref = weakref.ref(streamer)
+
+    def release(
+        _module: nn.Module,
+        _args: tuple[object, ...],
+        _output: object,
+    ) -> None:
+        streamer = streamer_ref()
+        if streamer is not None:
+            streamer.release()
+
+    return release
 
 
 class ModelRuntimeInUseError(RuntimeError):
@@ -109,6 +132,10 @@ class ModelOffloader:
         and streamed offload components.
     cache_bytes:
         Stable host-cache bytes owned by the bound components.
+    transient_streaming:
+        Release each streamed CUDA pool after its final block and reacquire all
+        pools after the root model forward. This opt-in policy is intended for
+        inference and leaves CPU activation unchanged.
     """
 
     def __init__(
@@ -117,13 +144,16 @@ class ModelOffloader:
         *,
         composite: CompositeComponent,
         cache_bytes: int,
+        transient_streaming: bool = False,
     ) -> None:
         self._model = model
         self._active_device: torch.device | None = None
         self._composite = composite
         self._cache_bytes = cache_bytes
+        self._transient_streaming = transient_streaming
         self._activation_lock = threading.Lock()
         self._lora_hook_removers: list[Callable[[], None]] = []
+        self._transient_hook_removers: list[Callable[[], None]] = []
 
     @classmethod
     def from_module(
@@ -134,6 +164,7 @@ class ModelOffloader:
         stream_trainable_weights: bool = False,
         block_compile: BlockCompileConfig | None = None,
         host_backing: HostBacking = "pinned",
+        transient_streaming: bool = False,
     ) -> Self:
         """Clone and bind ``model`` as one reusable cached runtime.
 
@@ -141,7 +172,11 @@ class ModelOffloader:
         Bound component instances retain the host state afterward, so the
         model is never rebound on subsequent uses.
         ``block_compile`` applies one forward-only compile policy to every
-        ``block_paths`` group and is invalid when no block group is declared.
+        ``block_paths`` group and is unused when no block group is declared.
+        ``transient_streaming=True`` scopes each streamed CUDA pool from
+        activation or the preceding model completion through its final block;
+        the root model post-forward hook reacquires released pools for the next
+        call.
         ``host_backing`` defaults to a pinned copy; ``"adopt"`` strictly
         retains frozen state already in CPU RAM and uses direct CUDA copies
         without an application-owned staging pool. It never silently
@@ -163,10 +198,6 @@ class ModelOffloader:
                     "parameters before constructing the offloader. Trainable "
                     f"parameters: {trainable_names!r}."
                 )
-        if block_compile is not None and not block_paths:
-            raise ValueError(
-                "block_compile requires at least one block path."
-            )
         composite_store = CompositeComponentStore.from_module(
             model,
             block_paths=block_paths,
@@ -179,6 +210,7 @@ class ModelOffloader:
             model,
             composite=composite,
             cache_bytes=cache_bytes,
+            transient_streaming=transient_streaming,
         )
 
     # ------------------------------------------------------------------ API
@@ -193,17 +225,7 @@ class ModelOffloader:
         if lora_strengths is None:
             strength_list = [1.0] * len(lora_list)
         else:
-            if len(lora_strengths) != len(lora_list):
-                raise ValueError("lora_strengths must have the same length as loras")
             strength_list = [float(strength) for strength in lora_strengths]
-        for lora in lora_list:
-            if not isinstance(lora, LoRA):
-                raise TypeError("ModelOffloader.activate() expects LoRA instances")
-        if len({id(lora) for lora in lora_list}) != len(lora_list):
-            raise ValueError(
-                "ModelOffloader.activate() does not accept the same LoRA "
-                "instance more than once"
-            )
         return [
             (lora, strength)
             for lora, strength in zip(lora_list, strength_list, strict=True)
@@ -340,6 +362,40 @@ class ModelOffloader:
         )
         return handle.remove
 
+    def _install_transient_streaming_hooks(self) -> None:
+        streamers = self._composite.streamed
+        for streamer in streamers:
+            handle = streamer.blocks[-1].register_forward_hook(
+                _release_after_forward_hook(streamer),
+            )
+            self._transient_hook_removers.append(handle.remove)
+
+        offloader_ref = weakref.ref(self)
+
+        def reacquire_after_forward(
+            _module: nn.Module,
+            _args: tuple[object, ...],
+            _output: object,
+        ) -> None:
+            offloader = offloader_ref()
+            if offloader is not None:
+                # A model post-hook inherits the caller's inference-mode
+                # context. Reusable targets must remain mutable because later
+                # prefetch threads refill them outside that context.
+                with torch.inference_mode(False):
+                    for streamer in offloader._composite.streamed:
+                        streamer.acquire()
+
+        self._transient_hook_removers.append(
+            self.register_forward_hook("", reacquire_after_forward)
+        )
+
+    def _clear_transient_streaming_hooks(self) -> None:
+        remove_hooks = self._transient_hook_removers
+        self._transient_hook_removers = []
+        for remove_hook in reversed(remove_hooks):
+            remove_hook()
+
     def _clear_active_lora_hooks(self) -> None:
         remove_hooks = self._lora_hook_removers
         self._lora_hook_removers = []
@@ -365,6 +421,11 @@ class ModelOffloader:
     def active_device(self) -> torch.device | None:
         """Currently active device, or ``None`` when inactive."""
         return self._active_device
+
+    @property
+    def transient_streaming(self) -> bool:
+        """Whether streamed CUDA pools follow model-forward lifetimes."""
+        return self._transient_streaming
 
     @property
     def param_names(self) -> frozenset[str]:
@@ -436,14 +497,42 @@ class ModelOffloader:
                     )
                 else:
                     self._register_routed_lora_hooks(targets)
-            # The composite self-cleans its components if activation fails midway.
-            self._composite.activate(
-                active_device,
-                compile_blocks=not (active_loras and lora_mode == "routed"),
+            schedule_streaming = (
+                self._transient_streaming
+                and bool(self._composite.streamed)
+                and active_device.type == "cuda"
             )
+            activation_context = (
+                torch.inference_mode(False)
+                if schedule_streaming
+                else contextlib.nullcontext()
+            )
+            # Reusable transient targets must be mutable even if the caller
+            # activates the offloader from inside inference mode.
+            with activation_context:
+                self._composite.activate(
+                    active_device,
+                    compile_blocks=not (
+                        active_loras and lora_mode == "routed"
+                    ),
+                )
+            if schedule_streaming:
+                self._install_transient_streaming_hooks()
         except BaseException:
+            # Deactivation is idempotent over partial component and hook state.
+            self.deactivate()
+            raise
+
+    def deactivate(self) -> None:
+        if self._active_device is None:
+            return
+        # Scheduling hooks must stop before their components deactivate. Drain
+        # asynchronous copies before removing LoRA merge hooks. Cleanup and
+        # activation-lock release still run if component teardown raises.
+        try:
+            self._clear_transient_streaming_hooks()
+        finally:
             try:
-                # Idempotent before/after partial composite activation.
                 self._composite.deactivate()
             finally:
                 try:
@@ -451,22 +540,6 @@ class ModelOffloader:
                 finally:
                     self._active_device = None
                     self._activation_lock.release()
-            raise
-
-    def deactivate(self) -> None:
-        if self._active_device is None:
-            return
-        # Drain asynchronous copies before removing their LoRA merge hooks.
-        # Hook cleanup and activation-lock release still run if component
-        # teardown unexpectedly raises.
-        try:
-            self._composite.deactivate()
-        finally:
-            try:
-                self._clear_active_lora_hooks()
-            finally:
-                self._active_device = None
-                self._activation_lock.release()
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:
