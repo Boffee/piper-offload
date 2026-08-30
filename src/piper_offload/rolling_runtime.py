@@ -56,9 +56,9 @@ class _RollingTargetRuntime:
         self._instances = instances
         self._param_names = param_names
         self._log_label = log_label
-        self._reset_active_state()
+        self._reset_acquired_state()
 
-    def _reset_active_state(self) -> None:
+    def _reset_acquired_state(self) -> None:
         self._lease: _CudaTargetLease | None = None
         self._stream: torch.cuda.Stream | None = None
         self._events: tuple[torch.cuda.Event, ...] = ()
@@ -68,16 +68,16 @@ class _RollingTargetRuntime:
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
 
     @property
-    def active(self) -> bool:
+    def acquired(self) -> bool:
         return self._lease is not None or self._stream is not None
 
     @property
     def compile_backend(self) -> CompileBackend:
         return rolling_inductor_backend
 
-    def activate(self, device: torch.device) -> None:
-        if self.active:
-            raise RuntimeError("rolling target runtime is already active")
+    def acquire(self, device: torch.device) -> None:
+        if self.acquired:
+            raise RuntimeError("rolling target runtime is already acquired")
         self._stream = torch.cuda.Stream(device=device, priority=-1)
         self._events = tuple(torch.cuda.Event() for _ in self._param_names)
         self._ready_events = tuple(torch.cuda.Event() for _ in self._param_names)
@@ -107,7 +107,7 @@ class _RollingTargetRuntime:
         self._register_hooks(device)
 
         logger.info(
-            f"{self._log_label} active: one rolling parameter target for {len(self._instances)} compiled blocks"
+            f"{self._log_label} acquired: one rolling parameter target for {len(self._instances)} compiled blocks"
         )
 
     def _register_hooks(self, device: torch.device) -> None:
@@ -150,7 +150,7 @@ class _RollingTargetRuntime:
     def wait_param(self, param_idx: int) -> None:
         lease = self._lease
         if lease is None:
-            raise RuntimeError("rolling wait executed while runtime is inactive")
+            raise RuntimeError("rolling wait executed while runtime is released")
         target = lease.target
         name = self._param_names[param_idx]
         device = target.param_targets[name].param.device
@@ -163,7 +163,7 @@ class _RollingTargetRuntime:
         prefetch_stream = self._stream
         owners = self._owners
         if lease is None or prefetch_stream is None or owners is None:
-            raise RuntimeError("rolling refill executed while runtime is inactive")
+            raise RuntimeError("rolling refill executed while runtime is released")
         target = lease.target
         block_idx = owners[param_idx]
         if block_idx < 0:
@@ -197,7 +197,7 @@ class _RollingTargetRuntime:
         self._ready_events[param_idx].record(prefetch_stream)
         owners[param_idx] = block_idx
 
-    def deactivate(self) -> None:
+    def release(self) -> None:
         for handle in self._hooks:
             handle.remove()
         self._hooks.clear()
@@ -217,16 +217,17 @@ class _RollingTargetRuntime:
             except BaseException as exc:
                 if first_error is None:
                     first_error = exc
-        self._reset_active_state()
+        self._reset_acquired_state()
         if first_error is not None:
             raise first_error
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:
-        if not self.active:
+        if not self.acquired:
             raise RuntimeError(
-                "StreamedComponent.optimizer_step() called on inactive "
-                "streamer. Use it inside the offloader's context manager."
+                "StreamedComponent.optimizer_step() called while its CUDA "
+                "working set is released. Acquire the component before "
+                "entering the optimizer step."
             )
         yield
 

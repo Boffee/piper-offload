@@ -303,6 +303,38 @@ class TestCompiledForwardLifecycle:
             offloader.deactivate()
 
     @CUDA
+    def test_compiled_forwards_remain_installed_across_release_acquire(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        spy = _CompileSpy()
+        monkeypatch.setattr(torch, "compile", spy)
+        model = _BlockModel()
+        offloader = _make_offloader(
+            model,
+            block_compile=BlockCompileConfig(),
+        )
+        streamer = streamed_components(offloader)[0]
+        runtime = streamer._block_runtime
+        try:
+            with activated_model(offloader, "cuda"):
+                assert runtime.acquired
+                assert all("forward" in block.__dict__ for block in model.blocks)
+
+                streamer.release()
+                assert not runtime.acquired
+                assert all("forward" in block.__dict__ for block in model.blocks)
+
+                streamer.acquire()
+                assert runtime.acquired
+                assert all("forward" in block.__dict__ for block in model.blocks)
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+            assert all("forward" not in block.__dict__ for block in model.blocks)
+        finally:
+            offloader.deactivate()
+
+    @CUDA
     def test_existing_instance_forward_override_is_restored_verbatim(
         self,
         monkeypatch: pytest.MonkeyPatch,

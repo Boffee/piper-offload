@@ -871,7 +871,10 @@ with cache.lease(spec) as store:
 
 `StreamedComponent` and `PinnedComponent` are composable
 `activate`/`deactivate` lifecycle pieces (no `value` or `model`) that live
-inside a top-level model runtime rather than acting as one themselves.
+inside a top-level model runtime rather than acting as one themselves. An
+active `StreamedComponent` may also `release()` and later `acquire()` its CUDA
+working set without ending the activation session; activation acquires it
+immediately by default.
 
 `TensorAdapter` is the per-parameter extension point. Its base contract
 only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,

@@ -578,8 +578,11 @@ class StreamedComponent:
     Lifecycle is uniform with :class:`PinnedComponent`: store construction
     pins (so ``cache_bytes`` is final at construction time, ready
     for :class:`~piper_offload.resource_cache.ResourceCache` admission), and
-    ``activate`` brings to CUDA or marks CPU active, ``deactivate`` returns state to
-    pinned CPU, removes hooks, and restores eager forwards. Optional
+    ``activate`` starts a device session and initially acquires its CUDA working
+    set, while ``deactivate`` releases that working set, returns state to pinned
+    CPU, removes hooks, and restores eager forwards. :meth:`release` and
+    :meth:`acquire` may cycle the CUDA working set without ending the session.
+    Optional
     ``block_compile`` policy belongs to this bound runtime and installs lazy
     compiled forwards only for eligible CUDA inference activations. Ordinary
     streaming owns one active block and one lookahead target; rolling
@@ -842,28 +845,62 @@ class StreamedComponent:
             else self._block_runtime
         )
 
-        # Record the selected runtime before activation so deactivate() can
+        # Record the selected runtime before acquisition so deactivate() can
         # clean up a partially-created pool, stream, or hook set if activation
         # raises midway through its lifecycle.
         self._active_device = active_device
         self._active_runtime = runtime
-        runtime.activate(active_device)
+        self.acquire()
         self._block_compile.install(compile_blocks)
+
+    def acquire(self) -> None:
+        """Acquire this active session's CUDA streaming working set.
+
+        Idempotent when already acquired. CPU sessions have no CUDA working
+        set and therefore need no acquisition. The activation session and any
+        installed compiled forwards remain intact across release/acquire
+        cycles.
+        """
+        active_device = self._active_device
+        if active_device is None:
+            raise RuntimeError(
+                "StreamedComponent.acquire() requires an active session; "
+                "call activate() first."
+            )
+        if active_device.type == "cpu":
+            return
+        runtime = self._active_runtime
+        if runtime is None:
+            raise RuntimeError(
+                "StreamedComponent CUDA session has no selected runtime."
+            )
+        if not runtime.acquired:
+            runtime.acquire(active_device)
+
+    def release(self) -> None:
+        """Idempotently release this session's CUDA streaming working set.
+
+        Blocks return to host backing and runtime-owned CUDA targets, streams,
+        prefetch work, and hooks are released. The component remains active,
+        and compiled forwards remain installed, so :meth:`acquire` can prepare
+        the same session for another traversal.
+        """
+        runtime = self._active_runtime
+        if runtime is not None:
+            runtime.release()
 
     def deactivate(self) -> None:
         """Tear down active resources idempotently — safe to call
         before activate or multiple times. The selected runtime owns cleanup
-        of any partial activation state. Drop the binding reference after
+        of any partial acquisition state. Drop the binding reference after
         deactivate to release pinned memory."""
         self._block_compile.restore()
         if self._active_device == torch.device("cpu"):
             self._active_device = None
             return
 
-        runtime = self._active_runtime
         try:
-            if runtime is not None:
-                runtime.deactivate()
+            self.release()
         finally:
             self._active_runtime = None
             self._active_device = None

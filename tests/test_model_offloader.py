@@ -7,6 +7,7 @@ CUDA-only tests gate on availability. CPU activation is pass-through
 over the host-backed pinned state.
 """
 
+import copy
 from collections.abc import Sequence
 from concurrent.futures import Future
 from pathlib import Path
@@ -406,7 +407,7 @@ class TestLifecycle:
             with activated_model(strategy, "cpu") as cpu_model:
                 assert strategy._active_device == torch.device("cpu")
                 assert all(s._active_device == torch.device("cpu") for s in streamed_components(strategy))
-                assert all(not s._block_runtime.active for s in streamed_components(strategy))
+                assert all(not s._block_runtime.acquired for s in streamed_components(strategy))
                 assert all(
                     block.weight is pinned
                     for block, pinned in zip(
@@ -558,7 +559,9 @@ class TestStreamedComponentBackendActivation:
             pinned_params = [block.weight for block in m.transformer_blocks]
             with streamer.use("cpu"):
                 assert streamer._active_device == torch.device("cpu")
-                assert not streamer._block_runtime.active
+                assert not streamer._block_runtime.acquired
+                streamer.release()
+                streamer.acquire()
                 assert all(
                     block.weight is pinned
                     for block, pinned in zip(
@@ -577,6 +580,52 @@ class TestStreamedComponentBackendActivation:
                 assert block.weight.is_pinned()
         finally:
             streamer.deactivate()
+
+    @CUDA
+    def test_cuda_working_set_can_release_and_reacquire(self) -> None:
+        torch.manual_seed(42)
+        eager_blocks = nn.ModuleList(
+            [nn.Linear(8, 8, bias=False) for _ in range(3)]
+        )
+        blocks = copy.deepcopy(eager_blocks)
+        value = torch.randn(2, 8)
+        with torch.no_grad():
+            expected = value
+            for block in eager_blocks:
+                expected = block(expected)
+
+        streamer = _make_streamed_component(blocks=list(blocks))
+        runtime = streamer._block_runtime
+        try:
+            streamer.activate(torch.device("cuda"))
+            assert runtime.acquired
+
+            streamer.release()
+            streamer.release()
+            assert streamer._active_device is not None
+            assert streamer._active_device.type == "cuda"
+            assert streamer._active_runtime is runtime
+            assert not runtime.acquired
+            assert all(block.weight.device.type == "cpu" for block in blocks)
+
+            streamer.acquire()
+            streamer.acquire()
+            assert runtime.acquired
+            with torch.no_grad():
+                actual = value.cuda()
+                for block in blocks:
+                    actual = block(actual)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual.cpu(), expected)
+        finally:
+            streamer.deactivate()
+
+    def test_acquire_requires_active_session(self) -> None:
+        block = nn.Linear(4, 4, bias=False)
+        streamer = _make_streamed_component(blocks=[block])
+        streamer.release()
+        with pytest.raises(RuntimeError, match="active session"):
+            streamer.acquire()
 
     def test_already_active_block_tracks_the_forward_stream(
         self,

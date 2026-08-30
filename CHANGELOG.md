@@ -5,6 +5,13 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add explicit `StreamedComponent.acquire()` and `release()` operations that
+  can cycle a block streamer's CUDA working set without ending its activation
+  session. Activation still acquires immediately, preserving existing model
+  behavior.
+
 ### Removed
 
 - Remove the `prefix_paths` and `suffix_paths` model selectors and their
