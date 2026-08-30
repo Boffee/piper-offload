@@ -287,15 +287,20 @@ class PinnedComponent:
             component = component_ref()
             if component is None:
                 return
-            lease = component._lease
             device = component._active_device
-            if lease is not None and device is not None and device.type == "cuda":
-                lease.record_stream(torch.cuda.current_stream(device))
+            if device is not None and device.type == "cuda":
+                component.record_stream(torch.cuda.current_stream(device))
 
         self._use_hook = self._instance.module.register_forward_pre_hook(
             record_stream,
             prepend=True,
         )
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        """Record a CUDA stream that may still be using the active target."""
+        lease = self._lease
+        if lease is not None:
+            lease.record_stream(stream)
 
     def _remove_use_hook(self) -> None:
         hook = self._use_hook

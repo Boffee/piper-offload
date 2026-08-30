@@ -38,6 +38,8 @@ type _ForwardHook = Callable[
 
 def _release_after_forward_hook(
     component: _TransientComponent,
+    *,
+    record_device: torch.device | None = None,
 ) -> _ForwardHook:
     component_ref = weakref.ref(component)
 
@@ -48,6 +50,11 @@ def _release_after_forward_hook(
     ) -> None:
         component = component_ref()
         if component is not None:
+            if record_device is not None:
+                assert isinstance(component, PinnedComponent)
+                component.record_stream(
+                    torch.cuda.current_stream(record_device),
+                )
             component.release()
 
     return release
@@ -174,7 +181,9 @@ class ModelOffloader:
         by ``block_paths`` retain their CUDA pools for the activation. Groups
         named by ``transient_block_paths`` release after their final blocks and
         reacquire after the root model forward. These groups are inference-only
-        and must not be traversed again later in the same root forward.
+        and must not be traversed again later in the same root forward. Their
+        block lists must contain distinct module objects because a module hook
+        cannot distinguish occurrences of an aliased block.
         Each module named by ``transient_paths`` similarly owns a separate
         CUDA working set that releases after that module's forward.
         ``host_backing`` defaults to a pinned copy; ``"adopt"`` strictly
@@ -367,12 +376,18 @@ class ModelOffloader:
         return handle.remove
 
     def _install_transient_hooks(self) -> None:
+        active_device = self._active_device
+        assert active_device is not None
+        assert active_device.type == "cuda"
         components: list[_TransientComponent] = []
         for path, component in self._composite.transient:
             self._transient_hook_removers.append(
                 self.register_forward_hook(
                     path,
-                    _release_after_forward_hook(component),
+                    _release_after_forward_hook(
+                        component,
+                        record_device=active_device,
+                    ),
                 )
             )
             components.append(component)

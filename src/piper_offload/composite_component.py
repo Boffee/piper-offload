@@ -181,6 +181,15 @@ class CompositeComponentStore:
                 "block_paths and transient_block_paths must be disjoint; "
                 f"both contain {sorted(overlap)!r}."
             )
+        for path in transient_streamed_paths:
+            blocks = model.get_submodule(path)
+            if isinstance(blocks, nn.ModuleList) and len(
+                {id(block) for block in blocks}
+            ) != len(blocks):
+                raise ValueError(
+                    "transient_block_paths does not support aliased block "
+                    f"modules; {path!r} contains repeated module objects."
+                )
 
         def make_streamed_store(blocks_path: str) -> StreamedComponentStore:
             return StreamedComponentStore.from_module(

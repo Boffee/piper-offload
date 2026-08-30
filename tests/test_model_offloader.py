@@ -1001,6 +1001,37 @@ class TestTransientResidency:
         assert not model.transformer_blocks[-1]._forward_hooks
 
     @CUDA
+    def test_transient_path_records_its_forward_stream_before_release(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model = _make_block_model()
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["transformer_blocks"],
+            transient_paths=["embed"],
+        )
+        embed = dict(transient_components(offloader))["embed"]
+        recorded_streams: list[torch.cuda.Stream] = []
+        original_record_stream = embed.record_stream
+
+        def record_stream(stream: torch.cuda.Stream) -> None:
+            recorded_streams.append(stream)
+            original_record_stream(stream)
+
+        monkeypatch.setattr(embed, "record_stream", record_stream)
+        side_stream = torch.cuda.Stream()
+        try:
+            with activated_model(offloader, "cuda"):
+                with torch.cuda.stream(side_stream):
+                    model.embed(torch.randn(2, 8, device="cuda"))
+
+                assert recorded_streams[-1] == side_stream
+                assert embed._lease is None
+        finally:
+            offloader.deactivate()
+
+    @CUDA
     def test_activation_inside_inference_mode_keeps_targets_mutable(self) -> None:
         model = _make_block_model(num_blocks=3)
         offloader = _make_model_offloader(
@@ -1402,6 +1433,22 @@ class TestValidation:
                 block_paths=["transformer_blocks"],
                 transient_block_paths=["transformer_blocks"],
             )
+
+    def test_transient_block_paths_reject_aliased_modules(self) -> None:
+        model = _make_block_model()
+        shared = nn.Linear(8, 8, bias=False).requires_grad_(False)
+        model.transformer_blocks = nn.ModuleList([shared, shared])
+
+        with pytest.raises(
+            ValueError,
+            match="transient_block_paths does not support aliased block modules",
+        ):
+            _make_model_offloader(
+                model,
+                transient_block_paths=["transformer_blocks"],
+            )
+
+        assert shared.weight.device.type == "cpu"
 
     def test_block_paths_resolving_to_non_modulelist_raises(self) -> None:
         m = _make_block_model(num_blocks=4)

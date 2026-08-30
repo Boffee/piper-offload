@@ -301,6 +301,11 @@ activation remains eager and installs no scheduling hooks. Ordinary and
 rolling transient block groups both stop at the final block instead of filling
 block 0 immediately before release.
 
+Every module object in a `transient_block_paths` group must be distinct. An
+ordinary `block_paths` group may still reuse a module object, but a module hook
+cannot distinguish which aliased list position just completed and therefore
+cannot provide a safe early-release boundary.
+
 ### Optional streamed-block compilation
 
 Repeated streamed blocks can opt into forward-only Inductor compilation at
