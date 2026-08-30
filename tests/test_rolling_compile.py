@@ -522,6 +522,38 @@ class TestRollingCompile:
         torch.testing.assert_close(second, first, rtol=0, atol=0)
 
     @CUDA
+    def test_transient_streaming_stops_rollover_at_final_block(self) -> None:
+        model = _BlockModel(num_blocks=3)
+        offloader = _make_offloader(
+            model,
+            block_compile=BlockCompileConfig(
+                dynamic=False,
+                rolling=True,
+                fullgraph=True,
+            ),
+            transient_streaming=True,
+        )
+        runtime = streamed_components(offloader)[0]._rolling_runtime
+        assert runtime is not None
+        original_refill = runtime._refill
+        refills: list[int] = []
+
+        def record_refill(block_idx: int, param_idx: int) -> None:
+            refills.append(block_idx)
+            original_refill(block_idx, param_idx)
+
+        runtime._refill = record_refill  # type: ignore[method-assign]
+        try:
+            with activated_model(offloader, "cuda"):
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+                torch.cuda.synchronize()
+        finally:
+            offloader.deactivate()
+
+        assert refills == [1, 2]
+
+    @CUDA
     def test_transient_rolling_target_survives_separate_activations(self) -> None:
         torch.manual_seed(14)
         baseline_model = _BlockModel()

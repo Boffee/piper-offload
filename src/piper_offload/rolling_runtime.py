@@ -52,10 +52,13 @@ class _RollingTargetRuntime:
         instances: tuple[PinnedModuleInstance, ...],
         param_names: tuple[str, ...],
         log_label: str,
+        *,
+        wraparound: bool = True,
     ) -> None:
         self._instances = instances
         self._param_names = param_names
         self._log_label = log_label
+        self._wraparound = wraparound
         self._reset_acquired_state()
 
     def _reset_acquired_state(self) -> None:
@@ -172,6 +175,8 @@ class _RollingTargetRuntime:
 
         next_idx = block_idx + 1
         if next_idx == len(self._instances):
+            if not self._wraparound:
+                return
             next_idx = 0
 
         name = self._param_names[param_idx]
@@ -266,6 +271,7 @@ def create_rolling_runtime(
     config: BlockCompileConfig | None,
     *,
     log_label: str,
+    wraparound: bool = True,
 ) -> _RollingTargetRuntime | None:
     """Validate and create the configured rolling runtime, if enabled."""
     if config is None or not config.rolling:
@@ -288,7 +294,12 @@ def create_rolling_runtime(
             reference_layouts,
         )
 
-    return _RollingTargetRuntime(tuple(instances), param_names, log_label)
+    return _RollingTargetRuntime(
+        tuple(instances),
+        param_names,
+        log_label,
+        wraparound=wraparound,
+    )
 
 
 __all__ = ["create_rolling_runtime"]

@@ -234,6 +234,7 @@ class CompositeComponentStore:
         model: nn.Module,
         *,
         block_compile: BlockCompileConfig | None = None,
+        wraparound: bool = True,
     ) -> CompositeComponent:
         resident = self.resident_store.bind(model) if self.resident_store else None
         transient = tuple(
@@ -241,7 +242,11 @@ class CompositeComponentStore:
             for path, store in self.transient_stores
         )
         streamed = tuple(
-            store.bind(model, block_compile=block_compile)
+            store.bind(
+                model,
+                block_compile=block_compile,
+                wraparound=wraparound,
+            )
             for store in self.streamed_stores
         )
         return CompositeComponent(

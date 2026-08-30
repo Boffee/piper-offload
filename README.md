@@ -297,7 +297,8 @@ autograd state. Paths must own disjoint state, and shared-storage aliases must
 not cross component boundaries; these guarantees belong to the caller. CPU
 activation remains eager and installs no scheduling hooks. Ordinary and
 rolling streaming use the same component-level acquire/release contract;
-rolling retains its normal block-0 wraparound refill before release.
+both stop scheduling at the final block instead of filling block 0 immediately
+before release.
 
 ### Optional streamed-block compilation
 
@@ -387,8 +388,10 @@ parameters, and no streamed buffers. Bitsandbytes, DTensor, unreviewed external 
 heterogeneous block layouts continue to use the existing morphing block-target
 pool. Structured logical weights are tracked across every AOT-flattened storage
 input, and the refill is placed after the last reader of any storage tensor.
-Repeated traversal rolls the final block directly into block zero. Skipped or
-out-of-order traversal remains correct through a foreground-refill fallback.
+Repeated resident traversal rolls the final block directly into block zero.
+Transient streaming stops at the final block and reacquires a fresh block-0
+target after the root model forward. Skipped or out-of-order traversal remains
+correct through a foreground-refill fallback.
 
 For the supported contract, the scheduler-only lifecycle edges preserve the
 ordinary compiled compute kernels and their autotuning identity. The benchmark

@@ -114,11 +114,13 @@ class BlockStreamingRuntime:
         instances: Sequence[PinnedModuleInstance],
         *,
         log_label: str,
+        wraparound: bool = True,
     ) -> None:
         self._instances = tuple(instances)
         self._blocks = tuple(instance.module for instance in instances)
         self._signatures = tuple(_instance_target_signature(instance) for instance in instances)
         self._log_label = log_label
+        self._wraparound = wraparound
         self._device: torch.device | None = None
         self._pool: _MorphingTargetPool | None = None
         self._block_to_lease: dict[int, _CudaTargetLease] = {}
@@ -369,6 +371,8 @@ class BlockStreamingRuntime:
         last = self._last_idx
         self._last_idx = idx
         num_blocks = len(self._instances)
+        if not self._wraparound and idx == num_blocks - 1:
+            return
         if last < 0:
             direction = 1
         else:

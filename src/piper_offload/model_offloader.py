@@ -211,7 +211,11 @@ class ModelOffloader:
             host_backing=backing,
         )
         cache_bytes = composite_store.cache_bytes
-        composite = composite_store.bind(model, block_compile=block_compile)
+        composite = composite_store.bind(
+            model,
+            block_compile=block_compile,
+            wraparound=not transient_streaming,
+        )
         return cls(
             model,
             composite=composite,

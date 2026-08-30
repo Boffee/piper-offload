@@ -512,6 +512,7 @@ class StreamedComponentStore:
         model: nn.Module,
         *,
         block_compile: BlockCompileConfig | None = None,
+        wraparound: bool = True,
     ) -> StreamedComponent:
         """Bind this store's per-block backing bytes to ``model``.
 
@@ -547,6 +548,7 @@ class StreamedComponentStore:
             name=self.blocks_path,
             block_indices=self.block_indices,
             block_compile=block_compile,
+            wraparound=wraparound,
         )
 
 
@@ -586,8 +588,8 @@ class StreamedComponent:
     ``block_compile`` policy belongs to this bound runtime and installs lazy
     compiled forwards only for eligible CUDA inference activations. Ordinary
     streaming owns one active block and one lookahead target; rolling
-    compilation owns one shared parameter target. Iteration wraparound is an
-    internal scheduling detail of both strategies.
+    compilation owns one shared parameter target. Both strategies wrap to
+    block 0 by default; transient model scheduling disables that wraparound.
     There is no ``close()``; pinned memory in module state is freed when the
     caller drops the binding and model references.
 
@@ -626,6 +628,9 @@ class StreamedComponent:
         Optional forward-only compile policy. One lazy callable is retained per
         distinct block module object, installed during eligible CUDA
         activations, and removed on deactivate. CPU activation stays eager.
+    wraparound:
+        Whether the runtime prepares block 0 while executing the final block.
+        :class:`ModelOffloader` disables this for transient streamed pools.
     """
 
     def __init__(
@@ -635,6 +640,7 @@ class StreamedComponent:
         name: str | None = None,
         block_indices: Sequence[int] | None = None,
         block_compile: BlockCompileConfig | None = None,
+        wraparound: bool = True,
     ) -> None:
         self._block_instances = list(block_instances)
         if block_indices is None:
@@ -651,11 +657,13 @@ class StreamedComponent:
         self._block_runtime = BlockStreamingRuntime(
             self._block_instances,
             log_label=self._log_label,
+            wraparound=wraparound,
         )
         self._rolling_runtime = create_rolling_runtime(
             self._block_instances,
             block_compile,
             log_label=self._log_label,
+            wraparound=wraparound,
         )
         compile_runtime: StreamingRuntime = self._rolling_runtime or self._block_runtime
         self._block_compile = _BlockCompileState.create(

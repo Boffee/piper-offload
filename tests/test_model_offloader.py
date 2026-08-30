@@ -1224,6 +1224,24 @@ class TestTraversalPrefetch:
         assert recorded == [1, 2, 3, 0], recorded
 
     @CUDA
+    def test_transient_streaming_stops_prefetch_at_final_block(self) -> None:
+        model = _make_block_model(num_blocks=4, width=8)
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["transformer_blocks"],
+            transient_streaming=True,
+        )
+        streamer = streamed_components(offloader)[0]
+
+        with activated_model(offloader, "cuda"):
+            recorded = self._record_prefetches(streamer)
+            with torch.inference_mode():
+                model(torch.randn(2, 8, device="cuda"))
+            torch.cuda.synchronize()
+
+        assert recorded == [1, 2, 3]
+
+    @CUDA
     def test_continuous_backward_stays_backward(self) -> None:
         # Step-by-step reverse traversal (3, 2, 1, 0): each Δ=-1 is
         # below the wrap threshold, so direction inference yields
