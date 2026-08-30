@@ -78,3 +78,8 @@ def streamed_components(offloader: object) -> list:
 def pinned_component(offloader: object):
     """A ModelOffloader's resident component, or None."""
     return offloader._composite.resident  # type: ignore[attr-defined]
+
+
+def transient_components(offloader: object) -> list:
+    """A ModelOffloader's ``(path, component)`` transient pairs."""
+    return list(offloader._composite.transient)  # type: ignore[attr-defined]

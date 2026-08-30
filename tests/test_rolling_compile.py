@@ -522,6 +522,34 @@ class TestRollingCompile:
         torch.testing.assert_close(second, first, rtol=0, atol=0)
 
     @CUDA
+    def test_transient_rolling_target_survives_separate_activations(self) -> None:
+        torch.manual_seed(14)
+        baseline_model = _BlockModel()
+        rolling_model = copy.deepcopy(baseline_model)
+        value = torch.randn(2, 8, device="cuda")
+        with torch.inference_mode():
+            expected = baseline_model(value.cpu()).cuda()
+
+        offloader = _make_offloader(
+            rolling_model,
+            block_compile=BlockCompileConfig(
+                dynamic=False,
+                rolling=True,
+                fullgraph=True,
+            ),
+            transient_streaming=True,
+        )
+        with torch.inference_mode():
+            with activated_model(offloader, "cuda"):
+                first = rolling_model(value).clone()
+            with activated_model(offloader, "cuda"):
+                second = rolling_model(value).clone()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(first, expected)
+        torch.testing.assert_close(second, first, rtol=0, atol=0)
+
+    @CUDA
     def test_routed_lora_selects_block_runtime_for_activation(self) -> None:
         model = _BlockModel()
         offloader = _make_offloader(

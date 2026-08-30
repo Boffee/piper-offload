@@ -28,8 +28,9 @@ class ModelSpec[M: nn.Module]:
     are rejected by the offloader. ``block_compile`` is an opt-in construction
     policy for every streamed group named by ``block_paths``.
     ``transient_streaming`` scopes those groups' CUDA pools to model-forward
-    execution. ``host_backing`` selects pinned copies (the default) or strict
-    zero-copy adoption of existing CPU model backing.
+    execution. ``transient_paths`` gives named modules independent CUDA working
+    sets scoped to their forwards. ``host_backing`` selects pinned copies (the
+    default) or strict zero-copy adoption of existing CPU model backing.
     """
 
     key: str
@@ -40,6 +41,7 @@ class ModelSpec[M: nn.Module]:
     block_compile: BlockCompileConfig | None = None
     host_backing: HostBacking = "pinned"
     transient_streaming: bool = False
+    transient_paths: tuple[str, ...] = ()
 
     def build_store(self) -> ModelOffloader:
         """Build, pin, and bind the cached model runtime."""
@@ -50,6 +52,7 @@ class ModelSpec[M: nn.Module]:
             block_compile=self.block_compile,
             host_backing=self.host_backing,
             transient_streaming=self.transient_streaming,
+            transient_paths=self.transient_paths,
         )
 
     def value(self, store: ResourceStore) -> ModelOffloader:

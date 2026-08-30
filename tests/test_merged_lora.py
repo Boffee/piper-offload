@@ -56,6 +56,7 @@ from piper_offload.tensor_adapters import (
 from tests.conftest import (
     activated_model,
     streamed_components,
+    transient_components,
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -108,15 +109,17 @@ def _quanto_absmax_oracle(
 def _make_model_offloader(
     model: nn.Module,
     *,
-    block_paths: list[str] = [],
+    block_paths: Sequence[str] = (),
     stream_trainable_weights: bool = False,
     transient_streaming: bool = False,
+    transient_paths: Sequence[str] = (),
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
         block_paths=block_paths,
         stream_trainable_weights=stream_trainable_weights,
         transient_streaming=transient_streaming,
+        transient_paths=transient_paths,
     )
 
 
@@ -1148,6 +1151,43 @@ class TestLifecycle:
 
 
 class TestMergeCorrectness:
+    @CUDA
+    @pytest.mark.parametrize("mode", ["merge", "routed"])
+    def test_transient_path_preserves_lora_on_reacquire(
+        self,
+        mode: LoRAMode,
+    ) -> None:
+        model = _make_bf16_model(num_blocks=2, dim=16)
+        lora = LoRA.from_state_dict(
+            {
+                "embed.lora_A.weight": torch.randn(4, 16),
+                "embed.lora_B.weight": torch.randn(16, 4),
+            }
+        )
+        offloader = _make_model_offloader(
+            model,
+            transient_paths=["embed"],
+        )
+        component = dict(transient_components(offloader))["embed"]
+        _request_loras(offloader, [(lora, 0.5)], mode=mode)
+        _activate(offloader, "cuda")
+        try:
+            value = torch.randn(
+                2,
+                16,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            with torch.inference_mode():
+                first = model(value).clone()
+                second = model(value).clone()
+            torch.cuda.synchronize()
+            assert component._lease is not None
+        finally:
+            offloader.deactivate()
+
+        torch.testing.assert_close(second, first, rtol=0, atol=0)
+
     @CUDA
     @pytest.mark.parametrize("mode", ["merge", "routed"])
     def test_transient_streaming_preserves_lora_on_reacquire(

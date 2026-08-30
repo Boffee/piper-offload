@@ -13,10 +13,11 @@ class _CudaTargetLease:
     The caller chooses the allocation-owner stream: short-lived staged
     components use the default allocator pool, while block lookahead targets
     stay with their copy stream. A ready event orders consumption after copies;
-    recorded consumer streams order later refills, and the allocation stream
-    waits for all remaining target work before storage is dropped. These stream
-    handoffs keep storage in its original allocator pool and work for opaque
-    adapter state without inspecting its physical tensors.
+    recorded consumer streams order later refills. These stream handoffs keep
+    storage in its original allocator pool and work for opaque adapter state
+    without inspecting its physical tensors. Closing the lease synchronizes all
+    recorded work before dropping the target so its storage cannot be
+    immediately reused while CUDA still accesses it.
     """
 
     def __init__(
@@ -120,17 +121,20 @@ class _CudaTargetLease:
         self._acquired = False
 
     def close(self) -> None:
-        """Release target storage without a device- or host-wide sync."""
+        """Release target storage after all recorded CUDA work completes."""
         if self._target is None:
             return
         self.release()
-        if self._ready_event is not None:
-            self._allocation_stream.wait_event(self._ready_event)
-        for tracked in self._lifetime_streams | self._consumer_streams:
-            if tracked != self._allocation_stream:
-                self._allocation_stream.wait_stream(tracked)
-        self._target = None
-        self._ready_event = None
-        self._staged = False
-        self._consumer_streams.clear()
-        self._lifetime_streams.clear()
+        try:
+            if self._ready_event is not None:
+                self._ready_event.synchronize()
+            streams = self._lifetime_streams | self._consumer_streams
+            streams.add(self._allocation_stream)
+            for stream in streams:
+                stream.synchronize()
+        finally:
+            self._target = None
+            self._ready_event = None
+            self._staged = False
+            self._consumer_streams.clear()
+            self._lifetime_streams.clear()

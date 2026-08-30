@@ -56,32 +56,42 @@ def test_stage_is_registry_pure_and_reuse_waits_for_consumer() -> None:
     torch.testing.assert_close(actual_second, expected_second)
 
 
-def test_close_hands_target_work_back_to_allocation_stream() -> None:
+def test_close_synchronizes_target_work_before_drop() -> None:
+    class Event:
+        def __init__(self) -> None:
+            self.synchronize_calls = 0
+
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
+
     class Stream:
         def __init__(self) -> None:
-            self.waited_events: list[object] = []
-            self.waited_streams: list[object] = []
+            self.synchronize_calls = 0
 
-        def wait_event(self, event: object) -> None:
-            self.waited_events.append(event)
-
-        def wait_stream(self, stream: object) -> None:
-            self.waited_streams.append(stream)
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
 
     allocation_stream = Stream()
     tracked_stream = Stream()
-    ready = object()
+    consumer_stream = Stream()
+    ready = Event()
     lease = _CudaTargetLease(
         cast(PinnedModuleTarget, object()),
         cast(torch.cuda.Stream, allocation_stream),
     )
     lease._ready_event = cast(torch.cuda.Event, ready)
+    lease._acquired = True
+    lease.mark_used(cast(torch.cuda.Stream, consumer_stream))
     lease.track_lifetime_stream(cast(torch.cuda.Stream, tracked_stream))
 
     lease.close()
 
-    assert allocation_stream.waited_events == [ready]
-    assert allocation_stream.waited_streams == [tracked_stream]
+    assert ready.synchronize_calls == 1
+    assert allocation_stream.synchronize_calls == 1
+    assert consumer_stream.synchronize_calls == 1
+    assert tracked_stream.synchronize_calls == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = lease.target
 
 
 def test_restage_waits_for_every_actual_use_stream(

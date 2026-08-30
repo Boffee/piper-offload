@@ -25,9 +25,11 @@ from .lora import (
     install_routed_residual_hook,
 )
 from .module_names import resolve_parent_leaf, sibling_parameter_name
+from .pinned_component import PinnedComponent
 from .streamed_component import StreamedComponent
 
 type _LoraParamMap = dict[str, list[ScaledLoRAFactor]]
+type _TransientComponent = PinnedComponent | StreamedComponent
 type _ForwardHook = Callable[
     [nn.Module, tuple[object, ...], object],
     object | None,
@@ -35,18 +37,18 @@ type _ForwardHook = Callable[
 
 
 def _release_after_forward_hook(
-    streamer: StreamedComponent,
+    component: _TransientComponent,
 ) -> _ForwardHook:
-    streamer_ref = weakref.ref(streamer)
+    component_ref = weakref.ref(component)
 
     def release(
         _module: nn.Module,
         _args: tuple[object, ...],
         _output: object,
     ) -> None:
-        streamer = streamer_ref()
-        if streamer is not None:
-            streamer.release()
+        component = component_ref()
+        if component is not None:
+            component.release()
 
     return release
 
@@ -72,17 +74,17 @@ class ModelOffloader:
 
     When ``block_paths`` is omitted, CUDA activation bulk-copies every
     managed parameter and buffer to CUDA. When it is set, CUDA activation
-    streams the selected block groups while non-streamed state remains resident
-    for the activation.
+    streams the selected block groups while other state remains resident unless
+    its module is selected by ``transient_paths``.
     Supplying ``block_compile`` at construction opts streamed block forwards
     into Inductor during CUDA inference. CPU activation is pass-through over
     the host-backed module state and remains eager.
 
-    Composes a resident :class:`PinnedComponent`
-    with one or more :class:`StreamedComponent`\\ s internally. LoRA requests
-    are supplied directly to :meth:`activate`; merge mode installs
-    activation-scoped post-copy hooks so the merge fires immediately after
-    each CPU->GPU weight copy. No separate merge binding is needed.
+    Composes resident and transient :class:`PinnedComponent`\\ s with one or
+    more :class:`StreamedComponent`\\ s internally. LoRA requests are supplied
+    directly to :meth:`activate`; merge mode installs activation-scoped
+    post-copy hooks so the merge fires immediately after each CPU->GPU weight
+    copy. No separate merge binding is needed.
 
     Training
     --------
@@ -165,6 +167,7 @@ class ModelOffloader:
         block_compile: BlockCompileConfig | None = None,
         host_backing: HostBacking = "pinned",
         transient_streaming: bool = False,
+        transient_paths: Sequence[str] = (),
     ) -> Self:
         """Clone and bind ``model`` as one reusable cached runtime.
 
@@ -177,6 +180,8 @@ class ModelOffloader:
         activation or the preceding model completion through its final block;
         the root model post-forward hook reacquires released pools for the next
         call.
+        Each module named by ``transient_paths`` similarly owns a separate
+        CUDA working set that releases after that module's forward.
         ``host_backing`` defaults to a pinned copy; ``"adopt"`` strictly
         retains frozen state already in CPU RAM and uses direct CUDA copies
         without an application-owned staging pool. It never silently
@@ -201,6 +206,7 @@ class ModelOffloader:
         composite_store = CompositeComponentStore.from_module(
             model,
             block_paths=block_paths,
+            transient_paths=transient_paths,
             stream_trainable_weights=stream_trainable_weights,
             host_backing=backing,
         )
@@ -362,35 +368,46 @@ class ModelOffloader:
         )
         return handle.remove
 
-    def _install_transient_streaming_hooks(self) -> None:
-        streamers = self._composite.streamed
-        for streamer in streamers:
-            handle = streamer.blocks[-1].register_forward_hook(
-                _release_after_forward_hook(streamer),
+    def _install_transient_hooks(self) -> None:
+        components: list[_TransientComponent] = []
+        for path, component in self._composite.transient:
+            self._transient_hook_removers.append(
+                self.register_forward_hook(
+                    path,
+                    _release_after_forward_hook(component),
+                )
             )
-            self._transient_hook_removers.append(handle.remove)
+            components.append(component)
 
-        offloader_ref = weakref.ref(self)
+        if self._transient_streaming:
+            for streamer in self._composite.streamed:
+                handle = streamer.blocks[-1].register_forward_hook(
+                    _release_after_forward_hook(streamer),
+                )
+                self._transient_hook_removers.append(handle.remove)
+                components.append(streamer)
+
+        component_refs = tuple(weakref.ref(component) for component in components)
 
         def reacquire_after_forward(
             _module: nn.Module,
             _args: tuple[object, ...],
             _output: object,
         ) -> None:
-            offloader = offloader_ref()
-            if offloader is not None:
-                # A model post-hook inherits the caller's inference-mode
-                # context. Reusable targets must remain mutable because later
-                # prefetch threads refill them outside that context.
-                with torch.inference_mode(False):
-                    for streamer in offloader._composite.streamed:
-                        streamer.acquire()
+            # A model post-hook inherits the caller's inference-mode context.
+            # Reusable targets must remain mutable because later prefetch
+            # threads refill them outside that context.
+            with torch.inference_mode(False):
+                for component_ref in component_refs:
+                    component = component_ref()
+                    if component is not None:
+                        component.acquire()
 
         self._transient_hook_removers.append(
             self.register_forward_hook("", reacquire_after_forward)
         )
 
-    def _clear_transient_streaming_hooks(self) -> None:
+    def _clear_transient_hooks(self) -> None:
         remove_hooks = self._transient_hook_removers
         self._transient_hook_removers = []
         for remove_hook in reversed(remove_hooks):
@@ -497,14 +514,19 @@ class ModelOffloader:
                     )
                 else:
                     self._register_routed_lora_hooks(targets)
-            schedule_streaming = (
-                self._transient_streaming
-                and bool(self._composite.streamed)
-                and active_device.type == "cuda"
+            schedule_transient = (
+                active_device.type == "cuda"
+                and (
+                    bool(self._composite.transient)
+                    or (
+                        self._transient_streaming
+                        and bool(self._composite.streamed)
+                    )
+                )
             )
             activation_context = (
                 torch.inference_mode(False)
-                if schedule_streaming
+                if schedule_transient
                 else contextlib.nullcontext()
             )
             # Reusable transient targets must be mutable even if the caller
@@ -516,8 +538,8 @@ class ModelOffloader:
                         active_loras and lora_mode == "routed"
                     ),
                 )
-            if schedule_streaming:
-                self._install_transient_streaming_hooks()
+            if schedule_transient:
+                self._install_transient_hooks()
         except BaseException:
             # Deactivation is idempotent over partial component and hook state.
             self.deactivate()
@@ -530,7 +552,7 @@ class ModelOffloader:
         # asynchronous copies before removing LoRA merge hooks. Cleanup and
         # activation-lock release still run if component teardown raises.
         try:
-            self._clear_transient_streaming_hooks()
+            self._clear_transient_hooks()
         finally:
             try:
                 self._composite.deactivate()

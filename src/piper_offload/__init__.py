@@ -82,7 +82,8 @@ from a fresh model instance.
 :class:`ModelOffloader` composes:
   1. A resident :class:`PinnedComponent` for non-streamed state, including
      trainables skipped by block streaming.
-  2. One :class:`StreamedComponent` per path in ``block_paths`` when streaming
+  2. One :class:`PinnedComponent` per stateful path in ``transient_paths``.
+  3. One :class:`StreamedComponent` per path in ``block_paths`` when streaming
      is configured.
 
 Optional LoRA merging is requested directly on :meth:`ModelOffloader.activate`

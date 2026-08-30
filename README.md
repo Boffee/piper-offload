@@ -267,33 +267,37 @@ CPU activation. Routed LoRA installs target-Linear hooks: a forward-PRE
 hook copies that target's host-backed factors to the input device, and a
 forward-POST hook applies the residual and releases those device copies.
 
-### Optional transient streaming
+### Optional transient residency
 
-Inference workloads can scope streamed CUDA pools to their block traversals:
+Inference workloads can release large modules and streamed pools as soon as
+their traversals finish:
 
 ```python
 offload = ModelOffloader.from_module(
     model,
     block_paths=["transformer_blocks"],
     transient_streaming=True,
+    transient_paths=["input_embedder", "output_head"],
 )
 ```
 
-CUDA activation initially acquires every streamed pool. After a group's final
-block succeeds, its pool is released before later groups or resident suffix
-modules execute. A successful root-model forward then reacquires all pools for
-the next invocation. This is the latency-oriented policy: the next block-0
-load is prefetched after the model completes, so those pools remain allocated
-during the following prefix. A conditionally skipped group remains acquired.
+Each `transient_paths` module recursively owns a separate CUDA working set for
+its non-streamed state. Its successful forward releases that set
+immediately, before later model work. `transient_streaming=True` applies the
+same policy to every declared `block_paths` pool, releasing it after its final
+block. A successful root-model forward reacquires all released components for
+the next invocation. A conditionally skipped component remains acquired.
 
-The option is off by default and has no effect without a `block_paths` group.
-It is intended for inference models whose final block uniquely marks one
-completed traversal. ModelOffloader deliberately does not inspect call counts,
-module aliases, or autograd state; those execution-boundary guarantees belong
-to the caller. CPU activation remains eager and installs no scheduling hooks.
-Both ordinary and rolling streaming use the same component-level
-acquire/release contract; rolling retains its normal block-0 wraparound refill
-before release.
+Paths are deliberately narrow: the named module's own `forward` is its release
+boundary, so it cannot run again or have its state used later in the same root
+call. A skipped path simply remains acquired. `ModuleList`/`ModuleDict`
+containers are not expanded, and ModelOffloader does not inspect repeated
+calls, functional parameter access, aliases across component boundaries, or
+autograd state. Paths must own disjoint state, and shared-storage aliases must
+not cross component boundaries; these guarantees belong to the caller. CPU
+activation remains eager and installs no scheduling hooks. Ordinary and
+rolling streaming use the same component-level acquire/release contract;
+rolling retains its normal block-0 wraparound refill before release.
 
 ### Optional streamed-block compilation
 
@@ -828,6 +832,10 @@ registration / cache admission
         |                    |
         |                    +-- PinnedComponent
         |                    |       |  resident non-block state
+        |                    |       +-- PinnedParam(s)
+        |                    |
+        |                    +-- PinnedComponent(s)
+        |                    |       |  transient path state
         |                    |       +-- PinnedParam(s)
         |                    |
         |                    +-- StreamedComponent(s)

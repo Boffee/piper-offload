@@ -18,6 +18,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - Add opt-in `transient_streaming` scheduling to `ModelOffloader`. Streamed
   CUDA pools release after their final blocks and reacquire after the root
   model forward without runtime-specific coordination.
+- Add `transient_paths` for named modules whose independent CUDA working sets
+  release after their forwards and reacquire after the root model forward.
 
 ### Removed
 

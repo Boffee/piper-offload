@@ -32,6 +32,7 @@ from tests.conftest import (
     activated_model,
     pinned_component,
     streamed_components,
+    transient_components,
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -40,15 +41,17 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def _make_model_offloader(
     model: nn.Module,
     *,
-    block_paths: list[str] = [],
+    block_paths: Sequence[str] = (),
     stream_trainable_weights: bool = False,
     transient_streaming: bool = False,
+    transient_paths: Sequence[str] = (),
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
         block_paths=block_paths,
         stream_trainable_weights=stream_trainable_weights,
         transient_streaming=transient_streaming,
+        transient_paths=transient_paths,
     )
 
 
@@ -892,26 +895,112 @@ class TestHookLifecycle:
 
 
 # ---------------------------------------------------------------------------
-# ModelOffloader-owned transient streaming schedule
+# ModelOffloader-owned transient residency schedule
 # ---------------------------------------------------------------------------
 
 
-class TestTransientStreaming:
+class TestTransientResidency:
+    def test_transient_paths_partition_from_resident_state(self) -> None:
+        model = _make_block_model()
+        model.embed.register_buffer("table", torch.randn(8))
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["transformer_blocks"],
+            transient_paths=["embed", "head"],
+        )
+        try:
+            components = dict(transient_components(offloader))
+            assert components["embed"].param_names == {"embed.weight"}
+            assert components["embed"].buffer_names == {"embed.table"}
+            assert components["head"].param_names == {"head.weight"}
+            assert pinned_component(offloader) is None
+        finally:
+            offloader.deactivate()
+
     def test_cpu_activation_stays_eager(self) -> None:
         model = _make_block_model()
         offloader = _make_model_offloader(
             model,
             block_paths=["transformer_blocks"],
             transient_streaming=True,
+            transient_paths=["embed", "head"],
         )
         try:
             with activated_model(offloader, "cpu"):
                 with torch.inference_mode():
                     model(torch.randn(2, 8))
                 assert not model._forward_hooks
+                assert not model.embed._forward_hooks
+                assert not model.head._forward_hooks
                 assert not model.transformer_blocks[-1]._forward_hooks
         finally:
             offloader.deactivate()
+
+    @CUDA
+    def test_paths_and_streaming_release_at_their_own_boundaries(self) -> None:
+        model = _make_block_model(num_blocks=3)
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["transformer_blocks"],
+            transient_streaming=True,
+            transient_paths=["embed", "head"],
+        )
+        components = dict(transient_components(offloader))
+        embed = components["embed"]
+        head = components["head"]
+        runtime = streamed_components(offloader)[0]._block_runtime
+        block_entry_states: list[tuple[bool, bool, bool]] = []
+        head_entry_states: list[tuple[bool, bool, bool]] = []
+        root_states: list[tuple[bool, bool, bool]] = []
+        block_handle = model.transformer_blocks[0].register_forward_pre_hook(
+            lambda _module, _args: block_entry_states.append(
+                (embed._lease is not None, runtime.acquired, head._lease is not None)
+            )
+        )
+        head_handle = model.head.register_forward_pre_hook(
+            lambda _module, _args: head_entry_states.append(
+                (embed._lease is not None, runtime.acquired, head._lease is not None)
+            )
+        )
+        root_handle = model.register_forward_hook(
+            lambda _module, _args, _output: root_states.append(
+                (embed._lease is not None, runtime.acquired, head._lease is not None)
+            )
+        )
+        try:
+            with activated_model(offloader, "cuda"):
+                value = torch.randn(2, 8, device="cuda")
+                with torch.inference_mode():
+                    first = model(value).clone()
+                    second = model(value).clone()
+                torch.cuda.synchronize()
+
+                assert block_entry_states == [
+                    (False, True, True),
+                    (False, True, True),
+                ]
+                assert head_entry_states == [
+                    (False, False, True),
+                    (False, False, True),
+                ]
+                assert root_states == [
+                    (False, False, False),
+                    (False, False, False),
+                ]
+                assert embed._lease is not None
+                assert runtime.acquired
+                assert head._lease is not None
+                torch.testing.assert_close(second, first, rtol=0, atol=0)
+        finally:
+            block_handle.remove()
+            head_handle.remove()
+            root_handle.remove()
+            offloader.deactivate()
+
+        assert not model._forward_hooks
+        assert not model.embed._forward_hooks
+        assert not model.head._forward_hooks
+        assert not model.transformer_blocks[-1]._forward_hooks
 
     @CUDA
     def test_activation_inside_inference_mode_keeps_targets_mutable(self) -> None:
@@ -920,12 +1009,15 @@ class TestTransientStreaming:
             model,
             block_paths=["transformer_blocks"],
             transient_streaming=True,
+            transient_paths=["embed"],
         )
+        embed = dict(transient_components(offloader))["embed"]
         runtime = streamed_components(offloader)[0]._block_runtime
         with torch.inference_mode():
             with activated_model(offloader, "cuda"):
                 model(torch.randn(2, 8, device="cuda"))
                 model(torch.randn(2, 8, device="cuda"))
+                assert embed._lease is not None
                 assert runtime.acquired
 
     @CUDA
@@ -1016,7 +1108,9 @@ class TestTransientStreaming:
             model,
             block_paths=["transformer_blocks"],
             transient_streaming=True,
+            transient_paths=["embed"],
         )
+        embed = dict(transient_components(offloader))["embed"]
         runtime = streamed_components(offloader)[0]._block_runtime
         try:
             offloader.activate("cuda")
@@ -1024,10 +1118,12 @@ class TestTransientStreaming:
                 with torch.inference_mode():
                     model(torch.randn(2, 8, device="cuda"))
             assert not runtime.acquired
+            assert embed._lease is None
         finally:
             offloader.deactivate()
 
         assert not model._forward_hooks
+        assert not model.embed._forward_hooks
         assert not model.transformer_blocks[-1]._forward_hooks
 
         model.head.fail = False
@@ -1036,6 +1132,7 @@ class TestTransientStreaming:
                 with torch.inference_mode():
                     model(torch.randn(2, 8, device="cuda"))
                 assert runtime.acquired
+                assert embed._lease is not None
         finally:
             offloader.deactivate()
 
@@ -1049,7 +1146,9 @@ class TestTransientStreaming:
             model,
             block_paths=["transformer_blocks"],
             transient_streaming=True,
+            transient_paths=["embed"],
         )
+        embed = dict(transient_components(offloader))["embed"]
         runtime = streamed_components(offloader)[0]._block_runtime
         original_register = model.register_forward_hook
 
@@ -1062,6 +1161,8 @@ class TestTransientStreaming:
 
         assert offloader.active_device is None
         assert not runtime.acquired
+        assert embed._lease is None
+        assert not model.embed._forward_hooks
         assert not model.transformer_blocks[-1]._forward_hooks
 
         monkeypatch.setattr(model, "register_forward_hook", original_register)
@@ -1070,6 +1171,7 @@ class TestTransientStreaming:
                 with torch.inference_mode():
                     model(torch.randn(2, 8, device="cuda"))
                 assert runtime.acquired
+                assert embed._lease is not None
         finally:
             offloader.deactivate()
 
@@ -1291,6 +1393,25 @@ class TestValidation:
 
 
 class TestResourceCacheIntegration:
+    def test_model_spec_propagates_transient_paths(self) -> None:
+        from piper_offload import ModelSpec
+
+        spec = ModelSpec(
+            key="transient",
+            estimated_cache_bytes=1024,
+            factory=_make_block_model,
+            block_paths=("transformer_blocks",),
+            transient_paths=("embed", "head"),
+        )
+
+        offloader = spec.build_store()
+        try:
+            assert [
+                path for path, _component in transient_components(offloader)
+            ] == ["embed", "head"]
+        finally:
+            offloader.deactivate()
+
     def test_model_spec_propagates_adopted_host_backing(self) -> None:
         from piper_offload import ModelSpec
 

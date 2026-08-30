@@ -309,6 +309,8 @@ class PinnedComponent:
         Registry entries and trainable gradients return to pinned CPU storage,
         and the CUDA target lease is closed. The activation session remains
         active so :meth:`acquire` can prepare another traversal.
+        Target retirement completes recorded CUDA work, so release is safe to
+        call immediately after a forward.
 
         Trainable ``.grad`` follows ``.data`` to pinned CPU here (grads
         otherwise linger wherever ``AccumulateGrad`` left them, i.e. on the

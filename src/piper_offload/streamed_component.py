@@ -883,7 +883,8 @@ class StreamedComponent:
         Blocks return to host backing and runtime-owned CUDA targets, streams,
         prefetch work, and hooks are released. The component remains active,
         and compiled forwards remain installed, so :meth:`acquire` can prepare
-        the same session for another traversal.
+        the same session for another traversal. Target retirement completes
+        recorded CUDA work, so release is safe immediately after a forward.
         """
         runtime = self._active_runtime
         if runtime is not None:
