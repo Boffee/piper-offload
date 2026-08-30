@@ -54,10 +54,6 @@ class _CudaTargetLease:
             raise RuntimeError("CUDA target lease is closed")
         return target
 
-    @property
-    def device(self) -> torch.device:
-        return self._allocation_stream.device
-
     def stage(
         self,
         instance: PinnedModuleInstance,

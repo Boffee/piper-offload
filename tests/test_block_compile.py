@@ -20,7 +20,6 @@ from tests._block_compile_helpers import (
 from tests.conftest import (
     activated_model,
     streamed_components,
-    synchronize_prefix_prefetch,
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -39,21 +38,6 @@ class _TwoGroupModel(nn.Module):
         for block in self.second_blocks:
             x = block(x)
         return x
-
-
-class _BoundaryBlockModel(nn.Module):
-    def __init__(self, width: int = 8) -> None:
-        super().__init__()
-        self.prefix = nn.Linear(width, width, bias=False)
-        self.blocks = nn.ModuleList([_Block(width), _Block(width)])
-        self.suffix = nn.Linear(width, width, bias=False)
-        self.requires_grad_(False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.prefix(x)
-        for block in self.blocks:
-            x = block(x)
-        return self.suffix(x)
 
 
 class _CompileSpy:
@@ -263,39 +247,6 @@ class TestCompiledForwardConstruction:
 
 
 class TestCompiledForwardLifecycle:
-    @CUDA
-    @pytest.mark.parametrize("rolling", [False, True])
-    def test_boundary_pinned_state_composes_with_compiled_blocks(
-        self,
-        rolling: bool,
-    ) -> None:
-        torch.manual_seed(0)
-        model = _BoundaryBlockModel()
-        value = torch.randn(2, 8)
-        with torch.inference_mode():
-            expected = model(value).cuda()
-        offloader = ModelOffloader.from_module(
-            model,
-            block_paths=("blocks",),
-            prefix_paths=("prefix",),
-            suffix_paths=("suffix",),
-            block_compile=BlockCompileConfig(
-                dynamic=False,
-                fullgraph=True,
-                rolling=rolling,
-            ),
-        )
-        try:
-            with activated_model(offloader, "cuda"):
-                with torch.inference_mode():
-                    actual = model(value.cuda()).clone()
-                synchronize_prefix_prefetch(offloader)
-                assert model.prefix.weight.device.type == "cpu"
-                assert model.suffix.weight.is_pinned()
-            torch.testing.assert_close(actual, expected)
-        finally:
-            offloader.deactivate()
-
     def test_cpu_activation_remains_eager(
         self,
         monkeypatch: pytest.MonkeyPatch,

@@ -235,8 +235,20 @@ class PinnedComponent:
             self._active_device = active_device
         elif active_device.type == "cuda":
             current_stream = torch.cuda.current_stream(active_device)
-            self._stage(active_device, current_stream)
-            self._acquire(current_stream)
+            lease = _CudaTargetLease.allocate(self._instance, active_device)
+            try:
+                lease.stage(
+                    self._instance,
+                    current_stream,
+                    run_post_copy_hooks=True,
+                    non_blocking=True,
+                )
+            except BaseException:
+                lease.close()
+                raise
+            self._lease = lease
+            self._instance.install_target(lease.acquire(current_stream))
+            self._active_device = active_device
             torch.cuda.synchronize(active_device)
             # Realign trainable grads with their now-GPU data so the next
             # backward accumulates on-device. A no-op unless a prior CPU
@@ -248,51 +260,6 @@ class PinnedComponent:
                 "PinnedComponent.activate() supports CUDA or CPU; "
                 f"got {active_device}."
             )
-
-    def _stage(
-        self,
-        device: torch.device,
-        stream: torch.cuda.Stream,
-    ) -> None:
-        """Asynchronously fill a CUDA target without installing it.
-
-        Package-internal: boundary streaming stages the next prefix on its
-        copy stream, then installs it on the model thread only after the
-        consuming stream has acquired the target.
-        """
-        if self._active_device is not None or self._lease is not None:
-            raise RuntimeError(
-                "PinnedComponent stage requested with an active or staged target."
-            )
-        lease_device = canonical_device(device)
-        if lease_device.type != "cuda":
-            raise ValueError(
-                "PinnedComponent staging requires CUDA; "
-                f"got {lease_device}."
-            )
-        lease = _CudaTargetLease.allocate(self._instance, lease_device)
-        try:
-            lease.stage(
-                self._instance,
-                stream,
-                run_post_copy_hooks=True,
-                non_blocking=True,
-            )
-        except BaseException:
-            lease.close()
-            raise
-        self._lease = lease
-
-    def _acquire(self, stream: torch.cuda.Stream) -> None:
-        """Install the staged target for consumption on ``stream``."""
-        if self._active_device is not None:
-            raise RuntimeError("PinnedComponent staged target is already active.")
-        lease = self._lease
-        if lease is None:
-            raise RuntimeError("PinnedComponent has no staged CUDA target.")
-        target = lease.acquire(stream)
-        self._instance.install_target(target)
-        self._active_device = lease.device
 
     def _install_use_hook(self) -> None:
         """Track the CUDA stream that actually executes the bound module."""
@@ -320,21 +287,6 @@ class PinnedComponent:
         if hook is not None:
             hook.remove()
 
-    def _release(self) -> None:
-        """Restore host backing and safely discard any staged CUDA target."""
-        self._remove_use_hook()
-        lease = self._lease
-        try:
-            self._instance.install_pinned()
-            self._instance.move_trainable_grads_to(torch.device("cpu"))
-        finally:
-            try:
-                if lease is not None:
-                    lease.close()
-            finally:
-                self._lease = None
-                self._active_device = None
-
     def deactivate(self) -> None:
         """Repoint registry entries back at pinned-CPU Parameters. Idempotent —
         safe to call before activate or multiple times. After
@@ -349,7 +301,18 @@ class PinnedComponent:
         ``.grad`` both on pinned CPU — so a context-free CPU
         ``optimizer.step()`` works the same for pinned and streamed
         trainables."""
-        self._release()
+        self._remove_use_hook()
+        lease = self._lease
+        try:
+            self._instance.install_pinned()
+            self._instance.move_trainable_grads_to(torch.device("cpu"))
+        finally:
+            try:
+                if lease is not None:
+                    lease.close()
+            finally:
+                self._lease = None
+                self._active_device = None
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:

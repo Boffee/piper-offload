@@ -5,6 +5,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Removed
+
+- Remove the `prefix_paths` and `suffix_paths` model selectors and their
+  boundary-scoped CUDA runtime. Non-streamed model state is resident for the
+  activation again.
+
 ## [0.4.1] - 2026-08-29
 
 ### Changed

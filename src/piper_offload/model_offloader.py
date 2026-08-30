@@ -49,15 +49,13 @@ class ModelOffloader:
 
     When ``block_paths`` is omitted, CUDA activation bulk-copies every
     managed parameter and buffer to CUDA. When it is set, CUDA activation
-    streams the selected block groups. Non-streamed state is resident for the
-    activation by default; frozen state selected by ``prefix_paths`` and
-    ``suffix_paths`` instead resides on CUDA only before or after the central
-    block span, with the next prefix prefetched after each successful forward.
+    streams the selected block groups while non-streamed state remains resident
+    for the activation.
     Supplying ``block_compile`` at construction opts streamed block forwards
     into Inductor during CUDA inference. CPU activation is pass-through over
     the host-backed module state and remains eager.
 
-    Composes resident, prefix, and suffix :class:`PinnedComponent` instances
+    Composes a resident :class:`PinnedComponent`
     with one or more :class:`StreamedComponent`\\ s internally. LoRA requests
     are supplied directly to :meth:`activate`; merge mode installs
     activation-scoped post-copy hooks so the merge fires immediately after
@@ -133,8 +131,6 @@ class ModelOffloader:
         model: nn.Module,
         *,
         block_paths: Sequence[str] = (),
-        prefix_paths: Sequence[str] = (),
-        suffix_paths: Sequence[str] = (),
         stream_trainable_weights: bool = False,
         block_compile: BlockCompileConfig | None = None,
         host_backing: HostBacking = "pinned",
@@ -143,10 +139,7 @@ class ModelOffloader:
 
         The intermediate component store exists only during construction.
         Bound component instances retain the host state afterward, so the
-        model is never rebound on subsequent uses. ``prefix_paths`` and
-        ``suffix_paths`` select module paths whose frozen state is resident
-        only before or after the central streamed block span; trainable and
-        state shared across pinned scopes remains in the resident remainder.
+        model is never rebound on subsequent uses.
         ``block_compile`` applies one forward-only compile policy to every
         ``block_paths`` group and is invalid when no block group is declared.
         ``host_backing`` defaults to a pinned copy; ``"adopt"`` strictly
@@ -177,8 +170,6 @@ class ModelOffloader:
         composite_store = CompositeComponentStore.from_module(
             model,
             block_paths=block_paths,
-            prefix_paths=prefix_paths,
-            suffix_paths=suffix_paths,
             stream_trainable_weights=stream_trainable_weights,
             host_backing=backing,
         )

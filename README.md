@@ -237,8 +237,6 @@ from piper_offload import ModelOffloader
 offload = ModelOffloader.from_module(
     model,
     block_paths=["transformer_blocks"],  # path(s) to the nn.ModuleList
-    prefix_paths=["token_refiner", "proj_in"],
-    suffix_paths=["norm_out", "proj_out"],
 )
 device = torch.device("cuda")
 
@@ -260,24 +258,6 @@ the whole model is one bulk-pinned component that activation copies to the GPU.
 For heterogeneous block lists, execution still limits concurrency to the active
 and lookahead blocks, while the morphing pool may park one reusable target per
 distinct tensor-layout signature.
-
-`prefix_paths` and `suffix_paths` are optional dotted paths to modules whose
-frozen parameters and buffers should be CUDA-resident only before or after the
-central streamed block span. Unselected state, all trainable state, and state
-whose storage is shared across the resident/prefix/suffix scopes remains
-resident for the complete activation. Block lists nested under a prefix or
-suffix path belong to that scope; the remaining `block_paths` groups define the
-central span. This allows, for example, a streamed token refiner inside the
-prefix without making it the point where the prefix is evicted. Prefix and
-suffix copies use the same pinned component and LoRA-merge machinery as
-resident non-block state. The first forward loads the prefix on demand. After
-each successful top-level forward, the runtime evicts the suffix and stages the
-next prefix on a private CUDA stream. Allocation waits for the model-done event
-so it does not inflate the model's forward peak; the copy can then overlap
-caller work between denoising steps. The next model call waits on the prefix's
-CUDA stream only if the copy is still in flight. A failed forward is fail-stop
-for that activation: use the normal `try`/`finally` or cache lease so
-`deactivate()` can discard partial boundary state before retrying.
 
 `ModelOffloader` only streams on CUDA. Activating the binding on
 `cpu` is a pass-through over the already-installed pinned CPU storage:
@@ -818,8 +798,8 @@ registration / cache admission
         |
         +-- builds/admit --> ModelOffloader (one model, one runtime)
         |                    |
-        |                    +-- PinnedComponent(s)
-        |                    |       |  resident / prefix / suffix
+        |                    +-- PinnedComponent
+        |                    |       |  resident non-block state
         |                    |       +-- PinnedParam(s)
         |                    |
         |                    +-- StreamedComponent(s)
