@@ -7,7 +7,7 @@ per-weight LoRA application in both modes.
 import contextlib
 import threading
 import weakref
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from typing import Self
 
 import torch
@@ -554,8 +554,7 @@ class ModelOffloader:
                     self._active_device = None
                     self._activation_lock.release()
 
-    @contextlib.contextmanager
-    def optimizer_step(self) -> Iterator[None]:
+    def optimizer_step(self) -> contextlib.AbstractContextManager[None]:
         """Context manager wrapping the optimizer-step boundary for
         managed trainable weights.
 
@@ -597,16 +596,13 @@ class ModelOffloader:
             optimizer.step()        # runs on CPU; states stay on host
             optimizer.zero_grad()
         """
-        with self._composite.optimizer_step():
-            yield
+        return self._composite.optimizer_step()
 
-    @contextlib.contextmanager
-    def gather_for_step(self) -> Iterator[None]:
+    def gather_for_step(self) -> contextlib.AbstractContextManager[None]:
         """Backward-compatible alias for :meth:`optimizer_step`.
 
         The public API names the boundary after the operation that
         requires all streamed trainable weight data to be materialized: the
         optimizer step.
         """
-        with self.optimizer_step():
-            yield
+        return self.optimizer_step()

@@ -4,7 +4,7 @@ import contextlib
 import functools
 import logging
 import weakref
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 
 import torch
 from torch import nn
@@ -227,7 +227,7 @@ class _RollingTargetRuntime:
             raise first_error
 
     @contextlib.contextmanager
-    def optimizer_step(self) -> Iterator[None]:
+    def optimizer_step(self) -> Generator[None]:
         if not self.acquired:
             raise RuntimeError(
                 "StreamedComponent.optimizer_step() called while its CUDA "

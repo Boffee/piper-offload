@@ -46,7 +46,7 @@ when you need bespoke composition (e.g., multiple block lists like Flux's
 
 import contextlib
 import weakref
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from typing import Self, cast
 
@@ -918,7 +918,7 @@ class StreamedComponent:
         device: torch.device | str,
         *,
         compile_blocks: bool = True,
-    ) -> Iterator[None]:
+    ) -> Generator[None]:
         """Activate on ``device`` for the duration of the context."""
         self.activate(canonical_device(device), compile_blocks=compile_blocks)
         try:
@@ -931,7 +931,7 @@ class StreamedComponent:
     # ------------------------------------------------------------------
 
     @contextlib.contextmanager
-    def optimizer_step(self) -> Iterator[None]:
+    def optimizer_step(self) -> Generator[None]:
         """Materialize streamed trainables around an optimizer step."""
         if self._active_device == torch.device("cpu"):
             if self._cpu_optimizer_step_active:
@@ -953,11 +953,9 @@ class StreamedComponent:
         with runtime.optimizer_step():
             yield
 
-    @contextlib.contextmanager
-    def gather_for_step(self) -> Iterator[None]:
+    def gather_for_step(self) -> contextlib.AbstractContextManager[None]:
         """Backward-compatible alias for :meth:`optimizer_step`."""
-        with self.optimizer_step():
-            yield
+        return self.optimizer_step()
 
 
 __all__ = [

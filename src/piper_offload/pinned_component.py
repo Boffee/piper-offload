@@ -53,7 +53,7 @@ Class-specific caveats
 
 import contextlib
 import weakref
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass
 from typing import Self
 
@@ -345,7 +345,7 @@ class PinnedComponent:
             self._active_device = None
 
     @contextlib.contextmanager
-    def optimizer_step(self) -> Iterator[None]:
+    def optimizer_step(self) -> Generator[None]:
         """Optimizer-step boundary for managed trainable parameters.
 
         On CUDA activation, the model's trainable ``.data`` points at

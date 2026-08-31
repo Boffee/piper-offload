@@ -7,7 +7,7 @@ generic cache machinery unaware of models and adapters.
 """
 
 import contextlib
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from typing import cast
 
 import torch
@@ -37,7 +37,7 @@ class ModelCache(ResourceCache):
         lora_strengths: Sequence[float] | None = None,
         lora_mode: LoRAMode = "merge",
         stochastic_rounding: bool = True,
-    ) -> Iterator[M]:
+    ) -> Generator[M]:
         """Lease dependencies and activate a cached model runtime.
 
         ``lora_strengths`` defaults to one for each LoRA and, when supplied,

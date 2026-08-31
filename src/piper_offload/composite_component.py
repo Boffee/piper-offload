@@ -1,7 +1,7 @@
 """Composition of resident, transient, and block-streamed components."""
 
 import contextlib
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Self
 
@@ -118,7 +118,7 @@ class CompositeComponent:
             stack.close()
 
     @contextlib.contextmanager
-    def optimizer_step(self) -> Iterator[None]:
+    def optimizer_step(self) -> Generator[None]:
         with contextlib.ExitStack() as stack:
             for component in self._components():
                 stack.enter_context(component.optimizer_step())
