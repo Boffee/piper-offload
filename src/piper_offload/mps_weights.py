@@ -1,7 +1,7 @@
 """Minimal whole-model CPU->MPS materializer."""
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Generator
 
 import torch
 from torch import nn
@@ -74,7 +74,7 @@ class MpsWeights:
         return
 
     @contextlib.contextmanager
-    def use(self, device: torch.device | str) -> Iterator[nn.Module]:
+    def use(self, device: torch.device | str) -> Generator[nn.Module]:
         self.activate(device)
         try:
             yield self._model

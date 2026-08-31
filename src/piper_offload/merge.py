@@ -69,16 +69,8 @@ def merge_lora(
     deterministic rounding. Dense targets always use their ordinary exact
     ``addmm_`` update.
     """
-    if len({id(lora) for lora, _strength in loras}) != len(loras):
-        raise ValueError("merge_lora() does not accept the same LoRA instance more than once")
-
-    for lora, _strength in loras:
-        if not isinstance(lora, LoRA):
-            raise TypeError("merge_lora() expects LoRA instances")
-
-    # Validate the request structure above before treating exact-zero
-    # contributors as absent. Filtering here avoids target lookup, staging,
-    # validation, and requantization for work that cannot modify a parameter.
+    # Filtering here avoids target lookup, staging, validation, and
+    # requantization for work that cannot modify a parameter.
     active_loras = [(lora, strength) for lora, strength in loras if strength != 0.0]
     return _merge_loras(
         model,

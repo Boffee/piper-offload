@@ -511,6 +511,9 @@ finally:
     offload.deactivate()
 ```
 
+LoRA entries are ordered contributions. Repeating the same `LoRA` applies it
+again, and each occurrence uses the corresponding `lora_strengths` value.
+
 Quantized merge uses stochastic rounding by default so LoRA updates smaller
 than one quantization step are not systematically rounded away. Opt into
 deterministic round-to-nearest when exact deterministic codes are required:
@@ -800,8 +803,9 @@ fails. `lora_strengths` defaults to `1.0` per LoRA; when supplied, it must
 have the same length as `lora_specs`. Exact `0.0` and `-0.0` strengths are
 inactive: they are filtered before target grouping or hook installation, and
 `ModelCache` does not construct or lease their LoRA resources. Merge and routed
-uses may share one cached LoRA across model runtimes because each runtime owns
-its own hooks and temporary device copies.
+uses may share one cached LoRA across model runtimes or repeat it within one
+use because each occurrence is an independent contribution with its own
+strength.
 
 For direct resource access, use a cache lease:
 

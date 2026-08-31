@@ -53,7 +53,7 @@ Class-specific caveats
 
 import contextlib
 import weakref
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass
 from typing import Self
 
@@ -163,11 +163,6 @@ class PinnedComponent:
     """
 
     def __init__(self, instance: PinnedModuleInstance) -> None:
-        if not isinstance(instance, PinnedModuleInstance):
-            raise TypeError(
-                "PinnedComponent requires a PinnedModuleInstance; "
-                "use PinnedComponentStore.from_module(model).bind(model)."
-            )
         self._instance = instance
         self._param_names = frozenset(instance.params)
         self._buffer_names = frozenset(instance.buffers)
@@ -350,7 +345,7 @@ class PinnedComponent:
             self._active_device = None
 
     @contextlib.contextmanager
-    def optimizer_step(self) -> Iterator[None]:
+    def optimizer_step(self) -> Generator[None]:
         """Optimizer-step boundary for managed trainable parameters.
 
         On CUDA activation, the model's trainable ``.data`` points at

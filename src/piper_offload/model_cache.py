@@ -7,7 +7,7 @@ generic cache machinery unaware of models and adapters.
 """
 
 import contextlib
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from typing import cast
 
 import torch
@@ -37,28 +37,19 @@ class ModelCache(ResourceCache):
         lora_strengths: Sequence[float] | None = None,
         lora_mode: LoRAMode = "merge",
         stochastic_rounding: bool = True,
-    ) -> Iterator[M]:
+    ) -> Generator[M]:
         """Lease dependencies and activate a cached model runtime.
 
         ``lora_strengths`` defaults to one for each LoRA and, when supplied,
-        must have the same length as ``lora_specs``. A LoRA resource key may
-        appear only once in a use. Exact-zero strengths are inactive and their
-        LoRA resources are not leased. ``stochastic_rounding`` is forwarded
-        to the model activation's merge path and defaults to stochastic
-        requantization for quantized targets; dense and routed targets are
-        unaffected.
+        must have the same length as ``lora_specs``. Repeated resource keys
+        contribute once per occurrence. Exact-zero strengths are inactive and
+        their LoRA resources are not leased. ``stochastic_rounding`` is
+        forwarded to the model activation's merge path and defaults to
+        stochastic requantization for quantized targets; dense and routed
+        targets are unaffected.
         """
         specs = tuple(lora_specs)
         strengths = None if lora_strengths is None else tuple(lora_strengths)
-        if strengths is not None and len(strengths) != len(specs):
-            raise ValueError(
-                "lora_strengths must have the same length as lora_specs"
-            )
-        if len({spec.key for spec in specs}) != len(specs):
-            raise ValueError(
-                "lora_specs must not contain the same LoRA resource key more than once"
-            )
-
         # A zero-strength LoRA is absent from this activation. Filter it
         # before leasing so its factory, cache admission, and host backing are
         # never needed merely to produce a no-op.

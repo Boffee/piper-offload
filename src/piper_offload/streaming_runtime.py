@@ -4,7 +4,7 @@ import contextlib
 import functools
 import logging
 import weakref
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Protocol
 
@@ -191,7 +191,7 @@ class BlockStreamingRuntime:
             raise first_prefetch_exc
 
     @contextlib.contextmanager
-    def optimizer_step(self) -> Iterator[None]:
+    def optimizer_step(self) -> Generator[None]:
         if not self.acquired:
             raise RuntimeError(
                 "StreamedComponent.optimizer_step() called while its CUDA "

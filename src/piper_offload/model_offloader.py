@@ -7,7 +7,7 @@ per-weight LoRA application in both modes.
 import contextlib
 import threading
 import weakref
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from typing import Self
 
 import torch
@@ -16,7 +16,7 @@ from torch import nn
 from ._devices import canonical_device
 from .block_compile import BlockCompileConfig
 from .composite_component import CompositeComponent, CompositeComponentStore
-from .host_backing import HostBacking, validate_host_backing
+from .host_backing import HostBacking
 from .lora import (
     LoRA,
     LoRAMode,
@@ -194,26 +194,13 @@ class ModelOffloader:
         writable mmap contents must remain immutable for the offloader's
         lifetime.
         """
-        backing = validate_host_backing(host_backing)
-        if backing == "adopt":
-            trainable_names = [
-                name
-                for name, parameter in model.named_parameters()
-                if parameter.requires_grad
-            ]
-            if trainable_names:
-                raise ValueError(
-                    "adopted host backing is inference-only; freeze all "
-                    "parameters before constructing the offloader. Trainable "
-                    f"parameters: {trainable_names!r}."
-                )
         composite_store = CompositeComponentStore.from_module(
             model,
             block_paths=block_paths,
             transient_block_paths=transient_block_paths,
             transient_paths=transient_paths,
             stream_trainable_weights=stream_trainable_weights,
-            host_backing=backing,
+            host_backing=host_backing,
         )
         cache_bytes = composite_store.cache_bytes
         composite = composite_store.bind(
@@ -239,11 +226,6 @@ class ModelOffloader:
             strength_list = [1.0] * len(lora_list)
         else:
             strength_list = [float(strength) for strength in lora_strengths]
-        if len({id(lora) for lora in lora_list}) != len(lora_list):
-            raise ValueError(
-                "ModelOffloader.activate() does not accept the same LoRA "
-                "instance more than once"
-            )
         return [
             (lora, strength)
             for lora, strength in zip(lora_list, strength_list, strict=True)
@@ -572,8 +554,7 @@ class ModelOffloader:
                     self._active_device = None
                     self._activation_lock.release()
 
-    @contextlib.contextmanager
-    def optimizer_step(self) -> Iterator[None]:
+    def optimizer_step(self) -> contextlib.AbstractContextManager[None]:
         """Context manager wrapping the optimizer-step boundary for
         managed trainable weights.
 
@@ -615,16 +596,13 @@ class ModelOffloader:
             optimizer.step()        # runs on CPU; states stay on host
             optimizer.zero_grad()
         """
-        with self._composite.optimizer_step():
-            yield
+        return self._composite.optimizer_step()
 
-    @contextlib.contextmanager
-    def gather_for_step(self) -> Iterator[None]:
+    def gather_for_step(self) -> contextlib.AbstractContextManager[None]:
         """Backward-compatible alias for :meth:`optimizer_step`.
 
         The public API names the boundary after the operation that
         requires all streamed trainable weight data to be materialized: the
         optimizer step.
         """
-        with self.optimizer_step():
-            yield
+        return self.optimizer_step()

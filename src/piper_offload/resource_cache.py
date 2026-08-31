@@ -44,7 +44,7 @@ import contextlib
 import logging
 import threading
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
@@ -397,7 +397,7 @@ class ResourceCache:
     def lease[T](
         self,
         resource: str | ResourceSpec[T],
-    ) -> Iterator[T]:
+    ) -> Generator[T]:
         """Lease a cached value, building its store on a cache miss.
 
         A lease protects the store from eviction for the duration of the
@@ -422,7 +422,7 @@ class ResourceCache:
     def lease_many(
         self,
         resources: Sequence[str | ResourceSpec[Any]],
-    ) -> Iterator[tuple[Any, ...]]:
+    ) -> Generator[tuple[Any, ...]]:
         """Lease resources in order and release them in reverse order.
 
         Earlier resources are protected before later stores are admitted,

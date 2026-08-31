@@ -719,12 +719,14 @@ class TestActivationLoraValidation:
         finally:
             s.deactivate()
 
-    def test_rejects_duplicate_lora_instance(self) -> None:
+    def test_duplicate_lora_instances_keep_each_strength(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         lora = _make_lora(4, 16)
-        with pytest.raises(ValueError, match="same LoRA instance"):
-            s._normalize_loras([lora, lora])
+        assert s._normalize_loras(
+            [lora, lora],
+            lora_strengths=[0.25, 0.75],
+        ) == [(lora, 0.25), (lora, 0.75)]
 
     def test_invalid_lora_mode_releases_activation_claim(self) -> None:
         m = _make_bf16_model()
@@ -2897,6 +2899,24 @@ class TestPermanentMerge:
         assert merge_lora(m, [(first, 1.0), (second, 1.0)]) == 1
         torch.testing.assert_close(m.target.weight, expected)
 
+    def test_duplicate_lora_instances_each_contribute(self) -> None:
+        model = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
+        lora = _make_lora(num_blocks=2, dim=16)
+        before = model.transformer_blocks[0].attn.weight.detach().clone()
+        contributions = [(lora, 0.25), (lora, 0.75)]
+        expected = _expected_merged_weight(
+            before,
+            contributions,
+            0,
+            "attn.weight",
+        )
+
+        assert merge_lora(model, contributions) == 2
+        torch.testing.assert_close(
+            model.transformer_blocks[0].attn.weight,
+            expected,
+        )
+
     def test_legacy_bias_merges_with_same_adapter_strength(self) -> None:
         class M(nn.Module):
             def __init__(self) -> None:
@@ -4475,7 +4495,7 @@ class TestLoRAResource:
         )
         cache = ModelCache(10**9)
 
-        with pytest.raises(ValueError, match="same length"):
+        with pytest.raises(ValueError, match="shorter"):
             with cache.use(
                 model_spec,
                 device="cpu",
@@ -4490,16 +4510,18 @@ class TestLoRAResource:
         with pytest.raises(ResourceNotRegisteredError):
             cache.info("model")
 
-    def test_model_cache_rejects_duplicate_lora_before_admission(self) -> None:
+    def test_model_cache_applies_duplicate_lora_contributions(self) -> None:
         factory_calls = {"lora": 0, "model": 0}
+        state_dict = _make_lora_sd(num_blocks=2, dim=8, rank=2)
+        expected_lora = LoRA.from_state_dict(state_dict)
 
         def lora_factory() -> dict[str, torch.Tensor]:
             factory_calls["lora"] += 1
-            return _make_lora_sd(num_blocks=2, dim=8, rank=2)
+            return state_dict
 
         def model_factory() -> nn.Module:
             factory_calls["model"] += 1
-            return _make_bf16_model(num_blocks=2, dim=8)
+            return _make_bf16_model(num_blocks=2, dim=8).to(torch.float32)
 
         lora_spec = LoRASpec(
             key="lora:style",
@@ -4512,17 +4534,25 @@ class TestLoRAResource:
             factory=model_factory,
         )
         cache = ModelCache(10**9)
+        value = torch.randn(2, 8)
 
-        with pytest.raises(ValueError, match="same LoRA resource key"):
-            with cache.use(
-                model_spec,
-                device="cpu",
-                lora_specs=[lora_spec, lora_spec],
-                lora_mode="routed",
-            ):
-                pass
+        with cache.use(
+            model_spec,
+            device="cpu",
+            lora_specs=[lora_spec, lora_spec],
+            lora_strengths=[0.25, 0.75],
+            lora_mode="routed",
+        ) as model:
+            actual = model(value)
+            expected = _expected_routed_output(
+                model,
+                value,
+                [(expected_lora, 0.25), (expected_lora, 0.75)],
+            )
+            torch.testing.assert_close(actual, expected)
 
-        assert factory_calls == {"lora": 0, "model": 0}
+        assert factory_calls == {"lora": 1, "model": 1}
+        assert cache.info("lora:style").lease_count == 0
 
     def test_lora_leased_during_resource_cache_miss(self) -> None:
         # The LoRAs acquired by a model-cache use are leased before the

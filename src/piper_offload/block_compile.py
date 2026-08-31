@@ -53,14 +53,6 @@ class BlockCompileConfig:
     rolling: bool = False
 
     def __post_init__(self) -> None:
-        if self.dynamic is not None and not isinstance(self.dynamic, bool):
-            raise TypeError(f"BlockCompileConfig.dynamic must be bool or None; got {type(self.dynamic).__name__}.")
-        if not isinstance(self.fullgraph, bool):
-            raise TypeError(f"BlockCompileConfig.fullgraph must be bool; got {type(self.fullgraph).__name__}.")
-        if self.options is not None and not isinstance(self.options, Mapping):
-            raise TypeError(f"BlockCompileConfig.options must be a mapping or None; got {type(self.options).__name__}.")
-        if not isinstance(self.rolling, bool):
-            raise TypeError(f"BlockCompileConfig.rolling must be bool; got {type(self.rolling).__name__}.")
         if self.rolling and not self.fullgraph:
             raise ValueError("BlockCompileConfig(rolling=True) requires fullgraph=True.")
 

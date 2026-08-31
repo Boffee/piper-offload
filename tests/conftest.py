@@ -14,7 +14,7 @@ assert a CUDA error catch it themselves, so they are unaffected.
 
 import contextlib
 import sys
-from collections.abc import Generator, Iterator
+from collections.abc import Generator
 
 import pytest
 import torch
@@ -61,7 +61,7 @@ def activated_model(
     offloader: ModelOffloader,
     device: torch.device | str,
     **kwargs: object,
-) -> Iterator[nn.Module]:
+) -> Generator[nn.Module]:
     """Test-only exception-safe scope for the low-level activation API."""
     offloader.activate(device, **kwargs)
     try:
