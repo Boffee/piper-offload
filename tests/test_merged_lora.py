@@ -56,7 +56,7 @@ from piper_offload.tensor_adapters import (
 from tests.conftest import (
     activated_model,
     streamed_components,
-    synchronize_prefix_prefetch,
+    transient_components,
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -109,13 +109,17 @@ def _quanto_absmax_oracle(
 def _make_model_offloader(
     model: nn.Module,
     *,
-    block_paths: list[str] = [],
+    block_paths: Sequence[str] = (),
+    transient_block_paths: Sequence[str] = (),
     stream_trainable_weights: bool = False,
+    transient_paths: Sequence[str] = (),
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
         block_paths=block_paths,
+        transient_block_paths=transient_block_paths,
         stream_trainable_weights=stream_trainable_weights,
+        transient_paths=transient_paths,
     )
 
 
@@ -674,6 +678,15 @@ class TestActivationLoraValidation:
             (lora, 0.25),
         ]
 
+    def test_lora_strengths_do_not_silently_truncate(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        with pytest.raises(ValueError, match="shorter"):
+            s._normalize_loras(
+                [_make_lora(4, 16)],
+                lora_strengths=[],
+            )
+
     @pytest.mark.parametrize("zero", [0.0, -0.0])
     def test_zero_strengths_are_inactive(self, zero: float) -> None:
         m = _make_bf16_model()
@@ -705,23 +718,6 @@ class TestActivationLoraValidation:
             torch.testing.assert_close(m(x), expected)
         finally:
             s.deactivate()
-
-    def test_rejects_lora_strength_length_mismatch(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        with pytest.raises(ValueError, match="same length"):
-            s._normalize_loras(
-                [_make_lora(4, 16)],
-                lora_strengths=[],
-            )
-
-    def test_rejects_tuple_pairs(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        with pytest.raises(TypeError, match="LoRA instances"):
-            s._normalize_loras(  # type: ignore[list-item]
-                [(_make_lora(4, 16), 1.0)],
-            )
 
     def test_rejects_duplicate_lora_instance(self) -> None:
         m = _make_bf16_model()
@@ -1048,54 +1044,6 @@ class TestActivationLoraValidation:
 
 class TestLifecycle:
     @CUDA
-    def test_merge_applies_to_prefix_and_suffix_on_every_forward(self) -> None:
-        torch.manual_seed(21)
-        baseline = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
-        model = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
-        model.load_state_dict(baseline.state_dict())
-        state = {
-            "embed.lora_A.weight": torch.randn(4, 16),
-            "embed.lora_B.weight": torch.randn(16, 4),
-            "head.lora_A.weight": torch.randn(4, 16),
-            "head.lora_B.weight": torch.randn(16, 4),
-        }
-        lora = LoRA.from_state_dict(state_dict=state)
-        strength = 0.7
-        with torch.no_grad():
-            for name in ("embed", "head"):
-                factor = lora.targets[f"{name}.weight"]
-                a, b = _factor_tensors(factor)
-                getattr(baseline, name).weight.addmm_(b, a, alpha=strength)
-        baseline.cuda()
-        value = torch.randn(2, 16, device="cuda")
-        with torch.inference_mode():
-            expected = baseline(value)
-
-        strategy = ModelOffloader.from_module(
-            model,
-            block_paths=("transformer_blocks",),
-            prefix_paths=("embed",),
-            suffix_paths=("head",),
-        )
-        try:
-            strategy.activate(
-                "cuda",
-                loras=(lora,),
-                lora_strengths=(strength,),
-            )
-            with torch.inference_mode():
-                first = model(value)
-                second = model(value)
-            torch.testing.assert_close(first, expected)
-            torch.testing.assert_close(second, expected)
-            synchronize_prefix_prefetch(strategy)
-            assert model.embed.weight.device.type == "cpu"
-            assert model.head.weight.is_pinned()
-        finally:
-            strategy.deactivate()
-        assert model.embed.weight.is_pinned()
-
-    @CUDA
     def test_activate_runs_components(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
@@ -1201,6 +1149,73 @@ class TestLifecycle:
 
 
 class TestMergeCorrectness:
+    @CUDA
+    @pytest.mark.parametrize("mode", ["merge", "routed"])
+    def test_transient_path_preserves_lora_on_reacquire(
+        self,
+        mode: LoRAMode,
+    ) -> None:
+        model = _make_bf16_model(num_blocks=2, dim=16)
+        lora = LoRA.from_state_dict(
+            {
+                "embed.lora_A.weight": torch.randn(4, 16),
+                "embed.lora_B.weight": torch.randn(16, 4),
+            }
+        )
+        offloader = _make_model_offloader(
+            model,
+            transient_paths=["embed"],
+        )
+        component = dict(transient_components(offloader))["embed"]
+        _request_loras(offloader, [(lora, 0.5)], mode=mode)
+        _activate(offloader, "cuda")
+        try:
+            value = torch.randn(
+                2,
+                16,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            with torch.inference_mode():
+                first = model(value).clone()
+                second = model(value).clone()
+            torch.cuda.synchronize()
+            assert component._lease is not None
+        finally:
+            offloader.deactivate()
+
+        torch.testing.assert_close(second, first, rtol=0, atol=0)
+
+    @CUDA
+    @pytest.mark.parametrize("mode", ["merge", "routed"])
+    def test_transient_block_path_preserves_lora_on_reacquire(
+        self,
+        mode: LoRAMode,
+    ) -> None:
+        model = _make_bf16_model(num_blocks=2, dim=16)
+        lora = _make_lora(num_blocks=2, dim=16, seed=9)
+        offloader = _make_model_offloader(
+            model,
+            transient_block_paths=["transformer_blocks"],
+        )
+        _request_loras(offloader, [(lora, 0.5)], mode=mode)
+        _activate(offloader, "cuda")
+        try:
+            value = torch.randn(
+                2,
+                16,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            with torch.inference_mode():
+                first = model(value).clone()
+                second = model(value).clone()
+            torch.cuda.synchronize()
+        finally:
+            offloader.deactivate()
+
+        torch.testing.assert_close(second, first, rtol=0, atol=0)
+
     @CUDA
     @pytest.mark.parametrize("streamed", [False, True])
     def test_legacy_bias_merge_resident_and_streamed(

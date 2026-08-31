@@ -237,8 +237,6 @@ from piper_offload import ModelOffloader
 offload = ModelOffloader.from_module(
     model,
     block_paths=["transformer_blocks"],  # path(s) to the nn.ModuleList
-    prefix_paths=["token_refiner", "proj_in"],
-    suffix_paths=["norm_out", "proj_out"],
 )
 device = torch.device("cuda")
 
@@ -255,29 +253,11 @@ Ordinary streaming owns one active block and one asynchronous lookahead target.
 That fixed two-target window overlaps the next whole-block copy without
 retaining blocks that a sequential traversal will reload anyway. Direction
 changes and iteration wraparound are detected internally. Streaming itself is
-selected by `block_paths`; with no `block_paths` (the default) nothing streams —
+selected by `block_paths` and `transient_block_paths`; with both lists empty,
 the whole model is one bulk-pinned component that activation copies to the GPU.
 For heterogeneous block lists, execution still limits concurrency to the active
 and lookahead blocks, while the morphing pool may park one reusable target per
 distinct tensor-layout signature.
-
-`prefix_paths` and `suffix_paths` are optional dotted paths to modules whose
-frozen parameters and buffers should be CUDA-resident only before or after the
-central streamed block span. Unselected state, all trainable state, and state
-whose storage is shared across the resident/prefix/suffix scopes remains
-resident for the complete activation. Block lists nested under a prefix or
-suffix path belong to that scope; the remaining `block_paths` groups define the
-central span. This allows, for example, a streamed token refiner inside the
-prefix without making it the point where the prefix is evicted. Prefix and
-suffix copies use the same pinned component and LoRA-merge machinery as
-resident non-block state. The first forward loads the prefix on demand. After
-each successful top-level forward, the runtime evicts the suffix and stages the
-next prefix on a private CUDA stream. Allocation waits for the model-done event
-so it does not inflate the model's forward peak; the copy can then overlap
-caller work between denoising steps. The next model call waits on the prefix's
-CUDA stream only if the copy is still in flight. A failed forward is fail-stop
-for that activation: use the normal `try`/`finally` or cache lease so
-`deactivate()` can discard partial boundary state before retrying.
 
 `ModelOffloader` only streams on CUDA. Activating the binding on
 `cpu` is a pass-through over the already-installed pinned CPU storage:
@@ -286,6 +266,45 @@ no target pool, no streaming hooks, no weight copies.
 CPU activation. Routed LoRA installs target-Linear hooks: a forward-PRE
 hook copies that target's host-backed factors to the input device, and a
 forward-POST hook applies the residual and releases those device copies.
+
+### Optional transient residency
+
+Inference workloads can release large modules and streamed pools as soon as
+their traversals finish:
+
+```python
+offload = ModelOffloader.from_module(
+    model,
+    transient_block_paths=["transformer_blocks"],
+    transient_paths=["input_embedder", "output_head"],
+)
+```
+
+Each `transient_paths` module recursively owns a separate CUDA working set for
+its non-streamed state. Its successful forward releases that set
+immediately, before later model work. Every entry in `transient_block_paths` is a
+streamed block group whose pool releases after its final block. Ordinary
+`block_paths` pools remain resident for the activation. A successful root-model
+forward reacquires all released components for the next invocation. A
+conditionally skipped component remains acquired.
+
+The release boundaries are deliberately explicit. A `transient_block_paths`
+group releases after its final block and therefore cannot traverse that stack
+again later in the same root call. For `transient_paths`, the named module's
+own `forward` is the boundary, so its state cannot be used again afterward. A
+skipped path remains acquired. `ModuleList`/`ModuleDict` containers are not
+expanded for `transient_paths`, and ModelOffloader does not inspect repeated
+calls, functional parameter access, aliases across component boundaries, or
+autograd state. Paths must own disjoint state, and shared-storage aliases must
+not cross component boundaries; these guarantees belong to the caller. CPU
+activation remains eager and installs no scheduling hooks. Ordinary and
+rolling transient block groups both stop at the final block instead of filling
+block 0 immediately before release.
+
+Every module object in a `transient_block_paths` group must be distinct. An
+ordinary `block_paths` group may still reuse a module object, but a module hook
+cannot distinguish which aliased list position just completed and therefore
+cannot provide a safe early-release boundary.
 
 ### Optional streamed-block compilation
 
@@ -308,8 +327,9 @@ offload = ModelOffloader.from_module(
 ```
 
 `block_compile=None` (the default) preserves eager behavior. One configuration
-applies to every `block_paths` group, and supplying a compile configuration
-without `block_paths` raises. The backend remains fixed to Inductor. Optional
+applies to every `block_paths` and `transient_block_paths` group and has no
+effect when neither is configured.
+The backend remains fixed to Inductor. Optional
 backend settings can be supplied through `options`; the mapping is copied for
 each block before it is forwarded to `torch.compile`. This is also the boundary
 for compiler extensions such as Piper Kernels' ConvRot preparation-sharing and
@@ -375,8 +395,10 @@ parameters, and no streamed buffers. Bitsandbytes, DTensor, unreviewed external 
 heterogeneous block layouts continue to use the existing morphing block-target
 pool. Structured logical weights are tracked across every AOT-flattened storage
 input, and the refill is placed after the last reader of any storage tensor.
-Repeated traversal rolls the final block directly into block zero. Skipped or
-out-of-order traversal remains correct through a foreground-refill fallback.
+Repeated resident traversal rolls the final block directly into block zero.
+Transient streaming stops at the final block and reacquires a fresh block-0
+target after the root model forward. Skipped or out-of-order traversal remains
+correct through a foreground-refill fallback.
 
 For the supported contract, the scheduler-only lifecycle edges preserve the
 ordinary compiled compute kernels and their autotuning identity. The benchmark
@@ -618,10 +640,11 @@ compatibility.
 
 ### Heterogeneous block lists
 
-`block_paths` accepts a list of dotted paths for models with
+`block_paths` and `transient_block_paths` accept dotted paths for models with
 multiple kinds of blocks (e.g. Flux's `transformer_blocks` +
 `single_transformer_blocks`). Each path becomes its own streaming
-group with its own target pool. Blocks within a group must share parameter and
+group with its own target pool; the two lists are mutually exclusive. Blocks
+within a group must share parameter and
 buffer names plus trainability structure, but their shapes, dtypes, quantization
 formats, alias topology, and buffer layouts may differ. The morphing pool keys
 reusable targets by those layouts. For bespoke grouping, compose
@@ -818,8 +841,12 @@ registration / cache admission
         |
         +-- builds/admit --> ModelOffloader (one model, one runtime)
         |                    |
+        |                    +-- PinnedComponent
+        |                    |       |  resident non-block state
+        |                    |       +-- PinnedParam(s)
+        |                    |
         |                    +-- PinnedComponent(s)
-        |                    |       |  resident / prefix / suffix
+        |                    |       |  transient path state
         |                    |       +-- PinnedParam(s)
         |                    |
         |                    +-- StreamedComponent(s)
@@ -891,7 +918,13 @@ with cache.lease(spec) as store:
 
 `StreamedComponent` and `PinnedComponent` are composable
 `activate`/`deactivate` lifecycle pieces (no `value` or `model`) that live
-inside a top-level model runtime rather than acting as one themselves.
+inside a top-level model runtime rather than acting as one themselves. Either
+active component may `release()` and later `acquire()` its CUDA working set
+without ending the activation session; activation acquires it immediately by
+default. `ModelOffloader.register_forward_hook()` registers a native PyTorch
+forward hook by fully-qualified module name and returns a caller-owned remover.
+This lets higher-level runtimes coordinate component lifetimes at model
+execution boundaries without adding policy to component internals.
 
 `TensorAdapter` is the per-parameter extension point. Its base contract
 only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,

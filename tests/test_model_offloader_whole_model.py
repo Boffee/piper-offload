@@ -118,7 +118,7 @@ class TestPinnedComponentStoreBind:
             def __init__(self) -> None:
                 self.used: list[object] = []
 
-            def mark_used(self, stream: object) -> None:
+            def record_stream(self, stream: object) -> None:
                 self.used.append(stream)
 
         model = _make_simple_model()
@@ -206,6 +206,78 @@ class TestPinnedComponentStoreBind:
 
         with pytest.raises(ValueError, match="Param 'weight' layout mismatch"):
             store.bind(target)
+
+    def test_cpu_acquire_and_release_are_noops(self) -> None:
+        model = _make_simple_model()
+        component = PinnedComponentStore.from_module(model).bind(model)
+        try:
+            component.activate(torch.device("cpu"))
+            component.release()
+            component.acquire()
+
+            assert component._active_device == torch.device("cpu")
+            assert component._lease is None
+            assert all(param.is_pinned() for param in model.parameters())
+        finally:
+            component.deactivate()
+
+    def test_acquire_requires_active_session(self) -> None:
+        model = _make_simple_model()
+        component = PinnedComponentStore.from_module(model).bind(model)
+        try:
+            component.release()
+            with pytest.raises(RuntimeError, match="active session"):
+                component.acquire()
+        finally:
+            component.deactivate()
+
+    @CUDA
+    def test_cuda_working_set_can_release_and_reacquire(self) -> None:
+        torch.manual_seed(42)
+        eager = _make_simple_model()
+        model = _make_simple_model()
+        model.load_state_dict(eager.state_dict())
+        value = torch.randn(2, 8)
+        with torch.inference_mode():
+            expected = eager(value)
+
+        component = PinnedComponentStore.from_module(model).bind(model)
+        copied: list[torch.device] = []
+        remove_copy_hook = component.register_post_copy_hook(
+            "0.weight",
+            lambda param: copied.append(param.device),
+        )
+        try:
+            component.activate(torch.device("cuda"))
+            assert component._lease is not None
+            assert [device.type for device in copied] == ["cuda"]
+            assert model._forward_pre_hooks
+            assert all(param.is_cuda for param in model.parameters())
+
+            component.release()
+            component.release()
+            assert component._active_device is not None
+            assert component._active_device.type == "cuda"
+            assert component._lease is None
+            assert not model._forward_pre_hooks
+            assert all(param.is_pinned() for param in model.parameters())
+
+            component.acquire()
+            component.acquire()
+            assert component._lease is not None
+            assert [device.type for device in copied] == ["cuda", "cuda"]
+            assert model._forward_pre_hooks
+            with torch.inference_mode():
+                actual = model(value.cuda()).cpu()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected)
+        finally:
+            remove_copy_hook()
+            component.deactivate()
+
+        assert component._active_device is None
+        assert component._lease is None
+        assert all(param.is_pinned() for param in model.parameters())
 
 
 # ---------------------------------------------------------------------------

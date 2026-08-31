@@ -13,10 +13,11 @@ class _CudaTargetLease:
     The caller chooses the allocation-owner stream: short-lived staged
     components use the default allocator pool, while block lookahead targets
     stay with their copy stream. A ready event orders consumption after copies;
-    recorded consumer streams order later refills, and the allocation stream
-    waits for all remaining target work before storage is dropped. These stream
-    handoffs keep storage in its original allocator pool and work for opaque
-    adapter state without inspecting its physical tensors.
+    recorded streams order later refills. These stream handoffs keep
+    storage in its original allocator pool and work for opaque adapter state
+    without inspecting its physical tensors. Closing the lease synchronizes all
+    recorded work before dropping the target so its storage cannot be
+    immediately reused while CUDA still accesses it.
     """
 
     def __init__(
@@ -29,8 +30,7 @@ class _CudaTargetLease:
         self._ready_event: torch.cuda.Event | None = None
         self._staged = False
         self._acquired = False
-        self._consumer_streams: set[torch.cuda.Stream] = set()
-        self._lifetime_streams: set[torch.cuda.Stream] = set()
+        self._recorded_streams: set[torch.cuda.Stream] = set()
 
     @classmethod
     def allocate(
@@ -54,10 +54,6 @@ class _CudaTargetLease:
             raise RuntimeError("CUDA target lease is closed")
         return target
 
-    @property
-    def device(self) -> torch.device:
-        return self._allocation_stream.device
-
     def stage(
         self,
         instance: PinnedModuleInstance,
@@ -75,10 +71,10 @@ class _CudaTargetLease:
         with torch.cuda.stream(stream):
             if prior is not None:
                 stream.wait_event(prior)
-            for consumer in self._consumer_streams:
-                if consumer != stream:
-                    stream.wait_stream(consumer)
-            self._consumer_streams.clear()
+            for recorded in self._recorded_streams:
+                if recorded != stream:
+                    stream.wait_stream(recorded)
+            self._recorded_streams.clear()
             try:
                 instance.copy_to_target(
                     target,
@@ -105,36 +101,33 @@ class _CudaTargetLease:
         stream.wait_event(event)
         self._staged = False
         self._acquired = True
-        self.mark_used(stream)
+        self.record_stream(stream)
         return self.target
 
-    def mark_used(self, stream: torch.cuda.Stream) -> None:
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
         """Record a stream that may read or write the acquired target."""
         if not self._acquired:
             raise RuntimeError("CUDA target must be acquired before use")
-        self._consumer_streams.add(stream)
-
-    def track_lifetime_stream(self, stream: torch.cuda.Stream) -> None:
-        """Protect externally ordered target work until the lease closes."""
-        if stream != self._allocation_stream:
-            self._lifetime_streams.add(stream)
+        self._recorded_streams.add(stream)
 
     def release(self) -> None:
         """End the acquired state while retaining its stream dependencies."""
         self._acquired = False
 
     def close(self) -> None:
-        """Release target storage without a device- or host-wide sync."""
+        """Release target storage after all recorded CUDA work completes."""
         if self._target is None:
             return
         self.release()
-        if self._ready_event is not None:
-            self._allocation_stream.wait_event(self._ready_event)
-        for tracked in self._lifetime_streams | self._consumer_streams:
-            if tracked != self._allocation_stream:
-                self._allocation_stream.wait_stream(tracked)
-        self._target = None
-        self._ready_event = None
-        self._staged = False
-        self._consumer_streams.clear()
-        self._lifetime_streams.clear()
+        try:
+            if self._ready_event is not None:
+                self._ready_event.synchronize()
+            streams = set(self._recorded_streams)
+            streams.add(self._allocation_stream)
+            for stream in streams:
+                stream.synchronize()
+        finally:
+            self._target = None
+            self._ready_event = None
+            self._staged = False
+            self._recorded_streams.clear()

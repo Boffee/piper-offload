@@ -424,7 +424,7 @@ class TestRollingCompile:
         try:
             with activated_model(rolling_offloader, "cuda"):
                 assert streamer._active_runtime is streamer._rolling_runtime
-                assert not streamer._block_runtime.active
+                assert not streamer._block_runtime.acquired
                 assert len({id(block.proj.weight) for block in rolling_model.blocks}) == 1
                 with torch.inference_mode():
                     actual = [rolling_model(x).clone() for x in inputs]
@@ -433,6 +433,153 @@ class TestRollingCompile:
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert all(block.proj.weight.device.type == "cpu" for block in rolling_model.blocks)
+
+    @CUDA
+    def test_release_reacquire_rebinds_rolling_target(self) -> None:
+        torch.manual_seed(12)
+        baseline_model = _BlockModel()
+        rolling_model = copy.deepcopy(baseline_model)
+        value = torch.randn(2, 8)
+        with torch.inference_mode():
+            expected = baseline_model(value).cuda()
+
+        offloader = _make_offloader(
+            rolling_model,
+            block_compile=BlockCompileConfig(
+                dynamic=False,
+                rolling=True,
+                fullgraph=True,
+            ),
+        )
+        streamer = streamed_components(offloader)[0]
+        runtime = streamer._rolling_runtime
+        assert runtime is not None
+        try:
+            with activated_model(offloader, "cuda"):
+                with torch.inference_mode():
+                    first = rolling_model(value.cuda()).clone()
+                torch.cuda.synchronize()
+
+                streamer.release()
+                assert streamer._active_device is not None
+                assert streamer._active_device.type == "cuda"
+                assert streamer._active_runtime is runtime
+                assert not runtime.acquired
+                assert all(
+                    block.proj.weight.device.type == "cpu"
+                    for block in rolling_model.blocks
+                )
+
+                streamer.acquire()
+                assert runtime.acquired
+                with torch.inference_mode():
+                    second = rolling_model(value.cuda()).clone()
+                torch.cuda.synchronize()
+        finally:
+            offloader.deactivate()
+
+        torch.testing.assert_close(first, expected)
+        torch.testing.assert_close(second, first, rtol=0, atol=0)
+
+    @CUDA
+    def test_transient_block_path_reacquires_rolling_target(self) -> None:
+        torch.manual_seed(13)
+        baseline_model = _BlockModel()
+        rolling_model = copy.deepcopy(baseline_model)
+        value = torch.randn(2, 8)
+        with torch.inference_mode():
+            expected = baseline_model(value).cuda()
+
+        offloader = _make_offloader(
+            rolling_model,
+            block_compile=BlockCompileConfig(
+                dynamic=False,
+                rolling=True,
+                fullgraph=True,
+            ),
+            transient_block_paths=("blocks",),
+        )
+        runtime = streamed_components(offloader)[0]._rolling_runtime
+        assert runtime is not None
+        root_states: list[bool] = []
+        remove_observer = offloader.register_forward_hook(
+            "",
+            lambda _module, _args, _output: root_states.append(runtime.acquired),
+        )
+        try:
+            with activated_model(offloader, "cuda"):
+                with torch.inference_mode():
+                    first = rolling_model(value.cuda()).clone()
+                    second = rolling_model(value.cuda()).clone()
+                torch.cuda.synchronize()
+                assert root_states == [False, False]
+                assert runtime.acquired
+        finally:
+            remove_observer()
+            offloader.deactivate()
+
+        torch.testing.assert_close(first, expected)
+        torch.testing.assert_close(second, first, rtol=0, atol=0)
+
+    @CUDA
+    def test_transient_block_path_stops_rollover_at_final_block(self) -> None:
+        model = _BlockModel(num_blocks=3)
+        offloader = _make_offloader(
+            model,
+            block_compile=BlockCompileConfig(
+                dynamic=False,
+                rolling=True,
+                fullgraph=True,
+            ),
+            transient_block_paths=("blocks",),
+        )
+        runtime = streamed_components(offloader)[0]._rolling_runtime
+        assert runtime is not None
+        original_refill = runtime._refill
+        refills: list[int] = []
+
+        def record_refill(block_idx: int, param_idx: int) -> None:
+            refills.append(block_idx)
+            original_refill(block_idx, param_idx)
+
+        runtime._refill = record_refill  # type: ignore[method-assign]
+        try:
+            with activated_model(offloader, "cuda"):
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+                torch.cuda.synchronize()
+        finally:
+            offloader.deactivate()
+
+        assert refills == [1, 2]
+
+    @CUDA
+    def test_transient_rolling_target_survives_separate_activations(self) -> None:
+        torch.manual_seed(14)
+        baseline_model = _BlockModel()
+        rolling_model = copy.deepcopy(baseline_model)
+        value = torch.randn(2, 8, device="cuda")
+        with torch.inference_mode():
+            expected = baseline_model(value.cpu()).cuda()
+
+        offloader = _make_offloader(
+            rolling_model,
+            block_compile=BlockCompileConfig(
+                dynamic=False,
+                rolling=True,
+                fullgraph=True,
+            ),
+            transient_block_paths=("blocks",),
+        )
+        with torch.inference_mode():
+            with activated_model(offloader, "cuda"):
+                first = rolling_model(value).clone()
+            with activated_model(offloader, "cuda"):
+                second = rolling_model(value).clone()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(first, expected)
+        torch.testing.assert_close(second, first, rtol=0, atol=0)
 
     @CUDA
     def test_routed_lora_selects_block_runtime_for_activation(self) -> None:
@@ -450,9 +597,9 @@ class TestRollingCompile:
                 lora_mode="routed",
             ):
                 assert streamer._active_runtime is streamer._block_runtime
-                assert streamer._block_runtime.active
+                assert streamer._block_runtime.acquired
                 assert streamer._rolling_runtime is not None
-                assert not streamer._rolling_runtime.active
+                assert not streamer._rolling_runtime.acquired
                 with torch.inference_mode():
                     model(torch.randn(2, 8, device="cuda"))
             assert streamer._active_runtime is None

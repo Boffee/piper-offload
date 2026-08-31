@@ -80,23 +80,6 @@ def pinned_component(offloader: object):
     return offloader._composite.resident  # type: ignore[attr-defined]
 
 
-def prefix_component(offloader: object):
-    """A ModelOffloader's prefix component, or None."""
-    return offloader._composite.prefix  # type: ignore[attr-defined]
-
-
-def suffix_component(offloader: object):
-    """A ModelOffloader's suffix component, or None."""
-    return offloader._composite.suffix  # type: ignore[attr-defined]
-
-
-def synchronize_prefix_prefetch(offloader: object) -> None:
-    """Wait for a ModelOffloader's scheduled prefix prefetch."""
-    boundary = offloader._composite._boundary  # type: ignore[attr-defined]
-    assert boundary is not None
-    pending = boundary._prefix_prefetch
-    assert pending is not None
-    pending.result()
-    stream = boundary._prefetch_stream
-    assert stream is not None
-    stream.synchronize()
+def transient_components(offloader: object) -> list:
+    """A ModelOffloader's ``(path, component)`` transient pairs."""
+    return list(offloader._composite.transient)  # type: ignore[attr-defined]

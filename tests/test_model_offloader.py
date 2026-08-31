@@ -7,6 +7,7 @@ CUDA-only tests gate on availability. CPU activation is pass-through
 over the host-backed pinned state.
 """
 
+import copy
 from collections.abc import Sequence
 from concurrent.futures import Future
 from pathlib import Path
@@ -30,10 +31,8 @@ from piper_offload.composite_component import CompositeComponent
 from tests.conftest import (
     activated_model,
     pinned_component,
-    prefix_component,
     streamed_components,
-    suffix_component,
-    synchronize_prefix_prefetch,
+    transient_components,
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -42,17 +41,17 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def _make_model_offloader(
     model: nn.Module,
     *,
-    block_paths: list[str] = [],
-    prefix_paths: list[str] = [],
-    suffix_paths: list[str] = [],
+    block_paths: Sequence[str] = (),
+    transient_block_paths: Sequence[str] = (),
     stream_trainable_weights: bool = False,
+    transient_paths: Sequence[str] = (),
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
         block_paths=block_paths,
-        prefix_paths=prefix_paths,
-        suffix_paths=suffix_paths,
+        transient_block_paths=transient_block_paths,
         stream_trainable_weights=stream_trainable_weights,
+        transient_paths=transient_paths,
     )
 
 
@@ -111,42 +110,6 @@ def _make_block_model(num_blocks: int = 4, width: int = 8) -> nn.Module:
     for p in m.parameters():
         p.requires_grad = False
     return m
-
-
-def _make_boundary_model(num_blocks: int = 3, width: int = 8) -> nn.Module:
-    class RecordingLinear(nn.Linear):
-        def __init__(self) -> None:
-            super().__init__(width, width, bias=False)
-            self.register_buffer("offset", torch.randn(width))
-            self.forward_devices: list[str] = []
-
-        def forward(self, value: torch.Tensor) -> torch.Tensor:
-            self.forward_devices.append(self.weight.device.type)
-            return super().forward(value) + self.offset
-
-    class BoundaryModel(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.prefix = RecordingLinear()
-            self.transformer_blocks = nn.ModuleList(
-                nn.Linear(width, width, bias=False) for _ in range(num_blocks)
-            )
-            self.suffix = RecordingLinear()
-            self.resident_scale = nn.Parameter(torch.randn(width))
-            self.fail_after_blocks = False
-
-        def forward(self, value: torch.Tensor) -> torch.Tensor:
-            value = self.prefix(value) * self.resident_scale
-            for block in self.transformer_blocks:
-                value = block(value)
-            if self.fail_after_blocks:
-                raise RuntimeError("after blocks")
-            return self.suffix(value)
-
-    model = BoundaryModel()
-    for param in model.parameters():
-        param.requires_grad = False
-    return model
 
 
 def _make_trainable_block_model(num_blocks: int = 4, width: int = 8) -> nn.Module:
@@ -449,7 +412,7 @@ class TestLifecycle:
             with activated_model(strategy, "cpu") as cpu_model:
                 assert strategy._active_device == torch.device("cpu")
                 assert all(s._active_device == torch.device("cpu") for s in streamed_components(strategy))
-                assert all(not s._block_runtime.active for s in streamed_components(strategy))
+                assert all(not s._block_runtime.acquired for s in streamed_components(strategy))
                 assert all(
                     block.weight is pinned
                     for block, pinned in zip(
@@ -583,359 +546,6 @@ class TestLifecycle:
             strategy.deactivate()
 
 
-class TestBoundaryPinnedLifecycle:
-    def test_partitions_resident_prefix_suffix_and_streamed_state(self) -> None:
-        model = _make_boundary_model()
-        strategy = _make_model_offloader(
-            model,
-            block_paths=["transformer_blocks"],
-            prefix_paths=["prefix"],
-            suffix_paths=["suffix"],
-        )
-        try:
-            resident = pinned_component(strategy)
-            prefix = prefix_component(strategy)
-            suffix = suffix_component(strategy)
-            assert resident is not None
-            assert prefix is not None
-            assert suffix is not None
-            assert resident.param_names == {"resident_scale"}
-            assert prefix.param_names == {"prefix.weight"}
-            assert suffix.param_names == {"suffix.weight"}
-            assert prefix.buffer_names == {"prefix.offset"}
-            assert suffix.buffer_names == {"suffix.offset"}
-            assert streamed_components(strategy)[0].param_names == {
-                f"transformer_blocks.{idx}.weight" for idx in range(3)
-            }
-            assert strategy.param_names == {
-                name for name, _param in model.named_parameters()
-            }
-            assert strategy.buffer_names == {
-                name for name, _buffer in model.named_buffers()
-            }
-        finally:
-            strategy.deactivate()
-
-    @CUDA
-    @pytest.mark.parametrize("host_backing", ["pinned", "adopt"])
-    def test_cuda_forward_loads_only_the_active_boundary_scope(
-        self,
-        host_backing: str,
-    ) -> None:
-        torch.manual_seed(42)
-        eager = _make_boundary_model()
-        model = _make_boundary_model()
-        model.load_state_dict(eager.state_dict())
-        value = torch.randn(2, 8)
-        expected = eager(value).cuda()
-        hook_devices: list[tuple[str, str]] = []
-        model.register_forward_pre_hook(
-            lambda module, _args: hook_devices.append(
-                ("model", module.prefix.weight.device.type)
-            )
-        )
-        model.transformer_blocks[0].register_forward_pre_hook(
-            lambda _module, _args: hook_devices.append(
-                ("blocks", model.prefix.weight.device.type)
-            )
-        )
-
-        strategy = ModelOffloader.from_module(
-            model,
-            block_paths=("transformer_blocks",),
-            prefix_paths=("prefix",),
-            suffix_paths=("suffix",),
-            host_backing=host_backing,
-        )
-        try:
-            strategy.activate("cuda")
-            assert model.resident_scale.is_cuda
-            assert model.prefix.weight.device.type == "cpu"
-            assert model.suffix.weight.device.type == "cpu"
-            assert model.prefix.offset.device.type == "cpu"
-            assert model.suffix.offset.device.type == "cpu"
-
-            actual = model(value.cuda())
-            synchronize_prefix_prefetch(strategy)
-
-            torch.testing.assert_close(actual, expected)
-            assert model.prefix.forward_devices == ["cuda"]
-            assert model.suffix.forward_devices == ["cuda"]
-            assert hook_devices == [("model", "cuda"), ("blocks", "cpu")]
-            assert model.prefix.weight.device.type == "cpu"
-            assert model.suffix.weight.device.type == "cpu"
-            assert model.prefix.offset.device.type == "cpu"
-            assert model.suffix.offset.device.type == "cpu"
-            assert model.resident_scale.is_cuda
-
-            model(value.cuda())
-            synchronize_prefix_prefetch(strategy)
-            assert model.prefix.forward_devices == ["cuda", "cuda"]
-            assert model.suffix.forward_devices == ["cuda", "cuda"]
-            assert hook_devices[-2:] == [("model", "cuda"), ("blocks", "cpu")]
-            assert model.prefix.weight.device.type == "cpu"
-            assert model.suffix.weight.device.type == "cpu"
-            assert model.suffix.weight.is_pinned() == (host_backing == "pinned")
-        finally:
-            strategy.deactivate()
-        assert model.prefix.weight.device.type == "cpu"
-        assert model.prefix.weight.is_pinned() == (host_backing == "pinned")
-
-    @CUDA
-    def test_forward_failure_requires_deactivation(self) -> None:
-        model = _make_boundary_model()
-        model.fail_after_blocks = True
-        strategy = _make_model_offloader(
-            model,
-            block_paths=["transformer_blocks"],
-            prefix_paths=["prefix"],
-            suffix_paths=["suffix"],
-        )
-        try:
-            strategy.activate("cuda")
-            with pytest.raises(RuntimeError, match="after blocks"):
-                model(torch.randn(2, 8, device="cuda"))
-            assert model.prefix.weight.is_pinned()
-            assert model.suffix.weight.is_cuda
-
-            model.fail_after_blocks = False
-            with pytest.raises(RuntimeError, match="unfinished forward"):
-                model(torch.randn(2, 8, device="cuda"))
-        finally:
-            strategy.deactivate()
-        assert model.prefix.weight.is_pinned()
-        assert model.suffix.weight.is_pinned()
-
-    @CUDA
-    def test_success_prefetches_prefix_without_suffix(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        model = _make_boundary_model()
-        strategy = _make_model_offloader(
-            model,
-            block_paths=["transformer_blocks"],
-            prefix_paths=["prefix"],
-        )
-        prefix = prefix_component(strategy)
-        assert prefix is not None
-        stage_calls = 0
-        original_stage = prefix._stage
-
-        def stage(
-            device: torch.device,
-            stream: torch.cuda.Stream,
-        ) -> None:
-            nonlocal stage_calls
-            stage_calls += 1
-            original_stage(device, stream)
-
-        monkeypatch.setattr(prefix, "_stage", stage)
-        try:
-            strategy.activate("cuda")
-            value = torch.randn(2, 8, device="cuda")
-            model(value)
-            boundary = strategy._composite._boundary
-            assert boundary is not None
-            assert boundary._prefix_prefetch is not None
-
-            model(value)
-            synchronize_prefix_prefetch(strategy)
-            assert stage_calls == 3
-            assert model.suffix.weight.is_cuda
-        finally:
-            strategy.deactivate()
-        assert model.prefix.weight.is_pinned()
-
-    @CUDA
-    def test_prefix_prefetch_failure_propagates_during_deactivation(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        model = _make_boundary_model()
-        strategy = _make_model_offloader(
-            model,
-            block_paths=["transformer_blocks"],
-            prefix_paths=["prefix"],
-            suffix_paths=["suffix"],
-        )
-        prefix = prefix_component(strategy)
-        assert prefix is not None
-        original_stage = prefix._stage
-        stage_calls = 0
-
-        def fail_stage(
-            device: torch.device,
-            stream: torch.cuda.Stream,
-        ) -> None:
-            nonlocal stage_calls
-            stage_calls += 1
-            if stage_calls == 1:
-                original_stage(device, stream)
-                return
-            raise RuntimeError("simulated prefix prefetch failure")
-
-        monkeypatch.setattr(prefix, "_stage", fail_stage)
-        strategy.activate("cuda")
-        try:
-            model(torch.randn(2, 8, device="cuda"))
-            with pytest.raises(
-                RuntimeError,
-                match="simulated prefix prefetch failure",
-            ):
-                strategy.deactivate()
-        finally:
-            strategy.deactivate()
-
-        assert strategy.active_device is None
-        assert model.prefix.weight.is_pinned()
-        assert model.suffix.weight.is_pinned()
-
-    @CUDA
-    def test_post_copy_hooks_run_on_each_boundary_load(self) -> None:
-        model = _make_boundary_model()
-        strategy = _make_model_offloader(
-            model,
-            block_paths=["transformer_blocks"],
-            prefix_paths=["prefix"],
-            suffix_paths=["suffix"],
-        )
-        copies = {"resident": 0, "prefix": 0, "suffix": 0}
-
-        def count(name: str):
-            def hook(_param: nn.Parameter) -> None:
-                copies[name] += 1
-
-            return hook
-
-        removers = [
-            strategy.register_post_copy_hook("resident_scale", count("resident")),
-            strategy.register_post_copy_hook("prefix.weight", count("prefix")),
-            strategy.register_post_copy_hook("suffix.weight", count("suffix")),
-        ]
-        try:
-            strategy.activate("cuda")
-            assert copies == {"resident": 1, "prefix": 0, "suffix": 0}
-            for _ in range(2):
-                model(torch.randn(2, 8, device="cuda"))
-        finally:
-            strategy.deactivate()
-            for remove in removers:
-                remove()
-        assert copies == {"resident": 1, "prefix": 3, "suffix": 2}
-
-    def test_cpu_activation_keeps_all_pinned_scopes_available(self) -> None:
-        torch.manual_seed(42)
-        eager = _make_boundary_model()
-        model = _make_boundary_model()
-        model.load_state_dict(eager.state_dict())
-        value = torch.randn(2, 8)
-        expected = eager(value)
-        strategy = _make_model_offloader(
-            model,
-            block_paths=["transformer_blocks"],
-            prefix_paths=["prefix"],
-            suffix_paths=["suffix"],
-        )
-        try:
-            with activated_model(strategy, "cpu"):
-                torch.testing.assert_close(model(value), expected)
-                assert model.prefix.weight.is_pinned()
-                assert model.suffix.weight.is_pinned()
-                assert model.prefix.offset.is_pinned()
-                assert model.suffix.offset.is_pinned()
-        finally:
-            strategy.deactivate()
-
-    def test_trainable_and_cross_scope_tied_state_remains_resident(self) -> None:
-        model = _make_boundary_model()
-        model.prefix.weight.requires_grad_(True)
-        model.suffix.weight = model.prefix.weight
-        strategy = _make_model_offloader(
-            model,
-            block_paths=["transformer_blocks"],
-            prefix_paths=["prefix"],
-            suffix_paths=["suffix"],
-        )
-        try:
-            resident = pinned_component(strategy)
-            assert resident is not None
-            assert {"prefix.weight", "suffix.weight"} <= resident.param_names
-            assert not prefix_component(strategy).param_names
-            assert not suffix_component(strategy).param_names
-        finally:
-            strategy.deactivate()
-
-    def test_prefix_nested_streamed_group_is_not_the_boundary(self) -> None:
-        class Prefix(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.proj = nn.Linear(8, 8, bias=False)
-                self.refiner_blocks = nn.ModuleList(
-                    nn.Linear(8, 8, bias=False) for _ in range(2)
-                )
-
-            def forward(self, value: torch.Tensor) -> torch.Tensor:
-                value = self.proj(value)
-                for block in self.refiner_blocks:
-                    value = block(value)
-                return value
-
-        class Model(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.prefix = Prefix()
-                self.transformer_blocks = nn.ModuleList(
-                    nn.Linear(8, 8, bias=False) for _ in range(2)
-                )
-                self.suffix = nn.Linear(8, 8, bias=False)
-
-        model = Model()
-        for param in model.parameters():
-            param.requires_grad_(False)
-        strategy = _make_model_offloader(
-            model,
-            block_paths=["prefix.refiner_blocks", "transformer_blocks"],
-            prefix_paths=["prefix"],
-            suffix_paths=["suffix"],
-        )
-        try:
-            boundary = strategy._composite._boundary
-            assert boundary is not None
-            assert boundary._first_block is model.transformer_blocks[0]
-            assert boundary._last_block is model.transformer_blocks[-1]
-            assert prefix_component(strategy).param_names == {"prefix.proj.weight"}
-        finally:
-            strategy.deactivate()
-
-    def test_boundary_attrs_require_unclaimed_central_blocks(self) -> None:
-        model = _make_boundary_model()
-        with pytest.raises(ValueError, match="require at least one block path"):
-            ModelOffloader.from_module(model, prefix_paths=["prefix"])
-        with pytest.raises(ValueError, match="leave no central"):
-            ModelOffloader.from_module(
-                model,
-                block_paths=["transformer_blocks"],
-                prefix_paths=["transformer_blocks"],
-            )
-        with pytest.raises(ValueError, match="cannot be nested"):
-            ModelOffloader.from_module(
-                model,
-                block_paths=["transformer_blocks"],
-                prefix_paths=["transformer_blocks.0"],
-            )
-
-    def test_boundary_attrs_must_be_disjoint_module_paths(self) -> None:
-        model = _make_boundary_model()
-        with pytest.raises(ValueError, match="must not overlap"):
-            ModelOffloader.from_module(
-                model,
-                block_paths=["transformer_blocks"],
-                prefix_paths=["prefix"],
-                suffix_paths=["prefix"],
-            )
-
-
 class TestStreamedComponentBackendActivation:
     def test_direct_cpu_activation_uses_host_backed_weights(self) -> None:
         torch.manual_seed(42)
@@ -954,7 +564,9 @@ class TestStreamedComponentBackendActivation:
             pinned_params = [block.weight for block in m.transformer_blocks]
             with streamer.use("cpu"):
                 assert streamer._active_device == torch.device("cpu")
-                assert not streamer._block_runtime.active
+                assert not streamer._block_runtime.acquired
+                streamer.release()
+                streamer.acquire()
                 assert all(
                     block.weight is pinned
                     for block, pinned in zip(
@@ -974,6 +586,52 @@ class TestStreamedComponentBackendActivation:
         finally:
             streamer.deactivate()
 
+    @CUDA
+    def test_cuda_working_set_can_release_and_reacquire(self) -> None:
+        torch.manual_seed(42)
+        eager_blocks = nn.ModuleList(
+            [nn.Linear(8, 8, bias=False) for _ in range(3)]
+        )
+        blocks = copy.deepcopy(eager_blocks)
+        value = torch.randn(2, 8)
+        with torch.no_grad():
+            expected = value
+            for block in eager_blocks:
+                expected = block(expected)
+
+        streamer = _make_streamed_component(blocks=list(blocks))
+        runtime = streamer._block_runtime
+        try:
+            streamer.activate(torch.device("cuda"))
+            assert runtime.acquired
+
+            streamer.release()
+            streamer.release()
+            assert streamer._active_device is not None
+            assert streamer._active_device.type == "cuda"
+            assert streamer._active_runtime is runtime
+            assert not runtime.acquired
+            assert all(block.weight.device.type == "cpu" for block in blocks)
+
+            streamer.acquire()
+            streamer.acquire()
+            assert runtime.acquired
+            with torch.no_grad():
+                actual = value.cuda()
+                for block in blocks:
+                    actual = block(actual)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual.cpu(), expected)
+        finally:
+            streamer.deactivate()
+
+    def test_acquire_requires_active_session(self) -> None:
+        block = nn.Linear(4, 4, bias=False)
+        streamer = _make_streamed_component(blocks=[block])
+        streamer.release()
+        with pytest.raises(RuntimeError, match="active session"):
+            streamer.acquire()
+
     def test_already_active_block_tracks_the_forward_stream(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -982,7 +640,7 @@ class TestStreamedComponentBackendActivation:
             def __init__(self) -> None:
                 self.used: list[object] = []
 
-            def mark_used(self, stream: object) -> None:
+            def record_stream(self, stream: object) -> None:
                 self.used.append(stream)
 
         streamer = _make_streamed_component(
@@ -1168,6 +826,43 @@ class TestCleanup:
 
 
 class TestHookLifecycle:
+    def test_named_forward_hook_is_caller_owned(self) -> None:
+        model = _make_block_model()
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["transformer_blocks"],
+        )
+        calls: list[nn.Module] = []
+        remove_hook = offloader.register_forward_hook(
+            "transformer_blocks.3",
+            lambda module, _args, _output: calls.append(module),
+        )
+        try:
+            with torch.no_grad():
+                model(torch.randn(2, 8))
+            assert calls == [model.transformer_blocks[3]]
+
+            remove_hook()
+            remove_hook()
+            with torch.no_grad():
+                model(torch.randn(2, 8))
+            assert calls == [model.transformer_blocks[3]]
+        finally:
+            remove_hook()
+            offloader.deactivate()
+
+    def test_named_forward_hook_requires_module_name(self) -> None:
+        model = _make_block_model()
+        offloader = _make_model_offloader(model)
+        try:
+            with pytest.raises(AttributeError):
+                offloader.register_forward_hook(
+                    "head.weight",
+                    lambda _module, _args, _output: None,
+                )
+        finally:
+            offloader.deactivate()
+
     @CUDA
     def test_hooks_installed_on_activate_removed_on_deactivate(self) -> None:
         m = _make_block_model()
@@ -1197,6 +892,315 @@ class TestHookLifecycle:
         strategy.deactivate()
         for block in blocks:
             assert len(block._forward_pre_hooks) == 0
+
+
+# ---------------------------------------------------------------------------
+# ModelOffloader-owned transient residency schedule
+# ---------------------------------------------------------------------------
+
+
+class TestTransientResidency:
+    def test_transient_paths_partition_from_resident_state(self) -> None:
+        model = _make_block_model()
+        model.embed.register_buffer("table", torch.randn(8))
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["transformer_blocks"],
+            transient_paths=["embed", "head"],
+        )
+        try:
+            components = dict(transient_components(offloader))
+            assert components["embed"].param_names == {"embed.weight"}
+            assert components["embed"].buffer_names == {"embed.table"}
+            assert components["head"].param_names == {"head.weight"}
+            assert pinned_component(offloader) is None
+        finally:
+            offloader.deactivate()
+
+    def test_cpu_activation_stays_eager(self) -> None:
+        model = _make_block_model()
+        offloader = _make_model_offloader(
+            model,
+            transient_block_paths=["transformer_blocks"],
+            transient_paths=["embed", "head"],
+        )
+        try:
+            with activated_model(offloader, "cpu"):
+                with torch.inference_mode():
+                    model(torch.randn(2, 8))
+                assert not model._forward_hooks
+                assert not model.embed._forward_hooks
+                assert not model.head._forward_hooks
+                assert not model.transformer_blocks[-1]._forward_hooks
+        finally:
+            offloader.deactivate()
+
+    @CUDA
+    def test_paths_and_streaming_release_at_their_own_boundaries(self) -> None:
+        model = _make_block_model(num_blocks=3)
+        offloader = _make_model_offloader(
+            model,
+            transient_block_paths=["transformer_blocks"],
+            transient_paths=["embed", "head"],
+        )
+        components = dict(transient_components(offloader))
+        embed = components["embed"]
+        head = components["head"]
+        runtime = streamed_components(offloader)[0]._block_runtime
+        block_entry_states: list[tuple[bool, bool, bool]] = []
+        head_entry_states: list[tuple[bool, bool, bool]] = []
+        root_states: list[tuple[bool, bool, bool]] = []
+        block_handle = model.transformer_blocks[0].register_forward_pre_hook(
+            lambda _module, _args: block_entry_states.append(
+                (embed._lease is not None, runtime.acquired, head._lease is not None)
+            )
+        )
+        head_handle = model.head.register_forward_pre_hook(
+            lambda _module, _args: head_entry_states.append(
+                (embed._lease is not None, runtime.acquired, head._lease is not None)
+            )
+        )
+        root_handle = model.register_forward_hook(
+            lambda _module, _args, _output: root_states.append(
+                (embed._lease is not None, runtime.acquired, head._lease is not None)
+            )
+        )
+        try:
+            with activated_model(offloader, "cuda"):
+                value = torch.randn(2, 8, device="cuda")
+                with torch.inference_mode():
+                    first = model(value).clone()
+                    second = model(value).clone()
+                torch.cuda.synchronize()
+
+                assert block_entry_states == [
+                    (False, True, True),
+                    (False, True, True),
+                ]
+                assert head_entry_states == [
+                    (False, False, True),
+                    (False, False, True),
+                ]
+                assert root_states == [
+                    (False, False, False),
+                    (False, False, False),
+                ]
+                assert embed._lease is not None
+                assert runtime.acquired
+                assert head._lease is not None
+                torch.testing.assert_close(second, first, rtol=0, atol=0)
+        finally:
+            block_handle.remove()
+            head_handle.remove()
+            root_handle.remove()
+            offloader.deactivate()
+
+        assert not model._forward_hooks
+        assert not model.embed._forward_hooks
+        assert not model.head._forward_hooks
+        assert not model.transformer_blocks[-1]._forward_hooks
+
+    @CUDA
+    def test_transient_path_records_its_forward_stream_before_release(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model = _make_block_model()
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["transformer_blocks"],
+            transient_paths=["embed"],
+        )
+        embed = dict(transient_components(offloader))["embed"]
+        recorded_streams: list[torch.cuda.Stream] = []
+        original_record_stream = embed.record_stream
+
+        def record_stream(stream: torch.cuda.Stream) -> None:
+            recorded_streams.append(stream)
+            original_record_stream(stream)
+
+        monkeypatch.setattr(embed, "record_stream", record_stream)
+        side_stream = torch.cuda.Stream()
+        try:
+            with activated_model(offloader, "cuda"):
+                with torch.cuda.stream(side_stream):
+                    model.embed(torch.randn(2, 8, device="cuda"))
+
+                assert recorded_streams[-1] == side_stream
+                assert embed._lease is None
+        finally:
+            offloader.deactivate()
+
+    @CUDA
+    def test_activation_inside_inference_mode_keeps_targets_mutable(self) -> None:
+        model = _make_block_model(num_blocks=3)
+        offloader = _make_model_offloader(
+            model,
+            transient_block_paths=["transformer_blocks"],
+            transient_paths=["embed"],
+        )
+        embed = dict(transient_components(offloader))["embed"]
+        runtime = streamed_components(offloader)[0]._block_runtime
+        with torch.inference_mode():
+            with activated_model(offloader, "cuda"):
+                model(torch.randn(2, 8, device="cuda"))
+                model(torch.randn(2, 8, device="cuda"))
+                assert embed._lease is not None
+                assert runtime.acquired
+
+    @CUDA
+    def test_persistent_and_transient_block_paths_schedule_independently(
+        self,
+    ) -> None:
+        class MultiPathModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.first_blocks = nn.ModuleList(
+                    [nn.Linear(8, 8, bias=False) for _ in range(2)]
+                )
+                self.second_blocks = nn.ModuleList(
+                    [nn.Linear(8, 8, bias=False) for _ in range(2)]
+                )
+                self.head = nn.Linear(8, 8, bias=False)
+                self.run_first = True
+                self.requires_grad_(False)
+
+            def forward(self, value: torch.Tensor) -> torch.Tensor:
+                if self.run_first:
+                    for block in self.first_blocks:
+                        value = block(value)
+                for block in self.second_blocks:
+                    value = block(value)
+                return self.head(value)
+
+        model = MultiPathModel()
+        offloader = _make_model_offloader(
+            model,
+            block_paths=["first_blocks"],
+            transient_block_paths=["second_blocks"],
+        )
+        first, second = streamed_components(offloader)
+        first_runtime = first._block_runtime
+        second_runtime = second._block_runtime
+        second_entry_states: list[tuple[bool, bool]] = []
+        suffix_states: list[tuple[bool, bool]] = []
+        second_handle = model.second_blocks[0].register_forward_pre_hook(
+            lambda _module, _args: second_entry_states.append(
+                (first_runtime.acquired, second_runtime.acquired)
+            )
+        )
+        suffix_handle = model.head.register_forward_pre_hook(
+            lambda _module, _args: suffix_states.append(
+                (first_runtime.acquired, second_runtime.acquired)
+            )
+        )
+        try:
+            with activated_model(offloader, "cuda"):
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+                assert second_entry_states == [(True, True)]
+                assert suffix_states == [(True, False)]
+                assert first_runtime.acquired
+                assert second_runtime.acquired
+
+                model.run_first = False
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+                assert second_entry_states[-1] == (True, True)
+                assert suffix_states[-1] == (True, False)
+                assert first_runtime.acquired
+                assert second_runtime.acquired
+        finally:
+            second_handle.remove()
+            suffix_handle.remove()
+            offloader.deactivate()
+
+        assert not model._forward_hooks
+        assert not model.first_blocks[-1]._forward_hooks
+        assert not model.second_blocks[-1]._forward_hooks
+
+    @CUDA
+    def test_forward_failure_leaves_released_runtime_safe_to_deactivate(
+        self,
+    ) -> None:
+        class FailingHead(nn.Linear):
+            fail = True
+
+            def forward(self, value: torch.Tensor) -> torch.Tensor:
+                if self.fail:
+                    raise RuntimeError("simulated suffix failure")
+                return super().forward(value)
+
+        model = _make_block_model(num_blocks=3)
+        model.head = FailingHead(8, 8, bias=False).requires_grad_(False)
+        offloader = _make_model_offloader(
+            model,
+            transient_block_paths=["transformer_blocks"],
+            transient_paths=["embed"],
+        )
+        embed = dict(transient_components(offloader))["embed"]
+        runtime = streamed_components(offloader)[0]._block_runtime
+        try:
+            offloader.activate("cuda")
+            with pytest.raises(RuntimeError, match="simulated suffix failure"):
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+            assert not runtime.acquired
+            assert embed._lease is None
+        finally:
+            offloader.deactivate()
+
+        assert not model._forward_hooks
+        assert not model.embed._forward_hooks
+        assert not model.transformer_blocks[-1]._forward_hooks
+
+        model.head.fail = False
+        try:
+            with activated_model(offloader, "cuda"):
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+                assert runtime.acquired
+                assert embed._lease is not None
+        finally:
+            offloader.deactivate()
+
+    @CUDA
+    def test_hook_install_failure_rolls_back_activation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model = _make_block_model(num_blocks=3)
+        offloader = _make_model_offloader(
+            model,
+            transient_block_paths=["transformer_blocks"],
+            transient_paths=["embed"],
+        )
+        embed = dict(transient_components(offloader))["embed"]
+        runtime = streamed_components(offloader)[0]._block_runtime
+        original_register = model.register_forward_hook
+
+        def fail_register(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("simulated root hook failure")
+
+        monkeypatch.setattr(model, "register_forward_hook", fail_register)
+        with pytest.raises(RuntimeError, match="simulated root hook failure"):
+            offloader.activate("cuda")
+
+        assert offloader.active_device is None
+        assert not runtime.acquired
+        assert embed._lease is None
+        assert not model.embed._forward_hooks
+        assert not model.transformer_blocks[-1]._forward_hooks
+
+        monkeypatch.setattr(model, "register_forward_hook", original_register)
+        try:
+            with activated_model(offloader, "cuda"):
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+                assert runtime.acquired
+                assert embed._lease is not None
+        finally:
+            offloader.deactivate()
 
 
 # ---------------------------------------------------------------------------
@@ -1245,6 +1249,23 @@ class TestTraversalPrefetch:
             torch.cuda.synchronize()
 
         assert recorded == [1, 2, 3, 0], recorded
+
+    @CUDA
+    def test_transient_block_path_stops_prefetch_at_final_block(self) -> None:
+        model = _make_block_model(num_blocks=4, width=8)
+        offloader = _make_model_offloader(
+            model,
+            transient_block_paths=["transformer_blocks"],
+        )
+        streamer = streamed_components(offloader)[0]
+
+        with activated_model(offloader, "cuda"):
+            recorded = self._record_prefetches(streamer)
+            with torch.inference_mode():
+                model(torch.randn(2, 8, device="cuda"))
+            torch.cuda.synchronize()
+
+        assert recorded == [1, 2, 3]
 
     @CUDA
     def test_continuous_backward_stays_backward(self) -> None:
@@ -1401,6 +1422,34 @@ class TestValidation:
         finally:
             strategy.deactivate()
 
+    def test_block_path_modes_must_be_disjoint(self) -> None:
+        model = _make_block_model()
+        with pytest.raises(
+            ValueError,
+            match="block_paths and transient_block_paths must be disjoint",
+        ):
+            _make_model_offloader(
+                model,
+                block_paths=["transformer_blocks"],
+                transient_block_paths=["transformer_blocks"],
+            )
+
+    def test_transient_block_paths_reject_aliased_modules(self) -> None:
+        model = _make_block_model()
+        shared = nn.Linear(8, 8, bias=False).requires_grad_(False)
+        model.transformer_blocks = nn.ModuleList([shared, shared])
+
+        with pytest.raises(
+            ValueError,
+            match="transient_block_paths does not support aliased block modules",
+        ):
+            _make_model_offloader(
+                model,
+                transient_block_paths=["transformer_blocks"],
+            )
+
+        assert shared.weight.device.type == "cpu"
+
     def test_block_paths_resolving_to_non_modulelist_raises(self) -> None:
         m = _make_block_model(num_blocks=4)
         with pytest.raises(TypeError, match="nn.ModuleList"):
@@ -1416,6 +1465,25 @@ class TestValidation:
 
 
 class TestResourceCacheIntegration:
+    def test_model_spec_propagates_transient_paths(self) -> None:
+        from piper_offload import ModelSpec
+
+        spec = ModelSpec(
+            key="transient",
+            estimated_cache_bytes=1024,
+            factory=_make_block_model,
+            block_paths=("transformer_blocks",),
+            transient_paths=("embed", "head"),
+        )
+
+        offloader = spec.build_store()
+        try:
+            assert [
+                path for path, _component in transient_components(offloader)
+            ] == ["embed", "head"]
+        finally:
+            offloader.deactivate()
+
     def test_model_spec_propagates_adopted_host_backing(self) -> None:
         from piper_offload import ModelSpec
 
@@ -1424,8 +1492,6 @@ class TestResourceCacheIntegration:
             estimated_cache_bytes=1024,
             factory=_make_block_model,
             block_paths=("transformer_blocks",),
-            prefix_paths=("embed",),
-            suffix_paths=("head",),
             host_backing="adopt",
         )
 
@@ -1435,8 +1501,9 @@ class TestResourceCacheIntegration:
                 not param.is_pinned()
                 for param in offloader.value.parameters()
             )
-            assert prefix_component(offloader).param_names == {"embed.weight"}
-            assert suffix_component(offloader).param_names == {"head.weight"}
+            resident = pinned_component(offloader)
+            assert resident is not None
+            assert resident.param_names == {"embed.weight", "head.weight"}
         finally:
             offloader.deactivate()
 
@@ -1681,14 +1748,11 @@ class TestActivateFailureCleanup:
         )
         strat._composite = CompositeComponent(
             resident=None,
-            prefix=None,
-            suffix=None,
             streamed=[
                 _Recorder("A"),
                 _Recorder("B"),
                 _Recorder("C", raise_on_activate=True),
             ],
-            boundary=None,
         )
 
         with pytest.raises(RuntimeError, match="C activate failed"):

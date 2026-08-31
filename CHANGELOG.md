@@ -5,6 +5,29 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add explicit `StreamedComponent.acquire()` and `release()` operations that
+  can cycle a block streamer's CUDA working set without ending its activation
+  session. Activation still acquires immediately, preserving existing model
+  behavior.
+- Add the same acquire/release lifecycle to `PinnedComponent`, allowing its
+  bulk CUDA working set to cycle independently from its activation session.
+- Add `ModelOffloader.register_forward_hook()` for caller-owned native PyTorch
+  hooks addressed by fully-qualified module name.
+- Add `transient_block_paths` to `ModelOffloader` for streamed CUDA pools that
+  release after their final blocks and reacquire after the root model forward
+  without runtime-specific coordination or a redundant block-0 wraparound
+  refill. Ordinary `block_paths` pools remain resident.
+- Add `transient_paths` for named modules whose independent CUDA working sets
+  release after their forwards and reacquire after the root model forward.
+
+### Removed
+
+- Remove the `prefix_paths` and `suffix_paths` model selectors and their
+  boundary-scoped CUDA runtime. Non-streamed model state is resident for the
+  activation again.
+
 ## [0.4.1] - 2026-08-29
 
 ### Changed

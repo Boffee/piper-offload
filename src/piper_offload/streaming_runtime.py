@@ -23,29 +23,29 @@ type _LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
 
 
 class StreamingRuntime(Protocol):
-    """Lifecycle shared by CUDA streaming strategies.
+    """CUDA working-set lifecycle shared by streaming strategies.
 
     Implementations allocate accelerator resources only during
-    :meth:`activate`. Activation may fail after partially initializing a
-    runtime, so :meth:`deactivate` must also be safe for inactive and partial
+    :meth:`acquire`. Acquisition may fail after partially initializing a
+    runtime, so :meth:`release` must also be safe for released and partial
     states and must release every resource it can before propagating a cleanup
     error.
     """
 
     @property
-    def active(self) -> bool: ...
+    def acquired(self) -> bool: ...
 
     @property
     def compile_backend(self) -> CompileBackend:
         """The ``torch.compile`` backend required by this strategy."""
         ...
 
-    def activate(self, device: torch.device) -> None:
-        """Allocate resources and install hooks for one CUDA activation."""
+    def acquire(self, device: torch.device) -> None:
+        """Allocate the CUDA working set and install execution hooks."""
         ...
 
-    def deactivate(self) -> None:
-        """Idempotently release resources from any activation state."""
+    def release(self) -> None:
+        """Idempotently release the CUDA working set from any state."""
         ...
 
     def optimizer_step(self) -> contextlib.AbstractContextManager[None]: ...
@@ -114,11 +114,13 @@ class BlockStreamingRuntime:
         instances: Sequence[PinnedModuleInstance],
         *,
         log_label: str,
+        wraparound: bool = True,
     ) -> None:
         self._instances = tuple(instances)
         self._blocks = tuple(instance.module for instance in instances)
         self._signatures = tuple(_instance_target_signature(instance) for instance in instances)
         self._log_label = log_label
+        self._wraparound = wraparound
         self._device: torch.device | None = None
         self._pool: _MorphingTargetPool | None = None
         self._block_to_lease: dict[int, _CudaTargetLease] = {}
@@ -132,16 +134,16 @@ class BlockStreamingRuntime:
         self._move_trainable_grads_to(torch.device("cpu"))
 
     @property
-    def active(self) -> bool:
+    def acquired(self) -> bool:
         return self._device is not None
 
     @property
     def compile_backend(self) -> CompileBackend:
         return "inductor"
 
-    def activate(self, device: torch.device) -> None:
-        if self.active:
-            raise RuntimeError("block streaming runtime is already active")
+    def acquire(self, device: torch.device) -> None:
+        if self.acquired:
+            raise RuntimeError("block streaming runtime is already acquired")
 
         num_blocks = len(self._instances)
         self._device = device
@@ -160,9 +162,12 @@ class BlockStreamingRuntime:
 
         self._register_hooks()
 
-        logger.info(f"{self._log_label} active: one block on GPU plus one lookahead target across {num_blocks} blocks")
+        logger.info(
+            f"{self._log_label} acquired: one block on GPU plus one "
+            f"lookahead target across {num_blocks} blocks"
+        )
 
-    def deactivate(self) -> None:
+    def release(self) -> None:
         for handle in self._hooks:
             handle.remove()
         self._hooks.clear()
@@ -187,11 +192,11 @@ class BlockStreamingRuntime:
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:
-        if not self.active:
+        if not self.acquired:
             raise RuntimeError(
-                "StreamedComponent.optimizer_step() called on inactive "
-                "streamer. Use it inside the offloader's context "
-                "manager, between backward and the next forward."
+                "StreamedComponent.optimizer_step() called while its CUDA "
+                "working set is released. Acquire the component before "
+                "entering the optimizer step."
             )
         if self._optimizer_step_active:
             raise RuntimeError(
@@ -210,7 +215,7 @@ class BlockStreamingRuntime:
 
         device = self._require_device()
         step_stream = self._stream
-        assert step_stream is not None, "stream allocated in activate()"
+        assert step_stream is not None, "stream allocated in acquire()"
 
         self._optimizer_step_active = True
         try:
@@ -226,7 +231,7 @@ class BlockStreamingRuntime:
     def _require_device(self) -> torch.device:
         device = self._device
         if device is None:
-            raise RuntimeError("block streaming runtime is inactive")
+            raise RuntimeError("block streaming runtime is released")
         return device
 
     def _load_trainables_for_step(
@@ -275,7 +280,7 @@ class BlockStreamingRuntime:
         *,
         non_blocking: bool = False,
     ) -> None:
-        assert self._pool is not None, "runtime is not active"
+        assert self._pool is not None, "runtime is not acquired"
         instance = self._instances[block_idx]
         lease = self._block_to_lease.get(block_idx)
         if lease is None:
@@ -305,7 +310,7 @@ class BlockStreamingRuntime:
         block_idx: int,
     ) -> None:
         self._instances[block_idx].install_pinned()
-        assert self._pool is not None, "runtime is not active"
+        assert self._pool is not None, "runtime is not acquired"
         lease = self._block_to_lease.pop(block_idx, None)
         if lease is not None:
             lease.release()
@@ -352,7 +357,7 @@ class BlockStreamingRuntime:
         self,
         idx: int,
     ) -> None:
-        if not self.active:
+        if not self.acquired:
             return
 
         current_stream = torch.cuda.current_stream(self._require_device())
@@ -361,11 +366,13 @@ class BlockStreamingRuntime:
                 self._release_block(self._active_idx)
                 self._active_idx = None
             self._ensure_on_gpu(idx)
-        self._block_to_lease[idx].mark_used(current_stream)
+        self._block_to_lease[idx].record_stream(current_stream)
 
         last = self._last_idx
         self._last_idx = idx
         num_blocks = len(self._instances)
+        if not self._wraparound and idx == num_blocks - 1:
+            return
         if last < 0:
             direction = 1
         else:

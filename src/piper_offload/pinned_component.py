@@ -24,11 +24,12 @@ Class-specific caveats
   the original (non-pinned) quanto wrapper.
 - Buffer mutations during forward (RNN/SSM state, KV cache,
   training-mode BatchNorm running stats) are *discarded* on
-  :meth:`deactivate`. Suitable for inference of stateless modules; not
-  suitable for models that need persistent buffer state across calls.
+  :meth:`release` or :meth:`deactivate`. Suitable for inference of stateless
+  modules; not suitable for models that need persistent buffer state across
+  calls.
 - Trainable parameter updates on CUDA must run inside
-  :meth:`optimizer_step`. Without that boundary, deactivation restores
-  older pinned CPU bytes and discards active GPU updates.
+  :meth:`optimizer_step`. Without that boundary, release or deactivation
+  restores older pinned CPU bytes and discards active GPU updates.
 - **Caller owns lifecycle correctness.** Calling :meth:`activate`
   twice without an intervening :meth:`deactivate` raises before registry
   movement or GPU allocation. Pinned construction optimizes peak host memory
@@ -135,13 +136,14 @@ class PinnedComponent:
     Instances are created by binding a :class:`PinnedComponentStore` to a
     compatible model. Every managed parameter is backed by pinned CPU
     storage (handling quanto decomposition and tied-weight dedup).
-    :meth:`activate` allocates GPU tensors for each unique pinned
-    parameter and installs that active storage into the managed model
-    registry entries. Frozen parameters use registry replacement;
-    trainable parameters preserve the user's Parameter objects and swap
-    only ``.data`` so optimizer state remains valid.
-    :meth:`deactivate` restores pinned CPU storage so GPU storage is
-    released by refcount.
+    :meth:`activate` starts a device session and eagerly calls
+    :meth:`acquire`. Acquisition allocates GPU tensors for each unique pinned
+    parameter and installs that active storage into the managed model registry
+    entries. Frozen parameters use registry replacement; trainable parameters
+    preserve the user's Parameter objects and swap only ``.data`` so optimizer
+    state remains valid. :meth:`release` restores pinned CPU storage and frees
+    the CUDA working set without ending the session; :meth:`deactivate` also
+    ends the session.
 
     If trainable params are active on CUDA, run ``optimizer.step()``
     inside :meth:`optimizer_step` so updated GPU bytes are copied back
@@ -214,13 +216,9 @@ class PinnedComponent:
         Calling activate() twice without an intervening deactivate()
         raises before any registry movement or GPU allocation.
 
-        **Activation failure semantics:** if CUDA activation fails
-        midway, the component is left in an undefined partial state —
-        some tensors may be GPU, some pinned-CPU. Retrying activation on
-        that component is unsupported; the caller's only supported
-        cleanup path is :meth:`deactivate` (which forces managed
-        tensors back to pinned-CPU) followed by dropping the component
-        reference.
+        **Activation failure semantics:** failed CUDA acquisition releases its
+        partial working set and restores pinned storage. The caller's cleanup
+        path remains :meth:`deactivate` followed by dropping the component.
         """
         del kwargs  # streaming-only policy; bulk-pinned activation ignores it
         if self._active_device is not None:
@@ -233,66 +231,51 @@ class PinnedComponent:
         if active_device.type == "cpu":
             self._instance.install_pinned()
             self._active_device = active_device
-        elif active_device.type == "cuda":
-            current_stream = torch.cuda.current_stream(active_device)
-            self._stage(active_device, current_stream)
-            self._acquire(current_stream)
+            return
+        if active_device.type == "cuda":
+            self._active_device = active_device
+            self.acquire()
+            return
+        raise ValueError(
+            "PinnedComponent.activate() supports CUDA or CPU; "
+            f"got {active_device}."
+        )
+
+    def acquire(self) -> None:
+        """Acquire this active session's CUDA working set.
+
+        Acquisition is idempotent. CPU sessions already use their host backing
+        and therefore have no separate working set.
+        """
+        active_device = self._active_device
+        if active_device is None:
+            raise RuntimeError(
+                "PinnedComponent.acquire() requires an active session; "
+                "call activate() first."
+            )
+        if active_device.type == "cpu" or self._lease is not None:
+            return
+
+        current_stream = torch.cuda.current_stream(active_device)
+        lease = _CudaTargetLease.allocate(self._instance, active_device)
+        self._lease = lease
+        try:
+            lease.stage(
+                self._instance,
+                current_stream,
+                run_post_copy_hooks=True,
+                non_blocking=True,
+            )
+            self._instance.install_target(lease.acquire(current_stream))
             torch.cuda.synchronize(active_device)
             # Realign trainable grads with their now-GPU data so the next
             # backward accumulates on-device. A no-op unless a prior CPU
             # optimizer step left a retained CPU grad (set_to_none=False).
             self._instance.move_trainable_grads_to(active_device)
             self._install_use_hook()
-        else:
-            raise ValueError(
-                "PinnedComponent.activate() supports CUDA or CPU; "
-                f"got {active_device}."
-            )
-
-    def _stage(
-        self,
-        device: torch.device,
-        stream: torch.cuda.Stream,
-    ) -> None:
-        """Asynchronously fill a CUDA target without installing it.
-
-        Package-internal: boundary streaming stages the next prefix on its
-        copy stream, then installs it on the model thread only after the
-        consuming stream has acquired the target.
-        """
-        if self._active_device is not None or self._lease is not None:
-            raise RuntimeError(
-                "PinnedComponent stage requested with an active or staged target."
-            )
-        lease_device = canonical_device(device)
-        if lease_device.type != "cuda":
-            raise ValueError(
-                "PinnedComponent staging requires CUDA; "
-                f"got {lease_device}."
-            )
-        lease = _CudaTargetLease.allocate(self._instance, lease_device)
-        try:
-            lease.stage(
-                self._instance,
-                stream,
-                run_post_copy_hooks=True,
-                non_blocking=True,
-            )
         except BaseException:
-            lease.close()
+            self.release()
             raise
-        self._lease = lease
-
-    def _acquire(self, stream: torch.cuda.Stream) -> None:
-        """Install the staged target for consumption on ``stream``."""
-        if self._active_device is not None:
-            raise RuntimeError("PinnedComponent staged target is already active.")
-        lease = self._lease
-        if lease is None:
-            raise RuntimeError("PinnedComponent has no staged CUDA target.")
-        target = lease.acquire(stream)
-        self._instance.install_target(target)
-        self._active_device = lease.device
 
     def _install_use_hook(self) -> None:
         """Track the CUDA stream that actually executes the bound module."""
@@ -300,19 +283,24 @@ class PinnedComponent:
             raise RuntimeError("PinnedComponent CUDA use hook is already installed.")
         component_ref = weakref.ref(self)
 
-        def mark_used(_module: nn.Module, _args: tuple[object, ...]) -> None:
+        def record_stream(_module: nn.Module, _args: tuple[object, ...]) -> None:
             component = component_ref()
             if component is None:
                 return
-            lease = component._lease
             device = component._active_device
-            if lease is not None and device is not None and device.type == "cuda":
-                lease.mark_used(torch.cuda.current_stream(device))
+            if device is not None and device.type == "cuda":
+                component.record_stream(torch.cuda.current_stream(device))
 
         self._use_hook = self._instance.module.register_forward_pre_hook(
-            mark_used,
+            record_stream,
             prepend=True,
         )
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        """Record a CUDA stream that may still be using the active target."""
+        lease = self._lease
+        if lease is not None:
+            lease.record_stream(stream)
 
     def _remove_use_hook(self) -> None:
         hook = self._use_hook
@@ -320,36 +308,46 @@ class PinnedComponent:
         if hook is not None:
             hook.remove()
 
-    def _release(self) -> None:
-        """Restore host backing and safely discard any staged CUDA target."""
-        self._remove_use_hook()
+    def release(self) -> None:
+        """Idempotently release this session's CUDA working set.
+
+        Registry entries and trainable gradients return to pinned CPU storage,
+        and the CUDA target lease is closed. The activation session remains
+        active so :meth:`acquire` can prepare another traversal.
+        Target retirement completes recorded CUDA work, so release is safe to
+        call immediately after a forward.
+
+        Trainable ``.grad`` follows ``.data`` to pinned CPU here (grads
+        otherwise linger wherever ``AccumulateGrad`` left them, i.e. on the
+        GPU, pinning device memory and stranding the gradient off-host).
+        This gives a uniform released resting state — ``.data`` and
+        ``.grad`` both on pinned CPU — so a context-free CPU
+        ``optimizer.step()`` works the same for pinned and streamed
+        trainables."""
         lease = self._lease
+        if lease is None:
+            return
+        self._remove_use_hook()
         try:
             self._instance.install_pinned()
             self._instance.move_trainable_grads_to(torch.device("cpu"))
         finally:
             try:
-                if lease is not None:
-                    lease.close()
+                lease.close()
             finally:
                 self._lease = None
-                self._active_device = None
 
     def deactivate(self) -> None:
-        """Repoint registry entries back at pinned-CPU Parameters. Idempotent —
-        safe to call before activate or multiple times. After
-        deactivate, drop the component reference to release pinned
-        memory (and the model reference too if you don't need it
-        anymore).
+        """Release working storage and end the activation session.
 
-        Trainable ``.grad`` follows ``.data`` to pinned CPU here (grads
-        otherwise linger wherever ``AccumulateGrad`` left them, i.e. on the
-        GPU, pinning device memory and stranding the gradient off-host).
-        This gives a uniform deactivated resting state — ``.data`` and
-        ``.grad`` both on pinned CPU — so a context-free CPU
-        ``optimizer.step()`` works the same for pinned and streamed
-        trainables."""
-        self._release()
+        Idempotent and safe to call before :meth:`activate` or multiple times.
+        Drop the component and model references afterward to release pinned
+        memory.
+        """
+        try:
+            self.release()
+        finally:
+            self._active_device = None
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Iterator[None]:

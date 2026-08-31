@@ -345,7 +345,7 @@ def _streamed_param_names_for_blocks(
                 "All blocks in a StreamedComponent group must select the "
                 "same parameter names (their shapes, dtypes, and quant "
                 "formats may differ). Split structurally different block "
-                "kinds across separate `block_paths=[...]` groups."
+                "kinds across separate block-path groups."
             )
     return param_names
 
@@ -359,7 +359,7 @@ def _streamed_buffer_names_for_blocks(blocks: Sequence[nn.Module]) -> set[str]:
                 "All blocks in a StreamedComponent group must select the "
                 "same buffer names (their shapes, dtypes, and layouts may "
                 "differ). Split structurally different block kinds across "
-                "separate `block_paths=[...]` groups."
+                "separate block-path groups."
             )
     return buffer_names
 
@@ -512,6 +512,7 @@ class StreamedComponentStore:
         model: nn.Module,
         *,
         block_compile: BlockCompileConfig | None = None,
+        wraparound: bool = True,
     ) -> StreamedComponent:
         """Bind this store's per-block backing bytes to ``model``.
 
@@ -547,6 +548,7 @@ class StreamedComponentStore:
             name=self.blocks_path,
             block_indices=self.block_indices,
             block_compile=block_compile,
+            wraparound=wraparound,
         )
 
 
@@ -578,13 +580,16 @@ class StreamedComponent:
     Lifecycle is uniform with :class:`PinnedComponent`: store construction
     pins (so ``cache_bytes`` is final at construction time, ready
     for :class:`~piper_offload.resource_cache.ResourceCache` admission), and
-    ``activate`` brings to CUDA or marks CPU active, ``deactivate`` returns state to
-    pinned CPU, removes hooks, and restores eager forwards. Optional
+    ``activate`` starts a device session and initially acquires its CUDA working
+    set, while ``deactivate`` releases that working set, returns state to pinned
+    CPU, removes hooks, and restores eager forwards. :meth:`release` and
+    :meth:`acquire` may cycle the CUDA working set without ending the session.
+    Optional
     ``block_compile`` policy belongs to this bound runtime and installs lazy
     compiled forwards only for eligible CUDA inference activations. Ordinary
     streaming owns one active block and one lookahead target; rolling
-    compilation owns one shared parameter target. Iteration wraparound is an
-    internal scheduling detail of both strategies.
+    compilation owns one shared parameter target. Both strategies wrap to
+    block 0 by default; transient model scheduling disables that wraparound.
     There is no ``close()``; pinned memory in module state is freed when the
     caller drops the binding and model references.
 
@@ -623,6 +628,9 @@ class StreamedComponent:
         Optional forward-only compile policy. One lazy callable is retained per
         distinct block module object, installed during eligible CUDA
         activations, and removed on deactivate. CPU activation stays eager.
+    wraparound:
+        Whether the runtime prepares block 0 while executing the final block.
+        :class:`ModelOffloader` disables this for transient streamed pools.
     """
 
     def __init__(
@@ -632,6 +640,7 @@ class StreamedComponent:
         name: str | None = None,
         block_indices: Sequence[int] | None = None,
         block_compile: BlockCompileConfig | None = None,
+        wraparound: bool = True,
     ) -> None:
         self._block_instances = list(block_instances)
         if block_indices is None:
@@ -648,11 +657,13 @@ class StreamedComponent:
         self._block_runtime = BlockStreamingRuntime(
             self._block_instances,
             log_label=self._log_label,
+            wraparound=wraparound,
         )
         self._rolling_runtime = create_rolling_runtime(
             self._block_instances,
             block_compile,
             log_label=self._log_label,
+            wraparound=wraparound,
         )
         compile_runtime: StreamingRuntime = self._rolling_runtime or self._block_runtime
         self._block_compile = _BlockCompileState.create(
@@ -842,28 +853,63 @@ class StreamedComponent:
             else self._block_runtime
         )
 
-        # Record the selected runtime before activation so deactivate() can
+        # Record the selected runtime before acquisition so deactivate() can
         # clean up a partially-created pool, stream, or hook set if activation
         # raises midway through its lifecycle.
         self._active_device = active_device
         self._active_runtime = runtime
-        runtime.activate(active_device)
+        self.acquire()
         self._block_compile.install(compile_blocks)
+
+    def acquire(self) -> None:
+        """Acquire this active session's CUDA streaming working set.
+
+        Idempotent when already acquired. CPU sessions have no CUDA working
+        set and therefore need no acquisition. The activation session and any
+        installed compiled forwards remain intact across release/acquire
+        cycles.
+        """
+        active_device = self._active_device
+        if active_device is None:
+            raise RuntimeError(
+                "StreamedComponent.acquire() requires an active session; "
+                "call activate() first."
+            )
+        if active_device.type == "cpu":
+            return
+        runtime = self._active_runtime
+        if runtime is None:
+            raise RuntimeError(
+                "StreamedComponent CUDA session has no selected runtime."
+            )
+        if not runtime.acquired:
+            runtime.acquire(active_device)
+
+    def release(self) -> None:
+        """Idempotently release this session's CUDA streaming working set.
+
+        Blocks return to host backing and runtime-owned CUDA targets, streams,
+        prefetch work, and hooks are released. The component remains active,
+        and compiled forwards remain installed, so :meth:`acquire` can prepare
+        the same session for another traversal. Target retirement completes
+        recorded CUDA work, so release is safe immediately after a forward.
+        """
+        runtime = self._active_runtime
+        if runtime is not None:
+            runtime.release()
 
     def deactivate(self) -> None:
         """Tear down active resources idempotently — safe to call
         before activate or multiple times. The selected runtime owns cleanup
-        of any partial activation state. Drop the binding reference after
+        of any partial acquisition state. Drop the binding reference after
         deactivate to release pinned memory."""
         self._block_compile.restore()
         if self._active_device == torch.device("cpu"):
             self._active_device = None
             return
 
-        runtime = self._active_runtime
         try:
-            if runtime is not None:
-                runtime.deactivate()
+            self.release()
         finally:
             self._active_runtime = None
             self._active_device = None
