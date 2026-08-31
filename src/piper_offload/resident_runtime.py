@@ -98,13 +98,13 @@ class ResidentBlockRuntime:
     def optimizer_step(self) -> Generator[None]:
         if not self.acquired:
             raise RuntimeError(
-                "StreamedComponent.optimizer_step() called while its CUDA "
+                "BlockComponent.optimizer_step() called while its CUDA "
                 "working set is released. Acquire the component before "
                 "entering the optimizer step."
             )
         if self._optimizer_step_active:
             raise RuntimeError(
-                "StreamedComponent.optimizer_step() does not support "
+                "BlockComponent.optimizer_step() does not support "
                 "reentrant entry."
             )
         if not any(instance.has_trainables for instance in self._instances):

@@ -48,12 +48,8 @@ def pytest_runtest_call(item: pytest.Item) -> Generator[None]:
     if torch.cuda.is_available() or outcome.excinfo is None:
         return
     exc = outcome.excinfo[1]
-    if isinstance(exc, RuntimeError) and any(
-        fragment in str(exc) for fragment in _CUDA_UNAVAILABLE_ERROR_FRAGMENTS
-    ):
-        outcome.force_exception(
-            pytest.skip.Exception(f"needs a CUDA GPU: {exc}", _use_item_location=True)
-        )
+    if isinstance(exc, RuntimeError) and any(fragment in str(exc) for fragment in _CUDA_UNAVAILABLE_ERROR_FRAGMENTS):
+        outcome.force_exception(pytest.skip.Exception(f"needs a CUDA GPU: {exc}", _use_item_location=True))
 
 
 @contextlib.contextmanager
@@ -70,9 +66,9 @@ def activated_model(
         offloader.deactivate()
 
 
-def streamed_components(offloader: object) -> list:
-    """A ModelOffloader's streamed components (test-introspection helper)."""
-    return list(offloader._composite.streamed)  # type: ignore[attr-defined]
+def block_components(offloader: object) -> list:
+    """A ModelOffloader's block components (test-introspection helper)."""
+    return list(offloader._composite.blocks)  # type: ignore[attr-defined]
 
 
 def pinned_component(offloader: object):

@@ -1,4 +1,4 @@
-"""CUDA execution strategies for streamed block components."""
+"""CUDA execution strategy that streams whole block targets."""
 
 import contextlib
 import functools
@@ -6,7 +6,6 @@ import logging
 import weakref
 from collections.abc import Generator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Protocol
 
 import torch
 from torch import nn
@@ -20,35 +19,6 @@ logger = logging.getLogger(__name__)
 
 type BlockSignature = tuple[object, ...]
 type _LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
-
-
-class StreamingRuntime(Protocol):
-    """CUDA working-set lifecycle shared by block-residency strategies.
-
-    Implementations allocate accelerator resources only during
-    :meth:`acquire`. Acquisition may fail after partially initializing a
-    runtime, so :meth:`release` must also be safe for released and partial
-    states and must release every resource it can before propagating a cleanup
-    error.
-    """
-
-    @property
-    def acquired(self) -> bool: ...
-
-    @property
-    def compile_backend(self) -> CompileBackend:
-        """The ``torch.compile`` backend required by this strategy."""
-        ...
-
-    def acquire(self, device: torch.device) -> None:
-        """Allocate the CUDA working set and install execution hooks."""
-        ...
-
-    def release(self) -> None:
-        """Idempotently release the CUDA working set from any state."""
-        ...
-
-    def optimizer_step(self) -> contextlib.AbstractContextManager[None]: ...
 
 
 def _instance_target_signature(instance: PinnedModuleInstance) -> BlockSignature:
@@ -106,7 +76,7 @@ class _MorphingTargetPool:
         self._free.clear()
 
 
-class BlockStreamingRuntime:
+class StreamingBlockRuntime:
     """One active block plus one whole-block lookahead target."""
 
     def __init__(
@@ -141,7 +111,7 @@ class BlockStreamingRuntime:
 
     def acquire(self, device: torch.device) -> None:
         if self.acquired:
-            raise RuntimeError("block streaming runtime is already acquired")
+            raise RuntimeError("streaming block runtime is already acquired")
 
         num_blocks = len(self._instances)
         self._device = device
@@ -161,8 +131,7 @@ class BlockStreamingRuntime:
         self._register_hooks()
 
         logger.info(
-            "block streaming runtime acquired: one block on GPU plus one "
-            "lookahead target across %d blocks",
+            "streaming block runtime acquired: one block on GPU plus one lookahead target across %d blocks",
             num_blocks,
         )
 
@@ -193,13 +162,13 @@ class BlockStreamingRuntime:
     def optimizer_step(self) -> Generator[None]:
         if not self.acquired:
             raise RuntimeError(
-                "StreamedComponent.optimizer_step() called while its CUDA "
+                "BlockComponent.optimizer_step() called while its CUDA "
                 "working set is released. Acquire the component before "
                 "entering the optimizer step."
             )
         if self._optimizer_step_active:
             raise RuntimeError(
-                "StreamedComponent.optimizer_step() does not support "
+                "BlockComponent.optimizer_step() does not support "
                 "reentrant entry. A nested optimizer-step boundary would "
                 "scatter the outer step's stale pinned bytes on top of "
                 "the inner update."
@@ -230,7 +199,7 @@ class BlockStreamingRuntime:
     def _require_device(self) -> torch.device:
         device = self._device
         if device is None:
-            raise RuntimeError("block streaming runtime is released")
+            raise RuntimeError("streaming block runtime is released")
         return device
 
     def _load_trainables_for_step(
@@ -393,4 +362,4 @@ class BlockStreamingRuntime:
             self._hooks.append(handle)
 
 
-__all__ = ["BlockStreamingRuntime", "StreamingRuntime"]
+__all__ = ["StreamingBlockRuntime"]

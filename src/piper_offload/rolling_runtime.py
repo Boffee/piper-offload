@@ -9,7 +9,7 @@ from collections.abc import Generator, Sequence
 import torch
 from torch import nn
 
-from .block_compile import BlockCompileConfig, CompileBackend
+from .block_compile import CompileBackend
 from .float8_adapter import Float8Adapter
 from .gguf_adapter import GgufAdapter
 from .int4_tile_adapter import Int4TilePackedAdapter
@@ -44,7 +44,7 @@ _ROLLING_ADAPTER_TYPES = (
 )
 
 
-class _RollingTargetRuntime:
+class RollingBlockRuntime:
     """One shared CUDA target refilled parameter-by-parameter."""
 
     def __init__(
@@ -78,7 +78,7 @@ class _RollingTargetRuntime:
 
     def acquire(self, device: torch.device) -> None:
         if self.acquired:
-            raise RuntimeError("rolling target runtime is already acquired")
+            raise RuntimeError("rolling block runtime is already acquired")
         self._stream = torch.cuda.Stream(device=device, priority=-1)
         self._events = tuple(torch.cuda.Event() for _ in self._param_names)
         self._ready_events = tuple(torch.cuda.Event() for _ in self._param_names)
@@ -108,8 +108,7 @@ class _RollingTargetRuntime:
         self._register_hooks(device)
 
         logger.info(
-            "rolling target runtime acquired: one parameter target for %d "
-            "compiled blocks",
+            "rolling block runtime acquired: one parameter target for %d compiled blocks",
             len(self._instances),
         )
 
@@ -230,7 +229,7 @@ class _RollingTargetRuntime:
     def optimizer_step(self) -> Generator[None]:
         if not self.acquired:
             raise RuntimeError(
-                "StreamedComponent.optimizer_step() called while its CUDA "
+                "BlockComponent.optimizer_step() called while its CUDA "
                 "working set is released. Acquire the component before "
                 "entering the optimizer step."
             )
@@ -246,7 +245,7 @@ def _validate_instance(
     if instance.has_trainables:
         raise NotImplementedError("rolling compilation is inference-only")
     if instance.buffers:
-        raise NotImplementedError("rolling compilation does not yet support streamed buffers")
+        raise NotImplementedError("rolling compilation does not yet support block buffers")
     if tuple(params) != param_names:
         raise NotImplementedError("rolling compilation requires identical parameter names and ordering in every block")
     if len({id(pinned) for pinned in params.values()}) != len(params):
@@ -263,24 +262,21 @@ def _validate_instance(
         raise NotImplementedError("rolling compilation does not support zero-sized parameter slots")
 
 
-def create_rolling_runtime(
+def create_rolling_block_runtime(
     instances: Sequence[PinnedModuleInstance],
-    config: BlockCompileConfig | None,
     *,
     wraparound: bool = True,
-) -> _RollingTargetRuntime | None:
-    """Validate and create the configured rolling runtime, if enabled."""
-    if config is None or not config.rolling:
-        return None
+) -> RollingBlockRuntime:
+    """Validate and create a rolling block runtime."""
     if not instances:
-        raise ValueError("rolling compilation requires at least one streamed block")
+        raise ValueError("rolling compilation requires at least one block")
     if len({id(instance.module) for instance in instances}) != len(instances):
         raise NotImplementedError("rolling compilation does not support aliased block modules")
 
     reference_params = instances[0].params
     param_names = tuple(reference_params)
     if not param_names:
-        raise ValueError("rolling compilation requires streamed parameters")
+        raise ValueError("rolling compilation requires block parameters")
     reference_layouts = tuple(pinned.target_layout for pinned in reference_params.values())
     for instance in instances:
         _validate_instance(
@@ -289,11 +285,11 @@ def create_rolling_runtime(
             reference_layouts,
         )
 
-    return _RollingTargetRuntime(
+    return RollingBlockRuntime(
         tuple(instances),
         param_names,
         wraparound=wraparound,
     )
 
 
-__all__ = ["create_rolling_runtime"]
+__all__ = ["RollingBlockRuntime", "create_rolling_block_runtime"]

@@ -24,7 +24,7 @@ device copies belong to activation-scoped model hooks.
 
 Composable lifecycle pieces inside a model runtime include
 :class:`~piper_offload.PinnedComponent` and
-:class:`~piper_offload.StreamedComponent`.
+:class:`~piper_offload.BlockComponent`.
 
 Lifecycle
 ---------

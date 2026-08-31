@@ -505,9 +505,7 @@ def rolling_inductor_backend(
             )
         flat_argument_idx += width
     if not param_specs:
-        raise RuntimeError(
-            "rolling compilation could not identify any streamed parameter arguments in the captured block graph"
-        )
+        raise RuntimeError("rolling compilation could not identify any block parameter arguments in the captured graph")
 
     lifecycle_pass = _RollingLifecyclePass(tuple((idx, *spec) for idx, spec in param_specs.items()))
     options = dict(cast(Mapping[str, object], kwargs.get("options") or {}))

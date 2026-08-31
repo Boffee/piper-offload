@@ -38,23 +38,11 @@ class BlockCompileConfig:
         Optional Inductor options forwarded to :func:`torch.compile`. The
         mapping is copied for every compiled block so compiler setup cannot
         mutate shared configuration state.
-    rolling:
-        Experimental inference-only single-target streaming. Inductor inserts
-        a target-refill operation after each supported parameter's final graph
-        use, allowing the next block to reuse that storage while the current
-        block continues computing. Supported adapters are regular dense,
-        TorchAO-family, Quanto, GGUF, and Piper ConvRot INT8. Requires
-        ``fullgraph=True`` and streamed block residency.
     """
 
     dynamic: bool | None = True
     fullgraph: bool = False
     options: Mapping[str, object] | None = None
-    rolling: bool = False
-
-    def __post_init__(self) -> None:
-        if self.rolling and not self.fullgraph:
-            raise ValueError("BlockCompileConfig(rolling=True) requires fullgraph=True.")
 
 
 @dataclass(slots=True)

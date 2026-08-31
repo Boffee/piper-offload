@@ -5,11 +5,16 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
-### Added
+### Changed
 
-- Add `stream_blocks=False` to keep ordinary `block_paths` resident while
-  retaining opt-in per-block compilation. Transient block paths remain
-  streamed.
+- Rename `StreamedComponent` to `BlockComponent` and standardize the resident,
+  streaming, and rolling block runtime names.
+- Replace `stream_blocks` and `BlockCompileConfig.rolling` with a single
+  `block_mode` setting for resident, whole-block streaming, or rolling
+  execution. The selected mode applies to ordinary and transient block paths;
+  transience controls working-set lifetime only.
+- Rename `stream_trainable_weights` to `include_block_trainables` so the option
+  describes block ownership independently of residency mode.
 
 ## [0.5.1] - 2026-08-31
 
@@ -34,7 +39,7 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
-- Add explicit `StreamedComponent.acquire()` and `release()` operations that
+- Add explicit `BlockComponent.acquire()` and `release()` operations that
   can cycle a block streamer's CUDA working set without ending its activation
   session. Activation still acquires immediately, preserving existing model
   behavior.

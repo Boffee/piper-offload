@@ -8,6 +8,7 @@ from torch import nn
 
 from piper_offload import (
     BlockCompileConfig,
+    BlockMode,
     LoRA,
     ModelOffloader,
     ModelSpec,
@@ -20,7 +21,7 @@ from tests._block_compile_helpers import (
 )
 from tests.conftest import (
     activated_model,
-    streamed_components,
+    block_components,
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -72,13 +73,20 @@ class TestBlockCompileConfig:
         assert config.dynamic is True
         assert config.fullgraph is False
         assert config.options is None
-        assert config.rolling is False
 
     def test_rolling_requires_fullgraph(self) -> None:
-        with pytest.raises(ValueError, match="requires fullgraph=True"):
+        with pytest.raises(ValueError, match="requires.*fullgraph=True"):
             _make_offloader(
                 _BlockModel(),
-                block_compile=BlockCompileConfig(rolling=True),
+                block_mode="rolling",
+                block_compile=BlockCompileConfig(),
+            )
+
+    def test_rolling_requires_compile_config(self) -> None:
+        with pytest.raises(ValueError, match="requires BlockCompileConfig"):
+            _make_offloader(
+                _BlockModel(),
+                block_mode="rolling",
             )
 
     def test_compile_without_block_paths_is_unused(self) -> None:
@@ -88,11 +96,11 @@ class TestBlockCompileConfig:
             block_compile=BlockCompileConfig(),
         )
         try:
-            assert not streamed_components(offloader)
+            assert not block_components(offloader)
         finally:
             offloader.deactivate()
 
-    def test_model_spec_passes_config_to_bound_streamer(
+    def test_model_spec_passes_config_to_bound_component(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -114,9 +122,9 @@ class TestBlockCompileConfig:
 
         offloader = spec.build_store()
         try:
-            streamer = streamed_components(offloader)[0]
-            assert streamer.block_compile is config
-            assert offloader._composite.transient_streamed == (streamer,)
+            block_component = block_components(offloader)[0]
+            assert block_component.block_compile is config
+            assert offloader._composite.transient_blocks == (block_component,)
             assert len(spy.calls) == 2
             assert all(
                 kwargs
@@ -145,52 +153,41 @@ class TestBlockCompileConfig:
             estimated_cache_bytes=1024,
             factory=_BlockModel,
             block_paths=("blocks",),
-            stream_blocks=False,
+            block_mode="resident",
             block_compile=BlockCompileConfig(),
         )
 
         offloader = spec.build_store()
         try:
-            streamers = streamed_components(offloader)
-            assert len(streamers) == 1
+            components = block_components(offloader)
+            assert len(components) == 1
             assert isinstance(
-                streamers[0]._block_runtime,
+                components[0]._runtime,
                 ResidentBlockRuntime,
             )
             assert len(spy.calls) == 2
         finally:
             offloader.deactivate()
 
-    def test_rolling_requires_streamed_blocks(self) -> None:
-        with pytest.raises(ValueError, match="requires stream_blocks=True"):
-            _make_offloader(
-                _BlockModel(),
-                stream_blocks=False,
-                block_compile=BlockCompileConfig(
-                    rolling=True,
-                    fullgraph=True,
-                ),
-            )
-
-    def test_transient_block_paths_still_stream(self) -> None:
+    def test_resident_mode_applies_to_transient_block_paths(self) -> None:
         model = _TwoGroupModel()
         offloader = _make_offloader(
             model,
             block_paths=["first_blocks"],
             transient_block_paths=("second_blocks",),
-            stream_blocks=False,
+            block_mode="resident",
         )
         try:
-            resident, transient = streamed_components(offloader)
+            resident, transient = block_components(offloader)
             assert isinstance(
-                resident._block_runtime,
+                resident._runtime,
                 ResidentBlockRuntime,
             )
-            assert not isinstance(
-                transient._block_runtime,
+            assert isinstance(
+                transient._runtime,
                 ResidentBlockRuntime,
             )
-            assert offloader._composite.transient_streamed == (transient,)
+            assert offloader._composite.transient_blocks == (transient,)
         finally:
             offloader.deactivate()
 
@@ -216,7 +213,7 @@ class TestBlockCompileConfig:
             block_compile=BlockCompileConfig(options={"max_autotune": False}),
         )
         try:
-            assert streamed_components(offloader)[0].block_compile is not None
+            assert block_components(offloader)[0].block_compile is not None
         finally:
             offloader.deactivate()
 
@@ -279,7 +276,7 @@ class TestCompiledForwardConstruction:
             block_compile=config,
         )
         try:
-            streamers = streamed_components(offloader)
+            streamers = block_components(offloader)
             assert len(streamers) == 2
             assert all(streamer.block_compile is config for streamer in streamers)
             assert len(spy.calls) == 4
@@ -288,18 +285,18 @@ class TestCompiledForwardConstruction:
 
 
 class TestCompiledForwardLifecycle:
-    @pytest.mark.parametrize("stream_blocks", [True, False])
+    @pytest.mark.parametrize("block_mode", ["streaming", "resident"])
     def test_cpu_activation_remains_eager(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        stream_blocks: bool,
+        block_mode: BlockMode,
     ) -> None:
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
         model = _BlockModel()
         offloader = _make_offloader(
             model,
-            stream_blocks=stream_blocks,
+            block_mode=block_mode,
             block_compile=BlockCompileConfig(),
         )
         try:
@@ -321,11 +318,11 @@ class TestCompiledForwardLifecycle:
         model = _BlockModel()
         offloader = _make_offloader(
             model,
-            stream_blocks=False,
+            block_mode="resident",
             block_compile=BlockCompileConfig(),
         )
-        streamer = streamed_components(offloader)[0]
-        runtime = streamer._block_runtime
+        streamer = block_components(offloader)[0]
+        runtime = streamer._runtime
         try:
             assert isinstance(runtime, ResidentBlockRuntime)
             with activated_model(offloader, "cuda"):
@@ -335,20 +332,14 @@ class TestCompiledForwardLifecycle:
                 assert not hasattr(runtime, "_executor")
                 assert not hasattr(runtime, "_stream")
                 assert not hasattr(runtime, "_hooks")
-                assert all(
-                    "forward" in block.__dict__
-                    for block in model.blocks
-                )
+                assert all("forward" in block.__dict__ for block in model.blocks)
                 assert all(param.device.type == "cuda" for param in model.parameters())
                 with torch.inference_mode():
                     model(torch.randn(2, 8, device="cuda"))
                     model(torch.randn(2, 8, device="cuda"))
                 assert tuple(runtime._leases) == leases
             assert spy.executions == 4
-            assert all(
-                "forward" not in block.__dict__
-                for block in model.blocks
-            )
+            assert all("forward" not in block.__dict__ for block in model.blocks)
             assert all(param.device.type == "cpu" for param in model.parameters())
         finally:
             offloader.deactivate()
@@ -367,8 +358,8 @@ class TestCompiledForwardLifecycle:
             model,
             block_compile=BlockCompileConfig(),
         )
-        streamer = streamed_components(offloader)[0]
-        runtime = streamer._block_runtime
+        streamer = block_components(offloader)[0]
+        runtime = streamer._runtime
         original_before = runtime._before_block_forward
 
         def record_before(*args: object, **kwargs: object) -> None:
@@ -400,8 +391,8 @@ class TestCompiledForwardLifecycle:
             model,
             block_compile=BlockCompileConfig(),
         )
-        streamer = streamed_components(offloader)[0]
-        runtime = streamer._block_runtime
+        streamer = block_components(offloader)[0]
+        runtime = streamer._runtime
         try:
             with activated_model(offloader, "cuda"):
                 assert runtime.acquired
@@ -464,8 +455,8 @@ class TestCompiledForwardLifecycle:
             block_compile=BlockCompileConfig(),
             transient_block_paths=("blocks",),
         )
-        streamer = streamed_components(offloader)[0]
-        runtime = streamer._block_runtime
+        streamer = block_components(offloader)[0]
+        runtime = streamer._runtime
         root_states: list[bool] = []
         remove_observer = offloader.register_forward_hook(
             "",
@@ -477,10 +468,7 @@ class TestCompiledForwardLifecycle:
                     with torch.inference_mode():
                         model(torch.randn(2, 8, device="cuda"))
                     assert runtime.acquired
-                    assert all(
-                        "forward" in block.__dict__
-                        for block in model.blocks
-                    )
+                    assert all("forward" in block.__dict__ for block in model.blocks)
                 assert root_states == [False, False]
             assert all("forward" not in block.__dict__ for block in model.blocks)
         finally:
@@ -515,20 +503,20 @@ class TestCompiledForwardLifecycle:
             offloader.deactivate()
 
     @CUDA
-    @pytest.mark.parametrize("stream_blocks", [True, False])
+    @pytest.mark.parametrize("block_mode", ["streaming", "resident"])
     def test_activation_failure_restores_original_forwards(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        stream_blocks: bool,
+        block_mode: BlockMode,
     ) -> None:
         monkeypatch.setattr(torch, "compile", _CompileSpy())
         model = _BlockModel()
         offloader = _make_offloader(
             model,
-            stream_blocks=stream_blocks,
+            block_mode=block_mode,
             block_compile=BlockCompileConfig(),
         )
-        streamer = streamed_components(offloader)[0]
+        streamer = block_components(offloader)[0]
         compile_state = streamer._block_compile
         state_type = type(compile_state)
         original_install = state_type.install
@@ -705,11 +693,11 @@ class TestCompiledLoRA:
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
 
     @CUDA
-    @pytest.mark.parametrize("stream_blocks", [True, False])
+    @pytest.mark.parametrize("block_mode", ["streaming", "resident"])
     def test_routed_bypass_is_model_wide_and_temporary(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        stream_blocks: bool,
+        block_mode: BlockMode,
     ) -> None:
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
@@ -723,7 +711,7 @@ class TestCompiledLoRA:
         offloader = _make_offloader(
             model,
             block_paths=["first_blocks", "second_blocks"],
-            stream_blocks=stream_blocks,
+            block_mode=block_mode,
             block_compile=BlockCompileConfig(),
         )
         x = torch.randn(2, 8, device="cuda")

@@ -14,9 +14,9 @@ High-level API:
 Lower-level resource bindings:
 
 - :class:`ModelOffloader` -- whole-model host-RAM bulk cache when
-  created by ``ModelOffloader.from_module(model)``, or per-block streaming
-  when it is constructed with ``block_paths`` or ``transient_block_paths``.
-  Streaming mode supports optional LoRA merge,
+  created by ``ModelOffloader.from_module(model)``, or configurable block
+  residency when constructed with ``block_paths`` or
+  ``transient_block_paths``. Block modes support optional LoRA merge,
   opt-in forward-only block compilation for CUDA inference,
   path-selected transient pool lifetimes, trainable-parameter support,
   CUDA prefetch on a secondary stream, and
@@ -24,7 +24,7 @@ Lower-level resource bindings:
   is disabled. By default,
   trainable params are managed by
   :class:`PinnedComponent` and stay GPU-resident while active; set
-  ``stream_trainable_weights=True`` to stream in-block trainable weights
+  ``include_block_trainables=True`` to stream in-block trainable weights
   and materialize them only around ``optimizer.step()``. That step runs on
   the GPU via the ``optimizer_step()`` context; calling ``optimizer.step()``
   after deactivation instead runs the optimizer on CPU over the host-backed
@@ -84,10 +84,10 @@ from a fresh model instance.
   1. A resident :class:`PinnedComponent` for non-streamed state, including
      trainables skipped by block streaming.
   2. One :class:`PinnedComponent` per stateful path in ``transient_paths``.
-  3. One :class:`StreamedComponent` per path in ``block_paths`` or
-     ``transient_block_paths`` when block residency is configured. With
-     ``stream_blocks=False``, ordinary block paths keep all of their targets
-     resident within the streamed component and may still be compiled.
+  3. One :class:`BlockComponent` per path in ``block_paths`` or
+     ``transient_block_paths`` when block residency is configured.
+     ``block_mode`` selects resident, whole-block streaming, or rolling
+     execution independently of the paths' persistent or transient lifetime.
 
 Optional LoRA merging is requested directly on :meth:`ModelOffloader.activate`
 and resolved by installing post-copy hooks for managed parameter targets.
@@ -141,6 +141,8 @@ Compatibility
 """
 
 from .block_compile import BlockCompileConfig
+from .block_component import BlockComponent, BlockComponentStore
+from .block_mode import BlockMode
 from .gguf_adapter import GGUFWeight
 from .host_backing import HostBacking
 from .lora import (
@@ -177,7 +179,6 @@ from .resource_cache import (
 )
 from .resource_specs import LoRASpec, ModelSpec, ObjectSpec
 from .seeding import derive_seed
-from .streamed_component import StreamedComponent, StreamedComponentStore
 from .tensor_adapter_registry import register_adapter
 from .tensor_adapters import (
     AdoptableTensorAdapter,
@@ -187,6 +188,9 @@ from .tensor_adapters import (
 __all__ = [
     "AdoptableTensorAdapter",
     "BlockCompileConfig",
+    "BlockComponent",
+    "BlockComponentStore",
+    "BlockMode",
     "CacheError",
     "DuplicateResourceKeyError",
     "EvictionCandidate",
@@ -219,8 +223,6 @@ __all__ = [
     "ResourceStore",
     "ResourceTooLargeError",
     "ScaledLoRAFactor",
-    "StreamedComponent",
-    "StreamedComponentStore",
     "TensorAdapter",
     "derive_seed",
     "merge_lora",

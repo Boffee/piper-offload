@@ -34,7 +34,7 @@ from piper_offload import (
     PinnedComponent,
     LoRASpec,
     ScaledLoRAFactor,
-    StreamedComponent,
+    BlockComponent,
     derive_seed,
     merge_lora,
 )
@@ -55,7 +55,7 @@ from piper_offload.tensor_adapters import (
 
 from tests.conftest import (
     activated_model,
-    streamed_components,
+    block_components,
     transient_components,
 )
 
@@ -111,14 +111,14 @@ def _make_model_offloader(
     *,
     block_paths: Sequence[str] = (),
     transient_block_paths: Sequence[str] = (),
-    stream_trainable_weights: bool = False,
+    include_block_trainables: bool = False,
     transient_paths: Sequence[str] = (),
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
         block_paths=block_paths,
         transient_block_paths=transient_block_paths,
-        stream_trainable_weights=stream_trainable_weights,
+        include_block_trainables=include_block_trainables,
         transient_paths=transient_paths,
     )
 
@@ -361,7 +361,7 @@ def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
     if isinstance(component, PinnedComponent):
         instance = component._instance
         return instance.post_copy_hook_key(param_name) in instance._post_copy_hooks
-    if isinstance(component, StreamedComponent):
+    if isinstance(component, BlockComponent):
         instance, local = component._resolve_param_name(param_name)
         return instance.post_copy_hook_key(local) in instance._post_copy_hooks
     return False
@@ -1294,10 +1294,10 @@ class TestMergeCorrectness:
         _request_loras(strategy, loras, mode="merge")
         _activate(strategy, "cuda")
         try:
-            streamer = streamed_components(strategy)[0] if streamed else None
+            streamer = block_components(strategy)[0] if streamed else None
             for block_idx, block in enumerate(m.transformer_blocks):
                 if streamer is not None:
-                    streamer._block_runtime._before_block_forward(block_idx)
+                    streamer._runtime._before_block_forward(block_idx)
                 actual = block.attn.bias
                 assert actual is not None
                 expected = base_biases[block_idx].to(actual.device)
@@ -4304,7 +4304,7 @@ class TestDeactivateCleanupInvariants:
         def streamer_boom() -> None:
             raise RuntimeError("streamer cleanup failed")
 
-        monkeypatch.setattr(streamed_components(s)[0], "deactivate", streamer_boom)
+        monkeypatch.setattr(block_components(s)[0], "deactivate", streamer_boom)
         _activate(s, "cuda")
 
         with pytest.raises(RuntimeError):

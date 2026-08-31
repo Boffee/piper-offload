@@ -1,4 +1,4 @@
-"""Composition of resident, transient, and block-streamed components."""
+"""Composition of resident, transient, and block components."""
 
 import contextlib
 from collections.abc import Callable, Generator, Iterator, Sequence
@@ -9,28 +9,29 @@ import torch
 from torch import nn
 
 from .block_compile import BlockCompileConfig
+from .block_component import BlockComponent, BlockComponentStore
+from .block_mode import BlockMode
 from .host_backing import HostBacking
 from .module_names import buffer_names, parameter_names
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .pinned_module import PostCopyHook
-from .streamed_component import StreamedComponent, StreamedComponentStore
 
 
 class CompositeComponent:
-    """Resident, transient-path, and streamed-block components."""
+    """Resident, transient-path, and block components."""
 
     def __init__(
         self,
         *,
         resident: PinnedComponent | None,
-        streamed: Sequence[StreamedComponent],
+        blocks: Sequence[BlockComponent],
         transient: Sequence[tuple[str, PinnedComponent]] = (),
-        transient_streamed: Sequence[StreamedComponent] = (),
+        transient_blocks: Sequence[BlockComponent] = (),
     ) -> None:
         self._resident = resident
         self._transient = tuple(transient)
-        self._streamed = tuple(streamed)
-        self._transient_streamed = tuple(transient_streamed)
+        self._blocks = tuple(blocks)
+        self._transient_blocks = tuple(transient_blocks)
         self._teardown_stack: contextlib.ExitStack | None = None
 
     @property
@@ -38,50 +39,40 @@ class CompositeComponent:
         return self._resident
 
     @property
-    def streamed(self) -> tuple[StreamedComponent, ...]:
-        return self._streamed
+    def blocks(self) -> tuple[BlockComponent, ...]:
+        return self._blocks
 
     @property
     def transient(self) -> tuple[tuple[str, PinnedComponent], ...]:
         return self._transient
 
     @property
-    def transient_streamed(self) -> tuple[StreamedComponent, ...]:
-        return self._transient_streamed
+    def transient_blocks(self) -> tuple[BlockComponent, ...]:
+        return self._transient_blocks
 
-    def _components(self) -> Iterator[PinnedComponent | StreamedComponent]:
+    def _components(self) -> Iterator[PinnedComponent | BlockComponent]:
         if self._resident is not None:
             yield self._resident
         for _path, component in self._transient:
             yield component
-        yield from self._streamed
+        yield from self._blocks
 
     @property
     def param_names(self) -> frozenset[str]:
-        return frozenset(
-            name
-            for component in self._components()
-            for name in component.param_names
-        )
+        return frozenset(name for component in self._components() for name in component.param_names)
 
     @property
     def buffer_names(self) -> frozenset[str]:
-        return frozenset(
-            name
-            for component in self._components()
-            for name in component.buffer_names
-        )
+        return frozenset(name for component in self._components() for name in component.buffer_names)
 
     def component_for_param_name(
         self,
         param_name: str,
-    ) -> PinnedComponent | StreamedComponent:
+    ) -> PinnedComponent | BlockComponent:
         for component in self._components():
             if param_name in component.param_names:
                 return component
-        raise KeyError(
-            f"param name {param_name!r} is not managed by this composite"
-        )
+        raise KeyError(f"param name {param_name!r} is not managed by this composite")
 
     def register_post_copy_hook(
         self,
@@ -100,10 +91,7 @@ class CompositeComponent:
         compile_blocks: bool = True,
     ) -> None:
         if self._teardown_stack is not None:
-            raise RuntimeError(
-                "CompositeComponent.activate() called while already active; "
-                "deactivate() first."
-            )
+            raise RuntimeError("CompositeComponent.activate() called while already active; deactivate() first.")
 
         with contextlib.ExitStack() as stack:
             for component in self._components():
@@ -127,35 +115,31 @@ class CompositeComponent:
 
 @dataclass(frozen=True, slots=True)
 class CompositeComponentStore:
-    """Reusable stores for resident, transient, and streamed model state."""
+    """Reusable stores for resident, transient, and block model state."""
 
     resident_store: PinnedComponentStore | None
-    streamed_stores: tuple[StreamedComponentStore, ...]
-    transient_streamed_stores: tuple[StreamedComponentStore, ...] = ()
+    block_stores: tuple[BlockComponentStore, ...]
+    transient_block_stores: tuple[BlockComponentStore, ...] = ()
     transient_stores: tuple[tuple[str, PinnedComponentStore], ...] = ()
-    stream_blocks: bool = True
 
     def __post_init__(self) -> None:
         if (
             self.resident_store is None
             and not self.transient_stores
-            and not self.streamed_stores
-            and not self.transient_streamed_stores
+            and not self.block_stores
+            and not self.transient_block_stores
         ):
-            raise ValueError(
-                "Offloading requires at least one parameter, registered "
-                "buffer, or streamed block to manage."
-            )
+            raise ValueError("Offloading requires at least one parameter, registered buffer, or block to manage.")
 
     def _stores(
         self,
-    ) -> Iterator[PinnedComponentStore | StreamedComponentStore]:
+    ) -> Iterator[PinnedComponentStore | BlockComponentStore]:
         if self.resident_store is not None:
             yield self.resident_store
         for _path, store in self.transient_stores:
             yield store
-        yield from self.streamed_stores
-        yield from self.transient_streamed_stores
+        yield from self.block_stores
+        yield from self.transient_block_stores
 
     @classmethod
     def from_module(
@@ -165,63 +149,45 @@ class CompositeComponentStore:
         block_paths: Sequence[str] = (),
         transient_block_paths: Sequence[str] = (),
         transient_paths: Sequence[str] = (),
-        stream_trainable_weights: bool = False,
-        stream_blocks: bool = True,
+        include_block_trainables: bool = False,
         host_backing: HostBacking = "pinned",
     ) -> Self:
         persistent_paths = tuple(block_paths)
-        transient_streamed_paths = tuple(transient_block_paths)
-        overlap = set(persistent_paths) & set(transient_streamed_paths)
+        transient_paths_with_blocks = tuple(transient_block_paths)
+        overlap = set(persistent_paths) & set(transient_paths_with_blocks)
         if overlap:
             raise ValueError(
-                "block_paths and transient_block_paths must be disjoint; "
-                f"both contain {sorted(overlap)!r}."
+                f"block_paths and transient_block_paths must be disjoint; both contain {sorted(overlap)!r}."
             )
-        for path in transient_streamed_paths:
+        for path in transient_paths_with_blocks:
             blocks = model.get_submodule(path)
-            if isinstance(blocks, nn.ModuleList) and len(
-                {id(block) for block in blocks}
-            ) != len(blocks):
+            if isinstance(blocks, nn.ModuleList) and len({id(block) for block in blocks}) != len(blocks):
                 raise ValueError(
                     "transient_block_paths does not support aliased block "
                     f"modules; {path!r} contains repeated module objects."
                 )
 
-        def make_streamed_store(blocks_path: str) -> StreamedComponentStore:
-            return StreamedComponentStore.from_module(
+        def make_block_store(blocks_path: str) -> BlockComponentStore:
+            return BlockComponentStore.from_module(
                 model,
                 blocks_path=blocks_path,
-                stream_trainable_weights=stream_trainable_weights,
+                include_block_trainables=include_block_trainables,
                 host_backing=host_backing,
             )
 
-        streamed_stores = tuple(
-            make_streamed_store(blocks_path)
-            for blocks_path in persistent_paths
-        )
-        transient_streamed_stores = tuple(
-            make_streamed_store(blocks_path)
-            for blocks_path in transient_streamed_paths
-        )
-        all_streamed_stores = (*streamed_stores, *transient_streamed_stores)
-        streamed_params = {
-            name for store in all_streamed_stores for name in store.param_names
-        }
-        streamed_buffers = {
-            name for store in all_streamed_stores for name in store.buffer_names
-        }
-        resident_params = parameter_names(model) - streamed_params
-        resident_buffers = buffer_names(model) - streamed_buffers
+        block_stores = tuple(make_block_store(blocks_path) for blocks_path in persistent_paths)
+        transient_block_stores = tuple(make_block_store(blocks_path) for blocks_path in transient_paths_with_blocks)
+        all_block_stores = (*block_stores, *transient_block_stores)
+        block_params = {name for store in all_block_stores for name in store.param_names}
+        block_buffers = {name for store in all_block_stores for name in store.buffer_names}
+        resident_params = parameter_names(model) - block_params
+        resident_buffers = buffer_names(model) - block_buffers
         transient_stores: list[tuple[str, PinnedComponentStore]] = []
         for path in transient_paths:
             module = model.get_submodule(path)
             prefix = f"{path}." if path else ""
-            selected_params = {
-                f"{prefix}{name}" for name in parameter_names(module)
-            } & resident_params
-            selected_buffers = {
-                f"{prefix}{name}" for name in buffer_names(module)
-            } & resident_buffers
+            selected_params = {f"{prefix}{name}" for name in parameter_names(module)} & resident_params
+            selected_buffers = {f"{prefix}{name}" for name in buffer_names(module)} & resident_buffers
             if not selected_params and not selected_buffers:
                 continue
             transient_stores.append(
@@ -249,10 +215,9 @@ class CompositeComponentStore:
         )
         return cls(
             resident_store=resident_store,
-            streamed_stores=streamed_stores,
-            transient_streamed_stores=transient_streamed_stores,
+            block_stores=block_stores,
+            transient_block_stores=transient_block_stores,
             transient_stores=tuple(transient_stores),
-            stream_blocks=stream_blocks,
         )
 
     @property
@@ -268,34 +233,33 @@ class CompositeComponentStore:
         model: nn.Module,
         *,
         block_compile: BlockCompileConfig | None = None,
+        block_mode: BlockMode = "streaming",
     ) -> CompositeComponent:
         resident = self.resident_store.bind(model) if self.resident_store else None
-        transient = tuple(
-            (path, store.bind(model))
-            for path, store in self.transient_stores
-        )
-        streamed = tuple(
+        transient = tuple((path, store.bind(model)) for path, store in self.transient_stores)
+        blocks = tuple(
             store.bind(
                 model,
                 block_compile=block_compile,
                 wraparound=True,
-                stream_blocks=self.stream_blocks,
+                block_mode=block_mode,
             )
-            for store in self.streamed_stores
+            for store in self.block_stores
         )
-        transient_streamed = tuple(
+        transient_blocks = tuple(
             store.bind(
                 model,
                 block_compile=block_compile,
                 wraparound=False,
+                block_mode=block_mode,
             )
-            for store in self.transient_streamed_stores
+            for store in self.transient_block_stores
         )
         return CompositeComponent(
             resident=resident,
-            streamed=(*streamed, *transient_streamed),
+            blocks=(*blocks, *transient_blocks),
             transient=transient,
-            transient_streamed=transient_streamed,
+            transient_blocks=transient_blocks,
         )
 
 

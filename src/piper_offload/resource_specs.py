@@ -13,6 +13,7 @@ import torch
 from torch import nn
 
 from .block_compile import BlockCompileConfig
+from .block_mode import BlockMode
 from .host_backing import HostBacking
 from .lora import LoRA
 from .model_offloader import ModelOffloader
@@ -27,9 +28,9 @@ class ModelSpec[M: nn.Module]:
     Every lease reuses that same model runtime sequentially; overlapping uses
     are rejected by the offloader. ``block_compile`` is an opt-in construction
     policy for every group named by ``block_paths`` or
-    ``transient_block_paths``. ``stream_blocks=False`` keeps ordinary block
-    groups resident while still compiling their forwards. Transient block
-    groups always stream and release their CUDA pools after their final blocks.
+    ``transient_block_paths``. ``block_mode`` selects resident, whole-block
+    streaming, or compiled rolling execution for every block group. Transient
+    block groups release their CUDA working sets after their final blocks.
     ``transient_paths`` gives named modules independent CUDA working sets
     scoped to their forwards. ``host_backing`` selects pinned copies (the
     default) or strict zero-copy adoption of existing CPU model backing.
@@ -40,8 +41,8 @@ class ModelSpec[M: nn.Module]:
     factory: Callable[[], M]
     block_paths: tuple[str, ...] = ()
     transient_block_paths: tuple[str, ...] = ()
-    stream_trainable_weights: bool = False
-    stream_blocks: bool = True
+    include_block_trainables: bool = False
+    block_mode: BlockMode = "streaming"
     block_compile: BlockCompileConfig | None = None
     host_backing: HostBacking = "pinned"
     transient_paths: tuple[str, ...] = ()
@@ -52,8 +53,8 @@ class ModelSpec[M: nn.Module]:
             self.factory(),
             block_paths=self.block_paths,
             transient_block_paths=self.transient_block_paths,
-            stream_trainable_weights=self.stream_trainable_weights,
-            stream_blocks=self.stream_blocks,
+            include_block_trainables=self.include_block_trainables,
+            block_mode=self.block_mode,
             block_compile=self.block_compile,
             host_backing=self.host_backing,
             transient_paths=self.transient_paths,

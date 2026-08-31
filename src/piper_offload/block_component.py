@@ -1,10 +1,10 @@
 """Block-residency primitive for memory-efficient training and inference.
 
-A :class:`StreamedComponentStore` manages reusable pinned CPU backing
+A :class:`BlockComponentStore` manages reusable pinned CPU backing
 storage for a single block list whose blocks share the same parameter
 layout (names, shapes, dtypes, and any tensor-adapter wrapper metadata).
 Binding that store to a compatible model creates a
-:class:`StreamedComponent` that either streams the resolved blocks to GPU on
+:class:`BlockComponent` that either streams the resolved blocks to GPU on
 demand or keeps every block resident. Ordinary streaming uses a reusable GPU
 target pool and background prefetcher; rolling compilation selects a
 single-target parameter runtime; resident mode loads every target once. On
@@ -16,7 +16,7 @@ reusable targets by per-block layout signature, so each block streams
 into a target matching its own format and no cross-format ``copy_`` ever
 happens. Only block lists whose blocks differ in *structure* — different
 parameter or buffer *names*, e.g. Flux's two block kinds — must split
-into multiple :class:`StreamedComponent` instances composed via
+into multiple :class:`BlockComponent` instances composed via
 :class:`ModelOffloader`.
 
 In-block trainable params (LoRA adapters) flow through the same target
@@ -30,17 +30,17 @@ This is the sharp, low-level primitive. It does NOT manage:
 
 - Non-block parts of the model (parent-module state, sibling
   modules) — caller derives :class:`PinnedComponent` include-name sets
-  by excluding the streamer's owned names.
+  by excluding the block component's owned names.
 - Out-of-block trainable parameter movement — caller handles that
   alongside non-streamed parameters, usually with :class:`PinnedComponent`.
-- Shared storage with tensors outside the streamed block list — caller
+- Shared storage with tensors outside the block list — caller
   must choose a valid composition; use whole-model
   :class:`PinnedComponent` if sharing must be preserved.
 - Activation-checkpointing enforcement — required for in-block
   trainable streaming, but checked at the composer level.
 
 Most users want :class:`ModelOffloader` (the blessed safe API). Reach for
-:class:`StreamedComponentStore` / :class:`StreamedComponent` directly only
+:class:`BlockComponentStore` / :class:`BlockComponent` directly only
 when you need bespoke composition (e.g., multiple block lists like Flux's
 ``transformer_blocks`` + ``single_transformer_blocks``).
 """
@@ -56,6 +56,8 @@ from torch import nn
 
 from ._devices import canonical_device
 from .block_compile import BlockCompileConfig, _BlockCompileState
+from .block_mode import BlockMode
+from .block_runtime import BlockRuntime
 from .host_backing import (
     HostBacking,
     validate_host_backing,
@@ -68,13 +70,13 @@ from .pinned_module import (
 )
 from .pinned_param import PinnedParam
 from .resident_runtime import ResidentBlockRuntime
-from .rolling_runtime import create_rolling_runtime
-from .streaming_runtime import BlockStreamingRuntime, StreamingRuntime
+from .rolling_runtime import create_rolling_block_runtime
+from .streaming_runtime import StreamingBlockRuntime
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
     # Process-wide PyTorch CUDA allocator cache is the only state the
-    # refcount-based GC of a streamer can't release on its own. Without
+    # refcount-based GC of a block component can't release on its own. Without
     # this, freed pinned/GPU pages stay held by the allocator until the
     # next allocation pressure event, which manifests as OOMs at
     # workload boundaries (e.g. successive trainers in one process).
@@ -90,7 +92,7 @@ def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Streamed block instances
+# Block instances
 # ---------------------------------------------------------------------------
 
 
@@ -118,10 +120,10 @@ def _param_target_layout(p: nn.Parameter) -> tuple[object, object]:
     return PinnedParam.target_layout_for(p)
 
 
-def _collect_streamed_schemas(
+def _collect_block_schemas(
     blocks: list[nn.Module],
-    stream_param_names: set[str] | None,
-    stream_buffer_names: set[str] | None,
+    managed_param_names: set[str] | None,
+    managed_buffer_names: set[str] | None,
 ) -> tuple[list[dict[str, bool]], list[set[str]]]:
     """Snapshot the cross-block contract without retaining tensor objects.
 
@@ -136,10 +138,10 @@ def _collect_streamed_schemas(
     block_buffer_schemas: list[set[str]] = []
 
     for block in blocks:
-        params, buffers = _select_streamed_schema(
+        params, buffers = _select_block_schema(
             block,
-            stream_param_names,
-            stream_buffer_names,
+            managed_param_names,
+            managed_buffer_names,
         )
         block_param_schemas.append(params)
         block_buffer_schemas.append(buffers)
@@ -147,33 +149,33 @@ def _collect_streamed_schemas(
     return block_param_schemas, block_buffer_schemas
 
 
-def _select_streamed_schema(
+def _select_block_schema(
     block: nn.Module,
-    stream_param_names: set[str] | None,
-    stream_buffer_names: set[str] | None,
+    managed_param_names: set[str] | None,
+    managed_buffer_names: set[str] | None,
 ) -> tuple[dict[str, bool], set[str]]:
     params: dict[str, bool] = {}
     all_param_names: set[str] = set()
     for name, param in block.named_parameters(remove_duplicate=False):
         all_param_names.add(name)
-        if stream_param_names is not None and name not in stream_param_names:
+        if managed_param_names is not None and name not in managed_param_names:
             continue
         params[name] = param.requires_grad
-    _validate_streamed_names_known(stream_param_names, all_param_names)
+    _validate_block_names_known(managed_param_names, all_param_names)
 
     buffers: set[str] = set()
     all_buffer_names: set[str] = set()
     for name, _buffer in block.named_buffers(remove_duplicate=False):
         all_buffer_names.add(name)
-        if stream_buffer_names is not None and name not in stream_buffer_names:
+        if managed_buffer_names is not None and name not in managed_buffer_names:
             continue
         buffers.add(name)
-    _validate_streamed_names_known(stream_buffer_names, all_buffer_names)
+    _validate_block_names_known(managed_buffer_names, all_buffer_names)
 
     return params, buffers
 
 
-def _validate_streamed_names_known(
+def _validate_block_names_known(
     names: set[str] | None,
     known_names: set[str],
 ) -> None:
@@ -181,7 +183,7 @@ def _validate_streamed_names_known(
         return
     missing = sorted(names - known_names)
     if missing:
-        raise ValueError(f"StreamedComponent cannot select unknown block-local names: {_format_names(missing)}.")
+        raise ValueError(f"BlockComponent cannot select unknown block-local names: {_format_names(missing)}.")
 
 
 def _format_names(names: Sequence[str]) -> str:
@@ -196,7 +198,7 @@ def _check_block_requires_grad_consistent(
     Per-block tensor *layouts* (shape, dtype, quant format, tying) may
     differ — the morphing target pool keys targets by layout signature.
     But mixing a trainable and a frozen weight under the same selected
-    name in one streamed group is unsupported: trainable streaming swaps
+    name in one block group is unsupported: trainable streaming swaps
     ``.data`` under an activation-checkpointing guard, so a half-trainable
     group has no coherent optimizer-step / checkpointing contract.
     Validated before pinning so a mismatch leaves the model unmutated.
@@ -212,18 +214,18 @@ def _check_block_requires_grad_consistent(
                     f"Block {i} param {name!r} requires_grad="
                     f"{requires_grad} differs from block 0 "
                     f"(requires_grad={ref_requires_grad}). All blocks "
-                    "in a StreamedComponent group must agree on requires_grad "
+                    "in a BlockComponent group must agree on requires_grad "
                     "per parameter; quantization formats, shapes, and dtypes "
                     "may differ, but trainable and frozen weights cannot be "
-                    "mixed in one streamed group."
+                    "mixed in one block group."
                 )
 
 
 def _pin_block_module_stores(
     blocks: Sequence[nn.Module],
     *,
-    stream_param_names: set[str] | None = None,
-    stream_buffer_names: set[str] | None = None,
+    managed_param_names: set[str] | None = None,
+    managed_buffer_names: set[str] | None = None,
     pin_memory: bool = True,
 ) -> list[PinnedModuleStore]:
     """Collect, validate, and pin one :class:`PinnedModuleStore` per block.
@@ -236,15 +238,15 @@ def _pin_block_module_stores(
     # Walk each block to snapshot selected names and requires_grad flags
     # WITHOUT retaining the Parameter/buffer objects or pinning anything.
     # Cross-block name consistency is enforced upstream
-    # (``_streamed_param_names_for_blocks`` / ``_streamed_buffer_names_for_blocks``);
+    # (``_block_param_names_for_blocks`` / ``_block_buffer_names_for_blocks``);
     # per-block tensor *layouts* may differ (heterogeneous quantization),
-    # since the streamer's morphing target pool keys reusable GPU targets
+    # since the component's morphing target pool keys reusable GPU targets
     # by per-block layout signature so blocks of different formats never
     # share a target.
-    block_param_schemas, block_buffer_schemas = _collect_streamed_schemas(
+    block_param_schemas, block_buffer_schemas = _collect_block_schemas(
         list(blocks),
-        stream_param_names,
-        stream_buffer_names,
+        managed_param_names,
+        managed_buffer_names,
     )
     _check_block_requires_grad_consistent(block_param_schemas)
 
@@ -281,14 +283,14 @@ def _build_param_name_index(
 ) -> dict[str, tuple[int, str]]:
     # The external NAME uses the true block index so a sparse group's params
     # are addressed at their real path; the stored VALUE keeps the compact
-    # position used to index ``_block_instances`` for the streaming engine.
+    # position used to index ``_block_instances`` for the block runtime.
     index: dict[str, tuple[int, str]] = {}
     for compact_idx, instance in enumerate(instances):
         true_idx = block_indices[compact_idx]
         for local_name in instance.params:
-            name = _streamed_param_name(prefix, true_idx, local_name)
+            name = _block_param_name(prefix, true_idx, local_name)
             if name in index:
-                raise ValueError(f"duplicate streamed parameter name {name!r}")
+                raise ValueError(f"duplicate block parameter name {name!r}")
             index[name] = (compact_idx, local_name)
     return index
 
@@ -302,14 +304,14 @@ def _build_buffer_name_index(
     for compact_idx, instance in enumerate(instances):
         true_idx = block_indices[compact_idx]
         for local_name in instance.buffers:
-            name = _streamed_param_name(prefix, true_idx, local_name)
+            name = _block_param_name(prefix, true_idx, local_name)
             if name in index:
-                raise ValueError(f"duplicate streamed buffer name {name!r}")
+                raise ValueError(f"duplicate block buffer name {name!r}")
             index[name] = (compact_idx, local_name)
     return index
 
 
-def _streamed_param_name(
+def _block_param_name(
     prefix: str | None,
     block_idx: int,
     local_name: str,
@@ -328,17 +330,17 @@ def _resolve_blocks(module: nn.Module, blocks_path: str) -> list[nn.Module]:
     return blocks
 
 
-def _streamed_param_names_for_blocks(
+def _block_param_names_for_blocks(
     blocks: Sequence[nn.Module],
     *,
-    stream_trainables: bool,
+    include_trainables: bool,
 ) -> set[str]:
-    param_names = _block_param_names(blocks[0], stream_trainables=stream_trainables)
+    param_names = _block_param_names(blocks[0], include_trainables=include_trainables)
     for i, block in enumerate(blocks[1:], start=1):
-        if _block_param_names(block, stream_trainables=stream_trainables) != param_names:
+        if _block_param_names(block, include_trainables=include_trainables) != param_names:
             raise ValueError(
                 f"Block {i} selected parameter names differ from block 0. "
-                "All blocks in a StreamedComponent group must select the "
+                "All blocks in a BlockComponent group must select the "
                 "same parameter names (their shapes, dtypes, and quant "
                 "formats may differ). Split structurally different block "
                 "kinds across separate block-path groups."
@@ -346,13 +348,13 @@ def _streamed_param_names_for_blocks(
     return param_names
 
 
-def _streamed_buffer_names_for_blocks(blocks: Sequence[nn.Module]) -> set[str]:
+def _block_buffer_names_for_blocks(blocks: Sequence[nn.Module]) -> set[str]:
     buffer_names = _block_buffer_names(blocks[0])
     for i, block in enumerate(blocks[1:], start=1):
         if _block_buffer_names(block) != buffer_names:
             raise ValueError(
                 f"Block {i} selected buffer names differ from block 0. "
-                "All blocks in a StreamedComponent group must select the "
+                "All blocks in a BlockComponent group must select the "
                 "same buffer names (their shapes, dtypes, and layouts may "
                 "differ). Split structurally different block kinds across "
                 "separate block-path groups."
@@ -363,12 +365,12 @@ def _streamed_buffer_names_for_blocks(blocks: Sequence[nn.Module]) -> set[str]:
 def _block_param_names(
     block: nn.Module,
     *,
-    stream_trainables: bool,
+    include_trainables: bool,
 ) -> set[str]:
     return {
         name
         for name, param in block.named_parameters(remove_duplicate=False)
-        if stream_trainables or not param.requires_grad
+        if include_trainables or not param.requires_grad
     }
 
 
@@ -380,19 +382,18 @@ def _block_is_empty(block: nn.Module) -> bool:
     """A block with no parameters or buffers at any depth.
 
     Empty positions carry nothing to stream and are skipped by
-    :meth:`StreamedComponentStore.from_module` while later blocks retain their
+    :meth:`BlockComponentStore.from_module` while later blocks retain their
     true externally-visible indices.
     """
     return next(block.parameters(), None) is None and next(block.buffers(), None) is None
 
 
 @dataclass(frozen=True, slots=True)
-class StreamedComponentStore:
-    """Reusable pinned backing storage for a streamed block group.
+class BlockComponentStore:
+    """Reusable pinned backing storage for a block group.
 
-    Built via :meth:`from_module`: the streamed tensor source IS the
-    model's block list, resolved by ``blocks_path``. Each block's forward-pre
-    hook triggers the load of its own streamed instance.
+    Built via :meth:`from_module`: the tensor source is the model's block list,
+    resolved by ``blocks_path``.
 
     ``block_indices`` records which positions of the resolved block list this
     group actually occupies. :meth:`from_module` skips structurally-empty
@@ -410,35 +411,34 @@ class StreamedComponentStore:
         model: nn.Module,
         *,
         blocks_path: str,
-        stream_trainable_weights: bool = False,
+        include_block_trainables: bool = False,
         host_backing: HostBacking = "pinned",
     ) -> Self:
-        """Resolve ``blocks_path`` on ``model`` and pin its streamed blocks.
+        """Resolve ``blocks_path`` on ``model`` and pin its managed blocks.
 
         Structurally-empty positions (no parameters or buffers) are skipped and
         dropped from :attr:`block_indices`. The surviving blocks must still
         agree on selected names (see
-        :func:`_streamed_param_names_for_blocks`).
+        :func:`_block_param_names_for_blocks`).
         """
         backing = validate_host_backing(host_backing)
         all_blocks = _resolve_blocks(model, blocks_path)
         kept = [(idx, block) for idx, block in enumerate(all_blocks) if not _block_is_empty(block)]
         if not kept:
             raise ValueError(
-                f"Block path {blocks_path!r} has no streamable blocks "
-                "(every block is structurally empty)."
+                f"Block path {blocks_path!r} has no streamable blocks (every block is structurally empty)."
             )
         block_indices = tuple(idx for idx, _ in kept)
         blocks = [block for _, block in kept]
-        stream_param_names = _streamed_param_names_for_blocks(
+        managed_param_names = _block_param_names_for_blocks(
             blocks,
-            stream_trainables=stream_trainable_weights,
+            include_trainables=include_block_trainables,
         )
-        stream_buffer_names = _streamed_buffer_names_for_blocks(blocks)
+        managed_buffer_names = _block_buffer_names_for_blocks(blocks)
         block_stores = _pin_block_module_stores(
             blocks,
-            stream_param_names=stream_param_names,
-            stream_buffer_names=stream_buffer_names,
+            managed_param_names=managed_param_names,
+            managed_buffer_names=managed_buffer_names,
             pin_memory=backing == "pinned",
         )
         return cls(
@@ -448,18 +448,18 @@ class StreamedComponentStore:
         )
 
     @property
-    def streamed_param_names_by_block(self) -> list[list[str]]:
-        """Per-block streamed parameter names."""
+    def managed_param_names_by_block(self) -> list[list[str]]:
+        """Per-block managed parameter names."""
         return [list(store.params) for store in self._block_stores]
 
     @property
-    def streamed_buffer_names_by_block(self) -> list[list[str]]:
-        """Per-block streamed buffer names."""
+    def managed_buffer_names_by_block(self) -> list[list[str]]:
+        """Per-block managed buffer names."""
         return [list(store.buffers) for store in self._block_stores]
 
     @property
     def param_names(self) -> frozenset[str]:
-        """Externally addressable streamed parameter names.
+        """Externally addressable managed parameter names.
 
         Named by TRUE block index (:attr:`block_indices`), not the compact
         store position — so a sparse group's factors are advertised at their
@@ -467,7 +467,7 @@ class StreamedComponentStore:
         :meth:`CompositeComponentStore.from_module` lines up correctly.
         """
         names = {
-            _streamed_param_name(self.blocks_path, true_idx, local_name)
+            _block_param_name(self.blocks_path, true_idx, local_name)
             for true_idx, store in zip(
                 self.block_indices,
                 self._block_stores,
@@ -479,9 +479,9 @@ class StreamedComponentStore:
 
     @property
     def buffer_names(self) -> frozenset[str]:
-        """Externally addressable streamed buffer names (true block indices)."""
+        """Externally addressable managed buffer names (true block indices)."""
         names = {
-            _streamed_param_name(self.blocks_path, true_idx, local_name)
+            _block_param_name(self.blocks_path, true_idx, local_name)
             for true_idx, store in zip(
                 self.block_indices,
                 self._block_stores,
@@ -509,8 +509,8 @@ class StreamedComponentStore:
         *,
         block_compile: BlockCompileConfig | None = None,
         wraparound: bool = True,
-        stream_blocks: bool = True,
-    ) -> StreamedComponent:
+        block_mode: BlockMode = "streaming",
+    ) -> BlockComponent:
         """Bind this store's per-block backing bytes to ``model``.
 
         Each instance owns and is installed onto its model block; loads repoint
@@ -523,7 +523,7 @@ class StreamedComponentStore:
         bind_blocks = self.resolve_blocks(model)
         if last >= len(bind_blocks):
             raise ValueError(
-                f"StreamedComponentStore.bind() bind model has too few blocks "
+                f"BlockComponentStore.bind() bind model has too few blocks "
                 f"at {self.blocks_path!r}: needs index {last}, found "
                 f"{len(bind_blocks)}."
             )
@@ -531,7 +531,7 @@ class StreamedComponentStore:
         unmanaged = [pos for pos, block in enumerate(bind_blocks) if pos not in occupied and not _block_is_empty(block)]
         if unmanaged:
             raise ValueError(
-                f"StreamedComponentStore.bind() bind model has non-empty "
+                f"BlockComponentStore.bind() bind model has non-empty "
                 f"block(s) {unmanaged} at {self.blocks_path!r} that this store "
                 f"does not occupy (it occupies {list(self.block_indices)}); "
                 "those blocks would never be moved or streamed. Bind a model "
@@ -540,29 +540,28 @@ class StreamedComponentStore:
         instances = [
             store.bind(bind_blocks[idx]) for store, idx in zip(self._block_stores, self.block_indices, strict=True)
         ]
-        return StreamedComponent(
+        return BlockComponent(
             instances,
             name=self.blocks_path,
             block_indices=self.block_indices,
             block_compile=block_compile,
             wraparound=wraparound,
-            stream_blocks=stream_blocks,
+            block_mode=block_mode,
         )
 
 
 # ---------------------------------------------------------------------------
-# StreamedComponent — public block-streaming primitive
+# BlockComponent — public block-residency primitive
 # ---------------------------------------------------------------------------
 
 
-class StreamedComponent:
+class BlockComponent:
     """Manages a block list between pinned CPU and CUDA.
 
     The sharp, low-level block-residency primitive. Manages bound block
     instances whose owned params and buffers are pinned to CPU. By default it
     streams them to CUDA via forward-pre hooks on :meth:`activate`; with
-    ``stream_blocks=False`` it loads every block once and installs no
-    scheduling hooks.
+    resident mode loads every block once and installs no scheduling hooks.
     CPU activation is pass-through over that pinned host-backed state:
     no pool, no hooks, no copies. Frozen params use parameter
     replacement; trainable params keep Parameter identity and swap only
@@ -570,7 +569,7 @@ class StreamedComponent:
     Does not touch parent modules, sibling modules, or out-of-block
     trainable parameters — those are the composer's responsibility.
 
-    A :class:`StreamedComponent` is a *component* meant to be composed
+    A :class:`BlockComponent` is a *component* meant to be composed
     inside a :class:`~piper_offload.model_offloader.ModelOffloader`.
     It deliberately is NOT a top-level model runtime (its
     :meth:`activate` returns ``None`` because it doesn't own the
@@ -605,25 +604,25 @@ class StreamedComponent:
     functional).
 
     Instances are usually created by binding a
-    :class:`StreamedComponentStore` to a compatible model.
+    :class:`BlockComponentStore` to a compatible model.
 
     Parameters
     ----------
     block_instances:
         The concrete bound block instances.
     name:
-        Optional model path for the streamed block list. When set,
+        Optional model path for the block list. When set,
         :attr:`param_names` and name-based post-copy hook registration
         use names like ``"blocks.3.weight"``. When omitted, standalone
-        streamers use ``"3.weight"``.
+        standalone components use ``"3.weight"``.
         Trainable streaming requires activation checkpointing on every
         block (the ``.data`` swap bypasses autograd's version-counter
-        check). The streamer doesn't enforce that precondition itself —
+        check). The component doesn't enforce that precondition itself —
         :class:`ModelOffloader` does.
     block_indices:
         True block index for each instance, used to NAME its params/buffers
         (so a sparse group addresses ``"blocks.2.weight"`` not the compact
-        ``"blocks.1.weight"``). The streaming engine still uses the compact
+        ``"blocks.1.weight"``). The block runtime still uses the compact
         ``0..k-1`` position internally. Defaults to ``0..k-1`` (contiguous).
     block_compile:
         Optional forward-only compile policy. One lazy callable is retained per
@@ -632,10 +631,11 @@ class StreamedComponent:
     wraparound:
         Whether the runtime prepares block 0 while executing the final block.
         :class:`ModelOffloader` disables this for transient streamed pools.
-    stream_blocks:
-        Whether to rotate blocks through an active/lookahead target window.
-        When false, every block gets a target at acquisition and remains
-        resident without prefetching until release.
+    block_mode:
+        CUDA residency strategy. ``"resident"`` keeps every block loaded,
+        ``"streaming"`` rotates whole blocks through an active/lookahead
+        target pool, and ``"rolling"`` refills one shared target
+        parameter-by-parameter through a compiled full graph.
     """
 
     def __init__(
@@ -646,52 +646,51 @@ class StreamedComponent:
         block_indices: Sequence[int] | None = None,
         block_compile: BlockCompileConfig | None = None,
         wraparound: bool = True,
-        stream_blocks: bool = True,
+        block_mode: BlockMode = "streaming",
     ) -> None:
-        if (
-            not stream_blocks
-            and block_compile is not None
-            and block_compile.rolling
-        ):
-            raise ValueError(
-                "BlockCompileConfig(rolling=True) requires stream_blocks=True."
-            )
+        if block_mode == "rolling" and (block_compile is None or not block_compile.fullgraph):
+            raise ValueError("block_mode='rolling' requires BlockCompileConfig(fullgraph=True).")
         self._block_instances = list(block_instances)
         if block_indices is None:
             block_indices = range(len(self._block_instances))
         block_indices = list(block_indices)
         if len(block_indices) != len(self._block_instances):
             raise ValueError(
-                "block_indices must have one index per streamed block: "
+                "block_indices must have one index per managed block: "
                 f"got {len(block_indices)} for "
                 f"{len(self._block_instances)} blocks."
             )
         self._blocks = [instance.module for instance in self._block_instances]
-        self._block_runtime: StreamingRuntime = (
-            BlockStreamingRuntime(
+        self._block_mode: BlockMode = block_mode
+        if block_mode == "resident":
+            runtime: BlockRuntime = ResidentBlockRuntime(self._block_instances)
+            eager_runtime = runtime
+        elif block_mode == "streaming":
+            runtime = StreamingBlockRuntime(
                 self._block_instances,
                 wraparound=wraparound,
             )
-            if stream_blocks
-            else ResidentBlockRuntime(self._block_instances)
-        )
-        self._rolling_runtime = (
-            create_rolling_runtime(
+            eager_runtime = runtime
+        elif block_mode == "rolling":
+            runtime = create_rolling_block_runtime(
                 self._block_instances,
-                block_compile,
                 wraparound=wraparound,
             )
-            if stream_blocks
-            else None
-        )
-        compile_runtime: StreamingRuntime = self._rolling_runtime or self._block_runtime
+            eager_runtime = StreamingBlockRuntime(
+                self._block_instances,
+                wraparound=wraparound,
+            )
+        else:
+            raise ValueError(f"unsupported block mode: {block_mode!r}")
+        self._runtime = runtime
+        self._eager_runtime = eager_runtime
         self._block_compile = _BlockCompileState.create(
             self._blocks,
             block_compile,
-            backend=compile_runtime.compile_backend,
+            backend=runtime.compile_backend,
         )
         self._active_device: torch.device | None = None
-        self._active_runtime: StreamingRuntime | None = None
+        self._active_runtime: BlockRuntime | None = None
         self._param_name_to_block_param = _build_param_name_index(
             self._block_instances,
             name,
@@ -706,7 +705,7 @@ class StreamedComponent:
         self._buffer_names = frozenset(self._buffer_name_to_block_buffer)
         self._cpu_optimizer_step_active = False
 
-        # Auto-flush the CUDA allocator cache when the streamer is GC'd,
+        # Auto-flush the CUDA allocator cache when the component is GC'd,
         # so callers don't need to remember an explicit empty_cache() at
         # workload boundaries. Captures only a bool (no self ref) so it
         # never blocks collection.
@@ -718,32 +717,37 @@ class StreamedComponent:
 
     @property
     def blocks(self) -> tuple[nn.Module, ...]:
-        """The bound modules whose forward drives streaming, in order."""
+        """The bound modules managed by this component, in order."""
         return tuple(self._blocks)
 
     @property
     def block_compile(self) -> BlockCompileConfig | None:
-        """This bound streamer's optional block compilation policy."""
+        """This component's optional block compilation policy."""
         return self._block_compile.config
 
     @property
-    def streamed_param_names_by_block(self) -> list[list[str]]:
-        """Per-block streamed parameter names."""
+    def block_mode(self) -> BlockMode:
+        """Configured CUDA block residency strategy."""
+        return self._block_mode
+
+    @property
+    def managed_param_names_by_block(self) -> list[list[str]]:
+        """Per-block managed parameter names."""
         return [list(instance.params) for instance in self._block_instances]
 
     @property
-    def streamed_buffer_names_by_block(self) -> list[list[str]]:
-        """Per-block streamed buffer names."""
+    def managed_buffer_names_by_block(self) -> list[list[str]]:
+        """Per-block managed buffer names."""
         return [list(instance.buffers) for instance in self._block_instances]
 
     @property
     def param_names(self) -> frozenset[str]:
-        """Externally addressable streamed parameter names."""
+        """Externally addressable managed parameter names."""
         return self._param_names
 
     @property
     def buffer_names(self) -> frozenset[str]:
-        """Externally addressable streamed buffer names."""
+        """Externally addressable managed buffer names."""
         return self._buffer_names
 
     @property
@@ -769,7 +773,7 @@ class StreamedComponent:
     ) -> tuple[PinnedModuleInstance, str]:
         ref = self._param_name_to_block_param.get(name)
         if ref is None:
-            raise ValueError(f"param name {name!r} is not owned by this streamer")
+            raise ValueError(f"param name {name!r} is not owned by this block component")
         block_idx, local_name = ref
         return self._resolve_block_param(block_idx, local_name)
 
@@ -779,7 +783,7 @@ class StreamedComponent:
     ) -> tuple[PinnedModuleInstance, str]:
         ref = self._buffer_name_to_block_buffer.get(name)
         if ref is None:
-            raise ValueError(f"buffer name {name!r} is not owned by this streamer")
+            raise ValueError(f"buffer name {name!r} is not owned by this block component")
         block_idx, local_name = ref
         return self._resolve_block_buffer(block_idx, local_name)
 
@@ -789,10 +793,10 @@ class StreamedComponent:
         name: str,
     ) -> tuple[PinnedModuleInstance, str]:
         if block_idx < 0 or block_idx >= len(self._block_instances):
-            raise ValueError(f"streamed block index {block_idx} is out of range")
+            raise ValueError(f"block index {block_idx} is out of range")
         instance = self._block_instances[block_idx]
         if name not in instance.params:
-            raise ValueError(f"param name {name!r} is not owned by streamed block {block_idx}")
+            raise ValueError(f"param name {name!r} is not owned by block {block_idx}")
         return instance, name
 
     def _resolve_block_buffer(
@@ -801,10 +805,10 @@ class StreamedComponent:
         name: str,
     ) -> tuple[PinnedModuleInstance, str]:
         if block_idx < 0 or block_idx >= len(self._block_instances):
-            raise ValueError(f"streamed block index {block_idx} is out of range")
+            raise ValueError(f"block index {block_idx} is out of range")
         instance = self._block_instances[block_idx]
         if name not in instance.buffers:
-            raise ValueError(f"buffer name {name!r} is not owned by streamed block {block_idx}")
+            raise ValueError(f"buffer name {name!r} is not owned by block {block_idx}")
         return instance, name
 
     # ------------------------------------------------------------------
@@ -823,15 +827,15 @@ class StreamedComponent:
         block runtime, then installs optional compiled block forwards. CPU
         activation is pass-through over pinned host-backed state.
         The composite's :meth:`activate` returns the model — this
-        method returns ``None`` because the streamer doesn't own one.
+        method returns ``None`` because the component doesn't own one.
 
         **Lifecycle is caller's responsibility.** Calling activate()
         twice without an intervening deactivate() raises before hooks or
         block pools are installed.
 
         **Activation failure semantics:** if activation fails midway,
-        the streamer is left in an undefined partial state. Retrying
-        activation on that streamer is unsupported; the caller's only
+        the component is left in an undefined partial state. Retrying
+        activation on that component is unsupported; the caller's only
         supported cleanup path is :meth:`deactivate`, which idempotently
         tears down whatever was allocated."""
         # Hard-guard against the documented "don't activate twice"
@@ -840,7 +844,7 @@ class StreamedComponent:
         # target pool on top of an active one.
         if self._active_device is not None:
             raise RuntimeError(
-                "StreamedComponent.activate() called while already "
+                "BlockComponent.activate() called while already "
                 "active. Deactivate first, or check for a leaked "
                 "context manager."
             )
@@ -849,7 +853,7 @@ class StreamedComponent:
             self._activate_cpu_resolved()
             return
         if active_device.type != "cuda":
-            raise ValueError(f"StreamedComponent.activate() supports CUDA or CPU; got {active_device}.")
+            raise ValueError(f"BlockComponent.activate() supports CUDA or CPU; got {active_device}.")
         self._activate_cuda_resolved(
             active_device,
             compile_blocks=compile_blocks,
@@ -864,11 +868,7 @@ class StreamedComponent:
         *,
         compile_blocks: bool,
     ) -> None:
-        runtime: StreamingRuntime = (
-            self._rolling_runtime
-            if compile_blocks and self._rolling_runtime is not None
-            else self._block_runtime
-        )
+        runtime = self._runtime if compile_blocks else self._eager_runtime
 
         # Record the selected runtime before acquisition so deactivate() can
         # clean up a partially-created pool, stream, or hook set if activation
@@ -879,7 +879,7 @@ class StreamedComponent:
         self._block_compile.install(compile_blocks)
 
     def acquire(self) -> None:
-        """Acquire this active session's CUDA streaming working set.
+        """Acquire this active session's CUDA working set.
 
         Idempotent when already acquired. CPU sessions have no CUDA working
         set and therefore need no acquisition. The activation session and any
@@ -888,22 +888,17 @@ class StreamedComponent:
         """
         active_device = self._active_device
         if active_device is None:
-            raise RuntimeError(
-                "StreamedComponent.acquire() requires an active session; "
-                "call activate() first."
-            )
+            raise RuntimeError("BlockComponent.acquire() requires an active session; call activate() first.")
         if active_device.type == "cpu":
             return
         runtime = self._active_runtime
         if runtime is None:
-            raise RuntimeError(
-                "StreamedComponent CUDA session has no selected runtime."
-            )
+            raise RuntimeError("BlockComponent CUDA session has no selected runtime.")
         if not runtime.acquired:
             runtime.acquire(active_device)
 
     def release(self) -> None:
-        """Idempotently release this session's CUDA streaming working set.
+        """Idempotently release this session's CUDA working set.
 
         Blocks return to host backing and runtime-owned CUDA targets, streams,
         prefetch work, and hooks are released. The component remains active,
@@ -954,7 +949,7 @@ class StreamedComponent:
         """Materialize streamed trainables around an optimizer step."""
         if self._active_device == torch.device("cpu"):
             if self._cpu_optimizer_step_active:
-                raise RuntimeError("StreamedComponent.optimizer_step() does not support reentrant entry.")
+                raise RuntimeError("BlockComponent.optimizer_step() does not support reentrant entry.")
             self._cpu_optimizer_step_active = True
             try:
                 yield
@@ -965,8 +960,8 @@ class StreamedComponent:
         runtime = self._active_runtime
         if runtime is None:
             raise RuntimeError(
-                "StreamedComponent.optimizer_step() called on inactive "
-                "streamer. Use it inside the offloader's context "
+                "BlockComponent.optimizer_step() called on inactive "
+                "block component. Use it inside the offloader's context "
                 "manager, between backward and the next forward."
             )
         with runtime.optimizer_step():
@@ -978,6 +973,6 @@ class StreamedComponent:
 
 
 __all__ = [
-    "StreamedComponent",
-    "StreamedComponentStore",
+    "BlockComponent",
+    "BlockComponentStore",
 ]

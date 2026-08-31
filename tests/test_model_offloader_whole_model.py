@@ -21,12 +21,12 @@ def _make_model_offloader(
     model: nn.Module,
     *,
     block_paths: list[str] = [],
-    stream_trainable_weights: bool = False,
+    include_block_trainables: bool = False,
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
         block_paths=block_paths,
-        stream_trainable_weights=stream_trainable_weights,
+        include_block_trainables=include_block_trainables,
     )
 
 
