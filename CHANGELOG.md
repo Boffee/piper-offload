@@ -22,6 +22,11 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - Add `transient_paths` for named modules whose independent CUDA working sets
   release after their forwards and reacquire after the root model forward.
 
+### Changed
+
+- Allow `ModelOffloader`, `ModelCache`, and `merge_lora()` to apply the same
+  LoRA more than once. Each occurrence contributes its supplied strength.
+
 ### Removed
 
 - Remove the `prefix_paths` and `suffix_paths` model selectors and their

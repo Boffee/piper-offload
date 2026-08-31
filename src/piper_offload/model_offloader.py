@@ -239,11 +239,6 @@ class ModelOffloader:
             strength_list = [1.0] * len(lora_list)
         else:
             strength_list = [float(strength) for strength in lora_strengths]
-        if len({id(lora) for lora in lora_list}) != len(lora_list):
-            raise ValueError(
-                "ModelOffloader.activate() does not accept the same LoRA "
-                "instance more than once"
-            )
         return [
             (lora, strength)
             for lora, strength in zip(lora_list, strength_list, strict=True)
