@@ -139,6 +139,7 @@ def _torch_merge_nvfp4_lora_(
 class _Nvfp4Meta:
     """Reconstruction metadata snapshot for a TorchAO NVFP4 tensor."""
 
+    wrapper_type: type[torch.Tensor]
     block_size: int
     orig_dtype: torch.dtype
     is_swizzled_scales: bool
@@ -171,6 +172,7 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
     @staticmethod
     def _meta_of(t: Any) -> _Nvfp4Meta:  # noqa: ANN401
         return _Nvfp4Meta(
+            wrapper_type=type(t),
             block_size=t.block_size,
             orig_dtype=t.orig_dtype,
             is_swizzled_scales=t.is_swizzled_scales,
@@ -193,11 +195,13 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
             meta.is_swizzled_scales,
             meta.use_triton_kernel,
             meta.act_quant_kwargs,
+            wrapper_type=meta.wrapper_type,
         )
 
     @staticmethod
     def _id_metadata(t: Any) -> tuple[object, ...]:  # noqa: ANN401
         return (
+            type(t),
             t.block_size,
             t.orig_dtype,
             t.is_swizzled_scales,

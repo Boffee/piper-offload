@@ -9,7 +9,7 @@ the adapter only preserves, moves, and (for LoRA merge) re-encodes those
 already-quantized tensors.
 """
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -73,11 +73,16 @@ def create_nvfp4_tensor(
     is_swizzled_scales: bool,
     use_triton_kernel: bool,
     act_quant_kwargs: object | None,
+    *,
+    wrapper_type: type[torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Rebuild a TorchAO ``NVFP4Tensor`` from raw storage + metadata."""
+    """Rebuild a compatible NVFP4 wrapper from raw storage + metadata."""
     if not TORCHAO_NVFP4_AVAILABLE:
         raise RuntimeError("torchao is required to create an NVFP4Tensor")
-    return NVFP4Tensor(
+    constructor = cast(Any, NVFP4Tensor if wrapper_type is None else wrapper_type)
+    if not issubclass(constructor, NVFP4Tensor):
+        raise TypeError(f"NVFP4 wrapper type must subclass TorchAO NVFP4Tensor, got {constructor.__name__}")
+    return constructor(
         qdata=qdata,
         scale=scale,
         block_size=block_size,
@@ -139,8 +144,7 @@ def requantize_nvfp4_tensor(
     nv = require_nvfp4_tensor(like)
     if tuple(t.shape) != tuple(nv.shape):
         raise ValueError(
-            f"Cannot requantize tensor with shape {tuple(t.shape)} like "
-            f"NVFP4Tensor with shape {tuple(nv.shape)}."
+            f"Cannot requantize tensor with shape {tuple(t.shape)} like NVFP4Tensor with shape {tuple(nv.shape)}."
         )
     if not nv.qdata.is_contiguous():
         # A transposed/strided NVFP4 weight has a packed layout that the
@@ -180,9 +184,7 @@ def requantize_nvfp4_tensor(
         # guard (matching int8's choose_qparams eps). A positive global scale
         # encodes an all-zero weight identically — every block scale is 0 —
         # so the result is an exact zero tensor.
-        per_tensor_scale = per_tensor_amax_to_scale(
-            t.detach().abs().max()
-        ).clamp_min(torch.finfo(torch.float32).eps)
+        per_tensor_scale = per_tensor_amax_to_scale(t.detach().abs().max()).clamp_min(torch.finfo(torch.float32).eps)
     out = NVFP4Tensor.to_nvfp4(
         t.to(dtype=nv.orig_dtype),
         block_size=nv.block_size,
@@ -191,6 +193,18 @@ def requantize_nvfp4_tensor(
         is_swizzled_scales=nv.is_swizzled_scales,
         use_triton_kernel=False,
         act_quant_kwargs=nv.act_quant_kwargs,
+    )
+    out = create_nvfp4_tensor(
+        out.qdata,
+        out.scale,
+        out.block_size,
+        out.orig_dtype,
+        out.per_tensor_scale,
+        out.act_per_tensor_scale,
+        out.is_swizzled_scales,
+        out.use_triton_kernel,
+        out.act_quant_kwargs,
+        wrapper_type=type(nv),
     )
     if rounding_seed is not None:
         _stochastic_recode_nvfp4_(out, t, rounding_seed=rounding_seed)
@@ -214,9 +228,7 @@ def _stochastic_recode_nvfp4_(
         torch.zeros_like(source, dtype=torch.float32),
     )
     deterministic_codes = unpack_uint4(nv.qdata.contiguous().view(torch.uint8))
-    codebook = f4_unpacked_to_f32(
-        torch.arange(16, device=source.device, dtype=torch.uint8)
-    )
+    codebook = f4_unpacked_to_f32(torch.arange(16, device=source.device, dtype=torch.uint8))
     codes = _stochastic_codebook_indices(
         normalized,
         codebook,

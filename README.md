@@ -1202,7 +1202,8 @@ TorchAO NVFP4 weights
 when the `torchao` optional extra is installed.
 `PinnedParam` pins the packed FP4 `qdata`, FP8 block `scale`,
 optional per-tensor scales, and the TorchAO dispatch metadata, then
-rebuilds the `NVFP4Tensor` wrapper around GPU storage on activation.
+rebuilds the same concrete `NVFP4Tensor` subclass around GPU storage on
+activation. Subclass identity also survives requantization and merge-mode LoRA.
 The optional extra requires the package's supported TorchAO release; dynamic
 NVFP4 matmul execution still depends on Blackwell-class CUDA hardware and the
 matching PyTorch CUDA stack.
