@@ -444,7 +444,12 @@ Gradients are not streamed; PyTorch owns `param.grad` normally.
 `ModelOffloader` supports optional per-weight LoRA merging through activation
 arguments. Merge mode
 installs activation-scoped post-copy hooks for managed parameter
-targets. Unknown targets raise during activation. LoRA target keys must
+targets. Unknown targets raise during activation by default. A LoRA that is
+intentionally shared across separately loaded model components can set
+`allow_partial_targets=True`; its merge and routed uses then apply only the
+intersection of adapter targets and model parameters, including a valid no-op
+when that intersection is empty. Present targets still receive the ordinary
+shape and capability validation. LoRA target keys must
 match the model's parameter names exactly; any remapping — stripping a
 `diffusion_model.` prefix, inserting a PEFT `.base_layer.` segment — is
 the caller's job when building the LoRA state dict. Each hook runs

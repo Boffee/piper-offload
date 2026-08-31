@@ -63,7 +63,9 @@ def merge_lora(
     strengths are inactive and do not create merge operations. Merge reads
     immutable host factor backing, so the same LoRA may also serve other
     merge or routed uses. All active target names and merge capabilities are
-    validated before any parameter is modified. Quantized targets use
+    validated before any parameter is modified. A LoRA constructed with
+    ``allow_partial_targets=True`` ignores targets absent from this model.
+    Quantized targets use
     terminal-code stochastic rounding by default so sub-step LoRA updates are
     not systematically rounded away; pass ``stochastic_rounding=False`` for
     deterministic rounding. Dense targets always use their ordinary exact
@@ -91,7 +93,7 @@ def _merge_loras(
         target_key
         for lora, _strength in loras
         for target_key in lora.targets
-        if target_key not in params_by_target
+        if target_key not in params_by_target and not lora.allow_partial_targets
     })
     if missing_targets:
         sample = sorted(params_by_target)[:3]
@@ -105,6 +107,11 @@ def _merge_loras(
         params_by_target,
         loras,
         stochastic_rounding=stochastic_rounding,
+    )
+    applied_target_count = sum(
+        target_key in params_by_target
+        for lora, _strength in loras
+        for target_key in lora.targets
     )
 
     # Preflight every operation before applying any of them. This catches all
@@ -129,7 +136,7 @@ def _merge_loras(
         len(modified_tensor_ids),
         len(merge_ops),
         bias_count,
-        sum(len(lora.targets) for lora, _ in loras),
+        applied_target_count,
     )
     return len(modified_tensor_ids)
 
@@ -151,7 +158,9 @@ def _build_merge_ops(
     factor_groups_by_tensor_id: dict[tuple[Any, ...], _FactorGroup] = {}
     for lora, strength in loras:
         for target_key, factor in lora.targets.items():
-            weight = params_by_target[target_key]
+            weight = params_by_target.get(target_key)
+            if weight is None:
+                continue
             tensor_id = param_tensor_id(weight)
             group = factor_groups_by_tensor_id.get(tensor_id)
             if group is None:

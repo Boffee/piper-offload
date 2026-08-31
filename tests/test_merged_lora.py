@@ -930,6 +930,40 @@ class TestActivationLoraValidation:
             _activate_loras_for_test(s)
         assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
 
+    @pytest.mark.parametrize("mode", ["merge", "routed"])
+    def test_partial_targets_apply_intersection(self, mode: LoRAMode) -> None:
+        m = _make_bf16_model(num_blocks=2, dim=16)
+        s = _make_strategy(m)
+        sd = _make_lora_sd(num_blocks=1, dim=16)
+        sd.update(_make_lora_sd(num_blocks=1, dim=16, prefix="missing."))
+        lora = LoRA.from_state_dict(sd, allow_partial_targets=True)
+
+        _request_loras(s, [(lora, 1.0)], mode=mode)
+
+        assert _activate_loras_for_test(s) == 1
+        if mode == "merge":
+            assert _has_post_copy_hook(
+                s,
+                "transformer_blocks.0.attn.weight",
+            )
+
+    @pytest.mark.parametrize("mode", ["merge", "routed"])
+    def test_partial_zero_overlap_is_activation_noop(self, mode: LoRAMode) -> None:
+        m = _make_bf16_model(num_blocks=2, dim=16)
+        s = _make_strategy(m)
+        lora = LoRA.from_state_dict(
+            _make_lora_sd(num_blocks=1, dim=16, prefix="missing."),
+            allow_partial_targets=True,
+        )
+        value = torch.randn(2, 16, dtype=torch.bfloat16)
+
+        expected = m(value)
+        s.activate("cpu", loras=[lora], lora_mode=mode)
+        try:
+            torch.testing.assert_close(m(value), expected)
+        finally:
+            s.deactivate()
+
     def test_target_keys_are_not_canonicalized(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
@@ -2870,6 +2904,40 @@ class TestPermanentMerge:
         for name, param in m.named_parameters():
             torch.testing.assert_close(param, before[name])
 
+    def test_partial_targets_merge_intersection(self) -> None:
+        m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
+        untouched = m.transformer_blocks[1].attn.weight.detach().clone()
+        sd = _make_lora_sd(num_blocks=1, dim=16)
+        sd.update(_make_lora_sd(num_blocks=1, dim=16, prefix="missing."))
+        lora = LoRA.from_state_dict(sd, allow_partial_targets=True)
+        before = m.transformer_blocks[0].attn.weight.detach().clone()
+        expected = _expected_merged_weight(
+            before,
+            [(lora, 1.0)],
+            0,
+            "attn.weight",
+        )
+
+        assert merge_lora(m, [(lora, 1.0)]) == 1
+
+        torch.testing.assert_close(m.transformer_blocks[0].attn.weight, expected)
+        torch.testing.assert_close(m.transformer_blocks[1].attn.weight, untouched)
+
+    def test_partial_targets_permanent_merge_allows_zero_overlap(self) -> None:
+        m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
+        before = {
+            name: param.detach().clone()
+            for name, param in m.named_parameters()
+        }
+        lora = LoRA.from_state_dict(
+            _make_lora_sd(num_blocks=1, dim=16, prefix="missing."),
+            allow_partial_targets=True,
+        )
+
+        assert merge_lora(m, [(lora, 1.0)]) == 0
+        for name, param in m.named_parameters():
+            torch.testing.assert_close(param, before[name])
+
     def test_multiple_loras_on_one_target_count_one_parameter(self) -> None:
         class M(nn.Module):
             def __init__(self) -> None:
@@ -4280,6 +4348,7 @@ class TestLoRAResource:
             assert isinstance(lora, LoRA)
             assert lora.cache_bytes > 0
             assert len(lora.targets) == 2
+            assert not lora.allow_partial_targets
         with cache.lease("lora:test") as lora2:
             assert lora2 is lora
 
@@ -4304,6 +4373,16 @@ class TestLoRAResource:
         assert b.data_ptr() == sd[
             "transformer_blocks.0.attn.lora_B.weight"
         ].data_ptr()
+
+    def test_lora_spec_propagates_partial_target_policy(self) -> None:
+        spec = LoRASpec(
+            key="lora:partial",
+            estimated_cache_bytes=1000,
+            factory=lambda: _make_lora_sd(num_blocks=1, dim=8, rank=2),
+            allow_partial_targets=True,
+        )
+
+        assert spec.build_store().allow_partial_targets
 
     def test_model_cache_applies_loras_and_holds_leases(
         self,
@@ -4357,6 +4436,71 @@ class TestLoRAResource:
             expected = _expected_routed_output(model, x, [(expected_lora, 1.0)])
             assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-5)
         assert factory_calls["lora"] == 1
+
+    def test_one_cached_partial_lora_serves_disjoint_models(self) -> None:
+        class PartModel(nn.Module):
+            def __init__(self, target: str) -> None:
+                super().__init__()
+                self.target = target
+                self.add_module(target, nn.Linear(3, 3, bias=False))
+                self.requires_grad_(False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.get_submodule(self.target)(x)
+
+        state = {
+            f"{target}.lora_A.weight": torch.full((1, 3), value)
+            for target, value in (("first", 0.25), ("second", 0.5))
+        }
+        state.update({
+            f"{target}.lora_B.weight": torch.full((3, 1), value)
+            for target, value in (("first", 0.75), ("second", 1.25))
+        })
+        factory_calls = 0
+
+        def lora_factory() -> dict[str, torch.Tensor]:
+            nonlocal factory_calls
+            factory_calls += 1
+            return state
+
+        lora_spec = LoRASpec(
+            key="lora:shared-parts",
+            estimated_cache_bytes=1000,
+            factory=lora_factory,
+            allow_partial_targets=True,
+        )
+        first_spec = ModelSpec(
+            key="model:first-part",
+            estimated_cache_bytes=1000,
+            factory=lambda: PartModel("first"),
+        )
+        second_spec = ModelSpec(
+            key="model:second-part",
+            estimated_cache_bytes=1000,
+            factory=lambda: PartModel("second"),
+        )
+        cache = ModelCache(10**9)
+        value = torch.randn(2, 3)
+
+        for model_spec, target in (
+            (first_spec, "first"),
+            (second_spec, "second"),
+        ):
+            with cache.use(
+                model_spec,
+                device="cpu",
+                lora_specs=[lora_spec],
+                lora_mode="routed",
+            ) as model:
+                layer = model.get_submodule(target)
+                assert isinstance(layer, nn.Linear)
+                base = F.linear(value, layer.weight)
+                a = state[f"{target}.lora_A.weight"]
+                b = state[f"{target}.lora_B.weight"]
+                expected = base + (value @ a.T) @ b.T
+                torch.testing.assert_close(model(value), expected)
+
+        assert factory_calls == 1
 
     @pytest.mark.parametrize(
         ("stochastic_rounding", "expected"),

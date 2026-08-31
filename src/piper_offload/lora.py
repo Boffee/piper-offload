@@ -263,11 +263,22 @@ class LoRA:
     ``.lora_B`` suffixed). Any key remapping — e.g. stripping the
     ``diffusion_model.`` prefix on ComfyUI adapters — is the caller's
     responsibility, done in the factory that produces the state dict.
+
+    ``allow_partial_targets`` is an explicit application policy for adapters
+    that intentionally span multiple separately loaded model components.
+    When enabled, targets absent from a particular model are ignored. Present
+    targets retain the same shape and capability validation as strict mode.
     """
 
-    def __init__(self, targets: Mapping[str, LoRAFactor]) -> None:
+    def __init__(
+        self,
+        targets: Mapping[str, LoRAFactor],
+        *,
+        allow_partial_targets: bool = False,
+    ) -> None:
         self._targets = MappingProxyType(dict(targets))
         self._cache_bytes = sum(factor.cache_bytes for factor in self._targets.values())
+        self._allow_partial_targets = allow_partial_targets
 
     @classmethod
     def from_state_dict(
@@ -276,6 +287,7 @@ class LoRA:
         *,
         dtype: torch.dtype | None = None,
         host_backing: HostBacking = "pinned",
+        allow_partial_targets: bool = False,
     ) -> Self:
         """Pair, validate, and build ``state_dict`` into a LoRA.
 
@@ -285,7 +297,8 @@ class LoRA:
         casts at apply time regardless. ``host_backing="adopt"`` strictly
         adopts existing CPU storage and therefore rejects any ``dtype`` that
         would require conversion. Adopted factor storage must remain immutable
-        for the resource's lifetime.
+        for the resource's lifetime. ``allow_partial_targets`` defaults to
+        false so accidental model/adapter mismatches continue to fail.
         """
         backing = validate_host_backing(host_backing)
         if dtype is not None and not dtype.is_floating_point:
@@ -298,7 +311,8 @@ class LoRA:
                 state_dict,
                 dtype=dtype,
                 pin_memory=backing == "pinned",
-            )
+            ),
+            allow_partial_targets=allow_partial_targets,
         )
 
     @property
@@ -309,6 +323,11 @@ class LoRA:
     @property
     def cache_bytes(self) -> int:
         return self._cache_bytes
+
+    @property
+    def allow_partial_targets(self) -> bool:
+        """Whether application may ignore targets absent from a model."""
+        return self._allow_partial_targets
 
 
 class LoRATransform:
