@@ -163,11 +163,6 @@ class PinnedComponent:
     """
 
     def __init__(self, instance: PinnedModuleInstance) -> None:
-        if not isinstance(instance, PinnedModuleInstance):
-            raise TypeError(
-                "PinnedComponent requires a PinnedModuleInstance; "
-                "use PinnedComponentStore.from_module(model).bind(model)."
-            )
         self._instance = instance
         self._param_names = frozenset(instance.params)
         self._buffer_names = frozenset(instance.buffers)

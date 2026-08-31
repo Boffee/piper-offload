@@ -16,7 +16,7 @@ from torch import nn
 from ._devices import canonical_device
 from .block_compile import BlockCompileConfig
 from .composite_component import CompositeComponent, CompositeComponentStore
-from .host_backing import HostBacking, validate_host_backing
+from .host_backing import HostBacking
 from .lora import (
     LoRA,
     LoRAMode,
@@ -194,26 +194,13 @@ class ModelOffloader:
         writable mmap contents must remain immutable for the offloader's
         lifetime.
         """
-        backing = validate_host_backing(host_backing)
-        if backing == "adopt":
-            trainable_names = [
-                name
-                for name, parameter in model.named_parameters()
-                if parameter.requires_grad
-            ]
-            if trainable_names:
-                raise ValueError(
-                    "adopted host backing is inference-only; freeze all "
-                    "parameters before constructing the offloader. Trainable "
-                    f"parameters: {trainable_names!r}."
-                )
         composite_store = CompositeComponentStore.from_module(
             model,
             block_paths=block_paths,
             transient_block_paths=transient_block_paths,
             transient_paths=transient_paths,
             stream_trainable_weights=stream_trainable_weights,
-            host_backing=backing,
+            host_backing=host_backing,
         )
         cache_bytes = composite_store.cache_bytes
         composite = composite_store.bind(

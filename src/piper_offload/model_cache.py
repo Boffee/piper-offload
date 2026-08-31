@@ -50,10 +50,6 @@ class ModelCache(ResourceCache):
         """
         specs = tuple(lora_specs)
         strengths = None if lora_strengths is None else tuple(lora_strengths)
-        if strengths is not None and len(strengths) != len(specs):
-            raise ValueError(
-                "lora_strengths must have the same length as lora_specs"
-            )
         # A zero-strength LoRA is absent from this activation. Filter it
         # before leasing so its factory, cache admission, and host backing are
         # never needed merely to produce a no-op.

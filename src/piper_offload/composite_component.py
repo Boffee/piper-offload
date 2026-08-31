@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from .block_compile import BlockCompileConfig
-from .host_backing import HostBacking, validate_host_backing
+from .host_backing import HostBacking
 from .module_names import buffer_names, parameter_names
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .pinned_module import PostCopyHook
@@ -99,11 +99,6 @@ class CompositeComponent:
         *,
         compile_blocks: bool = True,
     ) -> None:
-        if not isinstance(compile_blocks, bool):
-            raise TypeError(
-                "compile_blocks must be bool; "
-                f"got {type(compile_blocks).__name__}."
-            )
         if self._teardown_stack is not None:
             raise RuntimeError(
                 "CompositeComponent.activate() called while already active; "
@@ -172,7 +167,6 @@ class CompositeComponentStore:
         stream_trainable_weights: bool = False,
         host_backing: HostBacking = "pinned",
     ) -> Self:
-        backing = validate_host_backing(host_backing)
         persistent_paths = tuple(block_paths)
         transient_streamed_paths = tuple(transient_block_paths)
         overlap = set(persistent_paths) & set(transient_streamed_paths)
@@ -196,7 +190,7 @@ class CompositeComponentStore:
                 model,
                 blocks_path=blocks_path,
                 stream_trainable_weights=stream_trainable_weights,
-                host_backing=backing,
+                host_backing=host_backing,
             )
 
         streamed_stores = tuple(
@@ -235,7 +229,7 @@ class CompositeComponentStore:
                         model,
                         include_param_names=selected_params,
                         include_buffer_names=selected_buffers,
-                        host_backing=backing,
+                        host_backing=host_backing,
                     ),
                 )
             )
@@ -246,7 +240,7 @@ class CompositeComponentStore:
                 model,
                 include_param_names=resident_params,
                 include_buffer_names=resident_buffers,
-                host_backing=backing,
+                host_backing=host_backing,
             )
             if resident_params or resident_buffers
             else None

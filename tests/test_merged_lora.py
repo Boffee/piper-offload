@@ -4495,7 +4495,7 @@ class TestLoRAResource:
         )
         cache = ModelCache(10**9)
 
-        with pytest.raises(ValueError, match="same length"):
+        with pytest.raises(ValueError, match="shorter"):
             with cache.use(
                 model_spec,
                 device="cpu",

@@ -825,8 +825,6 @@ class StreamedComponent:
                 "active. Deactivate first, or check for a leaked "
                 "context manager."
             )
-        if not isinstance(compile_blocks, bool):
-            raise TypeError(f"compile_blocks must be bool; got {type(compile_blocks).__name__}.")
         active_device = canonical_device(device)
         if active_device.type == "cpu":
             self._activate_cpu_resolved()

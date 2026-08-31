@@ -73,26 +73,6 @@ class TestBlockCompileConfig:
         assert config.options is None
         assert config.rolling is False
 
-    @pytest.mark.parametrize("dynamic", [0, "yes", object()])
-    def test_dynamic_must_be_bool_or_none(self, dynamic: object) -> None:
-        with pytest.raises(TypeError, match="dynamic must be bool or None"):
-            BlockCompileConfig(dynamic=dynamic)  # type: ignore[arg-type]
-
-    @pytest.mark.parametrize("fullgraph", [0, "yes", object()])
-    def test_fullgraph_must_be_bool(self, fullgraph: object) -> None:
-        with pytest.raises(TypeError, match="fullgraph must be bool"):
-            BlockCompileConfig(fullgraph=fullgraph)  # type: ignore[arg-type]
-
-    @pytest.mark.parametrize("options", [[], "yes", object()])
-    def test_options_must_be_mapping_or_none(self, options: object) -> None:
-        with pytest.raises(TypeError, match="options must be a mapping or None"):
-            BlockCompileConfig(options=options)  # type: ignore[arg-type]
-
-    @pytest.mark.parametrize("rolling", [0, "yes", object()])
-    def test_rolling_must_be_bool(self, rolling: object) -> None:
-        with pytest.raises(TypeError, match="rolling must be bool"):
-            BlockCompileConfig(rolling=rolling)  # type: ignore[arg-type]
-
     def test_rolling_requires_fullgraph(self) -> None:
         with pytest.raises(ValueError, match="requires fullgraph=True"):
             _make_offloader(

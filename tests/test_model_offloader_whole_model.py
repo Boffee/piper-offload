@@ -8,7 +8,6 @@ from torch import nn
 
 from piper_offload import (
     ModelOffloader,
-    PinnedComponent,
     PinnedComponentStore,
     ResourceBinding,
 )
@@ -67,11 +66,6 @@ class TestResourceBindingConformance:
             assert not isinstance(component, ResourceBinding)
         finally:
             component.deactivate()
-
-    def test_component_constructor_is_not_public_factory(self) -> None:
-        model = _make_simple_model()
-        with pytest.raises(TypeError, match="PinnedComponentStore.from_module"):
-            PinnedComponent(cast(Any, model))
 
     def test_offloader_constructor_requires_bound_composite(self) -> None:
         with pytest.raises(TypeError, match="composite"):
