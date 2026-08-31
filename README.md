@@ -44,7 +44,7 @@ is not required.
 | `model_cache.py` | `ModelCache` — model-aware `ResourceCache` with activation and LoRA coordination |
 | `resource_specs.py` | `ModelSpec`, `LoRASpec`, `ObjectSpec` — standard frozen resource specifications |
 | `protocols.py` | `ResourceSpec`, `ResourceStore`, `ResourceBinding` plug-in contracts |
-| `block_compile.py` | `BlockCompileConfig` — opt-in Inductor policy for streamed block forwards |
+| `block_compile.py` | `BlockCompileConfig` — opt-in Inductor policy for declared block forwards |
 | `model_offloader.py` | `ModelOffloader` — cached single-model runtime for whole-model bulk pinned-CPU↔GPU or streamed block offload |
 | `pinned_component.py` | `PinnedComponentStore`, `PinnedComponent` — lower-level reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
 | `streamed_component.py` | `StreamedComponentStore`, `StreamedComponent` — lower-level streamed backing storage plus per-block-list streaming component |
@@ -253,8 +253,10 @@ Ordinary streaming owns one active block and one asynchronous lookahead target.
 That fixed two-target window overlaps the next whole-block copy without
 retaining blocks that a sequential traversal will reload anyway. Direction
 changes and iteration wraparound are detected internally. Streaming itself is
-selected by `block_paths` and `transient_block_paths`; with both lists empty,
-the whole model is one bulk-pinned component that activation copies to the GPU.
+selected by `block_paths` and `transient_block_paths`. Setting
+`stream_blocks=False` keeps every ordinary block target resident; transient
+block paths still stream. With both lists empty, the whole model is one
+bulk-pinned component that activation copies to the GPU.
 For heterogeneous block lists, execution still limits concurrency to the active
 and lookahead blocks, while the morphing pool may park one reusable target per
 distinct tensor-layout signature.
@@ -306,10 +308,10 @@ ordinary `block_paths` group may still reuse a module object, but a module hook
 cannot distinguish which aliased list position just completed and therefore
 cannot provide a safe early-release boundary.
 
-### Optional streamed-block compilation
+### Optional block compilation
 
-Repeated streamed blocks can opt into forward-only Inductor compilation at
-runtime construction:
+Repeated blocks can opt into forward-only Inductor compilation at runtime
+construction:
 
 ```python
 from piper_offload import BlockCompileConfig, ModelOffloader
@@ -328,7 +330,22 @@ offload = ModelOffloader.from_module(
 
 `block_compile=None` (the default) preserves eager behavior. One configuration
 applies to every `block_paths` and `transient_block_paths` group and has no
-effect when neither is configured.
+effect when neither is configured. Ordinary `block_paths` stream by default.
+Set `stream_blocks=False` to keep those blocks in the resident CUDA allocation
+while retaining the same per-block compilation. All block targets load once at
+activation; no pool rotation, prefetch thread, private copy stream, or block
+scheduling hooks are created:
+
+```python
+offload = ModelOffloader.from_module(
+    model,
+    block_paths=["transformer_blocks"],
+    stream_blocks=False,
+    block_compile=BlockCompileConfig(),
+)
+```
+
+`transient_block_paths` always stream, regardless of `stream_blocks`.
 The backend remains fixed to Inductor. Optional
 backend settings can be supplied through `options`; the mapping is copied for
 each block before it is forwarded to `torch.compile`. This is also the boundary
@@ -338,27 +355,26 @@ uses Inductor's default mode. Piper Offload does not pass `mode` because PyTorch
 treats `mode` and `options` as mutually exclusive.
 
 Only each distinct block module's `forward` is compiled. Its module
-`__call__` and Piper Offload's forward-pre hook stay eager, so block
-activation and prefetch finish before compiled computation begins. Compiled
-forwards are installed only for CUDA activations and the exact original
-forwards are restored on deactivate or activation rollback. CPU activation
-remains eager. The lazy compiled callables are retained by the bound runtime,
-so later eligible activations can reuse their compiled graphs.
+`__call__` stays eager. For streamed groups, the forward-pre hook also stays
+eager, so block activation and prefetch finish before compiled computation.
+Compiled forwards are installed only for CUDA activations and the exact
+original forwards are restored on deactivate or activation rollback. CPU
+activation remains eager. The lazy compiled callables are retained by the
+bound runtime, so later eligible activations can reuse their compiled graphs.
 
-Compilation is inference-only in this initial implementation. Streamed
-training remains available without `block_compile`, but combining block
-compilation with autograd/checkpointed training is unsupported until it has
-dedicated correctness coverage.
+Compilation is inference-only in this initial implementation. Training remains
+available without `block_compile`, but combining block compilation with
+autograd is unsupported until it has dedicated correctness coverage.
 
 Merge-mode LoRA remains compatible. If any routed LoRA is active, every
-streamed block runs eagerly for that activation because routed child-Linear
+declared block runs eagerly for that activation because routed child-Linear
 hooks stage parameters inside the block forward. The bypass is temporary:
 a later activation with no routed LoRA uses compiled forwards again.
 Selecting `lora_mode="routed"` without supplying a LoRA does not bypass
 compilation.
 
-An experimental rolling mode can replace the ordinary resident/prefetch block
-targets with one shared parameter target:
+With `stream_blocks=True`, an experimental rolling mode can replace the
+ordinary resident/prefetch block targets with one shared parameter target:
 
 ```python
 offload = ModelOffloader.from_module(
@@ -1037,10 +1053,11 @@ This is a low-level library; we don't guard against caller misuse.
 ## Compatibility
 
 - **`torch.compile` support is deliberately narrow.** Use
-  `block_compile=BlockCompileConfig(...)` to compile only declared streamed
-  block forwards during CUDA inference. External whole-model
-  `torch.compile(model)`, `model.compile()`, compilation of the pinned
-  remainder, and compiled streamed training remain unsupported. Routed LoRA
+  `block_compile=BlockCompileConfig(...)` to compile only declared block
+  forwards during CUDA inference. `stream_blocks=False` may keep ordinary
+  block groups resident. External whole-model `torch.compile(model)`,
+  `model.compile()`, compilation outside declared block groups, and compiled
+  training remain unsupported. Routed LoRA
   temporarily bypasses compiled blocks. Compiler code/artifact caches and
   compiler-owned workspace are outside `ResourceCache.cache_bytes`; model
   eviction does not call process-global `torch.compiler.reset()`. Experimental

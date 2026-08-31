@@ -133,6 +133,7 @@ class CompositeComponentStore:
     streamed_stores: tuple[StreamedComponentStore, ...]
     transient_streamed_stores: tuple[StreamedComponentStore, ...] = ()
     transient_stores: tuple[tuple[str, PinnedComponentStore], ...] = ()
+    stream_blocks: bool = True
 
     def __post_init__(self) -> None:
         if (
@@ -165,6 +166,7 @@ class CompositeComponentStore:
         transient_block_paths: Sequence[str] = (),
         transient_paths: Sequence[str] = (),
         stream_trainable_weights: bool = False,
+        stream_blocks: bool = True,
         host_backing: HostBacking = "pinned",
     ) -> Self:
         persistent_paths = tuple(block_paths)
@@ -250,6 +252,7 @@ class CompositeComponentStore:
             streamed_stores=streamed_stores,
             transient_streamed_stores=transient_streamed_stores,
             transient_stores=tuple(transient_stores),
+            stream_blocks=stream_blocks,
         )
 
     @property
@@ -276,6 +279,7 @@ class CompositeComponentStore:
                 model,
                 block_compile=block_compile,
                 wraparound=True,
+                stream_blocks=self.stream_blocks,
             )
             for store in self.streamed_stores
         )

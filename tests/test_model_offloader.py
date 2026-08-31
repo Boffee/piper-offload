@@ -44,6 +44,7 @@ def _make_model_offloader(
     block_paths: Sequence[str] = (),
     transient_block_paths: Sequence[str] = (),
     stream_trainable_weights: bool = False,
+    stream_blocks: bool = True,
     transient_paths: Sequence[str] = (),
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
@@ -51,6 +52,7 @@ def _make_model_offloader(
         block_paths=block_paths,
         transient_block_paths=transient_block_paths,
         stream_trainable_weights=stream_trainable_weights,
+        stream_blocks=stream_blocks,
         transient_paths=transient_paths,
     )
 
@@ -60,6 +62,7 @@ def _make_streamed_component(
     *,
     blocks_path: str = "blocks",
     stream_trainable_weights: bool = True,
+    stream_blocks: bool = True,
 ) -> StreamedComponent:
     model = _make_block_list_model(blocks, blocks_path)
     store = StreamedComponentStore.from_module(
@@ -67,7 +70,7 @@ def _make_streamed_component(
         blocks_path=blocks_path,
         stream_trainable_weights=stream_trainable_weights,
     )
-    return store.bind(model)
+    return store.bind(model, stream_blocks=stream_blocks)
 
 
 def _make_block_list_model(
@@ -587,7 +590,11 @@ class TestStreamedComponentBackendActivation:
             streamer.deactivate()
 
     @CUDA
-    def test_cuda_working_set_can_release_and_reacquire(self) -> None:
+    @pytest.mark.parametrize("stream_blocks", [True, False])
+    def test_cuda_working_set_can_release_and_reacquire(
+        self,
+        stream_blocks: bool,
+    ) -> None:
         torch.manual_seed(42)
         eager_blocks = nn.ModuleList(
             [nn.Linear(8, 8, bias=False) for _ in range(3)]
@@ -599,7 +606,10 @@ class TestStreamedComponentBackendActivation:
             for block in eager_blocks:
                 expected = block(expected)
 
-        streamer = _make_streamed_component(blocks=list(blocks))
+        streamer = _make_streamed_component(
+            blocks=list(blocks),
+            stream_blocks=stream_blocks,
+        )
         runtime = streamer._block_runtime
         try:
             streamer.activate(torch.device("cuda"))
@@ -3349,7 +3359,11 @@ class TestInBlockTrainableStreamingEndToEnd:
             )
 
     @CUDA
-    def test_optimizer_step_updates_match_baseline(self) -> None:
+    @pytest.mark.parametrize("stream_blocks", [True, False])
+    def test_optimizer_step_updates_match_baseline(
+        self,
+        stream_blocks: bool,
+    ) -> None:
         # Run one full step (forward + backward + step) on both a
         # baseline and a streamed model; verify resulting trainable
         # ``.data`` matches.
@@ -3383,6 +3397,7 @@ class TestInBlockTrainableStreamingEndToEnd:
             m_streamed,
             block_paths=["transformer_blocks"],
             stream_trainable_weights=True,
+            stream_blocks=stream_blocks,
         )
         try:
             with activated_model(offloader, "cuda") as gpu_model:

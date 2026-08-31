@@ -23,7 +23,7 @@ type _LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
 
 
 class StreamingRuntime(Protocol):
-    """CUDA working-set lifecycle shared by streaming strategies.
+    """CUDA working-set lifecycle shared by block-residency strategies.
 
     Implementations allocate accelerator resources only during
     :meth:`acquire`. Acquisition may fail after partially initializing a

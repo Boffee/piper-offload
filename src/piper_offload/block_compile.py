@@ -1,4 +1,4 @@
-"""Opt-in ``torch.compile`` policy for streamed model blocks."""
+"""Opt-in ``torch.compile`` policy for model block groups."""
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -15,7 +15,7 @@ _NO_INSTANCE_FORWARD = object()
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class BlockCompileConfig:
-    """Compilation options applied to every declared streamed block group.
+    """Compilation options applied to every declared block group.
 
     Compilation is disabled unless an instance of this configuration is
     supplied to :meth:`piper_offload.ModelOffloader.from_module` (directly or
@@ -44,7 +44,7 @@ class BlockCompileConfig:
         use, allowing the next block to reuse that storage while the current
         block continues computing. Supported adapters are regular dense,
         TorchAO-family, Quanto, GGUF, and Piper ConvRot INT8. Requires
-        ``fullgraph=True``.
+        ``fullgraph=True`` and streamed block residency.
     """
 
     dynamic: bool | None = True

@@ -85,7 +85,9 @@ from a fresh model instance.
      trainables skipped by block streaming.
   2. One :class:`PinnedComponent` per stateful path in ``transient_paths``.
   3. One :class:`StreamedComponent` per path in ``block_paths`` or
-     ``transient_block_paths`` when streaming is configured.
+     ``transient_block_paths`` when block residency is configured. With
+     ``stream_blocks=False``, ordinary block paths keep all of their targets
+     resident within the streamed component and may still be compiled.
 
 Optional LoRA merging is requested directly on :meth:`ModelOffloader.activate`
 and resolved by installing post-copy hooks for managed parameter targets.
@@ -123,10 +125,11 @@ for design notes.
 
 Compatibility
 -------------
-- **``torch.compile`` support is narrow.** Only streamed block forwards
+- **``torch.compile`` support is narrow.** Only declared block forwards
   configured through :class:`BlockCompileConfig` are supported, and only for
-  CUDA inference. External whole-model compilation, the pinned remainder,
-  routed-LoRA activations, and compiled streamed training remain unsupported.
+  CUDA inference. Ordinary block groups may be streamed or resident. External
+  whole-model compilation, modules outside declared block groups, routed-LoRA
+  activations, and compiled training remain unsupported.
   Experimental rolling compilation additionally requires frozen homogeneous
   blocks using a reviewed dense or quantized adapter, a full graph, and one
   shared target.

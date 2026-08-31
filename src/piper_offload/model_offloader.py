@@ -79,12 +79,11 @@ class ModelOffloader:
     overlapping activations. Concurrent use fails immediately with
     :class:`ModelRuntimeInUseError`.
 
-    When both block-path lists are omitted, CUDA activation bulk-copies every
-    managed parameter and buffer to CUDA. When either list is set, CUDA
-    activation streams the groups selected by ``block_paths`` and
-    ``transient_block_paths`` while other state remains resident unless its
-    module is selected by ``transient_paths``.
-    Supplying ``block_compile`` at construction opts streamed block forwards
+    By default, CUDA activation streams the groups selected by ``block_paths``
+    and ``transient_block_paths`` while other state remains resident unless
+    its module is selected by ``transient_paths``. Set ``stream_blocks=False``
+    to keep ordinary ``block_paths`` resident while retaining them as optional
+    compile targets. Supplying ``block_compile`` opts declared block forwards
     into Inductor during CUDA inference. CPU activation is pass-through over
     the host-backed module state and remains eager.
 
@@ -167,6 +166,7 @@ class ModelOffloader:
         block_paths: Sequence[str] = (),
         transient_block_paths: Sequence[str] = (),
         stream_trainable_weights: bool = False,
+        stream_blocks: bool = True,
         block_compile: BlockCompileConfig | None = None,
         host_backing: HostBacking = "pinned",
         transient_paths: Sequence[str] = (),
@@ -177,13 +177,17 @@ class ModelOffloader:
         Bound component instances retain the host state afterward, so the
         model is never rebound on subsequent uses.
         ``block_compile`` applies one forward-only compile policy to every
-        block group and is unused when no block group is declared. Groups named
-        by ``block_paths`` retain their CUDA pools for the activation. Groups
-        named by ``transient_block_paths`` release after their final blocks and
-        reacquire after the root model forward. These groups are inference-only
-        and must not be traversed again later in the same root forward. Their
-        block lists must contain distinct module objects because a module hook
-        cannot distinguish occurrences of an aliased block.
+        block group and is unused when no block group is declared. By default,
+        groups named by ``block_paths`` retain their CUDA pools for the
+        activation. With ``stream_blocks=False``, their streamed components
+        instead keep every block resident and perform no prefetching; the same
+        paths still select optional compiled forwards. Groups named by
+        ``transient_block_paths`` always stream,
+        release after their final blocks, and reacquire after the root model
+        forward. These groups are inference-only and must not be traversed
+        again later in the same root forward. Their block lists must contain
+        distinct module objects because a module hook cannot distinguish
+        occurrences of an aliased block.
         Each module named by ``transient_paths`` similarly owns a separate
         CUDA working set that releases after that module's forward.
         ``host_backing`` defaults to a pinned copy; ``"adopt"`` strictly
@@ -200,6 +204,7 @@ class ModelOffloader:
             transient_block_paths=transient_block_paths,
             transient_paths=transient_paths,
             stream_trainable_weights=stream_trainable_weights,
+            stream_blocks=stream_blocks,
             host_backing=host_backing,
         )
         cache_bytes = composite_store.cache_bytes

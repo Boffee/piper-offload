@@ -5,6 +5,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add `stream_blocks=False` to keep ordinary `block_paths` resident while
+  retaining opt-in per-block compilation. Transient block paths remain
+  streamed.
+
 ## [0.5.1] - 2026-08-31
 
 ### Added

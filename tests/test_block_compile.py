@@ -1,4 +1,4 @@
-"""Opt-in ``torch.compile`` integration for streamed blocks."""
+"""Opt-in ``torch.compile`` integration for declared block groups."""
 
 from collections.abc import Callable
 
@@ -12,6 +12,7 @@ from piper_offload import (
     ModelOffloader,
     ModelSpec,
 )
+from piper_offload.resident_runtime import ResidentBlockRuntime
 from tests._block_compile_helpers import (
     _Block,
     _BlockModel,
@@ -133,6 +134,66 @@ class TestBlockCompileConfig:
         finally:
             offloader.deactivate()
 
+    def test_model_spec_can_compile_resident_blocks(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        spy = _CompileSpy()
+        monkeypatch.setattr(torch, "compile", spy)
+        spec = ModelSpec(
+            key="resident-compiled",
+            estimated_cache_bytes=1024,
+            factory=_BlockModel,
+            block_paths=("blocks",),
+            stream_blocks=False,
+            block_compile=BlockCompileConfig(),
+        )
+
+        offloader = spec.build_store()
+        try:
+            streamers = streamed_components(offloader)
+            assert len(streamers) == 1
+            assert isinstance(
+                streamers[0]._block_runtime,
+                ResidentBlockRuntime,
+            )
+            assert len(spy.calls) == 2
+        finally:
+            offloader.deactivate()
+
+    def test_rolling_requires_streamed_blocks(self) -> None:
+        with pytest.raises(ValueError, match="requires stream_blocks=True"):
+            _make_offloader(
+                _BlockModel(),
+                stream_blocks=False,
+                block_compile=BlockCompileConfig(
+                    rolling=True,
+                    fullgraph=True,
+                ),
+            )
+
+    def test_transient_block_paths_still_stream(self) -> None:
+        model = _TwoGroupModel()
+        offloader = _make_offloader(
+            model,
+            block_paths=["first_blocks"],
+            transient_block_paths=("second_blocks",),
+            stream_blocks=False,
+        )
+        try:
+            resident, transient = streamed_components(offloader)
+            assert isinstance(
+                resident._block_runtime,
+                ResidentBlockRuntime,
+            )
+            assert not isinstance(
+                transient._block_runtime,
+                ResidentBlockRuntime,
+            )
+            assert offloader._composite.transient_streamed == (transient,)
+        finally:
+            offloader.deactivate()
+
     def test_compile_policy_does_not_change_cache_bytes(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -227,15 +288,18 @@ class TestCompiledForwardConstruction:
 
 
 class TestCompiledForwardLifecycle:
+    @pytest.mark.parametrize("stream_blocks", [True, False])
     def test_cpu_activation_remains_eager(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        stream_blocks: bool,
     ) -> None:
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
         model = _BlockModel()
         offloader = _make_offloader(
             model,
+            stream_blocks=stream_blocks,
             block_compile=BlockCompileConfig(),
         )
         try:
@@ -244,6 +308,48 @@ class TestCompiledForwardLifecycle:
                     model(torch.randn(2, 8))
                 assert all("forward" not in block.__dict__ for block in model.blocks)
             assert spy.executions == 0
+        finally:
+            offloader.deactivate()
+
+    @CUDA
+    def test_resident_blocks_compile_without_prefetching(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        spy = _CompileSpy()
+        monkeypatch.setattr(torch, "compile", spy)
+        model = _BlockModel()
+        offloader = _make_offloader(
+            model,
+            stream_blocks=False,
+            block_compile=BlockCompileConfig(),
+        )
+        streamer = streamed_components(offloader)[0]
+        runtime = streamer._block_runtime
+        try:
+            assert isinstance(runtime, ResidentBlockRuntime)
+            with activated_model(offloader, "cuda"):
+                assert runtime.acquired
+                assert len(runtime._leases) == len(model.blocks)
+                leases = tuple(runtime._leases)
+                assert not hasattr(runtime, "_executor")
+                assert not hasattr(runtime, "_stream")
+                assert not hasattr(runtime, "_hooks")
+                assert all(
+                    "forward" in block.__dict__
+                    for block in model.blocks
+                )
+                assert all(param.device.type == "cuda" for param in model.parameters())
+                with torch.inference_mode():
+                    model(torch.randn(2, 8, device="cuda"))
+                    model(torch.randn(2, 8, device="cuda"))
+                assert tuple(runtime._leases) == leases
+            assert spy.executions == 4
+            assert all(
+                "forward" not in block.__dict__
+                for block in model.blocks
+            )
+            assert all(param.device.type == "cpu" for param in model.parameters())
         finally:
             offloader.deactivate()
 
@@ -409,14 +515,17 @@ class TestCompiledForwardLifecycle:
             offloader.deactivate()
 
     @CUDA
+    @pytest.mark.parametrize("stream_blocks", [True, False])
     def test_activation_failure_restores_original_forwards(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        stream_blocks: bool,
     ) -> None:
         monkeypatch.setattr(torch, "compile", _CompileSpy())
         model = _BlockModel()
         offloader = _make_offloader(
             model,
+            stream_blocks=stream_blocks,
             block_compile=BlockCompileConfig(),
         )
         streamer = streamed_components(offloader)[0]
@@ -596,9 +705,11 @@ class TestCompiledLoRA:
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
 
     @CUDA
+    @pytest.mark.parametrize("stream_blocks", [True, False])
     def test_routed_bypass_is_model_wide_and_temporary(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        stream_blocks: bool,
     ) -> None:
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
@@ -612,6 +723,7 @@ class TestCompiledLoRA:
         offloader = _make_offloader(
             model,
             block_paths=["first_blocks", "second_blocks"],
+            stream_blocks=stream_blocks,
             block_compile=BlockCompileConfig(),
         )
         x = torch.randn(2, 8, device="cuda")

@@ -1,13 +1,14 @@
-"""Block-streaming primitive for memory-efficient training and inference.
+"""Block-residency primitive for memory-efficient training and inference.
 
 A :class:`StreamedComponentStore` manages reusable pinned CPU backing
 storage for a single block list whose blocks share the same parameter
 layout (names, shapes, dtypes, and any tensor-adapter wrapper metadata).
 Binding that store to a compatible model creates a
-:class:`StreamedComponent` that streams the resolved blocks to GPU on
-demand. Ordinary streaming uses a reusable GPU target pool and background
-prefetcher; rolling compilation selects a single-target parameter runtime.
-On CPU, the host-backed pinned state is used directly without streaming.
+:class:`StreamedComponent` that either streams the resolved blocks to GPU on
+demand or keeps every block resident. Ordinary streaming uses a reusable GPU
+target pool and background prefetcher; rolling compilation selects a
+single-target parameter runtime; resident mode loads every target once. On
+CPU, the host-backed pinned state is used directly without streaming.
 
 Blocks in one list may be heterogeneously quantized (mixed dtypes or
 quant formats on the same-named weights): the GPU target pool keys its
@@ -66,6 +67,7 @@ from .pinned_module import (
     PostCopyHook,
 )
 from .pinned_param import PinnedParam
+from .resident_runtime import ResidentBlockRuntime
 from .rolling_runtime import create_rolling_runtime
 from .streaming_runtime import BlockStreamingRuntime, StreamingRuntime
 
@@ -513,6 +515,7 @@ class StreamedComponentStore:
         *,
         block_compile: BlockCompileConfig | None = None,
         wraparound: bool = True,
+        stream_blocks: bool = True,
     ) -> StreamedComponent:
         """Bind this store's per-block backing bytes to ``model``.
 
@@ -549,6 +552,7 @@ class StreamedComponentStore:
             block_indices=self.block_indices,
             block_compile=block_compile,
             wraparound=wraparound,
+            stream_blocks=stream_blocks,
         )
 
 
@@ -558,11 +562,13 @@ class StreamedComponentStore:
 
 
 class StreamedComponent:
-    """Streams a single block list between pinned CPU and CUDA.
+    """Manages a block list between pinned CPU and CUDA.
 
-    The sharp, low-level streaming primitive. Manages bound block
-    instances whose owned params and buffers are pinned to CPU and
-    streams them to CUDA via forward-pre hooks on :meth:`activate`.
+    The sharp, low-level block-residency primitive. Manages bound block
+    instances whose owned params and buffers are pinned to CPU. By default it
+    streams them to CUDA via forward-pre hooks on :meth:`activate`; with
+    ``stream_blocks=False`` it loads every block once and installs no
+    scheduling hooks.
     CPU activation is pass-through over that pinned host-backed state:
     no pool, no hooks, no copies. Frozen params use parameter
     replacement; trainable params keep Parameter identity and swap only
@@ -587,9 +593,10 @@ class StreamedComponent:
     Optional
     ``block_compile`` policy belongs to this bound runtime and installs lazy
     compiled forwards only for eligible CUDA inference activations. Ordinary
-    streaming owns one active block and one lookahead target; rolling
-    compilation owns one shared parameter target. Both strategies wrap to
-    block 0 by default; transient model scheduling disables that wraparound.
+    streaming owns one active block and one lookahead target, resident mode
+    owns one target per block, and rolling compilation owns one shared
+    parameter target. Streaming strategies wrap to block 0 by default;
+    transient model scheduling disables that wraparound.
     There is no ``close()``; pinned memory in module state is freed when the
     caller drops the binding and model references.
 
@@ -631,6 +638,10 @@ class StreamedComponent:
     wraparound:
         Whether the runtime prepares block 0 while executing the final block.
         :class:`ModelOffloader` disables this for transient streamed pools.
+    stream_blocks:
+        Whether to rotate blocks through an active/lookahead target window.
+        When false, every block gets a target at acquisition and remains
+        resident without prefetching until release.
     """
 
     def __init__(
@@ -641,7 +652,16 @@ class StreamedComponent:
         block_indices: Sequence[int] | None = None,
         block_compile: BlockCompileConfig | None = None,
         wraparound: bool = True,
+        stream_blocks: bool = True,
     ) -> None:
+        if (
+            not stream_blocks
+            and block_compile is not None
+            and block_compile.rolling
+        ):
+            raise ValueError(
+                "BlockCompileConfig(rolling=True) requires stream_blocks=True."
+            )
         self._block_instances = list(block_instances)
         if block_indices is None:
             block_indices = range(len(self._block_instances))
@@ -654,16 +674,27 @@ class StreamedComponent:
             )
         self._blocks = [instance.module for instance in self._block_instances]
         self._log_label = _streamed_log_label(name, len(self._block_instances))
-        self._block_runtime = BlockStreamingRuntime(
-            self._block_instances,
-            log_label=self._log_label,
-            wraparound=wraparound,
+        self._block_runtime: StreamingRuntime = (
+            BlockStreamingRuntime(
+                self._block_instances,
+                log_label=self._log_label,
+                wraparound=wraparound,
+            )
+            if stream_blocks
+            else ResidentBlockRuntime(
+                self._block_instances,
+                log_label=self._log_label,
+            )
         )
-        self._rolling_runtime = create_rolling_runtime(
-            self._block_instances,
-            block_compile,
-            log_label=self._log_label,
-            wraparound=wraparound,
+        self._rolling_runtime = (
+            create_rolling_runtime(
+                self._block_instances,
+                block_compile,
+                log_label=self._log_label,
+                wraparound=wraparound,
+            )
+            if stream_blocks
+            else None
         )
         compile_runtime: StreamingRuntime = self._rolling_runtime or self._block_runtime
         self._block_compile = _BlockCompileState.create(
@@ -800,9 +831,9 @@ class StreamedComponent:
     ) -> None:
         """Activate the block list on ``device``.
 
-        CUDA activation selects either the resident-pool block runtime or the
-        single-target rolling runtime, then installs optional compiled block
-        forwards. CPU activation is pass-through over pinned host-backed state.
+        CUDA activation selects the ordinary, all-resident, or compiled rolling
+        block runtime, then installs optional compiled block forwards. CPU
+        activation is pass-through over pinned host-backed state.
         The composite's :meth:`activate` returns the model — this
         method returns ``None`` because the streamer doesn't own one.
 
