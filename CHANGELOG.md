@@ -5,6 +5,16 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Allow the ConvRot optional backend to use Piper Kernels 0.5 while retaining
+  compatibility with the 0.3 and 0.4 series.
+
+### Fixed
+
+- Preserve compatible concrete NVFP4 subclasses across pinned-host and device
+  reconstruction, layout identity, requantization, and streamed LoRA merging.
+
 ## [0.5.0] - 2026-08-30
 
 ### Added

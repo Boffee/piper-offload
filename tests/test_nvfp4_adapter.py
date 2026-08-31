@@ -42,6 +42,11 @@ def _nvfp4_modules():
     return mod.NVFP4Tensor, mod.QuantizeTensorToNVFP4Kwargs
 
 
+def _piper_nvfp4(tensor: torch.Tensor) -> torch.Tensor:
+    mod = pytest.importorskip("piper_kernels.linear.nvfp4")
+    return mod.PiperNVFP4Tensor.from_torchao(tensor)
+
+
 def _make_nvfp4(
     *,
     rows: int = 16,
@@ -211,6 +216,34 @@ class TestNvfp4Adapter:
         assert key[2][0] == qt.scale.device
         assert key[3][0] == qt.per_tensor_scale.device
         assert key == tensor_id(qt)
+
+    def test_identity_distinguishes_concrete_wrapper_type(self) -> None:
+        torchao = _make_nvfp4()
+        piper = _piper_nvfp4(torchao)
+
+        assert type(piper) is not type(torchao)
+        assert tensor_id(piper) != tensor_id(torchao)
+        assert _param_target_layout(nn.Parameter(piper, requires_grad=False)) != (
+            _param_target_layout(nn.Parameter(torchao, requires_grad=False))
+        )
+
+    def test_reconstruction_and_requantization_preserve_concrete_wrapper_type(self) -> None:
+        source = _piper_nvfp4(_make_nvfp4(swizzled=True))
+        source_type = type(source)
+        pinned_param = PinnedParam(nn.Parameter(source, requires_grad=False))
+
+        pinned = pinned_param.make_cpu_param().data
+        device_state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
+        pinned_param.copy_to_gpu(device_state)
+        reconstructed = pinned_param.make_gpu_param(device_state).data
+        requantized = Nvfp4Adapter.requantize(
+            Nvfp4Adapter.dequantize(reconstructed),
+            like=reconstructed,
+        )
+
+        assert type(pinned) is source_type
+        assert type(reconstructed) is source_type
+        assert type(requantized) is source_type
 
     def test_target_layout_ignores_tensor_id(self) -> None:
         p1 = nn.Parameter(_make_nvfp4(), requires_grad=False)
@@ -593,9 +626,7 @@ class TestNvfp4Adapter:
             "_triton_merge_nvfp4_lora",
             None,
         )
-        transform = LoRATransform(
-            [ScaledLoRAFactor.from_tensors(a, b, 0.5)]
-        )
+        transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
         transform.validate_target(param)
         transform.apply(param)
 
@@ -747,20 +778,22 @@ class TestNvfp4Adapter:
             strategy.deactivate()
 
     @CUDA
-    def test_streamed_nvfp4_merge_requantizes_on_activate(self) -> None:
+    def test_streamed_piper_nvfp4_merge_preserves_wrapper_on_activate(self) -> None:
         nvfp4_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
         nvfp4_cls, kwargs_cls = _nvfp4_modules()
 
         def _quantize(weight: torch.Tensor) -> torch.Tensor:
-            return nvfp4_cls.to_nvfp4(
-                weight,
-                per_tensor_scale=nvfp4_mod.per_tensor_amax_to_scale(torch.max(torch.abs(weight))),
-                is_swizzled_scales=True,
-                use_triton_kernel=False,
-                act_quant_kwargs=kwargs_cls(
+            return _piper_nvfp4(
+                nvfp4_cls.to_nvfp4(
+                    weight,
+                    per_tensor_scale=nvfp4_mod.per_tensor_amax_to_scale(torch.max(torch.abs(weight))),
                     is_swizzled_scales=True,
-                    use_dynamic_per_tensor_scale=True,
                     use_triton_kernel=False,
+                    act_quant_kwargs=kwargs_cls(
+                        is_swizzled_scales=True,
+                        use_dynamic_per_tensor_scale=True,
+                        use_triton_kernel=False,
+                    ),
                 ),
             )
 
@@ -787,6 +820,7 @@ class TestNvfp4Adapter:
                 requires_grad=False,
             )
         nv = model.blocks[0].weight.data
+        piper_nvfp4_type = type(nv)
         rank = 4
         a = torch.randn(rank, 64)
         b = torch.randn(64, rank)
@@ -821,7 +855,7 @@ class TestNvfp4Adapter:
                 lora_mode="merge",
             ) as active:
                 merged = active.blocks[0].weight.data
-                assert isinstance(merged, nvfp4_cls)
+                assert type(merged) is piper_nvfp4_type
                 # Triton's tiled BF16 update can move a handful of values
                 # across an FP4 rounding boundary relative to addmm.
                 _assert_triton_nvfp4_close(merged, expected)
