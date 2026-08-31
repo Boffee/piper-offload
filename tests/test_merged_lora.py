@@ -719,14 +719,12 @@ class TestActivationLoraValidation:
         finally:
             s.deactivate()
 
-    def test_accepts_duplicate_lora_instance(self) -> None:
+    def test_rejects_duplicate_lora_instance(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         lora = _make_lora(4, 16)
-        assert s._normalize_loras([lora, lora]) == [
-            (lora, 1.0),
-            (lora, 1.0),
-        ]
+        with pytest.raises(ValueError, match="same LoRA instance"):
+            s._normalize_loras([lora, lora])
 
     def test_invalid_lora_mode_releases_activation_claim(self) -> None:
         m = _make_bf16_model()
