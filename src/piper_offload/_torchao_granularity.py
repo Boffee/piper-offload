@@ -26,7 +26,7 @@ except ImportError:
 
 
 def granularity_from_block_size(
-    block_size: tuple[int, ...], shape: tuple[int, ...], *, label: str,
+    block_size: tuple[int, ...], shape: tuple[int, ...],
 ) -> object:
     """Invert TorchAO's ``get_block_size`` for the affine granularities.
 
@@ -37,8 +37,7 @@ def granularity_from_block_size(
     with ``group_size`` a proper divisor of the last dim). Shapes where two
     readings coincide (e.g. a dim of size 1, or ``group_size == in``)
     produce identical block partitions either way, so any matching reading
-    is correct; ``PerRow`` is checked first. ``label`` names the wrapper
-    type for the error raised on an unrecognized granularity.
+    is correct; ``PerRow`` is checked first.
     """
     if block_size == shape:
         return PerTensor()
@@ -58,7 +57,7 @@ def granularity_from_block_size(
     ):
         return PerGroup(last)
     raise ValueError(
-        f"{label} block_size {block_size!r} for shape {shape!r} matches "
+        f"block_size {block_size!r} for shape {shape!r} matches "
         "no PerTensor / PerRow / PerGroup granularity; TorchAO likely added "
         "a granularity this adapter does not support yet."
     )

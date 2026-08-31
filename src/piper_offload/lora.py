@@ -1055,7 +1055,6 @@ def _validate_lora_state_dict(state_dict: dict[str, torch.Tensor]) -> None:
 
     for base_key, a in a_tensors.items():
         _validate_factor_pair(
-            f"{base_key}.weight",
             a,
             b_tensors[base_key],
             bias_tensors.get(base_key),
@@ -1083,19 +1082,19 @@ def _split_factor_tensors(
 
 
 def _validate_factor_pair(
-    target_key: str,
     a: torch.Tensor,
     b: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> None:
     if not a.is_floating_point() or not b.is_floating_point():
         raise ValueError(
-            f"LoRA factors for {target_key!r}: must be floating-point; got A.dtype={a.dtype}, B.dtype={b.dtype}."
+            f"LoRA factors must be floating-point; got A.dtype={a.dtype}, "
+            f"B.dtype={b.dtype}."
         )
     if a.dim() != 2 or b.dim() != 2 or a.shape[0] != b.shape[1]:
         raise ValueError(
-            f"LoRA factor shape mismatch for {target_key!r}: "
-            f"A.shape={tuple(a.shape)}, B.shape={tuple(b.shape)}. "
+            f"LoRA factor shape mismatch: A.shape={tuple(a.shape)}, "
+            f"B.shape={tuple(b.shape)}. "
             f"Expected A=(rank, in_dim), B=(out_dim, rank) with "
             f"A.shape[0] == B.shape[1]."
         )
@@ -1103,12 +1102,11 @@ def _validate_factor_pair(
         return
     if not bias.is_floating_point():
         raise ValueError(
-            f"LoRA bias for {target_key!r} must be floating-point; "
-            f"got dtype={bias.dtype}."
+            f"LoRA bias must be floating-point; got dtype={bias.dtype}."
         )
     if bias.dim() != 1 or bias.shape[0] != b.shape[0]:
         raise ValueError(
-            f"LoRA bias shape mismatch for {target_key!r}: "
-            f"bias.shape={tuple(bias.shape)}, B.shape={tuple(b.shape)}. "
+            f"LoRA bias shape mismatch: bias.shape={tuple(bias.shape)}, "
+            f"B.shape={tuple(b.shape)}. "
             "Expected bias=(out_dim,) with bias.shape[0] == B.shape[0]."
         )

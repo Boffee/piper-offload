@@ -113,13 +113,11 @@ class BlockStreamingRuntime:
         self,
         instances: Sequence[PinnedModuleInstance],
         *,
-        log_label: str,
         wraparound: bool = True,
     ) -> None:
         self._instances = tuple(instances)
         self._blocks = tuple(instance.module for instance in instances)
         self._signatures = tuple(_instance_target_signature(instance) for instance in instances)
-        self._log_label = log_label
         self._wraparound = wraparound
         self._device: torch.device | None = None
         self._pool: _MorphingTargetPool | None = None
@@ -163,8 +161,9 @@ class BlockStreamingRuntime:
         self._register_hooks()
 
         logger.info(
-            f"{self._log_label} acquired: one block on GPU plus one "
-            f"lookahead target across {num_blocks} blocks"
+            "block streaming runtime acquired: one block on GPU plus one "
+            "lookahead target across %d blocks",
+            num_blocks,
         )
 
     def release(self) -> None:

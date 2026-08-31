@@ -109,7 +109,6 @@ def validate_float8_requantize_layout(t: torch.Tensor) -> object:
         return granularity_from_block_size(
             tuple(f8.block_size),
             tuple(f8.shape),
-            label="Float8Tensor",
         )
     except ValueError as exc:
         raise ValueError(

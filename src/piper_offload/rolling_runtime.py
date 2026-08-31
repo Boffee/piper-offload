@@ -51,13 +51,11 @@ class _RollingTargetRuntime:
         self,
         instances: tuple[PinnedModuleInstance, ...],
         param_names: tuple[str, ...],
-        log_label: str,
         *,
         wraparound: bool = True,
     ) -> None:
         self._instances = instances
         self._param_names = param_names
-        self._log_label = log_label
         self._wraparound = wraparound
         self._reset_acquired_state()
 
@@ -110,7 +108,9 @@ class _RollingTargetRuntime:
         self._register_hooks(device)
 
         logger.info(
-            f"{self._log_label} acquired: one rolling parameter target for {len(self._instances)} compiled blocks"
+            "rolling target runtime acquired: one parameter target for %d "
+            "compiled blocks",
+            len(self._instances),
         )
 
     def _register_hooks(self, device: torch.device) -> None:
@@ -239,21 +239,18 @@ class _RollingTargetRuntime:
 
 def _validate_instance(
     instance: PinnedModuleInstance,
-    block_idx: int,
     param_names: tuple[str, ...],
     reference_layouts: tuple[tuple[object, object], ...],
 ) -> None:
     params = instance.params
     if instance.has_trainables:
-        raise NotImplementedError(
-            f"rolling compilation is inference-only; streamed block {block_idx} contains trainable parameters"
-        )
+        raise NotImplementedError("rolling compilation is inference-only")
     if instance.buffers:
         raise NotImplementedError("rolling compilation does not yet support streamed buffers")
     if tuple(params) != param_names:
         raise NotImplementedError("rolling compilation requires identical parameter names and ordering in every block")
     if len({id(pinned) for pinned in params.values()}) != len(params):
-        raise NotImplementedError(f"rolling compilation does not yet support tied parameters inside block {block_idx}")
+        raise NotImplementedError("rolling compilation does not yet support tied parameters inside blocks")
     layouts = tuple(pinned.target_layout for pinned in params.values())
     if layouts != reference_layouts:
         raise NotImplementedError("rolling compilation requires identical parameter layouts in every block")
@@ -270,7 +267,6 @@ def create_rolling_runtime(
     instances: Sequence[PinnedModuleInstance],
     config: BlockCompileConfig | None,
     *,
-    log_label: str,
     wraparound: bool = True,
 ) -> _RollingTargetRuntime | None:
     """Validate and create the configured rolling runtime, if enabled."""
@@ -286,10 +282,9 @@ def create_rolling_runtime(
     if not param_names:
         raise ValueError("rolling compilation requires streamed parameters")
     reference_layouts = tuple(pinned.target_layout for pinned in reference_params.values())
-    for block_idx, instance in enumerate(instances):
+    for instance in instances:
         _validate_instance(
             instance,
-            block_idx,
             param_names,
             reference_layouts,
         )
@@ -297,7 +292,6 @@ def create_rolling_runtime(
     return _RollingTargetRuntime(
         tuple(instances),
         param_names,
-        log_label,
         wraparound=wraparound,
     )
 

@@ -19,11 +19,8 @@ class ResidentBlockRuntime:
     def __init__(
         self,
         instances: Sequence[PinnedModuleInstance],
-        *,
-        log_label: str,
     ) -> None:
         self._instances = tuple(instances)
-        self._log_label = log_label
         self._device: torch.device | None = None
         self._leases: list[_CudaTargetLease] = []
         self._optimizer_step_active = False
@@ -65,8 +62,8 @@ class ResidentBlockRuntime:
             raise
 
         logger.info(
-            f"{self._log_label} acquired: all "
-            f"{len(self._instances)} blocks resident"
+            "resident block runtime acquired: all %d blocks resident",
+            len(self._instances),
         )
 
     def release(self) -> None:

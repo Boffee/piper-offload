@@ -318,12 +318,6 @@ def _streamed_param_name(
     return name if prefix is None else f"{prefix}.{name}"
 
 
-def _streamed_log_label(name: str | None, block_count: int) -> str:
-    if name is None:
-        return f"StreamedComponent({block_count} blocks)"
-    return f"StreamedComponent[{name}]"
-
-
 def _resolve_blocks(module: nn.Module, blocks_path: str) -> list[nn.Module]:
     obj = walk_attr_path(module, blocks_path)
     if not isinstance(obj, nn.ModuleList):
@@ -673,24 +667,18 @@ class StreamedComponent:
                 f"{len(self._block_instances)} blocks."
             )
         self._blocks = [instance.module for instance in self._block_instances]
-        self._log_label = _streamed_log_label(name, len(self._block_instances))
         self._block_runtime: StreamingRuntime = (
             BlockStreamingRuntime(
                 self._block_instances,
-                log_label=self._log_label,
                 wraparound=wraparound,
             )
             if stream_blocks
-            else ResidentBlockRuntime(
-                self._block_instances,
-                log_label=self._log_label,
-            )
+            else ResidentBlockRuntime(self._block_instances)
         )
         self._rolling_runtime = (
             create_rolling_runtime(
                 self._block_instances,
                 block_compile,
-                log_label=self._log_label,
                 wraparound=wraparound,
             )
             if stream_blocks
