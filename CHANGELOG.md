@@ -5,6 +5,13 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add opt-in partial LoRA target application. A LoRA built with
+  `allow_partial_targets=True` applies the intersection of its targets and a
+  model's parameters in activation-scoped merge, routed, and permanent merge
+  paths; strict target validation remains the default.
+
 ### Changed
 
 - Allow the ConvRot optional backend to use Piper Kernels 0.5 while retaining

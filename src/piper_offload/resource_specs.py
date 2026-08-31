@@ -69,6 +69,8 @@ class LoRASpec:
     :meth:`LoRA.from_state_dict`; matching the model's compute dtype reduces
     routed per-forward transfer volume when using pinned backing. Adopted
     backing strictly retains compatible CPU factor tensors.
+    ``allow_partial_targets`` opts the built resource into applying only the
+    intersection of its targets and a model's parameters.
     """
 
     key: str
@@ -76,6 +78,7 @@ class LoRASpec:
     factory: Callable[[], dict[str, torch.Tensor]]
     dtype: torch.dtype | None = None
     host_backing: HostBacking = "pinned"
+    allow_partial_targets: bool = False
 
     def build_store(self) -> LoRA:
         """Build and pin this reusable adapter resource."""
@@ -83,6 +86,7 @@ class LoRASpec:
             self.factory(),
             dtype=self.dtype,
             host_backing=self.host_backing,
+            allow_partial_targets=self.allow_partial_targets,
         )
 
     def value(self, store: ResourceStore) -> LoRA:

@@ -89,7 +89,9 @@ from a fresh model instance.
 
 Optional LoRA merging is requested directly on :meth:`ModelOffloader.activate`
 and resolved by installing post-copy hooks for managed parameter targets.
-Unknown targets raise during activation. The
+Unknown targets raise during activation unless the LoRA resource explicitly
+allows partial targets, in which case application uses the intersection of
+LoRA targets and model parameters. The
 hooks run immediately after the owning component copies a base weight
 from host storage to GPU, so block-streamed and non-block weights
 use the same merge path. Merge eligibility is owned by the selected

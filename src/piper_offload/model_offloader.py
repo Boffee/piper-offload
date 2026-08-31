@@ -257,6 +257,8 @@ class ModelOffloader:
         per_param: _LoraParamMap = {}
         for lora, strength in loras:
             for target_key, factor in lora.targets.items():
+                if lora.allow_partial_targets and target_key not in self.param_names:
+                    continue
                 managed = self._require_managed_target(target_key)
                 per_param.setdefault(managed, []).append(factor.scaled(strength))
         return per_param
@@ -470,6 +472,8 @@ class ModelOffloader:
 
         ``loras`` and their optional ``lora_strengths`` apply only to this
         activation. Exact-zero strengths are inactive and install no hooks.
+        LoRAs that allow partial targets apply only to parameters managed by
+        this offloader; strict LoRAs reject any absent target.
         ``lora_mode`` selects in-place merge hooks or routed residual hooks.
         ``stochastic_rounding`` uses stochastic requantization for quantized
         merge targets by default; pass ``False`` for deterministic rounding.
@@ -495,11 +499,15 @@ class ModelOffloader:
                 loras,
                 lora_strengths=lora_strengths,
             )
+            targets = (
+                self._group_lora_factors_by_param_name(active_loras)
+                if active_loras
+                else {}
+            )
             # LoRA hooks are installed before the composite activates. Merge
             # hooks must be present for the first base-weight copy; routed
             # hooks do no work until a target Linear runs.
-            if active_loras:
-                targets = self._group_lora_factors_by_param_name(active_loras)
+            if targets:
                 if lora_mode == "merge":
                     self._register_merge_lora_hooks(
                         active_device,
@@ -525,9 +533,7 @@ class ModelOffloader:
             with activation_context:
                 self._composite.activate(
                     active_device,
-                    compile_blocks=not (
-                        active_loras and lora_mode == "routed"
-                    ),
+                    compile_blocks=not (targets and lora_mode == "routed"),
                 )
             if schedule_transient:
                 self._install_transient_hooks()
