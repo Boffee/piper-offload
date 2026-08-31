@@ -21,7 +21,7 @@ from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from piper_offload.dtensor_adapter import DTensorAdapter
 from piper_offload.pinned_module import PinnedModuleStore
 from piper_offload.pinned_param import PinnedParam
-from piper_offload.streamed_component import (
+from piper_offload.block_component import (
     _param_target_layout,
     _pin_block_module_stores,
 )

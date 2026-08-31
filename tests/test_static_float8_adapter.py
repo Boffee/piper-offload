@@ -15,7 +15,7 @@ from piper_offload import (
 from piper_offload.float8_adapter import Float8Adapter
 from piper_offload.pinned_param import PinnedParam
 from piper_offload.static_float8_adapter import StaticFloat8Adapter
-from piper_offload.streamed_component import _param_target_layout
+from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from tests.conftest import activated_model
 

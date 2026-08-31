@@ -17,7 +17,7 @@ from piper_offload import (
 )
 from piper_offload.bnb4bit_adapter import Bnb4bitAdapter
 from piper_offload.pinned_param import PinnedParam
-from piper_offload.streamed_component import _param_target_layout
+from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import tensor_id
 from tests.conftest import activated_model
 
@@ -28,12 +28,12 @@ def _make_model_offloader(
     model: nn.Module,
     *,
     block_paths: list[str] = [],
-    stream_trainable_weights: bool = False,
+    include_block_trainables: bool = False,
 ) -> ModelOffloader:
     return ModelOffloader.from_module(
         model,
         block_paths=block_paths,
-        stream_trainable_weights=stream_trainable_weights,
+        include_block_trainables=include_block_trainables,
     )
 
 

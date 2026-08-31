@@ -1,7 +1,7 @@
 """Per-parameter pinned-CPU storage primitive.
 
 Internal to the ``piper_offload`` subpackage. Shared by
-:class:`ModelOffloader` (whole-model bulk pin) and :class:`StreamedComponent`
+:class:`ModelOffloader` (whole-model bulk pin) and :class:`BlockComponent`
 (per-block streaming). Both consumers reach this through the same
 abstraction so the addition of new tensor types only requires writing
 a new :class:`TensorAdapter`, not editing the consumers.

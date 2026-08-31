@@ -236,16 +236,14 @@ def _quantize_kernel(
     tl.store(output_ptr + offsets, quantized, mask=mask)
 
 
-def _float_dtype_id(dtype: torch.dtype, *, label: str) -> int:
+def _float_dtype_id(dtype: torch.dtype) -> int:
     if dtype is torch.float16:
         return _COMPUTE_FP16
     if dtype is torch.bfloat16:
         return _COMPUTE_BF16
     if dtype is torch.float32:
         return _COMPUTE_FP32
-    raise ValueError(
-        f"Triton INT8 merge supports float16, bfloat16, and float32 {label}, got {dtype}."
-    )
+    raise ValueError(f"Triton INT8 merge supports float16, bfloat16, and float32, got {dtype}.")
 
 
 def _block_numel(
@@ -286,8 +284,8 @@ def merge_int8_lora(
         raise ValueError("Triton INT8 merge expects rank-two tensors.")
     if b.dtype is not a.dtype:
         raise ValueError("Triton INT8 merge requires matching LoRA factor dtypes.")
-    compute_dtype = _float_dtype_id(b.dtype, label="LoRA factors")
-    qparam_dtype = _float_dtype_id(scale.dtype, label="scales")
+    compute_dtype = _float_dtype_id(b.dtype)
+    qparam_dtype = _float_dtype_id(scale.dtype)
     quant_min, quant_max = (-64, 63) if reduce_range else (-128, 127)
     if (
         qdata.device != scale.device

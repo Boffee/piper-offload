@@ -289,7 +289,6 @@ def requantize_static_float8_tensor(
     granularity = granularity_from_block_size(
         tuple(f8.block_size),
         tuple(f8.shape),
-        label="PrototypeFloat8Tensor",
     )
     out = PrototypeFloat8Tensor.from_hp(
         t.to(dtype=f8.dtype),

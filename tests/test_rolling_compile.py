@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch import nn
 
-from piper_offload import BlockCompileConfig, LoRA, register_adapter
+from piper_offload import BlockCompileConfig, BlockMode, LoRA, register_adapter
 from piper_offload.rolling_compile import (
     register_rolling_target,
     unregister_rolling_target,
@@ -17,7 +17,7 @@ from tests._block_compile_helpers import (
     _BlockModel,
     _make_offloader,
 )
-from tests.conftest import activated_model, streamed_components
+from tests.conftest import activated_model, block_components
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 _ORDER_EVENTS: list[list[str]] = []
@@ -35,9 +35,15 @@ def _compiled_output[T](
     model: nn.Module,
     config: BlockCompileConfig,
     forward: Callable[[], T],
+    *,
+    block_mode: BlockMode = "streaming",
     **activation: object,
 ) -> T:
-    offloader = _make_offloader(model, block_compile=config)
+    offloader = _make_offloader(
+        model,
+        block_compile=config,
+        block_mode=block_mode,
+    )
     try:
         with activated_model(offloader, "cuda", **activation):
             with torch.inference_mode():
@@ -216,7 +222,8 @@ class TestRollingCompile:
             with pytest.raises(NotImplementedError, match="supports only"):
                 _make_offloader(
                     _BlockModel(),
-                    block_compile=BlockCompileConfig(rolling=True, fullgraph=True),
+                    block_mode="rolling",
+                    block_compile=BlockCompileConfig(fullgraph=True),
                 )
         finally:
             remove_adapter()
@@ -262,8 +269,9 @@ class TestRollingCompile:
         )
         actual = _compiled_output(
             rolling_model,
-            BlockCompileConfig(dynamic=False, rolling=True, fullgraph=True),
+            BlockCompileConfig(dynamic=False, fullgraph=True),
             lambda: [rolling_model(x).clone() for _ in range(2)],
+            block_mode="rolling",
             **activation,
         )
 
@@ -312,9 +320,9 @@ class TestRollingCompile:
 
         rolling_offloader = _make_offloader(
             rolling_model,
+            block_mode="rolling",
             block_compile=BlockCompileConfig(
                 dynamic=False,
-                rolling=True,
                 fullgraph=True,
                 options=compile_options,
             ),
@@ -346,14 +354,14 @@ class TestRollingCompile:
         )
         offloader = _make_offloader(
             model,
+            block_mode="rolling",
             block_compile=BlockCompileConfig(
                 dynamic=False,
-                rolling=True,
                 fullgraph=True,
             ),
         )
-        streamer = streamed_components(offloader)[0]
-        runtime = streamer._rolling_runtime
+        streamer = block_components(offloader)[0]
+        runtime = streamer._runtime
         assert runtime is not None
         runtime_type = type(runtime)
         original_wait = runtime_type.wait_param
@@ -415,16 +423,16 @@ class TestRollingCompile:
 
         rolling_offloader = _make_offloader(
             rolling_model,
+            block_mode="rolling",
             block_compile=BlockCompileConfig(
-                rolling=True,
                 fullgraph=True,
             ),
         )
-        streamer = streamed_components(rolling_offloader)[0]
+        streamer = block_components(rolling_offloader)[0]
         try:
             with activated_model(rolling_offloader, "cuda"):
-                assert streamer._active_runtime is streamer._rolling_runtime
-                assert not streamer._block_runtime.acquired
+                assert streamer._active_runtime is streamer._runtime
+                assert not streamer._eager_runtime.acquired
                 assert len({id(block.proj.weight) for block in rolling_model.blocks}) == 1
                 with torch.inference_mode():
                     actual = [rolling_model(x).clone() for x in inputs]
@@ -445,14 +453,14 @@ class TestRollingCompile:
 
         offloader = _make_offloader(
             rolling_model,
+            block_mode="rolling",
             block_compile=BlockCompileConfig(
                 dynamic=False,
-                rolling=True,
                 fullgraph=True,
             ),
         )
-        streamer = streamed_components(offloader)[0]
-        runtime = streamer._rolling_runtime
+        streamer = block_components(offloader)[0]
+        runtime = streamer._runtime
         assert runtime is not None
         try:
             with activated_model(offloader, "cuda"):
@@ -465,10 +473,7 @@ class TestRollingCompile:
                 assert streamer._active_device.type == "cuda"
                 assert streamer._active_runtime is runtime
                 assert not runtime.acquired
-                assert all(
-                    block.proj.weight.device.type == "cpu"
-                    for block in rolling_model.blocks
-                )
+                assert all(block.proj.weight.device.type == "cpu" for block in rolling_model.blocks)
 
                 streamer.acquire()
                 assert runtime.acquired
@@ -492,14 +497,14 @@ class TestRollingCompile:
 
         offloader = _make_offloader(
             rolling_model,
+            block_mode="rolling",
             block_compile=BlockCompileConfig(
                 dynamic=False,
-                rolling=True,
                 fullgraph=True,
             ),
             transient_block_paths=("blocks",),
         )
-        runtime = streamed_components(offloader)[0]._rolling_runtime
+        runtime = block_components(offloader)[0]._runtime
         assert runtime is not None
         root_states: list[bool] = []
         remove_observer = offloader.register_forward_hook(
@@ -526,14 +531,14 @@ class TestRollingCompile:
         model = _BlockModel(num_blocks=3)
         offloader = _make_offloader(
             model,
+            block_mode="rolling",
             block_compile=BlockCompileConfig(
                 dynamic=False,
-                rolling=True,
                 fullgraph=True,
             ),
             transient_block_paths=("blocks",),
         )
-        runtime = streamed_components(offloader)[0]._rolling_runtime
+        runtime = block_components(offloader)[0]._runtime
         assert runtime is not None
         original_refill = runtime._refill
         refills: list[int] = []
@@ -564,9 +569,9 @@ class TestRollingCompile:
 
         offloader = _make_offloader(
             rolling_model,
+            block_mode="rolling",
             block_compile=BlockCompileConfig(
                 dynamic=False,
-                rolling=True,
                 fullgraph=True,
             ),
             transient_block_paths=("blocks",),
@@ -582,13 +587,14 @@ class TestRollingCompile:
         torch.testing.assert_close(second, first, rtol=0, atol=0)
 
     @CUDA
-    def test_routed_lora_selects_block_runtime_for_activation(self) -> None:
+    def test_routed_lora_selects_eager_runtime_for_activation(self) -> None:
         model = _BlockModel()
         offloader = _make_offloader(
             model,
-            block_compile=BlockCompileConfig(rolling=True, fullgraph=True),
+            block_mode="rolling",
+            block_compile=BlockCompileConfig(fullgraph=True),
         )
-        streamer = streamed_components(offloader)[0]
+        streamer = block_components(offloader)[0]
         try:
             with activated_model(
                 offloader,
@@ -596,10 +602,9 @@ class TestRollingCompile:
                 loras=[_lora(len(model.blocks), 8)],
                 lora_mode="routed",
             ):
-                assert streamer._active_runtime is streamer._block_runtime
-                assert streamer._block_runtime.acquired
-                assert streamer._rolling_runtime is not None
-                assert not streamer._rolling_runtime.acquired
+                assert streamer._active_runtime is streamer._eager_runtime
+                assert streamer._eager_runtime.acquired
+                assert not streamer._runtime.acquired
                 with torch.inference_mode():
                     model(torch.randn(2, 8, device="cuda"))
             assert streamer._active_runtime is None
@@ -627,11 +632,11 @@ class TestRollingCompile:
         actual = _compiled_output(
             rolling_model,
             BlockCompileConfig(
-                rolling=True,
                 fullgraph=True,
                 options=compile_options,
             ),
             lambda: rolling_model(x).clone(),
+            block_mode="rolling",
         )
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -656,10 +661,10 @@ class TestRollingCompile:
         actual = _compiled_output(
             rolling_model,
             BlockCompileConfig(
-                rolling=True,
                 fullgraph=True,
             ),
             lambda: [rolling_model(x).clone() for _ in range(2)],
+            block_mode="rolling",
             loras=[lora],
             lora_strengths=[0.25],
             lora_mode="merge",

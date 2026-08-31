@@ -18,6 +18,7 @@ from torch import nn
 
 from piper_offload import (
     BlockCompileConfig,
+    BlockMode,
     ModelOffloader,
 )
 
@@ -97,7 +98,7 @@ def _dtype(name: str) -> torch.dtype:
 
 def _run(
     *,
-    rolling: bool,
+    block_mode: BlockMode,
     args: argparse.Namespace,
     device: torch.device,
     dtype: torch.dtype,
@@ -108,10 +109,8 @@ def _run(
     offloader = ModelOffloader.from_module(
         model,
         block_paths=("blocks",),
-        block_compile=BlockCompileConfig(
-            rolling=rolling,
-            fullgraph=True,
-        ),
+        block_mode=block_mode,
+        block_compile=BlockCompileConfig(fullgraph=True),
     )
     milliseconds: list[float] = []
     output: torch.Tensor | None = None
@@ -140,7 +139,7 @@ def _run(
         offloader.deactivate()
 
     return _Result(
-        mode="rolling" if rolling else "block-prefetch",
+        mode=block_mode,
         milliseconds=tuple(milliseconds),
         allocated_bytes=allocated_bytes,
         peak_bytes=peak_bytes,
@@ -175,7 +174,7 @@ def _main() -> None:
         device=device,
     )
     baseline = _run(
-        rolling=False,
+        block_mode="streaming",
         args=args,
         device=device,
         dtype=dtype,
@@ -184,7 +183,7 @@ def _main() -> None:
     gc.collect()
     torch.cuda.empty_cache()
     rolling = _run(
-        rolling=True,
+        block_mode="rolling",
         args=args,
         device=device,
         dtype=dtype,

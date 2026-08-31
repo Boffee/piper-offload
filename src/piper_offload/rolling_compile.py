@@ -173,17 +173,16 @@ def _registered_slot_entry(
 def _runtime_for_slot(
     slots: list[torch.Tensor],
     param_idx: int,
-    operation: str,
 ) -> RollingRuntime:
     if not slots:
-        raise RuntimeError(f"compiled rolling {operation} received no storage slots")
+        raise RuntimeError("compiled rolling callback received no storage slots")
     with _SLOT_REGISTRY_LOCK:
         entry = _SLOTS_BY_DATA_PTR.get(slots[0].data_ptr())
         runtime = None if entry is None else entry[0]()
     if runtime is None or entry is None:
         raise RuntimeError("compiled rolling lifecycle callback could not resolve its active target runtime")
     if entry[1] != param_idx:
-        raise RuntimeError(f"compiled rolling {operation} parameter index does not match its active target slot")
+        raise RuntimeError("compiled rolling parameter index does not match its active target slot")
     return cast(RollingRuntime, runtime)
 
 
@@ -195,7 +194,7 @@ def _rolling_wait(
     slots: list[torch.Tensor],
     param_idx: int,
 ) -> None:
-    _runtime_for_slot(slots, param_idx, "wait").wait_param(param_idx)
+    _runtime_for_slot(slots, param_idx).wait_param(param_idx)
 
 
 @torch.library.register_fake("piper_offload::rolling_wait")
@@ -214,7 +213,7 @@ def _rolling_refill(
     slots: list[torch.Tensor],
     param_idx: int,
 ) -> None:
-    _runtime_for_slot(slots, param_idx, "refill").rollover_param(param_idx)
+    _runtime_for_slot(slots, param_idx).rollover_param(param_idx)
 
 
 @torch.library.register_fake("piper_offload::rolling_refill")
@@ -506,9 +505,7 @@ def rolling_inductor_backend(
             )
         flat_argument_idx += width
     if not param_specs:
-        raise RuntimeError(
-            "rolling compilation could not identify any streamed parameter arguments in the captured block graph"
-        )
+        raise RuntimeError("rolling compilation could not identify any block parameter arguments in the captured graph")
 
     lifecycle_pass = _RollingLifecyclePass(tuple((idx, *spec) for idx, spec in param_specs.items()))
     options = dict(cast(Mapping[str, object], kwargs.get("options") or {}))

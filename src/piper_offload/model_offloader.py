@@ -15,6 +15,8 @@ from torch import nn
 
 from ._devices import canonical_device
 from .block_compile import BlockCompileConfig
+from .block_component import BlockComponent
+from .block_mode import BlockMode
 from .composite_component import CompositeComponent, CompositeComponentStore
 from .host_backing import HostBacking
 from .lora import (
@@ -26,10 +28,9 @@ from .lora import (
 )
 from .module_names import resolve_parent_leaf, sibling_parameter_name
 from .pinned_component import PinnedComponent
-from .streamed_component import StreamedComponent
 
 type _LoraParamMap = dict[str, list[ScaledLoRAFactor]]
-type _TransientComponent = PinnedComponent | StreamedComponent
+type _TransientComponent = PinnedComponent | BlockComponent
 type _ForwardHook = Callable[
     [nn.Module, tuple[object, ...], object],
     object | None,
@@ -71,7 +72,7 @@ __all__ = [
 
 
 class ModelOffloader:
-    """Move a whole model or streamed block groups between host RAM and
+    """Move a whole model or managed block groups between host RAM and
     CUDA, with optional LoRA merge and trainable-parameter support.
 
     Construct with :meth:`from_module`. One offloader owns one model and may
@@ -79,17 +80,16 @@ class ModelOffloader:
     overlapping activations. Concurrent use fails immediately with
     :class:`ModelRuntimeInUseError`.
 
-    When both block-path lists are omitted, CUDA activation bulk-copies every
-    managed parameter and buffer to CUDA. When either list is set, CUDA
-    activation streams the groups selected by ``block_paths`` and
-    ``transient_block_paths`` while other state remains resident unless its
-    module is selected by ``transient_paths``.
-    Supplying ``block_compile`` at construction opts streamed block forwards
-    into Inductor during CUDA inference. CPU activation is pass-through over
-    the host-backed module state and remains eager.
+    ``block_mode`` selects resident, whole-block streaming, or compiled rolling
+    execution for groups named by ``block_paths`` and
+    ``transient_block_paths``. Other state remains resident unless its module
+    is selected by ``transient_paths``. Supplying ``block_compile`` opts
+    declared block forwards into Inductor during CUDA inference. CPU
+    activation is pass-through over the host-backed module state and remains
+    eager.
 
     Composes resident and transient :class:`PinnedComponent`\\ s with one or
-    more :class:`StreamedComponent`\\ s internally. LoRA requests are supplied
+    more :class:`BlockComponent`\\ s internally. LoRA requests are supplied
     directly to :meth:`activate`; merge mode installs activation-scoped
     post-copy hooks so the merge fires immediately after each CPU->GPU weight
     copy. No separate merge binding is needed.
@@ -124,7 +124,7 @@ class ModelOffloader:
     back to the pinned CPU cache. CPU activation leaves them in the
     host-backed module state.
 
-    Configure ``stream_trainable_weights=True`` on :meth:`from_module` to
+    Configure ``include_block_trainables=True`` on :meth:`from_module` to
     stream in-block trainable parameter data through the CUDA block target
     pool. In that mode,
     :meth:`optimizer_step` is the optimizer boundary: it materializes
@@ -139,7 +139,7 @@ class ModelOffloader:
         The concrete model bound to the supplied composite.
     composite:
         Bound :class:`CompositeComponent` owning the model's pinned
-        and streamed offload components.
+        and block offload components.
     cache_bytes:
         Stable host-cache bytes owned by the bound components.
     """
@@ -166,7 +166,8 @@ class ModelOffloader:
         *,
         block_paths: Sequence[str] = (),
         transient_block_paths: Sequence[str] = (),
-        stream_trainable_weights: bool = False,
+        include_block_trainables: bool = False,
+        block_mode: BlockMode = "streaming",
         block_compile: BlockCompileConfig | None = None,
         host_backing: HostBacking = "pinned",
         transient_paths: Sequence[str] = (),
@@ -177,9 +178,12 @@ class ModelOffloader:
         Bound component instances retain the host state afterward, so the
         model is never rebound on subsequent uses.
         ``block_compile`` applies one forward-only compile policy to every
-        block group and is unused when no block group is declared. Groups named
-        by ``block_paths`` retain their CUDA pools for the activation. Groups
-        named by ``transient_block_paths`` release after their final blocks and
+        block group and is unused when no block group is declared. By default,
+        ``block_mode`` selects how every declared block group becomes resident:
+        all at once, one whole block ahead, or parameter-by-parameter through
+        a compiled rolling graph. Groups named by ``block_paths`` retain their
+        CUDA working sets for the activation. Groups named by
+        ``transient_block_paths`` release after their final blocks and
         reacquire after the root model forward. These groups are inference-only
         and must not be traversed again later in the same root forward. Their
         block lists must contain distinct module objects because a module hook
@@ -199,13 +203,14 @@ class ModelOffloader:
             block_paths=block_paths,
             transient_block_paths=transient_block_paths,
             transient_paths=transient_paths,
-            stream_trainable_weights=stream_trainable_weights,
+            include_block_trainables=include_block_trainables,
             host_backing=host_backing,
         )
         cache_bytes = composite_store.cache_bytes
         composite = composite_store.bind(
             model,
             block_compile=block_compile,
+            block_mode=block_mode,
         )
         return cls(
             model,
@@ -226,11 +231,7 @@ class ModelOffloader:
             strength_list = [1.0] * len(lora_list)
         else:
             strength_list = [float(strength) for strength in lora_strengths]
-        return [
-            (lora, strength)
-            for lora, strength in zip(lora_list, strength_list, strict=True)
-            if strength != 0.0
-        ]
+        return [(lora, strength) for lora, strength in zip(lora_list, strength_list, strict=True) if strength != 0.0]
 
     def _require_managed_target(self, target_key: str) -> str:
         """Validate that ``target_key`` names a parameter this offloader
@@ -277,9 +278,7 @@ class ModelOffloader:
                 "for CPU activation."
             )
 
-        params_by_name = dict(
-            self._model.named_parameters(remove_duplicate=False)
-        )
+        params_by_name = dict(self._model.named_parameters(remove_duplicate=False))
         for param_name, factors in targets.items():
             transform = LoRATransform(
                 factors,
@@ -381,12 +380,12 @@ class ModelOffloader:
             )
             components.append(component)
 
-        for streamer in self._composite.transient_streamed:
-            handle = streamer.blocks[-1].register_forward_hook(
-                _release_after_forward_hook(streamer),
+        for block_component in self._composite.transient_blocks:
+            handle = block_component.blocks[-1].register_forward_hook(
+                _release_after_forward_hook(block_component),
             )
             self._transient_hook_removers.append(handle.remove)
-            components.append(streamer)
+            components.append(block_component)
 
         component_refs = tuple(weakref.ref(component) for component in components)
 
@@ -404,9 +403,7 @@ class ModelOffloader:
                     if component is not None:
                         component.acquire()
 
-        self._transient_hook_removers.append(
-            self.register_forward_hook("", reacquire_after_forward)
-        )
+        self._transient_hook_removers.append(self.register_forward_hook("", reacquire_after_forward))
 
     def _clear_transient_hooks(self) -> None:
         remove_hooks = self._transient_hook_removers
@@ -485,25 +482,17 @@ class ModelOffloader:
         active_device = self._resolve_device(device)
         if not self._activation_lock.acquire(blocking=False):
             raise ModelRuntimeInUseError(
-                "ModelOffloader already has an active use; overlapping model "
-                "activations are not supported"
+                "ModelOffloader already has an active use; overlapping model activations are not supported"
             )
         self._active_device = active_device
         try:
             if lora_mode not in ("merge", "routed"):
-                raise ValueError(
-                    "lora_mode must be 'merge' or 'routed', "
-                    f"got {lora_mode!r}"
-                )
+                raise ValueError(f"lora_mode must be 'merge' or 'routed', got {lora_mode!r}")
             active_loras = self._normalize_loras(
                 loras,
                 lora_strengths=lora_strengths,
             )
-            targets = (
-                self._group_lora_factors_by_param_name(active_loras)
-                if active_loras
-                else {}
-            )
+            targets = self._group_lora_factors_by_param_name(active_loras) if active_loras else {}
             # LoRA hooks are installed before the composite activates. Merge
             # hooks must be present for the first base-weight copy; routed
             # hooks do no work until a target Linear runs.
@@ -516,18 +505,10 @@ class ModelOffloader:
                     )
                 else:
                     self._register_routed_lora_hooks(targets)
-            schedule_transient = (
-                active_device.type == "cuda"
-                and (
-                    bool(self._composite.transient)
-                    or bool(self._composite.transient_streamed)
-                )
+            schedule_transient = active_device.type == "cuda" and (
+                bool(self._composite.transient) or bool(self._composite.transient_blocks)
             )
-            activation_context = (
-                torch.inference_mode(False)
-                if schedule_transient
-                else contextlib.nullcontext()
-            )
+            activation_context = torch.inference_mode(False) if schedule_transient else contextlib.nullcontext()
             # Reusable transient targets must be mutable even if the caller
             # activates the offloader from inside inference mode.
             with activation_context:
@@ -565,7 +546,7 @@ class ModelOffloader:
         managed trainable weights.
 
         On CUDA activation, non-streamed trainables are already active
-        through :class:`PinnedComponent`, while streamed-component trainables
+        through :class:`PinnedComponent`, while block-component trainables
         are materialized on enter after force-evicting loaded blocks.
         On exit, updated trainable bytes are copied back to their pinned
         CPU storage. On CPU activation, this is a guarded no-op.
@@ -589,7 +570,7 @@ class ModelOffloader:
         ``optimizer.step()`` after :meth:`deactivate` without this context. On
         ``deactivate()`` every managed trainable has its ``.data``
         restored to pinned CPU storage *and* its ``.grad`` moved to CPU
-        (:class:`PinnedComponent` and :class:`StreamedComponent` alike), so
+        (:class:`PinnedComponent` and :class:`BlockComponent` alike), so
         the step runs on CPU and the in-place update is streamed to GPU on the
         next forward. Keep such trainables in fp32 so the update is a correct
         master-weight update::

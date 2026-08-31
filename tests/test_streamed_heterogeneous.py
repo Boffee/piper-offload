@@ -6,7 +6,7 @@ weights. Before that, the pool was templated off block 0 and a hard layout
 check rejected any block that differed — the case these tests cover.
 """
 
-from tests.conftest import activated_model, streamed_components
+from tests.conftest import activated_model, block_components
 
 from collections.abc import Sequence
 
@@ -54,8 +54,8 @@ def _frozen_model(dim: int, dtypes: Sequence[torch.dtype]) -> _Model:
     return model
 
 
-def _streamed_component(offloader: object):
-    components = streamed_components(offloader)  # type: ignore[attr-defined]
+def _block_component(offloader: object):
+    components = block_components(offloader)  # type: ignore[attr-defined]
     assert len(components) == 1
     return components[0]
 
@@ -79,7 +79,7 @@ def test_heterogeneous_block_list_builds_and_partitions_signatures() -> None:
         block_paths=["blocks"],
     )
 
-    signatures = _streamed_component(offloader)._block_runtime._signatures
+    signatures = _block_component(offloader)._runtime._signatures
     assert len(signatures) == len(dtypes)
     # Two distinct layouts (fp32 vs bf16), alternating with the dtype list.
     assert len(set(signatures)) == 2
@@ -94,7 +94,7 @@ def test_signature_distinguishes_each_dtype() -> None:
         model,
         block_paths=["blocks"],
     )
-    signatures = _streamed_component(offloader)._block_runtime._signatures
+    signatures = _block_component(offloader)._runtime._signatures
     assert len(set(signatures)) == 3
 
 
@@ -208,7 +208,7 @@ def test_cuda_streams_mixed_quant_and_plain_blocks() -> None:
         model,
         block_paths=["blocks"],
     )
-    assert len(set(_streamed_component(offloader)._block_runtime._signatures)) == 2
+    assert len(set(_block_component(offloader)._runtime._signatures)) == 2
 
     with torch.no_grad(), activated_model(offloader, "cuda") as bound:
         streamed = bound(x.cuda()).cpu()

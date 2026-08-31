@@ -156,7 +156,6 @@ def requantize_int8_tensor(
     granularity = granularity_from_block_size(
         tuple(qt.block_size),
         tuple(qt.shape),
-        label="Int8Tensor",
     )
     out = Int8Tensor.from_hp(
         t.to(dtype=qt.dtype),

@@ -83,13 +83,13 @@ class MpsWeights:
 
     def _validate_and_count(self) -> int:
         total = 0
-        for name, param in self._model.named_parameters(remove_duplicate=False):
-            _assert_frozen_param(name, param)
-            self._require_cpu(param.data, name)
+        for _name, param in self._model.named_parameters(remove_duplicate=False):
+            _assert_frozen_param(param)
+            self._require_cpu(param.data)
             total += param.numel() * param.element_size()
         if self._include_buffers:
-            for name, buffer in self._model.named_buffers(remove_duplicate=False):
-                self._require_cpu(buffer, name)
+            for _name, buffer in self._model.named_buffers(remove_duplicate=False):
+                self._require_cpu(buffer)
                 total += buffer.numel() * buffer.element_size()
         return total
 
@@ -125,9 +125,9 @@ class MpsWeights:
         return source.to(device)
 
     @staticmethod
-    def _require_cpu(tensor: torch.Tensor, name: str) -> None:
+    def _require_cpu(tensor: torch.Tensor) -> None:
         if tensor.device.type != "cpu":
-            raise ValueError(f"MpsWeights requires CPU tensors at construction; {name!r} is on {tensor.device}.")
+            raise ValueError(f"MpsWeights requires CPU tensors at construction; got {tensor.device}.")
 
     @staticmethod
     def _check_mps_available() -> None:
@@ -142,11 +142,10 @@ class MpsWeights:
             torch.mps.synchronize()
 
 
-def _assert_frozen_param(name: str, param: nn.Parameter) -> None:
+def _assert_frozen_param(param: nn.Parameter) -> None:
     if not param.requires_grad:
         return
     raise ValueError(
-        f"MpsWeights cannot manage trainable parameter {name!r}: "
-        "replacing the Parameter object would break optimizer/grad "
-        "identity."
+        "MpsWeights cannot manage trainable parameters because replacing "
+        "the Parameter object would break optimizer/grad identity."
     )
