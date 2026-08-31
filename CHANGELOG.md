@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-31
+
 ### Added
 
 - Add opt-in partial LoRA target application. A LoRA built with
