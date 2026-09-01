@@ -80,13 +80,13 @@ class ModelOffloader:
     overlapping activations. Concurrent use fails immediately with
     :class:`ModelRuntimeInUseError`.
 
-    ``block_mode`` selects resident, whole-block streaming, or compiled rolling
-    execution for groups named by ``block_paths`` and
-    ``transient_block_paths``. Other state remains resident unless its module
-    is selected by ``transient_paths``. Supplying ``block_compile`` opts
-    declared block forwards into Inductor during CUDA inference. CPU
-    activation is pass-through over the host-backed module state and remains
-    eager.
+    ``block_mode`` selects resident, whole-block streaming, compiled rolling,
+    or automatic rolling-with-streaming-fallback execution for groups named by
+    ``block_paths`` and ``transient_block_paths``. Other state remains resident
+    unless its module is selected by ``transient_paths``. Supplying
+    ``block_compile`` opts declared block forwards into Inductor during CUDA
+    inference. CPU activation is pass-through over the host-backed module state
+    and remains eager.
 
     Composes resident and transient :class:`PinnedComponent`\\ s with one or
     more :class:`BlockComponent`\\ s internally. LoRA requests are supplied
@@ -180,8 +180,9 @@ class ModelOffloader:
         ``block_compile`` applies one forward-only compile policy to every
         block group and is unused when no block group is declared. By default,
         ``block_mode`` selects how every declared block group becomes resident:
-        all at once, one whole block ahead, or parameter-by-parameter through
-        a compiled rolling graph. Groups named by ``block_paths`` retain their
+        all at once, one whole block ahead, parameter-by-parameter through a
+        compiled rolling graph, or rolling with per-group streaming fallback.
+        Groups named by ``block_paths`` retain their
         CUDA working sets for the activation. Groups named by
         ``transient_block_paths`` release after their final blocks and
         reacquire after the root model forward. These groups are inference-only

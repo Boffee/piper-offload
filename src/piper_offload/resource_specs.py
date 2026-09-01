@@ -29,8 +29,9 @@ class ModelSpec[M: nn.Module]:
     are rejected by the offloader. ``block_compile`` is an opt-in construction
     policy for every group named by ``block_paths`` or
     ``transient_block_paths``. ``block_mode`` selects resident, whole-block
-    streaming, or compiled rolling execution for every block group. Transient
-    block groups release their CUDA working sets after their final blocks.
+    streaming, compiled rolling, or automatic rolling-with-streaming-fallback
+    execution for every block group. Transient block groups release their CUDA
+    working sets after their final blocks.
     ``transient_paths`` gives named modules independent CUDA working sets
     scoped to their forwards. ``host_backing`` selects pinned copies (the
     default) or strict zero-copy adoption of existing CPU model backing.

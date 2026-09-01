@@ -14,6 +14,9 @@ from piper_offload import (
     ModelSpec,
 )
 from piper_offload.resident_runtime import ResidentBlockRuntime
+from piper_offload.rolling_compile import rolling_inductor_backend
+from piper_offload.rolling_runtime import RollingBlockRuntime
+from piper_offload.streaming_runtime import StreamingBlockRuntime
 from tests._block_compile_helpers import (
     _Block,
     _BlockModel,
@@ -40,6 +43,14 @@ class _TwoGroupModel(nn.Module):
         for block in self.second_blocks:
             x = block(x)
         return x
+
+
+class _MixedLayoutGroupModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.homogeneous_blocks = nn.ModuleList([_Block(8), _Block(8)])
+        self.heterogeneous_blocks = nn.ModuleList([_Block(8), _Block(16)])
+        self.requires_grad_(False)
 
 
 class _CompileSpy:
@@ -87,6 +98,54 @@ class TestBlockCompileConfig:
             _make_offloader(
                 _BlockModel(),
                 block_mode="rolling",
+            )
+
+    def test_auto_without_fullgraph_uses_streaming(self) -> None:
+        offloader = _make_offloader(
+            _BlockModel(),
+            block_mode="auto",
+        )
+        try:
+            component = block_components(offloader)[0]
+            assert component.block_mode == "streaming"
+            assert isinstance(component._runtime, StreamingBlockRuntime)
+        finally:
+            offloader.deactivate()
+
+    def test_auto_resolves_each_group_independently(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        spy = _CompileSpy()
+        monkeypatch.setattr(torch, "compile", spy)
+        offloader = _make_offloader(
+            _MixedLayoutGroupModel(),
+            block_paths=["homogeneous_blocks", "heterogeneous_blocks"],
+            block_mode="auto",
+            block_compile=BlockCompileConfig(fullgraph=True),
+        )
+        try:
+            homogeneous, heterogeneous = block_components(offloader)
+            assert homogeneous.block_mode == "rolling"
+            assert isinstance(homogeneous._runtime, RollingBlockRuntime)
+            assert heterogeneous.block_mode == "streaming"
+            assert isinstance(heterogeneous._runtime, StreamingBlockRuntime)
+            assert [kwargs["backend"] for _fn, kwargs in spy.calls] == [
+                rolling_inductor_backend,
+                rolling_inductor_backend,
+                "inductor",
+                "inductor",
+            ]
+        finally:
+            offloader.deactivate()
+
+    def test_strict_rolling_rejects_heterogeneous_group(self) -> None:
+        with pytest.raises(NotImplementedError, match="identical parameter layouts"):
+            _make_offloader(
+                _MixedLayoutGroupModel(),
+                block_paths=["heterogeneous_blocks"],
+                block_mode="rolling",
+                block_compile=BlockCompileConfig(fullgraph=True),
             )
 
     def test_compile_without_block_paths_is_unused(self) -> None:
