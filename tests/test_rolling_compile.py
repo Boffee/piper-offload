@@ -100,6 +100,13 @@ def _torchao_rolling_weight(kind: str) -> tuple[torch.Tensor, int, torch.dtype]:
 
 
 def _rolling_quant_weight(kind: str) -> tuple[torch.Tensor, int, torch.dtype]:
+    if kind == "piper-convrot-nvfp4":
+        from tests.test_piper_convrot_nvfp4_adapter import (
+            _make_convrot_nvfp4,
+        )
+
+        weight, _dense = _make_convrot_nvfp4(rows=64, cols=64)
+        return weight, 64, torch.bfloat16
     if kind.startswith("torchao-"):
         return _torchao_rolling_weight(kind)
     if kind in ("quanto-qint8", "quanto-qfloat8"):
@@ -239,6 +246,7 @@ class TestRollingCompile:
             "torchao-mxfp8",
             "torchao-mxfp4",
             "torchao-nvfp4",
+            "piper-convrot-nvfp4",
             "quanto-qint8",
             "quanto-qfloat8",
             "gguf-q4-0",

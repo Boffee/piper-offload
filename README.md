@@ -51,15 +51,16 @@ is not required.
 | `lora.py` | `LoRA`, `LoRATransform` — cached host-backed factors plus merge and routed application hooks |
 | `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights |
 | `seeding.py` | `derive_seed()` — canonical stable unsigned 64-bit seed derivation from typed identity parts |
-| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, Piper ConvRot INT8, DTensor, and TorchAO dynamic/static scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
+| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, Piper ConvRot INT8 / NVFP4, DTensor, and TorchAO dynamic/static scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
-| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `piper_convrot_int8_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `static_float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / Piper ConvRot / torchao / DTensor support |
+| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `piper_convrot_int8_adapter.py`, `piper_convrot_nvfp4_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `static_float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / Piper ConvRot / torchao / DTensor support |
 | `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (scaled-FP8 / INT8 / MX / NVFP4 / INT4 tile-packed) — common pin/move/identity mechanics + per-format hooks; capabilities beyond inference movement (CPU round-trip, dequant/requant conversion, copy, and staged LoRA merge) are opted into per subclass |
 | `dtensor_adapter.py` | Internal: `DTensorAdapter` for tensor-parallel `DTensor` weights — composes with other adapters by delegating local-shard movement and LoRA merge to the registry, then replaying the `(mesh, placements)` wrapper; frozen-inference scope (see `_dtensor.py`) |
 | `tensor_adapter_registry.py` | Public external-adapter registration plus adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
 | `_piper_convrot_int8.py` | Internal: Piper ConvRot INT8 optional-import, public-layout validation, and wrapper reconstruction; consumed by `piper_convrot_int8_adapter.py` |
+| `_piper_convrot_nvfp4.py` | Internal: Piper ConvRot NVFP4 optional-import, public-layout and merge-capability validation, and wrapper reconstruction; consumed by `piper_convrot_nvfp4_adapter.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation and dequant/requant; consumed by `nvfp4_adapter.py` |
 | `_torchao_mx.py` | Internal: TorchAO MX (MXFP8 / MXFP4) optional-import + layout validation, supported-dtype gate, and dequant/requant; consumed by `mx_adapter.py` |
 | `_torchao_float8.py`, `_torchao_static_float8.py` | Internal: TorchAO dynamic/weight-only `Float8Tensor` and calibrated static `PrototypeFloat8Tensor` optional imports, layout validation, and dequant/requant; consumed by the corresponding FP8 adapters |
@@ -415,7 +416,7 @@ LoRA, merge hooks run after every base refill on the copy stream. GGUF and
 TorchAO INT4 tile-packed weights retain their existing no-merge restriction.
 
 Explicit rolling deliberately fails closed outside its tested contract: `fullgraph=True`,
-frozen regular dense, TorchAO-family, Quanto, GGUF, or Piper ConvRot INT8
+frozen regular dense, TorchAO-family, Quanto, GGUF, or Piper ConvRot INT8 / NVFP4
 parameters, homogeneous block layouts, distinct block modules, no tied streamed
 parameters, and no streamed buffers. In auto mode, Bitsandbytes, DTensor,
 unreviewed external adapters, and heterogeneous block layouts instead use the
@@ -662,7 +663,8 @@ Triton backends replay independently for a fixed seed but do not promise
 byte-identical samples across implementations or Triton versions. Nested
 bitsandbytes 4-bit scales still use the reference path because their final
 effective scale is known only after double quantization. Piper ConvRot INT8
-forwards the derived seed to `piper-kernels`' public `addmm_`.
+and NVFP4 forward the derived seed to `piper-kernels`' public `addmm_`, which
+owns each format's terminal-code selection.
 
 This is one composable requantization pipeline per format rather than parallel
 deterministic and stochastic implementations. Each concrete adapter's existing
@@ -1134,6 +1136,7 @@ dtype, no merge capability required.
 | GGUF (k-quants) | ✓ | — routed only |
 | TorchAO INT4 tile-packed | ✓ | — routed only |
 | Piper ConvRot INT8 | ✓ | Piper in-place `addmm_` (Triton on supported CUDA; deterministic or stochastic) |
+| Piper ConvRot NVFP4 | ✓ | Piper in-place `addmm_` (deterministic or stochastic; Piper Kernels ≥ 0.6.1) † |
 | DTensor (tensor-parallel shard) | ✓ | shard-local delegation to the inner adapter ‡ |
 
 Notes:
@@ -1228,6 +1231,27 @@ importable without `piper-kernels`; use
 `uv sync --extra convrot --group dev` and then
 `pytest tests/test_piper_convrot_int8_adapter.py -q -rs` to exercise the
 optional suite.
+
+## Piper ConvRot NVFP4 support
+
+Piper ConvRot NVFP4 weights
+(`piper_kernels.linear.convrot.nvfp4.ConvRotNVFP4Tensor`) use a dedicated
+adapter selected before the broader TorchAO NVFP4 adapter. It pins the same
+packed E2M1 data, FP8 block scales, and optional global scales as ordinary
+NVFP4 while additionally preserving the rotation group through identity,
+pool-layout, host, device, and rolling reconstruction.
+
+Merge-mode LoRA passes the staged factors, strength, and optional deterministic
+rounding seed to Piper Kernels' public `ConvRotNVFP4Tensor.addmm_`. Piper
+Kernels rotates only the right-hand factor, updates the weight in its stored
+rotated basis, recomputes weight-side NVFP4 scales, and refills the existing
+packed storage while preserving activation calibration metadata. This keeps
+rotation and quantization semantics out of Piper Offload. Use routed LoRA to
+avoid the lossy 4-bit re-encode or when the packed target is non-contiguous.
+
+Install the `convrot` extra and run
+`pytest tests/test_piper_convrot_nvfp4_adapter.py -q -rs` to exercise this
+optional integration, including exact-SM120 forward coverage when available.
 
 ## TorchAO NVFP4 support
 

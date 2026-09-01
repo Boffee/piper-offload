@@ -9,6 +9,17 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 - Add `block_mode="auto"` to select rolling independently for supported block
   groups and fall back to whole-block streaming for other groups.
+- Add dedicated `ConvRotNVFP4Tensor` pinning, movement, rolling, identity, and
+  LoRA integration. Reconstruction preserves the rotation group and all
+  canonical NVFP4 metadata; merge-mode LoRA delegates factors and the optional
+  stochastic-rounding seed to Piper Kernels' in-place `addmm_` operation.
+
+### Changed
+
+- Allow the ConvRot optional backend to use Piper Kernels 0.6 while retaining
+  compatibility with the 0.3 through 0.5 series. ConvRot NVFP4 movement is
+  available with 0.6.0; merge-mode LoRA requires the kernel-owned `addmm_`
+  introduced in 0.6.1 and otherwise fails closed with an upgrade message.
 
 ## [0.6.0] - 2026-08-31
 
