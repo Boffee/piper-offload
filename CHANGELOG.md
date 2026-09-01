@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-01
+
 ### Added
 
 - Add `block_mode="auto"` to select rolling independently for supported block
@@ -232,7 +234,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - Python 3.14, PyTorch 2.13, TorchAO 0.18, Apache-2.0 licensing, and the Piper Offload package
   identity.
 
-[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/Boffee/piper-offload/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Boffee/piper-offload/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/Boffee/piper-offload/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Boffee/piper-offload/compare/v0.4.1...v0.5.0
