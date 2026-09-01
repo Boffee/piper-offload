@@ -5,6 +5,11 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add `block_mode="auto"` to select rolling independently for supported block
+  groups and fall back to whole-block streaming for other groups.
+
 ## [0.6.0] - 2026-08-31
 
 ### Changed

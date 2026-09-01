@@ -256,8 +256,10 @@ changes and iteration wraparound are detected internally. Block groups are
 selected by `block_paths` and `transient_block_paths`.
 `block_mode="streaming"` is the default. `block_mode="resident"` keeps every
 block target resident, while `block_mode="rolling"` uses one compiled target
-refilled parameter-by-parameter. With both path lists empty, the whole model is
-one bulk-pinned component that activation copies to the GPU.
+refilled parameter-by-parameter. `block_mode="auto"` selects rolling for each
+supported block group when full-graph compilation is configured and otherwise
+uses streaming. With both path lists empty, the whole model is one bulk-pinned
+component that activation copies to the GPU.
 For heterogeneous block lists, execution still limits concurrency to the active
 and lookahead blocks, while the morphing pool may park one reusable target per
 distinct tensor-layout signature.
@@ -393,6 +395,11 @@ finally:
     offload.deactivate()
 ```
 
+Use `block_mode="auto"` with the same full-graph configuration to select
+rolling independently for each compatible block group and whole-block
+streaming for the remaining groups. A component's `block_mode` property
+reports the resolved mode.
+
 After a parameter's final compiled-graph reader launches, a CUDA event lets a
 private stream refill that same storage from the next block while the remainder
 of the current block computes. Immediately before that parameter's first reader
@@ -407,13 +414,14 @@ coalescing, and kernel-autotuning plan. For adapters that support merge-mode
 LoRA, merge hooks run after every base refill on the copy stream. GGUF and
 TorchAO INT4 tile-packed weights retain their existing no-merge restriction.
 
-Rolling deliberately fails closed outside its tested contract: `fullgraph=True`,
+Explicit rolling deliberately fails closed outside its tested contract: `fullgraph=True`,
 frozen regular dense, TorchAO-family, Quanto, GGUF, or Piper ConvRot INT8
 parameters, homogeneous block layouts, distinct block modules, no tied streamed
-parameters, and no streamed buffers. Bitsandbytes, DTensor, unreviewed external adapters, and
-heterogeneous block layouts continue to use the existing morphing block-target
-pool. Structured logical weights are tracked across every AOT-flattened storage
-input, and the refill is placed after the last reader of any storage tensor.
+parameters, and no streamed buffers. In auto mode, Bitsandbytes, DTensor,
+unreviewed external adapters, and heterogeneous block layouts instead use the
+existing morphing block-target pool. Structured logical weights are tracked
+across every AOT-flattened storage input, and the refill is placed after the
+last reader of any storage tensor.
 Repeated resident traversal rolls the final block directly into block zero.
 Transient streaming stops at the final block and reacquires a fresh block-0
 target after the root model forward. Skipped or out-of-order traversal remains
@@ -1065,7 +1073,8 @@ This is a low-level library; we don't guard against caller misuse.
   compiler-owned workspace are outside `ResourceCache.cache_bytes`; model
   eviction does not call process-global `torch.compiler.reset()`. Experimental
   `block_mode="rolling"` has the additional homogeneous/full-graph and
-  adapter restrictions documented above.
+  adapter restrictions documented above. `block_mode="auto"` applies rolling
+  only to groups satisfying those static restrictions and streams the rest.
 - **Wrap before DDP/FSDP**, not after. Those wrappers manage parameter
   storage themselves and conflict with the registry-replacement pattern.
 - **One runtime per cached model.** `ResourceCache` serializes resource

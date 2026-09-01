@@ -276,7 +276,7 @@ def create_rolling_block_runtime(
     reference_params = instances[0].params
     param_names = tuple(reference_params)
     if not param_names:
-        raise ValueError("rolling compilation requires block parameters")
+        raise NotImplementedError("rolling compilation requires block parameters")
     reference_layouts = tuple(pinned.target_layout for pinned in reference_params.values())
     for instance in instances:
         _validate_instance(

@@ -1,8 +1,7 @@
 """Block-residency primitive for memory-efficient training and inference.
 
 A :class:`BlockComponentStore` manages reusable pinned CPU backing
-storage for a single block list whose blocks share the same parameter
-layout (names, shapes, dtypes, and any tensor-adapter wrapper metadata).
+storage for a single structurally compatible block list.
 Binding that store to a compatible model creates a
 :class:`BlockComponent` that either streams the resolved blocks to GPU on
 demand or keeps every block resident. Ordinary streaming uses a reusable GPU
@@ -46,6 +45,7 @@ when you need bespoke composition (e.g., multiple block lists like Flux's
 """
 
 import contextlib
+import logging
 import weakref
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
@@ -72,6 +72,8 @@ from .pinned_param import PinnedParam
 from .resident_runtime import ResidentBlockRuntime
 from .rolling_runtime import create_rolling_block_runtime
 from .streaming_runtime import StreamingBlockRuntime
+
+logger = logging.getLogger(__name__)
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -635,7 +637,9 @@ class BlockComponent:
         CUDA residency strategy. ``"resident"`` keeps every block loaded,
         ``"streaming"`` rotates whole blocks through an active/lookahead
         target pool, and ``"rolling"`` refills one shared target
-        parameter-by-parameter through a compiled full graph.
+        parameter-by-parameter through a compiled full graph. ``"auto"``
+        selects rolling independently for each supported block group and
+        otherwise uses streaming.
     """
 
     def __init__(
@@ -661,7 +665,7 @@ class BlockComponent:
                 f"{len(self._block_instances)} blocks."
             )
         self._blocks = [instance.module for instance in self._block_instances]
-        self._block_mode: BlockMode = block_mode
+        resolved_mode = block_mode
         if block_mode == "resident":
             runtime: BlockRuntime = ResidentBlockRuntime(self._block_instances)
             eager_runtime = runtime
@@ -680,8 +684,34 @@ class BlockComponent:
                 self._block_instances,
                 wraparound=wraparound,
             )
+        elif block_mode == "auto":
+            streaming_runtime = StreamingBlockRuntime(
+                self._block_instances,
+                wraparound=wraparound,
+            )
+            eager_runtime = streaming_runtime
+            if block_compile is None or not block_compile.fullgraph:
+                runtime = streaming_runtime
+                resolved_mode = "streaming"
+            else:
+                try:
+                    runtime = create_rolling_block_runtime(
+                        self._block_instances,
+                        wraparound=wraparound,
+                    )
+                except NotImplementedError as exc:
+                    logger.info(
+                        "block group %r does not support rolling; using streaming: %s",
+                        name,
+                        exc,
+                    )
+                    runtime = streaming_runtime
+                    resolved_mode = "streaming"
+                else:
+                    resolved_mode = "rolling"
         else:
             raise ValueError(f"unsupported block mode: {block_mode!r}")
+        self._block_mode: BlockMode = resolved_mode
         self._runtime = runtime
         self._eager_runtime = eager_runtime
         self._block_compile = _BlockCompileState.create(
@@ -727,7 +757,7 @@ class BlockComponent:
 
     @property
     def block_mode(self) -> BlockMode:
-        """Configured CUDA block residency strategy."""
+        """Resolved CUDA block residency strategy."""
         return self._block_mode
 
     @property

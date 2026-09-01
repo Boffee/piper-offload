@@ -86,8 +86,9 @@ from a fresh model instance.
   2. One :class:`PinnedComponent` per stateful path in ``transient_paths``.
   3. One :class:`BlockComponent` per path in ``block_paths`` or
      ``transient_block_paths`` when block residency is configured.
-     ``block_mode`` selects resident, whole-block streaming, or rolling
-     execution independently of the paths' persistent or transient lifetime.
+     ``block_mode`` selects resident, whole-block streaming, rolling, or
+     automatic per-group rolling with streaming fallback independently of the
+     paths' persistent or transient lifetime.
 
 Optional LoRA merging is requested directly on :meth:`ModelOffloader.activate`
 and resolved by installing post-copy hooks for managed parameter targets.
@@ -132,7 +133,8 @@ Compatibility
   activations, and compiled training remain unsupported.
   Experimental rolling compilation additionally requires frozen homogeneous
   blocks using a reviewed dense or quantized adapter, a full graph, and one
-  shared target.
+  shared target. Auto mode streams block groups that do not meet those static
+  requirements.
 - **Wrap before DDP/FSDP**, not after.
 - **Coarse cache concurrency.** :class:`ResourceCache` serializes cache
   metadata and lease operations and releases its lock while caller code
