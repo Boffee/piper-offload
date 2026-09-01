@@ -18,6 +18,7 @@ from .mx_adapter import MxAdapter
 from .nvfp4_adapter import Nvfp4Adapter
 from .pinned_module import PinnedModuleInstance
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
+from .piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
 from .quanto_adapter import QuantoAdapter
 from .rolling_compile import (
     register_rolling_target,
@@ -37,6 +38,7 @@ _ROLLING_ADAPTER_TYPES = (
     Int8Adapter,
     Int4TilePackedAdapter,
     MxAdapter,
+    PiperConvRotNVFP4Adapter,
     Nvfp4Adapter,
     QuantoAdapter,
     GgufAdapter,
