@@ -16,11 +16,11 @@ from torch import nn
 
 import piper_offload.dtensor_adapter as dtensor_adapter_module
 from piper_offload import (
-    LoRA,
+    Adapter,
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
-    merge_lora,
+    merge_adapter,
 )
 from piper_offload.dtensor_adapter import DTensorAdapter
 from piper_offload.int8_adapter import Int8Adapter
@@ -338,7 +338,7 @@ class TestDTensorAdapter:
                 )
 
         model = Net()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             {
                 "target.lora_A.weight": a,
                 "target.lora_B.weight": b,
@@ -353,9 +353,9 @@ class TestDTensorAdapter:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[strength],
-                lora_mode="merge",
+                adapters=[lora],
+                adapter_strengths=[strength],
+                adapter_mode="merge",
             ) as active:
                 actual = active.target.weight.data
                 assert _is_dtensor(actual)
@@ -398,7 +398,7 @@ class TestDTensorAdapter:
                 )
 
         model = Net()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             {
                 "first.lora_A.weight": torch.randn(rank, cols),
                 "first.lora_B.weight": torch.randn(rows, rank),
@@ -412,9 +412,9 @@ class TestDTensorAdapter:
             ValueError,
             match="supports only Replicate and contiguous Shard placements",
         ):
-            merge_lora(model, [(lora, 0.25)])
+            merge_adapter(model, [(lora, 0.25)])
 
-        # merge_lora preflights every target before mutating any of them.
+        # merge_adapter preflights every target before mutating any of them.
         torch.testing.assert_close(model.first.weight.to_local(), first_before)
 
     def test_permanent_merge_preflight_delegates_to_inner_quant_adapter(
@@ -464,7 +464,7 @@ class TestDTensorAdapter:
                 )
 
         model = Net()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             {
                 "first.lora_A.weight": torch.randn(rank, cols),
                 "first.lora_B.weight": torch.randn(rows, rank),
@@ -478,7 +478,7 @@ class TestDTensorAdapter:
             ValueError,
             match="transposed PerGroup.*routed LoRA",
         ):
-            merge_lora(model, [(lora, 0.25)])
+            merge_adapter(model, [(lora, 0.25)])
 
         torch.testing.assert_close(model.first.weight.to_local(), first_before)
 
@@ -509,7 +509,7 @@ class TestDTensorAdapter:
                 return self.target(inputs)
 
         model = Net()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             {
                 "target.lora_A.weight": distribute_tensor(
                     a,
@@ -531,9 +531,9 @@ class TestDTensorAdapter:
         with activated_model(
             offloader,
             "cuda",
-            loras=[lora],
-            lora_strengths=[strength],
-            lora_mode="routed",
+            adapters=[lora],
+            adapter_strengths=[strength],
+            adapter_mode="routed",
         ):
             actual = model(inputs)
             assert _is_dtensor(actual)
@@ -784,7 +784,7 @@ class TestDTensorAdapter:
         )
 
         model = Net()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             {
                 "target.lora_A.weight": torch.randn(
                     rank,
@@ -803,9 +803,9 @@ class TestDTensorAdapter:
         with activated_model(
             offloader,
             "cuda",
-            loras=[lora],
-            lora_strengths=[0.25],
-            lora_mode="merge",
+            adapters=[lora],
+            adapter_strengths=[0.25],
+            adapter_mode="merge",
         ):
             assert calls == [
                 (

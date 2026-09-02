@@ -1,4 +1,4 @@
-"""Tests for DTensor LoRA shard localization."""
+"""Tests for DTensor Adapter shard localization."""
 
 from pathlib import Path
 
@@ -39,9 +39,7 @@ def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
         b = torch.arange(11 * 3, dtype=torch.float32).reshape(11, 3) / 30
         strength = 0.25
         expected = weight + strength * (b @ a)
-        transform = LoRATransform(
-            [ScaledLoRAFactor.from_tensors(a, b, strength)]
-        )
+        transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, strength)])
 
         for shard_dim in (0, 1):
             target = distribute_tensor(weight.clone(), mesh, [Shard(shard_dim)])
@@ -71,9 +69,7 @@ def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
                 empty_weight.shape[0] * 2,
                 dtype=torch.float32,
             ).reshape(empty_weight.shape[0], 2)
-            empty_transform = LoRATransform(
-                [ScaledLoRAFactor.from_tensors(empty_a, empty_b, strength)]
-            )
+            empty_transform = LoRATransform([ScaledLoRAFactor.from_tensors(empty_a, empty_b, strength)])
             empty_target = distribute_tensor(
                 empty_weight.clone(),
                 mesh,
@@ -183,9 +179,7 @@ def test_transform_localizes_factors_before_staging(
         lambda _target: DTensorAdapter(),
     )
 
-    staged_inputs: list[
-        tuple[list[tuple[tuple[int, ...], tuple[int, ...]]], tuple[int, ...]]
-    ] = []
+    staged_inputs: list[tuple[list[tuple[tuple[int, ...], tuple[int, ...]]], tuple[int, ...]]] = []
     original_stage = LoRATransform._stage_single_or_packed_update.__func__
 
     def record_stage(
@@ -198,10 +192,7 @@ def test_transform_localizes_factors_before_staging(
     ) -> tuple[torch.Tensor, torch.Tensor, float]:
         staged_inputs.append(
             (
-                [
-                    (tuple(factor.a.shape), tuple(factor.b.shape))
-                    for factor in factors
-                ],
+                [(tuple(factor.a.shape), tuple(factor.b.shape)) for factor in factors],
                 logical_shape,
             )
         )
@@ -227,10 +218,7 @@ def test_transform_localizes_factors_before_staging(
         )
         for rank in range(2, 2 + factor_count)
     ]
-    transform = LoRATransform([
-        ScaledLoRAFactor.from_tensors(a, b, strength)
-        for a, b, strength in factor_inputs
-    ])
+    transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, strength) for a, b, strength in factor_inputs])
 
     transform.validate_target(target)
     transform.apply(target)

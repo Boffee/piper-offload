@@ -272,7 +272,7 @@ class PinnedModuleInstance:
         if key in self._post_copy_hooks:
             raise RuntimeError(
                 "post-copy hook already registered for "
-                f"param name {name!r}. Duplicate or shared LoRA "
+                f"param name {name!r}. Duplicate or shared adapter "
                 "targets for the same parameter backing are unsupported."
             )
         self._post_copy_hooks[key] = hook

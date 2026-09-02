@@ -9,7 +9,7 @@ from torch import nn
 from piper_offload import (
     BlockCompileConfig,
     BlockMode,
-    LoRA,
+    Adapter,
     ModelOffloader,
     ModelSpec,
 )
@@ -710,7 +710,7 @@ class TestCompiledLoRA:
         eager_model = _BlockModel()
         compiled_model = _BlockModel()
         compiled_model.load_state_dict(eager_model.state_dict())
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             {
                 "blocks.0.proj.lora_A.weight": torch.randn(2, 8),
                 "blocks.0.proj.lora_B.weight": torch.randn(8, 2),
@@ -723,9 +723,9 @@ class TestCompiledLoRA:
             with activated_model(
                 eager_offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.25],
-                lora_mode="merge",
+                adapters=[lora],
+                adapter_strengths=[0.25],
+                adapter_mode="merge",
             ):
                 with torch.inference_mode():
                     expected = eager_model(x).cpu()
@@ -740,9 +740,9 @@ class TestCompiledLoRA:
             with activated_model(
                 compiled_offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.25],
-                lora_mode="merge",
+                adapters=[lora],
+                adapter_strengths=[0.25],
+                adapter_mode="merge",
             ):
                 with torch.inference_mode():
                     actual = compiled_model(x).cpu()
@@ -761,7 +761,7 @@ class TestCompiledLoRA:
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
         model = _TwoGroupModel()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             {
                 "first_blocks.0.proj.lora_A.weight": torch.randn(2, 8),
                 "first_blocks.0.proj.lora_B.weight": torch.randn(8, 2),
@@ -778,8 +778,8 @@ class TestCompiledLoRA:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[lora],
-                lora_mode="routed",
+                adapters=[lora],
+                adapter_mode="routed",
             ):
                 assert all("forward" not in block.__dict__ for block in (*model.first_blocks, *model.second_blocks))
                 with torch.inference_mode():
@@ -789,7 +789,7 @@ class TestCompiledLoRA:
             with activated_model(
                 offloader,
                 "cuda",
-                lora_mode="routed",
+                adapter_mode="routed",
             ):
                 with torch.inference_mode():
                     model(x)
@@ -798,8 +798,8 @@ class TestCompiledLoRA:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[lora],
-                lora_mode="merge",
+                adapters=[lora],
+                adapter_mode="merge",
             ):
                 with torch.inference_mode():
                     model(x)

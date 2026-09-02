@@ -17,23 +17,4 @@ class ParameterTransform(Protocol):
         ...
 
 
-class ParameterTransformSequence:
-    """Ordered composition of parameter transforms behind one copy hook."""
-
-    __slots__ = ("_transforms",)
-
-    def __init__(self, *transforms: ParameterTransform) -> None:
-        if not transforms:
-            raise ValueError("ParameterTransformSequence requires a transform")
-        self._transforms = transforms
-
-    def validate_parameter(self, param: nn.Parameter) -> None:
-        for transform in self._transforms:
-            transform.validate_parameter(param)
-
-    def apply_parameter(self, param: nn.Parameter) -> None:
-        for transform in self._transforms:
-            transform.apply_parameter(param)
-
-
-__all__ = ["ParameterTransform", "ParameterTransformSequence"]
+__all__ = ["ParameterTransform"]

@@ -1,45 +1,32 @@
-"""Unified CUDA offload binding with optional LoRA application.
+"""Unified CUDA offload binding with optional adapter application.
 
 Supports whole-model pinned bulk offload or block streaming, with optional
-per-weight LoRA application in both modes.
+per-parameter adapter application.
 """
 
 import contextlib
 import threading
 import weakref
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
 from typing import Self
 
 import torch
 from torch import nn
 
 from ._devices import canonical_device
+from .adapter import Adapter, AdapterMode, AdapterTargetUpdates
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent
 from .block_mode import BlockMode
 from .composite_component import CompositeComponent, CompositeComponentStore
-from .dense_diff import DenseDiffTransform, ScaledDenseTarget
 from .host_backing import HostBacking
-from .lora import (
-    LoRA,
-    LoRAMode,
-    LoRATransform,
-    ScaledLoRAFactor,
-    install_routed_residual_hook,
-)
+from .lora import LoRATransform, install_routed_residual_hook
 from .module_names import resolve_parent_leaf, sibling_parameter_name
-from .parameter_transform import ParameterTransformSequence
+from .parameter_transform import ParameterTransform
+from .parameter_value import ParameterValueTransform
 from .pinned_component import PinnedComponent
 
-
-@dataclass(slots=True)
-class _ParameterUpdates:
-    factors: list[ScaledLoRAFactor] = field(default_factory=list)
-    dense: list[ScaledDenseTarget] = field(default_factory=list)
-
-
-type _ParameterUpdateMap = dict[str, _ParameterUpdates]
+type _ParameterUpdateMap = dict[str, AdapterTargetUpdates]
 type _TransientComponent = PinnedComponent | BlockComponent
 type _ForwardHook = Callable[
     [nn.Module, tuple[object, ...], object],
@@ -83,7 +70,7 @@ __all__ = [
 
 class ModelOffloader:
     """Move a whole model or managed block groups between host RAM and
-    CUDA, with optional LoRA merge and trainable-parameter support.
+    CUDA, with optional adapter application and trainable-parameter support.
 
     Construct with :meth:`from_module`. One offloader owns one model and may
     be reused sequentially, but it cannot create model replicas or serve
@@ -99,7 +86,7 @@ class ModelOffloader:
     and remains eager.
 
     Composes resident and transient :class:`PinnedComponent`\\ s with one or
-    more :class:`BlockComponent`\\ s internally. LoRA requests are supplied
+    more :class:`BlockComponent`\\ s internally. Adapter requests are supplied
     directly to :meth:`activate`; merge mode installs activation-scoped
     post-copy hooks so the merge fires immediately after each CPU->GPU weight
     copy. No separate merge binding is needed.
@@ -166,7 +153,7 @@ class ModelOffloader:
         self._composite = composite
         self._cache_bytes = cache_bytes
         self._activation_lock = threading.Lock()
-        self._lora_hook_removers: list[Callable[[], None]] = []
+        self._adapter_hook_removers: list[Callable[[], None]] = []
         self._transient_hook_removers: list[Callable[[], None]] = []
 
     @classmethod
@@ -232,54 +219,59 @@ class ModelOffloader:
     # ------------------------------------------------------------------ API
 
     @staticmethod
-    def _normalize_loras(
-        loras: Sequence[LoRA],
+    def _normalize_adapters(
+        adapters: Sequence[Adapter],
         *,
-        lora_strengths: Sequence[float] | None = None,
-    ) -> list[tuple[LoRA, float]]:
-        lora_list = list(loras)
-        if lora_strengths is None:
-            strength_list = [1.0] * len(lora_list)
+        adapter_strengths: Sequence[float] | None = None,
+    ) -> list[tuple[Adapter, float]]:
+        adapter_list = list(adapters)
+        if adapter_strengths is None:
+            strength_list = [1.0] * len(adapter_list)
         else:
-            strength_list = [float(strength) for strength in lora_strengths]
-        return [(lora, strength) for lora, strength in zip(lora_list, strength_list, strict=True) if strength != 0.0]
+            strength_list = [float(strength) for strength in adapter_strengths]
+        return [
+            (adapter, strength)
+            for adapter, strength in zip(
+                adapter_list,
+                strength_list,
+                strict=True,
+            )
+            if strength != 0.0
+        ]
 
     def _require_managed_target(self, target_key: str) -> str:
         """Validate that ``target_key`` names a parameter this offloader
         manages, returning it unchanged.
 
-        LoRA target keys must match the model's own parameter paths
+        Adapter target keys must match the model's own parameter paths
         exactly. Any key remapping (stripping a ``diffusion_model.``
         prefix, inserting a PEFT ``.base_layer.`` segment, …) is the
-        caller's responsibility when building the LoRA state dict.
+        caller's responsibility when building the adapter state dict.
         """
         if target_key not in self.param_names:
             sample = sorted(self.param_names)[:3]
             raise ValueError(
-                f"LoRA target {target_key!r} is not managed by this "
-                "ModelOffloader. LoRA target keys must match the model's "
+                f"Adapter target {target_key!r} is not managed by this "
+                "ModelOffloader. Adapter target keys must match the model's "
                 f"parameter names exactly. Sample managed keys: {sample} ..."
             )
         return target_key
 
-    def _group_lora_updates_by_param_name(
+    def _group_adapter_updates_by_param_name(
         self,
-        loras: Sequence[tuple[LoRA, float]],
+        adapters: Sequence[tuple[Adapter, float]],
     ) -> _ParameterUpdateMap:
         per_param: _ParameterUpdateMap = {}
-        for lora, strength in loras:
-            for target_key, factor, dense in lora._iter_targets():
-                if lora.allow_partial_targets and target_key not in self.param_names:
+        for adapter, strength in adapters:
+            for target_key, target in adapter.targets.items():
+                if adapter.allow_partial_targets and target_key not in self.param_names:
                     continue
                 managed = self._require_managed_target(target_key)
-                contributions = per_param.setdefault(managed, _ParameterUpdates())
-                if factor is not None:
-                    contributions.factors.append(factor.scaled(strength))
-                if dense is not None:
-                    contributions.dense.append(ScaledDenseTarget(dense, strength))
+                contributions = per_param.setdefault(managed, AdapterTargetUpdates())
+                contributions.add(target, strength, target_key=target_key)
         return per_param
 
-    def _register_merge_lora_hooks(
+    def _register_merge_adapter_hooks(
         self,
         active_device: torch.device,
         updates: _ParameterUpdateMap,
@@ -289,33 +281,24 @@ class ModelOffloader:
         if active_device.type != "cuda":
             raise ValueError(
                 "ModelOffloader merge mode requires CUDA activation; "
-                f"got {active_device}. Use lora_mode='routed' "
+                f"got {active_device}. Use adapter_mode='routed' "
                 "for CPU activation."
             )
 
         params_by_name = dict(self._model.named_parameters(remove_duplicate=False))
         for param_name, contributions in updates.items():
-            lora_transform = (
-                LoRATransform(
+            transform: ParameterTransform
+            lora_transform: LoRATransform | None = None
+            if contributions.factors:
+                lora_transform = LoRATransform(
                     contributions.factors,
                     stochastic_rounding=stochastic_rounding,
                     target_key=param_name,
                 )
-                if contributions.factors
-                else None
-            )
-            dense_transform = (
-                DenseDiffTransform(contributions.dense)
-                if contributions.dense
-                else None
-            )
-            transform = ParameterTransformSequence(
-                *(
-                    candidate
-                    for candidate in (lora_transform, dense_transform)
-                    if candidate is not None
-                )
-            )
+                transform = lora_transform
+            else:
+                assert contributions.value is not None
+                transform = ParameterValueTransform(contributions.value)
             bias_name: str | None = None
             bias: nn.Parameter | None = None
             if lora_transform is not None and lora_transform.has_bias:
@@ -333,14 +316,14 @@ class ModelOffloader:
                 param_name,
                 transform.apply_parameter,
             )
-            self._lora_hook_removers.append(remove_hook)
+            self._adapter_hook_removers.append(remove_hook)
             if bias_name is not None:
                 assert lora_transform is not None
                 remove_bias_hook = self._register_post_copy_hook(
                     bias_name,
                     lora_transform.apply_bias,
                 )
-                self._lora_hook_removers.append(remove_bias_hook)
+                self._adapter_hook_removers.append(remove_bias_hook)
 
     def _register_routed_lora_hooks(
         self,
@@ -352,15 +335,13 @@ class ModelOffloader:
         pinned backing to the invocation's input device. The POST hook applies
         their additive residual and releases the staged device tensors.
         """
-        dense_names = sorted(
-            param_name
-            for param_name, contributions in updates.items()
-            if contributions.dense
+        value_names = sorted(
+            param_name for param_name, contributions in updates.items() if contributions.value is not None
         )
-        if dense_names:
+        if value_names:
             raise ValueError(
-                "Routed LoRA mode does not support dense adapter targets; "
-                f"use lora_mode='merge'. Dense targets: {dense_names!r}."
+                "Routed LoRA mode does not support parameter values; "
+                f"use adapter_mode='merge'. Parameter values: {value_names!r}."
             )
 
         for param_name, contributions in updates.items():
@@ -376,7 +357,7 @@ class ModelOffloader:
                 parent,
                 contributions.factors,
             )
-            self._lora_hook_removers.append(remove_hook)
+            self._adapter_hook_removers.append(remove_hook)
 
     def _register_post_copy_hook(
         self,
@@ -460,9 +441,9 @@ class ModelOffloader:
         for remove_hook in reversed(remove_hooks):
             remove_hook()
 
-    def _clear_active_lora_hooks(self) -> None:
-        remove_hooks = self._lora_hook_removers
-        self._lora_hook_removers = []
+    def _clear_active_adapter_hooks(self) -> None:
+        remove_hooks = self._adapter_hook_removers
+        self._adapter_hook_removers = []
         for remove_hook in reversed(remove_hooks):
             remove_hook()
 
@@ -509,24 +490,25 @@ class ModelOffloader:
         self,
         device: torch.device | str | None = None,
         *,
-        loras: Sequence[LoRA] = (),
-        lora_strengths: Sequence[float] | None = None,
-        lora_mode: LoRAMode = "merge",
+        adapters: Sequence[Adapter] = (),
+        adapter_strengths: Sequence[float] | None = None,
+        adapter_mode: AdapterMode = "merge",
         stochastic_rounding: bool = True,
     ) -> None:
         """Make the owned model usable on ``device``.
 
-        ``loras`` and their optional ``lora_strengths`` apply only to this
+        ``adapters`` and their optional ``adapter_strengths`` apply only to this
         activation. Exact-zero strengths are inactive and install no hooks.
-        LoRAs that allow partial targets apply only to parameters managed by
-        this offloader; strict LoRAs reject any absent target.
-        ``lora_mode`` selects in-place merge hooks or routed residual hooks.
+        Adapters that allow partial targets apply only to parameters managed by
+        this offloader; strict adapters reject any absent target.
+        ``adapter_mode`` selects in-place merge hooks or routed LoRA residual
+        hooks. Routed mode requires factor-only adapters.
         ``stochastic_rounding`` uses stochastic requantization for quantized
         merge targets by default; pass ``False`` for deterministic rounding.
-        Full-shape dense targets use plain floating-point addition and are
-        merge-only; routed mode never requantizes. A frozen plain meta target
-        is treated as logical zero and is materialized only while a dense
-        target is active. Because the offloader owns one model runtime, a
+        Parameter values are merge-only and populate frozen floating-point
+        meta parameters; routed mode never requantizes. Such a logical-zero
+        target is materialized only while its parameter value is active.
+        Because the offloader owns one model runtime, a
         second activation before :meth:`deactivate` raises
         :class:`ModelRuntimeInUseError` immediately.
         """
@@ -537,19 +519,19 @@ class ModelOffloader:
             )
         self._active_device = active_device
         try:
-            if lora_mode not in ("merge", "routed"):
-                raise ValueError(f"lora_mode must be 'merge' or 'routed', got {lora_mode!r}")
-            active_loras = self._normalize_loras(
-                loras,
-                lora_strengths=lora_strengths,
+            if adapter_mode not in ("merge", "routed"):
+                raise ValueError(f"adapter_mode must be 'merge' or 'routed', got {adapter_mode!r}")
+            active_adapters = self._normalize_adapters(
+                adapters,
+                adapter_strengths=adapter_strengths,
             )
-            updates = self._group_lora_updates_by_param_name(active_loras) if active_loras else {}
-            # LoRA hooks are installed before the composite activates. Merge
+            updates = self._group_adapter_updates_by_param_name(active_adapters) if active_adapters else {}
+            # Adapter hooks are installed before the composite activates. Merge
             # hooks must be present for the first base-weight copy; routed
             # hooks do no work until a target Linear runs.
             if updates:
-                if lora_mode == "merge":
-                    self._register_merge_lora_hooks(
+                if adapter_mode == "merge":
+                    self._register_merge_adapter_hooks(
                         active_device,
                         updates,
                         stochastic_rounding=stochastic_rounding,
@@ -565,7 +547,7 @@ class ModelOffloader:
             with activation_context:
                 self._composite.activate(
                     active_device,
-                    compile_blocks=not (updates and lora_mode == "routed"),
+                    compile_blocks=not (updates and adapter_mode == "routed"),
                 )
             if schedule_transient:
                 self._install_transient_hooks()
@@ -578,7 +560,7 @@ class ModelOffloader:
         if self._active_device is None:
             return
         # Scheduling hooks must stop before their components deactivate. Drain
-        # asynchronous copies before removing LoRA merge hooks. Cleanup and
+        # asynchronous copies before removing adapter merge hooks. Cleanup and
         # activation-lock release still run if component teardown raises.
         try:
             self._clear_transient_hooks()
@@ -587,7 +569,7 @@ class ModelOffloader:
                 self._composite.deactivate()
             finally:
                 try:
-                    self._clear_active_lora_hooks()
+                    self._clear_active_adapter_hooks()
                 finally:
                     self._active_device = None
                     self._activation_lock.release()

@@ -17,8 +17,8 @@ These Protocols form the contract:
 Top-level :class:`ResourceBinding` implementations in this package:
 :class:`~piper_offload.ModelOffloader` (whole-model bulk DMA or streamed
 block offload) and :class:`~piper_offload.MpsWeights` (whole-model
-CPU->MPS materialization without a second CPU cache). A
-:class:`~piper_offload.LoRA` is itself the cached adapter resource. Merge
+CPU->MPS materialization without a second CPU cache). An
+:class:`~piper_offload.Adapter` is itself the cached adapter resource. Merge
 and routed consumers read its immutable pinned backing directly; routed
 device copies belong to activation-scoped model hooks.
 

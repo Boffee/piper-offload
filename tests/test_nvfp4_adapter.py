@@ -8,11 +8,11 @@ from torch import nn
 
 import piper_offload.nvfp4_adapter as nvfp4_adapter_module
 from piper_offload import (
-    LoRA,
+    Adapter,
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
-    merge_lora,
+    merge_adapter,
 )
 from piper_offload.nvfp4_adapter import Nvfp4Adapter
 from piper_offload.pinned_param import PinnedParam
@@ -332,7 +332,7 @@ class TestNvfp4Adapter:
             )
 
     def test_requantize_zero_dense_does_not_nan(self) -> None:
-        # An all-zero merged weight (e.g. a LoRA delta that exactly cancels
+        # An all-zero merged weight (e.g. a Adapter delta that exactly cancels
         # the base) recomputes a per_tensor_scale of 0; to_nvfp4's two-level
         # path would then divide block scales by it and emit NaN. requantize
         # must fall back to a valid scale and produce a clean all-zero
@@ -407,14 +407,14 @@ class TestNvfp4Adapter:
         # copy_into mutates the weight's storage in place, so snapshot the
         # original packed bytes rather than holding a tensor ref.
         original_qdata = model.lin.weight.data.qdata.clone()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 64),
                 "lin.lora_B.weight": torch.randn(16, 4),
             }
         )
 
-        merged = merge_lora(model, [(lora, 1.0)])
+        merged = merge_adapter(model, [(lora, 1.0)])
 
         assert merged == 1
         assert isinstance(model.lin.weight.data, _nvfp4_modules()[0])
@@ -824,7 +824,7 @@ class TestNvfp4Adapter:
         rank = 4
         a = torch.randn(rank, 64)
         b = torch.randn(64, rank)
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": a,
                 "blocks.0.lora_B.weight": b,
@@ -850,9 +850,9 @@ class TestNvfp4Adapter:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.5],
-                lora_mode="merge",
+                adapters=[lora],
+                adapter_strengths=[0.5],
+                adapter_mode="merge",
             ) as active:
                 merged = active.blocks[0].weight.data
                 assert type(merged) is piper_nvfp4_type
@@ -907,7 +907,7 @@ class TestNvfp4Adapter:
             model,
             block_paths=["blocks"],
         )
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(4, 128),
                 "blocks.0.lora_B.weight": torch.randn(128, 4),
@@ -918,9 +918,9 @@ class TestNvfp4Adapter:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.25],
-                lora_mode="routed",
+                adapters=[lora],
+                adapter_strengths=[0.25],
+                adapter_mode="routed",
             ) as active:
                 y = active(x)
                 torch.cuda.synchronize()

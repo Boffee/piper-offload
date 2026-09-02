@@ -72,14 +72,14 @@ class TestPinnedParam:
         with pytest.raises(ValueError, match=message):
             PinnedParam(source)
 
-    def test_logical_zero_cannot_materialize_without_dense_target(self) -> None:
+    def test_logical_zero_cannot_materialize_without_parameter_value(self) -> None:
         source = nn.Parameter(
             torch.empty(3, 4, device="meta"),
             requires_grad=False,
         )
         pinned = PinnedParam(source)
 
-        with pytest.raises(RuntimeError, match="active dense target"):
+        with pytest.raises(RuntimeError, match="active parameter value"):
             pinned.materialize(torch.device("cpu"))
 
     def test_clone_to_pinned_cpu_rejects_gpu_less_windows_before_allocation(

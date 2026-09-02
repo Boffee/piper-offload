@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch import nn
 
-from piper_offload import BlockCompileConfig, BlockMode, LoRA, register_adapter
+from piper_offload import BlockCompileConfig, BlockMode, Adapter, register_adapter
 from piper_offload.rolling_compile import (
     register_rolling_target,
     unregister_rolling_target,
@@ -52,12 +52,12 @@ def _compiled_output[T](
         offloader.deactivate()
 
 
-def _lora(num_blocks: int, width: int) -> LoRA:
+def _lora(num_blocks: int, width: int) -> Adapter:
     state: dict[str, torch.Tensor] = {}
     for block_idx in range(num_blocks):
         state[f"blocks.{block_idx}.proj.lora_A.weight"] = torch.randn(2, width)
         state[f"blocks.{block_idx}.proj.lora_B.weight"] = torch.randn(width, 2)
-    return LoRA.from_state_dict(state)
+    return Adapter.from_state_dict(state)
 
 
 def _torchao_mx_rolling_weight(kind: str) -> tuple[torch.Tensor, int, torch.dtype]:
@@ -263,9 +263,9 @@ class TestRollingCompile:
         activation: dict[str, object] = {}
         if quant_kind not in ("torchao-int4-tile", "gguf-q4-0"):
             activation.update(
-                loras=[_lora(3, width)],
-                lora_strengths=[0.125],
-                lora_mode="merge",
+                adapters=[_lora(3, width)],
+                adapter_strengths=[0.125],
+                adapter_mode="merge",
                 stochastic_rounding=False,
             )
 
@@ -320,9 +320,9 @@ class TestRollingCompile:
                 options=compile_options,
             ),
             lambda: baseline_model(x).clone(),
-            loras=[lora],
-            lora_strengths=[0.125],
-            lora_mode="merge",
+            adapters=[lora],
+            adapter_strengths=[0.125],
+            adapter_mode="merge",
             stochastic_rounding=False,
         )
 
@@ -339,9 +339,9 @@ class TestRollingCompile:
             with activated_model(
                 rolling_offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.125],
-                lora_mode="merge",
+                adapters=[lora],
+                adapter_strengths=[0.125],
+                adapter_mode="merge",
                 stochastic_rounding=False,
             ):
                 assert len({id(block.proj.weight) for block in rolling_model.blocks}) == 1
@@ -607,8 +607,8 @@ class TestRollingCompile:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[_lora(len(model.blocks), 8)],
-                lora_mode="routed",
+                adapters=[_lora(len(model.blocks), 8)],
+                adapter_mode="routed",
             ):
                 assert streamer._active_runtime is streamer._eager_runtime
                 assert streamer._eager_runtime.acquired
@@ -661,9 +661,9 @@ class TestRollingCompile:
             baseline_model,
             BlockCompileConfig(fullgraph=True),
             lambda: [baseline_model(x).clone() for _ in range(2)],
-            loras=[lora],
-            lora_strengths=[0.25],
-            lora_mode="merge",
+            adapters=[lora],
+            adapter_strengths=[0.25],
+            adapter_mode="merge",
         )
 
         actual = _compiled_output(
@@ -673,9 +673,9 @@ class TestRollingCompile:
             ),
             lambda: [rolling_model(x).clone() for _ in range(2)],
             block_mode="rolling",
-            loras=[lora],
-            lora_strengths=[0.25],
-            lora_mode="merge",
+            adapters=[lora],
+            adapter_strengths=[0.25],
+            adapter_mode="merge",
         )
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -11,7 +11,7 @@ Per-parameter mechanics live in the tensor adapter
 quanto). :class:`PinnedParam` is a thin holder that pairs one
 :class:`nn.Parameter` with the adapter that handles its tensor type
 plus the pinned-host state that adapter produced. Optional operations
-such as D2H round-trip, trainable ``.data`` swap, and dense updates
+such as D2H round-trip, trainable ``.data`` swap, and in-place updates
 are exposed through adapter capability methods.
 """
 
@@ -74,7 +74,7 @@ class PinnedParam:
 
     A frozen plain floating-point meta parameter is captured as a logical zero:
     its shape, dtype, and stride are retained without host backing or cache
-    charge. It remains meta unless a merge-mode dense target allocates and
+    charge. It remains meta unless a merge-mode parameter value allocates and
     fills active device storage. Low-rank factors cannot materialize it.
     """
 
@@ -263,7 +263,7 @@ class PinnedParam:
     def copy_to_gpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk DMA pinned host bytes into pre-allocated GPU storage."""
         if self.is_meta:
-            # The activation-scoped dense-target hook populates this storage
+            # The activation-scoped parameter-value hook populates this storage
             # directly. There are deliberately no zero bytes to transfer.
             return
         self.adapter.copy_to_gpu(self.pinned_state, gpu_state, non_blocking=non_blocking)
@@ -325,7 +325,7 @@ class PinnedParam:
         if self.is_meta:
             raise RuntimeError(
                 "A logical-zero parameter cannot be materialized without an "
-                "active dense target."
+                "active parameter value."
             )
         if device.type == "cpu":
             return self.make_cpu_param()

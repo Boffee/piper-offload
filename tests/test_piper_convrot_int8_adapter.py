@@ -10,12 +10,12 @@ import torch
 from torch import nn
 
 from piper_offload import (
-    LoRA,
+    Adapter,
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
     derive_seed,
-    merge_lora,
+    merge_adapter,
 )
 from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from piper_offload.dtensor_adapter import DTensorAdapter
@@ -329,14 +329,14 @@ class TestPiperConvRotInt8Adapter:
             requires_grad=False,
         )
         original_qdata = model.lin.weight.data.qdata.clone()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.ones(4, 64),
                 "lin.lora_B.weight": torch.ones(8, 4),
             }
         )
 
-        merged = merge_lora(model, [(lora, 1.0)])
+        merged = merge_adapter(model, [(lora, 1.0)])
 
         assert merged == 1
         assert isinstance(model.lin.weight.data, convrot_cls)
@@ -379,14 +379,14 @@ class TestPiperConvRotInt8Adapter:
             ),
             requires_grad=False,
         )
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.ones(4, 64),
                 "lin.lora_B.weight": torch.ones(8, 4),
             }
         )
 
-        merged = merge_lora(
+        merged = merge_adapter(
             model,
             [(lora, 1.0)],
             stochastic_rounding=True,
@@ -421,14 +421,14 @@ class TestPiperConvRotInt8Adapter:
                 convrot_cls.from_hp(weight.clone(), group_size=64),
                 requires_grad=False,
             )
-            lora = LoRA.from_state_dict(
+            lora = Adapter.from_state_dict(
                 state_dict={
                     key: value.clone()
                     for key, value in state_dict.items()
                 }
             )
             assert (
-                merge_lora(
+                merge_adapter(
                     model,
                     [(lora, 0.125)],
                     stochastic_rounding=True,
@@ -550,7 +550,7 @@ class TestPiperConvRotInt8Adapter:
         rank = 4
         a = torch.randn(rank, 64)
         b = torch.randn(64, rank)
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": a,
                 "blocks.0.lora_B.weight": b,
@@ -584,9 +584,9 @@ class TestPiperConvRotInt8Adapter:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.5],
-                lora_mode="merge",
+                adapters=[lora],
+                adapter_strengths=[0.5],
+                adapter_mode="merge",
                 stochastic_rounding=False,
             ) as active:
                 merged = active.blocks[0].weight.data
@@ -623,7 +623,7 @@ class TestPiperConvRotInt8Adapter:
             ),
             requires_grad=False,
         )
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(4, 64),
                 "blocks.0.lora_B.weight": torch.randn(64, 4),
@@ -636,7 +636,7 @@ class TestPiperConvRotInt8Adapter:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[lora],
+                adapters=[lora],
             ) as active:
                 samples.append(
                     active.blocks[0].weight.data.qdata.cpu().clone()
@@ -653,4 +653,4 @@ class TestPiperConvRotInt8Adapter:
 
         assert torch.equal(samples[0], samples[1])
         assert offloader.active_device is None
-        assert offloader._lora_hook_removers == []
+        assert offloader._adapter_hook_removers == []

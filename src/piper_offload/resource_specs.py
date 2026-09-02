@@ -1,21 +1,21 @@
 """Standard :class:`ResourceSpec` implementations.
 
 The cache itself remains resource-agnostic. These frozen dataclasses adapt
-model, LoRA, and ordinary-object factories to the structural resource-spec
+model, adapter, and ordinary-object factories to the structural resource-spec
 protocol.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import cast
 
 import torch
 from torch import nn
 
+from .adapter import Adapter
 from .block_compile import BlockCompileConfig
 from .block_mode import BlockMode
 from .host_backing import HostBacking
-from .lora import LoRA
 from .model_offloader import ModelOffloader
 from .protocols import ResourceStore
 
@@ -67,38 +67,38 @@ class ModelSpec[M: nn.Module]:
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
-class LoRASpec:
-    """LoRA resource built from a state-dict factory.
+class AdapterSpec:
+    """Adapter resource built from a state-dict factory.
 
     ``dtype`` and ``host_backing`` are forwarded to
-    :meth:`LoRA.from_state_dict`; matching the model's compute dtype reduces
+    :meth:`Adapter.from_state_dict`; matching the model's compute dtype reduces
     routed per-forward transfer volume when using pinned backing. Adopted
     backing strictly retains compatible CPU tensors. The factory's reserved
     LoRA-suffixed entries form factor pairs; every other entry is an exact
-    parameter-name to full-shape dense diff.
+    parameter-name value used to populate a frozen floating-point meta target.
     ``allow_partial_targets`` opts the built resource into applying only the
     intersection of its targets and a model's parameters.
     """
 
     key: str
     estimated_cache_bytes: int
-    factory: Callable[[], dict[str, torch.Tensor]]
+    factory: Callable[[], Mapping[str, torch.Tensor]]
     dtype: torch.dtype | None = None
     host_backing: HostBacking = "pinned"
     allow_partial_targets: bool = False
 
-    def build_store(self) -> LoRA:
+    def build_store(self) -> Adapter:
         """Build and pin this reusable adapter resource."""
-        return LoRA.from_state_dict(
+        return Adapter.from_state_dict(
             self.factory(),
             dtype=self.dtype,
             host_backing=self.host_backing,
             allow_partial_targets=self.allow_partial_targets,
         )
 
-    def value(self, store: ResourceStore) -> LoRA:
-        """Return the leased LoRA resource."""
-        return cast(LoRA, store)
+    def value(self, store: ResourceStore) -> Adapter:
+        """Return the leased adapter resource."""
+        return cast(Adapter, store)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,4 +130,4 @@ class ObjectSpec[T]:
         return cast(_ObjectStore[T], store).value
 
 
-__all__ = ["LoRASpec", "ModelSpec", "ObjectSpec"]
+__all__ = ["AdapterSpec", "ModelSpec", "ObjectSpec"]

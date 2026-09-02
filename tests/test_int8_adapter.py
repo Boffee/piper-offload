@@ -8,11 +8,11 @@ from torch import nn
 
 import piper_offload.int8_adapter as int8_adapter_module
 from piper_offload import (
-    LoRA,
+    Adapter,
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
-    merge_lora,
+    merge_adapter,
 )
 from piper_offload.int8_adapter import Int8Adapter
 from piper_offload.pinned_param import PinnedParam
@@ -350,14 +350,14 @@ class TestInt8Adapter:
             requires_grad=False,
         )
         original_qdata = model.lin.weight.data.qdata.clone()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 128),
                 "lin.lora_B.weight": torch.randn(32, 4),
             }
         )
 
-        merged = merge_lora(model, [(lora, 1.0)])
+        merged = merge_adapter(model, [(lora, 1.0)])
 
         assert merged == 1
         assert list(model.lin.weight.data.block_size) == [1, 64]
@@ -439,14 +439,14 @@ class TestInt8Adapter:
         # copy_into mutates the weight's storage in place, so snapshot the
         # original int8 bytes rather than holding a tensor ref.
         original_qdata = model.lin.weight.data.qdata.clone()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 16),
                 "lin.lora_B.weight": torch.randn(16, 4),
             }
         )
 
-        merged = merge_lora(model, [(lora, 1.0)])
+        merged = merge_adapter(model, [(lora, 1.0)])
 
         assert merged == 1
         assert not torch.equal(model.lin.weight.data.qdata, original_qdata)
@@ -581,7 +581,7 @@ class TestInt8Adapter:
             )
             for name, param in model.named_parameters()
         }
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             {
                 "first.lora_A.weight": torch.ones(rank, cols),
                 "first.lora_B.weight": torch.ones(rows, rank),
@@ -594,7 +594,7 @@ class TestInt8Adapter:
             ValueError,
             match="stored-coordinate LoRA factors must be finite",
         ):
-            merge_lora(model, [(lora, 1.0)])
+            merge_adapter(model, [(lora, 1.0)])
 
         for name, param in model.named_parameters():
             qdata, scale = before[name]
@@ -1274,7 +1274,7 @@ class TestInt8Adapter:
             model,
             block_paths=["blocks"],
         )
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(4, 128),
                 "blocks.0.lora_B.weight": torch.randn(128, 4),
@@ -1285,9 +1285,9 @@ class TestInt8Adapter:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.25],
-                lora_mode="routed",
+                adapters=[lora],
+                adapter_strengths=[0.25],
+                adapter_mode="routed",
             ) as active:
                 y = active(x)
                 torch.cuda.synchronize()
@@ -1326,7 +1326,7 @@ class TestInt8Adapter:
         rank = 4
         a = torch.randn(rank, 32)
         b = torch.randn(32, rank)
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": a,
                 "blocks.0.lora_B.weight": b,
@@ -1352,9 +1352,9 @@ class TestInt8Adapter:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.5],
-                lora_mode="merge",
+                adapters=[lora],
+                adapter_strengths=[0.5],
+                adapter_mode="merge",
             ) as active:
                 merged = active.blocks[0].weight.data
                 assert isinstance(merged, int8_cls)

@@ -9,11 +9,11 @@ from torch import nn
 import piper_offload.bnb8bit_adapter as bnb8bit_adapter_impl
 
 from piper_offload import (
-    LoRA,
+    Adapter,
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
-    merge_lora,
+    merge_adapter,
 )
 from piper_offload.bnb8bit_adapter import Bnb8bitAdapter
 from piper_offload.pinned_param import PinnedParam
@@ -235,14 +235,14 @@ class TestBnb8bitAdapter:
         # Int8Params is already a Parameter — assign it directly.
         model.lin.weight = _make_int8(rows=64, cols=32)
         original_cb = model.lin.weight.CB.clone()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 32),
                 "lin.lora_B.weight": torch.randn(64, 4),
             }
         )
 
-        merged = merge_lora(model, [(lora, 1.0)])
+        merged = merge_adapter(model, [(lora, 1.0)])
 
         assert merged == 1
         assert not torch.equal(model.lin.weight.CB, original_cb)
@@ -259,14 +259,14 @@ class TestBnb8bitAdapter:
         model = M().to("cuda")
         model.lin.weight = _make_int8(rows=64, cols=32, device="cuda")
         original_cb = model.lin.weight.CB.clone()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 32),
                 "lin.lora_B.weight": torch.randn(64, 4),
             }
         )
 
-        merged = merge_lora(model, [(lora, 1.0)])
+        merged = merge_adapter(model, [(lora, 1.0)])
 
         assert merged == 1
         assert torch.isfinite(model.lin.weight.SCB).all()
