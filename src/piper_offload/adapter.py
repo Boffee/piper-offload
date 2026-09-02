@@ -1,7 +1,7 @@
 """Reusable host-backed model adapter resources.
 
 An :class:`Adapter` captures a canonical state dict containing low-rank LoRA
-factors, exact-name values for logical-zero parameters, or both. It owns
+factors, exact-name values for meta parameters, or both. It owns
 storage and target metadata only; merge and routed execution live in their
 respective transform modules.
 """
@@ -75,7 +75,7 @@ class Adapter:
 
     Build once from a flat canonical ``state_dict``. Reserved LoRA suffixes
     identify factor tensors; every other key is the complete value for an
-    exact-name logical-zero parameter.
+    exact-name meta parameter.
     Inputs are validated, cast to the optional storage ``dtype``, and pinned
     directly by default. Adopt mode retains compatible CPU storage without
     copying it. The resource retains the resulting tensors but not the raw
@@ -135,7 +135,7 @@ class Adapter:
 
         Keys ending in ``.lora_A.weight``, ``.lora_B.weight``, or the legacy
         ``.lora_B.bias`` form factor targets. Every other key is an exact model
-        parameter name whose tensor is the complete value for a logical-zero
+        parameter name whose tensor is the complete value for a meta
         parameter. ``dtype`` casts every input before host capture.
         ``host_backing="adopt"`` strictly adopts existing CPU storage and
         therefore rejects conversions.

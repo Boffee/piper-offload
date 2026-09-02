@@ -26,7 +26,7 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 class TestPinnedParam:
     @pytest.mark.parametrize("pin_memory", [True, False])
-    def test_meta_parameter_is_storage_free_logical_zero(
+    def test_meta_parameter_has_no_host_storage(
         self,
         pin_memory: bool,
     ) -> None:
@@ -72,7 +72,7 @@ class TestPinnedParam:
         with pytest.raises(ValueError, match=message):
             PinnedParam(source)
 
-    def test_logical_zero_cannot_materialize_without_parameter_value(self) -> None:
+    def test_meta_parameter_cannot_materialize_without_parameter_value(self) -> None:
         source = nn.Parameter(
             torch.empty(3, 4, device="meta"),
             requires_grad=False,

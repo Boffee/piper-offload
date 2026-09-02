@@ -72,10 +72,10 @@ class PinnedParam:
     frozen CPU storage, never copies or normalizes it, and leaves the source
     parameter untouched until the owning store binds successfully.
 
-    A frozen plain floating-point meta parameter is captured as a logical zero:
-    its shape, dtype, and stride are retained without host backing or cache
-    charge. It remains meta unless a merge-mode parameter value allocates and
-    fills active device storage. Low-rank factors cannot materialize it.
+    A frozen plain floating-point meta parameter retains its shape, dtype, and
+    stride without host backing or cache charge. It remains meta unless a
+    merge-mode parameter value allocates and fills active device storage.
+    Low-rank factors cannot materialize it.
     """
 
     __slots__ = (
@@ -110,21 +110,21 @@ class PinnedParam:
             self.adapter, representation,
         )
         self.requires_grad: bool = param.requires_grad
-        logical_zero = representation.is_meta
-        if logical_zero:
+        is_meta = representation.is_meta
+        if is_meta:
             if type(representation) is not torch.Tensor:
                 raise NotImplementedError(
-                    "Logical-zero parameters require a plain meta torch.Tensor; "
+                    "Meta parameters require a plain torch.Tensor representation; "
                     f"got {type(representation).__name__}."
                 )
             if not representation.is_floating_point():
                 raise ValueError(
-                    "Logical-zero parameters must be floating-point; "
+                    "Meta parameters must be floating-point; "
                     f"got {representation.dtype}."
                 )
             if self.requires_grad:
                 raise ValueError(
-                    "Logical-zero parameters are inference-only and must have "
+                    "Meta parameters are inference-only and must have "
                     "requires_grad=False."
                 )
             # A meta tensor is the complete resting representation: it records
@@ -155,7 +155,7 @@ class PinnedParam:
         # construction; see the class docstring for failure semantics.
         # Only safe for plain tensors; subclass wrappers (and Parameter
         # subclasses) can lose metadata or ignore .data assignment.
-        if pin_memory and not logical_zero and type(representation) is torch.Tensor:
+        if pin_memory and not is_meta and type(representation) is torch.Tensor:
             param.data = self.make_cpu_param().data
 
     @staticmethod
@@ -280,7 +280,7 @@ class PinnedParam:
         """
         if self.is_meta:
             raise NotImplementedError(
-                "Logical-zero parameters have no physical host backing to update."
+                "Meta parameters have no physical host backing to update."
             )
         if not isinstance(self.adapter, CpuRoundTripTensorAdapter):
             raise NotImplementedError(
@@ -324,7 +324,7 @@ class PinnedParam:
         """
         if self.is_meta:
             raise RuntimeError(
-                "A logical-zero parameter cannot be materialized without an "
+                "A meta parameter cannot be materialized without an "
                 "active parameter value."
             )
         if device.type == "cpu":
@@ -357,7 +357,7 @@ class PinnedParam:
         """
         if self.is_meta:
             raise NotImplementedError(
-                "Logical-zero parameters are frozen and cannot use Parameter.data swap."
+                "Meta parameters are frozen and cannot use Parameter.data swap."
             )
         if not isinstance(self.adapter, ParameterDataSwapTensorAdapter):
             raise NotImplementedError(

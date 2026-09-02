@@ -2985,7 +2985,7 @@ class TestParameterValueActivation:
         )
 
     @CUDA
-    def test_logical_zero_is_storage_free_until_parameter_value_is_active(self) -> None:
+    def test_meta_parameter_is_storage_free_until_parameter_value_is_active(self) -> None:
         with torch.device("meta"):
             model = nn.Linear(3, 2, bias=False)
         model.requires_grad_(False)
@@ -3078,7 +3078,7 @@ class TestParameterValueActivation:
 
     @CUDA
     @pytest.mark.parametrize("block_mode", ["resident", "streaming", "rolling", "auto"])
-    def test_inactive_logical_zero_blocks_allocate_no_extra_slots(
+    def test_inactive_meta_blocks_allocate_no_extra_slots(
         self,
         block_mode: str,
     ) -> None:
@@ -3223,7 +3223,7 @@ class TestPermanentMerge:
             merge_adapter(model, [(first, 0.25), (second, -0.5)])
         assert model.weight.is_meta
 
-    def test_logical_zero_permanent_merge_materializes_cpu_aliases(self) -> None:
+    def test_meta_parameter_permanent_merge_materializes_cpu_aliases(self) -> None:
         class M(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -3246,7 +3246,7 @@ class TestPermanentMerge:
         assert not model.left.weight.requires_grad
         torch.testing.assert_close(model.left.weight, value * -0.25)
 
-    def test_low_rank_factor_cannot_materialize_logical_zero(self) -> None:
+    def test_low_rank_factor_cannot_materialize_meta_parameter(self) -> None:
         with torch.device("meta"):
             model = nn.Module()
             model.target = nn.Linear(3, 2, bias=False)
@@ -3262,7 +3262,7 @@ class TestPermanentMerge:
             merge_adapter(model, [(lora, 1.0)])
         assert model.target.weight.is_meta
 
-    def test_legacy_lora_bias_cannot_materialize_logical_zero(self) -> None:
+    def test_legacy_lora_bias_cannot_materialize_meta_parameter(self) -> None:
         model = nn.Module()
         model.target = nn.Linear(3, 2, bias=False)
         model.target.bias = nn.Parameter(

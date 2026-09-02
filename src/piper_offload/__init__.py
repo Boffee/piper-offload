@@ -107,9 +107,8 @@ weight shape and compute dtype.
 
 Every non-factor entry accepted by :meth:`Adapter.from_state_dict` is the
 complete value for an exact-name parameter. These values are merge-only and
-populate frozen plain floating-point meta parameters interpreted as
-storage-free logical zeros; low-rank A/B factors do not materialize logical
-zeros.
+populate storage-free frozen plain floating-point meta parameters; low-rank
+A/B factors do not materialize meta parameters.
 
 :class:`Adapter` owns immutable factor and parameter-value storage, pinned by
 default or strictly adopted from existing CPU backing. Compatible consumers read

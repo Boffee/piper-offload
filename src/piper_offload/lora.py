@@ -349,8 +349,8 @@ class LoRATransform:
         representation = param_representation(param)
         if representation.is_meta:
             raise ValueError(
-                "Logical-zero parameters can be populated only by parameter "
-                "values; low-rank A/B factors are unsupported."
+                "Meta parameters can be populated only by parameter values; "
+                "low-rank A/B factors are unsupported."
             )
         adapter = _select_lora_merge_adapter(representation)
         logical_shape = adapter.logical_shape(representation)
@@ -443,8 +443,8 @@ class LoRATransform:
             raise ValueError(f"LoRA bias merge requires a floating-point base bias; got {target.dtype}.")
         if target.is_meta:
             raise ValueError(
-                "Logical-zero parameters can be populated only by parameter "
-                "values; legacy LoRA bias updates are unsupported."
+                "Meta parameters can be populated only by parameter values; "
+                "legacy LoRA bias updates are unsupported."
             )
         if target.dim() != 1:
             raise ValueError(f"LoRA bias merge requires a rank-one base bias; got shape {tuple(target.shape)}.")

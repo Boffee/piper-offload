@@ -50,7 +50,7 @@ is not required.
 | `block_component.py` | `BlockComponentStore`, `BlockComponent` — lower-level streamed backing storage plus per-block-list streaming component |
 | `adapter.py` | `Adapter`, `AdapterTarget` — cached resources and their LoRA-or-value target union |
 | `lora.py` | `LoRAFactor`, `ScaledLoRAFactor`, `LoRATransform` — low-rank data, merge, and routed execution |
-| `parameter_value.py` | `ParameterValue`, `ScaledParameterValue`, `ParameterValueTransform` — logical-zero parameter data and materialization |
+| `parameter_value.py` | `ParameterValue`, `ScaledParameterValue`, `ParameterValueTransform` — meta-parameter data and materialization |
 | `parameter_transform.py` | `ParameterTransform` — shared parameter-update protocol |
 | `merge.py` | `merge_adapter()` — permanent in-place adapter application to base weights |
 | `seeding.py` | `derive_seed()` — canonical stable unsigned 64-bit seed derivation from typed identity parts |
@@ -525,14 +525,14 @@ value may own a target; repeated or competing values are rejected. Parameter
 values do not apply to existing physical parameters, quantized tensors,
 DTensors, or tensor subclasses.
 
-A frozen plain floating-point meta parameter represents a logical-zero base.
-It has no host backing and contributes zero bytes to model cache accounting.
+A frozen plain floating-point meta parameter has no host backing and
+contributes zero bytes to model cache accounting.
 Without an active parameter value it stays meta and no CUDA slot is allocated;
 executing a module that still references it is the caller's error. With a
 parameter value, resident, streaming, rolling, and automatic block modes allocate
-active storage and fill it directly from the scaled source—there is no allocated or
-copied zero base. Deactivation restores the meta parameter. Low-rank A/B
-factors cannot materialize a logical-zero target. Rolling allocates the union
+active storage and fill it directly from the scaled source—there is no base
+storage to allocate or copy. Deactivation restores the meta parameter. Low-rank
+A/B factors cannot materialize a meta target. Rolling allocates the union
 of slots needed by its homogeneous block group. If another block requires the
 same rolling slot, inactive blocks may temporarily reference that already
 allocated storage; its inactive contents are unspecified and consume no
@@ -699,7 +699,7 @@ activation-scoped adapter request, this is not reversible. Unknown targets
 raise, and all target names, factor shapes, and advertised merge
 capabilities are preflighted before mutation. Multiple LoRAs for one
 quantized parameter are packed into one staged low-rank update and the
-weight is re-encoded once. A logical-zero meta target is permanently
+weight is re-encoded once. A meta target is permanently
 materialized as one frozen CPU `Parameter`; tied aliases of the original meta
 parameter are preserved.
 

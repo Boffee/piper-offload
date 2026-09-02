@@ -77,7 +77,7 @@ class ScaledParameterValue:
 
 @dataclass(slots=True, frozen=True)
 class _ParameterValuePlan:
-    """Validated source and layout for one logical-zero target."""
+    """Validated source and layout for one meta target."""
 
     source: torch.Tensor
     strength: float
@@ -102,7 +102,7 @@ class ParameterValueTransform:
         self._plan: _ParameterValuePlan | None = None
 
     def validate_parameter(self, param: nn.Parameter) -> None:
-        """Validate a logical-zero target and prepare repeated fills."""
+        """Validate a meta target and prepare repeated fills."""
         self._plan = None
         target = param_representation(param)
         if type(target) is not torch.Tensor or not target.is_meta:

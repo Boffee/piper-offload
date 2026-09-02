@@ -252,8 +252,8 @@ class PinnedModuleInstance:
     def materialized_params(self) -> dict[str, PinnedParam]:
         """Parameters that require physical storage in this activation.
 
-        Physical bases always require a target. Logical-zero bases require one
-        only while a post-copy transform is registered to populate it.
+        Physical parameters always require a target. Meta parameters require
+        one only while a post-copy transform is registered to populate them.
         """
         return {
             name: pinned
@@ -519,7 +519,7 @@ def _validate_module_matches(
                 or representation.dtype is not pinned.compute_dtype
             ):
                 raise ValueError(
-                    f"Param {name!r} logical-zero layout mismatch: store has "
+                    f"Param {name!r} meta layout mismatch: store has "
                     f"shape={tuple(pinned.shape)}, dtype={pinned.compute_dtype}, "
                     f"module has type={type(representation).__name__}, "
                     f"device={representation.device}, shape={tuple(representation.shape)}, "

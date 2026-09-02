@@ -506,8 +506,8 @@ class ModelOffloader:
         ``stochastic_rounding`` uses stochastic requantization for quantized
         merge targets by default; pass ``False`` for deterministic rounding.
         Parameter values are merge-only and populate frozen floating-point
-        meta parameters; routed mode never requantizes. Such a logical-zero
-        target is materialized only while its parameter value is active.
+        meta parameters; routed mode never requantizes. Such a meta target is
+        materialized only while its parameter value is active.
         Because the offloader owns one model runtime, a
         second activation before :meth:`deactivate` raises
         :class:`ModelRuntimeInUseError` immediately.
