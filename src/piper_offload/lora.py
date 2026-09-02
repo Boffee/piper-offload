@@ -19,6 +19,7 @@ from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
+    RegularAdapter,
     adapter_name,
 )
 
@@ -359,6 +360,34 @@ class LoRATransform:
         # wrapped-quant parameters, but the param itself for a Parameter
         # subclass whose ``.data`` is lossy (bitsandbytes Params4bit).
         representation = param_representation(param)
+        self._apply_plan(representation, plan)
+
+    def accumulate_parameter_update(self, update: torch.Tensor) -> None:
+        """Add the validated LoRA contribution to a plain update tensor.
+
+        Composed transforms use this to combine low-rank and full-rank terms
+        before mutating the base parameter. Factor-only application continues
+        through :meth:`apply_parameter` so quantized target adapters retain
+        their existing merge behavior.
+        """
+        plan = self._weight_plan
+        if plan is None:
+            raise RuntimeError("LoRA weight target must be validated before application.")
+        if (
+            not isinstance(plan.adapter, RegularAdapter)
+            or type(update) is not torch.Tensor
+            or update.is_meta
+            or tuple(update.shape) != plan.staging_shape
+            or update.dtype is not plan.compute_dtype
+        ):
+            raise RuntimeError(
+                "LoRA update accumulation requires a physical plain tensor "
+                "matching the validated target."
+            )
+        self._apply_plan(update, plan)
+
+    def _apply_plan(self, representation: torch.Tensor, plan: _LoRAWeightPlan) -> None:
+        """Apply one validated plan and advance its merge sequence."""
         rounding_seed = self._rounding_seed()
         self._apply_merge(
             representation,

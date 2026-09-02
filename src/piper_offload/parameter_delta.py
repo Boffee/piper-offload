@@ -218,12 +218,17 @@ class ParameterDeltaTransform:
         )
 
     def apply_parameter(self, param: nn.Parameter) -> None:
-        """Stage every dense source, then apply the complete validated update."""
+        """Stage the complete update, then mutate the base parameter once."""
         dense_update = self._stage_dense_update(param)
-        if self._lora_transform is not None:
-            self._lora_transform.apply_parameter(param)
-        if dense_update is not None:
-            param_representation(param).add_(dense_update)
+        lora_transform = self._lora_transform
+        if dense_update is None:
+            if lora_transform is not None:
+                lora_transform.apply_parameter(param)
+            return
+
+        if lora_transform is not None:
+            lora_transform.accumulate_parameter_update(dense_update)
+        param_representation(param).add_(dense_update)
 
     def _materialize_dense_sources(self) -> list[tuple[torch.Tensor, float]]:
         sources: list[tuple[torch.Tensor, float]] = []

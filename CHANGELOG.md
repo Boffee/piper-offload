@@ -27,6 +27,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   so merge and routed execution enforce the same invariant.
 - Reject dense parameter deltas for plain float8 targets during preflight;
   full-rank updates currently require conventional floating-point storage.
+- Accumulate combined LoRA and dense terms into one update tensor before
+  mutating a low-precision base parameter, avoiding an intermediate base
+  rounding step.
 
 ### Removed
 

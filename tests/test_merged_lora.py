@@ -866,6 +866,35 @@ class TestParameterDelta:
             base_bias + strength * dense_bias,
         )
 
+    @pytest.mark.parametrize(
+        ("dtype", "base_value"),
+        [(torch.float16, 2048.0), (torch.bfloat16, 256.0)],
+    )
+    def test_combined_delta_accumulates_before_low_precision_base_update(
+        self,
+        dtype: torch.dtype,
+        base_value: float,
+    ) -> None:
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.tensor([[base_value]], dtype=dtype),
+            requires_grad=False,
+        )
+        before = model.weight.detach().clone()
+        adapter = Adapter(
+            {
+                "weight": ParameterDelta.from_tensors(
+                    a=torch.ones(1, 1, dtype=dtype),
+                    b=torch.ones(1, 1, dtype=dtype),
+                    dense=-torch.ones(1, 1, dtype=dtype),
+                    pin_memory=False,
+                )
+            }
+        )
+
+        assert merge_adapter(model, [(adapter, 1.0)]) == 1
+        torch.testing.assert_close(model.weight, before, rtol=0.0, atol=0.0)
+
     @CUDA
     def test_activation_merge_combines_lora_and_dense_then_restores_base(self) -> None:
         model = nn.Module()
