@@ -103,8 +103,14 @@ quantized wrappers can opt into an adapter-owned staged merge that selects its
 own kernel or framework-operator fallback. Otherwise, use routed LoRA when the
 module exposes a compatible logical Linear weight shape and compute dtype.
 
-:class:`LoRA` owns immutable factor storage, pinned by default or strictly
-adopted from existing CPU backing. Merge and routed consumers read
+Every non-factor entry accepted by :meth:`LoRA.from_state_dict` is a
+full-shape, exact-name dense target. These targets are merge-only and support
+plain floating-point parameters, including frozen meta parameters interpreted
+as storage-free logical zeros; low-rank A/B factors do not materialize logical
+zeros.
+
+:class:`LoRA` owns immutable factor and dense storage, pinned by default or
+strictly adopted from existing CPU backing. Compatible consumers read
 that backing directly and may overlap; routed hooks stage their own per-forward
 device copies.
 
@@ -145,6 +151,7 @@ Compatibility
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent, BlockComponentStore
 from .block_mode import BlockMode
+from .dense_diff import DenseDiffTransform, ScaledDenseTarget
 from .gguf_adapter import GGUFWeight
 from .host_backing import HostBacking
 from .lora import (
@@ -158,6 +165,7 @@ from .merge import merge_lora
 from .model_cache import ModelCache
 from .model_offloader import ModelOffloader, ModelRuntimeInUseError
 from .mps_weights import MpsWeights
+from .parameter_transform import ParameterTransform
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .protocols import (
     ResourceBinding,
@@ -194,6 +202,7 @@ __all__ = [
     "BlockComponentStore",
     "BlockMode",
     "CacheError",
+    "DenseDiffTransform",
     "DuplicateResourceKeyError",
     "EvictionCandidate",
     "EvictionContext",
@@ -213,6 +222,7 @@ __all__ = [
     "ModelSpec",
     "MpsWeights",
     "ObjectSpec",
+    "ParameterTransform",
     "PinnedComponent",
     "PinnedComponentStore",
     "ResourceBinding",
@@ -224,6 +234,7 @@ __all__ = [
     "ResourceSpec",
     "ResourceStore",
     "ResourceTooLargeError",
+    "ScaledDenseTarget",
     "ScaledLoRAFactor",
     "TensorAdapter",
     "derive_seed",

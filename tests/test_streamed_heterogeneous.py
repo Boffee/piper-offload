@@ -15,6 +15,7 @@ import torch
 from torch import nn
 
 from piper_offload import ModelOffloader
+from piper_offload.streaming_runtime import _instance_target_signature
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -60,6 +61,14 @@ def _block_component(offloader: object):
     return components[0]
 
 
+def _signatures(offloader: object) -> tuple[object, ...]:
+    component = _block_component(offloader)
+    return tuple(
+        _instance_target_signature(instance)
+        for instance in component._block_instances
+    )
+
+
 def test_heterogeneous_block_list_builds_and_partitions_signatures() -> None:
     """Construction (CPU pinning) no longer rejects mixed-layout blocks, and
     blocks partition into one pool signature per distinct layout."""
@@ -79,7 +88,7 @@ def test_heterogeneous_block_list_builds_and_partitions_signatures() -> None:
         block_paths=["blocks"],
     )
 
-    signatures = _block_component(offloader)._runtime._signatures
+    signatures = _signatures(offloader)
     assert len(signatures) == len(dtypes)
     # Two distinct layouts (fp32 vs bf16), alternating with the dtype list.
     assert len(set(signatures)) == 2
@@ -94,7 +103,7 @@ def test_signature_distinguishes_each_dtype() -> None:
         model,
         block_paths=["blocks"],
     )
-    signatures = _block_component(offloader)._runtime._signatures
+    signatures = _signatures(offloader)
     assert len(set(signatures)) == 3
 
 
@@ -208,7 +217,7 @@ def test_cuda_streams_mixed_quant_and_plain_blocks() -> None:
         model,
         block_paths=["blocks"],
     )
-    assert len(set(_block_component(offloader)._runtime._signatures)) == 2
+    assert len(set(_signatures(offloader))) == 2
 
     with torch.no_grad(), activated_model(offloader, "cuda") as bound:
         streamed = bound(x.cuda()).cpu()

@@ -25,6 +25,63 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 class TestPinnedParam:
+    @pytest.mark.parametrize("pin_memory", [True, False])
+    def test_meta_parameter_is_storage_free_logical_zero(
+        self,
+        pin_memory: bool,
+    ) -> None:
+        source = nn.Parameter(
+            torch.empty_strided(
+                (3, 4),
+                (1, 3),
+                dtype=torch.bfloat16,
+                device="meta",
+            ),
+            requires_grad=False,
+        )
+
+        pinned = PinnedParam(source, pin_memory=pin_memory)
+        restored = pinned.make_cpu_param()
+
+        assert pinned.is_meta
+        assert pinned.cache_bytes == 0
+        assert pinned.compute_dtype is torch.bfloat16
+        assert restored.is_meta
+        assert restored.shape == source.shape
+        assert restored.stride() == source.stride()
+        assert not restored.requires_grad
+
+    @pytest.mark.parametrize(
+        ("dtype", "requires_grad", "message"),
+        [
+            (torch.int32, False, "floating-point"),
+            (torch.float32, True, "requires_grad=False"),
+        ],
+    )
+    def test_meta_parameter_rejects_unsupported_state(
+        self,
+        dtype: torch.dtype,
+        requires_grad: bool,
+        message: str,
+    ) -> None:
+        source = nn.Parameter(
+            torch.empty(3, 4, dtype=dtype, device="meta"),
+            requires_grad=requires_grad,
+        )
+
+        with pytest.raises(ValueError, match=message):
+            PinnedParam(source)
+
+    def test_logical_zero_cannot_materialize_without_dense_target(self) -> None:
+        source = nn.Parameter(
+            torch.empty(3, 4, device="meta"),
+            requires_grad=False,
+        )
+        pinned = PinnedParam(source)
+
+        with pytest.raises(RuntimeError, match="active dense target"):
+            pinned.materialize(torch.device("cpu"))
+
     def test_clone_to_pinned_cpu_rejects_gpu_less_windows_before_allocation(
         self,
         monkeypatch: pytest.MonkeyPatch,

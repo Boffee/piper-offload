@@ -28,6 +28,7 @@ from piper_offload import (
     ResourceStore,
 )
 from piper_offload.composite_component import CompositeComponent
+from piper_offload.streaming_runtime import _instance_target_signature
 
 from tests.conftest import (
     activated_model,
@@ -2222,7 +2223,10 @@ class TestBlockLayoutCompatibility:
 
     @staticmethod
     def _signatures(component: object) -> list[object]:
-        return component._runtime._signatures  # type: ignore[attr-defined]
+        return [
+            _instance_target_signature(instance)
+            for instance in component._block_instances  # type: ignore[attr-defined]
+        ]
 
     def test_shape_mismatch_is_supported(self) -> None:
         # Different weight shapes → distinct pool signatures, not a reject.

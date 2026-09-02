@@ -21,7 +21,11 @@ from torch import nn
 from .module_names import group_names, resolve_parent_leaf
 from .pinned_buffer import PinnedBuffer
 from .pinned_param import PinnedParam
-from .tensor_adapter_registry import buffer_tensor_id, param_tensor_id
+from .tensor_adapter_registry import (
+    buffer_tensor_id,
+    param_representation,
+    param_tensor_id,
+)
 
 type PostCopyHook = Callable[[nn.Parameter], None]
 
@@ -233,12 +237,30 @@ class PinnedModuleInstance:
     ) -> PinnedModuleTarget:
         """Allocate active storage for selected bound entries on ``device``."""
         _validate_cuda_device(device)
-        params = _select_known_names(self.params, param_names)
+        params = (
+            self.materialized_params
+            if param_names is None
+            else _select_known_names(self.params, param_names)
+        )
         buffers = _select_known_names(self.buffers, buffer_names)
         return PinnedModuleTarget(
             param_targets=_allocate_param_targets(params, device),
             buffer_targets=_allocate_buffer_targets(buffers, device),
         )
+
+    @property
+    def materialized_params(self) -> dict[str, PinnedParam]:
+        """Parameters that require physical storage in this activation.
+
+        Physical bases always require a target. Logical-zero bases require one
+        only while a post-copy transform is registered to populate it.
+        """
+        return {
+            name: pinned
+            for name, pinned in self.params.items()
+            if not pinned.is_meta
+            or id(pinned) in self._post_copy_hooks
+        }
 
     def register_post_copy_hook(
         self,
@@ -488,6 +510,22 @@ def _validate_module_matches(
                 f"Param {name!r} requires_grad mismatch: store has "
                 f"{pinned.requires_grad}, module has {param.requires_grad}."
             )
+        if pinned.is_meta:
+            representation = param_representation(param)
+            if (
+                type(representation) is not torch.Tensor
+                or not representation.is_meta
+                or tuple(representation.shape) != tuple(pinned.shape)
+                or representation.dtype is not pinned.compute_dtype
+            ):
+                raise ValueError(
+                    f"Param {name!r} logical-zero layout mismatch: store has "
+                    f"shape={tuple(pinned.shape)}, dtype={pinned.compute_dtype}, "
+                    f"module has type={type(representation).__name__}, "
+                    f"device={representation.device}, shape={tuple(representation.shape)}, "
+                    f"dtype={representation.dtype}."
+                )
+            continue
         layout = PinnedParam.bind_layout_for(param)
         if layout != pinned.bind_layout:
             raise ValueError(

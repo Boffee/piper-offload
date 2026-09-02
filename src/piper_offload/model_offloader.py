@@ -8,6 +8,7 @@ import contextlib
 import threading
 import weakref
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from typing import Self
 
 import torch
@@ -18,6 +19,7 @@ from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent
 from .block_mode import BlockMode
 from .composite_component import CompositeComponent, CompositeComponentStore
+from .dense_diff import DenseDiffTransform, ScaledDenseTarget
 from .host_backing import HostBacking
 from .lora import (
     LoRA,
@@ -27,9 +29,17 @@ from .lora import (
     install_routed_residual_hook,
 )
 from .module_names import resolve_parent_leaf, sibling_parameter_name
+from .parameter_transform import ParameterTransformSequence
 from .pinned_component import PinnedComponent
 
-type _LoraParamMap = dict[str, list[ScaledLoRAFactor]]
+
+@dataclass(slots=True)
+class _ParameterUpdates:
+    factors: list[ScaledLoRAFactor] = field(default_factory=list)
+    dense: list[ScaledDenseTarget] = field(default_factory=list)
+
+
+type _ParameterUpdateMap = dict[str, _ParameterUpdates]
 type _TransientComponent = PinnedComponent | BlockComponent
 type _ForwardHook = Callable[
     [nn.Module, tuple[object, ...], object],
@@ -252,23 +262,27 @@ class ModelOffloader:
             )
         return target_key
 
-    def _group_lora_factors_by_param_name(
+    def _group_lora_updates_by_param_name(
         self,
         loras: Sequence[tuple[LoRA, float]],
-    ) -> _LoraParamMap:
-        per_param: _LoraParamMap = {}
+    ) -> _ParameterUpdateMap:
+        per_param: _ParameterUpdateMap = {}
         for lora, strength in loras:
-            for target_key, factor in lora.targets.items():
+            for target_key, factor, dense in lora._iter_targets():
                 if lora.allow_partial_targets and target_key not in self.param_names:
                     continue
                 managed = self._require_managed_target(target_key)
-                per_param.setdefault(managed, []).append(factor.scaled(strength))
+                contributions = per_param.setdefault(managed, _ParameterUpdates())
+                if factor is not None:
+                    contributions.factors.append(factor.scaled(strength))
+                if dense is not None:
+                    contributions.dense.append(ScaledDenseTarget(dense, strength))
         return per_param
 
     def _register_merge_lora_hooks(
         self,
         active_device: torch.device,
-        targets: _LoraParamMap,
+        updates: _ParameterUpdateMap,
         *,
         stochastic_rounding: bool = True,
     ) -> None:
@@ -280,37 +294,57 @@ class ModelOffloader:
             )
 
         params_by_name = dict(self._model.named_parameters(remove_duplicate=False))
-        for param_name, factors in targets.items():
-            transform = LoRATransform(
-                factors,
-                stochastic_rounding=stochastic_rounding,
-                target_key=param_name,
+        for param_name, contributions in updates.items():
+            lora_transform = (
+                LoRATransform(
+                    contributions.factors,
+                    stochastic_rounding=stochastic_rounding,
+                    target_key=param_name,
+                )
+                if contributions.factors
+                else None
+            )
+            dense_transform = (
+                DenseDiffTransform(contributions.dense)
+                if contributions.dense
+                else None
+            )
+            transform = ParameterTransformSequence(
+                *(
+                    candidate
+                    for candidate in (lora_transform, dense_transform)
+                    if candidate is not None
+                )
             )
             bias_name: str | None = None
             bias: nn.Parameter | None = None
-            if transform.has_bias:
+            if lora_transform is not None and lora_transform.has_bias:
                 bias_name = self._require_managed_target(
                     sibling_parameter_name(param_name, "bias"),
                 )
                 bias = params_by_name[bias_name]
 
-            transform.validate_target(params_by_name[param_name], bias)
+            transform.validate_parameter(params_by_name[param_name])
+            if lora_transform is not None and lora_transform.has_bias:
+                assert bias is not None
+                lora_transform.validate_bias_target(bias)
 
             remove_hook = self._register_post_copy_hook(
                 param_name,
-                transform.apply_weight,
+                transform.apply_parameter,
             )
             self._lora_hook_removers.append(remove_hook)
             if bias_name is not None:
+                assert lora_transform is not None
                 remove_bias_hook = self._register_post_copy_hook(
                     bias_name,
-                    transform.apply_bias,
+                    lora_transform.apply_bias,
                 )
                 self._lora_hook_removers.append(remove_bias_hook)
 
     def _register_routed_lora_hooks(
         self,
-        targets: _LoraParamMap,
+        updates: _ParameterUpdateMap,
     ) -> None:
         """Install one staged PRE/POST routed hook per target Linear.
 
@@ -318,7 +352,18 @@ class ModelOffloader:
         pinned backing to the invocation's input device. The POST hook applies
         their additive residual and releases the staged device tensors.
         """
-        for param_name, factors in targets.items():
+        dense_names = sorted(
+            param_name
+            for param_name, contributions in updates.items()
+            if contributions.dense
+        )
+        if dense_names:
+            raise ValueError(
+                "Routed LoRA mode does not support dense adapter targets; "
+                f"use lora_mode='merge'. Dense targets: {dense_names!r}."
+            )
+
+        for param_name, contributions in updates.items():
             parent, _leaf = resolve_parent_leaf(self._model, param_name)
             if not isinstance(parent, nn.Linear):
                 raise ValueError(
@@ -327,7 +372,10 @@ class ModelOffloader:
                     f"type {type(parent).__name__}. Use mode='merge' "
                     f"for non-Linear targets."
                 )
-            remove_hook = install_routed_residual_hook(parent, factors)
+            remove_hook = install_routed_residual_hook(
+                parent,
+                contributions.factors,
+            )
             self._lora_hook_removers.append(remove_hook)
 
     def _register_post_copy_hook(
@@ -475,8 +523,10 @@ class ModelOffloader:
         ``lora_mode`` selects in-place merge hooks or routed residual hooks.
         ``stochastic_rounding`` uses stochastic requantization for quantized
         merge targets by default; pass ``False`` for deterministic rounding.
-        Dense targets always use their ordinary exact ``addmm_``, and routed
-        mode never requantizes. Because the offloader owns one model runtime, a
+        Full-shape dense targets use plain floating-point addition and are
+        merge-only; routed mode never requantizes. A frozen plain meta target
+        is treated as logical zero and is materialized only while a dense
+        target is active. Because the offloader owns one model runtime, a
         second activation before :meth:`deactivate` raises
         :class:`ModelRuntimeInUseError` immediately.
         """
@@ -493,19 +543,19 @@ class ModelOffloader:
                 loras,
                 lora_strengths=lora_strengths,
             )
-            targets = self._group_lora_factors_by_param_name(active_loras) if active_loras else {}
+            updates = self._group_lora_updates_by_param_name(active_loras) if active_loras else {}
             # LoRA hooks are installed before the composite activates. Merge
             # hooks must be present for the first base-weight copy; routed
             # hooks do no work until a target Linear runs.
-            if targets:
+            if updates:
                 if lora_mode == "merge":
                     self._register_merge_lora_hooks(
                         active_device,
-                        targets,
+                        updates,
                         stochastic_rounding=stochastic_rounding,
                     )
                 else:
-                    self._register_routed_lora_hooks(targets)
+                    self._register_routed_lora_hooks(updates)
             schedule_transient = active_device.type == "cuda" and (
                 bool(self._composite.transient) or bool(self._composite.transient_blocks)
             )
@@ -515,7 +565,7 @@ class ModelOffloader:
             with activation_context:
                 self._composite.activate(
                     active_device,
-                    compile_blocks=not (targets and lora_mode == "routed"),
+                    compile_blocks=not (updates and lora_mode == "routed"),
                 )
             if schedule_transient:
                 self._install_transient_hooks()

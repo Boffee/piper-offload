@@ -5,6 +5,20 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Treat every non-factor entry passed to `LoRA.from_state_dict()` as an
+  exact-name full-shape dense diff. These merge-mode targets include
+  storage-free logical-zero model parameters represented by frozen plain
+  floating-point meta tensors. Dense-only adapters work across resident,
+  streaming, rolling, and automatic block modes and in permanent merges.
+
+### Changed
+
+- Separate low-rank and full-shape execution into `LoRATransform` and
+  `DenseDiffTransform`, composed through the shared `ParameterTransform`
+  protocol.
+
 ## [0.6.1] - 2026-09-01
 
 ### Added

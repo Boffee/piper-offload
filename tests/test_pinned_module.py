@@ -30,6 +30,7 @@ class _FakePinnedParam:
         self.copied_back = 0
         self.validated = 0
         self.copy_to_cpu_non_blocking: list[bool] = []
+        self.is_meta = False
         self.requires_grad = requires_grad
         self.target_data = target_data
         # Stable pinned-CPU backing aliased by every make_cpu_param() call,

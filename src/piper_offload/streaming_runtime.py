@@ -23,7 +23,7 @@ type _LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
 
 def _instance_target_signature(instance: PinnedModuleInstance) -> BlockSignature:
     """Return the layout-equivalence key for one block's GPU targets."""
-    params = instance.params
+    params = instance.materialized_params
     param_sig = tuple(
         (
             tuple(names),
@@ -87,7 +87,6 @@ class StreamingBlockRuntime:
     ) -> None:
         self._instances = tuple(instances)
         self._blocks = tuple(instance.module for instance in instances)
-        self._signatures = tuple(_instance_target_signature(instance) for instance in instances)
         self._wraparound = wraparound
         self._device: torch.device | None = None
         self._pool: _MorphingTargetPool | None = None
@@ -119,7 +118,6 @@ class StreamingBlockRuntime:
         self._stream = torch.cuda.Stream(device=device, priority=-1)
         self._pending = {}
         self._last_idx = -1
-
         self._pool = _MorphingTargetPool(device)
         self._move_trainable_grads_to(device)
 
@@ -253,7 +251,7 @@ class StreamingBlockRuntime:
         lease = self._block_to_lease.get(block_idx)
         if lease is None:
             lease = self._pool.acquire(
-                self._signatures[block_idx],
+                _instance_target_signature(instance),
                 instance,
                 stream,
             )
@@ -282,7 +280,10 @@ class StreamingBlockRuntime:
         lease = self._block_to_lease.pop(block_idx, None)
         if lease is not None:
             lease.release()
-            self._pool.release(self._signatures[block_idx], lease)
+            self._pool.release(
+                _instance_target_signature(self._instances[block_idx]),
+                lease,
+            )
 
     def _drain_and_evict_all(self) -> BaseException | None:
         first_prefetch_exc: BaseException | None = None

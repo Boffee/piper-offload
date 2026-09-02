@@ -21,6 +21,7 @@ import piper_offload.lora as lora_impl
 import piper_offload.quanto_adapter as quanto_adapter_impl
 
 from piper_offload import (
+    BlockCompileConfig,
     LoRA,
     LoRAFactor,
     LoRAMode,
@@ -372,14 +373,14 @@ def _activate_loras_for_test(
 ) -> int:
     loras, mode = _LORA_REQUESTS.pop(strategy, ([], "merge"))
     if mode == "merge":
-        targets = strategy._group_lora_factors_by_param_name(loras)
+        targets = strategy._group_lora_updates_by_param_name(loras)
         try:
             strategy._register_merge_lora_hooks(torch.device("cuda"), targets)
         except BaseException:
             strategy._clear_active_lora_hooks()
             raise
         return len(targets)
-    targets = strategy._group_lora_factors_by_param_name(loras)
+    targets = strategy._group_lora_updates_by_param_name(loras)
     before = len(strategy._lora_hook_removers)
     try:
         strategy._register_routed_lora_hooks(targets)
@@ -394,9 +395,9 @@ def _activate_loras_for_test(
 
 
 class TestLoRAConstruction:
-    def test_rejects_state_dict_without_factors(self) -> None:
-        with pytest.raises(ValueError, match="no factor pairs"):
-            LoRA.from_state_dict(state_dict={"adapter.alpha": torch.tensor(4.0)})
+    def test_rejects_empty_state_dict(self) -> None:
+        with pytest.raises(ValueError, match="no factor or dense targets"):
+            LoRA.from_state_dict(state_dict={})
 
     def test_unpaired_a_factor(self) -> None:
         sd = {"transformer_blocks.0.attn.lora_A.weight": torch.randn(4, 16)}
@@ -565,7 +566,7 @@ class TestLoRAConstruction:
     def test_adoption_rejects_dtype_conversion(self) -> None:
         sd = _make_lora_sd(num_blocks=1, dim=16, rank=4)
 
-        with pytest.raises(ValueError, match="cannot convert factor dtype"):
+        with pytest.raises(ValueError, match="cannot convert adapter tensor dtype"):
             LoRA.from_state_dict(
                 state_dict=sd,
                 dtype=torch.bfloat16,
@@ -656,6 +657,84 @@ class TestLoRAConstruction:
         sd = _make_lora_sd(num_blocks=1, dim=16, seed=1)
         with pytest.raises(ValueError, match="floating-point"):
             LoRA.from_state_dict(state_dict=sd, dtype=torch.int8)
+
+    def test_dense_only_resource_uses_exact_parameter_names(self) -> None:
+        weight = torch.randn(3, 4)
+        bias = torch.randn(3)
+
+        lora = LoRA.from_state_dict(
+            {
+                "target.weight": weight,
+                "target.bias": bias,
+            }
+        )
+
+        assert not lora.targets
+        assert tuple(lora.dense_targets) == (
+            "target.weight",
+            "target.bias",
+        )
+        assert lora.cache_bytes == weight.nbytes + bias.nbytes
+        with pytest.raises(TypeError):
+            lora.dense_targets["other"] = next(  # type: ignore[index]
+                iter(lora.dense_targets.values())
+            )
+
+    def test_factors_and_dense_targets_coexist(self) -> None:
+        sd = _make_lora_sd(num_blocks=1, dim=4, rank=2)
+        diff = torch.randn(4, 4)
+
+        lora = LoRA.from_state_dict(
+            {
+                **sd,
+                "transformer_blocks.0.attn.weight": diff,
+            }
+        )
+
+        assert tuple(lora.targets) == (
+            "transformer_blocks.0.attn.weight",
+        )
+        assert tuple(lora.dense_targets) == (
+            "transformer_blocks.0.attn.weight",
+        )
+        assert lora.cache_bytes == sum(tensor.nbytes for tensor in sd.values()) + diff.nbytes
+
+    @pytest.mark.parametrize(
+        ("diff", "message"),
+        [
+            (torch.ones(2, 2, dtype=torch.int32), "floating-point"),
+            (torch.empty(2, 2, device="meta"), "physical values"),
+        ],
+    )
+    def test_rejects_invalid_dense_target_source(
+        self,
+        diff: torch.Tensor,
+        message: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=message):
+            LoRA.from_state_dict({"target.weight": diff})
+
+    def test_dense_targets_obey_dtype_and_adoption_policy(self) -> None:
+        source = torch.randn(3, 4)
+        adopted = LoRA.from_state_dict(
+            {"target.weight": source},
+            host_backing="adopt",
+        )
+        adopted_tensor = adopted.dense_targets["target.weight"].make_cpu_param().data
+        assert adopted_tensor.data_ptr() == source.data_ptr()
+
+        cast = LoRA.from_state_dict(
+            {"target.weight": source},
+            dtype=torch.bfloat16,
+        )
+        assert cast.dense_targets["target.weight"].compute_dtype is torch.bfloat16
+
+        with pytest.raises(ValueError, match="cannot convert adapter tensor dtype"):
+            LoRA.from_state_dict(
+                {"target.weight": source},
+                dtype=torch.bfloat16,
+                host_backing="adopt",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2837,7 +2916,315 @@ class TestLoRATransform:
             s.deactivate()
 
 
+class TestDenseTargetActivation:
+    def test_routed_mode_rejects_dense_targets_before_activation(self) -> None:
+        model = _make_bf16_model(num_blocks=1, dim=4).to(torch.float32)
+        offloader = _make_strategy(model)
+        lora = LoRA.from_state_dict(
+            {
+                "transformer_blocks.0.attn.weight": torch.randn(4, 4),
+            }
+        )
+
+        with pytest.raises(ValueError, match="does not support dense adapter targets"):
+            offloader.activate("cpu", loras=[lora], lora_mode="routed")
+
+        assert offloader.active_device is None
+        assert offloader._lora_hook_removers == []
+
+    @CUDA
+    def test_dense_target_applies_to_physical_base_and_restores_it(self) -> None:
+        model = _make_bf16_model(num_blocks=1, dim=4).to(torch.float32)
+        offloader = _make_strategy(model)
+        base = model.transformer_blocks[0].attn.weight.detach().clone()
+        diff = torch.randn_like(base)
+        lora = LoRA.from_state_dict(
+            {
+                "transformer_blocks.0.attn.weight": diff,
+            }
+        )
+
+        offloader.activate(
+            "cuda",
+            loras=[lora],
+            lora_strengths=[0.25],
+        )
+        try:
+            torch.testing.assert_close(
+                model.transformer_blocks[0].attn.weight.cpu(),
+                base + diff * 0.25,
+            )
+        finally:
+            offloader.deactivate()
+
+        torch.testing.assert_close(
+            model.transformer_blocks[0].attn.weight,
+            base,
+        )
+
+    @CUDA
+    def test_logical_zero_is_storage_free_until_dense_target_is_active(self) -> None:
+        with torch.device("meta"):
+            model = nn.Linear(3, 2, bias=False)
+        model.requires_grad_(False)
+        offloader = ModelOffloader.from_module(model)
+
+        assert offloader.cache_bytes == 0
+        offloader.activate("cuda")
+        try:
+            assert model.weight.is_meta
+            resident = offloader._composite.resident
+            assert resident is not None
+            assert resident._lease is not None
+            assert resident._lease.target.param_targets == {}
+        finally:
+            offloader.deactivate()
+
+        diff = torch.randn(2, 3)
+        lora = LoRA.from_state_dict({"weight": diff})
+        offloader.activate(
+            "cuda",
+            loras=[lora],
+            lora_strengths=[-0.5],
+        )
+        try:
+            assert model.weight.device.type == "cuda"
+            torch.testing.assert_close(model.weight.cpu(), diff * -0.5)
+        finally:
+            offloader.deactivate()
+
+        assert model.weight.is_meta
+
+    @CUDA
+    @pytest.mark.parametrize("block_mode", ["resident", "streaming", "rolling", "auto"])
+    def test_logical_zero_dense_targets_work_in_every_block_mode(
+        self,
+        block_mode: str,
+    ) -> None:
+        dim = 4
+
+        class Block(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(
+                    torch.empty(dim, dim),
+                    requires_grad=False,
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return F.linear(x, self.weight)
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocks = nn.ModuleList([Block(), Block(), Block()])
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.blocks:
+                    x = block(x)
+                return x
+
+        with torch.device("meta"):
+            model = M()
+        compile_config = (
+            BlockCompileConfig(dynamic=False, fullgraph=True)
+            if block_mode in {"rolling", "auto"}
+            else None
+        )
+        offloader = ModelOffloader.from_module(
+            model,
+            block_paths=("blocks",),
+            block_mode=block_mode,  # type: ignore[arg-type]
+            block_compile=compile_config,
+        )
+        diffs = {
+            f"blocks.{idx}.weight": torch.eye(dim) * (idx + 1)
+            for idx in range(3)
+        }
+        lora = LoRA.from_state_dict(diffs)
+        x = torch.ones(2, dim, device="cuda")
+
+        assert offloader.cache_bytes == 0
+        offloader.activate("cuda", loras=[lora])
+        try:
+            torch.testing.assert_close(model(x).cpu(), x.cpu() * 6)
+            component = block_components(offloader)[0]
+            if component.block_mode == "rolling":
+                runtime = component._active_runtime
+                assert runtime is not None
+                assert runtime._lease is not None
+                assert len(runtime._lease.target.param_targets) == 1
+        finally:
+            offloader.deactivate()
+
+        assert all(param.is_meta for param in model.parameters())
+
+    @CUDA
+    @pytest.mark.parametrize("block_mode", ["resident", "streaming", "rolling", "auto"])
+    def test_inactive_logical_zero_blocks_allocate_no_extra_slots(
+        self,
+        block_mode: str,
+    ) -> None:
+        dim = 4
+
+        class Block(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(
+                    torch.empty(dim, dim),
+                    requires_grad=False,
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return F.linear(x, self.weight)
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocks = nn.ModuleList([Block(), Block(), Block()])
+
+        with torch.device("meta"):
+            model = M()
+        compile_config = (
+            BlockCompileConfig(dynamic=False, fullgraph=True)
+            if block_mode in {"rolling", "auto"}
+            else None
+        )
+        offloader = ModelOffloader.from_module(
+            model,
+            block_paths=("blocks",),
+            block_mode=block_mode,  # type: ignore[arg-type]
+            block_compile=compile_config,
+        )
+        diff = torch.eye(dim)
+        lora = LoRA.from_state_dict({"blocks.1.weight": diff})
+        x = torch.randn(2, dim, device="cuda")
+
+        offloader.activate("cuda", loras=[lora])
+        try:
+            torch.testing.assert_close(model.blocks[1](x).cpu(), x.cpu())
+            component = block_components(offloader)[0]
+            if component.block_mode == "rolling":
+                # Rolling installs its one already-required shared slot on the
+                # homogeneous block group. Inactive contents are unspecified,
+                # but they consume no additional parameter storage.
+                assert all(param.device.type == "cuda" for param in model.parameters())
+                runtime = component._active_runtime
+                assert runtime is not None
+                assert runtime._lease is not None
+                assert len(runtime._lease.target.param_targets) == 1
+            else:
+                assert model.blocks[0].weight.is_meta
+                assert model.blocks[1].weight.device.type == "cuda"
+                assert model.blocks[2].weight.is_meta
+        finally:
+            offloader.deactivate()
+
+        assert all(param.is_meta for param in model.parameters())
+
+
 class TestPermanentMerge:
+    def test_dense_targets_merge_additively_into_physical_parameter(self) -> None:
+        model = nn.Linear(3, 2, bias=False)
+        model.requires_grad_(False)
+        weight = model.weight
+        base = model.weight.detach().clone()
+        first_diff = torch.randn_like(base)
+        second_diff = torch.randn_like(base)
+        first = LoRA.from_state_dict({"weight": first_diff})
+        second = LoRA.from_state_dict({"weight": second_diff})
+
+        assert merge_lora(
+            model,
+            [(first, 0.25), (second, -0.5)],
+        ) == 1
+        assert model.weight is weight
+        torch.testing.assert_close(
+            model.weight,
+            base + first_diff * 0.25 - second_diff * 0.5,
+        )
+
+    def test_factor_and_dense_target_merge_into_same_parameter(self) -> None:
+        model = nn.Module()
+        model.target = nn.Linear(3, 2, bias=False)
+        model.requires_grad_(False)
+        base = model.target.weight.detach().clone()
+        a = torch.randn(1, 3)
+        b = torch.randn(2, 1)
+        diff = torch.randn_like(base)
+        lora = LoRA.from_state_dict(
+            {
+                "target.lora_A.weight": a,
+                "target.lora_B.weight": b,
+                "target.weight": diff,
+            }
+        )
+
+        assert merge_lora(model, [(lora, 0.5)]) == 1
+        expected = base + (b @ a) * 0.5 + diff * 0.5
+        torch.testing.assert_close(model.target.weight, expected)
+
+    def test_logical_zero_permanent_merge_materializes_cpu_aliases(self) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                shared = nn.Parameter(
+                    torch.empty(2, 3, device="meta"),
+                    requires_grad=False,
+                )
+                self.left = nn.Module()
+                self.right = nn.Module()
+                self.left.weight = shared
+                self.right.weight = shared
+
+        model = M()
+        diff = torch.randn(2, 3)
+        lora = LoRA.from_state_dict({"left.weight": diff})
+
+        assert merge_lora(model, [(lora, -0.25)]) == 1
+        assert model.left.weight is model.right.weight
+        assert model.left.weight.device.type == "cpu"
+        assert not model.left.weight.requires_grad
+        torch.testing.assert_close(model.left.weight, diff * -0.25)
+
+    def test_low_rank_factor_cannot_materialize_logical_zero(self) -> None:
+        with torch.device("meta"):
+            model = nn.Module()
+            model.target = nn.Linear(3, 2, bias=False)
+        model.requires_grad_(False)
+        lora = LoRA.from_state_dict(
+            {
+                "target.lora_A.weight": torch.randn(1, 3),
+                "target.lora_B.weight": torch.randn(2, 1),
+            }
+        )
+
+        with pytest.raises(ValueError, match="only by dense targets"):
+            merge_lora(model, [(lora, 1.0)])
+        assert model.target.weight.is_meta
+
+    def test_dense_target_rejects_tensor_subclass_before_mutation(self) -> None:
+        class UnknownTensor(torch.Tensor):
+            pass
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                wrapped = torch.Tensor._make_subclass(
+                    UnknownTensor,
+                    torch.randn(2, 3),
+                    False,
+                )
+                self.weight = nn.Parameter(wrapped, requires_grad=False)
+
+        model = M()
+        before = model.weight.detach().clone()
+        lora = LoRA.from_state_dict({"weight": torch.randn(2, 3)})
+
+        with pytest.raises(ValueError, match="plain floating-point base"):
+            merge_lora(model, [(lora, 1.0)])
+        torch.testing.assert_close(model.weight, before)
+
     @pytest.mark.parametrize("zero", [0.0, -0.0])
     def test_zero_strength_is_absent(self, zero: float) -> None:
         m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
@@ -3957,7 +4344,7 @@ class TestRoutedMode:
         lora = LoRA.from_state_dict(state_dict=sd)
         _request_loras(s, [(lora, 1.0)], mode="routed")
         active_loras, _mode = _LORA_REQUESTS.pop(s)
-        targets = s._group_lora_factors_by_param_name(active_loras)
+        targets = s._group_lora_updates_by_param_name(active_loras)
         s._register_routed_lora_hooks(targets)
         try:
             assert len(model.embed._forward_hooks) == (1 if target == "embed" else 0)
@@ -4351,6 +4738,21 @@ class TestLoRAResource:
             assert not lora.allow_partial_targets
         with cache.lease("lora:test") as lora2:
             assert lora2 is lora
+
+    def test_dense_only_lora_spec_builds_cached_resource(self) -> None:
+        diff = torch.randn(2, 3)
+        spec = LoRASpec(
+            key="lora:dense",
+            estimated_cache_bytes=diff.nbytes,
+            factory=lambda: {"target.weight": diff},
+            host_backing="adopt",
+        )
+
+        lora = spec.build_store()
+
+        assert not lora.targets
+        assert tuple(lora.dense_targets) == ("target.weight",)
+        assert lora.cache_bytes == diff.nbytes
 
     def test_lora_spec_propagates_adopted_host_backing(self) -> None:
         sd = _make_lora_sd(num_blocks=1, dim=8, rank=2)
