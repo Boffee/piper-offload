@@ -13,7 +13,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass, field
-from typing import Self
+from typing import Self, cast
 
 import torch
 from torch import nn
@@ -512,18 +512,21 @@ def _validate_module_matches(
             )
         if pinned.is_meta:
             representation = param_representation(param)
+            pinned_representation = cast(torch.Tensor, pinned.pinned_state)
             if (
                 type(representation) is not torch.Tensor
                 or not representation.is_meta
                 or tuple(representation.shape) != tuple(pinned.shape)
                 or representation.dtype is not pinned.compute_dtype
+                or representation.stride() != pinned_representation.stride()
             ):
                 raise ValueError(
                     f"Param {name!r} meta layout mismatch: store has "
                     f"shape={tuple(pinned.shape)}, dtype={pinned.compute_dtype}, "
+                    f"stride={pinned_representation.stride()}, "
                     f"module has type={type(representation).__name__}, "
                     f"device={representation.device}, shape={tuple(representation.shape)}, "
-                    f"dtype={representation.dtype}."
+                    f"dtype={representation.dtype}, stride={representation.stride()}."
                 )
             continue
         layout = PinnedParam.bind_layout_for(param)

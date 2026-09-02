@@ -878,6 +878,43 @@ class TestPinnedModuleInstance:
         with pytest.raises(ValueError, match="Param 'weight' layout mismatch"):
             store.bind(target)
 
+    def test_rejects_meta_param_stride_mismatch(self) -> None:
+        prototype = nn.Module()
+        prototype.weight = nn.Parameter(
+            torch.empty_strided((2, 3), (1, 2), device="meta"),
+            requires_grad=False,
+        )
+        store = PinnedModuleStore.from_module(prototype)
+
+        target = nn.Module()
+        target.weight = nn.Parameter(
+            torch.empty(2, 3, device="meta"),
+            requires_grad=False,
+        )
+
+        with pytest.raises(ValueError, match="meta layout mismatch.*stride"):
+            store.bind(target)
+
+        assert target.weight.stride() == (3, 1)
+
+    def test_bind_accepts_matching_meta_param_stride(self) -> None:
+        prototype = nn.Module()
+        prototype.weight = nn.Parameter(
+            torch.empty_strided((2, 3), (1, 2), device="meta"),
+            requires_grad=False,
+        )
+        store = PinnedModuleStore.from_module(prototype)
+
+        target = nn.Module()
+        target.weight = nn.Parameter(
+            torch.empty_strided((2, 3), (1, 2), device="meta"),
+            requires_grad=False,
+        )
+        store.bind(target)
+
+        assert target.weight.is_meta
+        assert target.weight.stride() == (1, 2)
+
     def test_rejects_buffer_layout_mismatch(self) -> None:
         prototype = nn.Module()
         prototype.register_buffer("running", torch.randn(2))
