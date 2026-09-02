@@ -1,15 +1,15 @@
 """Permanent adapter merge into model weights.
 
-Merges adapter updates directly into model parameters, supporting ordinary
-in-place ``addmm_`` or an adapter-owned staged LoRA merge. Quantized adapters
-own their encoding path and may select a
-format-specific kernel or a dequantize/requantize fallback; requantized
-merges are lossy but standard practice for permanent LoRA merges into
-quantized bases.
+Merges additive parameter deltas directly into existing model parameters and
+materializes parameter values for meta targets. Plain floating-point targets
+support combined low-rank and full-rank deltas. Quantized adapters own their
+LoRA encoding path and may select a format-specific kernel or a
+dequantize/requantize fallback; full-rank quantized deltas are not yet
+supported.
 
-Permanent and activation merge use the same LoRA and parameter-value
-transforms. Permanent merge applies them to resident model parameters;
-activation merge invokes them after individual parameter copies.
+Permanent and activation merge use the same parameter-delta and
+parameter-value transforms. Permanent merge applies them to resident model
+parameters; activation merge invokes them after individual parameter copies.
 """
 
 import logging
@@ -20,8 +20,8 @@ from typing import Any
 from torch import nn
 
 from .adapter import Adapter, AdapterTargetUpdates
-from .lora import LoRATransform
-from .module_names import resolve_parent_leaf, sibling_parameter_name
+from .module_names import resolve_parent_leaf
+from .parameter_delta import ParameterDeltaTransform
 from .parameter_transform import ParameterTransform
 from .parameter_value import ParameterValueTransform
 from .tensor_adapter_registry import param_tensor_id
@@ -42,18 +42,14 @@ class _TargetGroup:
 class _MergeOp:
     aliases: tuple[str, ...]
     param: nn.Parameter
-    bias: nn.Parameter | None
     transform: ParameterTransform
 
     def validate(self) -> None:
-        """Preflight this operation's parameter and optional legacy bias."""
+        """Preflight this operation's parameter."""
         self.transform.validate_parameter(self.param)
-        if isinstance(self.transform, LoRATransform) and self.transform.has_bias:
-            assert self.bias is not None
-            self.transform.validate_bias_target(self.bias)
 
     def apply(self, model: nn.Module) -> None:
-        """Apply this operation's parameter and optional legacy-bias updates."""
+        """Apply this operation's parameter update."""
         if isinstance(self.transform, ParameterValueTransform):
             materialized = self.transform.materialize()
             for alias in self.aliases:
@@ -63,9 +59,6 @@ class _MergeOp:
                 parent._parameters[leaf] = materialized
             return
         self.transform.apply_parameter(self.param)
-        if isinstance(self.transform, LoRATransform) and self.transform.has_bias:
-            assert self.bias is not None
-            self.transform.apply_bias(self.bias)
 
 
 def merge_adapter(
@@ -146,15 +139,11 @@ def _merge_adapters(
     for op in merge_ops:
         op.apply(model)
 
-    bias_count = sum(op.bias is not None for op in merge_ops)
     modified_tensor_ids = {param_tensor_id(op.param) for op in merge_ops}
-    modified_tensor_ids.update(param_tensor_id(op.bias) for op in merge_ops if op.bias is not None)
 
     logger.info(
-        "merge_adapter: merged %d unique parameters (%d weights, %d biases) from %d adapter targets",
+        "merge_adapter: merged %d unique parameters from %d adapter targets",
         len(modified_tensor_ids),
-        len(merge_ops),
-        bias_count,
         applied_target_count,
     )
     return len(modified_tensor_ids)
@@ -208,7 +197,6 @@ def _build_merge_ops(
             group.updates.add(target, strength, target_key=target_key)
 
     merge_ops: list[_MergeOp] = []
-    bias_owner_by_tensor_id: dict[tuple[Any, ...], str] = {}
     for group in groups_by_tensor_id.values():
         target_key = group.target_key
         param = group.param
@@ -216,43 +204,19 @@ def _build_merge_ops(
             tuple(name for name, param in params_by_target.items() if param is group.param) if param.is_meta else ()
         )
         transform: ParameterTransform
-        if group.updates.factors:
-            transform = LoRATransform(
-                group.updates.factors,
+        if group.updates.deltas:
+            transform = ParameterDeltaTransform(
+                group.updates.deltas,
                 stochastic_rounding=stochastic_rounding,
                 target_key=target_key,
             )
         else:
             assert group.updates.value is not None
             transform = ParameterValueTransform(group.updates.value)
-        bias: nn.Parameter | None = None
-        if isinstance(transform, LoRATransform) and transform.has_bias:
-            bias_key = sibling_parameter_name(target_key, "bias")
-            bias = params_by_target.get(bias_key)
-            if bias is None:
-                raise ValueError(
-                    f"Cannot merge legacy LoRA bias for {target_key!r}: "
-                    f"the model has no base bias parameter {bias_key!r}. "
-                    "Use routed LoRA for a bias-less base layer."
-                )
-
-            bias_tensor_id = param_tensor_id(bias)
-            previous_owner = bias_owner_by_tensor_id.setdefault(
-                bias_tensor_id,
-                target_key,
-            )
-            if previous_owner != target_key:
-                raise ValueError(
-                    f"LoRA targets {previous_owner!r} and {target_key!r} "
-                    "resolve to the same tied base-bias backing. Apply only "
-                    "one logical target for a tied bias."
-                )
-
         merge_ops.append(
             _MergeOp(
                 aliases,
                 param,
-                bias,
                 transform,
             )
         )

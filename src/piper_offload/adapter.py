@@ -1,7 +1,8 @@
 """Reusable host-backed model adapter resources.
 
 An :class:`Adapter` captures a canonical state dict containing low-rank LoRA
-factors, exact-name values for meta parameters, or both. It owns
+factors, full-rank parameter deltas, exact-name values for meta parameters,
+or a combination. It owns
 storage and target metadata only; merge and routed execution live in their
 respective transform modules.
 """
@@ -14,7 +15,8 @@ from typing import Literal, Self
 import torch
 
 from .host_backing import HostBacking, validate_host_backing
-from .lora import LoRAFactor, ScaledLoRAFactor
+from .lora import ScaledLoRAFactor
+from .parameter_delta import ParameterDelta, ScaledParameterDelta
 from .parameter_value import ParameterValue, ScaledParameterValue
 
 __all__ = [
@@ -27,16 +29,17 @@ type AdapterMode = Literal["merge", "routed"]
 
 _LORA_A_SUFFIX = ".lora_A.weight"
 _LORA_B_SUFFIX = ".lora_B.weight"
-_LORA_BIAS_SUFFIX = ".lora_B.bias"
+_DELTA_WEIGHT_SUFFIX = ".delta.weight"
+_DELTA_BIAS_SUFFIX = ".delta.bias"
 
-type AdapterTarget = LoRAFactor | ParameterValue
+type AdapterTarget = ParameterDelta | ParameterValue
 
 
 @dataclass(slots=True)
 class AdapterTargetUpdates:
     """Package-internal active contributions for one parameter name."""
 
-    factors: list[ScaledLoRAFactor] = field(default_factory=list)
+    deltas: list[ScaledParameterDelta] = field(default_factory=list)
     value: ScaledParameterValue | None = None
 
     def add(
@@ -47,35 +50,47 @@ class AdapterTargetUpdates:
         target_key: str,
     ) -> None:
         """Bind one contribution, enforcing exclusive value ownership."""
-        if isinstance(target, LoRAFactor):
+        if isinstance(target, ParameterDelta):
             if self.value is not None:
-                raise ValueError(f"Adapter target {target_key!r} cannot combine LoRA factors and a parameter value.")
-            self.factors.append(target.scaled(strength))
+                raise ValueError(f"Adapter target {target_key!r} cannot combine parameter deltas and a value.")
+            self.deltas.append(target.scaled(strength))
             return
 
-        if self.factors:
-            raise ValueError(f"Adapter target {target_key!r} cannot combine LoRA factors and a parameter value.")
+        if self.deltas:
+            raise ValueError(f"Adapter target {target_key!r} cannot combine parameter deltas and a value.")
         if self.value is not None:
             raise ValueError(f"Adapter target {target_key!r} has multiple active parameter values.")
         self.value = target.scaled(strength)
 
+    @property
+    def factors(self) -> list[ScaledLoRAFactor]:
+        """Low-rank contributions extracted for routed execution."""
+        return [
+            ScaledLoRAFactor(bound.delta.lora, bound.strength) for bound in self.deltas if bound.delta.lora is not None
+        ]
+
+    @property
+    def has_dense(self) -> bool:
+        """Whether any active delta contains a full-rank contribution."""
+        return any(bound.delta.dense is not None for bound in self.deltas)
+
 
 @dataclass(slots=True)
 class _AdapterSources:
-    """One parsed view of canonical factor and parameter-value tensors."""
+    """One parsed view of canonical adapter tensors."""
 
     a: dict[str, torch.Tensor]
     b: dict[str, torch.Tensor]
-    bias: dict[str, torch.Tensor]
+    deltas: dict[str, torch.Tensor]
     values: dict[str, torch.Tensor]
 
 
 class Adapter:
     """Reusable immutable host-backed model adapter resource.
 
-    Build once from a flat canonical ``state_dict``. Reserved LoRA suffixes
-    identify factor tensors; every other key is the complete value for an
-    exact-name meta parameter.
+    Build once from a flat canonical ``state_dict``. Exact LoRA and delta
+    suffixes identify low-rank factors and full-rank additive updates; every
+    other key is the complete value for an exact-name meta parameter.
     Inputs are validated, cast to the optional storage ``dtype``, and pinned
     directly by default. Adopt mode retains compatible CPU storage without
     copying it. The resource retains the resulting tensors but not the raw
@@ -112,9 +127,9 @@ class Adapter:
         for target_key, target in captured_targets.items():
             if not isinstance(target_key, str) or not target_key:
                 raise ValueError("Adapter target names must be non-empty strings")
-            if not isinstance(target, (LoRAFactor, ParameterValue)):
+            if not isinstance(target, (ParameterDelta, ParameterValue)):
                 raise ValueError(
-                    "Adapter targets must be LoRAFactor or ParameterValue instances; "
+                    "Adapter targets must be ParameterDelta or ParameterValue instances; "
                     f"target {target_key!r} has {type(target).__name__}."
                 )
 
@@ -133,10 +148,12 @@ class Adapter:
     ) -> Self:
         """Validate and capture factor and/or parameter-value tensors.
 
-        Keys ending in ``.lora_A.weight``, ``.lora_B.weight``, or the legacy
-        ``.lora_B.bias`` form factor targets. Every other key is an exact model
-        parameter name whose tensor is the complete value for a meta
-        parameter. ``dtype`` casts every input before host capture.
+        Keys ending in ``.lora_A.weight`` and ``.lora_B.weight`` form factor
+        targets. Keys ending in ``.delta.weight`` or ``.delta.bias`` are
+        full-rank additive updates targeting the corresponding model weight or
+        bias. Every other key is an exact model parameter name whose tensor is
+        the complete value for a meta parameter. ``dtype`` casts every input
+        before host capture.
         ``host_backing="adopt"`` strictly adopts existing CPU storage and
         therefore rejects conversions.
         """
@@ -182,10 +199,14 @@ def _parse_adapter_state_dict(
             base = key[: -len(_LORA_B_SUFFIX)]
             _validate_lora_base(base)
             sources.b[base] = tensor
-        elif key.endswith(_LORA_BIAS_SUFFIX):
-            base = key[: -len(_LORA_BIAS_SUFFIX)]
-            _validate_lora_base(base)
-            sources.bias[base] = tensor
+        elif key.endswith(_DELTA_WEIGHT_SUFFIX):
+            base = key[: -len(_DELTA_WEIGHT_SUFFIX)]
+            _validate_delta_base(base)
+            sources.deltas[f"{base}.weight"] = tensor
+        elif key.endswith(_DELTA_BIAS_SUFFIX):
+            base = key[: -len(_DELTA_BIAS_SUFFIX)]
+            _validate_delta_base(base)
+            sources.deltas[f"{base}.bias"] = tensor
         else:
             if not key:
                 raise ValueError("Parameter value target names must be non-empty")
@@ -206,18 +227,15 @@ def _validate_factor_pairing(sources: _AdapterSources) -> None:
             f".lora_A.weight and .lora_B.weight."
         )
 
-    bias_only = set(sources.bias) - set(sources.a)
-    if bias_only:
-        raise ValueError(
-            "Unpaired LoRA biases: "
-            f"{sorted(bias_only)}. Each .lora_B.bias must accompany "
-            "a complete .lora_A.weight / .lora_B.weight pair."
-        )
-
 
 def _validate_lora_base(base: str) -> None:
     if not base:
         raise ValueError("LoRA target names must be non-empty")
+
+
+def _validate_delta_base(base: str) -> None:
+    if not base:
+        raise ValueError("Parameter delta target names must be non-empty")
 
 
 def _validate_adopted_dtype(
@@ -247,18 +265,21 @@ def _build_adapter_targets(
 ) -> dict[str, AdapterTarget]:
     """Capture parsed sources into one target value per parameter name."""
     targets: dict[str, AdapterTarget] = {}
-    for base, a_source in sources.a.items():
-        targets[f"{base}.weight"] = LoRAFactor.from_tensors(
-            a_source,
-            sources.b[base],
-            sources.bias.get(base),
+    factor_sources = {f"{base}.weight": base for base in sources.a}
+    delta_targets = dict.fromkeys((*factor_sources, *sources.deltas))
+    for target_key in delta_targets:
+        base = factor_sources.get(target_key)
+        targets[target_key] = ParameterDelta.from_tensors(
+            a=None if base is None else sources.a[base],
+            b=None if base is None else sources.b[base],
+            dense=sources.deltas.get(target_key),
             dtype=dtype,
             pin_memory=pin_memory,
         )
 
     for target_key, source in sources.values.items():
         if target_key in targets:
-            raise ValueError(f"Adapter target {target_key!r} cannot contain both LoRA factors and a parameter value.")
+            raise ValueError(f"Adapter target {target_key!r} cannot contain both a parameter delta and a value.")
         targets[target_key] = ParameterValue.from_tensor(
             source,
             dtype=dtype,

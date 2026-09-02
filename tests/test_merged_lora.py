@@ -31,6 +31,8 @@ from piper_offload import (
     ResourceCache,
     ModelOffloader,
     ModelSpec,
+    ParameterDelta,
+    ParameterDeltaTransform,
     ParameterValue,
     ParameterValueTransform,
     ResourceNotRegisteredError,
@@ -73,8 +75,9 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def _require_factor(target: AdapterTarget) -> LoRAFactor:
-    assert isinstance(target, LoRAFactor)
-    return target
+    assert isinstance(target, ParameterDelta)
+    assert target.lora is not None
+    return target.lora
 
 
 def _factor_tensors(
@@ -83,14 +86,6 @@ def _factor_tensors(
     """Materialize a pinned :class:`LoRAFactor`'s ``(a, b)`` as CPU tensors."""
     factor = _require_factor(target)
     return factor.a.make_cpu_param().data, factor.b.make_cpu_param().data
-
-
-def _factor_bias(target: AdapterTarget) -> torch.Tensor | None:
-    """Materialize a legacy bias, when present, as a CPU tensor."""
-    factor = _require_factor(target)
-    if factor.bias is None:
-        return None
-    return factor.bias.make_cpu_param().data
 
 
 def _quanto_absmax_oracle(
@@ -213,8 +208,6 @@ def _make_lora_sd(
     rank: int = 4,
     seed: int = 0,
     prefix: str = "",
-    *,
-    legacy_bias: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Build a flat safetensors-style state dict targeting attn.weight."""
     g = torch.Generator().manual_seed(seed)
@@ -233,12 +226,6 @@ def _make_lora_sd(
             generator=g,
             dtype=torch.float32,
         )
-        if legacy_bias:
-            sd[f"{base}.lora_B.bias"] = torch.randn(
-                dim,
-                generator=g,
-                dtype=torch.float32,
-            )
     return sd
 
 
@@ -248,8 +235,6 @@ def _make_lora(
     rank: int = 4,
     seed: int = 0,
     prefix: str = "",
-    *,
-    legacy_bias: bool = False,
 ) -> Adapter:
     """Build a Adapter targeting attn.weight across all blocks."""
     sd = _make_lora_sd(
@@ -258,7 +243,6 @@ def _make_lora(
         rank=rank,
         seed=seed,
         prefix=prefix,
-        legacy_bias=legacy_bias,
     )
     return Adapter.from_state_dict(state_dict=sd)
 
@@ -343,16 +327,6 @@ def _expected_routed_output(
             b_part = b.to(device=h.device, dtype=h.dtype).clone()
             b_part.mul_(strength)
             b_parts.append(b_part)
-            bias = _factor_bias(factors)
-            if bias is not None:
-                base_attn = (
-                    base_attn
-                    + bias.to(
-                        device=h.device,
-                        dtype=h.dtype,
-                    )
-                    * strength
-                )
         if a_parts:
             a_fused = torch.cat(a_parts, dim=0)
             b_fused = torch.cat(b_parts, dim=1)
@@ -435,14 +409,12 @@ class TestLoRAConstruction:
         [
             "target.lora_A.weight",
             "target.lora_B.weight",
-            "target.lora_B.bias",
         ],
     )
     def test_rejects_meta_factor_sources(self, key: str) -> None:
         sd = {
             "target.lora_A.weight": torch.randn(1, 3),
             "target.lora_B.weight": torch.randn(2, 1),
-            "target.lora_B.bias": torch.randn(2),
         }
         sd[key] = torch.empty_like(sd[key], device="meta")
 
@@ -483,75 +455,6 @@ class TestLoRAConstruction:
         }
         with pytest.raises(ValueError, match="shape mismatch"):
             Adapter.from_state_dict(state_dict=sd)
-
-    def test_accepts_optional_legacy_bias(self) -> None:
-        sd = _make_lora_sd(
-            num_blocks=1,
-            dim=16,
-            rank=4,
-            legacy_bias=True,
-        )
-
-        lora = Adapter.from_state_dict(state_dict=sd)
-        factor = lora.targets["transformer_blocks.0.attn.weight"]
-        bias = _factor_bias(factor)
-
-        assert bias is not None
-        assert tuple(bias.shape) == (16,)
-        assert bias.is_pinned()
-        assert lora.cache_bytes == sum(tensor.nbytes for tensor in sd.values())
-
-    def test_rejects_unpaired_legacy_bias(self) -> None:
-        sd = _make_lora_sd(num_blocks=1, dim=16, rank=4)
-        sd["other.lora_B.bias"] = torch.randn(16)
-
-        with pytest.raises(ValueError, match="Unpaired LoRA biases"):
-            Adapter.from_state_dict(state_dict=sd)
-
-    @pytest.mark.parametrize(
-        "bias",
-        [
-            torch.zeros(16, dtype=torch.int32),
-            torch.randn(2, 8),
-            torch.randn(8),
-        ],
-    )
-    def test_rejects_invalid_legacy_bias(
-        self,
-        bias: torch.Tensor,
-    ) -> None:
-        sd = _make_lora_sd(num_blocks=1, dim=16, rank=4)
-        sd["transformer_blocks.0.attn.lora_B.bias"] = bias
-
-        with pytest.raises(ValueError, match="LoRA bias"):
-            Adapter.from_state_dict(state_dict=sd)
-
-    def test_legacy_bias_obeys_dtype_and_adoption_policy(self) -> None:
-        sd = _make_lora_sd(
-            num_blocks=1,
-            dim=16,
-            rank=4,
-            legacy_bias=True,
-        )
-        bias_source = sd["transformer_blocks.0.attn.lora_B.bias"]
-
-        adopted = Adapter.from_state_dict(
-            state_dict=sd,
-            dtype=torch.float32,
-            host_backing="adopt",
-        )
-        adopted_bias = _factor_bias(
-            adopted.targets["transformer_blocks.0.attn.weight"],
-        )
-        assert adopted_bias is not None
-        assert adopted_bias.data_ptr() == bias_source.data_ptr()
-
-        cast = Adapter.from_state_dict(state_dict=sd, dtype=torch.bfloat16)
-        cast_bias = _factor_bias(
-            cast.targets["transformer_blocks.0.attn.weight"],
-        )
-        assert cast_bias is not None
-        assert cast_bias.dtype is torch.bfloat16
 
     def test_factors_are_pinned(self) -> None:
         lora = _make_lora(4, 16)
@@ -701,8 +604,91 @@ class TestLoRAConstruction:
             Adapter({target_key: value})  # type: ignore[dict-item]
 
     def test_direct_constructor_rejects_invalid_target_type(self) -> None:
-        with pytest.raises(ValueError, match="LoRAFactor or ParameterValue"):
+        with pytest.raises(ValueError, match="ParameterDelta or ParameterValue"):
             Adapter({"target.weight": object()})  # type: ignore[dict-item]
+
+    def test_parameter_delta_resource_coalesces_lora_and_dense_weight(self) -> None:
+        a = torch.randn(2, 4)
+        b = torch.randn(3, 2)
+        dense = torch.randn(3, 4)
+
+        adapter = Adapter.from_state_dict(
+            {
+                "target.lora_A.weight": a,
+                "target.lora_B.weight": b,
+                "target.delta.weight": dense,
+            },
+            host_backing="adopt",
+        )
+
+        assert tuple(adapter.targets) == ("target.weight",)
+        delta = adapter.targets["target.weight"]
+        assert isinstance(delta, ParameterDelta)
+        assert delta.lora is not None
+        assert delta.dense is not None
+        assert delta.lora.a.make_cpu_param().data.data_ptr() == a.data_ptr()
+        assert delta.lora.b.make_cpu_param().data.data_ptr() == b.data_ptr()
+        assert delta.dense.make_cpu_param().data.data_ptr() == dense.data_ptr()
+        assert delta.cache_bytes == a.nbytes + b.nbytes + dense.nbytes
+
+    def test_parameter_delta_uses_final_component_as_exact_parameter_leaf(self) -> None:
+        weight = torch.randn(3, 4)
+        bias = torch.randn(3)
+
+        adapter = Adapter.from_state_dict(
+            {
+                "target.delta.weight": weight,
+                "target.delta.bias": bias,
+            }
+        )
+
+        assert tuple(adapter.targets) == ("target.weight", "target.bias")
+        assert all(isinstance(target, ParameterDelta) for target in adapter.targets.values())
+
+    def test_exact_delta_weight_suffix_is_recognized(self) -> None:
+        source = torch.randn(2, 2)
+
+        adapter = Adapter.from_state_dict({"target.delta.weight": source})
+
+        assert tuple(adapter.targets) == ("target.weight",)
+        assert isinstance(adapter.targets["target.weight"], ParameterDelta)
+
+    @pytest.mark.parametrize("key", [".delta.weight", ".delta.bias"])
+    def test_rejects_empty_delta_target_name(self, key: str) -> None:
+        with pytest.raises(ValueError, match="target names must be non-empty"):
+            Adapter.from_state_dict({key: torch.randn(2)})
+
+    def test_noncanonical_delta_leaf_remains_an_exact_parameter_value(self) -> None:
+        source = torch.randn(2)
+
+        adapter = Adapter.from_state_dict({"target.delta.scale": source})
+
+        assert tuple(adapter.targets) == ("target.delta.scale",)
+        assert isinstance(adapter.targets["target.delta.scale"], ParameterValue)
+
+    def test_parameter_delta_and_value_cannot_share_target(self) -> None:
+        with pytest.raises(ValueError, match="cannot contain both a parameter delta and a value"):
+            Adapter.from_state_dict(
+                {
+                    "target.delta.weight": torch.randn(2, 2),
+                    "target.weight": torch.randn(2, 2),
+                }
+            )
+
+    @pytest.mark.parametrize(
+        ("source", "message"),
+        [
+            (torch.ones(2, 2, dtype=torch.int32), "floating-point"),
+            (torch.empty(2, 2, device="meta"), "physical values"),
+        ],
+    )
+    def test_rejects_invalid_dense_parameter_delta_source(
+        self,
+        source: torch.Tensor,
+        message: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=message):
+            Adapter.from_state_dict({"target.delta.weight": source})
 
     def test_from_state_dict_rejects_non_floating_dtype(self) -> None:
         # A non-floating dtype would slip past the float-factor validation
@@ -789,6 +775,308 @@ class TestLoRAConstruction:
                 dtype=torch.bfloat16,
                 host_backing="adopt",
             )
+
+
+# ---------------------------------------------------------------------------
+# Parameter delta semantics
+# ---------------------------------------------------------------------------
+
+
+class TestParameterDelta:
+    def test_requires_at_least_one_delta_representation(self) -> None:
+        with pytest.raises(ValueError, match="requires a LoRA factor, a dense delta, or both"):
+            ParameterDelta.from_tensors()
+
+    @pytest.mark.parametrize("strength", [float("nan"), float("inf"), float("-inf")])
+    def test_scaled_adapter_representations_reject_non_finite_strength(self, strength: float) -> None:
+        delta = ParameterDelta.from_tensors(
+            a=torch.randn(1, 3),
+            b=torch.randn(2, 1),
+            pin_memory=False,
+        )
+        value = ParameterValue.from_tensor(torch.randn(2, 3), pin_memory=False)
+        factor = LoRAFactor.from_tensors(
+            torch.randn(1, 3),
+            torch.randn(2, 1),
+            pin_memory=False,
+        )
+
+        for representation in (delta, value, factor):
+            with pytest.raises(ValueError, match="strength must be finite"):
+                representation.scaled(strength)
+
+    @pytest.mark.parametrize("mode", ["merge", "routed"])
+    def test_adapter_modes_reject_non_finite_strength(self, mode: AdapterMode) -> None:
+        model = nn.Module()
+        model.target = nn.Linear(3, 2, bias=False)
+        model.requires_grad_(False)
+        before = model.target.weight.detach().clone()
+        adapter = Adapter.from_state_dict(
+            {
+                "target.lora_A.weight": torch.randn(1, 3),
+                "target.lora_B.weight": torch.randn(2, 1),
+            }
+        )
+
+        if mode == "merge":
+            with pytest.raises(ValueError, match="strength must be finite"):
+                merge_adapter(model, [(adapter, float("inf"))])
+        else:
+            offloader = ModelOffloader.from_module(model)
+            with pytest.raises(ValueError, match="strength must be finite"):
+                offloader.activate(
+                    "cpu",
+                    adapters=[adapter],
+                    adapter_strengths=[float("inf")],
+                    adapter_mode="routed",
+                )
+            assert offloader.active_device is None
+            assert offloader._adapter_hook_removers == []
+
+        torch.testing.assert_close(model.target.weight, before)
+
+    def test_permanent_merge_combines_lora_and_dense_under_one_strength(self) -> None:
+        model = nn.Module()
+        model.target = nn.Linear(4, 3, bias=True)
+        model.requires_grad_(False)
+        base_weight = model.target.weight.detach().clone()
+        base_bias = model.target.bias.detach().clone()
+        a = torch.randn(2, 4)
+        b = torch.randn(3, 2)
+        dense_weight = torch.randn(3, 4)
+        dense_bias = torch.randn(3)
+        strength = -0.25
+        adapter = Adapter.from_state_dict(
+            {
+                "target.lora_A.weight": a,
+                "target.lora_B.weight": b,
+                "target.delta.weight": dense_weight,
+                "target.delta.bias": dense_bias,
+            }
+        )
+
+        assert merge_adapter(model, [(adapter, strength)]) == 2
+
+        torch.testing.assert_close(
+            model.target.weight,
+            base_weight + strength * (b @ a + dense_weight),
+        )
+        torch.testing.assert_close(
+            model.target.bias,
+            base_bias + strength * dense_bias,
+        )
+
+    @pytest.mark.parametrize(
+        ("dtype", "base_value"),
+        [(torch.float16, 2048.0), (torch.bfloat16, 256.0)],
+    )
+    def test_combined_delta_accumulates_before_low_precision_base_update(
+        self,
+        dtype: torch.dtype,
+        base_value: float,
+    ) -> None:
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.tensor([[base_value]], dtype=dtype),
+            requires_grad=False,
+        )
+        before = model.weight.detach().clone()
+        adapter = Adapter(
+            {
+                "weight": ParameterDelta.from_tensors(
+                    a=torch.ones(1, 1, dtype=dtype),
+                    b=torch.ones(1, 1, dtype=dtype),
+                    dense=-torch.ones(1, 1, dtype=dtype),
+                    pin_memory=False,
+                )
+            }
+        )
+
+        assert merge_adapter(model, [(adapter, 1.0)]) == 1
+        torch.testing.assert_close(model.weight, before, rtol=0.0, atol=0.0)
+
+    @CUDA
+    def test_activation_merge_combines_lora_and_dense_then_restores_base(self) -> None:
+        model = nn.Module()
+        model.target = nn.Linear(4, 3, bias=True)
+        model.requires_grad_(False)
+        base_weight = model.target.weight.detach().clone()
+        base_bias = model.target.bias.detach().clone()
+        a = torch.randn(2, 4)
+        b = torch.randn(3, 2)
+        dense_weight = torch.randn(3, 4)
+        dense_bias = torch.randn(3)
+        strength = 0.375
+        adapter = Adapter.from_state_dict(
+            {
+                "target.lora_A.weight": a,
+                "target.lora_B.weight": b,
+                "target.delta.weight": dense_weight,
+                "target.delta.bias": dense_bias,
+            }
+        )
+        x = torch.randn(2, 4)
+        expected = F.linear(
+            x,
+            base_weight + strength * (b @ a + dense_weight),
+            base_bias + strength * dense_bias,
+        )
+        offloader = ModelOffloader.from_module(model)
+
+        offloader.activate(
+            "cuda",
+            adapters=[adapter],
+            adapter_strengths=[strength],
+            adapter_mode="merge",
+        )
+        try:
+            actual = model.target(x.cuda()).cpu()
+        finally:
+            offloader.deactivate()
+
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(model.target.weight, base_weight)
+        torch.testing.assert_close(model.target.bias, base_bias)
+
+    def test_multiple_parameter_deltas_keep_independent_strengths(self) -> None:
+        model = nn.Module()
+        model.target = nn.Linear(3, 2, bias=False)
+        model.requires_grad_(False)
+        base = model.target.weight.detach().clone()
+        first_dense = torch.randn_like(base)
+        second_dense = torch.randn_like(base)
+        a = torch.randn(1, 3)
+        b = torch.randn(2, 1)
+        first = Adapter.from_state_dict({"target.delta.weight": first_dense})
+        second = Adapter.from_state_dict(
+            {
+                "target.lora_A.weight": a,
+                "target.lora_B.weight": b,
+                "target.delta.weight": second_dense,
+            }
+        )
+
+        assert merge_adapter(model, [(first, 0.5), (second, 1.25)]) == 1
+
+        torch.testing.assert_close(
+            model.target.weight,
+            base + 0.5 * first_dense + 1.25 * (b @ a + second_dense),
+        )
+
+    def test_zero_strength_dense_delta_is_inactive(self) -> None:
+        model = nn.Linear(3, 2, bias=False)
+        model.requires_grad_(False)
+        base = model.weight.detach().clone()
+        adapter = Adapter(
+            {
+                "weight": ParameterDelta.from_tensors(
+                    dense=torch.randn_like(base),
+                )
+            }
+        )
+
+        assert merge_adapter(model, [(adapter, 0.0)]) == 0
+        torch.testing.assert_close(model.weight, base)
+
+    def test_dense_delta_rejects_float8_target_before_mutation(self) -> None:
+        model = nn.Module()
+        model.first = nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+        model.second = nn.Parameter(
+            torch.zeros(2, 2, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        first_before = model.first.detach().clone()
+        second_before = model.second.detach().clone()
+        adapter = Adapter(
+            {
+                "first": ParameterDelta.from_tensors(dense=torch.ones(2, 2)),
+                "second": ParameterDelta.from_tensors(dense=torch.ones(2, 2)),
+            }
+        )
+
+        with pytest.raises(ValueError, match="do not support float8 targets"):
+            merge_adapter(model, [(adapter, 1.0)])
+
+        torch.testing.assert_close(model.first, first_before)
+        assert torch.equal(model.second, second_before)
+
+    def test_dense_delta_requires_matching_shape(self) -> None:
+        model = nn.Linear(3, 2, bias=False)
+        model.requires_grad_(False)
+        base = model.weight.detach().clone()
+        adapter = Adapter(
+            {
+                "weight": ParameterDelta.from_tensors(
+                    dense=torch.randn(3, 2),
+                )
+            }
+        )
+
+        with pytest.raises(ValueError, match="shape mismatch"):
+            merge_adapter(model, [(adapter, 1.0)])
+        torch.testing.assert_close(model.weight, base)
+
+    def test_dense_delta_rejects_meta_target(self) -> None:
+        with torch.device("meta"):
+            model = nn.Linear(3, 2, bias=False)
+        model.requires_grad_(False)
+        adapter = Adapter(
+            {
+                "weight": ParameterDelta.from_tensors(
+                    dense=torch.randn(2, 3),
+                )
+            }
+        )
+
+        with pytest.raises(ValueError, match="existing plain floating-point target"):
+            merge_adapter(model, [(adapter, 1.0)])
+        assert model.weight.is_meta
+
+    def test_value_and_delta_conflict_across_adapters_before_mutation(self) -> None:
+        model = nn.Linear(3, 2, bias=False)
+        model.requires_grad_(False)
+        base = model.weight.detach().clone()
+        delta = Adapter(
+            {
+                "weight": ParameterDelta.from_tensors(
+                    dense=torch.randn_like(base),
+                )
+            }
+        )
+        value = Adapter.from_state_dict({"weight": torch.randn_like(base)})
+
+        with pytest.raises(ValueError, match="cannot combine parameter deltas and a value"):
+            merge_adapter(model, [(delta, 1.0), (value, 1.0)])
+        torch.testing.assert_close(model.weight, base)
+
+    def test_dense_delta_rejects_routed_mode(self) -> None:
+        model = nn.Linear(3, 2, bias=False)
+        model.requires_grad_(False)
+        offloader = ModelOffloader.from_module(model)
+        adapter = Adapter(
+            {
+                "weight": ParameterDelta.from_tensors(
+                    dense=torch.randn(2, 3),
+                )
+            }
+        )
+
+        with pytest.raises(ValueError, match="does not support dense parameter deltas"):
+            offloader.activate("cpu", adapters=[adapter], adapter_mode="routed")
+
+        assert offloader.active_device is None
+        assert offloader._adapter_hook_removers == []
+
+    def test_transform_requires_validation_before_dense_application(self) -> None:
+        target = nn.Parameter(torch.zeros(2, 3), requires_grad=False)
+        delta = ParameterDelta.from_tensors(
+            dense=torch.ones_like(target),
+            pin_memory=False,
+        )
+        transform = ParameterDeltaTransform([delta.scaled(0.5)])
+
+        with pytest.raises(RuntimeError, match="must be validated"):
+            transform.apply_parameter(target)
 
 
 # ---------------------------------------------------------------------------
@@ -919,76 +1207,6 @@ class TestActivationLoraValidation:
         _request_loras(s, [(Adapter.from_state_dict(state_dict=sd), 1.0)])
         _activate_loras_for_test(s)
         assert _has_post_copy_hook(s, "embed.weight")
-
-    def test_legacy_bias_registers_separate_base_bias_hook(self) -> None:
-        m = _make_bf16_model(num_blocks=2, attn_bias=True)
-        s = _make_strategy(m)
-        lora = _make_lora(
-            num_blocks=2,
-            dim=16,
-            legacy_bias=True,
-        )
-
-        _request_loras(s, [(lora, 0.5)], mode="merge")
-        _activate_loras_for_test(s)
-
-        for block_idx in range(2):
-            assert _has_post_copy_hook(
-                s,
-                f"transformer_blocks.{block_idx}.attn.weight",
-            )
-            assert _has_post_copy_hook(
-                s,
-                f"transformer_blocks.{block_idx}.attn.bias",
-            )
-
-    def test_legacy_bias_merge_rejects_biasless_base_before_hooks(self) -> None:
-        m = _make_bf16_model(num_blocks=2, attn_bias=False)
-        s = _make_strategy(m)
-        lora = _make_lora(
-            num_blocks=2,
-            dim=16,
-            legacy_bias=True,
-        )
-
-        _request_loras(s, [(lora, 0.5)], mode="merge")
-        with pytest.raises(ValueError, match="attn.bias.*is not managed"):
-            _activate_loras_for_test(s)
-
-        assert s._adapter_hook_removers == []
-        assert not _has_post_copy_hook(
-            s,
-            "transformer_blocks.0.attn.weight",
-        )
-
-    def test_legacy_bias_merge_rejects_invalid_base_bias_before_hooks(
-        self,
-    ) -> None:
-        m = _make_bf16_model(num_blocks=1, attn_bias=True)
-        m.transformer_blocks[0].attn.bias = nn.Parameter(
-            torch.randn(1, 16, dtype=torch.bfloat16),
-            requires_grad=False,
-        )
-        s = _make_strategy(m)
-        lora = _make_lora(
-            num_blocks=1,
-            dim=16,
-            legacy_bias=True,
-        )
-
-        _request_loras(s, [(lora, 0.5)], mode="merge")
-        with pytest.raises(ValueError, match="rank-one base bias"):
-            _activate_loras_for_test(s)
-
-        assert s._adapter_hook_removers == []
-        assert not _has_post_copy_hook(
-            s,
-            "transformer_blocks.0.attn.weight",
-        )
-        assert not _has_post_copy_hook(
-            s,
-            "transformer_blocks.0.attn.bias",
-        )
 
     def test_non_block_tied_alias_target_matched(self) -> None:
         m = _make_tied_non_block_model(dtype=torch.bfloat16)
@@ -1387,7 +1605,7 @@ class TestMergeCorrectness:
 
     @CUDA
     @pytest.mark.parametrize("streamed", [False, True])
-    def test_legacy_bias_merge_resident_and_streamed(
+    def test_dense_bias_delta_merge_resident_and_streamed(
         self,
         streamed: bool,
     ) -> None:
@@ -1397,25 +1615,24 @@ class TestMergeCorrectness:
             attn_bias=True,
         )
         base_biases = [block.attn.bias.detach().clone() for block in m.transformer_blocks]
+
+        def make_adapter(seed: int) -> Adapter:
+            state_dict = _make_lora_sd(
+                num_blocks=2,
+                dim=16,
+                seed=seed,
+            )
+            generator = torch.Generator().manual_seed(seed + 100)
+            for block_idx in range(2):
+                state_dict[f"transformer_blocks.{block_idx}.attn.delta.bias"] = torch.randn(
+                    16,
+                    generator=generator,
+                )
+            return Adapter.from_state_dict(state_dict)
+
         loras = [
-            (
-                _make_lora(
-                    num_blocks=2,
-                    dim=16,
-                    seed=10,
-                    legacy_bias=True,
-                ),
-                0.5,
-            ),
-            (
-                _make_lora(
-                    num_blocks=2,
-                    dim=16,
-                    seed=20,
-                    legacy_bias=True,
-                ),
-                -0.25,
-            ),
+            (make_adapter(10), 0.5),
+            (make_adapter(20), -0.25),
         ]
         strategy = _make_model_offloader(
             m,
@@ -1432,10 +1649,12 @@ class TestMergeCorrectness:
                 assert actual is not None
                 expected = base_biases[block_idx].to(actual.device)
                 delta = torch.zeros_like(expected)
-                target_name = f"transformer_blocks.{block_idx}.attn.weight"
+                target_name = f"transformer_blocks.{block_idx}.attn.bias"
                 for lora, strength in loras:
-                    bias = _factor_bias(lora.targets[target_name])
-                    assert bias is not None
+                    target = lora.targets[target_name]
+                    assert isinstance(target, ParameterDelta)
+                    assert target.dense is not None
+                    bias = target.dense.make_cpu_param().data
                     delta.add_(
                         bias.to(device=actual.device, dtype=actual.dtype),
                         alpha=strength,
@@ -1700,56 +1919,6 @@ class TestLoRATransform:
         expected = before.clone()
         expected.addmm_(b, a, alpha=0.5)
         torch.testing.assert_close(param, expected)
-
-    def test_joint_transform_applies_weight_and_bias(self) -> None:
-        weight = nn.Parameter(torch.randn(4, 8), requires_grad=False)
-        bias = nn.Parameter(torch.randn(4), requires_grad=False)
-        weight_before = weight.detach().clone()
-        bias_before = bias.detach().clone()
-        a = torch.randn(2, 8)
-        b = torch.randn(4, 2)
-        adapter_bias = torch.randn(4)
-        strength = -0.75
-        transform = LoRATransform(
-            [
-                ScaledLoRAFactor.from_tensors(
-                    a,
-                    b,
-                    strength,
-                    bias=adapter_bias,
-                )
-            ]
-        )
-
-        transform.validate_target(weight, bias)
-        transform.apply(weight, bias)
-
-        expected_weight = weight_before.clone()
-        expected_weight.addmm_(b, a, alpha=strength)
-        torch.testing.assert_close(weight, expected_weight)
-        torch.testing.assert_close(
-            bias,
-            bias_before + adapter_bias * strength,
-        )
-
-    def test_joint_transform_requires_bias_before_weight_mutation(self) -> None:
-        weight = nn.Parameter(torch.randn(4, 8), requires_grad=False)
-        weight_before = weight.detach().clone()
-        transform = LoRATransform(
-            [
-                ScaledLoRAFactor.from_tensors(
-                    torch.randn(2, 8),
-                    torch.randn(4, 2),
-                    0.5,
-                    bias=torch.randn(4),
-                )
-            ]
-        )
-
-        with pytest.raises(ValueError, match="no base bias target"):
-            transform.apply(weight)
-
-        torch.testing.assert_close(weight, weight_before)
 
     @CUDA
     def test_multiple_cuda_factors_use_one_packed_merge(
@@ -3182,12 +3351,17 @@ class TestPermanentMerge:
             merge_adapter(model, [(value, 2.0)])
         assert model.weight.is_meta
 
-    @pytest.mark.parametrize("strength", [1.0, 1_000.0])
-    def test_parameter_value_rejects_source_underflow_before_strength(
+    @pytest.mark.parametrize(
+        ("source_value", "strength"),
+        [(1e-8, 1.0), (1e-4, 1e-4)],
+        ids=["source-conversion", "scaled-value"],
+    )
+    def test_parameter_value_allows_rounding_to_zero(
         self,
+        source_value: float,
         strength: float,
     ) -> None:
-        source = torch.tensor([1e-8], dtype=torch.float32)
+        source = torch.tensor([source_value], dtype=torch.float32)
         model = nn.Module()
         model.weight = nn.Parameter(
             torch.empty(source.shape, device="meta", dtype=torch.float16),
@@ -3195,22 +3369,8 @@ class TestPermanentMerge:
         )
         value = Adapter.from_state_dict({"weight": source})
 
-        with pytest.raises(ValueError, match="source underflows to zero"):
-            merge_adapter(model, [(value, strength)])
-        assert model.weight.is_meta
-
-    def test_parameter_value_rejects_scaled_underflow(self) -> None:
-        source = torch.tensor([1e-4], dtype=torch.float32)
-        model = nn.Module()
-        model.weight = nn.Parameter(
-            torch.empty(source.shape, device="meta", dtype=torch.float16),
-            requires_grad=False,
-        )
-        value = Adapter.from_state_dict({"weight": source})
-
-        with pytest.raises(ValueError, match="Scaled parameter value underflows"):
-            merge_adapter(model, [(value, 1e-4)])
-        assert model.weight.is_meta
+        assert merge_adapter(model, [(value, strength)]) == 1
+        assert torch.equal(model.weight, torch.zeros_like(model.weight))
 
     @pytest.mark.parametrize(
         "stride",
@@ -3354,7 +3514,14 @@ class TestPermanentMerge:
         assert materialized.stride() == (1, 2)
         torch.testing.assert_close(materialized, source)
 
-    def test_parameter_value_scales_float8_target(self) -> None:
+    def test_parameter_value_rejects_float8_source(self) -> None:
+        with pytest.raises(ValueError, match="do not support float8 sources"):
+            ParameterValue.from_tensor(
+                torch.tensor([1.0], dtype=torch.float8_e4m3fn),
+                pin_memory=False,
+            )
+
+    def test_parameter_value_rejects_float8_target(self) -> None:
         source = torch.tensor([1.0], dtype=torch.float32)
         model = nn.Module()
         model.weight = nn.Parameter(
@@ -3363,8 +3530,9 @@ class TestPermanentMerge:
         )
         value = Adapter.from_state_dict({"weight": source})
 
-        assert merge_adapter(model, [(value, 0.5)]) == 1
-        assert torch.equal(model.weight, torch.tensor([0.5], dtype=torch.float8_e4m3fn))
+        with pytest.raises(ValueError, match="do not support float8 targets"):
+            merge_adapter(model, [(value, 0.5)])
+        assert model.weight.is_meta
 
     def test_factor_and_parameter_value_cannot_share_target_across_adapters(self) -> None:
         model = nn.Module()
@@ -3434,28 +3602,6 @@ class TestPermanentMerge:
         with pytest.raises(ValueError, match="only by parameter values"):
             merge_adapter(model, [(lora, 1.0)])
         assert model.target.weight.is_meta
-
-    def test_legacy_lora_bias_cannot_materialize_meta_parameter(self) -> None:
-        model = nn.Module()
-        model.target = nn.Linear(3, 2, bias=False)
-        model.target.bias = nn.Parameter(
-            torch.empty(2, device="meta"),
-            requires_grad=False,
-        )
-        model.requires_grad_(False)
-        weight_before = model.target.weight.detach().clone()
-        lora = Adapter.from_state_dict(
-            {
-                "target.lora_A.weight": torch.randn(1, 3),
-                "target.lora_B.weight": torch.randn(2, 1),
-                "target.lora_B.bias": torch.randn(2),
-            }
-        )
-
-        with pytest.raises(ValueError, match="only by parameter values"):
-            merge_adapter(model, [(lora, 1.0)])
-        torch.testing.assert_close(model.target.weight, weight_before)
-        assert model.target.bias.is_meta
 
     def test_parameter_value_rejects_tensor_subclass_before_mutation(self) -> None:
         class UnknownTensor(torch.Tensor):
@@ -3620,144 +3766,6 @@ class TestPermanentMerge:
             expected,
         )
 
-    def test_legacy_bias_merges_with_same_adapter_strength(self) -> None:
-        class M(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.target = nn.Linear(3, 4, bias=True)
-
-        m = M()
-        m.requires_grad_(False)
-        base_weight = m.target.weight.detach().clone()
-        base_bias = m.target.bias.detach().clone()
-        bias_param = m.target.bias
-
-        def make_lora(seed: int, *, with_bias: bool) -> Adapter:
-            generator = torch.Generator().manual_seed(seed)
-            state_dict = {
-                "target.lora_A.weight": torch.randn(
-                    2,
-                    3,
-                    generator=generator,
-                ),
-                "target.lora_B.weight": torch.randn(
-                    4,
-                    2,
-                    generator=generator,
-                ),
-            }
-            if with_bias:
-                state_dict["target.lora_B.bias"] = torch.randn(
-                    4,
-                    generator=generator,
-                )
-            return Adapter.from_state_dict(state_dict)
-
-        loras = [
-            (make_lora(1, with_bias=True), 0.5),
-            (make_lora(2, with_bias=False), 1.25),
-            (make_lora(3, with_bias=True), -0.75),
-        ]
-        expected_weight = base_weight.clone()
-        expected_bias = base_bias.clone()
-        bias_delta = torch.zeros_like(expected_bias)
-        for lora, strength in loras:
-            factor = lora.targets["target.weight"]
-            a, b = _factor_tensors(factor)
-            expected_weight.addmm_(b, a, alpha=strength)
-            bias = _factor_bias(factor)
-            if bias is not None:
-                bias_delta.add_(bias, alpha=strength)
-        expected_bias.add_(bias_delta)
-
-        assert merge_adapter(m, loras) == 2
-        torch.testing.assert_close(m.target.weight, expected_weight)
-        torch.testing.assert_close(m.target.bias, expected_bias)
-        assert m.target.bias is bias_param
-
-    def test_legacy_bias_merge_rejects_biasless_base_without_mutation(
-        self,
-    ) -> None:
-        class M(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.target = nn.Linear(3, 4, bias=False)
-
-        m = M()
-        m.requires_grad_(False)
-        before = m.target.weight.detach().clone()
-        lora = Adapter.from_state_dict(
-            {
-                "target.lora_A.weight": torch.randn(2, 3),
-                "target.lora_B.weight": torch.randn(4, 2),
-                "target.lora_B.bias": torch.randn(4),
-            },
-        )
-
-        with pytest.raises(ValueError, match="no base bias parameter"):
-            merge_adapter(m, [(lora, 0.5)])
-
-        torch.testing.assert_close(m.target.weight, before)
-
-    def test_legacy_bias_shape_preflight_prevents_weight_mutation(
-        self,
-    ) -> None:
-        class M(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.target = nn.Module()
-                self.target.weight = nn.Parameter(torch.randn(4, 3))
-                self.target.bias = nn.Parameter(torch.randn(3))
-
-        m = M()
-        m.requires_grad_(False)
-        weight_before = m.target.weight.detach().clone()
-        bias_before = m.target.bias.detach().clone()
-        lora = Adapter.from_state_dict(
-            {
-                "target.lora_A.weight": torch.randn(2, 3),
-                "target.lora_B.weight": torch.randn(4, 2),
-                "target.lora_B.bias": torch.randn(4),
-            },
-        )
-
-        with pytest.raises(ValueError, match="base bias shape"):
-            merge_adapter(m, [(lora, 0.5)])
-
-        torch.testing.assert_close(m.target.weight, weight_before)
-        torch.testing.assert_close(m.target.bias, bias_before)
-
-    def test_legacy_bias_rejects_tied_base_bias_without_mutation(self) -> None:
-        class M(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.first = nn.Linear(3, 4, bias=True)
-                self.second = nn.Linear(3, 4, bias=False)
-                self.second.bias = self.first.bias
-
-        m = M()
-        m.requires_grad_(False)
-        first_weight_before = m.first.weight.detach().clone()
-        second_weight_before = m.second.weight.detach().clone()
-        bias_before = m.first.bias.detach().clone()
-        lora = Adapter.from_state_dict(
-            {
-                "first.lora_A.weight": torch.randn(2, 3),
-                "first.lora_B.weight": torch.randn(4, 2),
-                "first.lora_B.bias": torch.randn(4),
-                "second.lora_A.weight": torch.randn(2, 3),
-                "second.lora_B.weight": torch.randn(4, 2),
-                "second.lora_B.bias": torch.randn(4),
-            },
-        )
-
-        with pytest.raises(ValueError, match="same tied base-bias backing"):
-            merge_adapter(m, [(lora, 0.5)])
-
-        torch.testing.assert_close(m.first.weight, first_weight_before)
-        torch.testing.assert_close(m.second.weight, second_weight_before)
-        torch.testing.assert_close(m.first.bias, bias_before)
-
     def test_shape_preflight_prevents_partial_merge(self) -> None:
         class M(nn.Module):
             def __init__(self) -> None:
@@ -3903,7 +3911,7 @@ class TestPermanentMerge:
         assert code_difference.max().item() <= 1
         torch.testing.assert_close(merged_qt._scale, expected._scale)
 
-    def test_legacy_bias_merges_separately_from_quantized_weight(self) -> None:
+    def test_dense_bias_delta_merges_separately_from_quantized_weight(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 
@@ -3933,17 +3941,16 @@ class TestPermanentMerge:
         m.requires_grad_(False)
         original_bias = m.target.bias
         bias_before = m.target.bias.detach().clone()
+        bias_delta = torch.randn(rows)
         lora = Adapter.from_state_dict(
             {
                 "target.lora_A.weight": torch.randn(rank, cols),
                 "target.lora_B.weight": torch.randn(rows, rank),
-                "target.lora_B.bias": torch.randn(rows),
+                "target.delta.bias": bias_delta,
             },
         )
         factor = lora.targets["target.weight"]
         a, b = _factor_tensors(factor)
-        bias = _factor_bias(factor)
-        assert bias is not None
         strength = 0.5
         expected_dense = quantized.dequantize()
         expected_dense.addmm_(
@@ -3966,7 +3973,7 @@ class TestPermanentMerge:
         assert type(m.target.bias.data) is torch.Tensor
         torch.testing.assert_close(
             m.target.bias,
-            bias_before + strength * bias.to(bias_before.dtype),
+            bias_before + strength * bias_delta.to(bias_before.dtype),
         )
 
     def test_permanent_quanto_merge_supports_empty_second_target(self) -> None:
@@ -4307,45 +4314,6 @@ class TestRoutedMode:
             expected = F.linear(x, m.target.weight)
             expected += ((x @ a.T) * strength) @ b.T
             torch.testing.assert_close(actual, expected)
-        finally:
-            offloader.deactivate()
-
-    def test_legacy_bias_routes_on_biasless_base(self) -> None:
-        class M(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.target = nn.Linear(3, 4, bias=False)
-
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                return self.target(x)
-
-        m = M()
-        m.requires_grad_(False)
-        lora = Adapter.from_state_dict(
-            {
-                "target.lora_A.weight": torch.randn(2, 3),
-                "target.lora_B.weight": torch.randn(4, 2),
-                "target.lora_B.bias": torch.randn(4),
-            },
-        )
-        factor = lora.targets["target.weight"]
-        a, b = _factor_tensors(factor)
-        bias = _factor_bias(factor)
-        assert bias is not None
-        strength = -0.75
-        x = torch.randn(5, 3)
-        expected = F.linear(x, m.target.weight)
-        expected = expected + strength * (x @ a.T @ b.T + bias)
-        offloader = _make_model_offloader(m)
-
-        offloader.activate(
-            "cpu",
-            adapters=[lora],
-            adapter_strengths=[strength],
-            adapter_mode="routed",
-        )
-        try:
-            torch.testing.assert_close(m(x), expected)
         finally:
             offloader.deactivate()
 

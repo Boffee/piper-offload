@@ -97,23 +97,24 @@ adapter resource explicitly allows partial targets, in which case application
 uses the intersection of adapter targets and model parameters. The
 hooks run immediately after the owning component copies a base weight
 from host storage to GPU, so block-streamed and non-block weights
-use the same merge path. Merge eligibility is owned by the selected
-tensor adapter: physical plain floating-point tensors support in-place
-low-rank ``addmm_``; structured quantized wrappers can opt into a staged LoRA
-merge that selects its own kernel or framework fallback. Frozen plain
-floating-point meta tensors can instead be populated by parameter values.
-Otherwise, use routed LoRA when the module exposes a compatible logical Linear
-weight shape and compute dtype.
+use the same merge path. Merge eligibility is owned by the selected tensor
+adapter: physical plain floating-point tensors support combined low-rank and
+full-rank additive deltas; structured quantized wrappers can opt into staged
+LoRA merge. Dense deltas for quantized wrappers are not yet supported. Frozen
+plain floating-point meta tensors can instead be populated by parameter
+values. Otherwise, use routed LoRA when the module exposes a compatible
+logical Linear weight shape and compute dtype.
 
-Every non-factor entry accepted by :meth:`Adapter.from_state_dict` is the
-complete value for an exact-name parameter. These values are merge-only and
-populate storage-free frozen plain floating-point meta parameters; low-rank
-A/B factors do not materialize meta parameters.
+:meth:`Adapter.from_state_dict` interprets the exact ``.delta.weight`` and
+``.delta.bias`` suffixes as full-rank additive updates and every other
+non-LoRA entry as the complete value for an exact-name parameter. Parameter
+values are merge-only and populate storage-free frozen plain floating-point
+meta parameters; parameter deltas require existing physical parameters.
 
-:class:`Adapter` owns immutable factor and parameter-value storage, pinned by
-default or strictly adopted from existing CPU backing. Compatible consumers read
-that backing directly and may overlap; routed hooks stage their own per-forward
-device copies.
+:class:`Adapter` owns immutable parameter-delta and parameter-value storage,
+pinned by default or strictly adopted from existing CPU backing. Compatible
+consumers read that backing directly and may overlap; routed hooks stage their
+own per-forward device copies.
 
 Downstream tensor subclasses can participate in pinning and movement without
 adding format-specific dependencies here: implement the public
@@ -160,6 +161,7 @@ from .merge import merge_adapter
 from .model_cache import ModelCache
 from .model_offloader import ModelOffloader, ModelRuntimeInUseError
 from .mps_weights import MpsWeights
+from .parameter_delta import ParameterDelta, ParameterDeltaTransform, ScaledParameterDelta
 from .parameter_transform import ParameterTransform
 from .parameter_value import (
     ParameterValue,
@@ -222,6 +224,8 @@ __all__ = [
     "ModelSpec",
     "MpsWeights",
     "ObjectSpec",
+    "ParameterDelta",
+    "ParameterDeltaTransform",
     "ParameterTransform",
     "ParameterValue",
     "ParameterValueTransform",
@@ -237,6 +241,7 @@ __all__ = [
     "ResourceStore",
     "ResourceTooLargeError",
     "ScaledLoRAFactor",
+    "ScaledParameterDelta",
     "ScaledParameterValue",
     "TensorAdapter",
     "derive_seed",
