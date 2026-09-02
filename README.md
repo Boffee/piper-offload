@@ -523,7 +523,10 @@ Parameter values are merge-only: routed mode rejects the request. For a meta
 target, merge mode materializes `strength * value`. Only one active parameter
 value may own a target; repeated or competing values are rejected. Parameter
 values do not apply to existing physical parameters, quantized tensors,
-DTensors, or tensor subclasses.
+DTensors, or tensor subclasses. Their meta targets must have strided,
+non-overlapping dense layouts with zero storage offset; this includes ordinary
+contiguous and transposed dense parameters but excludes overlapping or gapped
+views that cannot be populated while preserving the declared layout.
 
 A frozen plain floating-point meta parameter has no host backing and
 contributes zero bytes to model cache accounting.

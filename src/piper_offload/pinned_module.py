@@ -516,17 +516,30 @@ def _validate_module_matches(
             if (
                 type(representation) is not torch.Tensor
                 or not representation.is_meta
-                or tuple(representation.shape) != tuple(pinned.shape)
+                or representation.layout is not torch.strided
+            ):
+                raise ValueError(
+                    f"Param {name!r} meta layout mismatch: store requires a "
+                    "plain strided meta tensor, module has "
+                    f"type={type(representation).__name__}, "
+                    f"device={representation.device}, layout={representation.layout}."
+                )
+            if (
+                tuple(representation.shape) != tuple(pinned.shape)
                 or representation.dtype is not pinned.compute_dtype
                 or representation.stride() != pinned_representation.stride()
+                or representation.storage_offset()
+                != pinned_representation.storage_offset()
             ):
                 raise ValueError(
                     f"Param {name!r} meta layout mismatch: store has "
                     f"shape={tuple(pinned.shape)}, dtype={pinned.compute_dtype}, "
                     f"stride={pinned_representation.stride()}, "
+                    f"storage_offset={pinned_representation.storage_offset()}, "
                     f"module has type={type(representation).__name__}, "
                     f"device={representation.device}, shape={tuple(representation.shape)}, "
-                    f"dtype={representation.dtype}, stride={representation.stride()}."
+                    f"dtype={representation.dtype}, stride={representation.stride()}, "
+                    f"storage_offset={representation.storage_offset()}."
                 )
             continue
         layout = PinnedParam.bind_layout_for(param)

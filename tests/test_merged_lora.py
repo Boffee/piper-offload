@@ -3212,6 +3212,123 @@ class TestPermanentMerge:
             merge_adapter(model, [(value, 1e-4)])
         assert model.weight.is_meta
 
+    @pytest.mark.parametrize(
+        "stride",
+        [
+            (0, 1),
+            (1, 1),
+            (3, 1),
+        ],
+        ids=["zero-stride-overlap", "nonzero-stride-overlap", "gapped"],
+    )
+    def test_parameter_value_rejects_unsupported_meta_layout(
+        self,
+        stride: tuple[int, int],
+    ) -> None:
+        source = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.empty_strided((2, 2), stride, device="meta"),
+            requires_grad=False,
+        )
+        value = Adapter.from_state_dict({"weight": source})
+
+        with pytest.raises(ValueError, match="non-overlapping dense meta target"):
+            merge_adapter(model, [(value, 1.0)])
+
+        assert model.weight.is_meta
+        assert model.weight.stride() == stride
+
+    def test_parameter_value_layout_preflight_prevents_partial_merge(self) -> None:
+        model = nn.Module()
+        model.base = nn.Linear(2, 2, bias=False)
+        model.value = nn.Parameter(
+            torch.empty_strided((2, 2), (0, 1), device="meta"),
+            requires_grad=False,
+        )
+        model.requires_grad_(False)
+        base_before = model.base.weight.detach().clone()
+        adapter = Adapter.from_state_dict(
+            {
+                "base.lora_A.weight": torch.ones(1, 2),
+                "base.lora_B.weight": torch.ones(2, 1),
+                "value": torch.arange(4, dtype=torch.float32).reshape(2, 2),
+            }
+        )
+
+        with pytest.raises(ValueError, match="non-overlapping dense meta target"):
+            merge_adapter(model, [(adapter, 1.0)])
+
+        torch.testing.assert_close(model.base.weight, base_before)
+        assert model.value.is_meta
+
+    def test_parameter_value_rejects_nonzero_meta_storage_offset(self) -> None:
+        source = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        backing = torch.empty(8, device="meta")
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            backing.as_strided((2, 2), (2, 1), 1),
+            requires_grad=False,
+        )
+        value = Adapter.from_state_dict({"weight": source})
+
+        with pytest.raises(ValueError, match="storage_offset=0"):
+            merge_adapter(model, [(value, 1.0)])
+
+        assert model.weight.is_meta
+        assert model.weight.storage_offset() == 1
+
+    def test_parameter_value_rejects_sparse_meta_layout(self) -> None:
+        indices = torch.empty((2, 0), dtype=torch.int64, device="meta")
+        values = torch.empty(0, device="meta")
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.sparse_coo_tensor(
+                indices,
+                values,
+                (2, 2),
+                device="meta",
+                check_invariants=False,
+            ),
+            requires_grad=False,
+        )
+        value = Adapter.from_state_dict({"weight": torch.empty(2, 2)})
+
+        with pytest.raises(ValueError, match="strided meta target"):
+            merge_adapter(model, [(value, 1.0)])
+
+        assert model.weight.is_meta
+        assert model.weight.layout is torch.sparse_coo
+
+    @pytest.mark.parametrize(
+        ("shape", "stride"),
+        [
+            ((1, 2), (0, 1)),
+            ((0, 2), (0, 1)),
+            ((), ()),
+        ],
+        ids=["size-one", "empty", "scalar"],
+    )
+    def test_parameter_value_accepts_degenerate_dense_layout(
+        self,
+        shape: tuple[int, ...],
+        stride: tuple[int, ...],
+    ) -> None:
+        source = torch.zeros(shape)
+        value = ParameterValue.from_tensor(source, pin_memory=False)
+        transform = ParameterValueTransform(value.scaled(1.0))
+        target = nn.Parameter(
+            torch.empty_strided(shape, stride, device="meta"),
+            requires_grad=False,
+        )
+
+        transform.validate_parameter(target)
+        materialized = transform.materialize()
+
+        assert materialized.shape == source.shape
+        assert materialized.stride() == stride
+        torch.testing.assert_close(materialized, source)
+
     def test_parameter_value_rejects_physical_target_with_wrong_stride(self) -> None:
         source = torch.arange(6, dtype=torch.float32).view(2, 3)
         value = ParameterValue.from_tensor(source, pin_memory=False)
@@ -3225,6 +3342,13 @@ class TestPermanentMerge:
         wrong_stride = nn.Parameter(torch.empty(2, 3), requires_grad=False)
         with pytest.raises(RuntimeError, match="matching the validated meta target"):
             transform.apply_parameter(wrong_stride)
+
+        wrong_offset = nn.Parameter(
+            torch.empty(7).as_strided((2, 3), (3, 1), 1),
+            requires_grad=False,
+        )
+        with pytest.raises(RuntimeError, match="matching the validated meta target"):
+            transform.apply_parameter(wrong_offset)
 
         materialized = transform.materialize()
         assert materialized.stride() == (1, 2)

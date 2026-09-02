@@ -92,7 +92,9 @@ class ParameterValueTransform:
     Validation runs against the model's storage-free meta placeholder. During
     activation, :meth:`apply_parameter` fills the physical storage allocated
     for that placeholder. Permanent merge uses :meth:`materialize` to create a
-    CPU parameter with the same logical layout.
+    CPU parameter with the same logical layout. Targets must have a strided,
+    non-overlapping dense layout with zero storage offset so every logical
+    element has one independently writable physical location.
     """
 
     __slots__ = ("_plan", "_value")
@@ -114,6 +116,7 @@ class ParameterValueTransform:
             raise ValueError(f"Parameter values require a floating-point meta target; got {target.dtype}.")
         if param.requires_grad:
             raise ValueError("Parameter values are inference-only and require requires_grad=False.")
+        _validate_target_layout(target)
 
         source = param_representation(self._value.value.backing.make_cpu_param())
         assert type(source) is torch.Tensor
@@ -150,8 +153,10 @@ class ParameterValueTransform:
         if (
             type(target) is not torch.Tensor
             or target.is_meta
+            or target.layout is not torch.strided
             or tuple(target.shape) != plan.shape
             or target.stride() != plan.stride
+            or target.storage_offset() != 0
             or target.dtype is not plan.dtype
         ):
             raise RuntimeError(
@@ -190,6 +195,46 @@ class ParameterValueTransform:
         target.copy_(plan.source, non_blocking=True)
         if plan.strength != 1.0:
             target.mul_(plan.strength)
+
+
+def _validate_target_layout(target: torch.Tensor) -> None:
+    """Require a layout that can represent and populate every source value."""
+    if target.layout is not torch.strided:
+        raise ValueError(
+            "Parameter values require a strided meta target; "
+            f"got layout {target.layout}."
+        )
+    if target.storage_offset() != 0:
+        raise ValueError(
+            "Parameter values require a meta target with storage_offset=0; "
+            f"got {target.storage_offset()}."
+        )
+    if not _is_non_overlapping_and_dense(target.shape, target.stride()):
+        raise ValueError(
+            "Parameter values require a non-overlapping dense meta target; "
+            f"got shape={tuple(target.shape)}, stride={target.stride()}."
+        )
+
+
+def _is_non_overlapping_and_dense(
+    shape: torch.Size,
+    stride: tuple[int, ...],
+) -> bool:
+    """Check dense strided layout without relying on private PyTorch APIs."""
+    if any(size == 0 for size in shape):
+        return True
+
+    dimensions = sorted(
+        (dimension_stride, size)
+        for size, dimension_stride in zip(shape, stride, strict=True)
+        if size > 1
+    )
+    expected_stride = 1
+    for dimension_stride, size in dimensions:
+        if dimension_stride != expected_stride:
+            return False
+        expected_stride *= size
+    return True
 
 
 def _validate_target_range(

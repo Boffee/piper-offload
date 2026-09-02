@@ -72,6 +72,21 @@ class TestPinnedParam:
         with pytest.raises(ValueError, match=message):
             PinnedParam(source)
 
+    def test_meta_parameter_rejects_sparse_layout(self) -> None:
+        source = nn.Parameter(
+            torch.sparse_coo_tensor(
+                torch.empty((2, 0), dtype=torch.int64, device="meta"),
+                torch.empty(0, device="meta"),
+                (2, 2),
+                device="meta",
+                check_invariants=False,
+            ),
+            requires_grad=False,
+        )
+
+        with pytest.raises(ValueError, match="strided layout"):
+            PinnedParam(source)
+
     def test_meta_parameter_cannot_materialize_without_parameter_value(self) -> None:
         source = nn.Parameter(
             torch.empty(3, 4, device="meta"),
@@ -95,6 +110,22 @@ class TestPinnedParam:
         assert contiguous.shape == transposed.shape
         assert contiguous.stride() != transposed.stride()
         assert PinnedParam.target_layout_for(contiguous) != PinnedParam.target_layout_for(transposed)
+
+    def test_meta_target_layout_includes_storage_offset(self) -> None:
+        backing = torch.empty(12, device="meta")
+        first = nn.Parameter(
+            backing.as_strided((2, 3), (3, 1), 1),
+            requires_grad=False,
+        )
+        second = nn.Parameter(
+            backing.as_strided((2, 3), (3, 1), 2),
+            requires_grad=False,
+        )
+
+        assert first.shape == second.shape
+        assert first.stride() == second.stride()
+        assert first.storage_offset() != second.storage_offset()
+        assert PinnedParam.target_layout_for(first) != PinnedParam.target_layout_for(second)
 
     def test_clone_to_pinned_cpu_rejects_gpu_less_windows_before_allocation(
         self,

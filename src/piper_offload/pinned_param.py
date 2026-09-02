@@ -96,6 +96,29 @@ class PinnedParam:
         # Params4bit). See ``param_representation``.
         representation = param_representation(param)
         self._shape = torch.Size(representation.shape)
+        self.requires_grad: bool = param.requires_grad
+        is_meta = representation.is_meta
+        if is_meta:
+            if type(representation) is not torch.Tensor:
+                raise NotImplementedError(
+                    "Meta parameters require a plain torch.Tensor representation; "
+                    f"got {type(representation).__name__}."
+                )
+            if representation.layout is not torch.strided:
+                raise ValueError(
+                    "Meta parameters must use a strided layout; "
+                    f"got {representation.layout}."
+                )
+            if not representation.is_floating_point():
+                raise ValueError(
+                    "Meta parameters must be floating-point; "
+                    f"got {representation.dtype}."
+                )
+            if self.requires_grad:
+                raise ValueError(
+                    "Meta parameters are inference-only and must have "
+                    "requires_grad=False."
+                )
         self.adapter: TensorAdapter[Any, Any] = select_adapter(representation)
         # Precompute the rearm capability once: the per-load check is a hot
         # path (every param, every block rotation), and a runtime_checkable
@@ -109,24 +132,7 @@ class PinnedParam:
         self._bind_layout = self._bind_layout_from_adapter(
             self.adapter, representation,
         )
-        self.requires_grad: bool = param.requires_grad
-        is_meta = representation.is_meta
         if is_meta:
-            if type(representation) is not torch.Tensor:
-                raise NotImplementedError(
-                    "Meta parameters require a plain torch.Tensor representation; "
-                    f"got {type(representation).__name__}."
-                )
-            if not representation.is_floating_point():
-                raise ValueError(
-                    "Meta parameters must be floating-point; "
-                    f"got {representation.dtype}."
-                )
-            if self.requires_grad:
-                raise ValueError(
-                    "Meta parameters are inference-only and must have "
-                    "requires_grad=False."
-                )
             # A meta tensor is the complete resting representation: it records
             # shape, dtype, and stride without owning physical host bytes.
             self.pinned_state = representation.detach()
@@ -165,10 +171,16 @@ class PinnedParam:
         signature: object = adapter.layout_signature(tensor)
         if tensor.is_meta:
             # Physical regular tensors are normalized to contiguous backing,
-            # but meta parameters retain their declared stride when active
-            # storage is allocated. Keep differently strided meta parameters
-            # out of the same streaming/rolling target pool.
-            signature = ("meta", signature, tensor.stride())
+            # but meta parameters retain their declared layout while resting.
+            # Keep differing meta layouts out of the same streaming/rolling
+            # target pool. Parameter values separately reject nonzero storage
+            # offsets because active allocation starts at offset zero.
+            signature = (
+                "meta",
+                signature,
+                tensor.stride(),
+                tensor.storage_offset(),
+            )
         return (type(adapter), signature)
 
     @staticmethod

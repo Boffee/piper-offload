@@ -915,6 +915,50 @@ class TestPinnedModuleInstance:
         assert target.weight.is_meta
         assert target.weight.stride() == (1, 2)
 
+    def test_rejects_meta_param_storage_offset_mismatch(self) -> None:
+        prototype_backing = torch.empty(12, device="meta")
+        prototype = nn.Module()
+        prototype.weight = nn.Parameter(
+            prototype_backing.as_strided((2, 3), (3, 1), 1),
+            requires_grad=False,
+        )
+        store = PinnedModuleStore.from_module(prototype)
+
+        target_backing = torch.empty(12, device="meta")
+        target = nn.Module()
+        target.weight = nn.Parameter(
+            target_backing.as_strided((2, 3), (3, 1), 2),
+            requires_grad=False,
+        )
+
+        with pytest.raises(ValueError, match="meta layout mismatch.*storage_offset"):
+            store.bind(target)
+
+        assert target.weight.storage_offset() == 2
+
+    def test_rejects_sparse_meta_bind_target(self) -> None:
+        prototype = nn.Module()
+        prototype.weight = nn.Parameter(
+            torch.empty(2, 2, device="meta"),
+            requires_grad=False,
+        )
+        store = PinnedModuleStore.from_module(prototype)
+
+        target = nn.Module()
+        target.weight = nn.Parameter(
+            torch.sparse_coo_tensor(
+                torch.empty((2, 0), dtype=torch.int64, device="meta"),
+                torch.empty(0, device="meta"),
+                (2, 2),
+                device="meta",
+                check_invariants=False,
+            ),
+            requires_grad=False,
+        )
+
+        with pytest.raises(ValueError, match="plain strided meta tensor"):
+            store.bind(target)
+
     def test_rejects_buffer_layout_mismatch(self) -> None:
         prototype = nn.Module()
         prototype.register_buffer("running", torch.randn(2))
