@@ -6,11 +6,11 @@ from torch import nn
 
 from piper_offload import (
     BlockCompileConfig,
-    LoRA,
+    Adapter,
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
-    merge_lora,
+    merge_adapter,
 )
 from piper_offload.float8_adapter import Float8Adapter
 from piper_offload.pinned_param import PinnedParam
@@ -591,14 +591,14 @@ class TestStaticFloat8Adapter:
         original_qdata = model.lin.weight.data.qdata.view(torch.uint8).clone()
         original_act_scale = model.lin.weight.data.act_quant_scale.clone()
         original_act_scale_ptr = model.lin.weight.data.act_quant_scale.data_ptr()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 16),
                 "lin.lora_B.weight": torch.randn(16, 4),
             }
         )
 
-        merged = merge_lora(model, [(lora, 1.0)])
+        merged = merge_adapter(model, [(lora, 1.0)])
 
         assert merged == 1
         assert not torch.equal(
@@ -699,7 +699,7 @@ class TestStaticFloat8Adapter:
                 )
             return model
 
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(4, 64),
                 "blocks.0.lora_B.weight": torch.randn(64, 4),
@@ -714,9 +714,9 @@ class TestStaticFloat8Adapter:
                 with activated_model(
                     offloader,
                     "cuda",
-                    loras=[lora],
-                    lora_strengths=[0.25],
-                    lora_mode=mode,
+                    adapters=[lora],
+                    adapter_strengths=[0.25],
+                    adapter_mode=mode,
                 ) as active:
                     assert torch.equal(
                         active.blocks[0].weight.data.act_quant_scale.cpu(),

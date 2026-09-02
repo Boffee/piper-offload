@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 import piper_offload.quanto_adapter as quanto_adapter_module
-from piper_offload import LoRA, ModelOffloader
+from piper_offload import Adapter, ModelOffloader
 from piper_offload.pinned_param import PinnedParam
 from piper_offload.quanto_adapter import QuantoAdapter
 from piper_offload.tensor_adapter_registry import tensor_id
@@ -246,7 +246,7 @@ class TestQuantoMarlin:
             alpha=strength,
         )
         expected = _quanto_absmax_oracle(expected_dense, like=target)
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "0.lora_A.weight": a,
                 "0.lora_B.weight": b,
@@ -267,9 +267,9 @@ class TestQuantoMarlin:
         with activated_model(
             offloader,
             "cuda",
-            loras=[lora],
-            lora_strengths=[strength],
-            lora_mode="merge",
+            adapters=[lora],
+            adapter_strengths=[strength],
+            adapter_mode="merge",
         ) as active:
             merged = active[0].weight.data
             assert type(merged) is WeightQBytesTensor

@@ -3,9 +3,9 @@
 High-level API:
 
 - :class:`ResourceCache` accepts structural :class:`ResourceSpec` implementations
-  and leases reusable model, LoRA, and object stores under a host-memory
+  and leases reusable model, adapter, and object stores under a host-memory
   budget. :class:`ModelCache` specializes it with model-aware use: it composes
-  a leased :class:`ModelSpec` with optional :class:`LoRASpec` resources and
+  a leased :class:`ModelSpec` with optional :class:`AdapterSpec` resources and
   activates the cached :class:`ModelOffloader`.
   :class:`ObjectSpec` caches general Python objects (tokenizers,
   processors, configs) in the same registry; by default they are
@@ -16,7 +16,7 @@ Lower-level resource bindings:
 - :class:`ModelOffloader` -- whole-model host-RAM bulk cache when
   created by ``ModelOffloader.from_module(model)``, or configurable block
   residency when constructed with ``block_paths`` or
-  ``transient_block_paths``. Block modes support optional LoRA merge,
+  ``transient_block_paths``. Block modes support optional adapter merge,
   opt-in forward-only block compilation for CUDA inference,
   path-selected transient pool lifetimes, trainable-parameter support,
   CUDA prefetch on a secondary stream, and
@@ -90,21 +90,28 @@ from a fresh model instance.
      automatic per-group rolling with streaming fallback independently of the
      paths' persistent or transient lifetime.
 
-Optional LoRA merging is requested directly on :meth:`ModelOffloader.activate`
-and resolved by installing post-copy hooks for managed parameter targets.
-Unknown targets raise during activation unless the LoRA resource explicitly
-allows partial targets, in which case application uses the intersection of
-LoRA targets and model parameters. The
+Optional adapter application is requested directly on
+:meth:`ModelOffloader.activate` and resolved by installing post-copy hooks for
+managed parameter targets. Unknown targets raise during activation unless the
+adapter resource explicitly allows partial targets, in which case application
+uses the intersection of adapter targets and model parameters. The
 hooks run immediately after the owning component copies a base weight
 from host storage to GPU, so block-streamed and non-block weights
 use the same merge path. Merge eligibility is owned by the selected
-tensor adapter: plain dense tensors opt into in-place ``addmm_``; structured
-quantized wrappers can opt into an adapter-owned staged merge that selects its
-own kernel or framework-operator fallback. Otherwise, use routed LoRA when the
-module exposes a compatible logical Linear weight shape and compute dtype.
+tensor adapter: physical plain floating-point tensors support in-place
+low-rank ``addmm_``; structured quantized wrappers can opt into a staged LoRA
+merge that selects its own kernel or framework fallback. Frozen plain
+floating-point meta tensors can instead be populated by parameter values.
+Otherwise, use routed LoRA when the module exposes a compatible logical Linear
+weight shape and compute dtype.
 
-:class:`LoRA` owns immutable factor storage, pinned by default or strictly
-adopted from existing CPU backing. Merge and routed consumers read
+Every non-factor entry accepted by :meth:`Adapter.from_state_dict` is the
+complete value for an exact-name parameter. These values are merge-only and
+populate storage-free frozen plain floating-point meta parameters; low-rank
+A/B factors do not materialize meta parameters.
+
+:class:`Adapter` owns immutable factor and parameter-value storage, pinned by
+default or strictly adopted from existing CPU backing. Compatible consumers read
 that backing directly and may overlap; routed hooks stage their own per-forward
 device copies.
 
@@ -118,7 +125,7 @@ adapter state that aliases the retained source storage.
 
 :class:`ResourceCache` manages cached backing stores with policy-driven
 eviction, reference-counted leases, and transactional admission.
-:class:`ModelCache` owns dependency leasing, LoRA attachment, and device
+:class:`ModelCache` owns dependency leasing, adapter attachment, and device
 activation. Each model offloader rejects overlapping use. Custom
 :class:`EvictionPolicy`
 implementations can replace the default LRU behavior. See its docstring
@@ -138,26 +145,27 @@ Compatibility
 - **Wrap before DDP/FSDP**, not after.
 - **Coarse cache concurrency.** :class:`ResourceCache` serializes cache
   metadata and lease operations and releases its lock while caller code
-  holds a lease. Model cache entries support one active use at a time; LoRA
+  holds a lease. Model cache entries support one active use at a time; adapter
   backing may be shared.
 """
 
+from .adapter import Adapter, AdapterMode, AdapterTarget
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent, BlockComponentStore
 from .block_mode import BlockMode
 from .gguf_adapter import GGUFWeight
 from .host_backing import HostBacking
-from .lora import (
-    LoRA,
-    LoRAFactor,
-    LoRAMode,
-    LoRATransform,
-    ScaledLoRAFactor,
-)
-from .merge import merge_lora
+from .lora import LoRAFactor, LoRATransform, ScaledLoRAFactor
+from .merge import merge_adapter
 from .model_cache import ModelCache
 from .model_offloader import ModelOffloader, ModelRuntimeInUseError
 from .mps_weights import MpsWeights
+from .parameter_transform import ParameterTransform
+from .parameter_value import (
+    ParameterValue,
+    ParameterValueTransform,
+    ScaledParameterValue,
+)
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .protocols import (
     ResourceBinding,
@@ -179,7 +187,7 @@ from .resource_cache import (
     ResourceNotRegisteredError,
     ResourceTooLargeError,
 )
-from .resource_specs import LoRASpec, ModelSpec, ObjectSpec
+from .resource_specs import AdapterSpec, ModelSpec, ObjectSpec
 from .seeding import derive_seed
 from .tensor_adapter_registry import register_adapter
 from .tensor_adapters import (
@@ -188,6 +196,10 @@ from .tensor_adapters import (
 )
 
 __all__ = [
+    "Adapter",
+    "AdapterMode",
+    "AdapterSpec",
+    "AdapterTarget",
     "AdoptableTensorAdapter",
     "BlockCompileConfig",
     "BlockComponent",
@@ -202,10 +214,7 @@ __all__ = [
     "GGUFWeight",
     "HostBacking",
     "LRUEvictionPolicy",
-    "LoRA",
     "LoRAFactor",
-    "LoRAMode",
-    "LoRASpec",
     "LoRATransform",
     "ModelCache",
     "ModelOffloader",
@@ -213,6 +222,9 @@ __all__ = [
     "ModelSpec",
     "MpsWeights",
     "ObjectSpec",
+    "ParameterTransform",
+    "ParameterValue",
+    "ParameterValueTransform",
     "PinnedComponent",
     "PinnedComponentStore",
     "ResourceBinding",
@@ -225,8 +237,9 @@ __all__ = [
     "ResourceStore",
     "ResourceTooLargeError",
     "ScaledLoRAFactor",
+    "ScaledParameterValue",
     "TensorAdapter",
     "derive_seed",
-    "merge_lora",
+    "merge_adapter",
     "register_adapter",
 ]

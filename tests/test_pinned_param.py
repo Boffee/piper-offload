@@ -25,6 +25,108 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 class TestPinnedParam:
+    @pytest.mark.parametrize("pin_memory", [True, False])
+    def test_meta_parameter_has_no_host_storage(
+        self,
+        pin_memory: bool,
+    ) -> None:
+        source = nn.Parameter(
+            torch.empty_strided(
+                (3, 4),
+                (1, 3),
+                dtype=torch.bfloat16,
+                device="meta",
+            ),
+            requires_grad=False,
+        )
+
+        pinned = PinnedParam(source, pin_memory=pin_memory)
+        restored = pinned.make_cpu_param()
+
+        assert pinned.is_meta
+        assert pinned.cache_bytes == 0
+        assert pinned.compute_dtype is torch.bfloat16
+        assert restored.is_meta
+        assert restored.shape == source.shape
+        assert restored.stride() == source.stride()
+        assert not restored.requires_grad
+
+    @pytest.mark.parametrize(
+        ("dtype", "requires_grad", "message"),
+        [
+            (torch.int32, False, "floating-point"),
+            (torch.float32, True, "requires_grad=False"),
+        ],
+    )
+    def test_meta_parameter_rejects_unsupported_state(
+        self,
+        dtype: torch.dtype,
+        requires_grad: bool,
+        message: str,
+    ) -> None:
+        source = nn.Parameter(
+            torch.empty(3, 4, dtype=dtype, device="meta"),
+            requires_grad=requires_grad,
+        )
+
+        with pytest.raises(ValueError, match=message):
+            PinnedParam(source)
+
+    def test_meta_parameter_rejects_sparse_layout(self) -> None:
+        source = nn.Parameter(
+            torch.sparse_coo_tensor(
+                torch.empty((2, 0), dtype=torch.int64, device="meta"),
+                torch.empty(0, device="meta"),
+                (2, 2),
+                device="meta",
+                check_invariants=False,
+            ),
+            requires_grad=False,
+        )
+
+        with pytest.raises(ValueError, match="strided layout"):
+            PinnedParam(source)
+
+    def test_meta_parameter_cannot_materialize_without_parameter_value(self) -> None:
+        source = nn.Parameter(
+            torch.empty(3, 4, device="meta"),
+            requires_grad=False,
+        )
+        pinned = PinnedParam(source)
+
+        with pytest.raises(RuntimeError, match="active parameter value"):
+            pinned.materialize(torch.device("cpu"))
+
+    def test_meta_target_layout_includes_stride(self) -> None:
+        contiguous = nn.Parameter(
+            torch.empty(2, 3, device="meta"),
+            requires_grad=False,
+        )
+        transposed = nn.Parameter(
+            torch.empty(3, 2, device="meta").t(),
+            requires_grad=False,
+        )
+
+        assert contiguous.shape == transposed.shape
+        assert contiguous.stride() != transposed.stride()
+        assert PinnedParam.target_layout_for(contiguous) != PinnedParam.target_layout_for(transposed)
+
+    def test_meta_target_layout_includes_storage_offset(self) -> None:
+        backing = torch.empty(12, device="meta")
+        first = nn.Parameter(
+            backing.as_strided((2, 3), (3, 1), 1),
+            requires_grad=False,
+        )
+        second = nn.Parameter(
+            backing.as_strided((2, 3), (3, 1), 2),
+            requires_grad=False,
+        )
+
+        assert first.shape == second.shape
+        assert first.stride() == second.stride()
+        assert first.storage_offset() != second.storage_offset()
+        assert PinnedParam.target_layout_for(first) != PinnedParam.target_layout_for(second)
+
     def test_clone_to_pinned_cpu_rejects_gpu_less_windows_before_allocation(
         self,
         monkeypatch: pytest.MonkeyPatch,

@@ -11,7 +11,7 @@ Per-parameter mechanics live in the tensor adapter
 quanto). :class:`PinnedParam` is a thin holder that pairs one
 :class:`nn.Parameter` with the adapter that handles its tensor type
 plus the pinned-host state that adapter produced. Optional operations
-such as D2H round-trip, trainable ``.data`` swap, and dense updates
+such as D2H round-trip, trainable ``.data`` swap, and in-place updates
 are exposed through adapter capability methods.
 """
 
@@ -71,6 +71,11 @@ class PinnedParam:
     can drop wrapper state. Adopted construction instead aliases existing
     frozen CPU storage, never copies or normalizes it, and leaves the source
     parameter untouched until the owning store binds successfully.
+
+    A frozen plain floating-point meta parameter retains its shape, dtype, and
+    stride without host backing or cache charge. It remains meta unless a
+    merge-mode parameter value allocates and fills active device storage.
+    Low-rank factors cannot materialize it.
     """
 
     __slots__ = (
@@ -91,6 +96,29 @@ class PinnedParam:
         # Params4bit). See ``param_representation``.
         representation = param_representation(param)
         self._shape = torch.Size(representation.shape)
+        self.requires_grad: bool = param.requires_grad
+        is_meta = representation.is_meta
+        if is_meta:
+            if type(representation) is not torch.Tensor:
+                raise NotImplementedError(
+                    "Meta parameters require a plain torch.Tensor representation; "
+                    f"got {type(representation).__name__}."
+                )
+            if representation.layout is not torch.strided:
+                raise ValueError(
+                    "Meta parameters must use a strided layout; "
+                    f"got {representation.layout}."
+                )
+            if not representation.is_floating_point():
+                raise ValueError(
+                    "Meta parameters must be floating-point; "
+                    f"got {representation.dtype}."
+                )
+            if self.requires_grad:
+                raise ValueError(
+                    "Meta parameters are inference-only and must have "
+                    "requires_grad=False."
+                )
         self.adapter: TensorAdapter[Any, Any] = select_adapter(representation)
         # Precompute the rearm capability once: the per-load check is a hot
         # path (every param, every block rotation), and a runtime_checkable
@@ -104,8 +132,11 @@ class PinnedParam:
         self._bind_layout = self._bind_layout_from_adapter(
             self.adapter, representation,
         )
-        self.requires_grad: bool = param.requires_grad
-        if pin_memory:
+        if is_meta:
+            # A meta tensor is the complete resting representation: it records
+            # shape, dtype, and stride without owning physical host bytes.
+            self.pinned_state = representation.detach()
+        elif pin_memory:
             self.pinned_state = self.adapter.clone_pin(representation)
         elif self.requires_grad:
             raise ValueError(
@@ -130,14 +161,27 @@ class PinnedParam:
         # construction; see the class docstring for failure semantics.
         # Only safe for plain tensors; subclass wrappers (and Parameter
         # subclasses) can lose metadata or ignore .data assignment.
-        if pin_memory and type(representation) is torch.Tensor:
+        if pin_memory and not is_meta and type(representation) is torch.Tensor:
             param.data = self.make_cpu_param().data
 
     @staticmethod
     def _target_layout_from_adapter(
         adapter: TensorAdapter[Any, Any], tensor: torch.Tensor,
     ) -> tuple[object, object]:
-        return (type(adapter), adapter.layout_signature(tensor))
+        signature: object = adapter.layout_signature(tensor)
+        if tensor.is_meta:
+            # Physical regular tensors are normalized to contiguous backing,
+            # but meta parameters retain their declared layout while resting.
+            # Keep differing meta layouts out of the same streaming/rolling
+            # target pool. Parameter values separately reject nonzero storage
+            # offsets because active allocation starts at offset zero.
+            signature = (
+                "meta",
+                signature,
+                tensor.stride(),
+                tensor.storage_offset(),
+            )
+        return (type(adapter), signature)
 
     @staticmethod
     def _bind_layout_from_adapter(
@@ -188,6 +232,11 @@ class PinnedParam:
         """Shape of the source parameter representation at pin time."""
         return self._shape
 
+    @property
+    def is_meta(self) -> bool:
+        """Whether the resting parameter representation is meta."""
+        return type(self.pinned_state) is torch.Tensor and self.pinned_state.is_meta
+
     def make_cpu_param(self) -> nn.Parameter:
         """Build a CPU :class:`nn.Parameter` wrapper over this pinned state.
 
@@ -195,6 +244,11 @@ class PinnedParam:
         underlying pinned storage remains shared through this
         :class:`PinnedParam`.
         """
+        if self.is_meta:
+            return nn.Parameter(
+                cast(torch.Tensor, self.pinned_state),
+                requires_grad=False,
+            )
         return self.adapter.cpu_param(
             self.pinned_state, requires_grad=self.requires_grad,
         )
@@ -204,6 +258,14 @@ class PinnedParam:
         Returns an opaque adapter-specific handle; pass it back to
         :meth:`make_gpu_param`, :meth:`copy_to_gpu`, and
         :meth:`copy_to_cpu`."""
+        if self.is_meta:
+            source = cast(torch.Tensor, self.pinned_state)
+            return torch.empty_strided(
+                tuple(source.shape),
+                source.stride(),
+                dtype=source.dtype,
+                device=device,
+            )
         return self.adapter.alloc_gpu(self.pinned_state, device)
 
     def make_gpu_param(self, gpu_state: object) -> nn.Parameter:
@@ -211,12 +273,18 @@ class PinnedParam:
         Adapter receives the paired pinned state so structured tensor
         types (quanto) can reconstruct their wrappers. The wrapper's
         ``requires_grad`` matches the source parameter's at pin time."""
+        if self.is_meta:
+            return nn.Parameter(cast(torch.Tensor, gpu_state), requires_grad=False)
         return self.adapter.gpu_param(
             self.pinned_state, gpu_state, requires_grad=self.requires_grad,
         )
 
     def copy_to_gpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk DMA pinned host bytes into pre-allocated GPU storage."""
+        if self.is_meta:
+            # The activation-scoped parameter-value hook populates this storage
+            # directly. There are deliberately no zero bytes to transfer.
+            return
         self.adapter.copy_to_gpu(self.pinned_state, gpu_state, non_blocking=non_blocking)
 
     def copy_to_cpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
@@ -229,6 +297,10 @@ class PinnedParam:
         representation is not round-trippable do not expose this
         capability and raise :class:`NotImplementedError` here.
         """
+        if self.is_meta:
+            raise NotImplementedError(
+                "Meta parameters have no physical host backing to update."
+            )
         if not isinstance(self.adapter, CpuRoundTripTensorAdapter):
             raise NotImplementedError(
                 f"{adapter_name(self.adapter)} does not support CPU round-trip: "
@@ -269,6 +341,11 @@ class PinnedParam:
         CUDA materialization returns a parameter wrapping fresh adapter
         storage.
         """
+        if self.is_meta:
+            raise RuntimeError(
+                "A meta parameter cannot be materialized without an "
+                "active parameter value."
+            )
         if device.type == "cpu":
             return self.make_cpu_param()
         if device.type != "cuda":
@@ -297,6 +374,10 @@ class PinnedParam:
         compatibility and a D2H path back into pinned host state after
         optimizer updates.
         """
+        if self.is_meta:
+            raise NotImplementedError(
+                "Meta parameters are frozen and cannot use Parameter.data swap."
+            )
         if not isinstance(self.adapter, ParameterDataSwapTensorAdapter):
             raise NotImplementedError(
                 f"Trainable streaming requires a Parameter.data-swap-capable "
@@ -322,4 +403,6 @@ class PinnedParam:
     @property
     def cache_bytes(self) -> int:
         """Logical host bytes reported by this parameter's adapter."""
+        if self.is_meta:
+            return 0
         return self.adapter.cache_bytes(self.pinned_state)

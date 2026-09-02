@@ -9,11 +9,11 @@ from torch import nn
 import piper_offload.bnb4bit_adapter as bnb4bit_adapter_impl
 
 from piper_offload import (
-    LoRA,
+    Adapter,
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
-    merge_lora,
+    merge_adapter,
 )
 from piper_offload.bnb4bit_adapter import Bnb4bitAdapter
 from piper_offload.pinned_param import PinnedParam
@@ -343,14 +343,14 @@ class TestBnb4bitAdapter:
         # copy_into mutates the weight's packed storage in place, so snapshot
         # the original bytes rather than holding a tensor reference.
         original_packed = model.lin.weight.data.data.clone()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 32),
                 "lin.lora_B.weight": torch.randn(64, 4),
             }
         )
 
-        merged = merge_lora(model, [(lora, 1.0)])
+        merged = merge_adapter(model, [(lora, 1.0)])
 
         assert merged == 1
         assert not torch.equal(model.lin.weight.data.data, original_packed)
@@ -377,11 +377,11 @@ class TestBnb4bitAdapter:
                 weight=weight.clone(),
                 double_quant=True,
             )
-            lora = LoRA.from_state_dict(
+            lora = Adapter.from_state_dict(
                 state_dict={key: value.clone() for key, value in state_dict.items()}
             )
             assert (
-                merge_lora(
+                merge_adapter(
                     model,
                     [(lora, 0.125)],
                     stochastic_rounding=True,
@@ -409,7 +409,7 @@ class TestBnb4bitAdapter:
         )
         offloader = _make_model_offloader(model)
         generator = torch.Generator().manual_seed(321)
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 32, generator=generator),
                 "lin.lora_B.weight": torch.randn(64, 4, generator=generator),
@@ -421,9 +421,9 @@ class TestBnb4bitAdapter:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.125],
-                lora_mode="merge",
+                adapters=[lora],
+                adapter_strengths=[0.125],
+                adapter_mode="merge",
                 stochastic_rounding=True,
             ) as active:
                 samples.append(
@@ -1003,7 +1003,7 @@ class TestBnb4bitAdapter:
             model,
             block_paths=["blocks"],
         )
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(4, 128),
                 "blocks.0.lora_B.weight": torch.randn(128, 4),
@@ -1013,9 +1013,9 @@ class TestBnb4bitAdapter:
             x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
             with activated_model(offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.25],
-                lora_mode="routed",
+                adapters=[lora],
+                adapter_strengths=[0.25],
+                adapter_mode="routed",
             ) as active:
                 y = active(x)
                 torch.cuda.synchronize()

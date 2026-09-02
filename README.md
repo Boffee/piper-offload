@@ -1,7 +1,7 @@
 # Piper Offload
 
 A model-agnostic GPU/CPU memory manager for PyTorch. It caches reusable
-model and LoRA resources, and swaps independent models in and out of
+model and adapter resources, and swaps independent models in and out of
 GPU memory under a policy-driven cache.
 
 Piper Offload is self-contained and library-friendly: it has no required
@@ -41,15 +41,18 @@ is not required.
 | Module | Role |
 |---|---|
 | `resource_cache.py` | `ResourceCache`, eviction policy, cache metadata, and cache errors |
-| `model_cache.py` | `ModelCache` — model-aware `ResourceCache` with activation and LoRA coordination |
-| `resource_specs.py` | `ModelSpec`, `LoRASpec`, `ObjectSpec` — standard frozen resource specifications |
+| `model_cache.py` | `ModelCache` — model-aware `ResourceCache` with activation and adapter coordination |
+| `resource_specs.py` | `ModelSpec`, `AdapterSpec`, `ObjectSpec` — standard frozen resource specifications |
 | `protocols.py` | `ResourceSpec`, `ResourceStore`, `ResourceBinding` plug-in contracts |
 | `block_compile.py` | `BlockCompileConfig` — opt-in Inductor policy for declared block forwards |
 | `model_offloader.py` | `ModelOffloader` — cached single-model runtime for whole-model bulk pinned-CPU↔GPU or streamed block offload |
 | `pinned_component.py` | `PinnedComponentStore`, `PinnedComponent` — lower-level reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
 | `block_component.py` | `BlockComponentStore`, `BlockComponent` — lower-level streamed backing storage plus per-block-list streaming component |
-| `lora.py` | `LoRA`, `LoRATransform` — cached host-backed factors plus merge and routed application hooks |
-| `merge.py` | `merge_lora()` — permanent in-place LoRA merge into base weights |
+| `adapter.py` | `Adapter`, `AdapterTarget` — cached resources and their LoRA-or-value target union |
+| `lora.py` | `LoRAFactor`, `ScaledLoRAFactor`, `LoRATransform` — low-rank data, merge, and routed execution |
+| `parameter_value.py` | `ParameterValue`, `ScaledParameterValue`, `ParameterValueTransform` — meta-parameter data and materialization |
+| `parameter_transform.py` | `ParameterTransform` — shared parameter-update protocol |
+| `merge.py` | `merge_adapter()` — permanent in-place adapter application to base weights |
 | `seeding.py` | `derive_seed()` — canonical stable unsigned 64-bit seed derivation from typed identity parts |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, Piper ConvRot INT8 / NVFP4, DTensor, and TorchAO dynamic/static scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
@@ -65,7 +68,7 @@ is not required.
 | `_torchao_mx.py` | Internal: TorchAO MX (MXFP8 / MXFP4) optional-import + layout validation, supported-dtype gate, and dequant/requant; consumed by `mx_adapter.py` |
 | `_torchao_float8.py`, `_torchao_static_float8.py` | Internal: TorchAO dynamic/weight-only `Float8Tensor` and calibrated static `PrototypeFloat8Tensor` optional imports, layout validation, and dequant/requant; consumed by the corresponding FP8 adapters |
 | `_torchao_int8.py` | Internal: TorchAO INT8 optional-import + layout validation and dequant/requant; consumed by `int8_adapter.py` |
-| `_triton_*_lora.py` | Internal: format-specific CUDA LoRA merge kernels; adapters select them only for validated raw layouts and otherwise use their reference merge |
+| `_triton_*_lora.py` | Internal: format-specific CUDA LoRA merge kernels; tensor adapters select them only for validated raw layouts and otherwise use their reference merge |
 | `_torchao_int4_tile.py` | Internal: TorchAO INT4 tile-packed (CUDA-native tinygemm) optional-import + layout validation; consumed by `int4_tile_adapter.py` |
 | `_dtensor.py` | Internal: PyTorch `DTensor` optional-import + mesh/placements signatures and local-shard rewrap; consumed by `dtensor_adapter.py` |
 
@@ -83,11 +86,11 @@ same host-memory budget.
 
 This library gives you:
 
-1. **Cached resources** that pin reusable model or LoRA state to host RAM.
+1. **Cached resources** that pin reusable model or adapter state to host RAM.
 2. **Activation lifecycles** that move one cached model onto a compute device.
 3. **A resource cache** that evicts least-recently-used unleased entries and
    protects leased stores from eviction.
-4. **A model-aware cache** that leases model and LoRA resources and owns their
+4. **A model-aware cache** that leases model and adapter resources and owns their
    device lifecycle.
 
 ## When to use what
@@ -96,7 +99,7 @@ This library gives you:
 |---|---|
 | Most application code, especially multiple models or repeated calls | Use **`ModelCache`** with **`ModelSpec`** |
 | Model too big for a CUDA GPU even when active | Use **`ModelSpec(..., block_paths=...)`** for automatic block streaming |
-| LoRA adapters reused across calls | Pass **`LoRASpec`** entries through **`ModelCache.use()`** |
+| Adapters reused across calls | Pass **`AdapterSpec`** entries through **`ModelCache.use()`** |
 | Low-level/manual lifecycle for one model | Use **`ModelOffloader.from_module(model)`** directly |
 | Component or resource development | Use the lower-level store/binding protocols and component stores directly |
 
@@ -123,7 +126,7 @@ with cache.use(model_spec, device=device) as gpu_model:
 ```
 
 `ModelCache` inherits the complete `ResourceCache` API, adding model activation
-and LoRA coordination to the same registry and memory budget. `ModelSpec`
+and adapter coordination to the same registry and memory budget. `ModelSpec`
 factories should build fresh modules. One model cache entry contains one
 `ModelOffloader` and one model instance. Uses are sequential:
 an overlapping activation raises `ModelRuntimeInUseError`. Applications that
@@ -163,7 +166,7 @@ directly into the existing GPU target pool; CUDA owns any implicit staging.
 Trainable parameters, non-CPU tensors, incompatible layouts, and adapters that
 cannot preserve the source representation raise instead of silently
 materializing a copy. The policy applies to both streamed blocks and the
-non-streamed model remainder. LoRA resources choose their host storage
+non-streamed model remainder. Adapter resources choose their host storage
 independently (pinned by default), and `cache_bytes` accounts for model bytes
 the same way in either mode using each tensor adapter's logical byte count.
 For mmap backing, this is the size of the retained model tensors, not the
@@ -268,7 +271,7 @@ distinct tensor-layout signature.
 `ModelOffloader` only streams on CUDA. Activating the binding on
 `cpu` is a pass-through over the already-installed pinned CPU storage:
 no target pool, no streaming hooks, no weight copies.
-`lora_mode="merge"` is CUDA-only; use routed LoRA mode for
+`adapter_mode="merge"` is CUDA-only; use routed LoRA mode for
 CPU activation. Routed LoRA installs target-Linear hooks: a forward-PRE
 hook copies that target's host-backed factors to the input device, and a
 forward-POST hook applies the residual and releases those device copies.
@@ -371,11 +374,11 @@ Compilation is inference-only in this initial implementation. Training remains
 available without `block_compile`, but combining block compilation with
 autograd is unsupported until it has dedicated correctness coverage.
 
-Merge-mode LoRA remains compatible. If any routed LoRA is active, every
+Merge-mode adapter application remains compatible. If any routed LoRA is active, every
 declared block runs eagerly for that activation because routed child-Linear
 hooks stage parameters inside the block forward. The bypass is temporary:
 a later activation with no routed LoRA uses compiled forwards again.
-Selecting `lora_mode="routed"` without supplying a LoRA does not bypass
+Selecting `adapter_mode="routed"` without supplying an adapter does not bypass
 compilation.
 
 Experimental rolling mode replaces ordinary whole-block targets with one
@@ -411,8 +414,8 @@ analysis sees their rewritten graph. Waits and refills are non-mutating ordered
 host effects with late scheduler-only ordering edges. They neither consume
 reader tensors nor model an immutable parameter as mutated, avoiding forced
 intermediate materialization while preserving the ordinary fusion, memory
-coalescing, and kernel-autotuning plan. For adapters that support merge-mode
-LoRA, merge hooks run after every base refill on the copy stream. GGUF and
+coalescing, and kernel-autotuning plan. For factors whose tensor formats
+support merge-mode LoRA, merge hooks run after every base refill on the copy stream. GGUF and
 TorchAO INT4 tile-packed weights retain their existing no-merge restriction.
 
 Explicit rolling deliberately fails closed outside its tested contract: `fullgraph=True`,
@@ -467,39 +470,84 @@ mode. In streaming mode it is GPU-resident while its block is resident, plus
 during the optimizer update. CPU activation remains pass-through.
 Gradients are not streamed; PyTorch owns `param.grad` normally.
 
-### LoRA merge
+### Adapter application
 
-`ModelOffloader` supports optional per-weight LoRA merging through activation
-arguments. Merge mode
+`ModelOffloader` supports optional per-parameter adapter updates through
+activation arguments. Merge mode
 installs activation-scoped post-copy hooks for managed parameter
-targets. Unknown targets raise during activation by default. A LoRA that is
+targets. Unknown targets raise during activation by default. An adapter that is
 intentionally shared across separately loaded model components can set
 `allow_partial_targets=True`; its merge and routed uses then apply only the
 intersection of adapter targets and model parameters, including a valid no-op
 when that intersection is empty. Present targets still receive the ordinary
-shape and capability validation. LoRA target keys must
+shape and capability validation. Adapter target keys must
 match the model's parameter names exactly; any remapping — stripping a
 `diffusion_model.` prefix, inserting a PEFT `.base_layer.` segment — is
-the caller's job when building the LoRA state dict. Each hook runs
+the caller's job when building the adapter state dict. Each hook runs
 immediately after the owning
 component copies the base weight from pinned CPU storage to GPU, so both
 block-streamed and non-block weights use the same merge path. Merge
-compatibility is adapter-owned: plain dense tensors opt into in-place
-`addmm_`; structured quantized wrappers can opt into an adapter-owned staged
-merge, whose implementation may select a format-specific kernel or its own
-framework-operator fallback. Use routed mode for formats that do not expose
-either merge capability but still provide a compatible logical Linear weight
-shape and compute dtype. `PinnedParam`
-remains a storage primitive; LoRA merge mode asks the selected adapter
-for the required update capability.
+compatibility is tensor-format-owned: physical plain floating-point tensors
+accept low-rank `addmm_`; structured quantized wrappers may opt into a staged
+LoRA merge whose implementation selects a format-specific kernel or framework
+fallback. Frozen plain floating-point meta tensors can instead be populated by
+parameter values. Routed mode remains factor-only and requires a compatible
+logical `nn.Linear` shape and compute dtype. `PinnedParam` remains a storage
+primitive; transforms ask the selected tensor adapter for their required
+capabilities.
 
-The LoRA request is scoped to one `activate()` call. Target lookup
-is resolved during activation; target
-compatibility can be preflighted with `LoRATransform.validate_target()`
-or validated when the merge hook applies.
+`Adapter.from_state_dict()` reserves keys ending in `.lora_A.weight`,
+`.lora_B.weight`, and the legacy `.lora_B.bias` for low-rank factors. Every
+other entry is a `ParameterValue` whose key is the exact model parameter name
+and whose source is a physical floating-point tensor with the same shape as
+the target. Parameter values populate only frozen plain floating-point meta
+parameters. A target cannot contain both LoRA factors and a parameter value:
+
+```python
+feature_adapter = Adapter.from_state_dict(
+    {
+        "guidance_embedder.weight": guidance_weight,
+        "guidance_embedder.bias": guidance_bias,
+    }
+)
+```
+
+`Adapter.targets` is one immutable exact-name mapping. `AdapterTarget` is the
+union `LoRAFactor | ParameterValue`, so every mapped target is already in a
+valid, concrete form.
+
+The resource-level API uses `Adapter`, `AdapterMode`, `AdapterSpec`, and
+`merge_adapter`; activation arguments use the corresponding `adapter_*` names.
+
+Parameter values are merge-only: routed mode rejects the request. For a meta
+target, merge mode materializes `strength * value`. Only one active parameter
+value may own a target; repeated or competing values are rejected. Parameter
+values do not apply to existing physical parameters, quantized tensors,
+DTensors, or tensor subclasses. Their meta targets must have strided,
+non-overlapping dense layouts with zero storage offset; this includes ordinary
+contiguous and transposed dense parameters but excludes overlapping or gapped
+views that cannot be populated while preserving the declared layout.
+
+A frozen plain floating-point meta parameter has no host backing and
+contributes zero bytes to model cache accounting.
+Without an active parameter value it stays meta and no CUDA slot is allocated;
+executing a module that still references it is the caller's error. With a
+parameter value, resident, streaming, rolling, and automatic block modes allocate
+active storage and fill it directly from the scaled source—there is no base
+storage to allocate or copy. Deactivation restores the meta parameter. Low-rank
+A/B factors cannot materialize a meta target. Rolling allocates the union
+of slots needed by its homogeneous block group. If another block requires the
+same rolling slot, inactive blocks may temporarily reference that already
+allocated storage; its inactive contents are unspecified and consume no
+additional VRAM.
+
+The adapter request is scoped to one `activate()` call. Target lookup
+is resolved and both factor and parameter-value compatibility are preflighted during
+activation. Direct factor transforms use `LoRATransform.validate_target()`;
+direct value transforms use `ParameterValueTransform.validate_parameter()`.
 
 For backward compatibility, older PEFT/Wan adapters may include an optional
-`<module>.lora_B.bias` vector alongside their A/B matrices. `LoRA` detects and
+`<module>.lora_B.bias` vector alongside their A/B matrices. `Adapter` detects and
 stores that vector automatically; modern A/B-only adapters keep the existing
 path unchanged. Merge mode applies the vector to the module's existing plain
 dense bias with the same adapter strength. It raises before mutation when the
@@ -509,12 +557,17 @@ parameter. Direct `LoRATransform` use treats this as one logical operation via
 and application remain explicit phases. Offloaded activation uses separate
 weight and bias post-copy callbacks so neither update can be overwritten by a
 later parameter copy. Routed mode can apply the vector as part of its output
-residual even when the base `nn.Linear` has no bias. Native Wan/ComfyUI `.diff_b`
-conversion remains the caller's responsibility.
+residual even when the base `nn.Linear` has no bias. Native Wan/ComfyUI `.diff`
+and `.diff_b` parsing remains the caller's responsibility. Only tensors that
+represent complete values for meta model parameters belong under their exact
+parameter names; additive diffs for existing physical parameters are not
+supported. A converter must also remove checkpoint metadata and other
+non-adapter entries, since all non-factor entries are treated as parameter
+values.
 
 ```python
 import torch
-from piper_offload import ModelOffloader, LoRA
+from piper_offload import ModelOffloader, Adapter
 from safetensors.torch import load_file
 
 offload = ModelOffloader.from_module(
@@ -524,19 +577,19 @@ offload = ModelOffloader.from_module(
 )
 device = torch.device("cuda")
 
-# Each LoRA owns immutable factors shared by merge and routed uses.
-lora_a = LoRA.from_state_dict(
+# Each Adapter owns immutable tensors shared by compatible uses.
+lora_a = Adapter.from_state_dict(
     state_dict=load_file("lora_a.safetensors"),
 )
-lora_b = LoRA.from_state_dict(
+lora_b = Adapter.from_state_dict(
     state_dict=load_file("lora_b.safetensors"),
 )
 
 offload.activate(
     device,
-    loras=[lora_a, lora_b],
-    lora_strengths=[0.8, 0.5],
-    lora_mode="merge",
+    adapters=[lora_a, lora_b],
+    adapter_strengths=[0.8, 0.5],
+    adapter_mode="merge",
 )
 try:
     output = offload.value(input_tensor)
@@ -544,19 +597,19 @@ finally:
     offload.deactivate()
 ```
 
-LoRA entries are ordered contributions. Repeating the same `LoRA` applies it
-again, and each occurrence uses the corresponding `lora_strengths` value.
+Adapter entries are ordered contributions. Repeating the same `Adapter` applies it
+again, and each occurrence uses the corresponding `adapter_strengths` value.
 
-Quantized merge uses stochastic rounding by default so LoRA updates smaller
+Quantized LoRA merge uses stochastic rounding by default so factor updates smaller
 than one quantization step are not systematically rounded away. Opt into
 deterministic round-to-nearest when exact deterministic codes are required:
 
 ```python
 offload.activate(
     device,
-    loras=[lora_a],
-    lora_strengths=[0.8],
-    lora_mode="merge",
+    adapters=[lora_a],
+    adapter_strengths=[0.8],
+    adapter_mode="merge",
     stochastic_rounding=False,
 )
 ```
@@ -566,9 +619,10 @@ full parameter path and that transform's merge count, then used by backend-local
 randomness without consuming PyTorch's global RNG. Reapplying a streamed merge
 therefore uses a fresh deterministic sample each time. DTensor additionally
 derives a seed from each shard's global offsets, while replicated ranks retain
-matching samples. All LoRAs for a target are accumulated and rounded once.
-Dense targets still use their exact `addmm_` update. Routed mode ignores the
-option because it never requantizes the base.
+matching samples. All low-rank contributions for a target are accumulated and
+rounded once. Parameter values use plain floating-point copies and scaling and
+do not consume the stochastic-rounding seed. Routed mode ignores the option
+because it never requantizes the base.
 
 `derive_seed(*parts)` is the public canonical derivation utility used by this
 path. It accepts strings and unsigned 64-bit integers and is useful when an
@@ -580,43 +634,43 @@ from piper_offload import derive_seed
 local_seed = derive_seed(parent_seed, shard_offset)
 ```
 
-LoRA factors use pinned storage by default. To retain existing anonymous
-pageable or mmap/file-backed CPU tensors without copying them, use strict
-adoption:
+Adapter factor and parameter-value tensors use pinned storage by default. To retain existing
+anonymous pageable or mmap/file-backed CPU tensors without copying them, use
+strict adoption:
 
 ```python
-lora = LoRA.from_state_dict(
+lora = Adapter.from_state_dict(
     state_dict=load_file("lora.safetensors"),
     host_backing="adopt",
 )
 ```
 
 The loader must return tensors that still reference the desired backing.
-Adopted LoRA backing requires contiguous CPU factors and raises rather than
+Adopted adapter backing requires contiguous CPU tensors and raises rather than
 moving or normalizing them. A `dtype=` conversion is also rejected because it
 would allocate new storage; pre-convert the checkpoint or use pinned backing.
 Because the resource aliases adopted tensors, callers must not mutate those
-storages during the LoRA's lifetime. Pinned factors generally transfer faster,
+storages during the adapter's lifetime. Pinned factors generally transfer faster,
 especially in routed mode where the matched factors move on every invocation.
 
 Block reload from pristine pinned CPU storage automatically clears
 the previous merge — no explicit unmerge step needed.
 
-Pass `lora_mode="routed"` as an alternative to the default merge mode.
+Pass `adapter_mode="routed"` as an alternative to the default merge mode.
 Routed mode installs a forward hook pair on each matched
 `nn.Linear` parent — `y = base(x) + alpha * (B * A * x + bias)` when a legacy
 bias is present — instead of merging into the base weight. Its PRE hook
-copies only that target's adapter tensors from pinned CPU storage to the
+copies only that target's factor tensors from pinned CPU storage to the
 invocation's input device; its POST hook applies the residual and releases
 those device tensors. Multiple LoRAs on one target are grouped into one hook
 pair and summed independently. **Routed mode is
 inference-only:** factors are frozen (`requires_grad=False`) and no gradient
-flows to them. LoRA backing is immutable, so merge and routed uses may overlap
+flows to them. Adapter backing is immutable, so merge and routed uses may overlap
 across model runtimes. Use routed mode when:
 
 - The base weight is quantized or otherwise structured, but still exposes
   a logical `nn.Linear` weight shape and compute dtype, and its adapter
-  does not support merge updates. `lora_mode="routed"` works because it
+  does not support merge updates. `adapter_mode="routed"` works because it
   doesn't touch the base.
 - You want to switch LoRAs frequently without re-streaming the underlying
   base weight or retaining the whole adapter on GPU.
@@ -626,29 +680,31 @@ weights by hooking only the exact parent module named by the target, so
 it never mutates shared storage. Packed formats whose parameter shape
 differs from the logical matmul weight need a per-format route layer.
 
-For a one-shot **permanent** merge — bake the LoRA into the model
-weights and discard the LoRA — use `merge_lora`:
+For a one-shot **permanent** application—bake the adapter into the model
+weights and discard the adapter—use `merge_adapter`:
 
 ```python
-from piper_offload import merge_lora, LoRA
+from piper_offload import merge_adapter, Adapter
 
-merge_lora(
+merge_adapter(
     model,
-    [(LoRA.from_state_dict(state_dict=load_file("lora.safetensors")), 0.8)],
+    [(Adapter.from_state_dict(state_dict=load_file("lora.safetensors")), 0.8)],
     stochastic_rounding=False,  # optional deterministic opt-out
 )
 ```
 
-This uses an in-place `addmm_` for plain fp/bf bases. Supported quantized
+This uses in-place arithmetic for plain fp/bf bases. Supported quantized
 adapters use format-specific Triton kernels on CUDA and retain their
 dequantize/requantize reference path as a fallback. Formats without a merge
 path (GGUF, TorchAO INT4 tile-packed) need routed LoRA instead. See [Quantized weight
 support](#quantized-weight-support) for the full matrix. Unlike an
-activation-scoped LoRA request, this is not reversible. Unknown targets
+activation-scoped adapter request, this is not reversible. Unknown targets
 raise, and all target names, factor shapes, and advertised merge
 capabilities are preflighted before mutation. Multiple LoRAs for one
 quantized parameter are packed into one staged low-rank update and the
-weight is re-encoded once.
+weight is re-encoded once. A meta target is permanently
+materialized as one frozen CPU `Parameter`; tied aliases of the original meta
+parameter are preserved.
 
 For the default stochastic merge, each adapter first uses its existing upstream
 recipe to compute the final data-dependent scales and other quantization
@@ -785,12 +841,12 @@ CPU storage, and leaves gradients on GPU.
 ## Cached model details
 
 `ResourceCache` owns only reusable-resource admission, accounting, leases, and
-eviction. `ModelCache` inherits that API and adds dependency leasing, LoRA
+eviction. `ModelCache` inherits that API and adds dependency leasing, adapter
 attachment, and device activation for model uses.
 
 ```python
 from piper_offload import (
-    LoRASpec,
+    AdapterSpec,
     ModelCache,
     ModelSpec,
 )
@@ -810,7 +866,7 @@ diffusion_model = ModelSpec(
     factory=build_diffusion_model,
     block_paths=("transformer_blocks",),
 )
-style_lora = LoRASpec(
+style_lora = AdapterSpec(
     key="style-lora",
     estimated_cache_bytes=512 * 1024**2,
     factory=lambda: load_file("style.safetensors"),
@@ -823,23 +879,36 @@ with cache.use(text_encoder, device=device) as enc:
 with cache.use(
     diffusion_model,
     device=device,
-    lora_specs=[style_lora],
-    lora_strengths=[0.8],
-    lora_mode="routed",
+    adapter_specs=[style_lora],
+    adapter_strengths=[0.8],
+    adapter_mode="routed",
 ) as model:
     latent = model(...)
 ```
 
-The model cache leases LoRA resources before admitting the model resource. An
+For a parameter-value adapter, have the ordinary factory return the
+exact-name mapping and activate it with `adapter_mode="merge"`:
+
+```python
+feature_adapter = AdapterSpec(
+    key="feature-adapter",
+    estimated_cache_bytes=512 * 1024**2,
+    factory=load_parameter_values,
+    dtype=torch.bfloat16,
+)
+```
+
+The model cache leases adapter resources before admitting the model resource. An
 adapter selected for a use therefore cannot be evicted by that same model admission.
 All leases unwind in reverse order if construction or activation
-fails. `lora_strengths` defaults to `1.0` per LoRA; when supplied, it must
-have the same length as `lora_specs`. Exact `0.0` and `-0.0` strengths are
+fails. `adapter_strengths` defaults to `1.0` per adapter; when supplied, it must
+have the same length as `adapter_specs`. Exact `0.0` and `-0.0` strengths are
 inactive: they are filtered before target grouping or hook installation, and
-`ModelCache` does not construct or lease their LoRA resources. Merge and routed
-uses may share one cached LoRA across model runtimes or repeat it within one
-use because each occurrence is an independent contribution with its own
-strength.
+`ModelCache` does not construct or lease their adapter resources. Merge and routed
+uses may share one cached `Adapter` across model runtimes. LoRA-only adapters
+may repeat within one use because each occurrence is an independent
+contribution with its own strength; parameter values require a single active
+owner per target.
 
 For direct resource access, use a cache lease:
 
@@ -870,7 +939,7 @@ registration / cache admission
 ------------------------------
             ResourceSpec protocol
                     |
-         ModelSpec / LoRASpec / ObjectSpec
+         ModelSpec / AdapterSpec / ObjectSpec
         |
         v
   +-------------+
@@ -891,7 +960,7 @@ registration / cache admission
         |                            |
         |                            +-- PinnedParam(s)
         |
-        +-- builds/admit --> LoRA (pinned or adopted factors)
+        +-- builds/admit --> Adapter (pinned or adopted LoRA/parameter values)
         |
         +-- builds/admit --> custom ResourceStore
         |
@@ -901,10 +970,10 @@ ModelCache.use(...)
 -------------------
 ModelCache
    |
-   +-- lease LoRASpec(s), then ModelSpec
-   +-- ModelOffloader.activate(loras=...) claims the model runtime
+   +-- lease AdapterSpec(s), then ModelSpec
+   +-- ModelOffloader.activate(adapters=...) claims the model runtime
    +-- yield ModelOffloader.value
-   +-- ModelOffloader.deactivate() removes LoRA hooks + releases model
+   +-- ModelOffloader.deactivate() removes adapter hooks + releases model
 ```
 
 `ResourceSpec` is the structural registration contract: `key`,
@@ -916,9 +985,9 @@ eviction but does not create or activate a runtime.
 `ResourceBinding` is the active-resource lifecycle contract: `value`,
 `activate(device=None, **kwargs)`, and `deactivate()`.
 `ModelOffloader` is both a cached `ResourceStore` and a `ResourceBinding`;
-`LoRA` is an immutable cached `ResourceStore`. It exposes neither an active
+`Adapter` is an immutable cached `ResourceStore`. It exposes neither an active
 lifecycle nor a model-like `value`; merge and routed hooks read its pinned
-factor backing directly.
+adapter backing directly.
 
 A custom cached resource needs only one spec and one store:
 
@@ -973,7 +1042,7 @@ dequantize/requantize conversion, representation-preserving `copy_into`, and
 adapter-owned staged LoRA merge. Zero-copy host adoption is another optional
 capability: `adopt_host()` returns adapter-specific state that aliases the
 existing CPU storage. The existing `cache_bytes()` method accounts for either
-pinned or adopted state. LoRA dispatch uses either dense in-place
+pinned or adopted state. Tensor-adapter dispatch uses either dense in-place
 `addmm_` for plain bases or the staged merge capability for structured bases;
 conversion and copy capabilities do not implicitly advertise merge support.
 Adapters whose merge supports only certain layouts or staged factor values can
@@ -1019,12 +1088,12 @@ for tests and scoped integrations.
 
 Cached resources own cache accounting. Host capture happens during construction
 so `cache_bytes` is final at admission time; leases protect resources while
-they are used. `ModelOffloader` owns one exclusive activation lifecycle. `LoRA`
-remains immutable host backing throughout its lease:
+they are used. `ModelOffloader` owns one exclusive activation lifecycle.
+`Adapter` remains immutable host backing throughout its lease:
 
 ```
 ModelOffloader: construct -> lease -> activate <-> deactivate -> release lease
-LoRA:            construct -> lease -> read host factors -> release lease
+Adapter:       construct -> lease -> read host updates -> release lease
 ```
 
 `ModelOffloader.activate(device=...)` makes the model usable for compute on the
@@ -1116,13 +1185,13 @@ sharing must be preserved.
 ## Quantized weight support
 
 Every supported weight type can be offloaded (pinned host ↔ GPU
-movement). LoRA differs by type: a base can be **merged** into when its
-adapter exposes an in-place update path, and **routed** LoRA
-(`lora_mode="routed"` — a forward hook) is available for any of them
+movement). LoRA support differs by type: a base can be **merged** into when its
+tensor adapter exposes an in-place update path, and **routed** LoRA
+(`adapter_mode="routed"` — a forward hook) is available for any of them
 whose owning module is a logical `nn.Linear` with compatible shape and
 dtype, no merge capability required.
 
-| Weight type | Offload | LoRA merge (`mode="merge"` / `merge_lora`) |
+| Weight type | Offload | LoRA merge (`adapter_mode="merge"` / `merge_adapter`) |
 |---|---|---|
 | Plain floating-point tensor | ✓ | native in-place `addmm_` |
 | optimum-quanto qint8 / qfloat8 | ✓ | absmax-requantized Triton merge on CUDA; dequant / requant fallback |
@@ -1207,7 +1276,7 @@ dequantize/addmm/requantize path with the same scale policy. Exact-zero scale
 blocks are repaired to a small positive value so qfloat8 never encodes a
 `0 / 0` NaN. Both paths update the existing inner data and scale storage;
 neither attempts native in-place `addmm_` on a `WeightQBytesTensor`. Use
-`lora_mode="routed"` when the base must remain untouched or adapters need
+`adapter_mode="routed"` when the base must remain untouched or adapters need
 to switch without reloading it.
 
 ## Piper ConvRot INT8 support
@@ -1285,7 +1354,7 @@ NVFP4's 4-bit re-encoding is lossy.
 The adapter does not opt into CPU round-trip or trainable
 `Parameter.data` swap: the quant state lives in the wrapper object, not
 its bytes, so NVFP4 weights stay frozen for streaming/training. Routed
-LoRA remains the non-destructive alternative when the target module is a
+Routed LoRA remains the non-destructive alternative when the target module is a
 logical `nn.Linear` with compatible shape and compute dtype.
 
 ## TorchAO MX (MXFP8 / MXFP4) support

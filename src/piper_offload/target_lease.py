@@ -1,5 +1,6 @@
 """Stream-aware ownership for reusable CUDA module targets."""
 
+from collections.abc import Iterable
 from typing import cast
 
 import torch
@@ -39,12 +40,18 @@ class _CudaTargetLease:
         device: torch.device,
         *,
         allocation_stream: torch.cuda.Stream | None = None,
+        param_names: Iterable[str] | None = None,
+        buffer_names: Iterable[str] | None = None,
     ) -> _CudaTargetLease:
         """Allocate a target from the requested CUDA stream's pool."""
         if allocation_stream is None:
             allocation_stream = torch.cuda.default_stream(device)
         with torch.cuda.stream(allocation_stream):
-            target = instance.allocate_target(device)
+            target = instance.allocate_target(
+                device,
+                param_names=param_names,
+                buffer_names=buffer_names,
+            )
         return cls(target, allocation_stream)
 
     @property

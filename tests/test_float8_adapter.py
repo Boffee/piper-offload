@@ -6,11 +6,11 @@ from torch import nn
 
 import piper_offload.float8_adapter as float8_adapter_module
 from piper_offload import (
-    LoRA,
+    Adapter,
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
-    merge_lora,
+    merge_adapter,
 )
 from piper_offload.float8_adapter import Float8Adapter
 from piper_offload.pinned_param import PinnedParam
@@ -825,14 +825,14 @@ class TestFloat8Adapter:
         # copy_into mutates the weight's storage in place, so snapshot
         # the original packed bytes rather than holding a tensor ref.
         original_qdata = model.lin.weight.data.qdata.view(torch.uint8).clone()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 16),
                 "lin.lora_B.weight": torch.randn(16, 4),
             }
         )
 
-        merged = merge_lora(model, [(lora, 1.0)])
+        merged = merge_adapter(model, [(lora, 1.0)])
 
         assert merged == 1
         assert not torch.equal(model.lin.weight.data.qdata.view(torch.uint8), original_qdata)
@@ -864,7 +864,7 @@ class TestFloat8Adapter:
         first_scale = model.first.weight.data.scale.clone()
         second_qdata = model.second.weight.data.qdata.view(torch.uint8).clone()
         second_scale = model.second.weight.data.scale.clone()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "first.lora_A.weight": torch.randn(4, 16),
                 "first.lora_B.weight": torch.randn(16, 4),
@@ -877,7 +877,7 @@ class TestFloat8Adapter:
             ValueError,
             match="transposed PerGroup.*routed LoRA",
         ):
-            merge_lora(model, [(lora, 1.0)])
+            merge_adapter(model, [(lora, 1.0)])
 
         assert torch.equal(
             model.first.weight.data.qdata.view(torch.uint8),
@@ -967,7 +967,7 @@ class TestFloat8Adapter:
         rank = 4
         a = torch.randn(rank, 16)
         b = torch.randn(16, rank)
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": a,
                 "blocks.0.lora_B.weight": b,
@@ -998,9 +998,9 @@ class TestFloat8Adapter:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.5],
-                lora_mode="merge",
+                adapters=[lora],
+                adapter_strengths=[0.5],
+                adapter_mode="merge",
             ) as active:
                 merged = active.blocks[0].weight.data
                 assert isinstance(merged, float8_tensor_cls)

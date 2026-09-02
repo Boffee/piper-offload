@@ -6,11 +6,11 @@ from torch import nn
 
 import piper_offload.mx_adapter as mx_adapter_impl
 from piper_offload import (
-    LoRA,
+    Adapter,
     LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
-    merge_lora,
+    merge_adapter,
 )
 from piper_offload._torchao_mx import is_supported_mx_elem_dtype
 from piper_offload.mx_adapter import MxAdapter
@@ -417,14 +417,14 @@ class TestMxAdapter:
         # copy_into mutates the weight's storage in place, so snapshot the
         # original packed bytes rather than holding a tensor ref.
         original_qdata = model.lin.weight.data.qdata.view(torch.uint8).clone()
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(4, 64),
                 "lin.lora_B.weight": torch.randn(16, 4),
             }
         )
 
-        merged = merge_lora(model, [(lora, 1.0)])
+        merged = merge_adapter(model, [(lora, 1.0)])
 
         assert merged == 1
         assert not torch.equal(model.lin.weight.data.qdata.view(torch.uint8), original_qdata)
@@ -870,7 +870,7 @@ class TestMxAdapter:
             model,
             block_paths=["blocks"],
         )
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(4, 128),
                 "blocks.0.lora_B.weight": torch.randn(128, 4),
@@ -881,9 +881,9 @@ class TestMxAdapter:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.25],
-                lora_mode="routed",
+                adapters=[lora],
+                adapter_strengths=[0.25],
+                adapter_mode="routed",
             ) as active:
                 y = active(x)
                 torch.cuda.synchronize()
@@ -927,7 +927,7 @@ class TestMxAdapter:
         rank = 4
         a = torch.randn(rank, 64)
         b = torch.randn(64, rank)
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": a,
                 "blocks.0.lora_B.weight": b,
@@ -955,9 +955,9 @@ class TestMxAdapter:
             with activated_model(
                 offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.5],
-                lora_mode="merge",
+                adapters=[lora],
+                adapter_strengths=[0.5],
+                adapter_mode="merge",
                 stochastic_rounding=False,
             ) as active:
                 merged = active.blocks[0].weight.data

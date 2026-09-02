@@ -156,10 +156,11 @@ def param_representation(param: torch.Tensor) -> torch.Tensor:
 
 def param_tensor_id(param: nn.Parameter) -> tuple[Any, ...]:
     """Return an adapter-defined tensor identity for a parameter."""
-    if param.numel() == 0:
-        # Zero-sized tensors all share data_ptr()==0; key by object
-        # identity so aliases of the same Parameter still dedupe.
-        return ("__empty__", id(param))
+    if param.is_meta or param.numel() == 0:
+        # Meta and zero-sized tensors report data_ptr()==0. Only the same
+        # Parameter object is a true alias; independent placeholders must not
+        # be deduplicated by their nonexistent backing address.
+        return ("__identity_param__", id(param))
     return tensor_id(param_representation(param))
 
 

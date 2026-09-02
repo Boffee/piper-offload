@@ -12,9 +12,9 @@ import torch
 from torch import nn
 
 from piper_offload import (
-    LoRA,
+    Adapter,
     ModelOffloader,
-    merge_lora,
+    merge_adapter,
 )
 from piper_offload.int4_tile_adapter import Int4TilePackedAdapter
 from piper_offload.pinned_param import PinnedParam
@@ -137,7 +137,7 @@ class TestInt4TilePackedAdapter:
         model = M()
         model.lin.weight.requires_grad = False
         model.lin.weight = nn.Parameter(_make_int4_tile(), requires_grad=False)
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "lin.lora_A.weight": torch.randn(8, 256),
                 "lin.lora_B.weight": torch.randn(256, 8),
@@ -145,7 +145,7 @@ class TestInt4TilePackedAdapter:
         )
 
         with pytest.raises(ValueError, match="Int4TilePackedAdapter.*routed LoRA"):
-            merge_lora(model, [(lora, 1.0)])
+            merge_adapter(model, [(lora, 1.0)])
 
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:
         int4_cls = _int4_tile_cls()
@@ -225,7 +225,7 @@ class TestInt4TilePackedAdapter:
             model,
             block_paths=["blocks"],
         )
-        lora = LoRA.from_state_dict(
+        lora = Adapter.from_state_dict(
             state_dict={
                 "blocks.0.lora_A.weight": torch.randn(8, 256),
                 "blocks.0.lora_B.weight": torch.randn(256, 8),
@@ -235,9 +235,9 @@ class TestInt4TilePackedAdapter:
             x = torch.randn(64, 256, dtype=torch.bfloat16, device="cuda")
             with activated_model(offloader,
                 "cuda",
-                loras=[lora],
-                lora_strengths=[0.25],
-                lora_mode="routed",
+                adapters=[lora],
+                adapter_strengths=[0.25],
+                adapter_mode="routed",
             ) as active:
                 y = active(x)
                 torch.cuda.synchronize()

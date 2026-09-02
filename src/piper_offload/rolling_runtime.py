@@ -52,12 +52,10 @@ class RollingBlockRuntime:
     def __init__(
         self,
         instances: tuple[PinnedModuleInstance, ...],
-        param_names: tuple[str, ...],
         *,
         wraparound: bool = True,
     ) -> None:
         self._instances = instances
-        self._param_names = param_names
         self._wraparound = wraparound
         self._reset_acquired_state()
 
@@ -68,6 +66,7 @@ class RollingBlockRuntime:
         self._ready_events: tuple[torch.cuda.Event, ...] = ()
         self._fallback_event: torch.cuda.Event | None = None
         self._owners: list[int] | None = None
+        self._slot_names: tuple[str, ...] = ()
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
 
     @property
@@ -82,16 +81,39 @@ class RollingBlockRuntime:
         if self.acquired:
             raise RuntimeError("rolling block runtime is already acquired")
         self._stream = torch.cuda.Stream(device=device, priority=-1)
-        self._events = tuple(torch.cuda.Event() for _ in self._param_names)
-        self._ready_events = tuple(torch.cuda.Event() for _ in self._param_names)
+        materialized_names = {
+            name
+            for instance in self._instances
+            for name in instance.materialized_params
+        }
+        self._slot_names = tuple(
+            name
+            for name in self._instances[0].params
+            if name in materialized_names
+        )
+        self._events = tuple(torch.cuda.Event() for _name in self._slot_names)
+        self._ready_events = tuple(torch.cuda.Event() for _name in self._slot_names)
+        self._owners = [0] * len(self._slot_names)
+
+        if not self._slot_names:
+            logger.info(
+                "rolling block runtime acquired with no materialized parameter slots across %d blocks",
+                len(self._instances),
+            )
+            return
+
         self._fallback_event = torch.cuda.Event()
-        self._lease = _CudaTargetLease.allocate(self._instances[0], device)
+        self._lease = _CudaTargetLease.allocate(
+            self._instances[0],
+            device,
+            param_names=self._slot_names,
+            buffer_names=(),
+        )
         target = self._lease.target
         register_rolling_target(
             self,
-            [target.param_targets[name].param for name in self._param_names],
+            [target.param_targets[name].param for name in self._slot_names],
         )
-        self._owners = [-1] * len(self._param_names)
 
         self._lease.stage(
             self._instances[0],
@@ -104,7 +126,6 @@ class RollingBlockRuntime:
                 ready_event.record(self._stream)
         self._lease.acquire(torch.cuda.current_stream(device))
         self._lease.record_stream(self._stream)
-        self._owners[:] = [0] * len(self._param_names)
         for instance in self._instances:
             instance.install_target(target)
         self._register_hooks(device)
@@ -156,7 +177,7 @@ class RollingBlockRuntime:
         if lease is None:
             raise RuntimeError("rolling wait executed while runtime is released")
         target = lease.target
-        name = self._param_names[param_idx]
+        name = self._slot_names[param_idx]
         device = target.param_targets[name].param.device
         current_stream = torch.cuda.current_stream(device)
         lease.record_stream(current_stream)
@@ -170,17 +191,13 @@ class RollingBlockRuntime:
             raise RuntimeError("rolling refill executed while runtime is released")
         target = lease.target
         block_idx = owners[param_idx]
-        if block_idx < 0:
-            name = self._param_names[param_idx]
-            raise RuntimeError(f"rolling graph used {name!r} before its slot had an owner")
-
         next_idx = block_idx + 1
         if next_idx == len(self._instances):
             if not self._wraparound:
                 return
             next_idx = 0
 
-        name = self._param_names[param_idx]
+        name = self._slot_names[param_idx]
         device = target.param_targets[name].param.device
         current_stream = torch.cuda.current_stream(device)
         compute_done = self._events[param_idx]
@@ -197,7 +214,7 @@ class RollingBlockRuntime:
         target = lease.target
         assert prefetch_stream is not None
         assert owners is not None
-        name = self._param_names[param_idx]
+        name = self._slot_names[param_idx]
         param_target = target.param_targets[name]
         self._instances[block_idx].refill_param_target(name, param_target)
         self._ready_events[param_idx].record(prefetch_stream)
@@ -289,7 +306,6 @@ def create_rolling_block_runtime(
 
     return RollingBlockRuntime(
         tuple(instances),
-        param_names,
         wraparound=wraparound,
     )
 

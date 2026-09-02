@@ -5,6 +5,27 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Treat every non-factor entry passed to `Adapter.from_state_dict()` as an
+  exact-name `ParameterValue`. These merge-only values populate storage-free
+  model parameters represented by frozen plain floating-point meta tensors.
+  Values may be scaled during materialization and work across
+  resident, streaming, rolling, and automatic block modes and permanent
+  merges.
+
+### Changed
+
+- Separate low-rank and meta-parameter execution into `LoRATransform` and
+  `ParameterValueTransform`, both following the shared `ParameterTransform`
+  protocol.
+- Generalize the cached mixed update resource as `Adapter`, with one immutable
+  `AdapterTarget` union per exact parameter name. Each target is directly a
+  `LoRAFactor` or `ParameterValue`; the two are mutually exclusive for one
+  target. Replace the old resource-level `LoRA`, `LoRAMode`, `LoRASpec`, and
+  `merge_lora` APIs with `Adapter`, `AdapterMode`, `AdapterSpec`, and
+  `merge_adapter`.
+
 ## [0.6.1] - 2026-09-01
 
 ### Added
