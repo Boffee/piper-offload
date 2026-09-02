@@ -151,6 +151,7 @@ class ParameterValueTransform:
             type(target) is not torch.Tensor
             or target.is_meta
             or tuple(target.shape) != plan.shape
+            or target.stride() != plan.stride
             or target.dtype is not plan.dtype
         ):
             raise RuntimeError(
@@ -227,6 +228,50 @@ def _validate_target_range(
             f"limit {target_maximum}."
         )
 
+    _validate_no_underflow(
+        source,
+        target_dtype=target_dtype,
+        strength=strength,
+    )
+
+
+def _validate_no_underflow(
+    source: torch.Tensor,
+    *,
+    target_dtype: torch.dtype,
+    strength: float,
+) -> None:
+    """Reject nonzero values that target conversion or scaling erases."""
+    converted = source.to(dtype=target_dtype)
+    source_nonzero = _count_nonzero(source)
+    converted_nonzero = _count_nonzero(converted)
+    if converted_nonzero != source_nonzero:
+        raise ValueError(
+            "Parameter value source underflows to zero in target dtype "
+            f"{target_dtype} before strength is applied."
+        )
+
+    if strength in {0.0, 1.0}:
+        return
+    if converted is source:
+        converted = converted.clone()
+    if torch.finfo(target_dtype).bits == 8:
+        compute_source = converted.float()
+        torch.mul(compute_source, strength, out=converted)
+    else:
+        converted.mul_(strength)
+    if _count_nonzero(converted) != converted_nonzero:
+        raise ValueError(
+            "Scaled parameter value underflows to zero in target dtype "
+            f"{target_dtype}."
+        )
+
+
+def _count_nonzero(source: torch.Tensor) -> int:
+    """Count nonzero floating values, including CPU float8 tensors."""
+    count_source = source.float() if torch.finfo(source.dtype).bits == 8 else source
+    return int(torch.count_nonzero(count_source).item())
+
 
 def _prepare_source(
     source: torch.Tensor,
@@ -244,6 +289,7 @@ def _prepare_source(
         device="cpu",
         pin_memory=source.is_pinned(),
     )
-    compute_source = source if source.dtype is torch.float32 else source.float()
+    scaled.copy_(source)
+    compute_source = scaled.float()
     torch.mul(compute_source, strength, out=scaled)
     return scaled, 1.0

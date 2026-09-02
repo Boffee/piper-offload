@@ -32,6 +32,7 @@ from piper_offload import (
     ModelOffloader,
     ModelSpec,
     ParameterValue,
+    ParameterValueTransform,
     ResourceNotRegisteredError,
     ResourceTooLargeError,
     PinnedComponent,
@@ -3180,6 +3181,54 @@ class TestPermanentMerge:
         with pytest.raises(ValueError, match="Scaled parameter value exceeds"):
             merge_adapter(model, [(value, 2.0)])
         assert model.weight.is_meta
+
+    @pytest.mark.parametrize("strength", [1.0, 1_000.0])
+    def test_parameter_value_rejects_source_underflow_before_strength(
+        self,
+        strength: float,
+    ) -> None:
+        source = torch.tensor([1e-8], dtype=torch.float32)
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.empty(source.shape, device="meta", dtype=torch.float16),
+            requires_grad=False,
+        )
+        value = Adapter.from_state_dict({"weight": source})
+
+        with pytest.raises(ValueError, match="source underflows to zero"):
+            merge_adapter(model, [(value, strength)])
+        assert model.weight.is_meta
+
+    def test_parameter_value_rejects_scaled_underflow(self) -> None:
+        source = torch.tensor([1e-4], dtype=torch.float32)
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.empty(source.shape, device="meta", dtype=torch.float16),
+            requires_grad=False,
+        )
+        value = Adapter.from_state_dict({"weight": source})
+
+        with pytest.raises(ValueError, match="Scaled parameter value underflows"):
+            merge_adapter(model, [(value, 1e-4)])
+        assert model.weight.is_meta
+
+    def test_parameter_value_rejects_physical_target_with_wrong_stride(self) -> None:
+        source = torch.arange(6, dtype=torch.float32).view(2, 3)
+        value = ParameterValue.from_tensor(source, pin_memory=False)
+        transform = ParameterValueTransform(value.scaled(1.0))
+        meta_target = nn.Parameter(
+            torch.empty_strided((2, 3), (1, 2), device="meta"),
+            requires_grad=False,
+        )
+        transform.validate_parameter(meta_target)
+
+        wrong_stride = nn.Parameter(torch.empty(2, 3), requires_grad=False)
+        with pytest.raises(RuntimeError, match="matching the validated meta target"):
+            transform.apply_parameter(wrong_stride)
+
+        materialized = transform.materialize()
+        assert materialized.stride() == (1, 2)
+        torch.testing.assert_close(materialized, source)
 
     def test_parameter_value_scales_float8_target(self) -> None:
         source = torch.tensor([1.0], dtype=torch.float32)

@@ -162,7 +162,14 @@ class PinnedParam:
     def _target_layout_from_adapter(
         adapter: TensorAdapter[Any, Any], tensor: torch.Tensor,
     ) -> tuple[object, object]:
-        return (type(adapter), adapter.layout_signature(tensor))
+        signature: object = adapter.layout_signature(tensor)
+        if tensor.is_meta:
+            # Physical regular tensors are normalized to contiguous backing,
+            # but meta parameters retain their declared stride when active
+            # storage is allocated. Keep differently strided meta parameters
+            # out of the same streaming/rolling target pool.
+            signature = ("meta", signature, tensor.stride())
+        return (type(adapter), signature)
 
     @staticmethod
     def _bind_layout_from_adapter(

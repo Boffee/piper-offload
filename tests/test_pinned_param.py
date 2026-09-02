@@ -82,6 +82,20 @@ class TestPinnedParam:
         with pytest.raises(RuntimeError, match="active parameter value"):
             pinned.materialize(torch.device("cpu"))
 
+    def test_meta_target_layout_includes_stride(self) -> None:
+        contiguous = nn.Parameter(
+            torch.empty(2, 3, device="meta"),
+            requires_grad=False,
+        )
+        transposed = nn.Parameter(
+            torch.empty(3, 2, device="meta").t(),
+            requires_grad=False,
+        )
+
+        assert contiguous.shape == transposed.shape
+        assert contiguous.stride() != transposed.stride()
+        assert PinnedParam.target_layout_for(contiguous) != PinnedParam.target_layout_for(transposed)
+
     def test_clone_to_pinned_cpu_rejects_gpu_less_windows_before_allocation(
         self,
         monkeypatch: pytest.MonkeyPatch,
