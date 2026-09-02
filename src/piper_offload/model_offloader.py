@@ -20,8 +20,9 @@ from .block_component import BlockComponent
 from .block_mode import BlockMode
 from .composite_component import CompositeComponent, CompositeComponentStore
 from .host_backing import HostBacking
-from .lora import LoRATransform, install_routed_residual_hook
-from .module_names import resolve_parent_leaf, sibling_parameter_name
+from .lora import install_routed_residual_hook
+from .module_names import resolve_parent_leaf
+from .parameter_delta import ParameterDeltaTransform
 from .parameter_transform import ParameterTransform
 from .parameter_value import ParameterValueTransform
 from .pinned_component import PinnedComponent
@@ -288,42 +289,23 @@ class ModelOffloader:
         params_by_name = dict(self._model.named_parameters(remove_duplicate=False))
         for param_name, contributions in updates.items():
             transform: ParameterTransform
-            lora_transform: LoRATransform | None = None
-            if contributions.factors:
-                lora_transform = LoRATransform(
-                    contributions.factors,
+            if contributions.deltas:
+                transform = ParameterDeltaTransform(
+                    contributions.deltas,
                     stochastic_rounding=stochastic_rounding,
                     target_key=param_name,
                 )
-                transform = lora_transform
             else:
                 assert contributions.value is not None
                 transform = ParameterValueTransform(contributions.value)
-            bias_name: str | None = None
-            bias: nn.Parameter | None = None
-            if lora_transform is not None and lora_transform.has_bias:
-                bias_name = self._require_managed_target(
-                    sibling_parameter_name(param_name, "bias"),
-                )
-                bias = params_by_name[bias_name]
 
             transform.validate_parameter(params_by_name[param_name])
-            if lora_transform is not None and lora_transform.has_bias:
-                assert bias is not None
-                lora_transform.validate_bias_target(bias)
 
             remove_hook = self._register_post_copy_hook(
                 param_name,
                 transform.apply_parameter,
             )
             self._adapter_hook_removers.append(remove_hook)
-            if bias_name is not None:
-                assert lora_transform is not None
-                remove_bias_hook = self._register_post_copy_hook(
-                    bias_name,
-                    lora_transform.apply_bias,
-                )
-                self._adapter_hook_removers.append(remove_bias_hook)
 
     def _register_routed_lora_hooks(
         self,
@@ -342,6 +324,13 @@ class ModelOffloader:
             raise ValueError(
                 "Routed LoRA mode does not support parameter values; "
                 f"use adapter_mode='merge'. Parameter values: {value_names!r}."
+            )
+
+        dense_names = sorted(param_name for param_name, contributions in updates.items() if contributions.has_dense)
+        if dense_names:
+            raise ValueError(
+                "Routed LoRA mode does not support dense parameter deltas; "
+                f"use adapter_mode='merge'. Dense parameter deltas: {dense_names!r}."
             )
 
         for param_name, contributions in updates.items():

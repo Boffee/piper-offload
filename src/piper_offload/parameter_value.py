@@ -23,6 +23,8 @@ def _validate_value_tensor(source: torch.Tensor) -> None:
         raise ValueError("Parameter values must own physical values, not meta storage.")
     if not source.is_floating_point():
         raise ValueError(f"Parameter values must be floating-point; got {source.dtype}.")
+    if torch.finfo(source.dtype).bits == 8:
+        raise ValueError(f"Parameter values do not support float8 sources; got {source.dtype}.")
 
 
 @dataclass(slots=True, frozen=True)
@@ -74,6 +76,10 @@ class ScaledParameterValue:
     value: ParameterValue
     strength: float
 
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.strength):
+            raise ValueError(f"Parameter value strength must be finite; got {self.strength}.")
+
 
 @dataclass(slots=True, frozen=True)
 class _ParameterValuePlan:
@@ -114,6 +120,8 @@ class ParameterValueTransform:
             )
         if not target.is_floating_point():
             raise ValueError(f"Parameter values require a floating-point meta target; got {target.dtype}.")
+        if torch.finfo(target.dtype).bits == 8:
+            raise ValueError(f"Parameter values do not support float8 targets; got {target.dtype}.")
         if param.requires_grad:
             raise ValueError("Parameter values are inference-only and require requires_grad=False.")
         _validate_target_layout(target)
@@ -133,14 +141,9 @@ class ParameterValueTransform:
             target_dtype=target.dtype,
             strength=self._value.strength,
         )
-        prepared_source, prepared_strength = _prepare_source(
-            source,
-            target_dtype=target.dtype,
-            strength=self._value.strength,
-        )
         self._plan = _ParameterValuePlan(
-            prepared_source,
-            prepared_strength,
+            source,
+            self._value.strength,
             tuple(target.shape),
             target.stride(),
             target.dtype,
@@ -244,13 +247,10 @@ def _validate_target_range(
     strength: float,
 ) -> None:
     """Reject invalid source and scaled values before target mutation."""
-    if not math.isfinite(strength):
-        raise ValueError(f"Parameter value strength must be finite; got {strength}.")
     if source.numel() == 0:
         return
 
-    range_source = source.float() if torch.finfo(source.dtype).bits == 8 else source
-    minimum, maximum = torch.aminmax(range_source)
+    minimum, maximum = torch.aminmax(source)
     minimum_value = minimum.item()
     maximum_value = maximum.item()
     if not math.isfinite(minimum_value) or not math.isfinite(maximum_value):
@@ -272,69 +272,3 @@ def _validate_target_range(
             f"{target_dtype}: maximum magnitude {scaled_maximum}, "
             f"limit {target_maximum}."
         )
-
-    _validate_no_underflow(
-        source,
-        target_dtype=target_dtype,
-        strength=strength,
-    )
-
-
-def _validate_no_underflow(
-    source: torch.Tensor,
-    *,
-    target_dtype: torch.dtype,
-    strength: float,
-) -> None:
-    """Reject nonzero values that target conversion or scaling erases."""
-    converted = source.to(dtype=target_dtype)
-    source_nonzero = _count_nonzero(source)
-    converted_nonzero = _count_nonzero(converted)
-    if converted_nonzero != source_nonzero:
-        raise ValueError(
-            "Parameter value source underflows to zero in target dtype "
-            f"{target_dtype} before strength is applied."
-        )
-
-    if strength in {0.0, 1.0}:
-        return
-    if converted is source:
-        converted = converted.clone()
-    if torch.finfo(target_dtype).bits == 8:
-        compute_source = converted.float()
-        torch.mul(compute_source, strength, out=converted)
-    else:
-        converted.mul_(strength)
-    if _count_nonzero(converted) != converted_nonzero:
-        raise ValueError(
-            "Scaled parameter value underflows to zero in target dtype "
-            f"{target_dtype}."
-        )
-
-
-def _count_nonzero(source: torch.Tensor) -> int:
-    """Count nonzero floating values, including CPU float8 tensors."""
-    count_source = source.float() if torch.finfo(source.dtype).bits == 8 else source
-    return int(torch.count_nonzero(count_source).item())
-
-
-def _prepare_source(
-    source: torch.Tensor,
-    *,
-    target_dtype: torch.dtype,
-    strength: float,
-) -> tuple[torch.Tensor, float]:
-    """Prepare only scaled float8 targets, whose in-place multiply is unsupported."""
-    if strength == 1.0 or torch.finfo(target_dtype).bits != 8:
-        return source, strength
-
-    scaled = torch.empty(
-        tuple(source.shape),
-        dtype=target_dtype,
-        device="cpu",
-        pin_memory=source.is_pinned(),
-    )
-    scaled.copy_(source)
-    compute_source = scaled.float()
-    torch.mul(compute_source, strength, out=scaled)
-    return scaled, 1.0

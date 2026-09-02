@@ -29,12 +29,6 @@ def resolve_parent_leaf(root: nn.Module, name: str) -> tuple[nn.Module, str]:
     return parent, leaf
 
 
-def sibling_parameter_name(name: str, leaf: str) -> str:
-    """Replace a qualified parameter name's leaf with a sibling leaf."""
-    parent_path, separator, _current_leaf = name.rpartition(".")
-    return f"{parent_path}{separator}{leaf}"
-
-
 def parameter_names(module: nn.Module) -> set[str]:
     return {
         name

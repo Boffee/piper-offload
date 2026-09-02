@@ -48,8 +48,9 @@ is not required.
 | `model_offloader.py` | `ModelOffloader` — cached single-model runtime for whole-model bulk pinned-CPU↔GPU or streamed block offload |
 | `pinned_component.py` | `PinnedComponentStore`, `PinnedComponent` — lower-level reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
 | `block_component.py` | `BlockComponentStore`, `BlockComponent` — lower-level streamed backing storage plus per-block-list streaming component |
-| `adapter.py` | `Adapter`, `AdapterTarget` — cached resources and their LoRA-or-value target union |
+| `adapter.py` | `Adapter`, `AdapterTarget` — cached resources and their delta-or-value target union |
 | `lora.py` | `LoRAFactor`, `ScaledLoRAFactor`, `LoRATransform` — low-rank data, merge, and routed execution |
+| `parameter_delta.py` | `ParameterDelta`, `ScaledParameterDelta`, `ParameterDeltaTransform` — combined low-rank/full-rank additive updates |
 | `parameter_value.py` | `ParameterValue`, `ScaledParameterValue`, `ParameterValueTransform` — meta-parameter data and materialization |
 | `parameter_transform.py` | `ParameterTransform` — shared parameter-update protocol |
 | `merge.py` | `merge_adapter()` — permanent in-place adapter application to base weights |
@@ -488,24 +489,33 @@ immediately after the owning
 component copies the base weight from pinned CPU storage to GPU, so both
 block-streamed and non-block weights use the same merge path. Merge
 compatibility is tensor-format-owned: physical plain floating-point tensors
-accept low-rank `addmm_`; structured quantized wrappers may opt into a staged
-LoRA merge whose implementation selects a format-specific kernel or framework
-fallback. Frozen plain floating-point meta tensors can instead be populated by
-parameter values. Routed mode remains factor-only and requires a compatible
-logical `nn.Linear` shape and compute dtype. `PinnedParam` remains a storage
-primitive; transforms ask the selected tensor adapter for their required
-capabilities.
+accept combined low-rank and full-rank additive deltas; structured quantized
+wrappers may opt into a staged LoRA merge whose implementation selects a
+format-specific kernel or framework fallback. Full-rank deltas for quantized
+wrappers and plain float8 targets are not supported. Frozen plain
+floating-point meta tensors can instead be populated by parameter values.
+Routed mode remains factor-only and requires a compatible logical `nn.Linear`
+shape and compute dtype.
+`PinnedParam` remains a storage primitive; transforms ask the selected tensor
+adapter for their required capabilities.
 
-`Adapter.from_state_dict()` reserves keys ending in `.lora_A.weight`,
-`.lora_B.weight`, and the legacy `.lora_B.bias` for low-rank factors. Every
-other entry is a `ParameterValue` whose key is the exact model parameter name
-and whose source is a physical floating-point tensor with the same shape as
-the target. Parameter values populate only frozen plain floating-point meta
-parameters. A target cannot contain both LoRA factors and a parameter value:
+`Adapter.from_state_dict()` reserves the exact suffixes `.lora_A.weight` and
+`.lora_B.weight` for low-rank factors, and `.delta.weight` and `.delta.bias`
+for full-rank additive updates. `module.delta.weight` targets `module.weight`,
+while `module.delta.bias` targets `module.bias`. LoRA and dense terms for the
+same parameter form one `ParameterDelta`. Every other entry is a
+`ParameterValue` whose key is the exact model parameter name and whose source
+is the complete value for a conventional floating-point meta parameter. Plain
+float8 parameter values are not supported. Construct `Adapter(targets=...)`
+directly if a model parameter name itself ends in one of the reserved suffixes.
 
 ```python
 feature_adapter = Adapter.from_state_dict(
     {
+        "projection.lora_A.weight": projection_a,
+        "projection.lora_B.weight": projection_b,
+        "projection.delta.weight": projection_dense_delta,
+        "projection.delta.bias": projection_bias_delta,
         "guidance_embedder.weight": guidance_weight,
         "guidance_embedder.bias": guidance_bias,
     }
@@ -513,8 +523,10 @@ feature_adapter = Adapter.from_state_dict(
 ```
 
 `Adapter.targets` is one immutable exact-name mapping. `AdapterTarget` is the
-union `LoRAFactor | ParameterValue`, so every mapped target is already in a
-valid, concrete form.
+union `ParameterDelta | ParameterValue`, so every mapped target is already in
+a valid, concrete form. A parameter delta contributes
+`strength * (B @ A + dense)` with whichever low-rank and dense terms are
+present. A parameter value instead materializes `strength * value`.
 
 The resource-level API uses `Adapter`, `AdapterMode`, `AdapterSpec`, and
 `merge_adapter`; activation arguments use the corresponding `adapter_*` names.
@@ -541,29 +553,20 @@ same rolling slot, inactive blocks may temporarily reference that already
 allocated storage; its inactive contents are unspecified and consume no
 additional VRAM.
 
-The adapter request is scoped to one `activate()` call. Target lookup
-is resolved and both factor and parameter-value compatibility are preflighted during
-activation. Direct factor transforms use `LoRATransform.validate_target()`;
-direct value transforms use `ParameterValueTransform.validate_parameter()`.
+The adapter request is scoped to one `activate()` call. Target lookup is
+resolved and both parameter-delta and parameter-value compatibility are
+preflighted during activation. `ParameterDeltaTransform` coordinates each
+target's additive contributions; its low-rank term delegates to
+`LoRATransform`. Parameter values use `ParameterValueTransform`.
 
-For backward compatibility, older PEFT/Wan adapters may include an optional
-`<module>.lora_B.bias` vector alongside their A/B matrices. `Adapter` detects and
-stores that vector automatically; modern A/B-only adapters keep the existing
-path unchanged. Merge mode applies the vector to the module's existing plain
-dense bias with the same adapter strength. It raises before mutation when the
-legacy vector targets a bias-less module instead of materializing a new model
-parameter. Direct `LoRATransform` use treats this as one logical operation via
-`validate_target(weight, bias)` followed by `apply(weight, bias)`; validation
-and application remain explicit phases. Offloaded activation uses separate
-weight and bias post-copy callbacks so neither update can be overwritten by a
-later parameter copy. Routed mode can apply the vector as part of its output
-residual even when the base `nn.Linear` has no bias. Native Wan/ComfyUI `.diff`
-and `.diff_b` parsing remains the caller's responsibility. Only tensors that
-represent complete values for meta model parameters belong under their exact
-parameter names; additive diffs for existing physical parameters are not
-supported. A converter must also remove checkpoint metadata and other
-non-adapter entries, since all non-factor entries are treated as parameter
-values.
+Bias deltas use the same exact-name model as weight deltas:
+`module.delta.bias` contributes to the existing physical `module.bias`
+parameter. Routed mode remains low-rank factor-only and does not synthesize an
+adapter bias for a bias-less module. Native Wan/ComfyUI `.diff` and `.diff_b`
+parsing remains the caller's responsibility. A converter can map those entries
+to canonical `.delta.weight` and `.delta.bias` keys. Exact parameter-name
+entries represent complete values for meta model parameters, so a converter
+must also remove checkpoint metadata and other non-adapter entries.
 
 ```python
 import torch
@@ -634,9 +637,9 @@ from piper_offload import derive_seed
 local_seed = derive_seed(parent_seed, shard_offset)
 ```
 
-Adapter factor and parameter-value tensors use pinned storage by default. To retain existing
-anonymous pageable or mmap/file-backed CPU tensors without copying them, use
-strict adoption:
+Adapter delta and parameter-value tensors use pinned storage by default. To
+retain existing anonymous pageable or mmap/file-backed CPU tensors without
+copying them, use strict adoption:
 
 ```python
 lora = Adapter.from_state_dict(

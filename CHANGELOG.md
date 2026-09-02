@@ -5,6 +5,35 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add `ParameterDelta` and `ParameterDeltaTransform` for combined low-rank and
+  full-rank additive updates to existing plain floating-point parameters.
+  `Adapter.from_state_dict()` recognizes the exact `.delta.weight` and
+  `.delta.bias` suffixes; a dense weight delta composes with that parameter's
+  LoRA factors under one adapter strength.
+
+### Changed
+
+- Change `AdapterTarget` to `ParameterDelta | ParameterValue`. LoRA factors
+  are now the optional low-rank representation within a parameter delta;
+  exact-name parameter values retain their meta-only replacement semantics.
+  Routed mode remains factor-only, and dense deltas for quantized targets are
+  intentionally deferred.
+- Simplify parameter-value conversion to use ordinary target-dtype rounding,
+  including underflow to zero, and narrow parameter values to conventional
+  floating-point tensors rather than plain float8 storage.
+- Reject non-finite strengths when scaled adapter representations are created,
+  so merge and routed execution enforce the same invariant.
+- Reject dense parameter deltas for plain float8 targets during preflight;
+  full-rank updates currently require conventional floating-point storage.
+
+### Removed
+
+- Remove legacy `lora_B.bias` storage and execution. Represent an additive
+  bias update with the canonical `.delta.bias` suffix; routed mode remains
+  factor-only.
+
 ## [0.7.0] - 2026-09-02
 
 ### Added
