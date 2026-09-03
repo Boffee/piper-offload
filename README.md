@@ -520,7 +520,8 @@ feature_adapter = Adapter.from_state_dict(
         "projection.delta.bias": projection_bias_delta,
         "guidance_embedder.weight": guidance_weight,
         "guidance_embedder.bias": guidance_bias,
-    }
+    },
+    scale_parameter_values=False,
 )
 ```
 
@@ -528,19 +529,27 @@ feature_adapter = Adapter.from_state_dict(
 union `ParameterDelta | ParameterValue`, so every mapped target is already in
 a valid, concrete form. A parameter delta contributes
 `strength * (B @ A + dense)` with whichever low-rank and dense terms are
-present. A parameter value instead materializes `strength * value`.
+present. A parameter value materializes `strength * value` by default. Pass
+`scale_parameter_values=False` to `Adapter.from_state_dict()` or `AdapterSpec`
+when its complete values should materialize unchanged for every active,
+nonzero adapter strength. This setting affects only exact-name parameter
+values; LoRA and dense deltas remain strength-scaled. A zero-strength adapter
+is inactive under either policy. Directly constructed mappings can select the
+policy per target with
+`ParameterValue.from_tensor(..., scale_with_strength=False)`.
 
 The resource-level API uses `Adapter`, `AdapterMode`, `AdapterSpec`, and
 `merge_adapter`; activation arguments use the corresponding `adapter_*` names.
 
 Parameter values are merge-only: routed mode rejects the request. For a meta
-target, merge mode materializes `strength * value`. Only one active parameter
-value may own a target; repeated or competing values are rejected. Parameter
-values do not apply to existing physical parameters, quantized tensors,
-DTensors, or tensor subclasses. Their meta targets must have strided,
-non-overlapping dense layouts with zero storage offset; this includes ordinary
-contiguous and transposed dense parameters but excludes overlapping or gapped
-views that cannot be populated while preserving the declared layout.
+target, merge mode materializes the value according to its strength policy.
+Only one active parameter value may own a target; repeated or competing values
+are rejected. Parameter values do not apply to existing physical parameters,
+quantized tensors, DTensors, or tensor subclasses. Their meta targets must
+have strided, non-overlapping dense layouts with zero storage offset; this
+includes ordinary contiguous and transposed dense parameters but excludes
+overlapping or gapped views that cannot be populated while preserving the
+declared layout.
 
 A frozen plain floating-point meta parameter has no host backing and
 contributes zero bytes to model cache accounting.

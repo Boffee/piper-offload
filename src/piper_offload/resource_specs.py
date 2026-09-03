@@ -78,6 +78,8 @@ class AdapterSpec:
     parameter-name value used to populate a frozen floating-point meta target.
     ``allow_partial_targets`` opts the built resource into applying only the
     intersection of its targets and a model's parameters.
+    ``scale_parameter_values`` controls whether adapter strength scales those
+    complete values; disabling it leaves active parameter values unchanged.
     """
 
     key: str
@@ -86,6 +88,7 @@ class AdapterSpec:
     dtype: torch.dtype | None = None
     host_backing: HostBacking = "pinned"
     allow_partial_targets: bool = False
+    scale_parameter_values: bool = True
 
     def build_store(self) -> Adapter:
         """Build and pin this reusable adapter resource."""
@@ -94,6 +97,7 @@ class AdapterSpec:
             dtype=self.dtype,
             host_backing=self.host_backing,
             allow_partial_targets=self.allow_partial_targets,
+            scale_parameter_values=self.scale_parameter_values,
         )
 
     def value(self, store: ResourceStore) -> Adapter:

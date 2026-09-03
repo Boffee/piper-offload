@@ -721,9 +721,32 @@ class TestLoRAConstruction:
         assert isinstance(scaled, ScaledParameterValue)
         assert scaled.value is value
         assert scaled.strength == 0.25
+        assert scaled.materialization_strength == 0.25
+        assert value.scale_with_strength
         assert lora.cache_bytes == weight.nbytes + bias.nbytes
         with pytest.raises(TypeError):
             lora.targets["other"] = next(iter(lora.targets.values()))  # type: ignore[index]
+
+    def test_parameter_value_resource_can_ignore_adapter_strength(self) -> None:
+        source = torch.randn(3, 4)
+        adapter = Adapter.from_state_dict(
+            {"target.weight": source},
+            scale_parameter_values=False,
+        )
+
+        value = adapter.targets["target.weight"]
+        assert isinstance(value, ParameterValue)
+        assert not value.scale_with_strength
+        scaled = value.scaled(-0.25)
+        assert scaled.strength == -0.25
+        assert scaled.materialization_strength == 1.0
+
+        direct = ParameterValue.from_tensor(
+            source,
+            pin_memory=False,
+            scale_with_strength=False,
+        )
+        assert not direct.scale_with_strength
 
     def test_factor_and_parameter_value_cannot_share_target(self) -> None:
         sd = _make_lora_sd(num_blocks=1, dim=4, rank=2)
@@ -3351,6 +3374,30 @@ class TestParameterValueActivation:
         assert model.weight.is_meta
 
     @CUDA
+    def test_parameter_value_can_ignore_activation_strength(self) -> None:
+        with torch.device("meta"):
+            model = nn.Linear(3, 2, bias=False)
+        model.requires_grad_(False)
+        offloader = ModelOffloader.from_module(model)
+        value = torch.randn(2, 3)
+        adapter = Adapter.from_state_dict(
+            {"weight": value},
+            scale_parameter_values=False,
+        )
+
+        offloader.activate(
+            "cuda",
+            adapters=[adapter],
+            adapter_strengths=[-0.5],
+        )
+        try:
+            torch.testing.assert_close(model.weight.cpu(), value)
+        finally:
+            offloader.deactivate()
+
+        assert model.weight.is_meta
+
+    @CUDA
     @pytest.mark.parametrize("block_mode", ["resident", "streaming", "rolling", "auto"])
     def test_parameter_values_work_in_every_block_mode(
         self,
@@ -3513,6 +3560,24 @@ class TestPermanentMerge:
         with pytest.raises(ValueError, match="Scaled parameter value exceeds"):
             merge_adapter(model, [(value, 2.0)])
         assert model.weight.is_meta
+
+    def test_parameter_value_ignores_strength_for_range_and_materialization(self) -> None:
+        source = torch.tensor([40_000.0], dtype=torch.float32)
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.empty(source.shape, device="meta", dtype=torch.float16),
+            requires_grad=False,
+        )
+        value = Adapter.from_state_dict(
+            {"weight": source},
+            scale_parameter_values=False,
+        )
+
+        assert merge_adapter(model, [(value, 0.0)]) == 0
+        assert model.weight.is_meta
+        assert merge_adapter(model, [(value, 2.0)]) == 1
+        assert model.weight.dtype is torch.float16
+        torch.testing.assert_close(model.weight, source.to(torch.float16))
 
     @pytest.mark.parametrize(
         ("source_value", "strength"),
@@ -5119,12 +5184,15 @@ class TestLoRAResource:
             estimated_cache_bytes=value.nbytes,
             factory=lambda: {"target.weight": value},
             host_backing="adopt",
+            scale_parameter_values=False,
         )
 
         lora = spec.build_store()
 
         assert tuple(lora.targets) == ("target.weight",)
-        assert isinstance(lora.targets["target.weight"], ParameterValue)
+        target = lora.targets["target.weight"]
+        assert isinstance(target, ParameterValue)
+        assert not target.scale_with_strength
         assert lora.cache_bytes == value.nbytes
 
     def test_lora_spec_propagates_adopted_host_backing(self) -> None:

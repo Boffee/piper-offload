@@ -33,9 +33,12 @@ class ParameterValue:
 
     Use :meth:`from_tensor` for standalone construction. Adapter resources
     use the same constructor after classifying their canonical state dict.
+    ``scale_with_strength`` controls whether an active adapter's strength is
+    applied when the complete value is materialized.
     """
 
     backing: PinnedParam
+    scale_with_strength: bool = True
 
     def __post_init__(self) -> None:
         """Keep direct construction subject to the source-value invariant."""
@@ -48,15 +51,17 @@ class ParameterValue:
         *,
         dtype: torch.dtype | None = None,
         pin_memory: bool = True,
+        scale_with_strength: bool = True,
     ) -> ParameterValue:
-        """Validate and capture one unscaled parameter value."""
+        """Validate and capture one parameter value and its scaling policy."""
         _validate_value_tensor(source)
         tensor = source if dtype is None or source.dtype is dtype else source.to(dtype=dtype)
         return cls(
             PinnedParam(
                 nn.Parameter(tensor, requires_grad=False),
                 pin_memory=pin_memory,
-            )
+            ),
+            scale_with_strength=scale_with_strength,
         )
 
     @property
@@ -71,7 +76,7 @@ class ParameterValue:
 
 @dataclass(slots=True, frozen=True)
 class ScaledParameterValue:
-    """A parameter value bound to an extrinsic strength."""
+    """A parameter value bound to an extrinsic adapter strength."""
 
     value: ParameterValue
     strength: float
@@ -79,6 +84,11 @@ class ScaledParameterValue:
     def __post_init__(self) -> None:
         if not math.isfinite(self.strength):
             raise ValueError(f"Parameter value strength must be finite; got {self.strength}.")
+
+    @property
+    def materialization_strength(self) -> float:
+        """Return the multiplier selected by the value's scaling policy."""
+        return self.strength if self.value.scale_with_strength else 1.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -136,14 +146,15 @@ class ParameterValueTransform:
                 f"target shape is {tuple(target.shape)}."
             )
 
+        materialization_strength = self._value.materialization_strength
         _validate_target_range(
             source,
             target_dtype=target.dtype,
-            strength=self._value.strength,
+            strength=materialization_strength,
         )
         self._plan = _ParameterValuePlan(
             source,
-            self._value.strength,
+            materialization_strength,
             tuple(target.shape),
             target.stride(),
             target.dtype,
