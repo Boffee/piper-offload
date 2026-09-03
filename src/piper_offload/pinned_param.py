@@ -179,9 +179,9 @@ class PinnedParam:
         if tensor.is_meta:
             # Physical regular tensors are normalized to contiguous backing,
             # but meta parameters retain their declared layout while resting.
-            # Keep differing meta layouts out of the same streaming/rolling
-            # target pool. Parameter values separately reject nonzero storage
-            # offsets because active allocation starts at offset zero.
+            # Keep differing unresolved meta layouts out of the same
+            # streaming/rolling target pool. A ParameterValue load replaces
+            # this signature with its physical source layout.
             signature = (
                 "meta",
                 signature,

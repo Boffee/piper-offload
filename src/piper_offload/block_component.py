@@ -47,7 +47,7 @@ when you need bespoke composition (e.g., multiple block lists like Flux's
 import contextlib
 import logging
 import weakref
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Self, cast
 
@@ -64,9 +64,10 @@ from .host_backing import (
 )
 from .module_names import walk_attr_path
 from .pinned_module import (
+    ParameterOverride,
     PinnedModuleInstance,
+    PinnedModuleLoadPlan,
     PinnedModuleStore,
-    PostCopyHook,
 )
 from .pinned_param import PinnedParam
 from .resident_runtime import ResidentBlockRuntime
@@ -614,9 +615,9 @@ class BlockComponent:
         The concrete bound block instances.
     name:
         Optional model path for the block list. When set,
-        :attr:`param_names` and name-based post-copy hook registration
-        use names like ``"blocks.3.weight"``. When omitted, standalone
-        standalone components use ``"3.weight"``.
+        :attr:`param_names` and activation parameter overrides use names like
+        ``"blocks.3.weight"``. When omitted, standalone components use
+        ``"3.weight"``.
         Trainable streaming requires activation checkpointing on every
         block (the ``.data`` swap bypasses autograd's version-counter
         check). The component doesn't enforce that precondition itself —
@@ -721,6 +722,7 @@ class BlockComponent:
         )
         self._active_device: torch.device | None = None
         self._active_runtime: BlockRuntime | None = None
+        self._load_plans: tuple[PinnedModuleLoadPlan, ...] = ()
         self._param_name_to_block_param = _build_param_name_index(
             self._block_instances,
             name,
@@ -784,25 +786,6 @@ class BlockComponent:
     def has_trainables(self) -> bool:
         return any(instance.has_trainables for instance in self._block_instances)
 
-    def register_post_copy_hook(
-        self,
-        name: str,
-        hook: PostCopyHook,
-        *,
-        materialization_backing: PinnedParam | None = None,
-    ) -> Callable[[], None]:
-        """Register a hook after this component copies ``name`` to GPU.
-
-        Package-internal: used by :class:`ModelOffloader` for merge-mode
-        LoRA. Returns a callable that unregisters the hook.
-        """
-        instance, name = self._resolve_param_name(name)
-        return instance.register_post_copy_hook(
-            name,
-            hook,
-            materialization_backing=materialization_backing,
-        )
-
     def _resolve_param_name(
         self,
         name: str,
@@ -856,6 +839,7 @@ class BlockComponent:
         device: torch.device,
         *,
         compile_blocks: bool = True,
+        parameter_overrides: Mapping[str, ParameterOverride] | None = None,
     ) -> None:
         """Activate the block list on ``device``.
 
@@ -886,13 +870,43 @@ class BlockComponent:
             )
         active_device = canonical_device(device)
         if active_device.type == "cpu":
+            if parameter_overrides:
+                raise ValueError(
+                    "Parameter overrides require CUDA activation."
+                )
             self._activate_cpu_resolved()
             return
         if active_device.type != "cuda":
             raise ValueError(f"BlockComponent.activate() supports CUDA or CPU; got {active_device}.")
+        self._load_plans = self._resolve_load_plans(parameter_overrides)
         self._activate_cuda_resolved(
             active_device,
             compile_blocks=compile_blocks,
+        )
+
+    def _resolve_load_plans(
+        self,
+        overrides: Mapping[str, ParameterOverride] | None,
+    ) -> tuple[PinnedModuleLoadPlan, ...]:
+        by_block: list[dict[str, ParameterOverride]] = [
+            {} for _instance in self._block_instances
+        ]
+        if overrides is not None:
+            for name, override in overrides.items():
+                ref = self._param_name_to_block_param.get(name)
+                if ref is None:
+                    raise ValueError(
+                        f"param name {name!r} is not owned by this block component"
+                    )
+                block_idx, local_name = ref
+                by_block[block_idx][local_name] = override
+        return tuple(
+            instance.resolve_load_plan(local_overrides)
+            for instance, local_overrides in zip(
+                self._block_instances,
+                by_block,
+                strict=True,
+            )
         )
 
     def _activate_cpu_resolved(self) -> None:
@@ -931,7 +945,7 @@ class BlockComponent:
         if runtime is None:
             raise RuntimeError("BlockComponent CUDA session has no selected runtime.")
         if not runtime.acquired:
-            runtime.acquire(active_device)
+            runtime.acquire(active_device, self._load_plans)
 
     def release(self) -> None:
         """Idempotently release this session's CUDA working set.
@@ -954,6 +968,7 @@ class BlockComponent:
         self._block_compile.restore()
         if self._active_device == torch.device("cpu"):
             self._active_device = None
+            self._load_plans = ()
             return
 
         try:
@@ -961,6 +976,7 @@ class BlockComponent:
         finally:
             self._active_runtime = None
             self._active_device = None
+            self._load_plans = ()
 
     @contextlib.contextmanager
     def use(

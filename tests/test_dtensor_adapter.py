@@ -570,7 +570,10 @@ class TestDTensorAdapter:
         tp_mesh: Any,
     ) -> None:
         dt, full = _dtensor_weight(tp_mesh)
-        adapter = Adapter.from_state_dict({"weight": dt})
+        adapter = Adapter.from_state_dict(
+            {"weight": dt},
+            scale_parameter_values=True,
+        )
         model = nn.Module()
         model.weight = nn.Parameter(
             torch.empty(dt.shape, device="meta"),
@@ -635,7 +638,10 @@ class TestDTensorAdapter:
         assert isinstance(select_adapter(gpu_param.data.to_local()), Float8Adapter)
         assert gpu_param.data.placements == dt.placements
 
-        value_adapter = Adapter.from_state_dict({"weight": dt})
+        value_adapter = Adapter.from_state_dict(
+            {"weight": dt},
+            scale_parameter_values=True,
+        )
         model = nn.Module()
         model.weight = nn.Parameter(
             torch.empty(dt.shape, device="meta"),

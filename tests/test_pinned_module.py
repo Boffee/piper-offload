@@ -9,6 +9,7 @@ from torch import nn
 from piper_offload import pinned_module
 from piper_offload.pinned_buffer import PinnedBuffer
 from piper_offload.pinned_module import (
+    ParameterOverride,
     PinnedBufferTarget,
     PinnedModuleInstance,
     PinnedModuleStore,
@@ -31,6 +32,7 @@ class _FakePinnedParam:
         self.validated = 0
         self.copy_to_cpu_non_blocking: list[bool] = []
         self.is_meta = False
+        self.logical_shape = tuple(target_data.shape)
         self.requires_grad = requires_grad
         self.target_data = target_data
         # Stable pinned-CPU backing aliased by every make_cpu_param() call,
@@ -342,7 +344,7 @@ class TestPinnedModuleInstance:
             buffers=store.buffers,
         )
 
-        target = instance.allocate_target(torch.device("cuda"))
+        target = instance.resolve_load_plan().allocate_target(torch.device("cuda"))
 
         assert pinned_param.allocated == 1
         assert target.param_targets["left.weight"] is target.param_targets["right.weight"]
@@ -356,9 +358,49 @@ class TestPinnedModuleInstance:
         )
 
         with pytest.raises(ValueError, match="requires a CUDA device"):
-            instance.allocate_target(torch.device("cpu"))
+            instance.resolve_load_plan().allocate_target(torch.device("cpu"))
 
-    def test_load_to_target_copies_and_hooks_once_for_aliases(self) -> None:
+    def test_parameter_override_resolves_meta_replacement_source(self) -> None:
+        base = PinnedParam(
+            nn.Parameter(torch.empty(2, device="meta"), requires_grad=False),
+            pin_memory=False,
+        )
+        source = PinnedParam(
+            nn.Parameter(torch.ones(2), requires_grad=False),
+            pin_memory=False,
+        )
+        instance = PinnedModuleInstance(
+            module=nn.Module(),
+            params={"weight": base},
+            buffers={},
+        )
+
+        assert instance.resolve_load_plan().loads == {}
+        with pytest.raises(ValueError, match="physical replacement source"):
+            instance.resolve_load_plan(
+                {"weight": ParameterOverride(update=lambda _param: None)}
+            )
+
+        plan = instance.resolve_load_plan(
+            {"weight": ParameterOverride(source=source)}
+        )
+        assert plan.loads["weight"].source is source
+        assert plan.loads["weight"].update is None
+
+    def test_load_plan_is_immutable(self) -> None:
+        instance = PinnedModuleInstance(
+            module=nn.Module(),
+            params={},
+            buffers={},
+        )
+        plan = instance.resolve_load_plan()
+
+        with pytest.raises(AttributeError):
+            plan.instance = instance  # type: ignore[misc]
+        with pytest.raises(TypeError):
+            plan.loads["weight"] = object()  # type: ignore[index, assignment]
+
+    def test_load_to_target_copies_and_updates_once_for_aliases(self) -> None:
         module = nn.Module()
         shared = nn.Linear(2, 2, bias=False)
         shared.weight.requires_grad_(False)
@@ -377,19 +419,21 @@ class TestPinnedModuleInstance:
             params=store.params,
             buffers=store.buffers,
         )
-        target = instance.allocate_target(torch.device("cuda"))
-        hook_calls: list[nn.Parameter] = []
+        update_calls: list[nn.Parameter] = []
 
-        def hook(param: nn.Parameter) -> None:
-            hook_calls.append(param)
+        def update(param: nn.Parameter) -> None:
+            update_calls.append(param)
             param.data.add_(1)
 
-        instance.register_post_copy_hook("left.weight", hook)
-        instance.load_to_target(target, run_post_copy_hooks=True)
+        plan = instance.resolve_load_plan(
+            {"left.weight": ParameterOverride(update=update)}
+        )
+        target = plan.allocate_target(torch.device("cuda"))
+        plan.load_to_target(target)
 
         target_param = target.param_targets["left.weight"].param
         assert pinned.copied == 1
-        assert hook_calls == [target_param]
+        assert update_calls == [target_param]
         assert module.left.weight is target_param
         assert module.right.weight is target_param
         torch.testing.assert_close(target_param, torch.full((2, 2), 2.0))
@@ -404,17 +448,19 @@ class TestPinnedModuleInstance:
             params={"weight": cast(PinnedParam, pinned)},
             buffers={},
         )
-        target = instance.allocate_target(torch.device("cuda"))
-        hook_calls: list[nn.Parameter] = []
-        instance.register_post_copy_hook("weight", hook_calls.append)
+        update_calls: list[nn.Parameter] = []
+        plan = instance.resolve_load_plan(
+            {"weight": ParameterOverride(update=update_calls.append)}
+        )
+        target = plan.allocate_target(torch.device("cuda"))
 
-        instance.copy_to_target(target, run_post_copy_hooks=True)
+        plan.copy_to_target(target)
 
         assert module.weight is original
         assert pinned.copied == 1
-        assert hook_calls == [target.param_targets["weight"].param]
+        assert update_calls == [target.param_targets["weight"].param]
 
-    def test_load_to_target_skips_registered_hooks_by_default(self) -> None:
+    def test_resolve_load_plan_uses_base_source_without_override(self) -> None:
         module = nn.Module()
         module.weight = nn.Parameter(torch.zeros(2), requires_grad=False)
         pinned = _FakePinnedParam(torch.ones(2))
@@ -427,18 +473,13 @@ class TestPinnedModuleInstance:
             params=store.params,
             buffers=store.buffers,
         )
-        target = instance.allocate_target(torch.device("cuda"))
-        hook_calls: list[nn.Parameter] = []
-
-        def hook(param: nn.Parameter) -> None:
-            hook_calls.append(param)
-            param.data.add_(1)
-
-        instance.register_post_copy_hook("weight", hook)
-        instance.load_to_target(target)
+        plan = instance.resolve_load_plan()
+        target = plan.allocate_target(torch.device("cuda"))
+        plan.load_to_target(target)
 
         target_param = target.param_targets["weight"].param
-        assert hook_calls == []
+        assert plan.loads["weight"].source is pinned
+        assert plan.loads["weight"].update is None
         assert module.weight is target_param
         torch.testing.assert_close(target_param, torch.ones(2))
 
@@ -456,9 +497,10 @@ class TestPinnedModuleInstance:
             params=store.params,
             buffers=store.buffers,
         )
-        target = instance.allocate_target(torch.device("cuda"))
+        plan = instance.resolve_load_plan()
+        target = plan.allocate_target(torch.device("cuda"))
 
-        instance.load_to_target(target)
+        plan.load_to_target(target)
 
         assert module.weight is original
         assert module.weight.data_ptr() == target.param_targets["weight"].param.data_ptr()
@@ -497,7 +539,7 @@ class TestPinnedModuleInstance:
             },
         )
 
-        instance.load_to_target(target)
+        instance.resolve_load_plan().load_to_target(target)
 
         torch.testing.assert_close(target_tensor, store.buffers["running"].tensor)
         assert module.running is target_tensor
@@ -531,7 +573,7 @@ class TestPinnedModuleInstance:
         )
 
         with pytest.raises(ValueError, match="entries outside the store.*'extra'"):
-            instance.load_to_target(target)
+            instance.resolve_load_plan().load_to_target(target)
 
         assert pinned.copied == 0
         assert module.weight is original
@@ -559,7 +601,7 @@ class TestPinnedModuleInstance:
         )
 
         with pytest.raises(ValueError, match="entries outside the store.*'extra'"):
-            instance.load_to_target(target)
+            instance.resolve_load_plan().load_to_target(target)
 
         assert module.running is original
         assert "extra" not in module._buffers
@@ -578,7 +620,7 @@ class TestPinnedModuleInstance:
             params=store.params,
             buffers=store.buffers,
         )
-        target = instance.allocate_target(torch.device("cuda"))
+        target = instance.resolve_load_plan().allocate_target(torch.device("cuda"))
 
         instance.copy_trainables_from_target(target, non_blocking=True)
 
@@ -600,7 +642,7 @@ class TestPinnedModuleInstance:
             params=store.params,
             buffers=store.buffers,
         )
-        target = instance.allocate_target(torch.device("cuda"))
+        target = instance.resolve_load_plan().allocate_target(torch.device("cuda"))
 
         instance.copy_trainables_from_target(target)
 
@@ -622,10 +664,10 @@ class TestPinnedModuleInstance:
             params=store.params,
             buffers=store.buffers,
         )
-        target = instance.allocate_target(
-            torch.device("cuda"),
-            param_names={"trainable"},
-            buffer_names=(),
+        target = (
+            instance.resolve_load_plan()
+            .select_parameters({"trainable"})
+            .allocate_target(torch.device("cuda"), buffer_names=())
         )
 
         instance.copy_trainables_from_target(target)
@@ -673,12 +715,11 @@ class TestPinnedModuleInstance:
             buffers=store.buffers,
         )
 
-        target = instance.allocate_target(
-            torch.device("cuda"),
-            param_names=store.trainable_param_names,
-            buffer_names=(),
+        plan = instance.resolve_load_plan().select_parameters(
+            store.trainable_param_names
         )
-        instance.load_to_target(target, non_blocking=True)
+        target = plan.allocate_target(torch.device("cuda"), buffer_names=())
+        plan.load_to_target(target, non_blocking=True)
 
         assert set(target.param_targets) == {"trainable"}
         assert target.buffer_targets == {}
@@ -715,12 +756,11 @@ class TestPinnedModuleInstance:
         instance.install_pinned()
         pinned_trainable = module.trainable
         pinned_trainable_data_ptr = module.trainable.data_ptr()
-        target = instance.allocate_target(
-            torch.device("cuda"),
-            param_names=store.trainable_param_names,
-            buffer_names=(),
+        plan = instance.resolve_load_plan().select_parameters(
+            store.trainable_param_names
         )
-        instance.load_to_target(target)
+        target = plan.allocate_target(torch.device("cuda"), buffer_names=())
+        plan.load_to_target(target)
 
         instance.install_pinned()
 

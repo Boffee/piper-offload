@@ -11,14 +11,18 @@ import torch
 from torch import nn
 
 from .block_compile import CompileBackend
+from .block_runtime import validate_load_plans
 from .float8_adapter import Float8Adapter
 from .gguf_adapter import GgufAdapter
 from .int4_tile_adapter import Int4TilePackedAdapter
 from .int8_adapter import Int8Adapter
 from .mx_adapter import MxAdapter
 from .nvfp4_adapter import Nvfp4Adapter
-from .pinned_module import PinnedModuleInstance
-from .pinned_param import PinnedParam
+from .pinned_module import (
+    ParameterLoad,
+    PinnedModuleInstance,
+    PinnedModuleLoadPlan,
+)
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from .piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
 from .quanto_adapter import QuantoAdapter
@@ -28,7 +32,7 @@ from .rolling_compile import (
     unregister_rolling_target,
 )
 from .static_float8_adapter import StaticFloat8Adapter
-from .target_lease import _CudaTargetLease
+from .target_lease import CudaTargetLease
 from .tensor_adapters import RegularAdapter
 
 logger = logging.getLogger(__name__)
@@ -62,13 +66,14 @@ class RollingBlockRuntime:
         self._reset_acquired_state()
 
     def _reset_acquired_state(self) -> None:
-        self._lease: _CudaTargetLease | None = None
+        self._lease: CudaTargetLease | None = None
         self._stream: torch.cuda.Stream | None = None
         self._events: tuple[torch.cuda.Event, ...] = ()
         self._ready_events: tuple[torch.cuda.Event, ...] = ()
         self._fallback_event: torch.cuda.Event | None = None
         self._owners: list[int] | None = None
         self._slot_names: tuple[str, ...] = ()
+        self._load_plans: tuple[PinnedModuleLoadPlan, ...] = ()
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
 
     @property
@@ -79,22 +84,25 @@ class RollingBlockRuntime:
     def compile_backend(self) -> CompileBackend:
         return rolling_inductor_backend
 
-    def acquire(self, device: torch.device) -> None:
+    def acquire(
+        self,
+        device: torch.device,
+        load_plans: Sequence[PinnedModuleLoadPlan],
+    ) -> None:
         if self.acquired:
             raise RuntimeError("rolling block runtime is already acquired")
+        plans = validate_load_plans(self._instances, load_plans)
+        self._load_plans = plans
         self._stream = torch.cuda.Stream(device=device, priority=-1)
-        materialized_by_instance = tuple(
-            instance.materialized_params for instance in self._instances
-        )
-        materialized_names = {
+        source_names = {
             name
-            for params in materialized_by_instance
-            for name in params
+            for plan in plans
+            for name in plan.loads
         }
         self._slot_names = tuple(
             name
             for name in self._instances[0].params
-            if name in materialized_names
+            if name in source_names
         )
         self._events = tuple(torch.cuda.Event() for _name in self._slot_names)
         self._ready_events = tuple(torch.cuda.Event() for _name in self._slot_names)
@@ -102,44 +110,48 @@ class RollingBlockRuntime:
 
         if not self._slot_names:
             logger.info(
-                "rolling block runtime acquired with no materialized parameter slots across %d blocks",
+                "rolling block runtime acquired with no active parameter slots across %d blocks",
                 len(self._instances),
             )
             return
 
         self._fallback_event = torch.cuda.Event()
-        slot_backings: dict[str, PinnedParam] = {}
+        allocation_loads: dict[str, ParameterLoad] = {}
         for name in self._slot_names:
             active = [
-                backing for params in materialized_by_instance
-                if (backing := params.get(name)) is not None
+                load for plan in plans
+                if (load := plan.loads.get(name)) is not None
             ]
             assert active
-            backing = active[0]
+            source = active[0].source
             if any(
-                candidate.target_layout != backing.target_layout
+                candidate.source.target_layout != source.target_layout
                 for candidate in active[1:]
             ):
                 raise NotImplementedError(
                     "rolling compilation requires identical active parameter "
-                    f"layouts for slot {name!r} in every materialized block"
+                    f"layouts for slot {name!r} in every block with a source"
                 )
-            if type(backing.adapter) not in _ROLLING_ADAPTER_TYPES:
+            if type(source.adapter) not in _ROLLING_ADAPTER_TYPES:
                 raise NotImplementedError(
                     "rolling compilation does not support active parameter "
-                    f"adapter {type(backing.adapter).__name__} for slot {name!r}"
+                    f"adapter {type(source.adapter).__name__} for slot {name!r}"
                 )
-            if math.prod(backing.logical_shape) == 0:
+            if math.prod(source.logical_shape) == 0:
                 raise NotImplementedError(
                     "rolling compilation does not support zero-sized parameter slots"
                 )
-            slot_backings[name] = backing
-        self._lease = _CudaTargetLease.allocate(
-            self._instances[0],
+            # This synthetic plan defines shared target storage only. Block
+            # updates remain exclusively on their activation load plans.
+            allocation_loads[name] = ParameterLoad(source)
+        allocation_plan = PinnedModuleLoadPlan(
+            plans[0].instance,
+            allocation_loads,
+        )
+        self._lease = CudaTargetLease.allocate(
+            allocation_plan,
             device,
-            param_names=self._slot_names,
             buffer_names=(),
-            param_backings=slot_backings,
         )
         target = self._lease.target
         register_rolling_target(
@@ -148,9 +160,8 @@ class RollingBlockRuntime:
         )
 
         self._lease.stage(
-            self._instances[0],
+            plans[0],
             self._stream,
-            run_post_copy_hooks=True,
             non_blocking=True,
         )
         with torch.cuda.stream(self._stream):
@@ -248,7 +259,7 @@ class RollingBlockRuntime:
         assert owners is not None
         name = self._slot_names[param_idx]
         param_target = target.param_targets[name]
-        self._instances[block_idx].refill_param_target(name, param_target)
+        self._load_plans[block_idx].refill_param_target(name, param_target)
         self._ready_events[param_idx].record(prefetch_stream)
         owners[param_idx] = block_idx
 

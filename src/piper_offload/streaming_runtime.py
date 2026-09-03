@@ -11,9 +11,14 @@ import torch
 from torch import nn
 
 from .block_compile import CompileBackend
+from .block_runtime import validate_load_plans
 from .module_names import group_names
-from .pinned_module import PinnedModuleInstance, PinnedModuleTarget
-from .target_lease import _CudaTargetLease
+from .pinned_module import (
+    PinnedModuleInstance,
+    PinnedModuleLoadPlan,
+    PinnedModuleTarget,
+)
+from .target_lease import CudaTargetLease
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +26,10 @@ type BlockSignature = tuple[object, ...]
 type _LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
 
 
-def _instance_target_signature(instance: PinnedModuleInstance) -> BlockSignature:
+def _plan_target_signature(plan: PinnedModuleLoadPlan) -> BlockSignature:
     """Return the layout-equivalence key for one block's GPU targets."""
-    params = instance.materialized_params
+    instance = plan.instance
+    params = plan.sources
     param_sig = tuple(
         (
             tuple(names),
@@ -48,19 +54,19 @@ class _MorphingTargetPool:
 
     def __init__(self, device: torch.device) -> None:
         self._device = device
-        self._free: dict[BlockSignature, list[_CudaTargetLease]] = {}
+        self._free: dict[BlockSignature, list[CudaTargetLease]] = {}
 
     def acquire(
         self,
         signature: BlockSignature,
-        instance: PinnedModuleInstance,
+        plan: PinnedModuleLoadPlan,
         stream: torch.cuda.Stream,
-    ) -> _CudaTargetLease:
+    ) -> CudaTargetLease:
         free = self._free.get(signature)
         if free:
             return free.pop()
-        return _CudaTargetLease.allocate(
-            instance,
+        return CudaTargetLease.allocate(
+            plan,
             self._device,
             allocation_stream=stream,
         )
@@ -68,7 +74,7 @@ class _MorphingTargetPool:
     def release(
         self,
         signature: BlockSignature,
-        lease: _CudaTargetLease,
+        lease: CudaTargetLease,
     ) -> None:
         self._free.setdefault(signature, []).append(lease)
 
@@ -89,11 +95,11 @@ class StreamingBlockRuntime:
         wraparound: bool = True,
     ) -> None:
         self._instances = tuple(instances)
-        self._blocks = tuple(instance.module for instance in instances)
         self._wraparound = wraparound
         self._device: torch.device | None = None
+        self._load_plans: tuple[PinnedModuleLoadPlan, ...] = ()
         self._pool: _MorphingTargetPool | None = None
-        self._block_to_lease: dict[int, _CudaTargetLease] = {}
+        self._block_to_lease: dict[int, CudaTargetLease] = {}
         self._active_idx: int | None = None
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._executor: ThreadPoolExecutor | None = None
@@ -111,12 +117,19 @@ class StreamingBlockRuntime:
     def compile_backend(self) -> CompileBackend:
         return "inductor"
 
-    def acquire(self, device: torch.device) -> None:
+    def acquire(
+        self,
+        device: torch.device,
+        load_plans: Sequence[PinnedModuleLoadPlan],
+    ) -> None:
         if self.acquired:
             raise RuntimeError("streaming block runtime is already acquired")
 
+        plans = validate_load_plans(self._instances, load_plans)
+
         num_blocks = len(self._instances)
         self._device = device
+        self._load_plans = plans
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._stream = torch.cuda.Stream(device=device, priority=-1)
         self._pending = {}
@@ -155,6 +168,7 @@ class StreamingBlockRuntime:
         self._active_idx = None
         self._last_idx = -1
         self._device = None
+        self._load_plans = ()
 
         if first_prefetch_exc is not None:
             raise first_prefetch_exc
@@ -215,12 +229,14 @@ class StreamingBlockRuntime:
                 if not instance.has_trainables:
                     continue
                 stack.callback(instance.install_pinned)
-                target = instance.allocate_target(
+                plan = instance.resolve_load_plan().select_parameters(
+                    instance.trainable_param_names,
+                )
+                target = plan.allocate_target(
                     device,
-                    param_names=instance.trainable_param_names,
                     buffer_names=(),
                 )
-                instance.load_to_target(target, non_blocking=True)
+                plan.load_to_target(target, non_blocking=True)
                 instance.move_trainable_grads_to(device)
                 loaded.append((instance, target))
         torch.cuda.current_stream(device).wait_stream(step_stream)
@@ -250,19 +266,18 @@ class StreamingBlockRuntime:
         non_blocking: bool = False,
     ) -> None:
         assert self._pool is not None, "runtime is not acquired"
-        instance = self._instances[block_idx]
+        plan = self._load_plans[block_idx]
         lease = self._block_to_lease.get(block_idx)
         if lease is None:
             lease = self._pool.acquire(
-                _instance_target_signature(instance),
-                instance,
+                _plan_target_signature(plan),
+                plan,
                 stream,
             )
             self._block_to_lease[block_idx] = lease
         lease.stage(
-            instance,
+            plan,
             stream,
-            run_post_copy_hooks=True,
             non_blocking=non_blocking,
         )
 
@@ -272,19 +287,22 @@ class StreamingBlockRuntime:
         stream: torch.cuda.Stream,
     ) -> None:
         lease = self._block_to_lease[block_idx]
-        self._instances[block_idx].install_target(lease.acquire(stream))
+        self._load_plans[block_idx].instance.install_target(
+            lease.acquire(stream)
+        )
 
     def _release_block(
         self,
         block_idx: int,
     ) -> None:
-        self._instances[block_idx].install_pinned()
+        plan = self._load_plans[block_idx]
+        plan.instance.install_pinned()
         assert self._pool is not None, "runtime is not acquired"
         lease = self._block_to_lease.pop(block_idx, None)
         if lease is not None:
             lease.release()
             self._pool.release(
-                _instance_target_signature(self._instances[block_idx]),
+                _plan_target_signature(plan),
                 lease,
             )
 
@@ -360,9 +378,15 @@ class StreamingBlockRuntime:
             if runtime is not None:
                 runtime._before_block_forward(idx)
 
-        last_idx_by_module = {id(module): idx for idx, module in enumerate(self._blocks)}
+        last_idx_by_module = {
+            id(plan.instance.module): idx
+            for idx, plan in enumerate(self._load_plans)
+        }
         for idx in last_idx_by_module.values():
-            handle = self._blocks[idx].register_forward_pre_hook(functools.partial(_pre_hook, idx=idx))
+            module = self._load_plans[idx].instance.module
+            handle = module.register_forward_pre_hook(
+                functools.partial(_pre_hook, idx=idx)
+            )
             self._hooks.append(handle)
 
 

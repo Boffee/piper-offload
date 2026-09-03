@@ -484,6 +484,7 @@ class TestPiperConvRotInt8Adapter:
         adapter = Adapter.from_state_dict(
             {"weight": source},
             host_backing="adopt",
+            scale_parameter_values=True,
         )
         model = nn.Module()
         model.weight = nn.Parameter(
@@ -722,6 +723,7 @@ class TestPiperConvRotInt8Adapter:
         value = Adapter.from_state_dict(
             {"weight": source},
             host_backing="adopt",
+            scale_parameter_values=True,
         )
         offloader = ModelOffloader.from_module(
             model,
@@ -870,6 +872,7 @@ class TestPiperConvRotInt8Adapter:
                 for idx, source in enumerate(sources)
             },
             host_backing="adopt",
+            scale_parameter_values=True,
         )
         model = M()
         compile_config = (
@@ -1047,4 +1050,4 @@ class TestPiperConvRotInt8Adapter:
 
         assert torch.equal(samples[0], samples[1])
         assert offloader.active_device is None
-        assert offloader._adapter_hook_removers == []
+        assert offloader._routed_hook_removers == []

@@ -107,9 +107,9 @@ class Adapter:
     only frozen floating-point meta parameters.
 
     Strength is extrinsic and supplied when the adapter is activated or
-    permanently merged. By default it scales both parameter deltas and
-    parameter values. Parameter-value scaling can be disabled when complete
-    values should remain unchanged for every active adapter strength.
+    permanently merged. It always scales parameter deltas. Complete parameter
+    values remain unchanged by default and can explicitly opt into strength
+    scaling.
 
     ``state_dict`` keys must already use model parameter paths. Any key
     remapping and removal of non-adapter metadata are the caller's
@@ -151,7 +151,7 @@ class Adapter:
         dtype: torch.dtype | None = None,
         host_backing: HostBacking = "pinned",
         allow_partial_targets: bool = False,
-        scale_parameter_values: bool = True,
+        scale_parameter_values: bool = False,
     ) -> Self:
         """Validate and capture factor and/or parameter-value tensors.
 
@@ -162,8 +162,8 @@ class Adapter:
         the complete dense or supported prequantized value for a meta
         parameter. ``dtype`` casts dense inputs; structured values must already
         use it as their logical compute dtype.
-        ``scale_parameter_values=False`` materializes those complete values
-        unchanged instead of multiplying them by an active adapter's strength.
+        ``scale_parameter_values=True`` multiplies those complete values by
+        an active adapter's strength; by default they remain unchanged.
         A zero-strength adapter remains inactive.
         ``host_backing="adopt"`` strictly adopts existing CPU storage and
         therefore rejects conversions.
@@ -299,7 +299,7 @@ def _build_adapter_targets(
     *,
     dtype: torch.dtype | None = None,
     pin_memory: bool = True,
-    scale_parameter_values: bool = True,
+    scale_parameter_values: bool = False,
 ) -> dict[str, AdapterTarget]:
     """Capture parsed sources into one target value per parameter name."""
     targets: dict[str, AdapterTarget] = {}

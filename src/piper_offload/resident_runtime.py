@@ -7,8 +7,9 @@ from collections.abc import Generator, Sequence
 import torch
 
 from .block_compile import CompileBackend
-from .pinned_module import PinnedModuleInstance
-from .target_lease import _CudaTargetLease
+from .block_runtime import validate_load_plans
+from .pinned_module import PinnedModuleInstance, PinnedModuleLoadPlan
+from .target_lease import CudaTargetLease
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ class ResidentBlockRuntime:
     ) -> None:
         self._instances = tuple(instances)
         self._device: torch.device | None = None
-        self._leases: list[_CudaTargetLease] = []
+        self._leases: list[CudaTargetLease] = []
         self._optimizer_step_active = False
         self._move_trainable_grads_to(torch.device("cpu"))
 
@@ -34,25 +35,30 @@ class ResidentBlockRuntime:
     def compile_backend(self) -> CompileBackend:
         return "inductor"
 
-    def acquire(self, device: torch.device) -> None:
+    def acquire(
+        self,
+        device: torch.device,
+        load_plans: Sequence[PinnedModuleLoadPlan],
+    ) -> None:
         if self.acquired:
             raise RuntimeError("resident block runtime is already acquired")
+
+        plans = validate_load_plans(self._instances, load_plans)
 
         self._device = device
         current_stream = torch.cuda.current_stream(device)
         try:
             self._move_trainable_grads_to(device)
-            for instance in self._instances:
-                lease = _CudaTargetLease.allocate(
-                    instance,
+            for instance, plan in zip(self._instances, plans, strict=True):
+                lease = CudaTargetLease.allocate(
+                    plan,
                     device,
                     allocation_stream=current_stream,
                 )
                 self._leases.append(lease)
                 lease.stage(
-                    instance,
+                    plan,
                     current_stream,
-                    run_post_copy_hooks=True,
                     non_blocking=True,
                 )
                 instance.install_target(lease.acquire(current_stream))

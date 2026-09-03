@@ -26,7 +26,7 @@ from .parameter_delta import ParameterDeltaTransform
 from .parameter_transform import ParameterTransform
 from .parameter_value import ParameterValueTransform
 from .pinned_component import PinnedComponent
-from .pinned_param import PinnedParam
+from .pinned_module import ParameterOverride
 
 type _ParameterUpdateMap = dict[str, AdapterTargetUpdates]
 type _TransientComponent = PinnedComponent | BlockComponent
@@ -89,9 +89,9 @@ class ModelOffloader:
 
     Composes resident and transient :class:`PinnedComponent`\\ s with one or
     more :class:`BlockComponent`\\ s internally. Adapter requests are supplied
-    directly to :meth:`activate`; merge mode installs activation-scoped
-    post-copy hooks so the merge fires immediately after each CPU->GPU weight
-    copy. No separate merge binding is needed.
+    directly to :meth:`activate`; merge mode builds activation-scoped
+    parameter overrides so each update runs immediately after its source is
+    copied to CUDA. No separate merge binding is needed.
 
     Training
     --------
@@ -155,7 +155,7 @@ class ModelOffloader:
         self._composite = composite
         self._cache_bytes = cache_bytes
         self._activation_lock = threading.Lock()
-        self._adapter_hook_removers: list[Callable[[], None]] = []
+        self._routed_hook_removers: list[Callable[[], None]] = []
         self._transient_hook_removers: list[Callable[[], None]] = []
 
     @classmethod
@@ -273,13 +273,13 @@ class ModelOffloader:
                 contributions.add(target, strength, target_key=target_key)
         return per_param
 
-    def _register_merge_adapter_hooks(
+    def _build_merge_parameter_overrides(
         self,
         active_device: torch.device,
         updates: _ParameterUpdateMap,
         *,
         stochastic_rounding: bool = True,
-    ) -> None:
+    ) -> dict[str, ParameterOverride]:
         if active_device.type != "cuda":
             raise ValueError(
                 "ModelOffloader merge mode requires CUDA activation; "
@@ -288,6 +288,7 @@ class ModelOffloader:
             )
 
         params_by_name = dict(self._model.named_parameters(remove_duplicate=False))
+        overrides: dict[str, ParameterOverride] = {}
         for param_name, contributions in updates.items():
             transform: ParameterTransform
             if contributions.deltas:
@@ -306,16 +307,20 @@ class ModelOffloader:
 
             transform.validate_parameter(params_by_name[param_name])
 
-            remove_hook = self._register_post_copy_hook(
-                param_name,
-                transform.apply_parameter,
-                materialization_backing=(
-                    transform.materialization_backing
-                    if isinstance(transform, ParameterValueTransform)
-                    else None
-                ),
-            )
-            self._adapter_hook_removers.append(remove_hook)
+            if isinstance(transform, ParameterValueTransform):
+                overrides[param_name] = ParameterOverride(
+                    source=transform.backing,
+                    update=(
+                        transform.apply_parameter
+                        if transform.requires_update
+                        else None
+                    ),
+                )
+            else:
+                overrides[param_name] = ParameterOverride(
+                    update=transform.apply_parameter,
+                )
+        return overrides
 
     def _register_routed_lora_hooks(
         self,
@@ -356,28 +361,7 @@ class ModelOffloader:
                 parent,
                 contributions.factors,
             )
-            self._adapter_hook_removers.append(remove_hook)
-
-    def _register_post_copy_hook(
-        self,
-        param_name: str,
-        hook: Callable[[nn.Parameter], None],
-        *,
-        materialization_backing: PinnedParam | None = None,
-    ) -> Callable[[], None]:
-        return self._composite.register_post_copy_hook(
-            param_name,
-            hook,
-            materialization_backing=materialization_backing,
-        )
-
-    def register_post_copy_hook(
-        self,
-        param_name: str,
-        hook: Callable[[nn.Parameter], None],
-    ) -> Callable[[], None]:
-        """Register a post-copy hook and return a callable that removes it."""
-        return self._register_post_copy_hook(param_name, hook)
+            self._routed_hook_removers.append(remove_hook)
 
     def register_forward_hook(
         self,
@@ -447,8 +431,8 @@ class ModelOffloader:
             remove_hook()
 
     def _clear_active_adapter_hooks(self) -> None:
-        remove_hooks = self._adapter_hook_removers
-        self._adapter_hook_removers = []
+        remove_hooks = self._routed_hook_removers
+        self._routed_hook_removers = []
         for remove_hook in reversed(remove_hooks):
             remove_hook()
 
@@ -503,17 +487,17 @@ class ModelOffloader:
         """Make the owned model usable on ``device``.
 
         ``adapters`` and their optional ``adapter_strengths`` apply only to this
-        activation. Exact-zero strengths are inactive and install no hooks.
+        activation. Exact-zero strengths are inactive and create no updates.
         Adapters that allow partial targets apply only to parameters managed by
         this offloader; strict adapters reject any absent target.
-        ``adapter_mode`` selects in-place merge hooks or routed LoRA residual
-        hooks. Routed mode requires factor-only adapters.
+        ``adapter_mode`` selects in-place merge updates or routed LoRA
+        residual hooks. Routed mode requires factor-only adapters.
         ``stochastic_rounding`` uses stochastic requantization for quantized
         merge targets by default; pass ``False`` for deterministic rounding.
         Parameter values are merge-only and populate frozen floating-point
-        meta parameters from dense or supported prequantized representations;
-        routed mode never requantizes. Such a meta target is materialized only
-        while its parameter value is active.
+        meta parameters from registered physical representations; routed mode
+        never requantizes. Such a meta target is materialized only while its
+        parameter value is active.
         Because the offloader owns one model runtime, a
         second activation before :meth:`deactivate` raises
         :class:`ModelRuntimeInUseError` immediately.
@@ -532,12 +516,10 @@ class ModelOffloader:
                 adapter_strengths=adapter_strengths,
             )
             updates = self._group_adapter_updates_by_param_name(active_adapters) if active_adapters else {}
-            # Adapter hooks are installed before the composite activates. Merge
-            # hooks must be present for the first base-weight copy; routed
-            # hooks do no work until a target Linear runs.
+            parameter_overrides: dict[str, ParameterOverride] | None = None
             if updates:
                 if adapter_mode == "merge":
-                    self._register_merge_adapter_hooks(
+                    parameter_overrides = self._build_merge_parameter_overrides(
                         active_device,
                         updates,
                         stochastic_rounding=stochastic_rounding,
@@ -554,6 +536,7 @@ class ModelOffloader:
                 self._composite.activate(
                     active_device,
                     compile_blocks=not (updates and adapter_mode == "routed"),
+                    parameter_overrides=parameter_overrides,
                 )
             if schedule_transient:
                 self._install_transient_hooks()
@@ -566,7 +549,7 @@ class ModelOffloader:
         if self._active_device is None:
             return
         # Scheduling hooks must stop before their components deactivate. Drain
-        # asynchronous copies before removing adapter merge hooks. Cleanup and
+        # asynchronous copies before removing routed hooks. Cleanup and
         # activation-lock release still run if component teardown raises.
         try:
             self._clear_transient_hooks()

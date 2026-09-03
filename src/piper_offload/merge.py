@@ -79,10 +79,11 @@ def merge_adapter(
     sub-step additive updates are not systematically rounded away; pass
     ``stochastic_rounding=False`` for deterministic rounding. Parameter values
     populate frozen floating-point meta targets according to their strength
-    policy. Supported prequantized values retain their representation and use
-    dense merge for non-unit scaling. A populated meta target is replaced by
-    one independent frozen CPU parameter, preserving any tied aliases of the
-    original parameter.
+    policy. Every registered physical value retains its source representation;
+    explicit non-unit scaling additionally requires dequantization and dense
+    merge support. A populated meta target is replaced by one independent
+    frozen CPU parameter, preserving any tied aliases of the original
+    parameter.
     """
     # Filtering here avoids target lookup, staging, validation, and
     # requantization for work that cannot modify a parameter.

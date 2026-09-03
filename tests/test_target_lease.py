@@ -8,11 +8,11 @@ import torch
 from torch import nn
 
 from piper_offload.pinned_module import (
-    PinnedModuleInstance,
+    PinnedModuleLoadPlan,
     PinnedModuleStore,
     PinnedModuleTarget,
 )
-from piper_offload.target_lease import _CudaTargetLease
+from piper_offload.target_lease import CudaTargetLease
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -32,9 +32,11 @@ def test_stage_is_registry_pure_and_reuse_waits_for_consumer() -> None:
     device = torch.device("cuda")
     copy_stream = torch.cuda.Stream(device=device)
     compute_stream = torch.cuda.Stream(device=device)
-    lease = _CudaTargetLease.allocate(first_instance, device)
+    first_plan = first_instance.resolve_load_plan()
+    second_plan = second_instance.resolve_load_plan()
+    lease = CudaTargetLease.allocate(first_plan, device)
 
-    lease.stage(first_instance, copy_stream)
+    lease.stage(first_plan, copy_stream)
     assert first.weight.device.type == "cpu"
     with torch.cuda.stream(compute_stream):
         first_instance.install_target(lease.acquire(compute_stream))
@@ -42,7 +44,7 @@ def test_stage_is_registry_pure_and_reuse_waits_for_consumer() -> None:
     first_instance.install_pinned()
     lease.release()
 
-    lease.stage(second_instance, copy_stream)
+    lease.stage(second_plan, copy_stream)
     assert second.weight.device.type == "cpu"
     with torch.cuda.stream(compute_stream):
         second_instance.install_target(lease.acquire(compute_stream))
@@ -75,7 +77,7 @@ def test_close_synchronizes_target_work_before_drop() -> None:
     side_stream = Stream()
     consumer_stream = Stream()
     ready = Event()
-    lease = _CudaTargetLease(
+    lease = CudaTargetLease(
         cast(PinnedModuleTarget, object()),
         cast(torch.cuda.Stream, allocation_stream),
     )
@@ -112,7 +114,7 @@ def test_restage_waits_for_every_actual_use_stream(
         def record_event(self) -> object:
             return self.recorded
 
-    class Instance:
+    class Plan:
         def __init__(self) -> None:
             self.copied = False
 
@@ -124,8 +126,8 @@ def test_restage_waits_for_every_actual_use_stream(
     second_consumer = Stream()
     copy_stream = Stream()
     ready = object()
-    instance = Instance()
-    lease = _CudaTargetLease(
+    plan = Plan()
+    lease = CudaTargetLease(
         cast(PinnedModuleTarget, object()),
         cast(torch.cuda.Stream, allocation_stream),
     )
@@ -141,11 +143,11 @@ def test_restage_waits_for_every_actual_use_stream(
     )
 
     lease.stage(
-        cast(PinnedModuleInstance, instance),
+        cast(PinnedModuleLoadPlan, plan),
         cast(torch.cuda.Stream, copy_stream),
     )
 
     assert copy_stream.waited_events == [ready]
     assert set(copy_stream.waited_streams) == {first_consumer, second_consumer}
-    assert instance.copied
+    assert plan.copied
     assert lease._ready_event is copy_stream.recorded

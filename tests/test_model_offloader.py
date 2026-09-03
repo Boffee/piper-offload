@@ -28,7 +28,8 @@ from piper_offload import (
     ResourceStore,
 )
 from piper_offload.composite_component import CompositeComponent
-from piper_offload.streaming_runtime import _instance_target_signature
+from piper_offload.pinned_module import ParameterOverride
+from piper_offload.streaming_runtime import _plan_target_signature
 
 from tests.conftest import (
     activated_model,
@@ -2224,7 +2225,7 @@ class TestBlockLayoutCompatibility:
     @staticmethod
     def _signatures(component: object) -> list[object]:
         return [
-            _instance_target_signature(instance)
+            _plan_target_signature(instance.resolve_load_plan())
             for instance in component._block_instances  # type: ignore[attr-defined]
         ]
 
@@ -2567,30 +2568,29 @@ class TestBlockNameSelection:
         finally:
             strategy.deactivate()
 
-    def test_block_component_registers_post_copy_hook_by_param_name(self) -> None:
+    def test_block_component_resolves_parameter_override_by_name(self) -> None:
         m = _make_block_model()
         streamer = _make_block_component(
             blocks=list(m.transformer_blocks),
             blocks_path="transformer_blocks",
         )
-        try:
-            remove_hook = streamer.register_post_copy_hook(
-                "transformer_blocks.1.weight",
-                lambda _param: None,
-            )
-            # The hook lands on the block instance owning the named param,
-            # and nowhere else.
-            assert streamer._block_instances[1]._post_copy_hooks
-            assert not streamer._block_instances[0]._post_copy_hooks
+        def update(_param: nn.Parameter) -> None:
+            pass
 
-            assert callable(remove_hook)
-            remove_hook()
-            remove_hook()
-            assert not streamer._block_instances[1]._post_copy_hooks
+        try:
+            plans = streamer._resolve_load_plans(
+                {
+                    "transformer_blocks.1.weight": ParameterOverride(
+                        update=update
+                    )
+                }
+            )
+            assert plans[1].loads["weight"].update is update
+            assert plans[0].loads["weight"].update is None
         finally:
             streamer.deactivate()
 
-    def test_block_component_rejects_unknown_post_copy_hook_name(self) -> None:
+    def test_block_component_rejects_unknown_parameter_override_name(self) -> None:
         m = _make_block_model()
         streamer = _make_block_component(
             blocks=list(m.transformer_blocks),
@@ -2598,9 +2598,12 @@ class TestBlockNameSelection:
         )
         try:
             with pytest.raises(ValueError, match="not owned by this block component"):
-                streamer.register_post_copy_hook(
-                    "transformer_blocks.10.weight",
-                    lambda _param: None,
+                streamer._resolve_load_plans(
+                    {
+                        "transformer_blocks.10.weight": ParameterOverride(
+                            update=lambda _param: None
+                        )
+                    }
                 )
         finally:
             streamer.deactivate()

@@ -6,7 +6,6 @@ from torch import nn
 
 from piper_offload import (
     Adapter,
-    GGUFWeight,
     ModelOffloader,
     ParameterValue,
     merge_adapter,
@@ -119,6 +118,7 @@ def test_quantized_parameter_value_uses_dense_merge_support(
     adapter = Adapter.from_state_dict(
         {"weight": source},
         host_backing="adopt",
+        scale_parameter_values=True,
     )
     value = adapter.targets["weight"]
     assert isinstance(value, ParameterValue)
@@ -161,6 +161,7 @@ def test_quantized_parameter_value_permanent_scaling(kind: str) -> None:
     adapter = Adapter.from_state_dict(
         {"weight": source},
         host_backing="adopt",
+        scale_parameter_values=True,
     )
     value = adapter.targets["weight"]
     assert isinstance(value, ParameterValue)
@@ -211,13 +212,3 @@ def test_structured_parameter_value_dtype_is_representation_owned() -> None:
             dtype=torch.float16,
             pin_memory=False,
         )
-
-
-def test_parameter_value_rejects_structured_format_without_dense_merge() -> None:
-    source = GGUFWeight(
-        torch.zeros(64, dtype=torch.uint8),
-        quant_type=2,
-    )
-
-    with pytest.raises(ValueError, match="dense merge and dequantize"):
-        ParameterValue.from_tensor(source, pin_memory=False)
