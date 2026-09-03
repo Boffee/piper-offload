@@ -49,29 +49,15 @@ def _select_value_adapter(
     return adapter
 
 
-def _validate_value_representation(
-    source: torch.Tensor,
-) -> TensorAdapter[Any, Any]:
-    """Fully validate one final physical value representation."""
-    adapter = _select_value_adapter(source)
-    if isinstance(adapter, RegularAdapter) and source.numel():
-        finite_source = (
-            source.float()
-            if source.element_size() == 1
-            else source
-        )
-        if not bool(torch.isfinite(finite_source).all()):
-            raise ValueError("Parameter values must contain only finite values.")
-    return adapter
-
-
 @dataclass(slots=True, frozen=True)
 class ParameterValue:
     """One authoritative physical replacement for an exact parameter name.
 
     The backing defines active dtype, layout, quantization metadata, and
     copied bytes. Adapter strength does not scale a complete value unless
-    ``scale_with_strength=True`` is explicitly requested.
+    ``scale_with_strength=True`` is explicitly requested. Payload numerical
+    validity is the caller's responsibility; values are not scanned for NaN
+    or infinity.
     """
 
     backing: PinnedParam
@@ -85,7 +71,7 @@ class ParameterValue:
             )
         if self.backing.requires_grad:
             raise ValueError("Parameter values are inference-only and must be frozen.")
-        _validate_value_representation(
+        _select_value_adapter(
             param_representation(self.backing.make_cpu_param())
         )
 
@@ -107,7 +93,7 @@ class ParameterValue:
         if issubclass(type(source), nn.Parameter) and source.requires_grad:
             raise ValueError("Parameter values are inference-only and must be frozen.")
         # Inspect only the source representation and dtype policy here. The
-        # final converted and pinned representation is fully validated once by
+        # final converted and pinned representation is validated once by
         # ``ParameterValue.__post_init__``.
         adapter = _select_value_adapter(source)
         compute_dtype = adapter.compute_dtype(source)
@@ -292,8 +278,6 @@ class ParameterValueTransform:
                 "Validated parameter value scaling capability disappeared."
             )
         dense = adapter.dequantize(target)
-        if dense.numel() and not bool(torch.isfinite(dense).all()):
-            raise ValueError("Parameter values must contain only finite values.")
         adapter.merge_dense_(
             target,
             dense,
@@ -359,15 +343,13 @@ class ParameterValueTransform:
                 rounding_seed=rounding_seed,
             )
 
-        dense = adapter.dequantize(source)
-        if dense.numel() and not bool(torch.isfinite(dense).all()):
-            raise ValueError("Parameter values must contain only finite values.")
         if requires_update_validation:
             if not isinstance(adapter, DenseMergeValidationTensorAdapter):
                 raise ValueError(
                     f"{adapter_name(adapter)} requested staged dense-update "
                     "validation without implementing validate_dense_merge()."
                 )
+            dense = adapter.dequantize(source)
             adapter.validate_dense_merge(
                 source,
                 dense,

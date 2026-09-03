@@ -799,7 +799,6 @@ class TestLoRAConstruction:
         [
             (torch.ones(2, 2, dtype=torch.int32), "floating-point"),
             (torch.empty(2, 2, device="meta"), "physical values"),
-            (torch.tensor([float("nan")]), "finite values"),
         ],
     )
     def test_rejects_invalid_parameter_value_source(
@@ -836,11 +835,19 @@ class TestLoRAConstruction:
                 host_backing="adopt",
             )
 
-        with pytest.raises(ValueError, match="finite values"):
-            Adapter.from_state_dict(
-                {"target.weight": torch.tensor([1.0e10])},
-                dtype=torch.float16,
-            )
+    def test_parameter_value_payload_finiteness_is_caller_owned(self) -> None:
+        nan_value = Adapter.from_state_dict(
+            {"target.weight": torch.tensor([float("nan")])},
+        ).targets["target.weight"]
+        assert isinstance(nan_value, ParameterValue)
+        assert torch.isnan(nan_value.backing.make_cpu_param()).all()
+
+        infinite_value = Adapter.from_state_dict(
+            {"target.weight": torch.tensor([1.0e10])},
+            dtype=torch.float16,
+        ).targets["target.weight"]
+        assert isinstance(infinite_value, ParameterValue)
+        assert torch.isinf(infinite_value.backing.make_cpu_param()).all()
 
 
 # ---------------------------------------------------------------------------

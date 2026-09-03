@@ -25,6 +25,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   allocation so resident, streaming, and rolling execution share one explicit
   load path.
 
+### Changed
+
+- Treat `ParameterValue` payload numerical validity as the caller's
+  responsibility. Construction, activation, and permanent merge no longer
+  scan complete values for NaN or infinity.
+
 ## [0.9.0rc1] - 2026-09-02
 
 ### Added
