@@ -13,6 +13,8 @@ import piper_offload.dtensor_adapter as dtensor_adapter_module
 import piper_offload.lora as lora_module
 from piper_offload import (
     LoRATransform,
+    ParameterDelta,
+    ParameterDeltaTransform,
     ScaledLoRAFactor,
 )
 from piper_offload.dtensor_adapter import DTensorAdapter, _local_shape_and_offsets
@@ -55,6 +57,33 @@ def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
             )
             DTensorAdapter.merge_lora_(direct_target, b, a, strength)
             torch.testing.assert_close(direct_target.full_tensor(), expected)
+
+            dense = torch.arange(
+                weight.numel(),
+                dtype=weight.dtype,
+            ).reshape_as(weight).div(50)
+            dense_target = distribute_tensor(
+                weight.clone(),
+                mesh,
+                [Shard(shard_dim)],
+            )
+            dense_transform = ParameterDeltaTransform(
+                [
+                    ParameterDelta.from_tensors(
+                        a=a,
+                        b=b,
+                        dense=dense,
+                        pin_memory=False,
+                    ).scaled(strength)
+                ]
+            )
+            dense_param = nn.Parameter(dense_target, requires_grad=False)
+            dense_transform.validate_parameter(dense_param)
+            dense_transform.apply_parameter(dense_param)
+            torch.testing.assert_close(
+                dense_target.full_tensor(),
+                expected + strength * dense,
+            )
 
         empty_cases = (
             (torch.arange(2, dtype=torch.float32).reshape(1, 2), 0),
@@ -161,7 +190,7 @@ def test_transform_localizes_factors_before_staging(
     factor_count: int,
 ) -> None:
     target = nn.Parameter(torch.zeros(4, 3), requires_grad=False)
-    context = dtensor_adapter_module._DTensorMergeContext(
+    context = dtensor_adapter_module._DTensorLayoutContext(
         global_shape=(6, 8),
         local_shape=(4, 3),
         offsets=(2, 5),
@@ -172,6 +201,16 @@ def test_transform_localizes_factors_before_staging(
         dtensor_adapter_module,
         "_merge_context",
         lambda _target: context,
+    )
+    monkeypatch.setattr(
+        dtensor_adapter_module,
+        "_layout_context",
+        lambda _target: context,
+    )
+    monkeypatch.setattr(
+        DTensorAdapter,
+        "logical_shape",
+        staticmethod(lambda _target: context.global_shape),
     )
     monkeypatch.setattr(
         lora_module,
@@ -241,7 +280,7 @@ def test_stochastic_merge_forwards_seed_to_local_adapter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = nn.Parameter(torch.zeros(4, 3), requires_grad=False)
-    context = dtensor_adapter_module._DTensorMergeContext(
+    context = dtensor_adapter_module._DTensorLayoutContext(
         global_shape=(6, 8),
         local_shape=(4, 3),
         offsets=(2, 5),
@@ -252,6 +291,16 @@ def test_stochastic_merge_forwards_seed_to_local_adapter(
         dtensor_adapter_module,
         "_merge_context",
         lambda _target: context,
+    )
+    monkeypatch.setattr(
+        dtensor_adapter_module,
+        "_layout_context",
+        lambda _target: context,
+    )
+    monkeypatch.setattr(
+        DTensorAdapter,
+        "logical_shape",
+        staticmethod(lambda _target: context.global_shape),
     )
     monkeypatch.setattr(
         lora_module,
@@ -320,7 +369,7 @@ def test_dtensor_rounding_seed_decorrelates_shards_and_aligns_replicas() -> None
 def test_adapter_owned_merge_receives_contiguous_local_factors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    context = dtensor_adapter_module._DTensorMergeContext(
+    context = dtensor_adapter_module._DTensorLayoutContext(
         global_shape=(6, 8),
         local_shape=(6, 4),
         offsets=(0, 4),

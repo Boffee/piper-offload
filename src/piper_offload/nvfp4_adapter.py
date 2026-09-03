@@ -29,10 +29,11 @@ non-destructive alternative when the owning module is a logical
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
+from ._dense_merge import merge_dense_requantize_
 from ._torchao_nvfp4 import (
     create_nvfp4_tensor,
     dequantize_nvfp4_tensor,
@@ -46,11 +47,15 @@ from .torchao_structured_adapter import TorchaoStructuredAdapter, copy_storage_i
 
 try:
     from ._triton_nvfp4_lora import (
+        merge_nvfp4_dense as _triton_merge_nvfp4_dense,
+    )
+    from ._triton_nvfp4_lora import (
         merge_nvfp4_lora as _triton_merge_nvfp4_lora,
     )
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
+    _triton_merge_nvfp4_dense = None
     _triton_merge_nvfp4_lora = None
 
 
@@ -93,6 +98,60 @@ def _is_triton_nvfp4_layout(
         or tuple(nv.qdata.shape) != (rows, cols // 2)
         or b.shape != (rows, rank)
         or a.shape[1] != cols
+    ):
+        return False
+
+    scale_cols = cols // nv.block_size
+    expected_scale_shape = (
+        (
+            (rows + 127) // 128 * 32,
+            (cols + 63) // 64 * 16,
+        )
+        if nv.is_swizzled_scales
+        else (rows, scale_cols)
+    )
+    if tuple(nv.scale.shape) != expected_scale_shape:
+        return False
+    if nv.per_tensor_scale is None:
+        return True
+    return (
+        nv.per_tensor_scale.dtype is torch.float32
+        and nv.per_tensor_scale.device == nv.qdata.device
+        and nv.per_tensor_scale.numel() == 1
+    )
+
+
+def _is_triton_nvfp4_dense_layout(
+    nv: Any,  # noqa: ANN401
+    update: torch.Tensor,
+) -> bool:
+    """Return whether a dense update fits the raw NVFP4 representation."""
+    if (
+        _triton_merge_nvfp4_dense is None
+        or nv.qdata.device.type != "cuda"
+        or nv.qdata.dtype is not torch.uint8
+        or nv.scale.dtype is not torch.float8_e4m3fn
+        or nv.qdata.ndim != 2
+        or nv.scale.ndim != 2
+        or not nv.qdata.is_contiguous()
+        or not nv.scale.is_contiguous()
+        or nv.block_size != 16
+        or nv.orig_dtype not in (torch.bfloat16, torch.float32)
+        or update.ndim != 2
+        or update.dtype is not nv.orig_dtype
+        or nv.qdata.device != nv.scale.device
+        or nv.qdata.device != update.device
+        or len(nv.shape) != 2
+    ):
+        return False
+
+    rows, cols = nv.shape
+    if (
+        rows == 0
+        or cols == 0
+        or cols % 16 != 0
+        or tuple(nv.qdata.shape) != (rows, cols // 2)
+        or tuple(update.shape) != (rows, cols)
     ):
         return False
 
@@ -229,6 +288,35 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
         return requantize_nvfp4_tensor(t, like=like, rounding_seed=rounding_seed)
 
     @staticmethod
+    def _validate_merge_target(
+        target: torch.Tensor,
+        *,
+        kind: Literal["lora", "dense"],
+    ) -> None:
+        """Reject layouts whose weight quantizers cannot be preserved."""
+        label = "LoRA" if kind == "lora" else "a dense update"
+        nv = require_nvfp4_tensor(target)
+        if not nv.qdata.is_contiguous():
+            guidance = " Use routed LoRA for this weight." if kind == "lora" else ""
+            raise ValueError(
+                f"Cannot merge {label} into a non-contiguous (e.g. transposed) "
+                "NVFP4 weight: requantization produces the standard packed "
+                f"layout, which cannot fill a transposed target.{guidance}"
+            )
+        if nv.per_tensor_scale is not None and nv.per_tensor_scale.numel() != 1:
+            precision = (
+                "; the merge recomputes a single global scale and would drop "
+                "per-group precision. Use routed LoRA for this weight."
+                if kind == "lora"
+                else "."
+            )
+            raise ValueError(
+                f"Cannot merge {label} into an NVFP4 weight with a non-scalar "
+                "per_tensor_scale (e.g. per-expert grouped/MoE scales)"
+                f"{precision}"
+            )
+
+    @staticmethod
     def validate_lora_merge(
         target: torch.Tensor,
         _b: torch.Tensor,
@@ -237,23 +325,8 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        """Reject layouts whose weight quantizers cannot be preserved."""
         del rounding_seed
-        nv = require_nvfp4_tensor(target)
-        if not nv.qdata.is_contiguous():
-            raise ValueError(
-                "Cannot merge LoRA into a non-contiguous (e.g. transposed) "
-                "NVFP4 weight: requantization produces the standard packed "
-                "layout, which cannot fill a transposed target. Use routed "
-                "LoRA for this weight."
-            )
-        if nv.per_tensor_scale is not None and nv.per_tensor_scale.numel() != 1:
-            raise ValueError(
-                "Cannot merge LoRA into an NVFP4 weight with a non-scalar "
-                "per_tensor_scale (e.g. per-expert grouped/MoE scales); the "
-                "merge recomputes a single global scale and would drop "
-                "per-group precision. Use routed LoRA for this weight."
-            )
+        Nvfp4Adapter._validate_merge_target(target, kind="lora")
 
     @staticmethod
     def merge_lora_(
@@ -289,6 +362,52 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
             target,
             b,
             a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
+
+    @staticmethod
+    def validate_dense_merge_target(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> bool:
+        del rounding_seed
+        Nvfp4Adapter._validate_merge_target(target, kind="dense")
+        return False
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Merge a full-rank update while preserving target storage."""
+        nv = require_nvfp4_tensor(target)
+        if _is_triton_nvfp4_dense_layout(nv, update):
+            assert _triton_merge_nvfp4_dense is not None
+            qdata, scale, per_tensor_scale = _triton_merge_nvfp4_dense(
+                nv.qdata,
+                nv.scale,
+                nv.per_tensor_scale,
+                nv.block_size,
+                nv.is_swizzled_scales,
+                update,
+                strength,
+                rounding_seed=rounding_seed,
+            )
+            nv.qdata.copy_(qdata)
+            nv.scale.copy_(scale)
+            if nv.per_tensor_scale is not None:
+                assert per_tensor_scale is not None
+                nv.per_tensor_scale.copy_(per_tensor_scale)
+            return
+        merge_dense_requantize_(
+            Nvfp4Adapter,
+            target,
+            update,
             strength,
             rounding_seed=rounding_seed,
         )

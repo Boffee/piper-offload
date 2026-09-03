@@ -5,6 +5,27 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add the adapter-owned `merge_dense_` capability alongside `merge_lora_`.
+  Dense-only and mixed dense + LoRA parameter deltas now stage one full-rank
+  logical update and delegate it through this capability, allowing supported
+  quantized targets to requantize exactly once. Quanto, bitsandbytes 4-bit and
+  8-bit, TorchAO scaled/static FP8, INT8, MX, NVFP4, Piper ConvRot INT8/NVFP4,
+  plain tensors, and their supported DTensor compositions opt in; GGUF and
+  TorchAO INT4 tile-packed remain unsupported.
+  Target-only and staged-update validation are separate capabilities, and
+  composing adapters can expose one shared locality contract for both merge
+  representations.
+- Add dense specializations to every built-in Triton quantized LoRA merge
+  kernel. Standard CUDA layouts now use the same dequantize/update/requantize
+  pipeline for factorized and full-rank updates, with reference fallbacks for
+  supported nonstandard layouts and stochastic nested bitsandbytes 4-bit
+  scales.
+- Delegate ConvRot INT8 and NVFP4 dense and mixed updates to Piper Kernels'
+  public in-place `add_`, including stochastic-rounding seeds, and require
+  `piper-kernels[convrot]>=0.7.0rc1` for the optional integration.
+
 ## [0.8.0] - 2026-09-02
 
 ### Added

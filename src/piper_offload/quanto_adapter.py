@@ -41,11 +41,12 @@ optimum-quanto is not installed — quanto support is optional.
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import nn
 
+from ._dense_merge import merge_dense_requantize_
 from ._quanto import (
     canonical_qbytes_storage_layout,
     canonicalize_qbytes_tensor,
@@ -64,7 +65,13 @@ from .tensor_adapters import adopt_cpu_storage, clone_to_pinned_cpu
 
 try:
     from ._triton_quanto_lora import (
+        merge_quanto_qfloat8_dense as _triton_merge_quanto_qfloat8_dense,
+    )
+    from ._triton_quanto_lora import (
         merge_quanto_qfloat8_lora as _triton_merge_quanto_qfloat8_lora,
+    )
+    from ._triton_quanto_lora import (
+        merge_quanto_qint8_dense as _triton_merge_quanto_qint8_dense,
     )
     from ._triton_quanto_lora import (
         merge_quanto_qint8_lora as _triton_merge_quanto_qint8_lora,
@@ -72,7 +79,9 @@ try:
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
+    _triton_merge_quanto_qfloat8_dense = None
     _triton_merge_quanto_qfloat8_lora = None
+    _triton_merge_quanto_qint8_dense = None
     _triton_merge_quanto_qint8_lora = None
 
 
@@ -184,6 +193,24 @@ def _has_triton_compatible_layout(
         and scale.dtype is b.dtype
         and b.dtype is a.dtype
         and data.device == scale.device == b.device == a.device
+    )
+
+
+def _has_triton_compatible_dense_layout(
+    qt: Any,  # noqa: ANN401
+    update: torch.Tensor,
+) -> bool:
+    data = qt._data
+    scale = qt._scale
+    return (
+        data.device.type == "cuda"
+        and data.ndim == 2
+        and data.numel() != 0
+        and tuple(data.shape) == tuple(qt.size()) == tuple(update.shape)
+        and _has_supported_scale_layout(qt)
+        and scale.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and scale.dtype is update.dtype
+        and data.device == scale.device == update.device
     )
 
 
@@ -372,29 +399,54 @@ class QuantoAdapter:
     ) -> None:
         """Validate canonicalization and absmax-requantization layout."""
         del rounding_seed
+        QuantoAdapter._validate_merge_target(target, kind="lora")
+        if a.shape[0] == 0:
+            raise ValueError("Quanto LoRA merge requires a positive LoRA rank.")
+
+    @staticmethod
+    def validate_dense_merge_target(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> bool:
+        del rounding_seed
+        QuantoAdapter._validate_merge_target(target, kind="dense")
+        return False
+
+    @staticmethod
+    def _validate_merge_target(
+        target: torch.Tensor,
+        *,
+        kind: Literal["lora", "dense"],
+    ) -> Any:  # noqa: ANN401
+        """Validate canonicalization and absmax-requantization layout."""
+        label = "LoRA" if kind == "lora" else "dense"
         qt = canonicalize_qbytes_tensor(target)
         if qt._data.ndim != 2 or tuple(qt._data.shape) != tuple(qt.size()):
             raise ValueError(
-                "Quanto LoRA merge requires a rank-two weight whose qbytes storage matches its logical shape."
+                f"Quanto {label} merge requires a rank-two weight whose qbytes "
+                "storage matches its logical shape."
             )
         if getattr(qt.qtype, "bits", None) != 8:
-            raise ValueError("Quanto qbytes LoRA merge requires an 8-bit qtype.")
+            raise ValueError(f"Quanto qbytes {label} merge requires an 8-bit qtype.")
         qmax = getattr(qt.qtype, "qmax", None)
         if not isinstance(qmax, (int, float)) or qmax <= 0:
-            raise ValueError("Quanto qbytes LoRA merge requires a qtype with a positive qmax.")
+            raise ValueError(
+                f"Quanto qbytes {label} merge requires a qtype with a positive qmax."
+            )
         if getattr(qt.qtype, "dtype", None) is not qt._data.dtype:
             raise ValueError("Quanto qbytes storage dtype does not match its qtype metadata.")
         if not qt._scale.dtype.is_floating_point:
-            raise ValueError("Quanto qbytes LoRA merge requires floating-point scales.")
+            raise ValueError(f"Quanto qbytes {label} merge requires floating-point scales.")
         if qt._data.device != qt._scale.device:
             raise ValueError("Quanto qbytes data and scales must be on the same device.")
         if not _has_supported_scale_layout(qt):
             raise ValueError(
-                "Quanto LoRA merge expects a scalar scale, shape (rows, 1) "
+                f"Quanto {label} merge expects a scalar scale, shape (rows, 1) "
                 "for axis 0, or shape (1, columns) for the last axis."
             )
-        if a.shape[0] == 0:
-            raise ValueError("Quanto LoRA merge requires a positive LoRA rank.")
+        return qt
+
     @staticmethod
     def merge_lora_(
         target: torch.Tensor,
@@ -445,6 +497,52 @@ class QuantoAdapter:
         )
         merged = require_qbytes_tensor(merged)
         copy_qbytes_tensor_(merged, target_qt)
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Merge a full-rank update, preferring Triton for canonical storage."""
+        target_qt = require_qbytes_tensor(target)
+        qt = canonicalize_qbytes_tensor(target_qt)
+        triton_merge = None
+        if not is_marlin_f8_qbytes_tensor(target_qt):
+            if _is_qint8_layout(qt):
+                triton_merge = _triton_merge_quanto_qint8_dense
+            elif _is_qfloat8_layout(qt):
+                triton_merge = _triton_merge_quanto_qfloat8_dense
+
+        if triton_merge is not None and _has_triton_compatible_dense_layout(qt, update):
+            data, scale = triton_merge(
+                qt._data,
+                qt._scale,
+                qt.axis,
+                update,
+                strength,
+                rounding_seed=rounding_seed,
+            )
+            merged = create_qbytes_tensor(
+                qt.qtype,
+                qt.axis,
+                qt.size(),
+                qt.stride(),
+                data,
+                scale,
+                qbytes_activation_qtype(qt),
+            )
+            copy_qbytes_tensor_(merged, target_qt)
+            return
+        merge_dense_requantize_(
+            QuantoAdapter,
+            target,
+            update,
+            strength,
+            rounding_seed=rounding_seed,
+        )
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:

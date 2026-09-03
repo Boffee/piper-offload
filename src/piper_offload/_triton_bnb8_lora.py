@@ -1,8 +1,8 @@
-"""Triton kernels for bitsandbytes row-wise int8 LoRA merges."""
+"""Triton kernels for bitsandbytes row-wise int8 LoRA and dense merges."""
 
 # Triton JIT kernel signatures intentionally use untyped pointer parameters
 # and upper-case constexpr names.
-# ruff: noqa: ANN001, ANN202, N803, PLR0913
+# ruff: noqa: ANN001, ANN202, N803, PLR0912, PLR0913, PLR0915
 # pyright: reportCallIssue=false
 
 import torch
@@ -17,17 +17,19 @@ from ._triton_stochastic_quantization import (
 
 
 @triton.jit
-def _merge_dense_kernel(
+def _merge_update_kernel(
     cb_ptr,
     scb_ptr,
     b_ptr,
     a_ptr,
+    update_ptr,
     dense_ptr,
     row_tile_max_ptr,
     strength,
     M,
     N,
     K: tl.constexpr,
+    DENSE_UPDATE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -39,24 +41,29 @@ def _merge_dense_kernel(
 
     offsets_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offsets_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    for k_start in range(0, K, BLOCK_K):
-        offsets_k = k_start + tl.arange(0, BLOCK_K)
-        b = tl.load(
-            b_ptr + offsets_m[:, None] * K + offsets_k[None, :],
-            mask=(offsets_m[:, None] < M) & (offsets_k[None, :] < K),
-            other=0.0,
-        )
-        a = tl.load(
-            a_ptr + offsets_k[:, None] * N + offsets_n[None, :],
-            mask=(offsets_k[:, None] < K) & (offsets_n[None, :] < N),
-            other=0.0,
-        )
-        accumulator += tl.dot(b, a)
-
     offsets = offsets_m[:, None] * N + offsets_n[None, :]
     mask = (offsets_m[:, None] < M) & (offsets_n[None, :] < N)
+    if DENSE_UPDATE:
+        accumulator = tl.load(
+            update_ptr + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_K):
+            offsets_k = k_start + tl.arange(0, BLOCK_K)
+            b = tl.load(
+                b_ptr + offsets_m[:, None] * K + offsets_k[None, :],
+                mask=(offsets_m[:, None] < M) & (offsets_k[None, :] < K),
+                other=0.0,
+            )
+            a = tl.load(
+                a_ptr + offsets_k[:, None] * N + offsets_n[None, :],
+                mask=(offsets_k[:, None] < K) & (offsets_n[None, :] < N),
+                other=0.0,
+            )
+            accumulator += tl.dot(b, a)
     cb = tl.load(cb_ptr + offsets, mask=mask, other=0).to(tl.float16)
     scb = tl.load(
         scb_ptr + offsets_m,
@@ -142,48 +149,58 @@ def _quantize_kernel(
     tl.store(output_cb_ptr + offsets, quantized, mask=mask)
 
 
-def merge_bnb8_lora(
+def _merge_bnb8(
     cb: torch.Tensor,
     scb: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
+    update: torch.Tensor,
     strength: float,
     *,
+    dense_update: bool,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return raw ``CB`` and ``SCB`` buffers after one LoRA merge."""
+    """Return raw ``CB`` and ``SCB`` after a LoRA or dense update."""
     if cb.device.type != "cuda":
         raise ValueError("Triton BNB8 merge requires CUDA tensors.")
     if cb.dtype is not torch.int8 or scb.dtype is not torch.float32:
         raise ValueError(
             "Triton BNB8 merge expects int8 CB and float32 SCB tensors."
         )
-    if b.dtype is not torch.float16 or a.dtype is not torch.float16:
+    if dense_update:
+        if update.dtype is not torch.float16 or update.ndim != 2:
+            raise ValueError("Triton BNB8 merge expects a rank-two float16 update.")
+    elif b.dtype is not torch.float16 or a.dtype is not torch.float16:
         raise ValueError("Triton BNB8 merge expects float16 LoRA factors.")
-    if cb.ndim != 2 or b.ndim != 2 or a.ndim != 2:
+    if cb.ndim != 2 or (not dense_update and (b.ndim != 2 or a.ndim != 2)):
         raise ValueError("Triton BNB8 merge expects rank-two tensors.")
-    if (
-        cb.device != scb.device
-        or cb.device != b.device
-        or cb.device != a.device
-    ):
+    operands = (update,) if dense_update else (b, a)
+    if cb.device != scb.device or any(cb.device != operand.device for operand in operands):
         raise ValueError(
             "Triton BNB8 merge requires all tensors on one CUDA device."
         )
 
     rows, cols = cb.shape
-    rank = a.shape[0]
+    rank = 1 if dense_update else a.shape[0]
     if rows == 0 or cols == 0 or rank == 0:
         raise ValueError("Triton BNB8 merge requires non-empty tensors.")
     if scb.numel() != rows:
         raise ValueError("Triton BNB8 merge expects one SCB value per row.")
-    if b.shape != (rows, rank) or a.shape[1] != cols:
+    if dense_update and tuple(update.shape) != (rows, cols):
+        raise ValueError("Dense update does not match the BNB8 weight shape.")
+    if not dense_update and (b.shape != (rows, rank) or a.shape[1] != cols):
         raise ValueError("LoRA factors do not match the BNB8 weight shape.")
 
     cb = cb.contiguous()
     scb = scb.contiguous()
-    b = b.contiguous()
-    a = a.contiguous()
+    if dense_update:
+        update = update.contiguous()
+        b = update
+        a = update
+    else:
+        b = b.contiguous()
+        a = a.contiguous()
+        update = b
 
     block_m = 16
     block_n = 128
@@ -204,17 +221,19 @@ def merge_bnb8_lora(
     output_cb = torch.empty_like(cb)
     output_scb = torch.empty_like(scb)
 
-    _merge_dense_kernel[(num_tiles,)](
+    _merge_update_kernel[(num_tiles,)](
         cb,
         scb,
         b,
         a,
+        update,
         dense,
         row_tile_max,
         strength,
         M=rows,
         N=cols,
         K=rank,
+        DENSE_UPDATE=dense_update,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
@@ -240,3 +259,46 @@ def merge_bnb8_lora(
         num_warps=4,
     )
     return output_cb, output_scb
+
+
+def merge_bnb8_lora(
+    cb: torch.Tensor,
+    scb: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+    *,
+    rounding_seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return raw ``CB`` and ``SCB`` buffers after one LoRA merge."""
+    return _merge_bnb8(
+        cb,
+        scb,
+        b,
+        a,
+        b,
+        strength,
+        dense_update=False,
+        rounding_seed=rounding_seed,
+    )
+
+
+def merge_bnb8_dense(
+    cb: torch.Tensor,
+    scb: torch.Tensor,
+    update: torch.Tensor,
+    strength: float,
+    *,
+    rounding_seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return raw ``CB`` and ``SCB`` buffers after one dense merge."""
+    return _merge_bnb8(
+        cb,
+        scb,
+        update,
+        update,
+        update,
+        strength,
+        dense_update=True,
+        rounding_seed=rounding_seed,
+    )

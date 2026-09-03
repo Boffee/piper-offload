@@ -1,4 +1,4 @@
-"""Triton kernels for bitsandbytes blockwise 4-bit LoRA merges."""
+"""Triton kernels for bitsandbytes blockwise 4-bit LoRA and dense merges."""
 
 # Triton JIT kernel signatures intentionally use untyped pointer parameters
 # and upper-case constexpr names.
@@ -170,6 +170,7 @@ def _merge_quantize_kernel(
     offset_ptr,
     b_ptr,
     a_ptr,
+    update_ptr,
     output_absmax_ptr,
     output_packed_ptr,
     strength,
@@ -177,6 +178,7 @@ def _merge_quantize_kernel(
     M,
     N,
     K: tl.constexpr,
+    DENSE_UPDATE: tl.constexpr,
     QUANT_TYPE: tl.constexpr,
     NESTED: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
@@ -192,23 +194,31 @@ def _merge_quantize_kernel(
     offsets_n = pid_n * QUANT_BLOCK + tl.arange(0, QUANT_BLOCK)
     row_mask = offsets_m < M
 
-    accumulator = tl.zeros((BLOCK_M, QUANT_BLOCK), dtype=tl.float32)
-    for rank_start in range(0, K, BLOCK_K):
-        offsets_k = rank_start + tl.arange(0, BLOCK_K)
-        b = tl.load(
-            b_ptr + offsets_m[:, None] * K + offsets_k[None, :],
-            mask=row_mask[:, None] & (offsets_k[None, :] < K),
+    if DENSE_UPDATE:
+        update_offsets = offsets_m[:, None] * N + offsets_n[None, :]
+        accumulator = tl.load(
+            update_ptr + update_offsets,
+            mask=row_mask[:, None],
             other=0.0,
-        )
-        a = tl.load(
-            a_ptr + offsets_k[:, None] * N + offsets_n[None, :],
-            mask=offsets_k[:, None] < K,
-            other=0.0,
-        )
-        if COMPUTE_DTYPE == 2:
-            accumulator += tl.dot(b, a, input_precision="ieee")
-        else:
-            accumulator += tl.dot(b, a)
+        ).to(tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_M, QUANT_BLOCK), dtype=tl.float32)
+        for rank_start in range(0, K, BLOCK_K):
+            offsets_k = rank_start + tl.arange(0, BLOCK_K)
+            b = tl.load(
+                b_ptr + offsets_m[:, None] * K + offsets_k[None, :],
+                mask=row_mask[:, None] & (offsets_k[None, :] < K),
+                other=0.0,
+            )
+            a = tl.load(
+                a_ptr + offsets_k[:, None] * N + offsets_n[None, :],
+                mask=offsets_k[:, None] < K,
+                other=0.0,
+            )
+            if COMPUTE_DTYPE == 2:
+                accumulator += tl.dot(b, a, input_precision="ieee")
+            else:
+                accumulator += tl.dot(b, a)
 
     packed_cols = pid_n * (QUANT_BLOCK // 2) + tl.arange(
         0,
@@ -431,7 +441,7 @@ def _mean_absmax(absmax: torch.Tensor) -> torch.Tensor:
     return output
 
 
-def merge_bnb4_lora(
+def _merge_bnb4(
     packed: torch.Tensor,
     absmax: torch.Tensor,
     code: torch.Tensor,
@@ -443,8 +453,10 @@ def merge_bnb4_lora(
     quant_type: str,
     b: torch.Tensor,
     a: torch.Tensor,
+    update: torch.Tensor,
     strength: float,
     *,
+    dense_update: bool,
     rounding_seed: int | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -452,7 +464,7 @@ def merge_bnb4_lora(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Merge each row-aligned quantization block without a dense weight."""
+    """Merge each row-aligned block from a LoRA or dense update."""
     if packed.device.type != "cuda":
         raise ValueError("Triton BNB4 merge requires CUDA tensors.")
     if packed.dtype is not torch.uint8:
@@ -460,14 +472,15 @@ def merge_bnb4_lora(
     quant_type_id = _quant_type_id(quant_type)
     if code.dtype is not torch.float32 or code.numel() != 16:
         raise ValueError("Triton BNB4 merge expects a 16-value float32 codebook.")
-    if b.dtype is not a.dtype:
+    compute_tensor = update if dense_update else b
+    if not dense_update and b.dtype is not a.dtype:
         raise ValueError("Triton BNB4 merge requires matching factor dtypes.")
-    compute_dtype = _compute_dtype_id(b.dtype)
-    if b.ndim != 2 or a.ndim != 2:
-        raise ValueError("Triton BNB4 merge expects rank-two factors.")
+    compute_dtype = _compute_dtype_id(compute_tensor.dtype)
+    if update.ndim != 2 or (not dense_update and (b.ndim != 2 or a.ndim != 2)):
+        raise ValueError("Triton BNB4 merge expects rank-two update inputs.")
 
     rows, cols = logical_shape
-    rank = a.shape[0]
+    rank = 1 if dense_update else a.shape[0]
     numel = rows * cols
     num_blocks = (numel + blocksize - 1) // blocksize
     nested = nested_absmax is not None
@@ -479,15 +492,17 @@ def merge_bnb4_lora(
         raise ValueError("Triton BNB4 merge expects the standard 64-value blocks.")
     if cols % blocksize != 0:
         raise ValueError("Triton BNB4 merge requires row-aligned 64-value blocks.")
-    if b.shape != (rows, rank) or a.shape[1] != cols:
+    if dense_update and tuple(update.shape) != (rows, cols):
+        raise ValueError("Dense update does not match the BNB4 weight shape.")
+    if not dense_update and (b.shape != (rows, rank) or a.shape[1] != cols):
         raise ValueError("LoRA factors do not match the BNB4 weight shape.")
     if absmax.numel() != num_blocks:
         raise ValueError("BNB4 absmax shape does not match the logical weight.")
+    operands = (update,) if dense_update else (b, a)
     if (
         packed.device != absmax.device
         or packed.device != code.device
-        or packed.device != b.device
-        or packed.device != a.device
+        or any(packed.device != operand.device for operand in operands)
     ):
         raise ValueError(
             "Triton BNB4 merge requires all tensors on one CUDA device."
@@ -529,8 +544,14 @@ def merge_bnb4_lora(
     packed = packed.contiguous()
     absmax = absmax.contiguous()
     code = code.contiguous()
-    b = b.contiguous()
-    a = a.contiguous()
+    if dense_update:
+        update = update.contiguous()
+        b = update
+        a = update
+    else:
+        b = b.contiguous()
+        a = a.contiguous()
+        update = b
     nested_absmax_input = (
         nested_absmax.contiguous() if nested_absmax is not None else absmax
     )
@@ -560,6 +581,7 @@ def merge_bnb4_lora(
         offset_input,
         b,
         a,
+        update,
         raw_absmax,
         output_packed,
         strength,
@@ -567,6 +589,7 @@ def merge_bnb4_lora(
         M=rows,
         N=cols,
         K=rank,
+        DENSE_UPDATE=dense_update,
         QUANT_TYPE=quant_type_id,
         NESTED=nested,
         COMPUTE_DTYPE=compute_dtype,
@@ -601,4 +624,75 @@ def merge_bnb4_lora(
         output_qabsmax,
         output_nested_absmax,
         output_offset,
+    )
+
+
+def merge_bnb4_lora(
+    packed: torch.Tensor,
+    absmax: torch.Tensor,
+    code: torch.Tensor,
+    nested_absmax: torch.Tensor | None,
+    nested_code: torch.Tensor | None,
+    offset: torch.Tensor | None,
+    logical_shape: tuple[int, int],
+    blocksize: int,
+    quant_type: str,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+    *,
+    rounding_seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Merge each row-aligned quantization block from LoRA factors."""
+    return _merge_bnb4(
+        packed,
+        absmax,
+        code,
+        nested_absmax,
+        nested_code,
+        offset,
+        logical_shape,
+        blocksize,
+        quant_type,
+        b,
+        a,
+        b,
+        strength,
+        dense_update=False,
+        rounding_seed=rounding_seed,
+    )
+
+
+def merge_bnb4_dense(
+    packed: torch.Tensor,
+    absmax: torch.Tensor,
+    code: torch.Tensor,
+    nested_absmax: torch.Tensor | None,
+    nested_code: torch.Tensor | None,
+    offset: torch.Tensor | None,
+    logical_shape: tuple[int, int],
+    blocksize: int,
+    quant_type: str,
+    update: torch.Tensor,
+    strength: float,
+    *,
+    rounding_seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Merge each row-aligned quantization block from a dense update."""
+    return _merge_bnb4(
+        packed,
+        absmax,
+        code,
+        nested_absmax,
+        nested_code,
+        offset,
+        logical_shape,
+        blocksize,
+        quant_type,
+        update,
+        update,
+        update,
+        strength,
+        dense_update=True,
+        rounding_seed=rounding_seed,
     )

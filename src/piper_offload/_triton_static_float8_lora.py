@@ -1,8 +1,8 @@
-"""Triton kernels for static per-tensor FP8 LoRA merging."""
+"""Triton kernels for static per-tensor FP8 LoRA and dense merging."""
 
 # Triton JIT kernel signatures intentionally use untyped pointer parameters
 # and upper-case constexpr names.
-# ruff: noqa: ANN001, ANN202, N803, PLR0913
+# ruff: noqa: ANN001, ANN202, N803, PLR0913, PLR0915
 # pyright: reportCallIssue=false
 
 import torch
@@ -21,17 +21,19 @@ _REDUCTION_BLOCK = 8192
 
 
 @triton.jit
-def _merge_dense_kernel(
+def _merge_update_kernel(
     qdata_ptr,
     scale_ptr,
     b_ptr,
     a_ptr,
+    update_ptr,
     dense_ptr,
     tile_max_ptr,
     strength,
     M,
     N,
     K: tl.constexpr,
+    DENSE_UPDATE: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -44,27 +46,32 @@ def _merge_dense_kernel(
 
     offsets_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offsets_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    for k_start in range(0, K, BLOCK_K):
-        offsets_k = k_start + tl.arange(0, BLOCK_K)
-        b = tl.load(
-            b_ptr + offsets_m[:, None] * K + offsets_k[None, :],
-            mask=(offsets_m[:, None] < M) & (offsets_k[None, :] < K),
-            other=0.0,
-        )
-        a = tl.load(
-            a_ptr + offsets_k[:, None] * N + offsets_n[None, :],
-            mask=(offsets_k[:, None] < K) & (offsets_n[None, :] < N),
-            other=0.0,
-        )
-        if COMPUTE_DTYPE == 2:
-            accumulator += tl.dot(b, a, input_precision="ieee")
-        else:
-            accumulator += tl.dot(b, a)
-
     offsets = offsets_m[:, None] * N + offsets_n[None, :]
     mask = (offsets_m[:, None] < M) & (offsets_n[None, :] < N)
+    if DENSE_UPDATE:
+        accumulator = tl.load(
+            update_ptr + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_K):
+            offsets_k = k_start + tl.arange(0, BLOCK_K)
+            b = tl.load(
+                b_ptr + offsets_m[:, None] * K + offsets_k[None, :],
+                mask=(offsets_m[:, None] < M) & (offsets_k[None, :] < K),
+                other=0.0,
+            )
+            a = tl.load(
+                a_ptr + offsets_k[:, None] * N + offsets_n[None, :],
+                mask=(offsets_k[:, None] < K) & (offsets_n[None, :] < N),
+                other=0.0,
+            )
+            if COMPUTE_DTYPE == 2:
+                accumulator += tl.dot(b, a, input_precision="ieee")
+            else:
+                accumulator += tl.dot(b, a)
     weight_scale = tl.load(scale_ptr)
     base = tl.load(qdata_ptr + offsets, mask=mask, other=0.0)
     base = base.to(tl.float32) * weight_scale
@@ -171,16 +178,18 @@ def _compute_dtype_id(dtype: torch.dtype) -> int:
     )
 
 
-def merge_static_float8_lora(
+def _merge_static_float8(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
+    update: torch.Tensor,
     strength: float,
     *,
+    dense_update: bool,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return raw FP8 buffers after one static-per-tensor LoRA merge."""
+    """Return raw FP8 buffers after one LoRA or dense merge."""
     if qdata.device.type != "cuda":
         raise ValueError("Triton static-FP8 merge requires CUDA tensors.")
     if qdata.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
@@ -188,18 +197,15 @@ def merge_static_float8_lora(
             "Triton static-FP8 merge supports E4M3FN and E5M2 storage, "
             f"got {qdata.dtype}."
         )
-    if b.dtype is not a.dtype:
+    if not dense_update and b.dtype is not a.dtype:
         raise ValueError(
             "Triton static-FP8 merge requires matching LoRA factor dtypes."
         )
-    compute_dtype = _compute_dtype_id(b.dtype)
-    if qdata.ndim != 2 or b.ndim != 2 or a.ndim != 2:
+    compute_dtype = _compute_dtype_id(update.dtype if dense_update else b.dtype)
+    if qdata.ndim != 2 or update.ndim != 2 or (not dense_update and (b.ndim != 2 or a.ndim != 2)):
         raise ValueError("Triton static-FP8 merge expects rank-two tensors.")
-    if (
-        qdata.device != scale.device
-        or qdata.device != b.device
-        or qdata.device != a.device
-    ):
+    operands = (update,) if dense_update else (b, a)
+    if qdata.device != scale.device or any(qdata.device != operand.device for operand in operands):
         raise ValueError(
             "Triton static-FP8 merge requires all tensors on one CUDA device."
         )
@@ -207,17 +213,25 @@ def merge_static_float8_lora(
         raise ValueError("Triton static-FP8 merge expects one float32 per-tensor scale.")
 
     rows, cols = qdata.shape
-    rank = a.shape[0]
+    rank = 1 if dense_update else a.shape[0]
     if rows == 0 or cols == 0 or rank == 0:
         raise ValueError(
             "Triton static-FP8 merge requires non-empty weight and factors."
         )
-    if b.shape != (rows, rank) or a.shape[1] != cols:
+    if dense_update and tuple(update.shape) != (rows, cols):
+        raise ValueError("Dense update does not match the FP8 weight shape.")
+    if not dense_update and (b.shape != (rows, rank) or a.shape[1] != cols):
         raise ValueError("LoRA factors do not match the FP8 weight shape.")
 
     qdata = qdata.contiguous()
-    b = b.contiguous()
-    a = a.contiguous()
+    if dense_update:
+        update = update.contiguous()
+        b = update
+        a = update
+    else:
+        b = b.contiguous()
+        a = a.contiguous()
+        update = b
 
     block_m = 64
     block_n = 128
@@ -225,22 +239,24 @@ def merge_static_float8_lora(
     num_tiles = ((rows + block_m - 1) // block_m) * (
         (cols + block_n - 1) // block_n
     )
-    dense = torch.empty_like(qdata, dtype=b.dtype)
+    dense = torch.empty_like(qdata, dtype=update.dtype if dense_update else b.dtype)
     tile_max = torch.empty(num_tiles, device=qdata.device, dtype=torch.float32)
     output_qdata = torch.empty_like(qdata)
     output_scale = torch.empty_like(scale)
 
-    _merge_dense_kernel[(num_tiles,)](
+    _merge_update_kernel[(num_tiles,)](
         qdata,
         scale,
         b,
         a,
+        update,
         dense,
         tile_max,
         strength,
         M=rows,
         N=cols,
         K=rank,
+        DENSE_UPDATE=dense_update,
         COMPUTE_DTYPE=compute_dtype,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
@@ -293,3 +309,46 @@ def merge_static_float8_lora(
         num_warps=8,
     )
     return output_qdata, output_scale
+
+
+def merge_static_float8_lora(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+    *,
+    rounding_seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return raw FP8 buffers after one static-per-tensor LoRA merge."""
+    return _merge_static_float8(
+        qdata,
+        scale,
+        b,
+        a,
+        b,
+        strength,
+        dense_update=False,
+        rounding_seed=rounding_seed,
+    )
+
+
+def merge_static_float8_dense(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    update: torch.Tensor,
+    strength: float,
+    *,
+    rounding_seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return raw FP8 buffers after one static-per-tensor dense merge."""
+    return _merge_static_float8(
+        qdata,
+        scale,
+        update,
+        update,
+        update,
+        strength,
+        dense_update=True,
+        rounding_seed=rounding_seed,
+    )

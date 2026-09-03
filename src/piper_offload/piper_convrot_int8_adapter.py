@@ -4,7 +4,8 @@
 Piper Offload owns the movement and merge integration: pin the public ``qdata``
 and ``scale`` storage tensors, move those bytes, reconstruct the wrapper with
 its ``group_size`` and logical ``dtype`` metadata, and delegate staged LoRA
-updates to the public in-place ``ConvRotInt8Tensor.addmm_`` operation.
+and dense updates to the public in-place ``ConvRotInt8Tensor.addmm_`` and
+``ConvRotInt8Tensor.add_`` operations.
 When stochastic rounding is requested, Piper Offload forwards its stable
 per-target seed to the kernel-owned terminal INT8 code selection.
 
@@ -24,6 +25,7 @@ import torch
 from ._piper_convrot_int8 import (
     create_convrot_int8_tensor,
     is_convrot_int8_tensor,
+    require_convrot_int8_add,
     require_convrot_int8_tensor,
     validate_layout,
 )
@@ -118,3 +120,29 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
     ) -> None:
         del rounding_seed
         require_convrot_int8_tensor(target)
+
+    @staticmethod
+    def validate_dense_merge_target(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> bool:
+        """Validate kernel support without staging the dense update."""
+        del rounding_seed
+        require_convrot_int8_add(target)
+        return False
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Delegate a validated dense update to Piper Kernels."""
+        require_convrot_int8_add(target).add_(
+            update,
+            alpha=strength,
+            rounding_seed=rounding_seed,
+        )

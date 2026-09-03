@@ -29,10 +29,11 @@ non-destructive alternative when the owning module is a logical
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
+from ._dense_merge import merge_dense_requantize_
 from ._torchao_mx import (
     create_mx_tensor,
     dequantize_mx_tensor,
@@ -45,10 +46,16 @@ from .tensor_adapters import metadata_key
 from .torchao_structured_adapter import TorchaoStructuredAdapter, copy_storage_into
 
 try:
-    from ._triton_mx_lora import merge_mx_lora_ as _triton_merge_mx_lora_
+    from ._triton_mx_lora import (
+        merge_mx_dense_ as _triton_merge_mx_dense_,
+    )
+    from ._triton_mx_lora import (
+        merge_mx_lora_ as _triton_merge_mx_lora_,
+    )
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
+    _triton_merge_mx_dense_ = None
     _triton_merge_mx_lora_ = None
 
 
@@ -116,6 +123,50 @@ def _can_use_triton_merge(
     rows, cols = tuple(mx.shape)
     rank = a.shape[0]
     if rows == 0 or cols == 0 or rank == 0 or cols % 32 != 0 or b.shape != (rows, rank) or a.shape[1] != cols:
+        return False
+
+    if mx.elem_dtype is _FP4_ELEM_DTYPE and _FP4_ELEM_DTYPE is not None:
+        expected_qdata_shape = (rows, cols // 2)
+        if mx.qdata.dtype is not torch.uint8:
+            return False
+    elif mx.elem_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        expected_qdata_shape = (rows, cols)
+        if mx.qdata.dtype is not mx.elem_dtype:
+            return False
+    else:
+        return False
+
+    return tuple(mx.qdata.shape) == expected_qdata_shape and tuple(mx.scale.shape) == _expected_scale_shape(
+        rows,
+        cols,
+        swizzled=mx.is_swizzled_scales,
+    )
+
+
+def _can_use_triton_dense_merge(
+    mx: Any,  # noqa: ANN401
+    update: torch.Tensor,
+) -> bool:
+    if (
+        _triton_merge_mx_dense_ is None
+        or mx.qdata.device.type != "cuda"
+        or mx.qdata.ndim != 2
+        or mx.scale.ndim != 2
+        or not mx.qdata.is_contiguous()
+        or not mx.scale.is_contiguous()
+        or mx.scale.dtype is not _E8M0_DTYPE
+        or mx.block_size != 32
+        or mx.orig_dtype not in _TRITON_COMPUTE_DTYPES
+        or update.ndim != 2
+        or update.dtype is not mx.orig_dtype
+        or mx.qdata.device != mx.scale.device
+        or mx.qdata.device != update.device
+        or _scaling_mode_id(mx) is None
+    ):
+        return False
+
+    rows, cols = tuple(mx.shape)
+    if rows == 0 or cols == 0 or cols % 32 != 0 or tuple(update.shape) != (rows, cols):
         return False
 
     if mx.elem_dtype is _FP4_ELEM_DTYPE and _FP4_ELEM_DTYPE is not None:
@@ -251,6 +302,23 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
         return requantize_mx_tensor(t, like=like, rounding_seed=rounding_seed)
 
     @staticmethod
+    def _validate_merge_target(
+        target: torch.Tensor,
+        *,
+        kind: Literal["lora", "dense"],
+    ) -> None:
+        """Reject layouts the standard MX re-encode cannot refill."""
+        label = "LoRA" if kind == "lora" else "a dense update"
+        mx = require_mx_tensor(target)
+        if not mx.qdata.is_contiguous():
+            guidance = " Use routed LoRA for this weight." if kind == "lora" else ""
+            raise ValueError(
+                f"Cannot merge {label} into a non-contiguous (e.g. transposed) "
+                "MX weight: requantization produces the standard packed layout, "
+                f"which cannot fill a transposed target.{guidance}"
+            )
+
+    @staticmethod
     def validate_lora_merge(
         target: torch.Tensor,
         _b: torch.Tensor,
@@ -259,16 +327,8 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        """Reject layouts the standard MX re-encode cannot refill."""
         del rounding_seed
-        mx = require_mx_tensor(target)
-        if not mx.qdata.is_contiguous():
-            raise ValueError(
-                "Cannot merge LoRA into a non-contiguous (e.g. transposed) MX "
-                "weight: requantization produces the standard packed layout, "
-                "which cannot fill a transposed target. Use routed LoRA for "
-                "this weight."
-            )
+        MxAdapter._validate_merge_target(target, kind="lora")
 
     @staticmethod
     def merge_lora_(
@@ -303,6 +363,51 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
             target,
             b,
             a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
+
+    @staticmethod
+    def validate_dense_merge_target(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> bool:
+        del rounding_seed
+        MxAdapter._validate_merge_target(target, kind="dense")
+        return False
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Merge a full-rank update, preferring raw Triton storage."""
+        mx = require_mx_tensor(target)
+        if _can_use_triton_dense_merge(mx, update):
+            assert _triton_merge_mx_dense_ is not None
+            scaling_mode = _scaling_mode_id(mx)
+            assert scaling_mode is not None
+            _triton_merge_mx_dense_(
+                mx.qdata,
+                mx.scale,
+                mx.elem_dtype,
+                mx.block_size,
+                mx.orig_dtype,
+                update,
+                strength,
+                scaling_mode=scaling_mode,
+                swizzled=mx.is_swizzled_scales,
+                rounding_seed=rounding_seed,
+            )
+            return
+        merge_dense_requantize_(
+            MxAdapter,
+            target,
+            update,
             strength,
             rounding_seed=rounding_seed,
         )

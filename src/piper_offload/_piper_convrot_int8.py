@@ -1,10 +1,10 @@
 """Internal optional-import boundary for Piper ConvRot INT8 support.
 
 ``piper-kernels`` owns the :class:`ConvRotInt8Tensor` representation and its
-linear and in-place ``addmm_`` execution backends. Piper Offload uses the
-public wrapper constructor and storage fields to preserve the representation
-during movement; its adapter delegates LoRA merges, including optional
-stochastic rounding, to the public ``addmm_``.
+linear, in-place ``addmm_``, and in-place ``add_`` execution backends. Piper
+Offload uses the public wrapper constructor and storage fields to preserve the
+representation during movement; its adapter delegates LoRA and dense merges,
+including optional stochastic rounding, to those public operations.
 
 The dependency remains optional: importing :mod:`piper_offload` succeeds when
 ``piper-kernels`` (or its ``convrot`` extra) is absent.
@@ -43,6 +43,14 @@ def require_convrot_int8_tensor(t: torch.Tensor) -> Any:  # noqa: ANN401
         raise TypeError(f"expected piper_kernels.linear.convrot.ConvRotInt8Tensor, got {type(t).__name__}")
     validate_layout(t)
     return t
+
+
+def require_convrot_int8_add(t: torch.Tensor) -> Any:  # noqa: ANN401
+    """Require the kernel-owned ConvRot INT8 dense-update API."""
+    tensor = require_convrot_int8_tensor(t)
+    if ConvRotInt8Tensor.add_ is torch.Tensor.add_:
+        raise RuntimeError("ConvRot INT8 dense merge requires piper-kernels>=0.7.0rc1; upgrade piper-kernels")
+    return tensor
 
 
 def create_convrot_int8_tensor(

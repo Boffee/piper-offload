@@ -1,4 +1,4 @@
-"""Triton kernels for TorchAO NVFP4 LoRA merges."""
+"""Triton kernels for TorchAO NVFP4 LoRA and dense merges."""
 
 # Triton JIT kernel signatures intentionally use untyped pointer parameters
 # and upper-case constexpr names.
@@ -111,11 +111,13 @@ def _merged_tile(
     input_global_scale_ptr,
     b_ptr,
     a_ptr,
+    update_ptr,
     strength,
     M,
     PACKED_N,
     NUM_SWIZZLE_COL_BLOCKS,
     R: tl.constexpr,
+    DENSE_UPDATE: tl.constexpr,
     SCALE_COLS: tl.constexpr,
     HAS_GLOBAL_SCALE: tl.constexpr,
     SWIZZLED: tl.constexpr,
@@ -162,23 +164,31 @@ def _merged_tile(
     if COMPUTE_DTYPE == 0:
         base = base.to(tl.bfloat16)
 
-    accumulator = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
-    for rank_start in range(0, R, BLOCK_R):
-        offsets_r = rank_start + tl.arange(0, BLOCK_R)
-        b = tl.load(
-            b_ptr + offsets_m[:, None] * R + offsets_r[None, :],
-            mask=row_mask[:, None] & (offsets_r[None, :] < R),
+    if DENSE_UPDATE:
+        update_offsets = offsets_m[:, None] * (PACKED_N * 2) + offsets_n[None, :]
+        accumulator = tl.load(
+            update_ptr + update_offsets,
+            mask=row_mask[:, None],
             other=0.0,
-        )
-        a = tl.load(
-            a_ptr + offsets_r[:, None] * (PACKED_N * 2) + offsets_n[None, :],
-            mask=(offsets_r[:, None] < R),
-            other=0.0,
-        )
-        if COMPUTE_DTYPE == 1:
-            accumulator += tl.dot(b, a, input_precision="ieee")
-        else:
-            accumulator += tl.dot(b, a)
+        ).to(tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+        for rank_start in range(0, R, BLOCK_R):
+            offsets_r = rank_start + tl.arange(0, BLOCK_R)
+            b = tl.load(
+                b_ptr + offsets_m[:, None] * R + offsets_r[None, :],
+                mask=row_mask[:, None] & (offsets_r[None, :] < R),
+                other=0.0,
+            )
+            a = tl.load(
+                a_ptr + offsets_r[:, None] * (PACKED_N * 2) + offsets_n[None, :],
+                mask=(offsets_r[:, None] < R),
+                other=0.0,
+            )
+            if COMPUTE_DTYPE == 1:
+                accumulator += tl.dot(b, a, input_precision="ieee")
+            else:
+                accumulator += tl.dot(b, a)
 
     update = accumulator * strength
     merged = tl.where(update == 0.0, base.to(tl.float32), base + update)
@@ -194,12 +204,14 @@ def _merged_amax_kernel(
     input_global_scale_ptr,
     b_ptr,
     a_ptr,
+    update_ptr,
     partial_max_ptr,
     strength,
     M,
     PACKED_N,
     NUM_SWIZZLE_COL_BLOCKS,
     R: tl.constexpr,
+    DENSE_UPDATE: tl.constexpr,
     SCALE_COLS: tl.constexpr,
     HAS_GLOBAL_SCALE: tl.constexpr,
     SWIZZLED: tl.constexpr,
@@ -213,11 +225,13 @@ def _merged_amax_kernel(
         input_global_scale_ptr,
         b_ptr,
         a_ptr,
+        update_ptr,
         strength,
         M,
         PACKED_N,
         NUM_SWIZZLE_COL_BLOCKS,
         R,
+        DENSE_UPDATE,
         SCALE_COLS,
         HAS_GLOBAL_SCALE,
         SWIZZLED,
@@ -274,6 +288,7 @@ def _quantize_kernel(
     output_global_scale_ptr,
     b_ptr,
     a_ptr,
+    update_ptr,
     output_qdata_ptr,
     output_scale_ptr,
     strength,
@@ -282,6 +297,7 @@ def _quantize_kernel(
     PACKED_N,
     NUM_SWIZZLE_COL_BLOCKS,
     R: tl.constexpr,
+    DENSE_UPDATE: tl.constexpr,
     SCALE_COLS: tl.constexpr,
     HAS_GLOBAL_SCALE: tl.constexpr,
     SWIZZLED: tl.constexpr,
@@ -296,11 +312,13 @@ def _quantize_kernel(
         input_global_scale_ptr,
         b_ptr,
         a_ptr,
+        update_ptr,
         strength,
         M,
         PACKED_N,
         NUM_SWIZZLE_COL_BLOCKS,
         R,
+        DENSE_UPDATE,
         SCALE_COLS,
         HAS_GLOBAL_SCALE,
         SWIZZLED,
@@ -383,6 +401,9 @@ def _validate_inputs(  # noqa: PLR0912
     is_swizzled_scales: bool,
     b: torch.Tensor,
     a: torch.Tensor,
+    update: torch.Tensor,
+    *,
+    dense_update: bool,
 ) -> tuple[int, int, int, int]:
     """Validate a raw NVFP4 launch and return M, N, rank, and dtype id."""
     if qdata.device.type != "cuda":
@@ -391,17 +412,18 @@ def _validate_inputs(  # noqa: PLR0912
         raise ValueError(f"Triton NVFP4 merge expects packed uint8 data, got {qdata.dtype}.")
     if scale.dtype is not torch.float8_e4m3fn:
         raise ValueError("Triton NVFP4 merge expects E4M3FN block scales.")
-    if qdata.ndim != 2 or scale.ndim != 2 or b.ndim != 2 or a.ndim != 2:
+    if qdata.ndim != 2 or scale.ndim != 2 or update.ndim != 2 or (not dense_update and (b.ndim != 2 or a.ndim != 2)):
         raise ValueError("Triton NVFP4 merge expects rank-two tensors.")
     if not qdata.is_contiguous() or not scale.is_contiguous():
         raise ValueError("Triton NVFP4 merge requires contiguous packed data and scales.")
-    if b.dtype is not a.dtype:
+    compute_tensor = update if dense_update else b
+    if not dense_update and b.dtype is not a.dtype:
         raise ValueError("Triton NVFP4 merge requires matching factor dtypes.")
-    compute_dtype = _compute_dtype_id(b.dtype)
+    compute_dtype = _compute_dtype_id(compute_tensor.dtype)
+    operands = (update,) if dense_update else (b, a)
     if (
         qdata.device != scale.device
-        or qdata.device != b.device
-        or qdata.device != a.device
+        or any(qdata.device != operand.device for operand in operands)
         or (per_tensor_scale is not None and qdata.device != per_tensor_scale.device)
     ):
         raise ValueError("Triton NVFP4 merge requires all tensors on one CUDA device.")
@@ -410,12 +432,14 @@ def _validate_inputs(  # noqa: PLR0912
 
     rows, packed_cols = qdata.shape
     cols = packed_cols * 2
-    rank = a.shape[0]
+    rank = 1 if dense_update else a.shape[0]
     if rows == 0 or cols == 0 or rank == 0:
         raise ValueError("Triton NVFP4 merge requires non-empty tensors.")
     if packed_cols % _PACKED_BLOCK_SIZE != 0:
         raise ValueError("Triton NVFP4 merge requires columns divisible by 16.")
-    if b.shape != (rows, rank) or a.shape[1] != cols:
+    if dense_update and tuple(update.shape) != (rows, cols):
+        raise ValueError("Dense update does not match the NVFP4 weight shape.")
+    if not dense_update and (b.shape != (rows, rank) or a.shape[1] != cols):
         raise ValueError("LoRA factors do not match the NVFP4 weight shape.")
 
     scale_cols = cols // _BLOCK_SIZE
@@ -441,11 +465,13 @@ def _recompute_global_scale(
     is_swizzled_scales: bool,
     b: torch.Tensor,
     a: torch.Tensor,
+    update: torch.Tensor,
     strength: float,
     *,
     rows: int,
     cols: int,
     rank: int,
+    dense_update: bool,
     compute_dtype: int,
     block_m: int,
     block_r: int,
@@ -466,12 +492,14 @@ def _recompute_global_scale(
         input_global_scale,
         b,
         a,
+        update,
         partial_max,
         strength,
         M=rows,
         PACKED_N=cols // 2,
         NUM_SWIZZLE_COL_BLOCKS=num_swizzle_col_blocks,
         R=rank,
+        DENSE_UPDATE=dense_update,
         SCALE_COLS=scale_cols,
         HAS_GLOBAL_SCALE=True,
         SWIZZLED=is_swizzled_scales,
@@ -512,7 +540,7 @@ def _recompute_global_scale(
     return output_global_scale
 
 
-def merge_nvfp4_lora(
+def _merge_nvfp4(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     per_tensor_scale: torch.Tensor | None,
@@ -520,11 +548,13 @@ def merge_nvfp4_lora(
     is_swizzled_scales: bool,
     b: torch.Tensor,
     a: torch.Tensor,
+    update: torch.Tensor,
     strength: float,
     *,
+    dense_update: bool,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Return packed NVFP4 buffers after one raw LoRA merge."""
+    """Return packed NVFP4 buffers after one LoRA or dense merge."""
     rows, cols, rank, compute_dtype = _validate_inputs(
         qdata,
         scale,
@@ -533,11 +563,19 @@ def merge_nvfp4_lora(
         is_swizzled_scales,
         b,
         a,
+        update,
+        dense_update=dense_update,
     )
     qdata = qdata.contiguous()
     scale = scale.contiguous()
-    b = b.contiguous()
-    a = a.contiguous()
+    if dense_update:
+        update = update.contiguous()
+        b = update
+        a = update
+    else:
+        b = b.contiguous()
+        a = a.contiguous()
+        update = b
 
     block_m = 16
     block_r = 16 if rank <= 16 else 32
@@ -549,10 +587,12 @@ def merge_nvfp4_lora(
             is_swizzled_scales,
             b,
             a,
+            update,
             strength,
             rows=rows,
             cols=cols,
             rank=rank,
+            dense_update=dense_update,
             compute_dtype=compute_dtype,
             block_m=block_m,
             block_r=block_r,
@@ -575,6 +615,7 @@ def merge_nvfp4_lora(
         quant_global_scale,
         b,
         a,
+        update,
         output_qdata,
         output_scale,
         strength,
@@ -583,6 +624,7 @@ def merge_nvfp4_lora(
         PACKED_N=cols // 2,
         NUM_SWIZZLE_COL_BLOCKS=num_swizzle_col_blocks,
         R=rank,
+        DENSE_UPDATE=dense_update,
         SCALE_COLS=scale_cols,
         HAS_GLOBAL_SCALE=per_tensor_scale is not None,
         SWIZZLED=is_swizzled_scales,
@@ -593,3 +635,58 @@ def merge_nvfp4_lora(
         num_warps=4,
     )
     return output_qdata, output_scale, output_global_scale
+
+
+def merge_nvfp4_lora(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    per_tensor_scale: torch.Tensor | None,
+    block_size: int,
+    is_swizzled_scales: bool,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+    *,
+    rounding_seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Return packed NVFP4 buffers after one raw LoRA merge."""
+    return _merge_nvfp4(
+        qdata,
+        scale,
+        per_tensor_scale,
+        block_size,
+        is_swizzled_scales,
+        b,
+        a,
+        b,
+        strength,
+        dense_update=False,
+        rounding_seed=rounding_seed,
+    )
+
+
+def merge_nvfp4_dense(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    per_tensor_scale: torch.Tensor | None,
+    block_size: int,
+    is_swizzled_scales: bool,
+    update: torch.Tensor,
+    strength: float,
+    *,
+    rounding_seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Return packed NVFP4 buffers after one raw dense merge."""
+    return _merge_nvfp4(
+        qdata,
+        scale,
+        per_tensor_scale,
+        block_size,
+        is_swizzled_scales,
+        update,
+        update,
+        update,
+        strength,
+        dense_update=True,
+        rounding_seed=rounding_seed,
+    )

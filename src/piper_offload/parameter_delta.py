@@ -3,14 +3,32 @@
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Self
+from typing import Any, Self
 
 import torch
 from torch import nn
 
-from .lora import LoRAFactor, LoRATransform, ScaledLoRAFactor
+from .lora import (
+    LoRAFactor,
+    LoRATransform,
+    ScaledLoRAFactor,
+    _localize_materialized_weight_factors,
+    _materialize_weight_factors,
+    _MaterializedWeightFactor,
+    _pack_materialized_weight_factors,
+    _validate_factor_shapes,
+    _validate_materialized_weight_factors,
+)
 from .pinned_param import PinnedParam
-from .tensor_adapter_registry import param_representation
+from .seeding import derive_seed
+from .tensor_adapter_registry import param_representation, select_adapter
+from .tensor_adapters import (
+    DenseMergeTargetValidationTensorAdapter,
+    DenseMergeTensorAdapter,
+    DenseMergeValidationTensorAdapter,
+    MergeLocalityTensorAdapter,
+    adapter_name,
+)
 
 __all__ = [
     "ParameterDelta",
@@ -125,26 +143,36 @@ class ScaledParameterDelta:
 
 
 @dataclass(slots=True, frozen=True)
-class _DenseDeltaPlan:
-    """Validated dense sources and target representation for repeated merges."""
+class _DenseMergePlan:
+    """Validated logical sources and target representation for dense merge."""
 
-    sources: tuple[tuple[torch.Tensor, float], ...]
-    shape: tuple[int, ...]
-    dtype: torch.dtype
+    adapter: DenseMergeTensorAdapter[Any, Any]
+    dense_sources: tuple[tuple[torch.Tensor, float], ...]
+    factors: tuple[_MaterializedWeightFactor, ...]
+    logical_shape: tuple[int, ...]
+    local_shape: tuple[int, ...]
+    offsets: tuple[int, ...]
+    compute_dtype: torch.dtype
 
 
 class ParameterDeltaTransform:
     """Apply combined low-rank and dense updates to one existing parameter.
 
-    This first implementation supports dense terms on physical plain
-    floating-point tensors. Factor-only transforms continue to delegate to
-    :class:`LoRATransform`, including all existing quantized merge paths.
+    Factor-only transforms delegate to :class:`LoRATransform`. When any dense
+    term is present, every dense and low-rank contribution is staged into one
+    full-rank logical update and delegated to the target adapter's dense merge
+    capability. Quantized targets can therefore re-encode the base only once.
     """
 
     __slots__ = (
         "_deltas",
         "_dense_plan",
+        "_has_dense",
+        "_lora_factors",
         "_lora_transform",
+        "_merge_index",
+        "_stochastic_rounding",
+        "_target_key",
     )
 
     def __init__(
@@ -157,51 +185,54 @@ class ParameterDeltaTransform:
         if not deltas:
             raise ValueError("ParameterDeltaTransform requires a delta.")
         self._deltas = tuple(deltas)
-        factors = [
+        self._has_dense = any(
+            scaled.delta.dense is not None for scaled in self._deltas
+        )
+        if stochastic_rounding and not target_key:
+            raise ValueError(
+                "Stochastic ParameterDeltaTransform requires a non-empty target_key."
+            )
+        self._lora_factors = tuple(
             ScaledLoRAFactor(scaled.delta.lora, scaled.strength)
             for scaled in self._deltas
             if scaled.delta.lora is not None
-        ]
+        )
         self._lora_transform = (
             None
-            if not factors
+            if not self._lora_factors or self._has_dense
             else LoRATransform(
-                factors,
+                self._lora_factors,
                 stochastic_rounding=stochastic_rounding,
                 target_key=target_key,
             )
         )
-        self._dense_plan: _DenseDeltaPlan | None = None
-
-    @property
-    def has_dense(self) -> bool:
-        """Whether any bound update contains a full-rank contribution."""
-        return any(scaled.delta.dense is not None for scaled in self._deltas)
+        self._stochastic_rounding = stochastic_rounding
+        self._target_key = target_key
+        self._merge_index = 0
+        self._dense_plan: _DenseMergePlan | None = None
 
     def validate_parameter(self, param: nn.Parameter) -> None:
         """Validate every contribution before preparing repeated application."""
         self._dense_plan = None
-        lora_transform = self._lora_transform
-        if lora_transform is not None:
-            lora_transform.validate_parameter(param)
-
-        dense_sources = self._materialize_dense_sources()
-        if not dense_sources:
+        if not self._has_dense:
             # Factor-only application is completely owned by LoRATransform.
+            lora_transform = self._lora_transform
+            assert lora_transform is not None
+            lora_transform.validate_parameter(param)
             return
+        dense_sources = self._materialize_dense_sources()
+        assert dense_sources
 
         target = param_representation(param)
-        if type(target) is not torch.Tensor or target.is_meta:
+        if target.is_meta:
             raise ValueError(
-                "Dense parameter deltas currently require an existing plain floating-point target; "
+                "Dense parameter deltas require an existing plain floating-point target "
+                "or structured target with dense merge support; "
                 f"got {type(target).__name__} on {target.device}."
             )
-        if not target.is_floating_point():
-            raise ValueError(f"Dense parameter deltas require a floating-point target; got {target.dtype}.")
-        if torch.finfo(target.dtype).bits == 8:
-            raise ValueError(f"Dense parameter deltas do not support float8 targets; got {target.dtype}.")
-
-        shape = tuple(target.shape)
+        adapter = _select_dense_merge_adapter(target)
+        shape = adapter.logical_shape(target)
+        dtype = adapter.compute_dtype(target)
         for source, _strength in dense_sources:
             if tuple(source.shape) != shape:
                 raise ValueError(
@@ -211,24 +242,80 @@ class ParameterDeltaTransform:
             if source.numel() and not bool(torch.isfinite(source).all()):
                 raise ValueError("Dense parameter deltas must contain only finite values.")
 
-        self._dense_plan = _DenseDeltaPlan(
-            tuple(dense_sources),
-            shape,
-            target.dtype,
+        rounding_seed = self._rounding_seed()
+        requires_update_validation = isinstance(
+            adapter,
+            DenseMergeValidationTensorAdapter,
         )
+        if isinstance(adapter, DenseMergeTargetValidationTensorAdapter):
+            requires_update_validation = adapter.validate_dense_merge_target(
+                target,
+                rounding_seed=rounding_seed,
+            )
+        if requires_update_validation and not isinstance(
+            adapter,
+            DenseMergeValidationTensorAdapter,
+        ):
+            raise ValueError(
+                f"{adapter_name(adapter)} requested staged dense-update validation "
+                "without implementing validate_dense_merge()."
+            )
+
+        if isinstance(adapter, MergeLocalityTensorAdapter):
+            local_shape, offsets = adapter.merge_local_shape_and_offsets(target)
+        else:
+            offsets = tuple(0 for _ in shape)
+            local_shape = shape
+
+        _validate_factor_shapes(self._lora_factors, shape)
+        factors = _materialize_weight_factors(self._lora_factors)
+        _validate_materialized_weight_factors(factors)
+        if factors:
+            factors = _localize_materialized_weight_factors(
+                factors,
+                out_range=(offsets[0], local_shape[0]),
+                in_range=(offsets[1], local_shape[1]),
+            )
+
+        plan = _DenseMergePlan(
+            adapter=adapter,
+            dense_sources=tuple(dense_sources),
+            factors=tuple(factors),
+            logical_shape=shape,
+            local_shape=local_shape,
+            offsets=offsets,
+            compute_dtype=dtype,
+        )
+        if requires_update_validation:
+            assert isinstance(adapter, DenseMergeValidationTensorAdapter)
+            staged = self._stage_update_for_plan(param, plan)
+            adapter.validate_dense_merge(
+                target,
+                staged,
+                1.0,
+                rounding_seed=rounding_seed,
+            )
+        self._dense_plan = plan
 
     def apply_parameter(self, param: nn.Parameter) -> None:
         """Stage the complete update, then mutate the base parameter once."""
-        dense_update = self._stage_dense_update(param)
-        lora_transform = self._lora_transform
-        if dense_update is None:
-            if lora_transform is not None:
-                lora_transform.apply_parameter(param)
+        if not self._has_dense:
+            lora_transform = self._lora_transform
+            assert lora_transform is not None
+            lora_transform.apply_parameter(param)
             return
 
-        if lora_transform is not None:
-            lora_transform.accumulate_parameter_update(dense_update)
-        param_representation(param).add_(dense_update)
+        plan = self._dense_plan
+        if plan is None:
+            raise RuntimeError("Dense parameter delta target must be validated before application.")
+        dense_update = self._stage_update_for_plan(param, plan)
+        plan.adapter.merge_dense_(
+            param_representation(param),
+            dense_update,
+            1.0,
+            rounding_seed=self._rounding_seed(),
+        )
+        self._merge_index += 1
 
     def _materialize_dense_sources(self) -> list[tuple[torch.Tensor, float]]:
         sources: list[tuple[torch.Tensor, float]] = []
@@ -242,30 +329,102 @@ class ParameterDeltaTransform:
             sources.append((source, bound.strength))
         return sources
 
-    def _stage_dense_update(self, param: nn.Parameter) -> torch.Tensor | None:
-        plan = self._dense_plan
-        if plan is None:
-            if self.has_dense:
-                raise RuntimeError("Dense parameter delta target must be validated before application.")
-            return None
-
+    def _stage_update_for_plan(
+        self,
+        param: nn.Parameter,
+        plan: _DenseMergePlan,
+    ) -> torch.Tensor:
+        """Materialize one local logical update from a validated plan."""
         target = param_representation(param)
+        try:
+            current_adapter = select_adapter(target)
+        except NotImplementedError as exc:
+            raise RuntimeError(
+                "Dense parameter delta application target no longer has a "
+                "registered adapter."
+            ) from exc
         if (
-            type(target) is not torch.Tensor
-            or target.is_meta
-            or tuple(target.shape) != plan.shape
-            or target.dtype is not plan.dtype
+            target.is_meta
+            or type(current_adapter) is not type(plan.adapter)
+            or current_adapter.compute_dtype(target) is not plan.compute_dtype
+            or current_adapter.logical_shape(target) != plan.logical_shape
         ):
             raise RuntimeError(
-                "Dense parameter delta application requires a physical plain tensor matching the validated target."
+                "Dense parameter delta application requires a physical tensor "
+                "matching the validated target representation."
             )
 
-        update = torch.zeros_like(target)
-        for source, strength in plan.sources:
-            staged = source.to(
+        update = torch.zeros(
+            plan.local_shape,
+            device=target.device,
+            dtype=plan.compute_dtype,
+        )
+        for source, strength in plan.dense_sources:
+            local_source = _local_dense_view(
+                source,
+                offsets=plan.offsets,
+                local_shape=plan.local_shape,
+            )
+            staged = local_source.to(
                 device=target.device,
-                dtype=target.dtype,
+                dtype=plan.compute_dtype,
                 non_blocking=True,
             )
             update.add_(staged, alpha=strength)
+        self._accumulate_lora(update, plan)
         return update
+
+    @staticmethod
+    def _accumulate_lora(update: torch.Tensor, plan: _DenseMergePlan) -> None:
+        """Accumulate all logical low-rank terms into one dense update."""
+        if not plan.factors:
+            return
+        packed_a, packed_b = _pack_materialized_weight_factors(
+            update,
+            plan.factors,
+            logical_shape=plan.local_shape,
+            compute_dtype=plan.compute_dtype,
+        )
+        update.addmm_(packed_b, packed_a)
+
+    def _rounding_seed(self) -> int | None:
+        if not self._stochastic_rounding:
+            return None
+        return derive_seed(self._target_key, self._merge_index)
+
+
+def _select_dense_merge_adapter(
+    target: torch.Tensor,
+) -> DenseMergeTensorAdapter[Any, Any]:
+    try:
+        adapter = select_adapter(target)
+    except NotImplementedError as exc:
+        raise ValueError(
+            f"Tensor type {type(target).__name__} has no registered tensor adapter. "
+            "Merge requires a tensor adapter with dense merge support."
+        ) from exc
+    if not isinstance(adapter, DenseMergeTensorAdapter):
+        raise ValueError(
+            f"{adapter_name(adapter)} does not support dense parameter merge."
+        )
+    dtype = adapter.compute_dtype(target)
+    if not dtype.is_floating_point:
+        raise ValueError(
+            "Dense parameter merge requires a floating-point compute dtype, "
+            f"got {dtype}."
+        )
+    return adapter
+
+
+def _local_dense_view(
+    source: torch.Tensor,
+    *,
+    offsets: tuple[int, ...],
+    local_shape: tuple[int, ...],
+) -> torch.Tensor:
+    local = source
+    for dim, (offset, size) in enumerate(
+        zip(offsets, local_shape, strict=True)
+    ):
+        local = local.narrow(dim, offset, size)
+    return local.contiguous()

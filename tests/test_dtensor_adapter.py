@@ -27,8 +27,12 @@ from piper_offload.int8_adapter import Int8Adapter
 from piper_offload.pinned_param import PinnedParam
 from piper_offload.tensor_adapters import (
     CpuRoundTripTensorAdapter,
+    DenseMergeTargetValidationTensorAdapter,
+    DenseMergeTensorAdapter,
+    DenseMergeValidationTensorAdapter,
     DequantRequantTensorAdapter,
     LoRAMergeTensorAdapter,
+    MergeLocalityTensorAdapter,
     ParameterDataSwapTensorAdapter,
     RegularAdapter,
     TensorCopyIntoAdapter,
@@ -250,7 +254,7 @@ class TestDTensorAdapter:
                 calls.append((b, a))
 
         local = torch.empty(3, 4, device="cuda")
-        context = dtensor_adapter_module._DTensorMergeContext(
+        context = dtensor_adapter_module._DTensorLayoutContext(
             global_shape=(6, 8),
             local_shape=(3, 4),
             offsets=(2, 3),
@@ -544,11 +548,15 @@ class TestDTensorAdapter:
         self,
         tp_mesh: Any,
     ) -> None:
-        # Frozen-inference scope: local LoRA merge is available, but CPU
-        # round-trip, dequant/requant, copy_into, and trainable .data swap stay
-        # hidden even when the inner adapter has those capabilities.
+        # Frozen-inference scope: shard-local additive merge is available, but
+        # CPU round-trip, dequant/requant, copy_into, and trainable .data swap
+        # stay hidden even when the inner adapter has those capabilities.
         adapter = select_adapter(_dtensor_weight(tp_mesh)[0])
         assert isinstance(adapter, LoRAMergeTensorAdapter)
+        assert isinstance(adapter, DenseMergeTensorAdapter)
+        assert isinstance(adapter, DenseMergeTargetValidationTensorAdapter)
+        assert isinstance(adapter, DenseMergeValidationTensorAdapter)
+        assert isinstance(adapter, MergeLocalityTensorAdapter)
         assert not isinstance(adapter, CpuRoundTripTensorAdapter)
         assert not isinstance(adapter, DequantRequantTensorAdapter)
         assert not isinstance(adapter, TensorCopyIntoAdapter)

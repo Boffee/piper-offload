@@ -99,8 +99,9 @@ hooks run immediately after the owning component copies a base weight
 from host storage to GPU, so block-streamed and non-block weights
 use the same merge path. Merge eligibility is owned by the selected tensor
 adapter: physical plain floating-point tensors support combined low-rank and
-full-rank additive deltas; structured quantized wrappers can opt into staged
-LoRA merge. Dense deltas for quantized wrappers are not yet supported. Frozen
+full-rank additive deltas; structured quantized wrappers can independently opt
+into staged factorized and full-rank merge capabilities. A mixed dense + LoRA
+delta uses the full-rank path and re-encodes a quantized base once. Frozen
 plain floating-point meta tensors can instead be populated by parameter
 values. Otherwise, use routed LoRA when the module exposes a compatible
 logical Linear weight shape and compute dtype.

@@ -31,6 +31,7 @@ from typing import Any
 
 import torch
 
+from ._dense_merge import merge_dense_requantize_
 from ._torchao_float8 import (
     create_float8_tensor,
     dequantize_float8_tensor,
@@ -54,9 +55,11 @@ except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
     _TRITON_MAX_GROUP_SIZE = 0
+    _triton_merge_float8_dense = None
     _triton_merge_float8_lora = None
 else:
     _TRITON_MAX_GROUP_SIZE = _triton_float8_lora.MAX_GROUP_SIZE
+    _triton_merge_float8_dense = _triton_float8_lora.merge_float8_dense
     _triton_merge_float8_lora = _triton_float8_lora.merge_float8_lora
 
 
@@ -85,6 +88,39 @@ def _is_triton_float8_layout(
     rows, cols = t.qdata.shape
     rank = a.shape[0]
     if rows == 0 or cols == 0 or rank == 0 or b.shape != (rows, rank) or a.shape[1] != cols:
+        return False
+
+    block_size = tuple(t.block_size)
+    if block_size == (rows, cols):
+        return t.scale.numel() == 1
+    if len(block_size) != 2 or block_size[0] != 1 or not 0 < block_size[1] <= cols or cols % block_size[1] != 0:
+        return False
+    group_size = block_size[1]
+    if group_size < cols and group_size > _TRITON_MAX_GROUP_SIZE:
+        return False
+    return tuple(t.scale.shape) == (rows, cols // group_size)
+
+
+def _is_triton_float8_dense_layout(
+    t: Any,  # noqa: ANN401
+    update: torch.Tensor,
+) -> bool:
+    """Return whether ``t`` and a dense update fit the Triton path."""
+    if (
+        _triton_merge_float8_dense is None
+        or t.qdata.device.type != "cuda"
+        or t.qdata.ndim != 2
+        or t.qdata.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+        or t.scale.dtype is not torch.float32
+        or update.ndim != 2
+        or update.dtype is not t.dtype
+        or update.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or t.qdata.device != t.scale.device
+        or t.qdata.device != update.device
+    ):
+        return False
+    rows, cols = t.qdata.shape
+    if rows == 0 or cols == 0 or tuple(update.shape) != (rows, cols):
         return False
 
     block_size = tuple(t.block_size)
@@ -267,6 +303,47 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
             target,
             b,
             a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
+
+    @staticmethod
+    def validate_dense_merge_target(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> bool:
+        del rounding_seed
+        validate_float8_requantize_layout(target)
+        return False
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Merge a full-rank update while preserving the wrapper."""
+        f8 = require_float8_tensor(target)
+        if _is_triton_float8_dense_layout(f8, update):
+            assert _triton_merge_float8_dense is not None
+            qdata, scale = _triton_merge_float8_dense(
+                f8.qdata,
+                f8.scale,
+                tuple(f8.block_size),
+                update,
+                strength,
+                rounding_seed=rounding_seed,
+            )
+            f8.qdata.copy_(qdata)
+            f8.scale.copy_(scale)
+            return
+        merge_dense_requantize_(
+            Float8Adapter,
+            target,
+            update,
             strength,
             rounding_seed=rounding_seed,
         )

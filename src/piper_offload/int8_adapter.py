@@ -14,18 +14,18 @@ because TorchAO models them as the same ``Int8Tensor`` parameterized by
 ``act_quant_kwargs``.
 
 Beyond inference movement, this adapter opts into dequantize/requantize,
-``copy_into``, and a format-specific CUDA LoRA merge. Supported
-per-tensor, per-row, and per-group layouts use raw Triton kernels when
+``copy_into``, a format-specific CUDA LoRA merge, and full-rank dense merge.
+Supported per-tensor, per-row, and per-group layouts use raw Triton kernels when
 available; other layouts and environments use the exact generic
 dequantize/GEMM/requantize path. Both recompute the per-block weight
 scale and preserve the existing wrapper and storage tensors. Like any
 merge into a quantized base it is lossy; choosing merge vs routed
 (non-destructive) LoRA is the caller's tradeoff.
 
-It does not opt into CPU round-trip, trainable ``Parameter.data`` swap,
-or activation-scoped dense ``addmm_`` merge: the quant state lives in the
-wrapper object, not its bytes, so int8 weights stay frozen for
-streaming/training. Routed LoRA remains the non-destructive alternative.
+It does not opt into CPU round-trip or trainable ``Parameter.data`` swap: the
+quant state lives in the wrapper object, not its bytes, so int8 weights stay
+frozen for streaming/training. Routed LoRA remains the non-destructive
+alternative.
 """
 
 from collections.abc import Sequence
@@ -34,6 +34,7 @@ from typing import Any
 
 import torch
 
+from ._dense_merge import merge_dense_requantize_
 from ._torchao_int8 import (
     create_int8_tensor,
     dequantize_int8_tensor,
@@ -46,10 +47,12 @@ from .tensor_adapters import metadata_key
 from .torchao_structured_adapter import TorchaoStructuredAdapter, copy_storage_into
 
 try:
+    from ._triton_int8_lora import merge_int8_dense as _triton_merge_int8_dense
     from ._triton_int8_lora import merge_int8_lora as _triton_merge_int8_lora
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
+    _triton_merge_int8_dense = None
     _triton_merge_int8_lora = None
 
 
@@ -57,7 +60,7 @@ _TRITON_COMPUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 def _normalized_act_pre_scale(qt: Any) -> torch.Tensor | None:  # noqa: ANN401
-    """Return ``act_pre_scale`` in scalar or per-input LoRA shape.
+    """Return ``act_pre_scale`` in scalar or per-input merge shape.
 
     TorchAO applies this tensor to the activation before its weight matmul.
     A permanent logical-weight update must therefore be divided by the same
@@ -69,10 +72,13 @@ def _normalized_act_pre_scale(qt: Any) -> torch.Tensor | None:  # noqa: ANN401
     if pre_scale is None:
         return None
     if not pre_scale.dtype.is_floating_point:
-        raise ValueError(f"TorchAO INT8 act_pre_scale must be floating-point for LoRA merge, got {pre_scale.dtype}.")
+        raise ValueError(
+            "TorchAO INT8 act_pre_scale must be floating-point for additive "
+            f"merge, got {pre_scale.dtype}."
+        )
     if pre_scale.device != qt.qdata.device:
         raise ValueError(
-            "TorchAO INT8 act_pre_scale must be on the weight device for LoRA "
+            "TorchAO INT8 act_pre_scale must be on the weight device for additive "
             f"merge, got {pre_scale.device} and {qt.qdata.device}."
         )
 
@@ -88,15 +94,21 @@ def _normalized_act_pre_scale(qt: Any) -> torch.Tensor | None:  # noqa: ANN401
     else:
         raise ValueError(
             "TorchAO INT8 act_pre_scale must be a scalar or one value per "
-            "input feature with only singleton leading dimensions for LoRA "
+            "input feature with only singleton leading dimensions for additive "
             f"merge; got shape {tuple(pre_scale.shape)} for {input_features} "
             "input features."
         )
 
     if not bool(torch.isfinite(normalized).all()):
-        raise ValueError("TorchAO INT8 act_pre_scale must contain only finite values for LoRA merge.")
+        raise ValueError(
+            "TorchAO INT8 act_pre_scale must contain only finite values for "
+            "additive merge."
+        )
     if bool((normalized == 0).any()):
-        raise ValueError("TorchAO INT8 act_pre_scale must contain only non-zero values for LoRA merge.")
+        raise ValueError(
+            "TorchAO INT8 act_pre_scale must contain only non-zero values for "
+            "additive merge."
+        )
     return normalized
 
 
@@ -141,6 +153,28 @@ def _prepare_lora_merge(
     return qt, stored_a, stored_strength
 
 
+def _prepare_dense_merge(
+    target: torch.Tensor,
+    update: torch.Tensor,
+    strength: float,
+) -> tuple[Any, torch.Tensor, float]:
+    """Validate and express one logical dense update in stored coordinates."""
+    qt = require_int8_tensor(target)
+    pre_scale = _normalized_act_pre_scale(qt)
+    if pre_scale is None:
+        return qt, update, strength
+
+    stored_update = (
+        update.to(torch.float64)
+        .mul(strength)
+        .div(pre_scale.to(device=update.device, dtype=torch.float64))
+        .to(dtype=update.dtype)
+    )
+    if not bool(torch.isfinite(stored_update).all()):
+        raise ValueError("TorchAO INT8 act_pre_scale produces a non-finite stored-coordinate dense update.")
+    return qt, stored_update, 1.0
+
+
 def _triton_int8_layout_supported(
     qt: Any,  # noqa: ANN401
     b: torch.Tensor,
@@ -167,6 +201,48 @@ def _triton_int8_layout_supported(
     rows, cols = qt.qdata.shape
     rank = a.shape[0]
     if rows == 0 or cols == 0 or rank == 0 or b.shape != (rows, rank) or a.shape[1] != cols:
+        return False
+
+    block_size = tuple(qt.block_size)
+    if block_size == (rows, cols):
+        expected_qparam_shape = (1, 1)
+    elif len(block_size) == 2 and block_size[0] == 1 and 0 < block_size[1] <= cols and cols % block_size[1] == 0:
+        expected_qparam_shape = (rows, cols // block_size[1])
+    else:
+        return False
+
+    if tuple(qt.scale.shape) != expected_qparam_shape:
+        return False
+    if qt.zero_point is None:
+        return True
+    return (
+        qt.zero_point.dtype is torch.int8
+        and qt.zero_point.device == qt.qdata.device
+        and tuple(qt.zero_point.shape) == expected_qparam_shape
+    )
+
+
+def _triton_int8_dense_layout_supported(
+    qt: Any,  # noqa: ANN401
+    update: torch.Tensor,
+) -> bool:
+    """Return whether a dense update fits the Triton affine-INT8 pipeline."""
+    if (
+        _triton_merge_int8_dense is None
+        or qt.qdata.device.type != "cuda"
+        or qt.qdata.dtype is not torch.int8
+        or qt.qdata.ndim != 2
+        or update.ndim != 2
+        or update.dtype is not qt.dtype
+        or update.dtype not in _TRITON_COMPUTE_DTYPES
+        or qt.scale.dtype not in _TRITON_COMPUTE_DTYPES
+        or qt.qdata.device != qt.scale.device
+        or qt.qdata.device != update.device
+    ):
+        return False
+
+    rows, cols = qt.qdata.shape
+    if rows == 0 or cols == 0 or tuple(update.shape) != (rows, cols):
         return False
 
     block_size = tuple(qt.block_size)
@@ -366,6 +442,58 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
             b,
             a,
             strength,
+            rounding_seed=rounding_seed,
+        )
+
+    @staticmethod
+    def validate_dense_merge(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        del rounding_seed
+        _prepare_dense_merge(target, update, strength)
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Merge a logical full-rank update into stored-weight coordinates."""
+        qt, stored_update, stored_strength = _prepare_dense_merge(
+            target,
+            update,
+            strength,
+        )
+        if _triton_int8_dense_layout_supported(qt, stored_update):
+            assert _triton_merge_int8_dense is not None
+            asymmetric = qt.zero_point is not None and bool(qt.zero_point.any())
+            qdata, scale, zero_point = _triton_merge_int8_dense(
+                qt.qdata,
+                qt.scale,
+                qt.zero_point,
+                tuple(qt.block_size),
+                stored_update,
+                stored_strength,
+                asymmetric=asymmetric,
+                reduce_range=bool(qt.reduce_range),
+                rounding_seed=rounding_seed,
+            )
+            qt.qdata.copy_(qdata)
+            qt.scale.copy_(scale)
+            if qt.zero_point is not None:
+                qt.zero_point.copy_(zero_point)
+            return
+        merge_dense_requantize_(
+            Int8Adapter,
+            qt,
+            stored_update,
+            stored_strength,
             rounding_seed=rounding_seed,
         )
 

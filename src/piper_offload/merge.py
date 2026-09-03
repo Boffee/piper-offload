@@ -3,9 +3,9 @@
 Merges additive parameter deltas directly into existing model parameters and
 materializes parameter values for meta targets. Plain floating-point targets
 support combined low-rank and full-rank deltas. Quantized adapters own their
-LoRA encoding path and may select a format-specific kernel or a
-dequantize/requantize fallback; full-rank quantized deltas are not yet
-supported.
+factorized and dense encoding paths and may select a format-specific kernel or
+a dequantize/requantize fallback. Mixed deltas are staged as one full-rank
+update so the quantized base is encoded once.
 
 Permanent and activation merge use the same parameter-delta and
 parameter-value transforms. Permanent merge applies them to resident model
@@ -75,10 +75,10 @@ def merge_adapter(
     merge or routed uses. All active target names and merge capabilities are
     validated before any parameter is modified. An adapter constructed with
     ``allow_partial_targets=True`` ignores targets absent from this model.
-    Quantized targets use
-    terminal-code stochastic rounding by default so sub-step LoRA updates are
-    not systematically rounded away; pass ``stochastic_rounding=False`` for
-    deterministic rounding. Parameter values populate frozen floating-point
+    Quantized targets use terminal-code stochastic rounding by default so
+    sub-step additive updates are not systematically rounded away; pass
+    ``stochastic_rounding=False`` for deterministic rounding. Parameter values
+    populate frozen floating-point
     meta targets and are scaled during materialization. A populated meta
     target is replaced by one frozen CPU parameter, preserving any tied
     aliases of the original parameter.

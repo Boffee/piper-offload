@@ -6,7 +6,13 @@ import pytest
 import torch
 from torch import nn
 
-from piper_offload import LoRATransform, ModelOffloader, ScaledLoRAFactor
+from piper_offload import (
+    Adapter,
+    LoRATransform,
+    ModelOffloader,
+    ScaledLoRAFactor,
+    merge_adapter,
+)
 from piper_offload.block_component import _param_target_layout
 from piper_offload.nvfp4_adapter import Nvfp4Adapter
 from piper_offload.pinned_param import PinnedParam
@@ -18,6 +24,8 @@ from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
     CpuRoundTripTensorAdapter,
     DequantRequantTensorAdapter,
+    DenseMergeTargetValidationTensorAdapter,
+    DenseMergeTensorAdapter,
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
     ParameterDataSwapTensorAdapter,
@@ -179,6 +187,95 @@ class TestPiperConvRotNVFP4Adapter:
         )
         torch.testing.assert_close(param.data.dequantize(), expected.dequantize())
 
+    @pytest.mark.parametrize("with_lora", [False, True])
+    def test_parameter_delta_uses_kernel_add_in_place(
+        self,
+        with_lora: bool,
+    ) -> None:
+        rows, cols, rank = 16, 64, 4
+        convrot, _dense = _make_convrot_nvfp4(rows=rows, cols=cols)
+        model = nn.Module()
+        model.lin = nn.Linear(cols, rows, bias=False, dtype=convrot.orig_dtype)
+        model.lin.weight = nn.Parameter(convrot, requires_grad=False)
+        dense = torch.randn(rows, cols)
+        strength = -0.25
+        state_dict = {"lin.delta.weight": dense}
+        expected_update = torch.zeros(rows, cols, dtype=convrot.orig_dtype)
+        expected_update.add_(dense.to(convrot.orig_dtype), alpha=strength)
+        if with_lora:
+            a = torch.randn(rank, cols)
+            b = torch.randn(rows, rank)
+            state_dict.update(
+                {
+                    "lin.lora_A.weight": a,
+                    "lin.lora_B.weight": b,
+                }
+            )
+            scaled_a = a.to(convrot.orig_dtype)
+            scaled_a.mul_(strength)
+            expected_update.addmm_(b.to(convrot.orig_dtype), scaled_a)
+        expected = convrot.clone()
+        expected.add_(expected_update)
+        qdata_ptr = convrot.qdata.data_ptr()
+        scale_ptr = convrot.scale.data_ptr()
+        adapter = Adapter.from_state_dict(
+            state_dict,
+            host_backing="adopt",
+        )
+
+        assert (
+            merge_adapter(
+                model,
+                [(adapter, strength)],
+                stochastic_rounding=False,
+            )
+            == 1
+        )
+
+        assert model.lin.weight.data.qdata.data_ptr() == qdata_ptr
+        assert model.lin.weight.data.scale.data_ptr() == scale_ptr
+        assert torch.equal(model.lin.weight.data.qdata, expected.qdata)
+        assert torch.equal(
+            model.lin.weight.data.scale.view(torch.uint8),
+            expected.scale.view(torch.uint8),
+        )
+
+    def test_dense_merge_forwards_strength_and_rounding_seed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        convrot_cls = _modules()[3]
+        convrot, _dense = _make_convrot_nvfp4()
+        update = torch.randn(16, 64, dtype=convrot.orig_dtype)
+        calls: list[tuple[float, int | None]] = []
+        original_add = convrot_cls.add_
+
+        def recording_add(
+            target: torch.Tensor,
+            other: torch.Tensor,
+            *,
+            alpha: float = 1,
+            rounding_seed: int | None = None,
+        ) -> torch.Tensor:
+            calls.append((alpha, rounding_seed))
+            return original_add(
+                target,
+                other,
+                alpha=alpha,
+                rounding_seed=rounding_seed,
+            )
+
+        monkeypatch.setattr(convrot_cls, "add_", recording_add)
+
+        PiperConvRotNVFP4Adapter.merge_dense_(
+            convrot,
+            update,
+            0.125,
+            rounding_seed=456,
+        )
+
+        assert calls == [(0.125, 456)]
+
     def test_merge_forwards_rounding_seed_to_kernel_addmm(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -248,6 +345,8 @@ class TestPiperConvRotNVFP4Adapter:
 
         assert isinstance(adapter, LoRAMergeTensorAdapter)
         assert isinstance(adapter, LoRAMergeValidationTensorAdapter)
+        assert isinstance(adapter, DenseMergeTensorAdapter)
+        assert isinstance(adapter, DenseMergeTargetValidationTensorAdapter)
         assert not isinstance(adapter, DequantRequantTensorAdapter)
         assert not isinstance(adapter, TensorCopyIntoAdapter)
         assert not isinstance(adapter, CpuRoundTripTensorAdapter)
@@ -277,6 +376,17 @@ class TestPiperConvRotNVFP4Adapter:
                 torch.empty(4, 64, dtype=torch.bfloat16),
                 1.0,
             )
+
+    def test_dense_merge_fails_clearly_when_kernel_add_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        convrot_cls = _modules()[3]
+        convrot, _dense = _make_convrot_nvfp4()
+        monkeypatch.delattr(convrot_cls, "add_")
+
+        with pytest.raises(RuntimeError, match=r"piper-kernels>=0\.7\.0rc1"):
+            PiperConvRotNVFP4Adapter.validate_dense_merge_target(convrot)
 
     @SM120
     def test_model_offloader_cuda_forward_preserves_convrot_nvfp4(self) -> None:
