@@ -41,11 +41,12 @@ optimum-quanto is not installed — quanto support is optional.
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import nn
 
+from ._dense_merge import merge_dense_requantize_
 from ._quanto import (
     canonical_qbytes_storage_layout,
     canonicalize_qbytes_tensor,
@@ -372,29 +373,54 @@ class QuantoAdapter:
     ) -> None:
         """Validate canonicalization and absmax-requantization layout."""
         del rounding_seed
+        QuantoAdapter._validate_merge_target(target, kind="lora")
+        if a.shape[0] == 0:
+            raise ValueError("Quanto LoRA merge requires a positive LoRA rank.")
+
+    @staticmethod
+    def validate_dense_merge_target(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> bool:
+        del rounding_seed
+        QuantoAdapter._validate_merge_target(target, kind="dense")
+        return False
+
+    @staticmethod
+    def _validate_merge_target(
+        target: torch.Tensor,
+        *,
+        kind: Literal["lora", "dense"],
+    ) -> Any:  # noqa: ANN401
+        """Validate canonicalization and absmax-requantization layout."""
+        label = "LoRA" if kind == "lora" else "dense"
         qt = canonicalize_qbytes_tensor(target)
         if qt._data.ndim != 2 or tuple(qt._data.shape) != tuple(qt.size()):
             raise ValueError(
-                "Quanto LoRA merge requires a rank-two weight whose qbytes storage matches its logical shape."
+                f"Quanto {label} merge requires a rank-two weight whose qbytes "
+                "storage matches its logical shape."
             )
         if getattr(qt.qtype, "bits", None) != 8:
-            raise ValueError("Quanto qbytes LoRA merge requires an 8-bit qtype.")
+            raise ValueError(f"Quanto qbytes {label} merge requires an 8-bit qtype.")
         qmax = getattr(qt.qtype, "qmax", None)
         if not isinstance(qmax, (int, float)) or qmax <= 0:
-            raise ValueError("Quanto qbytes LoRA merge requires a qtype with a positive qmax.")
+            raise ValueError(
+                f"Quanto qbytes {label} merge requires a qtype with a positive qmax."
+            )
         if getattr(qt.qtype, "dtype", None) is not qt._data.dtype:
             raise ValueError("Quanto qbytes storage dtype does not match its qtype metadata.")
         if not qt._scale.dtype.is_floating_point:
-            raise ValueError("Quanto qbytes LoRA merge requires floating-point scales.")
+            raise ValueError(f"Quanto qbytes {label} merge requires floating-point scales.")
         if qt._data.device != qt._scale.device:
             raise ValueError("Quanto qbytes data and scales must be on the same device.")
         if not _has_supported_scale_layout(qt):
             raise ValueError(
-                "Quanto LoRA merge expects a scalar scale, shape (rows, 1) "
+                f"Quanto {label} merge expects a scalar scale, shape (rows, 1) "
                 "for axis 0, or shape (1, columns) for the last axis."
             )
-        if a.shape[0] == 0:
-            raise ValueError("Quanto LoRA merge requires a positive LoRA rank.")
+        return qt
+
     @staticmethod
     def merge_lora_(
         target: torch.Tensor,
@@ -445,6 +471,23 @@ class QuantoAdapter:
         )
         merged = require_qbytes_tensor(merged)
         copy_qbytes_tensor_(merged, target_qt)
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Merge a full-rank update through the reference requantization path."""
+        merge_dense_requantize_(
+            QuantoAdapter,
+            target,
+            update,
+            strength,
+            rounding_seed=rounding_seed,
+        )
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:

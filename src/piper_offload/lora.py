@@ -12,14 +12,13 @@ from typing import Any, Protocol, Self, runtime_checkable
 import torch
 from torch import nn
 
-from .dtensor_adapter import DTensorAdapter
 from .pinned_param import PinnedParam
 from .seeding import derive_seed
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
-    RegularAdapter,
+    MergeLocalityTensorAdapter,
     adapter_name,
 )
 
@@ -232,6 +231,92 @@ class _MaterializedWeightFactor:
     b: torch.Tensor
 
 
+def _materialize_weight_factors(
+    factors: Sequence[ScaledLoRAFactor],
+) -> list[_MaterializedWeightFactor]:
+    """Expose scaled factors as plain host tensors."""
+    return [
+        _MaterializedWeightFactor(
+            strength=factor.strength,
+            a=param_representation(factor.a.make_cpu_param()),
+            b=param_representation(factor.b.make_cpu_param()),
+        )
+        for factor in factors
+    ]
+
+
+def _validate_materialized_weight_factors(
+    factors: Sequence[_MaterializedWeightFactor],
+) -> None:
+    if all(
+        type(factor.a) is torch.Tensor
+        and type(factor.b) is torch.Tensor
+        and factor.a.device.type == "cpu"
+        and factor.b.device.type == "cpu"
+        for factor in factors
+    ):
+        return
+    raise ValueError(
+        "LoRA merge requires plain CPU torch.Tensor factors; "
+        "wrapped factor representations are unsupported."
+    )
+
+
+def _localize_materialized_weight_factors(
+    factors: Sequence[_MaterializedWeightFactor],
+    *,
+    out_range: tuple[int, int],
+    in_range: tuple[int, int],
+) -> list[_MaterializedWeightFactor]:
+    """Slice logical factors to one target-local output/input region."""
+    out_offset, out_size = out_range
+    in_offset, in_size = in_range
+    return [
+        _MaterializedWeightFactor(
+            strength=factor.strength,
+            a=factor.a.narrow(1, in_offset, in_size),
+            b=factor.b.narrow(0, out_offset, out_size),
+        )
+        for factor in factors
+    ]
+
+
+def _pack_materialized_weight_factors(
+    data: torch.Tensor,
+    factors: Sequence[_MaterializedWeightFactor],
+    *,
+    logical_shape: tuple[int, ...],
+    compute_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stage several logical LoRAs as one packed update."""
+    total_rank = sum(factor.a.shape[0] for factor in factors)
+    a_packed = torch.empty(
+        (total_rank, logical_shape[1]),
+        device=data.device,
+        dtype=compute_dtype,
+    )
+    b_packed = torch.empty(
+        (logical_shape[0], total_rank),
+        device=data.device,
+        dtype=compute_dtype,
+    )
+
+    rank_offset = 0
+    for factor in factors:
+        next_offset = rank_offset + factor.a.shape[0]
+        a_slice = a_packed[rank_offset:next_offset]
+        b_slice = b_packed[:, rank_offset:next_offset]
+        a_slice.copy_(factor.a, non_blocking=True)
+        b_slice.copy_(factor.b, non_blocking=True)
+        if factor.strength != 1.0:
+            # Scaling the contiguous A slice keeps B's strided destination
+            # copy as the only non-contiguous operation for each factor.
+            a_slice.mul_(factor.strength)
+        rank_offset = next_offset
+
+    return a_packed, b_packed
+
+
 @dataclass(slots=True, frozen=True)
 class _LoRAWeightPlan:
     """Validated, device-independent inputs for repeated weight merges."""
@@ -362,30 +447,6 @@ class LoRATransform:
         representation = param_representation(param)
         self._apply_plan(representation, plan)
 
-    def accumulate_parameter_update(self, update: torch.Tensor) -> None:
-        """Add the validated LoRA contribution to a plain update tensor.
-
-        Composed transforms use this to combine low-rank and full-rank terms
-        before mutating the base parameter. Factor-only application continues
-        through :meth:`apply_parameter` so quantized target adapters retain
-        their existing merge behavior.
-        """
-        plan = self._weight_plan
-        if plan is None:
-            raise RuntimeError("LoRA weight target must be validated before application.")
-        if (
-            not isinstance(plan.adapter, RegularAdapter)
-            or type(update) is not torch.Tensor
-            or update.is_meta
-            or tuple(update.shape) != plan.staging_shape
-            or update.dtype is not plan.compute_dtype
-        ):
-            raise RuntimeError(
-                "LoRA update accumulation requires a physical plain tensor "
-                "matching the validated target."
-            )
-        self._apply_plan(update, plan)
-
     def _apply_plan(self, representation: torch.Tensor, plan: _LoRAWeightPlan) -> None:
         """Apply one validated plan and advance its merge sequence."""
         rounding_seed = self._rounding_seed()
@@ -403,14 +464,7 @@ class LoRATransform:
     def _materialize_weight_factors(
         self,
     ) -> list[_MaterializedWeightFactor]:
-        return [
-            _MaterializedWeightFactor(
-                strength=factor.strength,
-                a=param_representation(factor.a.make_cpu_param()),
-                b=param_representation(factor.b.make_cpu_param()),
-            )
-            for factor in self._factors
-        ]
+        return _materialize_weight_factors(self._factors)
 
     def _apply_merge(
         self,
@@ -457,19 +511,18 @@ class LoRATransform:
         list[_MaterializedWeightFactor],
         tuple[int, ...],
     ]:
-        """Slice host-backed factors to a DTensor target's local shard."""
-        if not isinstance(adapter, DTensorAdapter):
+        """Slice host-backed factors to an adapter-local merge region."""
+        if not isinstance(adapter, MergeLocalityTensorAdapter):
             return list(factors), logical_shape
 
-        (out_offset, out_size), (in_offset, in_size) = adapter.lora_factor_ranges(data)
-        localized = [
-            _MaterializedWeightFactor(
-                strength=factor.strength,
-                a=factor.a.narrow(1, in_offset, in_size),
-                b=factor.b.narrow(0, out_offset, out_size),
-            )
-            for factor in factors
-        ]
+        local_shape, offsets = adapter.merge_local_shape_and_offsets(data)
+        out_size, in_size = local_shape
+        out_offset, in_offset = offsets
+        localized = _localize_materialized_weight_factors(
+            factors,
+            out_range=(out_offset, out_size),
+            in_range=(in_offset, in_size),
+        )
         return localized, (out_size, in_size)
 
     @classmethod
@@ -535,28 +588,11 @@ class LoRATransform:
             False,
         )
 
-    @classmethod
+    @staticmethod
     def _validate_materialized_factors(
-        cls,
         factors: Sequence[_MaterializedWeightFactor],
     ) -> None:
-        if cls._are_plain_cpu_factors(factors):
-            return
-        raise ValueError(
-            "LoRA merge requires plain CPU torch.Tensor factors; wrapped factor representations are unsupported."
-        )
-
-    @staticmethod
-    def _are_plain_cpu_factors(
-        factors: Sequence[_MaterializedWeightFactor],
-    ) -> bool:
-        return all(
-            type(factor.a) is torch.Tensor
-            and type(factor.b) is torch.Tensor
-            and factor.a.device.type == "cpu"
-            and factor.b.device.type == "cpu"
-            for factor in factors
-        )
+        _validate_materialized_weight_factors(factors)
 
     @staticmethod
     def _pack_factors(
@@ -573,32 +609,12 @@ class LoRATransform:
         their destination slices, avoiding the extra individual device
         tensors that a target-side ``torch.cat`` would require.
         """
-        total_rank = sum(factor.a.shape[0] for factor in factors)
-        a_packed = torch.empty(
-            (total_rank, logical_shape[1]),
-            device=data.device,
-            dtype=compute_dtype,
+        return _pack_materialized_weight_factors(
+            data,
+            factors,
+            logical_shape=logical_shape,
+            compute_dtype=compute_dtype,
         )
-        b_packed = torch.empty(
-            (logical_shape[0], total_rank),
-            device=data.device,
-            dtype=compute_dtype,
-        )
-
-        rank_offset = 0
-        for factor in factors:
-            next_offset = rank_offset + factor.a.shape[0]
-            a_slice = a_packed[rank_offset:next_offset]
-            b_slice = b_packed[:, rank_offset:next_offset]
-            a_slice.copy_(factor.a, non_blocking=True)
-            b_slice.copy_(factor.b, non_blocking=True)
-            if factor.strength != 1.0:
-                # Scaling the contiguous A slice keeps B's strided destination
-                # copy as the only non-contiguous operation for each factor.
-                a_slice.mul_(factor.strength)
-            rank_offset = next_offset
-
-        return a_packed, b_packed
 
 
 def _validate_factor_shapes(

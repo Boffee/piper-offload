@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import piper_offload.lora as lora_impl
+import piper_offload.parameter_delta as parameter_delta_impl
 import piper_offload.quanto_adapter as quanto_adapter_impl
 
 from piper_offload import (
@@ -54,6 +55,7 @@ from piper_offload.protocols import (
     ResourceStore,
 )
 from piper_offload.tensor_adapters import (
+    DenseMergeTensorAdapter,
     DequantRequantTensorAdapter,
     LoRAMergeTensorAdapter,
     RegularAdapter,
@@ -962,6 +964,167 @@ class TestParameterDelta:
             model.target.weight,
             base + 0.5 * first_dense + 1.25 * (b @ a + second_dense),
         )
+
+    def test_plain_dense_merge_delegates_once_to_adapter_capability(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model = nn.Linear(3, 2, bias=False)
+        model.requires_grad_(False)
+        before = model.weight.detach().clone()
+        dense = torch.randn_like(before)
+        adapter = Adapter(
+            {
+                "weight": ParameterDelta.from_tensors(
+                    dense=dense,
+                    pin_memory=False,
+                )
+            }
+        )
+        calls: list[tuple[torch.Tensor, float, int | None]] = []
+        original = RegularAdapter.merge_dense_
+
+        def tracked_merge(
+            target: torch.Tensor,
+            update: torch.Tensor,
+            strength: float,
+            *,
+            rounding_seed: int | None = None,
+        ) -> None:
+            calls.append((update.detach().clone(), strength, rounding_seed))
+            original(
+                target,
+                update,
+                strength,
+                rounding_seed=rounding_seed,
+            )
+
+        monkeypatch.setattr(
+            RegularAdapter,
+            "merge_dense_",
+            staticmethod(tracked_merge),
+        )
+
+        assert merge_adapter(model, [(adapter, 0.25)]) == 1
+
+        assert len(calls) == 1
+        staged, strength, seed = calls[0]
+        torch.testing.assert_close(staged, dense * 0.25)
+        assert strength == 1.0
+        assert seed == derive_seed("weight", 0)
+        torch.testing.assert_close(model.weight, before + dense * 0.25)
+
+    @pytest.mark.parametrize("with_lora", [False, True])
+    def test_quanto_dense_merge_supports_dense_only_and_mixed_updates(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        with_lora: bool,
+    ) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols, rank = 3, 4, 2
+        data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1).add_(0.25)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8,
+            0,
+            (rows, cols),
+            (cols, 1),
+            data,
+            scale,
+            None,
+        )
+        model = nn.Module()
+        model.target = nn.Module()
+        model.target.weight = nn.Parameter(qt, requires_grad=False)
+        before = qt.dequantize()
+        dense = torch.randn(rows, cols)
+        strength = -0.375
+        state_dict = {"target.delta.weight": dense}
+        low_rank = torch.zeros_like(dense)
+        if with_lora:
+            a = torch.randn(rank, cols)
+            b = torch.randn(rows, rank)
+            state_dict.update(
+                {
+                    "target.lora_A.weight": a,
+                    "target.lora_B.weight": b,
+                }
+            )
+            low_rank = b @ a
+        adapter = Adapter.from_state_dict(state_dict)
+        assert isinstance(QuantoAdapter(), DenseMergeTensorAdapter)
+        original_data_ptr = model.target.weight.data._data.data_ptr()
+        original_scale_ptr = model.target.weight.data._scale.data_ptr()
+        calls = 0
+        stage_calls = 0
+        original_dense_merge = QuantoAdapter.merge_dense_
+        original_stage = ParameterDeltaTransform._stage_update_for_plan
+
+        def tracked_stage(
+            transform: ParameterDeltaTransform,
+            param: nn.Parameter,
+            plan: parameter_delta_impl._DenseMergePlan,
+        ) -> torch.Tensor:
+            nonlocal stage_calls
+            stage_calls += 1
+            return original_stage(transform, param, plan)
+
+        def tracked_dense_merge(
+            target: torch.Tensor,
+            update: torch.Tensor,
+            staged_strength: float,
+            *,
+            rounding_seed: int | None = None,
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            original_dense_merge(
+                target,
+                update,
+                staged_strength,
+                rounding_seed=rounding_seed,
+            )
+
+        def unexpected_lora_merge(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("mixed update used the factorized merge path")
+
+        monkeypatch.setattr(
+            QuantoAdapter,
+            "merge_dense_",
+            staticmethod(tracked_dense_merge),
+        )
+        monkeypatch.setattr(
+            QuantoAdapter,
+            "merge_lora_",
+            staticmethod(unexpected_lora_merge),
+        )
+        monkeypatch.setattr(
+            ParameterDeltaTransform,
+            "_stage_update_for_plan",
+            tracked_stage,
+        )
+
+        assert (
+            merge_adapter(
+                model,
+                [(adapter, strength)],
+                stochastic_rounding=False,
+            )
+            == 1
+        )
+
+        expected = _quanto_absmax_oracle(
+            before + strength * (dense + low_rank),
+            like=qt,
+        )
+        assert calls == 1
+        assert stage_calls == 1
+        assert model.target.weight.data._data.data_ptr() == original_data_ptr
+        assert model.target.weight.data._scale.data_ptr() == original_scale_ptr
+        torch.testing.assert_close(model.target.weight.data._data, expected._data)
+        torch.testing.assert_close(model.target.weight.data._scale, expected._scale)
 
     def test_zero_strength_dense_delta_is_inactive(self) -> None:
         model = nn.Linear(3, 2, bias=False)

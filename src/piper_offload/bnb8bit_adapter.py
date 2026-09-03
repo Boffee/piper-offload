@@ -48,6 +48,7 @@ from ._bnb import (
     requantize_int8_params,
     require_int8_params,
 )
+from ._dense_merge import merge_dense_requantize_
 from .tensor_adapters import (
     adopt_cpu_storage,
     clone_to_pinned_cpu,
@@ -313,6 +314,23 @@ class Bnb8bitAdapter:
         cb, scb = merged
         qt.CB.copy_(cb)
         qt.SCB.copy_(scb)
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Merge a full-rank update through the reference requantization path."""
+        merge_dense_requantize_(
+            Bnb8bitAdapter,
+            target,
+            update,
+            strength,
+            rounding_seed=rounding_seed,
+        )
 
     @staticmethod
     def rearm_after_load(param: nn.Parameter, gpu_state: _Bnb8bitGpu) -> None:

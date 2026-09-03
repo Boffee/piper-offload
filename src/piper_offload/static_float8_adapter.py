@@ -21,6 +21,7 @@ from typing import Any
 
 import torch
 
+from ._dense_merge import merge_dense_requantize_
 from ._torchao_static_float8 import (
     create_static_float8_tensor,
     dequantize_static_float8_tensor,
@@ -236,6 +237,23 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
         qdata, scale = merged
         f8.qdata.copy_(qdata)
         f8.scale.copy_(scale)
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Merge a full-rank update without changing activation calibration."""
+        merge_dense_requantize_(
+            StaticFloat8Adapter,
+            target,
+            update,
+            strength,
+            rounding_seed=rounding_seed,
+        )
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:

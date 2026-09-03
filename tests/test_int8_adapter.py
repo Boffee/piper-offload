@@ -636,6 +636,34 @@ class TestInt8Adapter:
             atol=0.025,
         )
 
+    def test_dense_merge_maps_logical_update_through_act_pre_scale(self) -> None:
+        rows, cols = 7, 8
+        pre_scale = torch.tensor(
+            [0.5, 0.75, 1.0, 1.5, 2.0, 0.625, 1.25, 1.75],
+        )
+        qt = _with_act_pre_scale(
+            _make_affine_int8(torch.randn(rows, cols) * 0.3),
+            pre_scale,
+        )
+        update = torch.randn(rows, cols) * 0.1
+        strength = -0.375
+        expected_dense = Int8Adapter.dequantize(qt)
+        expected_dense.add_(
+            update / pre_scale.reshape(1, cols),
+            alpha=strength,
+        )
+        expected = Int8Adapter.requantize(expected_dense, like=qt)
+        qdata_ptr = qt.qdata.data_ptr()
+        scale_ptr = qt.scale.data_ptr()
+
+        Int8Adapter.validate_dense_merge(qt, update, strength)
+        Int8Adapter.merge_dense_(qt, update, strength)
+
+        assert qt.qdata.data_ptr() == qdata_ptr
+        assert qt.scale.data_ptr() == scale_ptr
+        assert torch.equal(qt.qdata, expected.qdata)
+        assert torch.equal(qt.scale, expected.scale)
+
     @pytest.mark.parametrize(
         ("device", "expects_triton"),
         [

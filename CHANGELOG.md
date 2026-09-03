@@ -5,6 +5,19 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add the adapter-owned `merge_dense_` capability alongside `merge_lora_`.
+  Dense-only and mixed dense + LoRA parameter deltas now stage one full-rank
+  logical update and delegate it through this capability, allowing supported
+  quantized targets to requantize exactly once. Quanto, bitsandbytes 4-bit and
+  8-bit, TorchAO scaled/static FP8, INT8, MX, NVFP4, plain tensors, and their
+  supported DTensor compositions opt in; GGUF, TorchAO INT4 tile-packed, and
+  Piper ConvRot remain unsupported until they provide a suitable dense merge.
+  Target-only and staged-update validation are separate capabilities, and
+  composing adapters can expose one shared locality contract for both merge
+  representations.
+
 ## [0.8.0] - 2026-09-02
 
 ### Added

@@ -54,6 +54,7 @@ from ._bnb import (
     requantize_params_4bit,
     require_params_4bit,
 )
+from ._dense_merge import merge_dense_requantize_
 from .tensor_adapters import (
     adopt_cpu_storage,
     clone_to_pinned_cpu,
@@ -453,6 +454,23 @@ class Bnb4bitAdapter:
             rounding_seed=rounding_seed,
         )
         Bnb4bitAdapter.copy_into(merged, target=target)
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Merge a full-rank update through the reference requantization path."""
+        merge_dense_requantize_(
+            Bnb4bitAdapter,
+            target,
+            update,
+            strength,
+            rounding_seed=rounding_seed,
+        )
 
     @staticmethod
     def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:

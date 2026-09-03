@@ -29,10 +29,11 @@ non-destructive alternative when the owning module is a logical
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
+from ._dense_merge import merge_dense_requantize_
 from ._torchao_mx import (
     create_mx_tensor,
     dequantize_mx_tensor,
@@ -251,6 +252,23 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
         return requantize_mx_tensor(t, like=like, rounding_seed=rounding_seed)
 
     @staticmethod
+    def _validate_merge_target(
+        target: torch.Tensor,
+        *,
+        kind: Literal["lora", "dense"],
+    ) -> None:
+        """Reject layouts the standard MX re-encode cannot refill."""
+        label = "LoRA" if kind == "lora" else "a dense update"
+        mx = require_mx_tensor(target)
+        if not mx.qdata.is_contiguous():
+            guidance = " Use routed LoRA for this weight." if kind == "lora" else ""
+            raise ValueError(
+                f"Cannot merge {label} into a non-contiguous (e.g. transposed) "
+                "MX weight: requantization produces the standard packed layout, "
+                f"which cannot fill a transposed target.{guidance}"
+            )
+
+    @staticmethod
     def validate_lora_merge(
         target: torch.Tensor,
         _b: torch.Tensor,
@@ -259,16 +277,8 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        """Reject layouts the standard MX re-encode cannot refill."""
         del rounding_seed
-        mx = require_mx_tensor(target)
-        if not mx.qdata.is_contiguous():
-            raise ValueError(
-                "Cannot merge LoRA into a non-contiguous (e.g. transposed) MX "
-                "weight: requantization produces the standard packed layout, "
-                "which cannot fill a transposed target. Use routed LoRA for "
-                "this weight."
-            )
+        MxAdapter._validate_merge_target(target, kind="lora")
 
     @staticmethod
     def merge_lora_(
@@ -303,6 +313,33 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
             target,
             b,
             a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
+
+    @staticmethod
+    def validate_dense_merge_target(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> bool:
+        del rounding_seed
+        MxAdapter._validate_merge_target(target, kind="dense")
+        return False
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Merge a full-rank update through the reference requantization path."""
+        merge_dense_requantize_(
+            MxAdapter,
+            target,
+            update,
             strength,
             rounding_seed=rounding_seed,
         )

@@ -41,10 +41,14 @@ __all__ = [
     "AdoptableTensorAdapter",
     "BindLayoutTensorAdapter",
     "CpuRoundTripTensorAdapter",
+    "DenseMergeTargetValidationTensorAdapter",
+    "DenseMergeTensorAdapter",
+    "DenseMergeValidationTensorAdapter",
     "DequantRequantTensorAdapter",
     "LoRAMergeTensorAdapter",
     "LoRAMergeValidationTensorAdapter",
     "LogicalShapeTensorAdapter",
+    "MergeLocalityTensorAdapter",
     "ParameterDataSwapTensorAdapter",
     "PostLoadRearmTensorAdapter",
     "TensorAdapter",
@@ -275,6 +279,79 @@ class LoRAMergeValidationTensorAdapter(Protocol):
         rounding_seed: int | None = None,
     ) -> None:
         """Validate the staged update and optional rounding mode."""
+        ...
+
+
+@runtime_checkable
+class DenseMergeTensorAdapter[PinnedStateT, GpuStateT](
+    LogicalShapeTensorAdapter[PinnedStateT, GpuStateT],
+    Protocol,
+):
+    """Optional capability for an in-place staged full-rank merge.
+
+    ``update`` is a dense logical delta on the target device and in the
+    adapter's compute dtype. Implementations preserve the target tensor's
+    object and storage identities; structured formats may use a native kernel
+    or dequantize/add/requantize internally.
+    """
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Merge ``strength * update``, optionally using stochastic rounding."""
+        ...
+
+
+@runtime_checkable
+class DenseMergeTargetValidationTensorAdapter(Protocol):
+    """Optional target-only preflight for an advertised dense merge."""
+
+    @staticmethod
+    def validate_dense_merge_target(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> bool:
+        """Validate ``target`` and report whether update validation is needed.
+
+        Returning ``True`` requires the adapter to also implement
+        :class:`DenseMergeValidationTensorAdapter`. This supports composing
+        wrappers whose inner adapter may or may not need to inspect the staged
+        update without forcing target-only formats to stage it during preflight.
+        """
+        ...
+
+
+@runtime_checkable
+class DenseMergeValidationTensorAdapter(Protocol):
+    """Optional staged-update validation for an advertised dense merge."""
+
+    @staticmethod
+    def validate_dense_merge(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Validate the staged full-rank update and rounding mode."""
+        ...
+
+
+@runtime_checkable
+class MergeLocalityTensorAdapter(Protocol):
+    """Optional target-local region used to stage logical merge inputs."""
+
+    @staticmethod
+    def merge_local_shape_and_offsets(
+        target: torch.Tensor,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Return this target's local shape and global offsets."""
         ...
 
 
@@ -694,6 +771,31 @@ class RegularAdapter:
     ) -> None:
         del rounding_seed
         target.addmm_(b, a, alpha=strength)
+
+    @staticmethod
+    def validate_dense_merge_target(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> bool:
+        del rounding_seed
+        if target.dtype.is_floating_point and torch.finfo(target.dtype).bits == 8:
+            raise ValueError(
+                "Dense merges do not support float8 targets with plain storage; "
+                f"got {target.dtype}."
+            )
+        return False
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        del rounding_seed
+        target.add_(update, alpha=strength)
 
     @staticmethod
     def validate_parameter_data_swap_target(t: torch.Tensor) -> None:

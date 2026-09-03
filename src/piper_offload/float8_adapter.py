@@ -31,6 +31,7 @@ from typing import Any
 
 import torch
 
+from ._dense_merge import merge_dense_requantize_
 from ._torchao_float8 import (
     create_float8_tensor,
     dequantize_float8_tensor,
@@ -267,6 +268,33 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
             target,
             b,
             a,
+            strength,
+            rounding_seed=rounding_seed,
+        )
+
+    @staticmethod
+    def validate_dense_merge_target(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> bool:
+        del rounding_seed
+        validate_float8_requantize_layout(target)
+        return False
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Merge a full-rank update through the reference requantization path."""
+        merge_dense_requantize_(
+            Float8Adapter,
+            target,
+            update,
             strength,
             rounding_seed=rounding_seed,
         )

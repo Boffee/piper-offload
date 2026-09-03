@@ -20,17 +20,17 @@ rejects such a local shard with ``NotImplementedError`` rather than silently
 corrupting it. (bitsandbytes + tensor parallelism is not a supported
 combination upstream regardless.)
 
-Scope: **movement plus shard-local LoRA merge, for frozen-inference tensor
-parallelism.** Merge mode supports rank-two weights with ordinary
-``Replicate`` and contiguous ``Shard`` placements. It selects the pinned
-factor regions needed by each rank before device staging, then delegates the
-actual update to the local shard's adapter. This keeps tensor-parallel
-concerns out of format-specific quant adapters.
+Scope: **movement plus shard-local additive merge, for frozen-inference tensor
+parallelism.** Merge mode supports ordinary ``Replicate`` and contiguous
+``Shard`` placements. It selects the pinned dense regions and, for rank-two
+weights, LoRA factor regions needed by each rank before device staging, then
+delegates the actual update to the local shard's adapter. This keeps
+tensor-parallel concerns out of format-specific quant adapters.
 
 The adapter advertises no CPU round-trip, dequantize/requantize, ``copy_into``,
-or trainable ``.data`` swap capability. A DTensor is mergeable only when its
-local shard's adapter supports LoRA merge; otherwise routed LoRA remains the
-inference path.
+or trainable ``.data`` swap capability. A DTensor merge is available only when
+its local shard's adapter supports the corresponding factorized or dense merge
+operation; otherwise routed LoRA remains the inference path.
 
 Identity and layout keys are taken from the **local shard** (delegated to
 the inner adapter) plus a structural ``(mesh, placements)`` signature. This
@@ -69,6 +69,9 @@ from ._dtensor import (
 from .seeding import derive_seed
 from .tensor_adapters import (
     BindLayoutTensorAdapter,
+    DenseMergeTargetValidationTensorAdapter,
+    DenseMergeTensorAdapter,
+    DenseMergeValidationTensorAdapter,
     LogicalShapeTensorAdapter,
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
@@ -130,7 +133,7 @@ def _local_shape_and_offsets(
 
     if not (len(mesh_shape) == len(coordinate) == len(placements)):
         raise ValueError(
-            "DTensor LoRA merge requires one placement and coordinate per "
+            "DTensor merge requires one placement and coordinate per "
             f"mesh dimension; mesh shape is {mesh_shape}, coordinate is "
             f"{coordinate}, and placements are {placements}."
         )
@@ -144,9 +147,9 @@ def _local_shape_and_offsets(
             continue
         if type(placement) is not Shard:
             raise ValueError(
-                "DTensor LoRA merge supports only Replicate and contiguous "
+                "DTensor merge supports only Replicate and contiguous "
                 f"Shard placements; mesh dimension {mesh_dim} uses "
-                f"{placement!r}. Use routed LoRA for this layout."
+                f"{placement!r}."
             )
 
         tensor_dim = placement.dim
@@ -154,7 +157,7 @@ def _local_shape_and_offsets(
             tensor_dim += len(global_shape)
         if not 0 <= tensor_dim < len(global_shape):
             raise ValueError(
-                f"DTensor LoRA merge placement {placement!r} refers to tensor "
+                f"DTensor merge placement {placement!r} refers to tensor "
                 f"dimension {placement.dim}, but the target shape is "
                 f"{global_shape}."
             )
@@ -187,14 +190,22 @@ def _logical_shape(
 
 
 @dataclass(slots=True, frozen=True)
-class _DTensorMergeContext:
-    """Validated global-to-local information for one DTensor merge."""
+class _DTensorLayoutContext[InnerT]:
+    """Validated global-to-local layout independent of merge capability."""
 
     global_shape: tuple[int, ...]
     local_shape: tuple[int, ...]
     offsets: tuple[int, ...]
     local: torch.Tensor
-    inner: LoRAMergeTensorAdapter[Any, Any]
+    inner: InnerT
+
+
+type _DTensorLoRAMergeContext = _DTensorLayoutContext[
+    LoRAMergeTensorAdapter[Any, Any]
+]
+type _DTensorDenseMergeContext = _DTensorLayoutContext[
+    DenseMergeTensorAdapter[Any, Any]
+]
 
 
 def _localize_rounding_seed(
@@ -207,16 +218,15 @@ def _localize_rounding_seed(
     return derive_seed(seed, *offsets)
 
 
-def _merge_context(target: torch.Tensor) -> _DTensorMergeContext:
-    """Validate a DTensor merge target before any weight mutation."""
+def _layout_context(
+    target: torch.Tensor,
+) -> _DTensorLayoutContext[TensorAdapter[Any, Any]]:
+    """Validate a DTensor's global-to-local contiguous shard layout."""
     dt = require_dtensor(target)
     global_shape = tuple(dt.shape)
-    if len(global_shape) != 2:
-        raise ValueError(f"DTensor LoRA merge requires a rank-two weight, got global shape {global_shape}.")
-
     coordinate = dt.device_mesh.get_coordinate()
     if coordinate is None:
-        raise ValueError("DTensor LoRA merge cannot run on a rank outside the target device mesh.")
+        raise ValueError("DTensor merge cannot run on a rank outside the target device mesh.")
     local_shape, offsets = _local_shape_and_offsets(
         global_shape,
         tuple(dt.device_mesh.shape),
@@ -229,19 +239,13 @@ def _merge_context(target: torch.Tensor) -> _DTensorMergeContext:
     actual_local_shape = _logical_shape(local, inner)
     if actual_local_shape != local_shape:
         raise ValueError(
-            "DTensor LoRA merge computed a local shard shape that does not "
+            "DTensor merge computed a local shard shape that does not "
             "match the target representation: "
             f"computed={local_shape}, actual={actual_local_shape}, "
             f"global={global_shape}, placements={tuple(dt.placements)}."
         )
 
-    if not isinstance(inner, LoRAMergeTensorAdapter):
-        raise ValueError(
-            f"DTensor local shard adapter {adapter_name(inner)} does not support "
-            "LoRA merge. Use routed LoRA for this tensor type."
-        )
-
-    return _DTensorMergeContext(
+    return _DTensorLayoutContext(
         global_shape=global_shape,
         local_shape=local_shape,
         offsets=offsets,
@@ -250,8 +254,60 @@ def _merge_context(target: torch.Tensor) -> _DTensorMergeContext:
     )
 
 
+def _merge_context(target: torch.Tensor) -> _DTensorLoRAMergeContext:
+    """Validate a DTensor LoRA merge target before any weight mutation."""
+    context = _layout_context(target)
+    if len(context.global_shape) != 2:
+        raise ValueError(
+            "DTensor LoRA merge requires a rank-two weight, got global shape "
+            f"{context.global_shape}."
+        )
+    if not isinstance(context.inner, LoRAMergeTensorAdapter):
+        raise ValueError(
+            f"DTensor local shard adapter {adapter_name(context.inner)} does not support "
+            "LoRA merge. Use routed LoRA for this tensor type."
+        )
+
+    return cast(_DTensorLoRAMergeContext, context)
+
+
+def _dense_merge_context(
+    target: torch.Tensor,
+) -> _DTensorDenseMergeContext:
+    """Validate dense-merge support on this rank's local shard."""
+    context = _layout_context(target)
+    if not isinstance(context.inner, DenseMergeTensorAdapter):
+        raise ValueError(
+            f"DTensor local shard adapter {adapter_name(context.inner)} does "
+            "not support dense parameter merge."
+        )
+    return cast(_DTensorDenseMergeContext, context)
+
+
+def _local_dense_update(
+    context: _DTensorLayoutContext[Any],
+    update: torch.Tensor,
+) -> torch.Tensor:
+    """Accept a global or already-local dense update for this rank."""
+    shape = tuple(update.shape)
+    if shape == context.local_shape:
+        return update.contiguous()
+    if shape != context.global_shape:
+        raise ValueError(
+            "DTensor dense update must match either the global or local shape: "
+            f"global={context.global_shape}, local={context.local_shape}, "
+            f"update={shape}."
+        )
+    local = update
+    for dim, (offset, size) in enumerate(
+        zip(context.offsets, context.local_shape, strict=True)
+    ):
+        local = local.narrow(dim, offset, size)
+    return local.contiguous()
+
+
 def _validate_local_prepared_factors(
-    context: _DTensorMergeContext,
+    context: _DTensorLoRAMergeContext,
     b: torch.Tensor,
     a: torch.Tensor,
 ) -> None:
@@ -270,7 +326,7 @@ def _validate_local_prepared_factors(
 
 
 def _local_lora_factors(
-    context: _DTensorMergeContext,
+    context: _DTensorLoRAMergeContext,
     b: torch.Tensor,
     a: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -301,7 +357,7 @@ def _local_lora_factors(
 
 
 class DTensorAdapter:
-    """Movement and local LoRA-merge adapter for tensor-parallel weights."""
+    """Movement and shard-local additive merges for tensor-parallel weights."""
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
@@ -435,18 +491,16 @@ class DTensorAdapter:
 
     @staticmethod
     def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
-        """Validate the merge target and return its global logical shape."""
-        return _merge_context(t).global_shape
+        """Return the DTensor's global logical shape."""
+        return tuple(require_dtensor(t).shape)
 
     @staticmethod
-    def lora_factor_ranges(
+    def merge_local_shape_and_offsets(
         target: torch.Tensor,
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
-        """Return the local ``B`` row and ``A`` column ranges."""
-        context = _merge_context(target)
-        out_offset, in_offset = context.offsets
-        out_size, in_size = context.local_shape
-        return (out_offset, out_size), (in_offset, in_size)
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Return this rank's local merge shape and global offsets."""
+        context = _layout_context(target)
+        return context.local_shape, context.offsets
 
     @staticmethod
     def validate_lora_merge(
@@ -471,6 +525,57 @@ class DTensorAdapter:
                     context.offsets,
                 ),
             )
+
+    @staticmethod
+    def validate_dense_merge(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Validate placement and the local shard's dense merge operation."""
+        context = _dense_merge_context(target)
+        local_update = _local_dense_update(context, update)
+        if isinstance(context.inner, DenseMergeValidationTensorAdapter):
+            context.inner.validate_dense_merge(
+                context.local,
+                local_update,
+                strength,
+                rounding_seed=_localize_rounding_seed(
+                    rounding_seed,
+                    context.offsets,
+                ),
+            )
+
+    @staticmethod
+    def validate_dense_merge_target(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> bool:
+        """Validate the local target and propagate staged-validation needs."""
+        context = _dense_merge_context(target)
+        local_seed = _localize_rounding_seed(rounding_seed, context.offsets)
+        requires_update_validation = isinstance(
+            context.inner,
+            DenseMergeValidationTensorAdapter,
+        )
+        if isinstance(context.inner, DenseMergeTargetValidationTensorAdapter):
+            requires_update_validation = context.inner.validate_dense_merge_target(
+                context.local,
+                rounding_seed=local_seed,
+            )
+        if requires_update_validation and not isinstance(
+            context.inner,
+            DenseMergeValidationTensorAdapter,
+        ):
+            raise ValueError(
+                f"DTensor local shard adapter {adapter_name(context.inner)} "
+                "requested staged dense-update validation without implementing "
+                "validate_dense_merge()."
+            )
+        return requires_update_validation
 
     @staticmethod
     def stage_lora_factors(
@@ -588,6 +693,26 @@ class DTensorAdapter:
             context.local,
             local_b,
             local_a,
+            strength,
+            rounding_seed=_localize_rounding_seed(
+                rounding_seed,
+                context.offsets,
+            ),
+        )
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Merge a global or local full-rank update into this rank's shard."""
+        context = _dense_merge_context(target)
+        context.inner.merge_dense_(
+            context.local,
+            _local_dense_update(context, update),
             strength,
             rounding_seed=_localize_rounding_seed(
                 rounding_seed,
