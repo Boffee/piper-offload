@@ -47,11 +47,15 @@ from .torchao_structured_adapter import TorchaoStructuredAdapter, copy_storage_i
 
 try:
     from ._triton_nvfp4_lora import (
+        merge_nvfp4_dense as _triton_merge_nvfp4_dense,
+    )
+    from ._triton_nvfp4_lora import (
         merge_nvfp4_lora as _triton_merge_nvfp4_lora,
     )
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
+    _triton_merge_nvfp4_dense = None
     _triton_merge_nvfp4_lora = None
 
 
@@ -94,6 +98,60 @@ def _is_triton_nvfp4_layout(
         or tuple(nv.qdata.shape) != (rows, cols // 2)
         or b.shape != (rows, rank)
         or a.shape[1] != cols
+    ):
+        return False
+
+    scale_cols = cols // nv.block_size
+    expected_scale_shape = (
+        (
+            (rows + 127) // 128 * 32,
+            (cols + 63) // 64 * 16,
+        )
+        if nv.is_swizzled_scales
+        else (rows, scale_cols)
+    )
+    if tuple(nv.scale.shape) != expected_scale_shape:
+        return False
+    if nv.per_tensor_scale is None:
+        return True
+    return (
+        nv.per_tensor_scale.dtype is torch.float32
+        and nv.per_tensor_scale.device == nv.qdata.device
+        and nv.per_tensor_scale.numel() == 1
+    )
+
+
+def _is_triton_nvfp4_dense_layout(
+    nv: Any,  # noqa: ANN401
+    update: torch.Tensor,
+) -> bool:
+    """Return whether a dense update fits the raw NVFP4 representation."""
+    if (
+        _triton_merge_nvfp4_dense is None
+        or nv.qdata.device.type != "cuda"
+        or nv.qdata.dtype is not torch.uint8
+        or nv.scale.dtype is not torch.float8_e4m3fn
+        or nv.qdata.ndim != 2
+        or nv.scale.ndim != 2
+        or not nv.qdata.is_contiguous()
+        or not nv.scale.is_contiguous()
+        or nv.block_size != 16
+        or nv.orig_dtype not in (torch.bfloat16, torch.float32)
+        or update.ndim != 2
+        or update.dtype is not nv.orig_dtype
+        or nv.qdata.device != nv.scale.device
+        or nv.qdata.device != update.device
+        or len(nv.shape) != 2
+    ):
+        return False
+
+    rows, cols = nv.shape
+    if (
+        rows == 0
+        or cols == 0
+        or cols % 16 != 0
+        or tuple(nv.qdata.shape) != (rows, cols // 2)
+        or tuple(update.shape) != (rows, cols)
     ):
         return False
 
@@ -326,7 +384,26 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        """Merge a full-rank update through the reference requantization path."""
+        """Merge a full-rank update while preserving target storage."""
+        nv = require_nvfp4_tensor(target)
+        if _is_triton_nvfp4_dense_layout(nv, update):
+            assert _triton_merge_nvfp4_dense is not None
+            qdata, scale, per_tensor_scale = _triton_merge_nvfp4_dense(
+                nv.qdata,
+                nv.scale,
+                nv.per_tensor_scale,
+                nv.block_size,
+                nv.is_swizzled_scales,
+                update,
+                strength,
+                rounding_seed=rounding_seed,
+            )
+            nv.qdata.copy_(qdata)
+            nv.scale.copy_(scale)
+            if nv.per_tensor_scale is not None:
+                assert per_tensor_scale is not None
+                nv.per_tensor_scale.copy_(per_tensor_scale)
+            return
         merge_dense_requantize_(
             Nvfp4Adapter,
             target,

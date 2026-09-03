@@ -1,8 +1,8 @@
-"""Triton kernel for TorchAO MXFP8 / MXFP4 LoRA merges."""
+"""Triton kernel for TorchAO MXFP8 / MXFP4 LoRA and dense merges."""
 
 # Triton JIT kernel signatures intentionally use untyped pointer parameters
 # and upper-case constexpr names.
-# ruff: noqa: ANN001, ANN202, N803, PLR0124, PLR0912, PLR0913
+# ruff: noqa: ANN001, ANN202, N803, PLR0124, PLR0912, PLR0913, PLR0915
 # pyright: reportCallIssue=false
 
 import torch
@@ -165,12 +165,14 @@ def _merge_mx_kernel(
     scale_ptr,
     b_ptr,
     a_ptr,
+    update_ptr,
     strength,
     rounding_seed,
     M,
     N,
     NUM_SCALE_BLOCKS,
     K: tl.constexpr,
+    DENSE_UPDATE: tl.constexpr,
     FORMAT: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
     SCALING_MODE: tl.constexpr,
@@ -188,23 +190,31 @@ def _merge_mx_kernel(
     offsets_n = pid_n * 32 + tl.arange(0, 32)
     row_mask = offsets_m < M
 
-    accumulator = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
-    for k_start in range(0, K, BLOCK_K):
-        offsets_k = k_start + tl.arange(0, BLOCK_K)
-        b = tl.load(
-            b_ptr + offsets_m[:, None] * K + offsets_k[None, :],
-            mask=row_mask[:, None] & (offsets_k[None, :] < K),
+    if DENSE_UPDATE:
+        update_offsets = offsets_m[:, None] * N + offsets_n[None, :]
+        accumulator = tl.load(
+            update_ptr + update_offsets,
+            mask=row_mask[:, None],
             other=0.0,
-        )
-        a = tl.load(
-            a_ptr + offsets_k[:, None] * N + offsets_n[None, :],
-            mask=offsets_k[:, None] < K,
-            other=0.0,
-        )
-        if COMPUTE_DTYPE == 1:
-            accumulator += tl.dot(b, a, input_precision="ieee")
-        else:
-            accumulator += tl.dot(b, a)
+        ).to(tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_K):
+            offsets_k = k_start + tl.arange(0, BLOCK_K)
+            b = tl.load(
+                b_ptr + offsets_m[:, None] * K + offsets_k[None, :],
+                mask=row_mask[:, None] & (offsets_k[None, :] < K),
+                other=0.0,
+            )
+            a = tl.load(
+                a_ptr + offsets_k[:, None] * N + offsets_n[None, :],
+                mask=offsets_k[:, None] < K,
+                other=0.0,
+            )
+            if COMPUTE_DTYPE == 1:
+                accumulator += tl.dot(b, a, input_precision="ieee")
+            else:
+                accumulator += tl.dot(b, a)
 
     if FORMAT == 2:
         packed_offsets_n = pid_n * 16 + tl.arange(0, 16)
@@ -330,7 +340,7 @@ def _expected_scale_shape(
     )
 
 
-def merge_mx_lora_(
+def _merge_mx_(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     elem_dtype: torch.dtype,
@@ -338,23 +348,28 @@ def merge_mx_lora_(
     orig_dtype: torch.dtype,
     b: torch.Tensor,
     a: torch.Tensor,
+    update: torch.Tensor,
     strength: float,
     *,
+    dense_update: bool,
     scaling_mode: int,
     swizzled: bool,
     rounding_seed: int | None = None,
 ) -> None:
-    """Merge one staged LoRA update directly into raw MX storage."""
+    """Merge one LoRA or dense update directly into raw MX storage."""
     if qdata.device.type != "cuda":
         raise ValueError("Triton MX merge requires CUDA tensors.")
-    if qdata.ndim != 2 or scale.ndim != 2 or b.ndim != 2 or a.ndim != 2:
+    if qdata.ndim != 2 or scale.ndim != 2 or update.ndim != 2 or (not dense_update and (b.ndim != 2 or a.ndim != 2)):
         raise ValueError("Triton MX merge expects rank-two tensors.")
     if block_size != _MX_BLOCK_SIZE:
         raise ValueError("Triton MX merge supports block size 32.")
-    if b.dtype is not a.dtype or b.dtype is not orig_dtype:
+    if (dense_update and update.dtype is not orig_dtype) or (
+        not dense_update and (b.dtype is not a.dtype or b.dtype is not orig_dtype)
+    ):
         raise ValueError("Triton MX merge requires factors in the weight's original dtype.")
     compute_dtype = _compute_dtype_id(orig_dtype)
-    if qdata.device != scale.device or qdata.device != b.device or qdata.device != a.device:
+    operands = (update,) if dense_update else (b, a)
+    if qdata.device != scale.device or any(qdata.device != operand.device for operand in operands):
         raise ValueError("Triton MX merge requires all tensors on one CUDA device.")
     if not qdata.is_contiguous() or not scale.is_contiguous():
         raise ValueError("Triton MX merge requires contiguous MX storage.")
@@ -366,10 +381,11 @@ def merge_mx_lora_(
     ):
         raise ValueError(f"Unsupported MX scaling mode id {scaling_mode}.")
 
-    rows, rank = b.shape
-    if a.shape[0] != rank:
+    rows = update.shape[0] if dense_update else b.shape[0]
+    rank = 1 if dense_update else b.shape[1]
+    if not dense_update and a.shape[0] != rank:
         raise ValueError("LoRA factor inner dimensions do not match.")
-    cols = a.shape[1]
+    cols = update.shape[1] if dense_update else a.shape[1]
     if rows == 0 or cols == 0 or rank == 0:
         raise ValueError("Triton MX merge requires non-empty weight and factors.")
     if cols % _MX_BLOCK_SIZE != 0:
@@ -392,8 +408,14 @@ def merge_mx_lora_(
     elif qdata.dtype is not elem_dtype:
         raise ValueError("MXFP8 qdata dtype does not match elem_dtype.")
 
-    b = b.contiguous()
-    a = a.contiguous()
+    if dense_update:
+        update = update.contiguous()
+        b = update
+        a = update
+    else:
+        b = b.contiguous()
+        a = a.contiguous()
+        update = b
     block_m = 16
     block_k = 16 if rank <= 16 else 32
     grid = (
@@ -405,12 +427,14 @@ def merge_mx_lora_(
         scale.view(torch.uint8),
         b,
         a,
+        update,
         strength,
         _seed_argument(rounding_seed),
         M=rows,
         N=cols,
         NUM_SCALE_BLOCKS=cols // _MX_BLOCK_SIZE,
         K=rank,
+        DENSE_UPDATE=dense_update,
         FORMAT=format_id,
         COMPUTE_DTYPE=compute_dtype,
         SCALING_MODE=scaling_mode,
@@ -422,4 +446,67 @@ def merge_mx_lora_(
         BLOCK_M=block_m,
         BLOCK_K=block_k,
         num_warps=4,
+    )
+
+
+def merge_mx_lora_(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    elem_dtype: torch.dtype,
+    block_size: int,
+    orig_dtype: torch.dtype,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    strength: float,
+    *,
+    scaling_mode: int,
+    swizzled: bool,
+    rounding_seed: int | None = None,
+) -> None:
+    """Merge one staged LoRA update directly into raw MX storage."""
+    _merge_mx_(
+        qdata,
+        scale,
+        elem_dtype,
+        block_size,
+        orig_dtype,
+        b,
+        a,
+        b,
+        strength,
+        dense_update=False,
+        scaling_mode=scaling_mode,
+        swizzled=swizzled,
+        rounding_seed=rounding_seed,
+    )
+
+
+def merge_mx_dense_(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    elem_dtype: torch.dtype,
+    block_size: int,
+    orig_dtype: torch.dtype,
+    update: torch.Tensor,
+    strength: float,
+    *,
+    scaling_mode: int,
+    swizzled: bool,
+    rounding_seed: int | None = None,
+) -> None:
+    """Merge one dense update directly into raw MX storage."""
+    _merge_mx_(
+        qdata,
+        scale,
+        elem_dtype,
+        block_size,
+        orig_dtype,
+        update,
+        update,
+        update,
+        strength,
+        dense_update=True,
+        scaling_mode=scaling_mode,
+        swizzled=swizzled,
+        rounding_seed=rounding_seed,
     )

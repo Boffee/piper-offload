@@ -40,11 +40,15 @@ from .torchao_structured_adapter import (
 
 try:
     from ._triton_static_float8_lora import (
+        merge_static_float8_dense as _triton_merge_static_float8_dense,
+    )
+    from ._triton_static_float8_lora import (
         merge_static_float8_lora as _triton_merge_static_float8_lora,
     )
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
+    _triton_merge_static_float8_dense = None
     _triton_merge_static_float8_lora = None
 
 
@@ -247,6 +251,18 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a full-rank update without changing activation calibration."""
+        f8 = require_static_float8_tensor(target)
+        if _triton_merge_static_float8_dense is not None and f8.qdata.device.type == "cuda":
+            qdata, scale = _triton_merge_static_float8_dense(
+                f8.qdata,
+                f8.scale,
+                update,
+                strength,
+                rounding_seed=rounding_seed,
+            )
+            f8.qdata.copy_(qdata)
+            f8.scale.copy_(scale)
+            return
         merge_dense_requantize_(
             StaticFloat8Adapter,
             target,

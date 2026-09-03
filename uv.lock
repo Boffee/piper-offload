@@ -636,15 +636,15 @@ wheels = [
 
 [[package]]
 name = "piper-kernels"
-version = "0.6.1"
+version = "0.7.0rc1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e6/4a/89737a88dffaf10e95c70bbef8401dab2e1a1a04d637ec90466407af24a6/piper_kernels-0.6.1.tar.gz", hash = "sha256:adca0ad34f8ed2444bc66963a30005f580dce009a8da667adbc5e42eec3ff534", size = 150743, upload-time = "2026-09-01T07:09:35.144Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/31/a7/9007aa9a1fecc27489c56418d5b502732d8088b13b0500dfefaddcfaeb5a/piper_kernels-0.7.0rc1.tar.gz", hash = "sha256:c0f1d05c58b189b566e8988c68e347289b15418d4a91ac4acc31dd4587a9cca5", size = 175705, upload-time = "2026-09-03T02:26:05.406Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/45/ab/00669ab033df90b483d8822febf32ee1740e359b4bfbac6fbe16f7c9185a/piper_kernels-0.6.1-py3-none-any.whl", hash = "sha256:8fc9a0b9b2f85ab26b9aa3d95a9f27481ebe4a9cd7222bf23a2d3e264d752113", size = 214410, upload-time = "2026-09-01T07:09:33.642Z" },
+    { url = "https://files.pythonhosted.org/packages/ff/1b/fac5f198d0593e406413850165551aa9c700d5e2160533b1698a684ae76d/piper_kernels-0.7.0rc1-py3-none-any.whl", hash = "sha256:aab1047e00417386f7837379baf3bdddbc6ddafa324cf0a0a205b6b9662e59a0", size = 246280, upload-time = "2026-09-03T02:26:03.932Z" },
 ]
 
 [package.optional-dependencies]
@@ -717,8 +717,8 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'torchao'", specifier = ">=2.3.2,<3" },
     { name = "optimum-quanto", marker = "extra == 'all'", specifier = ">=0.2.7,<0.3" },
     { name = "optimum-quanto", marker = "extra == 'quanto'", specifier = ">=0.2.7,<0.3" },
-    { name = "piper-kernels", extras = ["convrot"], marker = "extra == 'all'", specifier = ">=0.3.0rc1,<0.7" },
-    { name = "piper-kernels", extras = ["convrot"], marker = "extra == 'convrot'", specifier = ">=0.3.0rc1,<0.7" },
+    { name = "piper-kernels", extras = ["convrot"], marker = "extra == 'all'", specifier = ">=0.7.0rc1,<0.8" },
+    { name = "piper-kernels", extras = ["convrot"], marker = "extra == 'convrot'", specifier = ">=0.7.0rc1,<0.8" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.13,<2.14" },
     { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.13,<2.14", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchao", marker = "sys_platform == 'linux' and extra == 'all'", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },

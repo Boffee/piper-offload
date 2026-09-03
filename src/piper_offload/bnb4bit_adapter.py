@@ -65,11 +65,15 @@ from .tensor_adapters import (
 
 try:
     from ._triton_bnb4_lora import (
+        merge_bnb4_dense as _triton_merge_bnb4_dense,
+    )
+    from ._triton_bnb4_lora import (
         merge_bnb4_lora as _triton_merge_bnb4_lora,
     )
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
+    _triton_merge_bnb4_dense = None
     _triton_merge_bnb4_lora = None
 
 _TRITON_STORAGE_DTYPES = (
@@ -98,11 +102,7 @@ def _torch_merge_bnb4_lora(
     )
 
 
-def _can_use_triton_merge(
-    qt: Any,  # noqa: ANN401
-    b: torch.Tensor,
-    a: torch.Tensor,
-) -> bool:
+def _has_triton_storage_layout(qt: Any) -> bool:  # noqa: ANN401
     state = qt.quant_state
     logical_shape = tuple(state.shape)
     if len(logical_shape) != 2:
@@ -111,8 +111,7 @@ def _can_use_triton_merge(
     numel = rows * cols
     num_blocks = (numel + state.blocksize - 1) // state.blocksize
     common = (
-        _triton_merge_bnb4_lora is not None
-        and qt.data.device.type == "cuda"
+        qt.data.device.type == "cuda"
         and qt.data.dtype in _TRITON_STORAGE_DTYPES
         and qt.data.is_contiguous()
         and qt.data.storage_offset() == 0
@@ -125,14 +124,7 @@ def _can_use_triton_merge(
         and state.code.dtype is torch.float32
         and state.code.numel() == 16
         and state.absmax.numel() == num_blocks
-        and b.ndim == 2
-        and a.ndim == 2
-        and b.dtype is state.dtype
-        and a.dtype is state.dtype
-        and b.shape == (rows, a.shape[0])
-        and a.shape[1] == cols
         and qt.data.device == state.absmax.device == state.code.device
-        and qt.data.device == b.device == a.device
     )
     if not common:
         return False
@@ -158,6 +150,44 @@ def _can_use_triton_merge(
         == state2.absmax.device
         == state2.code.device
         == offset.device
+    )
+
+
+def _can_use_triton_merge(
+    qt: Any,  # noqa: ANN401
+    b: torch.Tensor,
+    a: torch.Tensor,
+) -> bool:
+    logical_shape = tuple(qt.quant_state.shape)
+    if len(logical_shape) != 2:
+        return False
+    rows, cols = logical_shape
+    return (
+        _triton_merge_bnb4_lora is not None
+        and _has_triton_storage_layout(qt)
+        and b.ndim == 2
+        and a.ndim == 2
+        and b.dtype is qt.quant_state.dtype
+        and a.dtype is qt.quant_state.dtype
+        and b.shape == (rows, a.shape[0])
+        and a.shape[1] == cols
+        and qt.data.device == b.device == a.device
+    )
+
+
+def _can_use_triton_dense_merge(
+    qt: Any,  # noqa: ANN401
+    update: torch.Tensor,
+) -> bool:
+    logical_shape = tuple(qt.quant_state.shape)
+    return (
+        _triton_merge_bnb4_dense is not None
+        and len(logical_shape) == 2
+        and _has_triton_storage_layout(qt)
+        and update.ndim == 2
+        and update.dtype is qt.quant_state.dtype
+        and tuple(update.shape) == logical_shape
+        and qt.data.device == update.device
     )
 
 
@@ -463,7 +493,35 @@ class Bnb4bitAdapter:
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        """Merge a full-rank update through the reference requantization path."""
+        """Merge a full-rank update, preferring the raw Triton path."""
+        qt = require_params_4bit(target)
+        if _can_use_triton_dense_merge(qt, update) and (rounding_seed is None or not qt.quant_state.nested):
+            assert _triton_merge_bnb4_dense is not None
+            state = qt.quant_state
+            state2 = state.state2 if state.nested else None
+            packed, absmax, nested_absmax, offset = _triton_merge_bnb4_dense(
+                qt.data.view(torch.uint8).reshape(-1),
+                state.absmax,
+                state.code,
+                state2.absmax if state2 is not None else None,
+                state2.code if state2 is not None else None,
+                state.offset if state.nested else None,
+                tuple(state.shape),
+                state.blocksize,
+                state.quant_type,
+                update,
+                strength,
+                rounding_seed=rounding_seed,
+            )
+            qt.data.view(torch.uint8).reshape(-1).copy_(packed)
+            state.absmax.copy_(absmax)
+            if state.nested:
+                assert state2 is not None
+                assert nested_absmax is not None
+                assert offset is not None
+                state2.absmax.copy_(nested_absmax)
+                state.offset.copy_(offset)
+            return
         merge_dense_requantize_(
             Bnb4bitAdapter,
             target,

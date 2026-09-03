@@ -1,4 +1,4 @@
-"""Triton kernels for absmax-requantized Quanto qint8/qfloat8 LoRA merges."""
+"""Triton kernels for absmax-requantized Quanto qint8/qfloat8 merges."""
 
 # Triton JIT kernel signatures intentionally use untyped pointer parameters
 # and upper-case constexpr names.
@@ -25,16 +25,18 @@ _COMPUTE_FP32 = 2
 
 
 @triton.jit
-def _merge_dense_kernel(
+def _merge_update_kernel(
     qdata_ptr,
     scale_ptr,
     b_ptr,
     a_ptr,
+    update_ptr,
     output_ptr,
     strength,
     M,
     N,
     K: tl.constexpr,
+    DENSE_UPDATE: tl.constexpr,
     SCALE_AXIS: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -48,27 +50,32 @@ def _merge_dense_kernel(
 
     offsets_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offsets_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    for k_start in range(0, K, BLOCK_K):
-        offsets_k = k_start + tl.arange(0, BLOCK_K)
-        b = tl.load(
-            b_ptr + offsets_m[:, None] * K + offsets_k[None, :],
-            mask=(offsets_m[:, None] < M) & (offsets_k[None, :] < K),
-            other=0.0,
-        )
-        a = tl.load(
-            a_ptr + offsets_k[:, None] * N + offsets_n[None, :],
-            mask=(offsets_k[:, None] < K) & (offsets_n[None, :] < N),
-            other=0.0,
-        )
-        if COMPUTE_DTYPE == 2:
-            accumulator += tl.dot(b, a, input_precision="ieee")
-        else:
-            accumulator += tl.dot(b, a)
-
     offsets = offsets_m[:, None] * N + offsets_n[None, :]
     mask = (offsets_m[:, None] < M) & (offsets_n[None, :] < N)
+    if DENSE_UPDATE:
+        accumulator = tl.load(
+            update_ptr + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_K):
+            offsets_k = k_start + tl.arange(0, BLOCK_K)
+            b = tl.load(
+                b_ptr + offsets_m[:, None] * K + offsets_k[None, :],
+                mask=(offsets_m[:, None] < M) & (offsets_k[None, :] < K),
+                other=0.0,
+            )
+            a = tl.load(
+                a_ptr + offsets_k[:, None] * N + offsets_n[None, :],
+                mask=(offsets_k[:, None] < K) & (offsets_n[None, :] < N),
+                other=0.0,
+            )
+            if COMPUTE_DTYPE == 2:
+                accumulator += tl.dot(b, a, input_precision="ieee")
+            else:
+                accumulator += tl.dot(b, a)
     qdata = tl.load(qdata_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     if SCALE_AXIS == 1:
         scale = tl.load(
@@ -217,53 +224,61 @@ def _absmax_scale(
     return torch.where(output == 0, torch.full_like(output, eps), output)
 
 
-def _merge_quanto_qbytes_lora(
+def _merge_quanto_qbytes(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     axis: int | None,
     b: torch.Tensor,
     a: torch.Tensor,
+    update: torch.Tensor,
     strength: float,
     *,
+    dense_update: bool,
     integer_storage: bool,
     qmin: float,
     qmax: float,
     rounding_seed: int | None,
     e4m3: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return qbytes data and a fresh absmax scale after one LoRA merge."""
+    """Return qbytes data and a fresh scale after a LoRA or dense merge."""
     if qdata.device.type != "cuda":
         raise ValueError("Triton Quanto qbytes merge requires CUDA tensors.")
-    if scale.dtype is not b.dtype or b.dtype is not a.dtype:
+    compute_tensor = update if dense_update else b
+    if scale.dtype is not compute_tensor.dtype or (not dense_update and b.dtype is not a.dtype):
         raise ValueError(
             "Triton Quanto qbytes merge requires matching scale and factor dtypes."
         )
-    compute_dtype = _compute_dtype_id(b.dtype)
-    if qdata.ndim != 2 or b.ndim != 2 or a.ndim != 2:
+    compute_dtype = _compute_dtype_id(compute_tensor.dtype)
+    if qdata.ndim != 2 or update.ndim != 2 or (not dense_update and (b.ndim != 2 or a.ndim != 2)):
         raise ValueError("Triton Quanto qbytes merge expects rank-two tensors.")
-    if (
-        qdata.device != scale.device
-        or qdata.device != b.device
-        or qdata.device != a.device
-    ):
+    operands = (update,) if dense_update else (b, a)
+    if qdata.device != scale.device or any(qdata.device != operand.device for operand in operands):
         raise ValueError(
             "Triton Quanto qbytes merge requires all tensors on one CUDA device."
         )
 
     rows, cols = qdata.shape
-    rank = a.shape[0]
+    rank = 1 if dense_update else a.shape[0]
     if rows == 0 or cols == 0 or rank == 0:
         raise ValueError(
             "Triton Quanto qbytes merge requires non-empty tensors."
         )
-    if b.shape != (rows, rank) or a.shape[1] != cols:
+    if dense_update and tuple(update.shape) != (rows, cols):
+        raise ValueError("Dense update does not match the Quanto weight shape.")
+    if not dense_update and (b.shape != (rows, rank) or a.shape[1] != cols):
         raise ValueError("LoRA factors do not match the Quanto weight shape.")
     scale_axis = _scale_axis_id(axis, scale, rows, cols)
 
     qdata = qdata.contiguous()
     scale = scale.contiguous()
-    b = b.contiguous()
-    a = a.contiguous()
+    if dense_update:
+        update = update.contiguous()
+        b = update
+        a = update
+    else:
+        b = b.contiguous()
+        a = a.contiguous()
+        update = b
 
     block_m = 16
     block_n = 128
@@ -272,17 +287,19 @@ def _merge_quanto_qbytes_lora(
         ((rows + block_m - 1) // block_m)
         * ((cols + block_n - 1) // block_n),
     )
-    dense = torch.empty(qdata.shape, device=qdata.device, dtype=b.dtype)
-    _merge_dense_kernel[grid](
+    dense = torch.empty(qdata.shape, device=qdata.device, dtype=compute_tensor.dtype)
+    _merge_update_kernel[grid](
         qdata,
         scale,
         b,
         a,
+        update,
         dense,
         strength,
         M=rows,
         N=cols,
         K=rank,
+        DENSE_UPDATE=dense_update,
         SCALE_AXIS=scale_axis,
         COMPUTE_DTYPE=compute_dtype,
         BLOCK_M=block_m,
@@ -327,13 +344,15 @@ def merge_quanto_qint8_lora(
     """Return qint8 storage and its recomputed absmax scale."""
     if qdata.dtype is not torch.int8:
         raise ValueError("Triton Quanto qint8 merge expects int8 storage.")
-    return _merge_quanto_qbytes_lora(
+    return _merge_quanto_qbytes(
         qdata,
         scale,
         axis,
         b,
         a,
+        b,
         strength,
+        dense_update=False,
         integer_storage=True,
         qmin=-128.0,
         qmax=127.0,
@@ -362,13 +381,74 @@ def merge_quanto_qfloat8_lora(
             f"got {qdata.dtype}."
         )
     limits = torch.finfo(qdata.dtype)
-    return _merge_quanto_qbytes_lora(
+    return _merge_quanto_qbytes(
         qdata,
         scale,
         axis,
         b,
         a,
+        b,
         strength,
+        dense_update=False,
+        integer_storage=False,
+        qmin=limits.min,
+        qmax=limits.max,
+        rounding_seed=rounding_seed,
+        e4m3=qdata.dtype is torch.float8_e4m3fn,
+    )
+
+
+def merge_quanto_qint8_dense(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    axis: int | None,
+    update: torch.Tensor,
+    strength: float,
+    *,
+    rounding_seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return qint8 storage and its recomputed scale after a dense merge."""
+    if qdata.dtype is not torch.int8:
+        raise ValueError("Triton Quanto qint8 merge expects int8 storage.")
+    return _merge_quanto_qbytes(
+        qdata,
+        scale,
+        axis,
+        update,
+        update,
+        update,
+        strength,
+        dense_update=True,
+        integer_storage=True,
+        qmin=-128.0,
+        qmax=127.0,
+        rounding_seed=rounding_seed,
+        e4m3=False,
+    )
+
+
+def merge_quanto_qfloat8_dense(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    axis: int | None,
+    update: torch.Tensor,
+    strength: float,
+    *,
+    rounding_seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return qfloat8 storage and its recomputed scale after a dense merge."""
+    if qdata.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        raise ValueError(f"Triton Quanto qfloat8 merge expects E4M3FN or E5M2 storage, got {qdata.dtype}.")
+    limits = torch.finfo(qdata.dtype)
+    return _merge_quanto_qbytes(
+        qdata,
+        scale,
+        axis,
+        update,
+        update,
+        update,
+        strength,
+        dense_update=True,
         integer_storage=False,
         qmin=limits.min,
         qmax=limits.max,

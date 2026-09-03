@@ -1,8 +1,9 @@
 """Internal optional-import boundary for Piper ConvRot NVFP4 support.
 
 ``piper-kernels`` owns the semantic tensor, grouped rotation, and in-place
-``addmm_`` update. Piper Offload only preserves its public packed storage and
-metadata during movement, then delegates LoRA merges to that operation.
+``addmm_`` and ``add_`` updates. Piper Offload only preserves its public packed
+storage and metadata during movement, then delegates LoRA and dense merges to
+those operations.
 
 The dependency remains optional: importing :mod:`piper_offload` succeeds when
 ``piper-kernels`` or TorchAO is absent.
@@ -47,6 +48,14 @@ def require_convrot_nvfp4_addmm(t: torch.Tensor) -> Any:  # noqa: ANN401
         raise RuntimeError(
             "ConvRot NVFP4 LoRA merge requires piper-kernels>=0.6.1; upgrade piper-kernels or use routed LoRA"
         )
+    return tensor
+
+
+def require_convrot_nvfp4_add(t: torch.Tensor) -> Any:  # noqa: ANN401
+    """Require the kernel-owned ConvRot NVFP4 dense-update API."""
+    tensor = require_convrot_nvfp4_tensor(t)
+    if ConvRotNVFP4Tensor.add_ is torch.Tensor.add_:
+        raise RuntimeError("ConvRot NVFP4 dense merge requires piper-kernels>=0.7.0rc1; upgrade piper-kernels")
     return tensor
 
 

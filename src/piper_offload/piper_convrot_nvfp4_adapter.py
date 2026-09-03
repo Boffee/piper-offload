@@ -1,8 +1,9 @@
 """Piper ``ConvRotNVFP4Tensor`` offload adapter.
 
-Piper Offload owns packed-storage movement and LoRA integration. Piper Kernels
-owns rotation, scale recomputation, terminal-code selection, and the in-place
-update itself through ``ConvRotNVFP4Tensor.addmm_``.
+Piper Offload owns packed-storage movement and merge integration. Piper
+Kernels owns rotation, scale recomputation, terminal-code selection, and the
+in-place updates through ``ConvRotNVFP4Tensor.addmm_`` and
+``ConvRotNVFP4Tensor.add_``.
 """
 
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ import torch
 from ._piper_convrot_nvfp4 import (
     create_convrot_nvfp4_tensor,
     is_convrot_nvfp4_tensor,
+    require_convrot_nvfp4_add,
     require_convrot_nvfp4_addmm,
     require_convrot_nvfp4_tensor,
     validate_layout,
@@ -139,3 +141,29 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
     ) -> None:
         del rounding_seed
         require_convrot_nvfp4_addmm(target)
+
+    @staticmethod
+    def validate_dense_merge_target(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> bool:
+        """Validate kernel support without staging the dense update."""
+        del rounding_seed
+        require_convrot_nvfp4_add(target)
+        return False
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        strength: float,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Delegate a validated dense update to Piper Kernels."""
+        require_convrot_nvfp4_add(target).add_(
+            update,
+            alpha=strength,
+            rounding_seed=rounding_seed,
+        )

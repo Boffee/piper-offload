@@ -65,7 +65,13 @@ from .tensor_adapters import adopt_cpu_storage, clone_to_pinned_cpu
 
 try:
     from ._triton_quanto_lora import (
+        merge_quanto_qfloat8_dense as _triton_merge_quanto_qfloat8_dense,
+    )
+    from ._triton_quanto_lora import (
         merge_quanto_qfloat8_lora as _triton_merge_quanto_qfloat8_lora,
+    )
+    from ._triton_quanto_lora import (
+        merge_quanto_qint8_dense as _triton_merge_quanto_qint8_dense,
     )
     from ._triton_quanto_lora import (
         merge_quanto_qint8_lora as _triton_merge_quanto_qint8_lora,
@@ -73,7 +79,9 @@ try:
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
+    _triton_merge_quanto_qfloat8_dense = None
     _triton_merge_quanto_qfloat8_lora = None
+    _triton_merge_quanto_qint8_dense = None
     _triton_merge_quanto_qint8_lora = None
 
 
@@ -185,6 +193,24 @@ def _has_triton_compatible_layout(
         and scale.dtype is b.dtype
         and b.dtype is a.dtype
         and data.device == scale.device == b.device == a.device
+    )
+
+
+def _has_triton_compatible_dense_layout(
+    qt: Any,  # noqa: ANN401
+    update: torch.Tensor,
+) -> bool:
+    data = qt._data
+    scale = qt._scale
+    return (
+        data.device.type == "cuda"
+        and data.ndim == 2
+        and data.numel() != 0
+        and tuple(data.shape) == tuple(qt.size()) == tuple(update.shape)
+        and _has_supported_scale_layout(qt)
+        and scale.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and scale.dtype is update.dtype
+        and data.device == scale.device == update.device
     )
 
 
@@ -480,7 +506,36 @@ class QuantoAdapter:
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        """Merge a full-rank update through the reference requantization path."""
+        """Merge a full-rank update, preferring Triton for canonical storage."""
+        target_qt = require_qbytes_tensor(target)
+        qt = canonicalize_qbytes_tensor(target_qt)
+        triton_merge = None
+        if not is_marlin_f8_qbytes_tensor(target_qt):
+            if _is_qint8_layout(qt):
+                triton_merge = _triton_merge_quanto_qint8_dense
+            elif _is_qfloat8_layout(qt):
+                triton_merge = _triton_merge_quanto_qfloat8_dense
+
+        if triton_merge is not None and _has_triton_compatible_dense_layout(qt, update):
+            data, scale = triton_merge(
+                qt._data,
+                qt._scale,
+                qt.axis,
+                update,
+                strength,
+                rounding_seed=rounding_seed,
+            )
+            merged = create_qbytes_tensor(
+                qt.qtype,
+                qt.axis,
+                qt.size(),
+                qt.stride(),
+                data,
+                scale,
+                qbytes_activation_qtype(qt),
+            )
+            copy_qbytes_tensor_(merged, target_qt)
+            return
         merge_dense_requantize_(
             QuantoAdapter,
             target,

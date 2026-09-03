@@ -700,11 +700,10 @@ merge_adapter(
 ```
 
 This uses in-place arithmetic for plain fp/bf bases. Supported quantized
-adapters use format-specific Triton kernels for factor-only updates on CUDA and
-retain their dequantize/requantize reference path as a fallback. Full-rank and
-mixed updates currently use that reference path. Formats without the required
-factorized merge capability need routed LoRA instead; a dense update requires
-the full-rank capability. See [Quantized weight
+adapters use format-specific Triton kernels for factor-only and full-rank
+updates on CUDA and retain their dequantize/requantize reference path as a
+fallback. Formats without the required factorized merge capability need routed
+LoRA instead; a dense update requires the full-rank capability. See [Quantized weight
 support](#quantized-weight-support) for the full matrix. Unlike an
 activation-scoped adapter request, this is not reversible. Unknown targets
 raise, and all target names, factor shapes, and advertised merge
@@ -729,8 +728,8 @@ Triton backends replay independently for a fixed seed but do not promise
 byte-identical samples across implementations or Triton versions. Nested
 bitsandbytes 4-bit scales still use the reference path because their final
 effective scale is known only after double quantization. Piper ConvRot INT8
-and NVFP4 forward the derived seed to `piper-kernels`' public `addmm_`, which
-owns each format's terminal-code selection.
+and NVFP4 forward the derived seed to `piper-kernels`' public `addmm_` or
+`add_`, which owns each format's terminal-code selection.
 
 This is one composable requantization pipeline per format rather than parallel
 deterministic and stochastic implementations. Each concrete adapter's existing
@@ -1209,18 +1208,18 @@ dtype, no merge capability required.
 | Weight type | Offload | LoRA merge | Dense / mixed merge |
 |---|---|---|---|
 | Plain floating-point tensor | ✓ | native `addmm_` | native `add_` |
-| optimum-quanto qint8 / qfloat8 | ✓ | Triton; reference fallback | reference dequant / requant |
-| bitsandbytes NF4 / FP4 | ✓ | Triton; reference fallback | reference dequant / requant |
-| bitsandbytes int8 | ✓ | Triton; reference fallback | reference dequant / requant |
-| TorchAO scaled-FP8 | ✓ | Triton; reference fallback | reference dequant / requant |
-| TorchAO static-activation scaled-FP8 | ✓ | Triton; reference fallback | reference dequant / requant |
-| TorchAO INT8 | ✓ | Triton; reference fallback | reference dequant / requant |
-| TorchAO MX (MXFP8 / MXFP4) | ✓ | Triton; reference fallback † | reference dequant / requant † |
-| TorchAO NVFP4 | ✓ | Triton; reference fallback † | reference dequant / requant † |
+| optimum-quanto qint8 / qfloat8 | ✓ | Triton; reference fallback | Triton; reference fallback |
+| bitsandbytes NF4 / FP4 | ✓ | Triton; reference fallback | Triton; reference fallback |
+| bitsandbytes int8 | ✓ | Triton; reference fallback | Triton; reference fallback |
+| TorchAO scaled-FP8 | ✓ | Triton; reference fallback | Triton; reference fallback |
+| TorchAO static-activation scaled-FP8 | ✓ | Triton; reference fallback | Triton; reference fallback |
+| TorchAO INT8 | ✓ | Triton; reference fallback | Triton; reference fallback |
+| TorchAO MX (MXFP8 / MXFP4) | ✓ | Triton; reference fallback † | Triton; reference fallback † |
+| TorchAO NVFP4 | ✓ | Triton; reference fallback † | Triton; reference fallback † |
 | GGUF (k-quants) | ✓ | — routed only | — |
 | TorchAO INT4 tile-packed | ✓ | — routed only | — |
-| Piper ConvRot INT8 | ✓ | Piper `addmm_` | — |
-| Piper ConvRot NVFP4 | ✓ | Piper `addmm_` (Piper Kernels ≥ 0.6.1) † | — |
+| Piper ConvRot INT8 | ✓ | Piper `addmm_` | Piper `add_` |
+| Piper ConvRot NVFP4 | ✓ | Piper `addmm_` † | Piper `add_` † |
 | DTensor (tensor-parallel shard) | ✓ | delegate to inner adapter ‡ | delegate to inner adapter ‡ |
 
 Notes:
@@ -1304,12 +1303,15 @@ float32 per-output `scale`, preserves `group_size` and the logical floating
 `dtype`, and reconstructs the same wrapper around CUDA storage on activation.
 
 The adapter remains frozen-only: it does not expose CPU round-trip or
-trainable `Parameter.data` swap. Merge-mode LoRA delegates the staged low-rank
-update and optional reproducible stochastic-rounding seed to Piper's public
-in-place `ConvRotInt8Tensor.addmm_`, preserving the wrapper and its storage
-identities. Piper uses its optimized Triton backend on supported CUDA devices
-and its portable reference backend elsewhere. Use routed LoRA when the base
-must remain untouched. The base package remains
+trainable `Parameter.data` swap. Merge-mode LoRA delegates staged factors to
+Piper's public in-place `ConvRotInt8Tensor.addmm_`; dense-only and mixed
+dense + LoRA updates are combined once and delegated to
+`ConvRotInt8Tensor.add_`. Both operations receive the optional reproducible
+stochastic-rounding seed and preserve the wrapper and its storage identities.
+Piper uses its optimized Triton backend on supported CUDA devices and its
+portable reference backend elsewhere. Use routed LoRA when the base must
+remain untouched. This integration requires Piper Kernels 0.7.0rc1 or newer.
+The base package remains
 importable without `piper-kernels`; use
 `uv sync --extra convrot --group dev` and then
 `pytest tests/test_piper_convrot_int8_adapter.py -q -rs` to exercise the
@@ -1325,12 +1327,14 @@ NVFP4 while additionally preserving the rotation group through identity,
 pool-layout, host, device, and rolling reconstruction.
 
 Merge-mode LoRA passes the staged factors, strength, and optional deterministic
-rounding seed to Piper Kernels' public `ConvRotNVFP4Tensor.addmm_`. Piper
-Kernels rotates only the right-hand factor, updates the weight in its stored
-rotated basis, recomputes weight-side NVFP4 scales, and refills the existing
-packed storage while preserving activation calibration metadata. This keeps
-rotation and quantization semantics out of Piper Offload. Use routed LoRA to
-avoid the lossy 4-bit re-encode or when the packed target is non-contiguous.
+rounding seed to Piper Kernels' public `ConvRotNVFP4Tensor.addmm_`. Dense-only
+and mixed dense + LoRA updates are combined once and passed to its public
+`add_`. Piper Kernels performs the appropriate rotation, updates the weight in
+its stored rotated basis, recomputes weight-side NVFP4 scales, and refills the
+existing packed storage while preserving activation calibration metadata.
+This keeps rotation and quantization semantics out of Piper Offload. Use
+routed LoRA to avoid the lossy 4-bit re-encode or when the packed target is
+non-contiguous. Dense merge requires Piper Kernels 0.7.0rc1 or newer.
 
 Install the `convrot` extra and run
 `pytest tests/test_piper_convrot_nvfp4_adapter.py -q -rs` to exercise this

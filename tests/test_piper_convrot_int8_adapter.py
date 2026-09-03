@@ -29,6 +29,8 @@ from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
     CpuRoundTripTensorAdapter,
     DequantRequantTensorAdapter,
+    DenseMergeTargetValidationTensorAdapter,
+    DenseMergeTensorAdapter,
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
     ParameterDataSwapTensorAdapter,
@@ -317,6 +319,99 @@ class TestPiperConvRotInt8Adapter:
         assert torch.equal(param.data.qdata, expected.qdata)
         assert torch.equal(param.data.scale, expected.scale)
 
+    @pytest.mark.parametrize("with_lora", [False, True])
+    def test_parameter_delta_uses_piper_add_in_place(
+        self,
+        with_lora: bool,
+    ) -> None:
+        convrot_cls = _convrot_cls()
+        rows, cols, rank = 8, 64, 4
+        convrot = convrot_cls.from_hp(
+            torch.randn(rows, cols, dtype=torch.bfloat16),
+            group_size=64,
+        )
+        model = nn.Module()
+        model.lin = nn.Linear(cols, rows, bias=False, dtype=torch.bfloat16)
+        model.lin.weight = nn.Parameter(convrot, requires_grad=False)
+        dense = torch.randn(rows, cols)
+        strength = -0.25
+        state_dict = {"lin.delta.weight": dense}
+        expected_update = torch.zeros(rows, cols, dtype=convrot.dtype)
+        expected_update.add_(dense.to(convrot.dtype), alpha=strength)
+        if with_lora:
+            a = torch.randn(rank, cols)
+            b = torch.randn(rows, rank)
+            state_dict.update(
+                {
+                    "lin.lora_A.weight": a,
+                    "lin.lora_B.weight": b,
+                }
+            )
+            scaled_a = a.to(convrot.dtype)
+            scaled_a.mul_(strength)
+            expected_update.addmm_(b.to(convrot.dtype), scaled_a)
+        expected = convrot.clone()
+        expected.add_(expected_update)
+        qdata_ptr = convrot.qdata.data_ptr()
+        scale_ptr = convrot.scale.data_ptr()
+        adapter = Adapter.from_state_dict(
+            state_dict,
+            host_backing="adopt",
+        )
+
+        assert (
+            merge_adapter(
+                model,
+                [(adapter, strength)],
+                stochastic_rounding=False,
+            )
+            == 1
+        )
+
+        assert model.lin.weight.data.qdata.data_ptr() == qdata_ptr
+        assert model.lin.weight.data.scale.data_ptr() == scale_ptr
+        assert torch.equal(model.lin.weight.data.qdata, expected.qdata)
+        assert torch.equal(model.lin.weight.data.scale, expected.scale)
+
+    def test_dense_merge_forwards_strength_and_rounding_seed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        convrot_cls = _convrot_cls()
+        convrot = convrot_cls.from_hp(
+            torch.randn(8, 64, dtype=torch.bfloat16),
+            group_size=64,
+        )
+        update = torch.randn(8, 64, dtype=torch.bfloat16)
+        calls: list[tuple[float, int | None]] = []
+        original_add = convrot_cls.add_
+
+        def recording_add(
+            target: torch.Tensor,
+            other: torch.Tensor,
+            *,
+            alpha: float = 1,
+            rounding_seed: int | None = None,
+        ) -> torch.Tensor:
+            calls.append((alpha, rounding_seed))
+            return original_add(
+                target,
+                other,
+                alpha=alpha,
+                rounding_seed=rounding_seed,
+            )
+
+        monkeypatch.setattr(convrot_cls, "add_", recording_add)
+
+        PiperConvRotInt8Adapter.merge_dense_(
+            convrot,
+            update,
+            0.125,
+            rounding_seed=456,
+        )
+
+        assert calls == [(0.125, 456)]
+
     def test_merge_lora_merges_convrot_weight(self) -> None:
         convrot_cls = _convrot_cls()
         model = nn.Module()
@@ -453,6 +548,8 @@ class TestPiperConvRotInt8Adapter:
         assert not isinstance(adapter, TensorCopyIntoAdapter)
         assert isinstance(adapter, LoRAMergeTensorAdapter)
         assert isinstance(adapter, LoRAMergeValidationTensorAdapter)
+        assert isinstance(adapter, DenseMergeTensorAdapter)
+        assert isinstance(adapter, DenseMergeTargetValidationTensorAdapter)
         assert not isinstance(adapter, ParameterDataSwapTensorAdapter)
 
         pinned_param = PinnedParam(
@@ -463,6 +560,17 @@ class TestPiperConvRotInt8Adapter:
             pinned_param.copy_to_cpu(state)
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
             pinned_param.validate_parameter_data_swap_target()
+
+    def test_dense_merge_fails_clearly_when_kernel_add_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        convrot_cls = _convrot_cls()
+        convrot = _make_convrot()
+        monkeypatch.delattr(convrot_cls, "add_")
+
+        with pytest.raises(RuntimeError, match=r"piper-kernels>=0\.7\.0rc1"):
+            PiperConvRotInt8Adapter.validate_dense_merge_target(convrot)
 
     @CUDA
     def test_allocate_copy_and_reconstruct_gpu_wrapper(self) -> None:

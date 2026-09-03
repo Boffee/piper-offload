@@ -59,11 +59,15 @@ from .tensor_adapters import (
 
 try:
     from ._triton_bnb8_lora import (
+        merge_bnb8_dense as _triton_merge_bnb8_dense,
+    )
+    from ._triton_bnb8_lora import (
         merge_bnb8_lora as _triton_merge_bnb8_lora,
     )
 except ModuleNotFoundError as exc:
     if exc.name != "triton":
         raise
+    _triton_merge_bnb8_dense = None
     _triton_merge_bnb8_lora = None
 
 _TRITON_MAX_COLUMNS = 8_388_608
@@ -118,6 +122,25 @@ def _can_use_triton_merge(
         and b.shape == (rows, rank)
         and a.shape[1] == cols
     )
+
+
+def _can_use_triton_dense_merge(
+    cb: torch.Tensor,
+    scb: torch.Tensor,
+    update: torch.Tensor,
+) -> bool:
+    if not (
+        _triton_merge_bnb8_dense is not None
+        and cb.device.type == "cuda"
+        and cb.dtype is torch.int8
+        and scb.dtype is torch.float32
+        and update.dtype is torch.float16
+        and cb.device == scb.device == update.device
+        and cb.ndim == update.ndim == 2
+    ):
+        return False
+    rows, cols = cb.shape
+    return rows > 0 and 0 < cols <= _TRITON_MAX_COLUMNS and scb.numel() == rows and tuple(update.shape) == (rows, cols)
 
 
 @dataclass(slots=True)
@@ -323,7 +346,20 @@ class Bnb8bitAdapter:
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        """Merge a full-rank update through the reference requantization path."""
+        """Merge a full-rank update, preferring the raw Triton path."""
+        qt = require_int8_params(target)
+        if _can_use_triton_dense_merge(qt.CB, qt.SCB, update):
+            assert _triton_merge_bnb8_dense is not None
+            cb, scb = _triton_merge_bnb8_dense(
+                qt.CB,
+                qt.SCB,
+                update,
+                strength,
+                rounding_seed=rounding_seed,
+            )
+            qt.CB.copy_(cb)
+            qt.SCB.copy_(scb)
+            return
         merge_dense_requantize_(
             Bnb8bitAdapter,
             target,
