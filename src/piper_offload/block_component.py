@@ -71,7 +71,7 @@ from .pinned_module import (
 )
 from .pinned_param import PinnedParam
 from .resident_runtime import ResidentBlockRuntime
-from .rolling_runtime import create_rolling_block_runtime
+from .rolling_runtime import RollingBlockRuntime, create_rolling_block_runtime
 from .streaming_runtime import StreamingBlockRuntime
 
 logger = logging.getLogger(__name__)
@@ -713,13 +713,16 @@ class BlockComponent:
         else:
             raise ValueError(f"unsupported block mode: {block_mode!r}")
         self._block_mode: BlockMode = resolved_mode
-        self._runtime = runtime
-        self._eager_runtime = eager_runtime
+        self._runtime, self._eager_runtime = runtime, eager_runtime
         self._block_compile = _BlockCompileState.create(
             self._blocks,
             block_compile,
             backend=runtime.compile_backend,
         )
+        self._auto_rolling = (
+            block_mode == "auto" and isinstance(runtime, RollingBlockRuntime)
+        )
+        self._auto_fallback_compile: _BlockCompileState | None = None
         self._active_device: torch.device | None = None
         self._active_runtime: BlockRuntime | None = None
         self._load_plans: tuple[PinnedModuleLoadPlan, ...] = ()
@@ -918,7 +921,9 @@ class BlockComponent:
         *,
         compile_blocks: bool,
     ) -> None:
-        runtime = self._runtime if compile_blocks else self._eager_runtime
+        runtime, block_compile = self._select_cuda_runtime(
+            compile_blocks=compile_blocks,
+        )
 
         # Record the selected runtime before acquisition so deactivate() can
         # clean up a partially-created pool, stream, or hook set if activation
@@ -926,7 +931,38 @@ class BlockComponent:
         self._active_device = active_device
         self._active_runtime = runtime
         self.acquire()
-        self._block_compile.install(compile_blocks)
+        block_compile.install(compile_blocks)
+
+    def _select_cuda_runtime(
+        self,
+        *,
+        compile_blocks: bool,
+    ) -> tuple[BlockRuntime, _BlockCompileState]:
+        """Select the runtime after activation overrides have been resolved."""
+        if not compile_blocks:
+            return self._eager_runtime, self._block_compile
+
+        if self._auto_rolling:
+            rolling = cast(RollingBlockRuntime, self._runtime)
+            try:
+                rolling.validate_load_plans(self._load_plans)
+            except NotImplementedError as exc:
+                logger.info(
+                    "block group does not support rolling for this activation; "
+                    "using streaming: %s",
+                    exc,
+                )
+                fallback_compile = self._auto_fallback_compile
+                if fallback_compile is None:
+                    fallback_compile = _BlockCompileState.create(
+                        self._blocks,
+                        self._block_compile.config,
+                        backend=self._eager_runtime.compile_backend,
+                    )
+                    self._auto_fallback_compile = fallback_compile
+                return self._eager_runtime, fallback_compile
+
+        return self._runtime, self._block_compile
 
     def acquire(self) -> None:
         """Acquire this active session's CUDA working set.
@@ -966,6 +1002,8 @@ class BlockComponent:
         of any partial acquisition state. Drop the binding reference after
         deactivate to release pinned memory."""
         self._block_compile.restore()
+        if self._auto_fallback_compile is not None:
+            self._auto_fallback_compile.restore()
         if self._active_device == torch.device("cpu"):
             self._active_device = None
             self._load_plans = ()

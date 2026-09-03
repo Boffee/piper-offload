@@ -6,9 +6,11 @@ from torch import nn
 
 from piper_offload import (
     Adapter,
+    BlockCompileConfig,
     ModelOffloader,
     ParameterValue,
     merge_adapter,
+    register_adapter,
 )
 from piper_offload.tensor_adapter_registry import (
     param_representation,
@@ -18,7 +20,7 @@ from piper_offload.tensor_adapters import (
     DenseMergeTensorAdapter,
     DequantizeTensorAdapter,
 )
-from tests.conftest import activated_model
+from tests.conftest import activated_model, block_components
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -212,3 +214,51 @@ def test_structured_parameter_value_dtype_is_representation_owned() -> None:
             dtype=torch.float16,
             pin_memory=False,
         )
+
+
+@CUDA
+def test_auto_mode_falls_back_for_incompatible_value_adapter() -> None:
+    from tests._block_compile_helpers import _BlockModel
+    from tests.test_tensor_adapter_registry import (
+        _ExternalAdapter,
+        _ExternalTensor,
+    )
+
+    dim = 8
+    with torch.device("meta"):
+        model = _BlockModel(width=dim)
+    offloader = ModelOffloader.from_module(
+        model,
+        block_paths=("blocks",),
+        block_mode="auto",
+        block_compile=BlockCompileConfig(fullgraph=True),
+        host_backing="adopt",
+    )
+    component = block_components(offloader)[0]
+    assert component.block_mode == "rolling"
+    assert component._auto_rolling
+    assert component._auto_fallback_compile is None
+
+    remove_adapter = register_adapter(_ExternalAdapter)
+    try:
+        incompatible = Adapter.from_state_dict(
+            {
+                f"blocks.{idx}.proj.weight": torch.Tensor._make_subclass(
+                    _ExternalTensor,
+                    torch.eye(dim),
+                    False,
+                )
+                for idx in range(2)
+            },
+            host_backing="adopt",
+        )
+        offloader.activate("cuda", adapters=[incompatible])
+        assert component._active_runtime is component._eager_runtime
+        assert component._auto_fallback_compile is not None
+        assert component._auto_fallback_compile.installed
+        assert not component._block_compile.installed
+    finally:
+        offloader.deactivate()
+        remove_adapter()
+    assert component._auto_fallback_compile is not None
+    assert not component._auto_fallback_compile.installed

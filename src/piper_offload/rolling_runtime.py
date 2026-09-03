@@ -52,6 +52,47 @@ _ROLLING_ADAPTER_TYPES = (
 )
 
 
+def _resolve_rolling_loads(
+    instances: Sequence[PinnedModuleInstance],
+    load_plans: Sequence[PinnedModuleLoadPlan],
+) -> tuple[tuple[PinnedModuleLoadPlan, ...], dict[str, ParameterLoad]]:
+    """Validate active sources and build the shared-target allocation loads."""
+    plans = validate_load_plans(instances, load_plans)
+    source_names = {name for plan in plans for name in plan.loads}
+    allocation_loads: dict[str, ParameterLoad] = {}
+    for name in instances[0].params:
+        if name not in source_names:
+            continue
+        active = [
+            load
+            for plan in plans
+            if (load := plan.loads.get(name)) is not None
+        ]
+        assert active
+        source = active[0].source
+        if any(
+            candidate.source.target_layout != source.target_layout
+            for candidate in active[1:]
+        ):
+            raise NotImplementedError(
+                "rolling compilation requires identical active parameter "
+                f"layouts for slot {name!r} in every block with a source"
+            )
+        if type(source.adapter) not in _ROLLING_ADAPTER_TYPES:
+            raise NotImplementedError(
+                "rolling compilation does not support active parameter "
+                f"adapter {type(source.adapter).__name__} for slot {name!r}"
+            )
+        if math.prod(source.logical_shape) == 0:
+            raise NotImplementedError(
+                "rolling compilation does not support zero-sized parameter slots"
+            )
+        # This synthetic plan defines shared target storage only. Block
+        # updates remain exclusively on their activation load plans.
+        allocation_loads[name] = ParameterLoad(source)
+    return plans, allocation_loads
+
+
 class RollingBlockRuntime:
     """One shared CUDA target refilled parameter-by-parameter."""
 
@@ -84,6 +125,13 @@ class RollingBlockRuntime:
     def compile_backend(self) -> CompileBackend:
         return rolling_inductor_backend
 
+    def validate_load_plans(
+        self,
+        load_plans: Sequence[PinnedModuleLoadPlan],
+    ) -> None:
+        """Raise when active loads cannot use one compiled rolling target."""
+        _resolve_rolling_loads(self._instances, load_plans)
+
     def acquire(
         self,
         device: torch.device,
@@ -91,19 +139,13 @@ class RollingBlockRuntime:
     ) -> None:
         if self.acquired:
             raise RuntimeError("rolling block runtime is already acquired")
-        plans = validate_load_plans(self._instances, load_plans)
-        self._load_plans = plans
-        self._stream = torch.cuda.Stream(device=device, priority=-1)
-        source_names = {
-            name
-            for plan in plans
-            for name in plan.loads
-        }
-        self._slot_names = tuple(
-            name
-            for name in self._instances[0].params
-            if name in source_names
+        plans, allocation_loads = _resolve_rolling_loads(
+            self._instances,
+            load_plans,
         )
+        self._load_plans = plans
+        self._slot_names = tuple(allocation_loads)
+        self._stream = torch.cuda.Stream(device=device, priority=-1)
         self._events = tuple(torch.cuda.Event() for _name in self._slot_names)
         self._ready_events = tuple(torch.cuda.Event() for _name in self._slot_names)
         self._owners = [0] * len(self._slot_names)
@@ -116,34 +158,6 @@ class RollingBlockRuntime:
             return
 
         self._fallback_event = torch.cuda.Event()
-        allocation_loads: dict[str, ParameterLoad] = {}
-        for name in self._slot_names:
-            active = [
-                load for plan in plans
-                if (load := plan.loads.get(name)) is not None
-            ]
-            assert active
-            source = active[0].source
-            if any(
-                candidate.source.target_layout != source.target_layout
-                for candidate in active[1:]
-            ):
-                raise NotImplementedError(
-                    "rolling compilation requires identical active parameter "
-                    f"layouts for slot {name!r} in every block with a source"
-                )
-            if type(source.adapter) not in _ROLLING_ADAPTER_TYPES:
-                raise NotImplementedError(
-                    "rolling compilation does not support active parameter "
-                    f"adapter {type(source.adapter).__name__} for slot {name!r}"
-                )
-            if math.prod(source.logical_shape) == 0:
-                raise NotImplementedError(
-                    "rolling compilation does not support zero-sized parameter slots"
-                )
-            # This synthetic plan defines shared target storage only. Block
-            # updates remain exclusively on their activation load plans.
-            allocation_loads[name] = ParameterLoad(source)
         allocation_plan = PinnedModuleLoadPlan(
             plans[0].instance,
             allocation_loads,
