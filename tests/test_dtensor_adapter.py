@@ -595,6 +595,39 @@ class TestDTensorAdapter:
 
         assert model.weight.is_meta
 
+    def test_permanent_parameter_value_scales_cpu_dtensor(
+        self,
+        tp_mesh: Any,
+    ) -> None:
+        dt, _ = _dtensor_weight(tp_mesh)
+        adapter = Adapter.from_state_dict(
+            {"weight": dt},
+            scale_parameter_values=True,
+        )
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.empty(dt.shape, device="meta"),
+            requires_grad=False,
+        )
+
+        assert (
+            merge_adapter(
+                model,
+                [(adapter, 0.5)],
+                stochastic_rounding=False,
+            )
+            == 1
+        )
+
+        actual = param_representation(model.weight)
+        assert _is_dtensor(actual)
+        assert actual.device_mesh.device_type == "cpu"
+        assert actual.placements == dt.placements
+        torch.testing.assert_close(
+            actual.to_local(),
+            dt.to_local().cpu() * 0.5,
+        )
+
     def test_composes_with_quantized_local_shard(self, tp_mesh: Any) -> None:
         # The crown-jewel claim: one adapter composes with every quant adapter.
         # A DTensor wrapping a TorchAO Float8Tensor must reuse Float8Adapter

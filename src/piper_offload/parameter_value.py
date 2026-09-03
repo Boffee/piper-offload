@@ -263,12 +263,6 @@ class ParameterValueTransform:
         """Apply optional scaling to an already-loaded replacement."""
         plan = self._require_plan()
         target = param_representation(param)
-        try:
-            adapter = select_adapter(target)
-        except NotImplementedError as exc:
-            raise RuntimeError(
-                "Parameter value target no longer has a registered tensor adapter."
-            ) from exc
         if (
             target.is_meta
             or PinnedParam.target_layout_for(param) != plan.target_layout
@@ -277,8 +271,19 @@ class ParameterValueTransform:
                 "Parameter value update requires physical storage matching "
                 "the validated replacement source."
             )
+        self._scale_parameter(target)
+
+    def _scale_parameter(self, target: torch.Tensor) -> None:
+        """Scale one trusted physical replacement representation in place."""
+        plan = self._require_plan()
         if plan.effective_strength == 1.0:
             return
+        try:
+            adapter = select_adapter(target)
+        except NotImplementedError as exc:
+            raise RuntimeError(
+                "Parameter value target no longer has a registered tensor adapter."
+            ) from exc
         if not (
             isinstance(adapter, DenseMergeTensorAdapter)
             and isinstance(adapter, DequantizeTensorAdapter)
@@ -312,7 +317,10 @@ class ParameterValueTransform:
             else backing.materialize(target_device)
         )
         if self.requires_update:
-            self.apply_parameter(param)
+            # This clone was constructed by the validated backing itself. Its
+            # representation is trusted even when an outer wrapper changes
+            # device metadata, as DTensor does for its resting CPU mesh.
+            self._scale_parameter(param_representation(param))
         return param
 
     def _require_plan(self) -> _ParameterValuePlan:
