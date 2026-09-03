@@ -416,7 +416,7 @@ host effects with late scheduler-only ordering edges. They neither consume
 reader tensors nor model an immutable parameter as mutated, avoiding forced
 intermediate materialization while preserving the ordinary fusion, memory
 coalescing, and kernel-autotuning plan. For factors whose tensor formats
-support merge-mode LoRA, merge hooks run after every base refill on the copy stream. GGUF and
+support merge-mode LoRA, planned updates run after every base refill on the copy stream. GGUF and
 TorchAO INT4 tile-packed weights retain their existing no-merge restriction.
 
 Explicit rolling deliberately fails closed outside its tested contract: `fullgraph=True`,
@@ -474,9 +474,10 @@ Gradients are not streamed; PyTorch owns `param.grad` normally.
 ### Adapter application
 
 `ModelOffloader` supports optional per-parameter adapter updates through
-activation arguments. Merge mode
-installs activation-scoped post-copy hooks for managed parameter
-targets. Unknown targets raise during activation by default. An adapter that is
+activation arguments. Merge mode builds activation-scoped parameter overrides
+for managed targets. Each component resolves those overrides into immutable
+load plans before allocating CUDA storage. Unknown targets raise during
+activation by default. An adapter that is
 intentionally shared across separately loaded model components can set
 `allow_partial_targets=True`; its merge and routed uses then apply only the
 intersection of adapter targets and model parameters, including a valid no-op
@@ -484,18 +485,18 @@ when that intersection is empty. Present targets still receive the ordinary
 shape and capability validation. Adapter target keys must
 match the model's parameter names exactly; any remapping — stripping a
 `diffusion_model.` prefix, inserting a PEFT `.base_layer.` segment — is
-the caller's job when building the adapter state dict. Each hook runs
-immediately after the owning
-component copies the base weight from pinned CPU storage to GPU, so both
+the caller's job when building the adapter state dict. Each planned update runs
+immediately after the owning component copies its effective source from pinned
+CPU storage to GPU, so both
 block-streamed and non-block weights use the same merge path. Merge
 compatibility is tensor-format-owned: physical plain floating-point tensors
 accept combined low-rank and full-rank additive deltas; structured quantized
 wrappers may independently opt into staged factorized and full-rank merges
 whose implementations select a format-specific kernel or framework fallback.
 Dense-only and mixed dense + LoRA updates use the full-rank capability; the
-mixed form re-encodes a quantized base once. Plain float8 targets remain
-unsupported. Frozen plain
-floating-point meta tensors can instead be populated by parameter values.
+mixed form re-encodes a quantized base once. Plain float8 merge targets remain
+unsupported. Frozen plain floating-point meta tensors can instead be populated
+by dense or registered structured parameter values.
 Routed mode remains factor-only and requires a compatible logical `nn.Linear`
 shape and compute dtype.
 `PinnedParam` remains a storage primitive; transforms ask the selected tensor
@@ -507,9 +508,11 @@ for full-rank additive updates. `module.delta.weight` targets `module.weight`,
 while `module.delta.bias` targets `module.bias`. LoRA and dense terms for the
 same parameter form one `ParameterDelta`. Every other entry is a
 `ParameterValue` whose key is the exact model parameter name and whose source
-is the complete value for a conventional floating-point meta parameter. Plain
-float8 parameter values are not supported. Construct `Adapter(targets=...)`
-directly if a model parameter name itself ends in one of the reserved suffixes.
+is the complete value for a plain floating-point meta parameter. The source may
+be any physical representation with a registered tensor adapter and a floating
+compute dtype. Its dtype, layout, quantization metadata, and bytes become the
+active representation. Construct `Adapter(targets=...)` directly if a model
+parameter name itself ends in one of the reserved suffixes.
 
 ```python
 feature_adapter = Adapter.from_state_dict(
@@ -521,7 +524,6 @@ feature_adapter = Adapter.from_state_dict(
         "guidance_embedder.weight": guidance_weight,
         "guidance_embedder.bias": guidance_bias,
     },
-    scale_parameter_values=False,
 )
 ```
 
@@ -529,14 +531,15 @@ feature_adapter = Adapter.from_state_dict(
 union `ParameterDelta | ParameterValue`, so every mapped target is already in
 a valid, concrete form. A parameter delta contributes
 `strength * (B @ A + dense)` with whichever low-rank and dense terms are
-present. A parameter value materializes `strength * value` by default. Pass
-`scale_parameter_values=False` to `Adapter.from_state_dict()` or `AdapterSpec`
-when its complete values should materialize unchanged for every active,
-nonzero adapter strength. This setting affects only exact-name parameter
-values; LoRA and dense deltas remain strength-scaled. A zero-strength adapter
-is inactive under either policy. Directly constructed mappings can select the
-policy per target with
-`ParameterValue.from_tensor(..., scale_with_strength=False)`.
+present. A parameter value materializes the complete value unchanged by
+default. Pass `scale_parameter_values=True` to `Adapter.from_state_dict()` or
+`AdapterSpec` when active adapter strength should scale those values. Explicit
+non-unit scaling requires the value representation to support both
+`dequantize()` and `merge_dense_()`. This setting affects only exact-name
+parameter values; LoRA and dense deltas remain strength-scaled. A zero-strength
+adapter is inactive under either policy. Directly constructed mappings can
+select the policy per target with
+`ParameterValue.from_tensor(..., scale_with_strength=True)`.
 
 The resource-level API uses `Adapter`, `AdapterMode`, `AdapterSpec`, and
 `merge_adapter`; activation arguments use the corresponding `adapter_*` names.
@@ -544,21 +547,41 @@ The resource-level API uses `Adapter`, `AdapterMode`, `AdapterSpec`, and
 Parameter values are merge-only: routed mode rejects the request. For a meta
 target, merge mode materializes the value according to its strength policy.
 Only one active parameter value may own a target; repeated or competing values
-are rejected. Parameter values do not apply to existing physical parameters,
-quantized tensors, DTensors, or tensor subclasses. Their meta targets must
-have strided, non-overlapping dense layouts with zero storage offset; this
-includes ordinary contiguous and transposed dense parameters but excludes
-overlapping or gapped views that cannot be populated while preserving the
-declared layout.
+are rejected. Parameter values do not apply to existing physical model
+parameters: the model-side target remains a storage-free plain floating-point
+meta placeholder. The value's backing owns the active dtype, layout, packed
+storage, quantization metadata, logical compute dtype, and any DTensor
+composition. The placeholder supplies only the target name, logical shape, and
+alias group. Supplying `dtype=` while constructing an adapter can cast a dense
+value, but cannot convert a structured value; it must either match the
+representation's compute dtype or the caller must prequantize the value again.
+The caller is responsible for payload numerical validity: parameter values are
+not scanned for NaN or infinity during construction, activation, or permanent
+merge.
+
+Exact replacement supports offload-capable physical representations with a
+registered tensor adapter, floating compute dtype, and compatible logical-shape
+metadata. This includes TorchAO INT4 tile-packed values even though that format
+does not support additive merges. Only explicit non-unit strength scaling
+needs both dequantization and dense merge support. That scaled subset mirrors
+dense-delta support across Quanto, bitsandbytes, TorchAO, Piper ConvRot, and
+supported DTensor compositions. `ParameterValue` does not define a second
+quantization metadata schema.
 
 A frozen plain floating-point meta parameter has no host backing and
 contributes zero bytes to model cache accounting.
 Without an active parameter value it stays meta and no CUDA slot is allocated;
 executing a module that still references it is the caller's error. With a
-parameter value, resident, streaming, rolling, and automatic block modes allocate
-active storage and fill it directly from the scaled source—there is no base
-storage to allocate or copy. Deactivation restores the meta parameter. Low-rank
-A/B factors cannot materialize a meta target. Rolling allocates the union
+parameter value, resident, streaming, rolling, and automatic block modes
+allocate active storage—there is no model base storage to copy. Dense values
+are filled in the placeholder's declared layout. Structured values allocate
+from their own backing and copy the packed representation exactly. Unit
+strength (or disabled strength scaling) therefore performs no
+dequantize/requantize round trip. A non-unit strength reuses dense merge as
+`W + (strength - 1) * W`, producing one terminal requantization. Permanent
+merge follows the same rule and installs an independent representation rather
+than aliasing immutable adapter backing. Deactivation restores the meta
+parameter. Low-rank A/B factors cannot materialize a meta target. Rolling allocates the union
 of slots needed by its homogeneous block group. If another block requires the
 same rolling slot, inactive blocks may temporarily reference that already
 allocated storage; its inactive contents are unspecified and consume no
@@ -1120,7 +1143,7 @@ Adapter:       construct -> lease -> read host updates -> release lease
 ```
 
 `ModelOffloader.activate(device=...)` makes the model usable for compute on the
-requested device. Merge hooks copy factors when their base weight is loaded;
+requested device. Merge updates stage factors when their base weight is loaded;
 routed PRE hooks copy factors for one Linear invocation and routed POST hooks
 release them after enqueueing the residual.
 `ModelOffloader`, `MpsWeights`, `PinnedComponent`, and

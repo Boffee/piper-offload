@@ -11,8 +11,10 @@ from torch import nn
 
 from piper_offload import (
     Adapter,
+    BlockCompileConfig,
     LoRATransform,
     ModelOffloader,
+    ParameterValue,
     ScaledLoRAFactor,
     derive_seed,
     merge_adapter,
@@ -29,6 +31,7 @@ from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
     CpuRoundTripTensorAdapter,
     DequantRequantTensorAdapter,
+    DequantizeTensorAdapter,
     DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
     LoRAMergeTensorAdapter,
@@ -412,6 +415,86 @@ class TestPiperConvRotInt8Adapter:
 
         assert calls == [(0.125, 456)]
 
+    @pytest.mark.parametrize("scale_with_strength", [False, True])
+    def test_parameter_value_permanent_merge_preserves_representation(
+        self,
+        scale_with_strength: bool,
+    ) -> None:
+        source = _make_convrot()
+        source_dense = source.dequantize()
+        strength = -0.25
+        adapter = Adapter.from_state_dict(
+            {"weight": source},
+            host_backing="adopt",
+            scale_parameter_values=scale_with_strength,
+        )
+        value = adapter.targets["weight"]
+        assert isinstance(value, ParameterValue)
+        backing = value.backing.make_cpu_param().data
+        expected = source.clone()
+        if scale_with_strength:
+            expected.add_(source_dense, alpha=strength - 1.0)
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.empty(source.shape, device="meta"),
+            requires_grad=False,
+        )
+
+        assert (
+            merge_adapter(
+                model,
+                [(adapter, strength)],
+                stochastic_rounding=False,
+            )
+            == 1
+        )
+
+        actual = model.weight.data
+        assert isinstance(actual, _convrot_cls())
+        assert actual.qdata.data_ptr() != backing.qdata.data_ptr()
+        assert actual.scale.data_ptr() != backing.scale.data_ptr()
+        assert torch.equal(actual.qdata, expected.qdata)
+        assert torch.equal(actual.scale, expected.scale)
+
+    def test_scaled_parameter_value_forwards_stochastic_rounding_seed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        convrot_cls = _convrot_cls()
+        source = _make_convrot()
+        seeds: list[int | None] = []
+        original_add = convrot_cls.add_
+
+        def recording_add(
+            target: torch.Tensor,
+            other: torch.Tensor,
+            *,
+            alpha: float = 1,
+            rounding_seed: int | None = None,
+        ) -> torch.Tensor:
+            seeds.append(rounding_seed)
+            return original_add(
+                target,
+                other,
+                alpha=alpha,
+                rounding_seed=rounding_seed,
+            )
+
+        monkeypatch.setattr(convrot_cls, "add_", recording_add)
+        adapter = Adapter.from_state_dict(
+            {"weight": source},
+            host_backing="adopt",
+            scale_parameter_values=True,
+        )
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.empty(source.shape, device="meta"),
+            requires_grad=False,
+        )
+
+        assert merge_adapter(model, [(adapter, 0.5)]) == 1
+        assert seeds == [derive_seed("weight", 0)]
+
     def test_merge_lora_merges_convrot_weight(self) -> None:
         convrot_cls = _convrot_cls()
         model = nn.Module()
@@ -544,6 +627,7 @@ class TestPiperConvRotInt8Adapter:
         adapter = PiperConvRotInt8Adapter()
 
         assert not isinstance(adapter, CpuRoundTripTensorAdapter)
+        assert isinstance(adapter, DequantizeTensorAdapter)
         assert not isinstance(adapter, DequantRequantTensorAdapter)
         assert not isinstance(adapter, TensorCopyIntoAdapter)
         assert isinstance(adapter, LoRAMergeTensorAdapter)
@@ -615,6 +699,211 @@ class TestPiperConvRotInt8Adapter:
             torch.testing.assert_close(actual, expected)
         finally:
             offloader.deactivate()
+
+    @CUDA
+    @pytest.mark.parametrize("strength", [1.0, 0.5])
+    def test_parameter_value_allocates_quantized_activation_storage(
+        self,
+        strength: float,
+    ) -> None:
+        source = _make_convrot(rows=8, cols=64)
+        expected = source.clone().cuda()
+        if strength != 1.0:
+            expected.add_(
+                expected.dequantize(),
+                alpha=strength - 1.0,
+            )
+        model = nn.Linear(
+            64,
+            8,
+            bias=False,
+            device="meta",
+        )
+        model.requires_grad_(False)
+        value = Adapter.from_state_dict(
+            {"weight": source},
+            host_backing="adopt",
+            scale_parameter_values=True,
+        )
+        offloader = ModelOffloader.from_module(
+            model,
+            host_backing="adopt",
+        )
+
+        with activated_model(
+            offloader,
+            "cuda",
+            adapters=[value],
+            adapter_strengths=[strength],
+            stochastic_rounding=False,
+        ) as active:
+            actual = active.weight.data
+            assert isinstance(actual, _convrot_cls())
+            assert actual.qdata.is_cuda
+            assert torch.equal(actual.qdata, expected.qdata)
+            assert torch.equal(actual.scale, expected.scale)
+
+        assert model.weight.is_meta
+
+    @CUDA
+    def test_parameter_value_target_identity_follows_model_ties(self) -> None:
+        model = nn.Module()
+        model.left = nn.Linear(64, 8, bias=False, device="meta")
+        model.right = nn.Linear(64, 8, bias=False, device="meta")
+        model.right.weight = model.left.weight
+        model.requires_grad_(False)
+        source = _make_convrot()
+        adapter = Adapter.from_state_dict(
+            {"left.weight": source},
+            host_backing="adopt",
+        )
+        offloader = ModelOffloader.from_module(model, host_backing="adopt")
+
+        with activated_model(offloader, "cuda", adapters=[adapter]):
+            assert model.left.weight is model.right.weight
+            assert isinstance(model.left.weight.data, _convrot_cls())
+
+        assert model.left.weight is model.right.weight
+        assert model.left.weight.is_meta
+
+    @CUDA
+    def test_reused_parameter_value_source_does_not_tie_independent_targets(
+        self,
+    ) -> None:
+        model = nn.Module()
+        model.left = nn.Linear(64, 8, bias=False, device="meta")
+        model.right = nn.Linear(64, 8, bias=False, device="meta")
+        model.requires_grad_(False)
+        source = _make_convrot()
+        adapter = Adapter.from_state_dict(
+            {
+                "left.weight": source,
+                "right.weight": source,
+            },
+            host_backing="adopt",
+        )
+        offloader = ModelOffloader.from_module(model, host_backing="adopt")
+
+        with activated_model(offloader, "cuda", adapters=[adapter]):
+            assert model.left.weight is not model.right.weight
+            assert (
+                model.left.weight.data.qdata.data_ptr()
+                != model.right.weight.data.qdata.data_ptr()
+            )
+
+        assert model.left.weight is not model.right.weight
+        assert model.left.weight.is_meta
+        assert model.right.weight.is_meta
+
+    @CUDA
+    def test_rolling_allocates_quantized_slot_from_later_active_block(
+        self,
+    ) -> None:
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocks = nn.ModuleList(
+                    [
+                        nn.Linear(64, 8, bias=False, device="meta"),
+                        nn.Linear(64, 8, bias=False, device="meta"),
+                    ]
+                )
+                self.requires_grad_(False)
+
+        source = _make_convrot()
+        adapter = Adapter.from_state_dict(
+            {"blocks.1.weight": source},
+            host_backing="adopt",
+        )
+        model = M()
+        offloader = ModelOffloader.from_module(
+            model,
+            block_paths=("blocks",),
+            block_mode="rolling",
+            block_compile=BlockCompileConfig(dynamic=False, fullgraph=True),
+            host_backing="adopt",
+        )
+        inputs = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
+        expected = torch.nn.functional.linear(inputs, source.clone().cuda())
+
+        with activated_model(offloader, "cuda", adapters=[adapter]) as active:
+            torch.testing.assert_close(active.blocks[1](inputs), expected)
+            assert isinstance(active.blocks[1].weight.data, _convrot_cls())
+
+        assert all(param.is_meta for param in model.parameters())
+
+    @CUDA
+    @pytest.mark.parametrize(
+        "block_mode",
+        ["resident", "streaming", "rolling", "auto"],
+    )
+    def test_quantized_parameter_values_work_in_every_block_mode(
+        self,
+        block_mode: str,
+    ) -> None:
+        convrot_cls = _convrot_cls()
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocks = nn.ModuleList(
+                    [
+                        nn.Linear(64, 64, bias=False, device="meta")
+                        for _ in range(3)
+                    ]
+                )
+                self.requires_grad_(False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.blocks:
+                    x = block(x)
+                return x
+
+        sources = [
+            convrot_cls.from_hp(
+                torch.randn(64, 64, dtype=torch.bfloat16),
+                group_size=64,
+            )
+            for _ in range(3)
+        ]
+        adapter = Adapter.from_state_dict(
+            {
+                f"blocks.{idx}.weight": source
+                for idx, source in enumerate(sources)
+            },
+            host_backing="adopt",
+            scale_parameter_values=True,
+        )
+        model = M()
+        compile_config = (
+            BlockCompileConfig(dynamic=False, fullgraph=True)
+            if block_mode in {"rolling", "auto"}
+            else None
+        )
+        offloader = ModelOffloader.from_module(
+            model,
+            block_paths=("blocks",),
+            block_mode=block_mode,  # type: ignore[arg-type]
+            block_compile=compile_config,
+            host_backing="adopt",
+        )
+        inputs = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
+        expected = inputs
+        for source in sources:
+            scaled = source.clone().cuda()
+            scaled.add_(scaled.dequantize(), alpha=-0.5)
+            expected = torch.nn.functional.linear(expected, scaled)
+
+        with activated_model(
+            offloader,
+            "cuda",
+            adapters=[adapter],
+            adapter_strengths=[0.5],
+            stochastic_rounding=False,
+        ) as active:
+            torch.testing.assert_close(active(inputs), expected)
+
+        assert all(param.is_meta for param in model.parameters())
 
     @CUDA
     def test_streamed_merge_requantizes_on_activate(self) -> None:
@@ -761,4 +1050,4 @@ class TestPiperConvRotInt8Adapter:
 
         assert torch.equal(samples[0], samples[1])
         assert offloader.active_device is None
-        assert offloader._adapter_hook_removers == []
+        assert offloader._routed_hook_removers == []

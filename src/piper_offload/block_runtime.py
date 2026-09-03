@@ -1,11 +1,29 @@
 """Shared contract for CUDA block-residency runtimes."""
 
 import contextlib
+from collections.abc import Sequence
 from typing import Protocol
 
 import torch
 
 from .block_compile import CompileBackend
+from .pinned_module import PinnedModuleInstance, PinnedModuleLoadPlan
+
+
+def validate_load_plans(
+    instances: Sequence[PinnedModuleInstance],
+    load_plans: Sequence[PinnedModuleLoadPlan],
+) -> tuple[PinnedModuleLoadPlan, ...]:
+    """Return plans after validating one positional plan per instance."""
+    plans = tuple(load_plans)
+    if len(plans) != len(instances) or any(
+        plan.instance is not instance
+        for plan, instance in zip(plans, instances, strict=True)
+    ):
+        raise ValueError(
+            "block runtime requires one matching load plan per block"
+        )
+    return plans
 
 
 class BlockRuntime(Protocol):
@@ -25,7 +43,11 @@ class BlockRuntime(Protocol):
         """The ``torch.compile`` backend required by this strategy."""
         ...
 
-    def acquire(self, device: torch.device) -> None:
+    def acquire(
+        self,
+        device: torch.device,
+        load_plans: Sequence[PinnedModuleLoadPlan],
+    ) -> None:
         """Allocate the CUDA working set and install execution hooks."""
         ...
 
@@ -36,4 +58,4 @@ class BlockRuntime(Protocol):
     def optimizer_step(self) -> contextlib.AbstractContextManager[None]: ...
 
 
-__all__ = ["BlockRuntime"]
+__all__ = ["BlockRuntime", "validate_load_plans"]

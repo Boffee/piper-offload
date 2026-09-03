@@ -47,7 +47,7 @@ when you need bespoke composition (e.g., multiple block lists like Flux's
 import contextlib
 import logging
 import weakref
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Self, cast
 
@@ -64,13 +64,14 @@ from .host_backing import (
 )
 from .module_names import walk_attr_path
 from .pinned_module import (
+    ParameterOverride,
     PinnedModuleInstance,
+    PinnedModuleLoadPlan,
     PinnedModuleStore,
-    PostCopyHook,
 )
 from .pinned_param import PinnedParam
 from .resident_runtime import ResidentBlockRuntime
-from .rolling_runtime import create_rolling_block_runtime
+from .rolling_runtime import RollingBlockRuntime, create_rolling_block_runtime
 from .streaming_runtime import StreamingBlockRuntime
 
 logger = logging.getLogger(__name__)
@@ -614,9 +615,9 @@ class BlockComponent:
         The concrete bound block instances.
     name:
         Optional model path for the block list. When set,
-        :attr:`param_names` and name-based post-copy hook registration
-        use names like ``"blocks.3.weight"``. When omitted, standalone
-        standalone components use ``"3.weight"``.
+        :attr:`param_names` and activation parameter overrides use names like
+        ``"blocks.3.weight"``. When omitted, standalone components use
+        ``"3.weight"``.
         Trainable streaming requires activation checkpointing on every
         block (the ``.data`` swap bypasses autograd's version-counter
         check). The component doesn't enforce that precondition itself —
@@ -712,15 +713,19 @@ class BlockComponent:
         else:
             raise ValueError(f"unsupported block mode: {block_mode!r}")
         self._block_mode: BlockMode = resolved_mode
-        self._runtime = runtime
-        self._eager_runtime = eager_runtime
+        self._runtime, self._eager_runtime = runtime, eager_runtime
         self._block_compile = _BlockCompileState.create(
             self._blocks,
             block_compile,
             backend=runtime.compile_backend,
         )
+        self._auto_rolling = (
+            block_mode == "auto" and isinstance(runtime, RollingBlockRuntime)
+        )
+        self._auto_fallback_compile: _BlockCompileState | None = None
         self._active_device: torch.device | None = None
         self._active_runtime: BlockRuntime | None = None
+        self._load_plans: tuple[PinnedModuleLoadPlan, ...] = ()
         self._param_name_to_block_param = _build_param_name_index(
             self._block_instances,
             name,
@@ -784,19 +789,6 @@ class BlockComponent:
     def has_trainables(self) -> bool:
         return any(instance.has_trainables for instance in self._block_instances)
 
-    def register_post_copy_hook(
-        self,
-        name: str,
-        hook: PostCopyHook,
-    ) -> Callable[[], None]:
-        """Register a hook after this component copies ``name`` to GPU.
-
-        Package-internal: used by :class:`ModelOffloader` for merge-mode
-        LoRA. Returns a callable that unregisters the hook.
-        """
-        instance, name = self._resolve_param_name(name)
-        return instance.register_post_copy_hook(name, hook)
-
     def _resolve_param_name(
         self,
         name: str,
@@ -850,6 +842,7 @@ class BlockComponent:
         device: torch.device,
         *,
         compile_blocks: bool = True,
+        parameter_overrides: Mapping[str, ParameterOverride] | None = None,
     ) -> None:
         """Activate the block list on ``device``.
 
@@ -880,13 +873,43 @@ class BlockComponent:
             )
         active_device = canonical_device(device)
         if active_device.type == "cpu":
+            if parameter_overrides:
+                raise ValueError(
+                    "Parameter overrides require CUDA activation."
+                )
             self._activate_cpu_resolved()
             return
         if active_device.type != "cuda":
             raise ValueError(f"BlockComponent.activate() supports CUDA or CPU; got {active_device}.")
+        self._load_plans = self._resolve_load_plans(parameter_overrides)
         self._activate_cuda_resolved(
             active_device,
             compile_blocks=compile_blocks,
+        )
+
+    def _resolve_load_plans(
+        self,
+        overrides: Mapping[str, ParameterOverride] | None,
+    ) -> tuple[PinnedModuleLoadPlan, ...]:
+        by_block: list[dict[str, ParameterOverride]] = [
+            {} for _instance in self._block_instances
+        ]
+        if overrides is not None:
+            for name, override in overrides.items():
+                ref = self._param_name_to_block_param.get(name)
+                if ref is None:
+                    raise ValueError(
+                        f"param name {name!r} is not owned by this block component"
+                    )
+                block_idx, local_name = ref
+                by_block[block_idx][local_name] = override
+        return tuple(
+            instance.resolve_load_plan(local_overrides)
+            for instance, local_overrides in zip(
+                self._block_instances,
+                by_block,
+                strict=True,
+            )
         )
 
     def _activate_cpu_resolved(self) -> None:
@@ -898,7 +921,9 @@ class BlockComponent:
         *,
         compile_blocks: bool,
     ) -> None:
-        runtime = self._runtime if compile_blocks else self._eager_runtime
+        runtime, block_compile = self._select_cuda_runtime(
+            compile_blocks=compile_blocks,
+        )
 
         # Record the selected runtime before acquisition so deactivate() can
         # clean up a partially-created pool, stream, or hook set if activation
@@ -906,7 +931,38 @@ class BlockComponent:
         self._active_device = active_device
         self._active_runtime = runtime
         self.acquire()
-        self._block_compile.install(compile_blocks)
+        block_compile.install(compile_blocks)
+
+    def _select_cuda_runtime(
+        self,
+        *,
+        compile_blocks: bool,
+    ) -> tuple[BlockRuntime, _BlockCompileState]:
+        """Select the runtime after activation overrides have been resolved."""
+        if not compile_blocks:
+            return self._eager_runtime, self._block_compile
+
+        if self._auto_rolling:
+            rolling = cast(RollingBlockRuntime, self._runtime)
+            try:
+                rolling.validate_load_plans(self._load_plans)
+            except NotImplementedError as exc:
+                logger.info(
+                    "block group does not support rolling for this activation; "
+                    "using streaming: %s",
+                    exc,
+                )
+                fallback_compile = self._auto_fallback_compile
+                if fallback_compile is None:
+                    fallback_compile = _BlockCompileState.create(
+                        self._blocks,
+                        self._block_compile.config,
+                        backend=self._eager_runtime.compile_backend,
+                    )
+                    self._auto_fallback_compile = fallback_compile
+                return self._eager_runtime, fallback_compile
+
+        return self._runtime, self._block_compile
 
     def acquire(self) -> None:
         """Acquire this active session's CUDA working set.
@@ -925,7 +981,7 @@ class BlockComponent:
         if runtime is None:
             raise RuntimeError("BlockComponent CUDA session has no selected runtime.")
         if not runtime.acquired:
-            runtime.acquire(active_device)
+            runtime.acquire(active_device, self._load_plans)
 
     def release(self) -> None:
         """Idempotently release this session's CUDA working set.
@@ -946,8 +1002,11 @@ class BlockComponent:
         of any partial acquisition state. Drop the binding reference after
         deactivate to release pinned memory."""
         self._block_compile.restore()
+        if self._auto_fallback_compile is not None:
+            self._auto_fallback_compile.restore()
         if self._active_device == torch.device("cpu"):
             self._active_device = None
+            self._load_plans = ()
             return
 
         try:
@@ -955,6 +1014,7 @@ class BlockComponent:
         finally:
             self._active_runtime = None
             self._active_device = None
+            self._load_plans = ()
 
     @contextlib.contextmanager
     def use(

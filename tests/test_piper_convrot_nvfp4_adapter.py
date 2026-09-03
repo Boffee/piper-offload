@@ -24,6 +24,7 @@ from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
     CpuRoundTripTensorAdapter,
     DequantRequantTensorAdapter,
+    DequantizeTensorAdapter,
     DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
     LoRAMergeTensorAdapter,
@@ -347,6 +348,7 @@ class TestPiperConvRotNVFP4Adapter:
         assert isinstance(adapter, LoRAMergeValidationTensorAdapter)
         assert isinstance(adapter, DenseMergeTensorAdapter)
         assert isinstance(adapter, DenseMergeTargetValidationTensorAdapter)
+        assert isinstance(adapter, DequantizeTensorAdapter)
         assert not isinstance(adapter, DequantRequantTensorAdapter)
         assert not isinstance(adapter, TensorCopyIntoAdapter)
         assert not isinstance(adapter, CpuRoundTripTensorAdapter)

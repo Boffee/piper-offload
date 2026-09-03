@@ -11,6 +11,7 @@ from piper_offload import (
     PinnedComponentStore,
     ResourceBinding,
 )
+from piper_offload.pinned_module import ParameterOverride
 
 from tests.conftest import activated_model, pinned_component
 
@@ -237,12 +238,15 @@ class TestPinnedComponentStoreBind:
 
         component = PinnedComponentStore.from_module(model).bind(model)
         copied: list[torch.device] = []
-        remove_copy_hook = component.register_post_copy_hook(
-            "0.weight",
-            lambda param: copied.append(param.device),
-        )
         try:
-            component.activate(torch.device("cuda"))
+            component.activate(
+                torch.device("cuda"),
+                parameter_overrides={
+                    "0.weight": ParameterOverride(
+                        update=lambda param: copied.append(param.device)
+                    )
+                },
+            )
             assert component._lease is not None
             assert [device.type for device in copied] == ["cuda"]
             assert model._forward_pre_hooks
@@ -266,7 +270,6 @@ class TestPinnedComponentStoreBind:
             torch.cuda.synchronize()
             torch.testing.assert_close(actual, expected)
         finally:
-            remove_copy_hook()
             component.deactivate()
 
         assert component._active_device is None

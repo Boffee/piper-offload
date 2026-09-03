@@ -30,6 +30,7 @@ from piper_offload.tensor_adapters import (
     DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
     DenseMergeValidationTensorAdapter,
+    DequantizeTensorAdapter,
     DequantRequantTensorAdapter,
     LoRAMergeTensorAdapter,
     MergeLocalityTensorAdapter,
@@ -549,18 +550,83 @@ class TestDTensorAdapter:
         tp_mesh: Any,
     ) -> None:
         # Frozen-inference scope: shard-local additive merge is available, but
-        # CPU round-trip, dequant/requant, copy_into, and trainable .data swap
-        # stay hidden even when the inner adapter has those capabilities.
+        # CPU round-trip, full dequant/requant, copy_into, and trainable .data
+        # swap stay hidden. Dense local-shard exposure is available for
+        # parameter-value scaling.
         adapter = select_adapter(_dtensor_weight(tp_mesh)[0])
         assert isinstance(adapter, LoRAMergeTensorAdapter)
         assert isinstance(adapter, DenseMergeTensorAdapter)
         assert isinstance(adapter, DenseMergeTargetValidationTensorAdapter)
         assert isinstance(adapter, DenseMergeValidationTensorAdapter)
+        assert isinstance(adapter, DequantizeTensorAdapter)
         assert isinstance(adapter, MergeLocalityTensorAdapter)
         assert not isinstance(adapter, CpuRoundTripTensorAdapter)
         assert not isinstance(adapter, DequantRequantTensorAdapter)
         assert not isinstance(adapter, TensorCopyIntoAdapter)
         assert not isinstance(adapter, ParameterDataSwapTensorAdapter)
+
+    def test_parameter_value_preserves_dtensor_and_scales_local_shard(
+        self,
+        tp_mesh: Any,
+    ) -> None:
+        dt, full = _dtensor_weight(tp_mesh)
+        adapter = Adapter.from_state_dict(
+            {"weight": dt},
+            scale_parameter_values=True,
+        )
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.empty(dt.shape, device="meta"),
+            requires_grad=False,
+        )
+        offloader = ModelOffloader.from_module(model)
+
+        with activated_model(
+            offloader,
+            "cuda",
+            adapters=[adapter],
+            adapter_strengths=[0.5],
+            stochastic_rounding=False,
+        ):
+            actual = param_representation(model.weight)
+            assert _is_dtensor(actual)
+            assert actual.device_mesh == tp_mesh
+            torch.testing.assert_close(actual.full_tensor(), full * 0.5)
+
+        assert model.weight.is_meta
+
+    def test_permanent_parameter_value_scales_cpu_dtensor(
+        self,
+        tp_mesh: Any,
+    ) -> None:
+        dt, _ = _dtensor_weight(tp_mesh)
+        adapter = Adapter.from_state_dict(
+            {"weight": dt},
+            scale_parameter_values=True,
+        )
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.empty(dt.shape, device="meta"),
+            requires_grad=False,
+        )
+
+        assert (
+            merge_adapter(
+                model,
+                [(adapter, 0.5)],
+                stochastic_rounding=False,
+            )
+            == 1
+        )
+
+        actual = param_representation(model.weight)
+        assert _is_dtensor(actual)
+        assert actual.device_mesh.device_type == "cpu"
+        assert actual.placements == dt.placements
+        torch.testing.assert_close(
+            actual.to_local(),
+            dt.to_local().cpu() * 0.5,
+        )
 
     def test_composes_with_quantized_local_shard(self, tp_mesh: Any) -> None:
         # The crown-jewel claim: one adapter composes with every quant adapter.
@@ -604,6 +670,34 @@ class TestDTensorAdapter:
         # the reconstructed local shard is still the Float8 quant subclass
         assert isinstance(select_adapter(gpu_param.data.to_local()), Float8Adapter)
         assert gpu_param.data.placements == dt.placements
+
+        value_adapter = Adapter.from_state_dict(
+            {"weight": dt},
+            scale_parameter_values=True,
+        )
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.empty(dt.shape, device="meta"),
+            requires_grad=False,
+        )
+        offloader = ModelOffloader.from_module(model)
+        dense_source = Float8Adapter.dequantize(dt.to_local())
+        with activated_model(
+            offloader,
+            "cuda",
+            adapters=[value_adapter],
+            adapter_strengths=[0.5],
+            stochastic_rounding=False,
+        ):
+            actual = param_representation(model.weight)
+            assert _is_dtensor(actual)
+            assert isinstance(select_adapter(actual.to_local()), Float8Adapter)
+            torch.testing.assert_close(
+                Float8Adapter.dequantize(actual.to_local()),
+                dense_source * 0.5,
+                rtol=0.15,
+                atol=0.05,
+            )
 
     def test_packed_int8_extreme_strength_delegates_factor_aware_staging(
         self,

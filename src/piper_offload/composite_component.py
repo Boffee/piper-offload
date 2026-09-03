@@ -1,7 +1,7 @@
 """Composition of resident, transient, and block components."""
 
 import contextlib
-from collections.abc import Callable, Generator, Iterator, Sequence
+from collections.abc import Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Self
 
@@ -14,7 +14,7 @@ from .block_mode import BlockMode
 from .host_backing import HostBacking
 from .module_names import buffer_names, parameter_names
 from .pinned_component import PinnedComponent, PinnedComponentStore
-from .pinned_module import PostCopyHook
+from .pinned_module import ParameterOverride
 
 
 class CompositeComponent:
@@ -65,38 +65,40 @@ class CompositeComponent:
     def buffer_names(self) -> frozenset[str]:
         return frozenset(name for component in self._components() for name in component.buffer_names)
 
-    def component_for_param_name(
-        self,
-        param_name: str,
-    ) -> PinnedComponent | BlockComponent:
-        for component in self._components():
-            if param_name in component.param_names:
-                return component
-        raise KeyError(f"param name {param_name!r} is not managed by this composite")
-
-    def register_post_copy_hook(
-        self,
-        name: str,
-        hook: PostCopyHook,
-    ) -> Callable[[], None]:
-        return self.component_for_param_name(name).register_post_copy_hook(
-            name,
-            hook,
-        )
-
     def activate(
         self,
         device: torch.device,
         *,
         compile_blocks: bool = True,
+        parameter_overrides: Mapping[str, ParameterOverride] | None = None,
     ) -> None:
         if self._teardown_stack is not None:
             raise RuntimeError("CompositeComponent.activate() called while already active; deactivate() first.")
 
+        overrides = {} if parameter_overrides is None else dict(parameter_overrides)
+        if overrides:
+            unknown = sorted(set(overrides) - set(self.param_names))
+            if unknown:
+                raise ValueError(
+                    f"Parameter overrides contain unmanaged names: {unknown!r}."
+                )
+
         with contextlib.ExitStack() as stack:
             for component in self._components():
                 stack.callback(component.deactivate)
-                component.activate(device, compile_blocks=compile_blocks)
+                component.activate(
+                    device,
+                    compile_blocks=compile_blocks,
+                    parameter_overrides=(
+                        {
+                            name: override
+                            for name, override in overrides.items()
+                            if name in component.param_names
+                        }
+                        if overrides
+                        else None
+                    ),
+                )
             self._teardown_stack = stack.pop_all()
 
     def deactivate(self) -> None:

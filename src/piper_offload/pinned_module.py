@@ -12,7 +12,8 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Self, cast
 
 import torch
@@ -27,7 +28,30 @@ from .tensor_adapter_registry import (
     param_tensor_id,
 )
 
-type PostCopyHook = Callable[[nn.Parameter], None]
+type ParameterUpdate = Callable[[nn.Parameter], None]
+
+
+@dataclass(frozen=True, slots=True)
+class ParameterOverride:
+    """Activation-scoped replacement source and/or in-place update."""
+
+    source: PinnedParam | None = None
+    update: ParameterUpdate | None = None
+
+    def __post_init__(self) -> None:
+        if self.source is None and self.update is None:
+            raise ValueError(
+                "ParameterOverride requires a replacement source, an "
+                "update, or both."
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ParameterLoad:
+    """Resolved source and optional update for one active parameter."""
+
+    source: PinnedParam
+    update: ParameterUpdate | None = None
 
 
 @dataclass(slots=True)
@@ -36,6 +60,7 @@ class PinnedParamTarget:
 
     _state: object
     param: nn.Parameter
+    _backing: PinnedParam
 
 
 @dataclass(slots=True)
@@ -158,24 +183,17 @@ class PinnedModuleStore:
 class PinnedModuleInstance:
     """One concrete module bound to pinned parameter and buffer backings.
 
-    Owns the :class:`nn.Module` whose managed params and buffers are
-    backed by this instance's pinned host bytes, plus the copy machinery
-    to stream them to (and trainable bytes back from) a GPU
-    :class:`PinnedModuleTarget`. :meth:`load_to_target` copies into a
-    target and installs that active storage onto :attr:`module`;
-    :meth:`install_pinned` installs the pinned host bytes onto
-    :attr:`module`. :meth:`copy_to_target` and
-    :meth:`copy_trainables_from_target` touch no module at all.
+    Owns the :class:`nn.Module` whose managed params and buffers are backed by
+    this instance's pinned host bytes, including trainable target-to-host
+    synchronization. :meth:`resolve_load_plan` combines activation-scoped
+    overrides with immutable model backing; the resulting plan owns target
+    allocation and loading. :meth:`install_pinned` restores the pinned host
+    bytes onto :attr:`module`.
     """
 
     module: nn.Module
     params: Mapping[str, PinnedParam]
     buffers: Mapping[str, PinnedBuffer]
-    _post_copy_hooks: dict[int, PostCopyHook] = field(
-        default_factory=dict,
-        init=False,
-        repr=False,
-    )
 
     @property
     def has_trainables(self) -> bool:
@@ -208,147 +226,49 @@ class PinnedModuleInstance:
             {name: buffer_target.tensor for name, buffer_target in target.buffer_targets.items()},
         )
 
-    def refill_param_target(
+    def resolve_load_plan(
         self,
-        name: str,
-        target: PinnedParamTarget,
-    ) -> None:
-        """Refill one existing parameter target without module mutation.
-
-        This is the copy primitive used by compiled rolling streaming. The
-        target wrapper remains installed on every homogeneous block while its
-        backing bytes are replaced in place.
-        """
-        pinned = self.params.get(name)
-        if pinned is None:
-            raise ValueError(f"param name {name!r} is not owned by this PinnedModuleInstance")
-        pinned.copy_to_gpu(target._state, non_blocking=True)
-        pinned.rearm_after_load(target.param, target._state)
-        hook = self._post_copy_hooks.get(id(pinned))
-        if hook is not None:
-            hook(target.param)
-
-    def allocate_target(
-        self,
-        device: torch.device,
-        *,
-        param_names: Iterable[str] | None = None,
-        buffer_names: Iterable[str] | None = None,
-    ) -> PinnedModuleTarget:
-        """Allocate active storage for selected bound entries on ``device``."""
-        _validate_cuda_device(device)
-        params = (
-            self.materialized_params
-            if param_names is None
-            else _select_known_names(self.params, param_names)
-        )
-        buffers = _select_known_names(self.buffers, buffer_names)
-        return PinnedModuleTarget(
-            param_targets=_allocate_param_targets(params, device),
-            buffer_targets=_allocate_buffer_targets(buffers, device),
-        )
-
-    @property
-    def materialized_params(self) -> dict[str, PinnedParam]:
-        """Parameters that require physical storage in this activation.
-
-        Physical parameters always require a target. Meta parameters require
-        one only while a post-copy transform is registered to populate them.
-        """
-        return {
-            name: pinned
-            for name, pinned in self.params.items()
-            if not pinned.is_meta
-            or id(pinned) in self._post_copy_hooks
-        }
-
-    def register_post_copy_hook(
-        self,
-        name: str,
-        hook: PostCopyHook,
-    ) -> Callable[[], None]:
-        """Register a post-copy hook and return a callable that removes it."""
-        key = self.post_copy_hook_key(name)
-        if key in self._post_copy_hooks:
-            raise RuntimeError(
-                "post-copy hook already registered for "
-                f"param name {name!r}. Duplicate or shared adapter "
-                "targets for the same parameter backing are unsupported."
+        overrides: Mapping[str, ParameterOverride] | None = None,
+    ) -> PinnedModuleLoadPlan:
+        """Resolve one immutable activation plan against model alias groups."""
+        selected = {} if overrides is None else dict(overrides)
+        unknown = sorted(set(selected) - set(self.params))
+        if unknown:
+            raise ValueError(
+                f"Cannot override unknown parameter names: {_format_names(unknown)}."
             )
-        self._post_copy_hooks[key] = hook
-        hooks = self._post_copy_hooks
-        removed = False
 
-        def remove_hook() -> None:
-            nonlocal removed
-            if removed:
-                return
-            hooks.pop(key, None)
-            removed = True
+        overrides_by_pinned: dict[int, ParameterOverride] = {}
+        for name, override in selected.items():
+            if not isinstance(override, ParameterOverride):
+                raise ValueError(
+                    "Parameter overrides must be ParameterOverride "
+                    f"instances; {name!r} has {type(override).__name__}."
+                )
+            key = id(self.params[name])
+            previous = overrides_by_pinned.get(key)
+            if previous is not None and not _same_load_override(previous, override):
+                raise ValueError(
+                    "Tied parameter aliases cannot use different activation "
+                    f"overrides; conflict at {name!r}."
+                )
+            overrides_by_pinned[key] = override
 
-        return remove_hook
-
-    def post_copy_hook_key(self, name: str) -> int:
-        """Stable hook/dedup key for a managed parameter name."""
-        if name not in self.params:
-            raise ValueError(f"param name {name!r} is not owned by this PinnedModuleInstance")
-        return id(self.params[name])
-
-    def load_to_target(
-        self,
-        target: PinnedModuleTarget,
-        *,
-        run_post_copy_hooks: bool = False,
-        non_blocking: bool = False,
-    ) -> None:
-        """Copy selected pinned bytes into ``target`` and install them.
-
-        Copies the selected pinned params and buffers into ``target``,
-        runs any registered post-copy hooks, then repoints :attr:`module`'s
-        managed attributes at the filled target storage. Copying and hooks
-        complete before any module mutation, so a copy failure does not
-        leave :attr:`module` partially active.
-        """
-        self.copy_to_target(
-            target,
-            run_post_copy_hooks=run_post_copy_hooks,
-            non_blocking=non_blocking,
-        )
-        self.install_target(target)
-
-    def copy_to_target(
-        self,
-        target: PinnedModuleTarget,
-        *,
-        run_post_copy_hooks: bool = False,
-        non_blocking: bool = False,
-    ) -> None:
-        """Copy selected pinned bytes into ``target`` without installation.
-
-        Post-copy hooks run after their base parameter copies and before this
-        method returns, so a staged target is complete before any instance
-        exposes it through its module registry.
-        """
-        _validate_target_names_known(self.params, self.buffers, target)
-        params = _items_for_names(self.params, target.param_targets)
-        buffers = _items_for_names(self.buffers, target.buffer_targets)
-
-        _copy_params_to_target(
-            params,
-            target.param_targets,
-            non_blocking=non_blocking,
-        )
-        if run_post_copy_hooks:
-            _run_post_copy_hooks(
-                params,
-                target.param_targets,
-                self._post_copy_hooks,
-            )
-        _copy_buffers_to_target(
-            buffers,
-            target.buffer_targets,
-            non_blocking=non_blocking,
-        )
+        loads_by_pinned: dict[int, ParameterLoad | None] = {}
+        parameters: dict[str, ParameterLoad] = {}
+        for name, base in self.params.items():
+            key = id(base)
+            if key not in loads_by_pinned:
+                override = overrides_by_pinned.get(key)
+                loads_by_pinned[key] = _resolve_parameter_load(
+                    name,
+                    base,
+                    override,
+                )
+            load = loads_by_pinned[key]
+            if load is not None:
+                parameters[name] = load
+        return PinnedModuleLoadPlan(self, parameters)
 
     def copy_trainables_from_target(
         self,
@@ -404,6 +324,123 @@ class PinnedModuleInstance:
                 continue
             seen.add(param_id)
             yield param
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class PinnedModuleLoadPlan:
+    """Resolved parameter loads for one module activation.
+
+    The bound instance retains model-name and alias ownership. This plan owns
+    only the activation's effective sources and updates, so target allocation,
+    copying, and mutation all consume the same immutable description.
+    """
+
+    instance: PinnedModuleInstance
+    loads: Mapping[str, ParameterLoad]
+
+    def __init__(
+        self,
+        instance: PinnedModuleInstance,
+        loads: Mapping[str, ParameterLoad],
+    ) -> None:
+        selected = dict(loads)
+        unknown = sorted(set(selected) - set(instance.params))
+        if unknown:
+            raise ValueError(
+                f"Parameter load plan contains unknown names: {_format_names(unknown)}."
+            )
+        for name, load in selected.items():
+            if not isinstance(load, ParameterLoad):
+                raise ValueError(
+                    "Resolved parameter loads must be ParameterLoad instances; "
+                    f"{name!r} has {type(load).__name__}."
+                )
+        _validate_alias_loads(instance.params, selected)
+        object.__setattr__(self, "instance", instance)
+        object.__setattr__(self, "loads", MappingProxyType(selected))
+
+    @property
+    def sources(self) -> dict[str, PinnedParam]:
+        """Effective source backing for every parameter loaded by this plan."""
+        return {name: load.source for name, load in self.loads.items()}
+
+    def select_parameters(
+        self,
+        names: Iterable[str],
+    ) -> PinnedModuleLoadPlan:
+        """Return a plan containing only the requested active parameters."""
+        return PinnedModuleLoadPlan(
+            self.instance,
+            _select_known_names(self.loads, names),
+        )
+
+    def allocate_target(
+        self,
+        device: torch.device,
+        *,
+        buffer_names: Iterable[str] | None = None,
+    ) -> PinnedModuleTarget:
+        """Allocate target storage from this plan's effective sources."""
+        _validate_cuda_device(device)
+        params = self.sources
+        buffers = _select_known_names(self.instance.buffers, buffer_names)
+        return PinnedModuleTarget(
+            param_targets=_allocate_param_targets(
+                params,
+                _items_for_names(self.instance.params, params),
+                device,
+            ),
+            buffer_targets=_allocate_buffer_targets(buffers, device),
+        )
+
+    def refill_param_target(
+        self,
+        name: str,
+        target: PinnedParamTarget,
+        *,
+        non_blocking: bool = True,
+    ) -> None:
+        """Refill one target and immediately apply its planned update."""
+        if name not in self.instance.params:
+            raise ValueError(
+                f"param name {name!r} is not owned by this PinnedModuleInstance"
+            )
+        load = self.loads.get(name)
+        if load is None:
+            return
+        _load_param_target(load, target, non_blocking=non_blocking)
+
+    def load_to_target(
+        self,
+        target: PinnedModuleTarget,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
+        """Load this plan into ``target`` and install it on the module."""
+        self.copy_to_target(target, non_blocking=non_blocking)
+        self.instance.install_target(target)
+
+    def copy_to_target(
+        self,
+        target: PinnedModuleTarget,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
+        """Copy sources, apply updates, and leave module registries untouched."""
+        instance = self.instance
+        _validate_target_names_known(instance.params, instance.buffers, target)
+        loads = _items_for_names(self.loads, target.param_targets)
+        buffers = _items_for_names(instance.buffers, target.buffer_targets)
+        _load_params_to_target(
+            loads,
+            target.param_targets,
+            non_blocking=non_blocking,
+        )
+        _copy_buffers_to_target(
+            buffers,
+            target.buffer_targets,
+            non_blocking=non_blocking,
+        )
 
 
 def _pin_params(
@@ -634,20 +671,85 @@ def _validate_names_present(
     raise ValueError(f"Module is missing pinned names: {'; '.join(details)}.")
 
 
+def _same_load_override(
+    left: ParameterOverride,
+    right: ParameterOverride,
+) -> bool:
+    return left.source is right.source and left.update is right.update
+
+
+def _resolve_parameter_load(
+    name: str,
+    base: PinnedParam,
+    override: ParameterOverride | None,
+) -> ParameterLoad | None:
+    if override is None:
+        return None if base.is_meta else ParameterLoad(base)
+
+    source = override.source
+    if source is None:
+        if base.is_meta:
+            raise ValueError(
+                f"Meta parameter {name!r} requires a physical replacement source."
+            )
+        source = base
+    elif not isinstance(source, PinnedParam):
+        raise ValueError(
+            f"Parameter load source for {name!r} must be a PinnedParam; "
+            f"got {type(source).__name__}."
+        )
+    if source.is_meta:
+        raise ValueError(
+            f"Parameter load source for {name!r} must own physical storage."
+        )
+    if source.logical_shape != base.logical_shape:
+        raise ValueError(
+            f"Parameter load source shape mismatch for {name!r}: source has "
+            f"{source.logical_shape}, model slot has {base.logical_shape}."
+        )
+    if source.requires_grad != base.requires_grad:
+        raise ValueError(
+            f"Parameter load source requires_grad mismatch for {name!r}: "
+            f"source has {source.requires_grad}, model slot has {base.requires_grad}."
+        )
+    return ParameterLoad(source, override.update)
+
+
+def _validate_alias_loads(
+    identities: Mapping[str, PinnedParam],
+    loads: Mapping[str, ParameterLoad],
+) -> None:
+    by_identity: dict[int, ParameterLoad] = {}
+    for name, load in loads.items():
+        key = id(identities[name])
+        previous = by_identity.get(key)
+        if previous is not None and (
+            previous.source is not load.source
+            or previous.update is not load.update
+        ):
+            raise ValueError(
+                "Tied parameter aliases cannot resolve to different loads; "
+                f"conflict at {name!r}."
+            )
+        by_identity[key] = load
+
+
 def _allocate_param_targets(
     params: Mapping[str, PinnedParam],
+    identities: Mapping[str, PinnedParam],
     device: torch.device,
 ) -> dict[str, PinnedParamTarget]:
     targets_by_pinned_id: dict[int, PinnedParamTarget] = {}
     targets_by_name: dict[str, PinnedParamTarget] = {}
     for name, pinned in params.items():
-        key = id(pinned)
+        key = id(identities[name])
         target = targets_by_pinned_id.get(key)
         if target is None:
             state = pinned.allocate_gpu_storage(device)
             target = PinnedParamTarget(
                 _state=state,
                 param=pinned.make_gpu_param(state),
+                _backing=pinned,
             )
             targets_by_pinned_id[key] = target
         targets_by_name[name] = target
@@ -683,22 +785,45 @@ def _allocate_buffer_targets(
     return targets_by_name
 
 
-def _copy_params_to_target(
-    params: Mapping[str, PinnedParam],
+def _load_params_to_target(
+    loads: Mapping[str, ParameterLoad],
     targets: Mapping[str, PinnedParamTarget],
     *,
     non_blocking: bool,
 ) -> None:
     copied: set[int] = set()
-    for name, pinned in params.items():
-        key = id(pinned)
+    for name, load in loads.items():
+        target = targets[name]
+        key = id(target)
         if key in copied:
             continue
-        pinned.copy_to_gpu(targets[name]._state, non_blocking=non_blocking)
-        # Re-arm the reused wrapper at the freshly-loaded buffers (no-op
-        # unless the adapter migrates state off the wrapper, e.g. bnb int8).
-        pinned.rearm_after_load(targets[name].param, targets[name]._state)
+        _load_param_target(
+            load,
+            target,
+            non_blocking=non_blocking,
+        )
         copied.add(key)
+
+
+def _load_param_target(
+    load: ParameterLoad,
+    target: PinnedParamTarget,
+    *,
+    non_blocking: bool,
+) -> None:
+    """Copy one source and immediately apply its optional update."""
+    source = load.source
+    if source.target_layout != target._backing.target_layout:
+        raise RuntimeError(
+            "Parameter target layout does not match the active load source. "
+            "Reallocate the target for the current activation plan."
+        )
+    source.copy_to_gpu(target._state, non_blocking=non_blocking)
+    # Re-arm the reused wrapper at the freshly-loaded buffers (no-op unless
+    # the adapter migrates state off the wrapper, e.g. bitsandbytes int8).
+    source.rearm_after_load(target.param, target._state)
+    if load.update is not None:
+        load.update(target.param)
 
 
 def _copy_buffers_to_target(
@@ -731,22 +856,6 @@ def _copy_trainable_params_from_target(
             continue
         pinned.copy_to_cpu(targets[name]._state, non_blocking=non_blocking)
         copied.add(key)
-
-
-def _run_post_copy_hooks(
-    params: Mapping[str, PinnedParam],
-    targets: Mapping[str, PinnedParamTarget],
-    hooks: Mapping[int, PostCopyHook],
-) -> None:
-    seen: set[int] = set()
-    for name, pinned in params.items():
-        key = id(pinned)
-        if key in seen:
-            continue
-        seen.add(key)
-        hook = hooks.get(key)
-        if hook is not None:
-            hook(targets[name].param)
 
 
 def _install_pinned_params(
@@ -857,10 +966,13 @@ def _format_names(names: Iterable[str]) -> str:
 
 
 __all__ = [
+    "ParameterLoad",
+    "ParameterOverride",
+    "ParameterUpdate",
     "PinnedBufferTarget",
     "PinnedModuleInstance",
+    "PinnedModuleLoadPlan",
     "PinnedModuleStore",
     "PinnedModuleTarget",
     "PinnedParamTarget",
-    "PostCopyHook",
 ]

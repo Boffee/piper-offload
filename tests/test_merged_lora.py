@@ -11,6 +11,7 @@ CUDA-only tests gate on availability.
 from array import array
 from collections.abc import Sequence
 from pathlib import Path
+from weakref import WeakKeyDictionary
 
 import pytest
 import torch
@@ -47,7 +48,7 @@ from piper_offload import (
     merge_adapter,
 )
 from piper_offload.gguf_adapter import GgufAdapter
-from piper_offload.pinned_module import PinnedModuleInstance
+from piper_offload.pinned_module import ParameterOverride, PinnedModuleInstance
 from piper_offload.pinned_param import PinnedParam
 from piper_offload.quanto_adapter import QuantoAdapter
 from piper_offload.protocols import (
@@ -255,6 +256,7 @@ def _request_loras(
     *,
     mode: AdapterMode = "merge",
 ) -> None:
+    _MERGE_OVERRIDES.pop(strategy, None)
     normalized = strategy._normalize_adapters(
         [lora for lora, _strength in loras],
         adapter_strengths=[strength for _lora, strength in loras],
@@ -266,6 +268,10 @@ _LORA_REQUESTS: dict[
     ModelOffloader,
     tuple[list[tuple[Adapter, float]], AdapterMode],
 ] = {}
+_MERGE_OVERRIDES: WeakKeyDictionary[
+    ModelOffloader,
+    dict[str, ParameterOverride],
+] = WeakKeyDictionary()
 
 
 def _activate(
@@ -342,18 +348,32 @@ def _make_strategy(model: nn.Module) -> ModelOffloader:
     return _make_model_offloader(model, block_paths=["transformer_blocks"])
 
 
-def _has_post_copy_hook(strategy: ModelOffloader, target_key: str) -> bool:
-    """Check whether a merge hook is installed for the given target."""
+def _has_parameter_update(strategy: ModelOffloader, target_key: str) -> bool:
+    """Check whether test-built overrides resolve to an update for a target."""
     if target_key not in strategy.param_names:
         return False
-    param_name = target_key
-    component = strategy._composite.component_for_param_name(param_name)
-    if isinstance(component, PinnedComponent):
-        instance = component._instance
-        return instance.post_copy_hook_key(param_name) in instance._post_copy_hooks
-    if isinstance(component, BlockComponent):
-        instance, local = component._resolve_param_name(param_name)
-        return instance.post_copy_hook_key(local) in instance._post_copy_hooks
+    overrides = _MERGE_OVERRIDES.get(strategy)
+    if overrides is None:
+        return False
+    for component in strategy._composite._components():
+        if target_key not in component.param_names:
+            continue
+        local_overrides = {
+            name: override
+            for name, override in overrides.items()
+            if name in component.param_names
+        }
+        if isinstance(component, PinnedComponent):
+            load = component._instance.resolve_load_plan(
+                local_overrides
+            ).loads.get(target_key)
+            return load is not None and load.update is not None
+        if isinstance(component, BlockComponent):
+            instance, local = component._resolve_param_name(target_key)
+            plans = component._resolve_load_plans(local_overrides)
+            plan = next(plan for plan in plans if plan.instance is instance)
+            load = plan.loads.get(local)
+            return load is not None and load.update is not None
     return False
 
 
@@ -364,16 +384,30 @@ def _activate_loras_for_test(
     if mode == "merge":
         targets = strategy._group_adapter_updates_by_param_name(loras)
         try:
-            strategy._register_merge_adapter_hooks(torch.device("cuda"), targets)
+            overrides = strategy._build_merge_parameter_overrides(
+                torch.device("cuda"), targets
+            )
+            for component in strategy._composite._components():
+                local_overrides = {
+                    name: override
+                    for name, override in overrides.items()
+                    if name in component.param_names
+                }
+                if isinstance(component, PinnedComponent):
+                    component._instance.resolve_load_plan(local_overrides)
+                elif isinstance(component, BlockComponent):
+                    component._resolve_load_plans(local_overrides)
         except BaseException:
-            strategy._clear_active_adapter_hooks()
+            _MERGE_OVERRIDES.pop(strategy, None)
             raise
+        _MERGE_OVERRIDES[strategy] = overrides
         return len(targets)
+    _MERGE_OVERRIDES.pop(strategy, None)
     targets = strategy._group_adapter_updates_by_param_name(loras)
-    before = len(strategy._adapter_hook_removers)
+    before = len(strategy._routed_hook_removers)
     try:
         strategy._register_routed_lora_hooks(targets)
-        return len(strategy._adapter_hook_removers) - before
+        return len(strategy._routed_hook_removers) - before
     finally:
         strategy._clear_active_adapter_hooks()
 
@@ -721,32 +755,32 @@ class TestLoRAConstruction:
         assert isinstance(scaled, ScaledParameterValue)
         assert scaled.value is value
         assert scaled.strength == 0.25
-        assert scaled.materialization_strength == 0.25
-        assert value.scale_with_strength
+        assert scaled.effective_strength == 1.0
+        assert not value.scale_with_strength
         assert lora.cache_bytes == weight.nbytes + bias.nbytes
         with pytest.raises(TypeError):
             lora.targets["other"] = next(iter(lora.targets.values()))  # type: ignore[index]
 
-    def test_parameter_value_resource_can_ignore_adapter_strength(self) -> None:
+    def test_parameter_value_resource_can_scale_with_adapter_strength(self) -> None:
         source = torch.randn(3, 4)
         adapter = Adapter.from_state_dict(
             {"target.weight": source},
-            scale_parameter_values=False,
+            scale_parameter_values=True,
         )
 
         value = adapter.targets["target.weight"]
         assert isinstance(value, ParameterValue)
-        assert not value.scale_with_strength
+        assert value.scale_with_strength
         scaled = value.scaled(-0.25)
         assert scaled.strength == -0.25
-        assert scaled.materialization_strength == 1.0
+        assert scaled.effective_strength == -0.25
 
         direct = ParameterValue.from_tensor(
             source,
             pin_memory=False,
-            scale_with_strength=False,
+            scale_with_strength=True,
         )
-        assert not direct.scale_with_strength
+        assert direct.scale_with_strength
 
     def test_factor_and_parameter_value_cannot_share_target(self) -> None:
         sd = _make_lora_sd(num_blocks=1, dim=4, rank=2)
@@ -800,6 +834,20 @@ class TestLoRAConstruction:
                 dtype=torch.bfloat16,
                 host_backing="adopt",
             )
+
+    def test_parameter_value_payload_finiteness_is_caller_owned(self) -> None:
+        nan_value = Adapter.from_state_dict(
+            {"target.weight": torch.tensor([float("nan")])},
+        ).targets["target.weight"]
+        assert isinstance(nan_value, ParameterValue)
+        assert torch.isnan(nan_value.backing.make_cpu_param()).all()
+
+        infinite_value = Adapter.from_state_dict(
+            {"target.weight": torch.tensor([1.0e10])},
+            dtype=torch.float16,
+        ).targets["target.weight"]
+        assert isinstance(infinite_value, ParameterValue)
+        assert torch.isinf(infinite_value.backing.make_cpu_param()).all()
 
 
 # ---------------------------------------------------------------------------
@@ -856,7 +904,7 @@ class TestParameterDelta:
                     adapter_mode="routed",
                 )
             assert offloader.active_device is None
-            assert offloader._adapter_hook_removers == []
+            assert offloader._routed_hook_removers == []
 
         torch.testing.assert_close(model.target.weight, before)
 
@@ -1251,7 +1299,7 @@ class TestParameterDelta:
             offloader.activate("cpu", adapters=[adapter], adapter_mode="routed")
 
         assert offloader.active_device is None
-        assert offloader._adapter_hook_removers == []
+        assert offloader._routed_hook_removers == []
 
     def test_transform_requires_validation_before_dense_application(self) -> None:
         target = nn.Parameter(torch.zeros(2, 3), requires_grad=False)
@@ -1321,7 +1369,7 @@ class TestActivationLoraValidation:
             stochastic_rounding=True,
         )
         try:
-            assert s._adapter_hook_removers == []
+            assert s._routed_hook_removers == []
             torch.testing.assert_close(m(x), expected)
         finally:
             s.deactivate()
@@ -1368,7 +1416,7 @@ class TestActivationLoraValidation:
         _request_loras(s, [(Adapter.from_state_dict(state_dict=sd), 1.0)])
         with pytest.raises(ValueError, match="B@A produces"):
             _activate_loras_for_test(s)
-        assert not _has_post_copy_hook(
+        assert not _has_parameter_update(
             s,
             "transformer_blocks.0.attn.weight",
         )
@@ -1379,9 +1427,9 @@ class TestActivationLoraValidation:
             p.requires_grad = False
         s = _make_strategy(m)
         _request_loras(s, [(_make_lora(4, 16), 1.0)])
-        assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
+        assert not _has_parameter_update(s, "transformer_blocks.0.attn.weight")
         _activate_loras_for_test(s)
-        assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
+        assert _has_parameter_update(s, "transformer_blocks.0.attn.weight")
 
     def test_non_block_targets_matched(self) -> None:
         m = _make_bf16_model()
@@ -1392,7 +1440,7 @@ class TestActivationLoraValidation:
         }
         _request_loras(s, [(Adapter.from_state_dict(state_dict=sd), 1.0)])
         _activate_loras_for_test(s)
-        assert _has_post_copy_hook(s, "embed.weight")
+        assert _has_parameter_update(s, "embed.weight")
 
     def test_non_block_tied_alias_target_matched(self) -> None:
         m = _make_tied_non_block_model(dtype=torch.bfloat16)
@@ -1403,8 +1451,8 @@ class TestActivationLoraValidation:
         }
         _request_loras(s, [(Adapter.from_state_dict(state_dict=sd), 1.0)], mode="merge")
         _activate_loras_for_test(s)
-        assert _has_post_copy_hook(s, "head.weight")
-        assert _has_post_copy_hook(s, "embed.weight")
+        assert _has_parameter_update(s, "head.weight")
+        assert _has_parameter_update(s, "embed.weight")
 
     def test_rejects_duplicate_tied_alias_targets(self) -> None:
         m = _make_tied_non_block_model(dtype=torch.bfloat16)
@@ -1416,10 +1464,10 @@ class TestActivationLoraValidation:
             "head.lora_B.weight": torch.randn(16, 4),
         }
         _request_loras(s, [(Adapter.from_state_dict(state_dict=sd), 1.0)], mode="merge")
-        with pytest.raises(RuntimeError, match="shared adapter targets"):
+        with pytest.raises(ValueError, match="Tied parameter aliases"):
             _activate_loras_for_test(s)
-        assert not _has_post_copy_hook(s, "embed.weight")
-        assert not _has_post_copy_hook(s, "head.weight")
+        assert not _has_parameter_update(s, "embed.weight")
+        assert not _has_parameter_update(s, "head.weight")
 
     def test_streamed_block_shared_submodule_alias_target_matched(self) -> None:
         class Block(nn.Module):
@@ -1445,8 +1493,8 @@ class TestActivationLoraValidation:
         }
         _request_loras(s, [(Adapter.from_state_dict(state_dict=sd), 1.0)], mode="merge")
         _activate_loras_for_test(s)
-        assert _has_post_copy_hook(s, "transformer_blocks.0.b.weight")
-        assert _has_post_copy_hook(s, "transformer_blocks.0.a.weight")
+        assert _has_parameter_update(s, "transformer_blocks.0.b.weight")
+        assert _has_parameter_update(s, "transformer_blocks.0.a.weight")
 
     def test_exact_keys_match(self) -> None:
         m = _make_bf16_model()
@@ -1454,7 +1502,7 @@ class TestActivationLoraValidation:
         lora = _make_lora(4, 16)
         _request_loras(s, [(lora, 1.0)])
         _activate_loras_for_test(s)
-        assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
+        assert _has_parameter_update(s, "transformer_blocks.0.attn.weight")
 
     def test_prefixed_keys_rejected(self) -> None:
         # Keys are verbatim, so a ``diffusion_model.``-prefixed adapter does not
@@ -1465,7 +1513,7 @@ class TestActivationLoraValidation:
         _request_loras(s, [(lora, 1.0)])
         with pytest.raises(ValueError, match="Adapter target .* is not managed"):
             _activate_loras_for_test(s)
-        assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
+        assert not _has_parameter_update(s, "transformer_blocks.0.attn.weight")
 
     @pytest.mark.parametrize("mode", ["merge", "routed"])
     def test_partial_targets_apply_intersection(self, mode: AdapterMode) -> None:
@@ -1479,7 +1527,7 @@ class TestActivationLoraValidation:
 
         assert _activate_loras_for_test(s) == 1
         if mode == "merge":
-            assert _has_post_copy_hook(
+            assert _has_parameter_update(
                 s,
                 "transformer_blocks.0.attn.weight",
             )
@@ -1512,8 +1560,8 @@ class TestActivationLoraValidation:
 
         with pytest.raises(ValueError, match="Adapter target .* is not managed"):
             _activate_loras_for_test(s)
-        assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
-        assert not _has_post_copy_hook(
+        assert not _has_parameter_update(s, "transformer_blocks.0.attn.weight")
+        assert not _has_parameter_update(
             s,
             "transformer_blocks.0.attn.base_layer.weight",
         )
@@ -1526,14 +1574,15 @@ class TestActivationLoraValidation:
         with pytest.raises(ValueError, match="merge mode requires CUDA"):
             _activate(s, "cpu")
 
-    def test_clear_active_adapter_hooks_clears_previous_merge_hooks(self) -> None:
+    def test_merge_overrides_do_not_enter_routed_hook_registry(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         _request_loras(s, [(_make_lora(4, 16, rank=4), 1.0)])
         _activate_loras_for_test(s)
-        assert _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
+        assert _has_parameter_update(s, "transformer_blocks.0.attn.weight")
+        assert s._routed_hook_removers == []
         s._clear_active_adapter_hooks()
-        assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
+        assert _has_parameter_update(s, "transformer_blocks.0.attn.weight")
 
     def test_accepts_quanto_target_in_merge_mode(self) -> None:
         quanto = pytest.importorskip("optimum.quanto")
@@ -1561,7 +1610,7 @@ class TestActivationLoraValidation:
         }
         _request_loras(s, [(Adapter.from_state_dict(state_dict=sd), 1.0)], mode="merge")
         assert _activate_loras_for_test(s) == 1
-        assert _has_post_copy_hook(s, "embed.weight")
+        assert _has_parameter_update(s, "embed.weight")
 
         # routed mode must still accept it.
         _request_loras(s, [(Adapter.from_state_dict(state_dict=sd), 1.0)], mode="routed")
@@ -1582,7 +1631,7 @@ class TestActivationLoraValidation:
         _request_loras(s, [(Adapter.from_state_dict(state_dict=sd), 1.0)], mode="merge")
         with pytest.raises(ValueError, match="floating-point compute dtype"):
             _activate_loras_for_test(s)
-        assert not _has_post_copy_hook(s, "embed.weight")
+        assert not _has_parameter_update(s, "embed.weight")
 
     def test_accepts_fp16_base(self) -> None:
         m = _make_bf16_model().to(torch.float16)
@@ -1605,7 +1654,7 @@ class TestActivationLoraValidation:
             actual = m(x)
             expected = _expected_routed_output(m, x, loras)
             assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-5)
-            assert not _has_post_copy_hook(s, "transformer_blocks.0.attn.weight")
+            assert not _has_parameter_update(s, "transformer_blocks.0.attn.weight")
         finally:
             s.deactivate()
 
@@ -3314,7 +3363,7 @@ class TestParameterValueActivation:
             offloader.activate("cpu", adapters=[lora], adapter_mode="routed")
 
         assert offloader.active_device is None
-        assert offloader._adapter_hook_removers == []
+        assert offloader._routed_hook_removers == []
 
     @CUDA
     def test_parameter_value_rejects_physical_base(self) -> None:
@@ -3367,23 +3416,20 @@ class TestParameterValueActivation:
         )
         try:
             assert model.weight.device.type == "cuda"
-            torch.testing.assert_close(model.weight.cpu(), value * -0.5)
+            torch.testing.assert_close(model.weight.cpu(), value)
         finally:
             offloader.deactivate()
 
         assert model.weight.is_meta
 
     @CUDA
-    def test_parameter_value_can_ignore_activation_strength(self) -> None:
+    def test_parameter_value_does_not_scale_by_default(self) -> None:
         with torch.device("meta"):
             model = nn.Linear(3, 2, bias=False)
         model.requires_grad_(False)
         offloader = ModelOffloader.from_module(model)
         value = torch.randn(2, 3)
-        adapter = Adapter.from_state_dict(
-            {"weight": value},
-            scale_parameter_values=False,
-        )
+        adapter = Adapter.from_state_dict({"weight": value})
 
         offloader.activate(
             "cuda",
@@ -3531,11 +3577,7 @@ class TestPermanentMerge:
         assert model.weight is weight
         torch.testing.assert_close(model.weight, base)
 
-    @pytest.mark.parametrize("strength", [1.0, 0.5])
-    def test_parameter_value_rejects_source_outside_target_range(
-        self,
-        strength: float,
-    ) -> None:
+    def test_parameter_value_source_owns_dtype_and_range(self) -> None:
         source = torch.tensor([65520.0], dtype=torch.float32)
         model = nn.Module()
         model.weight = nn.Parameter(
@@ -3544,22 +3586,25 @@ class TestPermanentMerge:
         )
         value = Adapter.from_state_dict({"weight": source})
 
-        with pytest.raises(ValueError, match="source exceeds the finite range"):
-            merge_adapter(model, [(value, strength)])
-        assert model.weight.is_meta
+        assert merge_adapter(model, [(value, 0.5)]) == 1
+        assert model.weight.dtype is torch.float32
+        torch.testing.assert_close(model.weight, source)
 
-    def test_parameter_value_rejects_scaled_value_outside_target_range(self) -> None:
+    def test_parameter_value_explicit_scaling_uses_source_compute_dtype(self) -> None:
         source = torch.tensor([40_000.0], dtype=torch.float32)
         model = nn.Module()
         model.weight = nn.Parameter(
             torch.empty(source.shape, device="meta", dtype=torch.float16),
             requires_grad=False,
         )
-        value = Adapter.from_state_dict({"weight": source})
+        value = Adapter.from_state_dict(
+            {"weight": source},
+            scale_parameter_values=True,
+        )
 
-        with pytest.raises(ValueError, match="Scaled parameter value exceeds"):
-            merge_adapter(model, [(value, 2.0)])
-        assert model.weight.is_meta
+        assert merge_adapter(model, [(value, 2.0)]) == 1
+        assert model.weight.dtype is torch.float32
+        torch.testing.assert_close(model.weight, source * 2.0)
 
     def test_parameter_value_ignores_strength_for_range_and_materialization(self) -> None:
         source = torch.tensor([40_000.0], dtype=torch.float32)
@@ -3570,35 +3615,13 @@ class TestPermanentMerge:
         )
         value = Adapter.from_state_dict(
             {"weight": source},
-            scale_parameter_values=False,
         )
 
         assert merge_adapter(model, [(value, 0.0)]) == 0
         assert model.weight.is_meta
         assert merge_adapter(model, [(value, 2.0)]) == 1
-        assert model.weight.dtype is torch.float16
-        torch.testing.assert_close(model.weight, source.to(torch.float16))
-
-    @pytest.mark.parametrize(
-        ("source_value", "strength"),
-        [(1e-8, 1.0), (1e-4, 1e-4)],
-        ids=["source-conversion", "scaled-value"],
-    )
-    def test_parameter_value_allows_rounding_to_zero(
-        self,
-        source_value: float,
-        strength: float,
-    ) -> None:
-        source = torch.tensor([source_value], dtype=torch.float32)
-        model = nn.Module()
-        model.weight = nn.Parameter(
-            torch.empty(source.shape, device="meta", dtype=torch.float16),
-            requires_grad=False,
-        )
-        value = Adapter.from_state_dict({"weight": source})
-
-        assert merge_adapter(model, [(value, strength)]) == 1
-        assert torch.equal(model.weight, torch.zeros_like(model.weight))
+        assert model.weight.dtype is torch.float32
+        torch.testing.assert_close(model.weight, source)
 
     @pytest.mark.parametrize(
         "stride",
@@ -3609,7 +3632,7 @@ class TestPermanentMerge:
         ],
         ids=["zero-stride-overlap", "nonzero-stride-overlap", "gapped"],
     )
-    def test_parameter_value_rejects_unsupported_meta_layout(
+    def test_parameter_value_ignores_placeholder_stride(
         self,
         stride: tuple[int, int],
     ) -> None:
@@ -3621,36 +3644,11 @@ class TestPermanentMerge:
         )
         value = Adapter.from_state_dict({"weight": source})
 
-        with pytest.raises(ValueError, match="non-overlapping dense meta target"):
-            merge_adapter(model, [(value, 1.0)])
+        assert merge_adapter(model, [(value, 1.0)]) == 1
+        assert model.weight.is_contiguous()
+        torch.testing.assert_close(model.weight, source)
 
-        assert model.weight.is_meta
-        assert model.weight.stride() == stride
-
-    def test_parameter_value_layout_preflight_prevents_partial_merge(self) -> None:
-        model = nn.Module()
-        model.base = nn.Linear(2, 2, bias=False)
-        model.value = nn.Parameter(
-            torch.empty_strided((2, 2), (0, 1), device="meta"),
-            requires_grad=False,
-        )
-        model.requires_grad_(False)
-        base_before = model.base.weight.detach().clone()
-        adapter = Adapter.from_state_dict(
-            {
-                "base.lora_A.weight": torch.ones(1, 2),
-                "base.lora_B.weight": torch.ones(2, 1),
-                "value": torch.arange(4, dtype=torch.float32).reshape(2, 2),
-            }
-        )
-
-        with pytest.raises(ValueError, match="non-overlapping dense meta target"):
-            merge_adapter(model, [(adapter, 1.0)])
-
-        torch.testing.assert_close(model.base.weight, base_before)
-        assert model.value.is_meta
-
-    def test_parameter_value_rejects_nonzero_meta_storage_offset(self) -> None:
+    def test_parameter_value_ignores_placeholder_storage_offset(self) -> None:
         source = torch.arange(4, dtype=torch.float32).reshape(2, 2)
         backing = torch.empty(8, device="meta")
         model = nn.Module()
@@ -3660,11 +3658,9 @@ class TestPermanentMerge:
         )
         value = Adapter.from_state_dict({"weight": source})
 
-        with pytest.raises(ValueError, match="storage_offset=0"):
-            merge_adapter(model, [(value, 1.0)])
-
-        assert model.weight.is_meta
-        assert model.weight.storage_offset() == 1
+        assert merge_adapter(model, [(value, 1.0)]) == 1
+        assert model.weight.storage_offset() == 0
+        torch.testing.assert_close(model.weight, source)
 
     def test_parameter_value_rejects_sparse_meta_layout(self) -> None:
         indices = torch.empty((2, 0), dtype=torch.int64, device="meta")
@@ -3682,42 +3678,13 @@ class TestPermanentMerge:
         )
         value = Adapter.from_state_dict({"weight": torch.empty(2, 2)})
 
-        with pytest.raises(ValueError, match="strided meta target"):
+        with pytest.raises(ValueError, match="plain floating-point meta target"):
             merge_adapter(model, [(value, 1.0)])
 
         assert model.weight.is_meta
         assert model.weight.layout is torch.sparse_coo
 
-    @pytest.mark.parametrize(
-        ("shape", "stride"),
-        [
-            ((1, 2), (0, 1)),
-            ((0, 2), (0, 1)),
-            ((), ()),
-        ],
-        ids=["size-one", "empty", "scalar"],
-    )
-    def test_parameter_value_accepts_degenerate_dense_layout(
-        self,
-        shape: tuple[int, ...],
-        stride: tuple[int, ...],
-    ) -> None:
-        source = torch.zeros(shape)
-        value = ParameterValue.from_tensor(source, pin_memory=False)
-        transform = ParameterValueTransform(value.scaled(1.0))
-        target = nn.Parameter(
-            torch.empty_strided(shape, stride, device="meta"),
-            requires_grad=False,
-        )
-
-        transform.validate_parameter(target)
-        materialized = transform.materialize()
-
-        assert materialized.shape == source.shape
-        assert materialized.stride() == stride
-        torch.testing.assert_close(materialized, source)
-
-    def test_parameter_value_rejects_physical_target_with_wrong_stride(self) -> None:
+    def test_parameter_value_rejects_physical_target_with_wrong_layout(self) -> None:
         source = torch.arange(6, dtype=torch.float32).view(2, 3)
         value = ParameterValue.from_tensor(source, pin_memory=False)
         transform = ParameterValueTransform(value.scaled(1.0))
@@ -3727,29 +3694,30 @@ class TestPermanentMerge:
         )
         transform.validate_parameter(meta_target)
 
-        wrong_stride = nn.Parameter(torch.empty(2, 3), requires_grad=False)
-        with pytest.raises(RuntimeError, match="matching the validated meta target"):
-            transform.apply_parameter(wrong_stride)
-
-        wrong_offset = nn.Parameter(
-            torch.empty(7).as_strided((2, 3), (3, 1), 1),
+        wrong_dtype = nn.Parameter(
+            torch.empty(2, 3, dtype=torch.float16),
             requires_grad=False,
         )
-        with pytest.raises(RuntimeError, match="matching the validated meta target"):
-            transform.apply_parameter(wrong_offset)
+        with pytest.raises(RuntimeError, match="matching.*replacement source"):
+            transform.apply_parameter(wrong_dtype)
 
         materialized = transform.materialize()
-        assert materialized.stride() == (1, 2)
+        assert materialized.is_contiguous()
         torch.testing.assert_close(materialized, source)
 
-    def test_parameter_value_rejects_float8_source(self) -> None:
-        with pytest.raises(ValueError, match="do not support float8 sources"):
-            ParameterValue.from_tensor(
-                torch.tensor([1.0], dtype=torch.float8_e4m3fn),
-                pin_memory=False,
-            )
+    def test_parameter_value_accepts_float8_source(self) -> None:
+        source = torch.tensor([1.0], dtype=torch.float8_e4m3fn)
+        value = ParameterValue.from_tensor(source, pin_memory=False)
+        transform = ParameterValueTransform(value.scaled(0.5))
+        transform.validate_parameter(
+            nn.Parameter(torch.empty(1, device="meta"), requires_grad=False)
+        )
 
-    def test_parameter_value_rejects_float8_target(self) -> None:
+        materialized = transform.materialize()
+        assert materialized.dtype is torch.float8_e4m3fn
+        assert torch.equal(materialized, source)
+
+    def test_parameter_value_ignores_float8_placeholder_dtype(self) -> None:
         source = torch.tensor([1.0], dtype=torch.float32)
         model = nn.Module()
         model.weight = nn.Parameter(
@@ -3758,9 +3726,9 @@ class TestPermanentMerge:
         )
         value = Adapter.from_state_dict({"weight": source})
 
-        with pytest.raises(ValueError, match="do not support float8 targets"):
-            merge_adapter(model, [(value, 0.5)])
-        assert model.weight.is_meta
+        assert merge_adapter(model, [(value, 0.5)]) == 1
+        assert model.weight.dtype is torch.float32
+        torch.testing.assert_close(model.weight, source)
 
     def test_factor_and_parameter_value_cannot_share_target_across_adapters(self) -> None:
         model = nn.Module()
@@ -3813,7 +3781,7 @@ class TestPermanentMerge:
         assert model.left.weight is model.right.weight
         assert model.left.weight.device.type == "cpu"
         assert not model.left.weight.requires_grad
-        torch.testing.assert_close(model.left.weight, value * -0.25)
+        torch.testing.assert_close(model.left.weight, value)
 
     def test_low_rank_factor_cannot_materialize_meta_parameter(self) -> None:
         with torch.device("meta"):
@@ -4969,8 +4937,8 @@ class TestRoutedStaging:
         s = _make_model_offloader(m)
         s.activate("cpu", adapters=[lora], adapter_mode="routed")
         try:
-            assert len(s._adapter_hook_removers) == 1
-            assert callable(s._adapter_hook_removers[0])
+            assert len(s._routed_hook_removers) == 1
+            assert callable(s._routed_hook_removers[0])
             with pytest.raises(RuntimeError, match="linear failed"):
                 m(torch.randn(2, 3))
 
@@ -5045,16 +5013,16 @@ class TestRoutedStaging:
         _request_loras(s, [(lora, 1.0)], mode="routed")
         _activate(s, torch.device("cpu"))
         # One paired-hook remover per target.
-        assert len(s._adapter_hook_removers) == 2
+        assert len(s._routed_hook_removers) == 2
 
         s.deactivate()
-        assert s._adapter_hook_removers == []
+        assert s._routed_hook_removers == []
 
         # A new activation-scoped request works after teardown.
         _request_loras(s, [(lora, 1.0)], mode="routed")
         _activate(s, torch.device("cpu"))
         try:
-            assert len(s._adapter_hook_removers) == 2
+            assert len(s._routed_hook_removers) == 2
         finally:
             s.deactivate()
 
@@ -5106,7 +5074,7 @@ class TestRoutedStaging:
             _activate(s, torch.device("cpu"))
 
         assert s.active_device is None
-        assert s._adapter_hook_removers == []
+        assert s._routed_hook_removers == []
         # Composite was deactivated -> a fresh activation succeeds and runs.
         _activate(s, torch.device("cpu"))
         try:
@@ -5184,7 +5152,6 @@ class TestLoRAResource:
             estimated_cache_bytes=value.nbytes,
             factory=lambda: {"target.weight": value},
             host_backing="adopt",
-            scale_parameter_values=False,
         )
 
         lora = spec.build_store()

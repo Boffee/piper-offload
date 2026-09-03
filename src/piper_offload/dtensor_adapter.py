@@ -27,10 +27,13 @@ weights, LoRA factor regions needed by each rank before device staging, then
 delegates the actual update to the local shard's adapter. This keeps
 tensor-parallel concerns out of format-specific quant adapters.
 
-The adapter advertises no CPU round-trip, dequantize/requantize, ``copy_into``,
-or trainable ``.data`` swap capability. A DTensor merge is available only when
-its local shard's adapter supports the corresponding factorized or dense merge
-operation; otherwise routed LoRA remains the inference path.
+The adapter advertises no CPU round-trip, full dequantize/requantize,
+``copy_into``, or trainable ``.data`` swap capability. It can expose a dense
+local shard when the inner adapter can, which lets exact-name parameter values
+reuse the same dense merge path for strength scaling. A DTensor merge is
+available only when its local shard's adapter supports the corresponding
+factorized or dense merge operation; otherwise routed LoRA remains the
+inference path.
 
 Identity and layout keys are taken from the **local shard** (delegated to
 the inner adapter) plus a structural ``(mesh, placements)`` signature. This
@@ -72,6 +75,7 @@ from .tensor_adapters import (
     DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
     DenseMergeValidationTensorAdapter,
+    DequantizeTensorAdapter,
     LogicalShapeTensorAdapter,
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
@@ -493,6 +497,17 @@ class DTensorAdapter:
     def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
         """Return the DTensor's global logical shape."""
         return tuple(require_dtensor(t).shape)
+
+    @staticmethod
+    def dequantize(t: torch.Tensor) -> torch.Tensor:
+        """Return the dense local shard accepted by this adapter's merge."""
+        context = _dense_merge_context(t)
+        if not isinstance(context.inner, DequantizeTensorAdapter):
+            raise ValueError(
+                f"DTensor local shard adapter {adapter_name(context.inner)} "
+                "does not expose a dense logical value."
+            )
+        return context.inner.dequantize(context.local)
 
     @staticmethod
     def merge_local_shape_and_offsets(

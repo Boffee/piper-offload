@@ -14,6 +14,7 @@ from torch import nn
 from piper_offload import (
     Adapter,
     ModelOffloader,
+    ParameterValue,
     merge_adapter,
 )
 from piper_offload.int4_tile_adapter import Int4TilePackedAdapter
@@ -127,6 +128,30 @@ class TestInt4TilePackedAdapter:
             pinned_param.copy_to_cpu(state)
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
             pinned_param.validate_parameter_data_swap_target()
+
+    def test_exact_parameter_value_accepts_format_without_dense_merge(self) -> None:
+        value = ParameterValue.from_tensor(_make_int4_tile())
+
+        assert isinstance(value.backing.adapter, Int4TilePackedAdapter)
+
+    def test_exact_parameter_value_uses_int4_activation_storage(self) -> None:
+        int4_cls = _int4_tile_cls()
+        source = _make_int4_tile()
+        adapter = Adapter.from_state_dict({"weight": source})
+        model = nn.Module()
+        model.weight = nn.Parameter(
+            torch.empty(source.shape, device="meta", dtype=source.dtype),
+            requires_grad=False,
+        )
+        offloader = ModelOffloader.from_module(model)
+
+        with activated_model(offloader, "cuda", adapters=[adapter]):
+            actual = model.weight.data
+            assert isinstance(actual, int4_cls)
+            assert torch.equal(actual.qdata, source.qdata)
+            assert torch.equal(actual.scale_and_zero, source.scale_and_zero)
+
+        assert model.weight.is_meta
 
     def test_merge_lora_rejects_int4_tile_weight(self) -> None:
         class M(nn.Module):

@@ -15,7 +15,7 @@ import torch
 from torch import nn
 
 from piper_offload import ModelOffloader
-from piper_offload.streaming_runtime import _instance_target_signature
+from piper_offload.streaming_runtime import _plan_target_signature
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -64,7 +64,7 @@ def _block_component(offloader: object):
 def _signatures(offloader: object) -> tuple[object, ...]:
     component = _block_component(offloader)
     return tuple(
-        _instance_target_signature(instance)
+        _plan_target_signature(instance.resolve_load_plan())
         for instance in component._block_instances
     )
 

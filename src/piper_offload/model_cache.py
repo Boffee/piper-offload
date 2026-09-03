@@ -45,8 +45,8 @@ class ModelCache(ResourceCache):
         contribute once per occurrence. Exact-zero strengths are inactive and
         their adapter resources are not leased. ``stochastic_rounding`` is
         forwarded to the model activation's merge path and defaults to
-        stochastic requantization for quantized targets; parameter values and
-        routed targets are unaffected.
+        stochastic requantization for quantized delta targets and scaled
+        quantized parameter values; routed targets are unaffected.
         """
         specs = tuple(adapter_specs)
         strengths = None if adapter_strengths is None else tuple(adapter_strengths)

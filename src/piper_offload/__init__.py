@@ -91,13 +91,13 @@ from a fresh model instance.
      paths' persistent or transient lifetime.
 
 Optional adapter application is requested directly on
-:meth:`ModelOffloader.activate` and resolved by installing post-copy hooks for
-managed parameter targets. Unknown targets raise during activation unless the
+:meth:`ModelOffloader.activate` and resolved into immutable parameter load
+plans for managed targets. Unknown targets raise during activation unless the
 adapter resource explicitly allows partial targets, in which case application
-uses the intersection of adapter targets and model parameters. The
-hooks run immediately after the owning component copies a base weight
-from host storage to GPU, so block-streamed and non-block weights
-use the same merge path. Merge eligibility is owned by the selected tensor
+uses the intersection of adapter targets and model parameters. Planned updates
+run immediately after the owning component copies its effective source from
+host storage to GPU, so block-streamed and non-block weights use the same merge
+path. Merge eligibility is owned by the selected tensor
 adapter: physical plain floating-point tensors support combined low-rank and
 full-rank additive deltas; structured quantized wrappers can independently opt
 into staged factorized and full-rank merge capabilities. A mixed dense + LoRA

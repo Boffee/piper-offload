@@ -75,11 +75,12 @@ class AdapterSpec:
     routed per-forward transfer volume when using pinned backing. Adopted
     backing strictly retains compatible CPU tensors. The factory's reserved
     LoRA-suffixed entries form factor pairs; every other entry is an exact
-    parameter-name value used to populate a frozen floating-point meta target.
+    parameter-name physical value used to populate a
+    frozen floating-point meta target.
     ``allow_partial_targets`` opts the built resource into applying only the
     intersection of its targets and a model's parameters.
-    ``scale_parameter_values`` controls whether adapter strength scales those
-    complete values; disabling it leaves active parameter values unchanged.
+    ``scale_parameter_values`` opts complete values into adapter-strength
+    scaling; by default active parameter values remain unchanged.
     """
 
     key: str
@@ -88,7 +89,7 @@ class AdapterSpec:
     dtype: torch.dtype | None = None
     host_backing: HostBacking = "pinned"
     allow_partial_targets: bool = False
-    scale_parameter_values: bool = True
+    scale_parameter_values: bool = False
 
     def build_store(self) -> Adapter:
         """Build and pin this reusable adapter resource."""

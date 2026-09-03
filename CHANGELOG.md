@@ -7,12 +7,29 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
-- Add opt-out parameter-value strength scaling. Set
-  `scale_parameter_values=False` on `Adapter.from_state_dict()` or
-  `AdapterSpec` to materialize exact-name values unchanged for every active
-  adapter strength, or set `scale_with_strength=False` on an individual
-  `ParameterValue`. Default scaling and zero-strength inactivity are
-  unchanged.
+- Allow exact-name `ParameterValue` sources to retain offload-capable physical
+  representations with registered tensor adapters, floating compute dtypes,
+  and compatible logical-shape metadata. The replacement source is
+  authoritative for allocation, layout, quantization metadata, and loaded
+  bytes. Exact activation and permanent merge do not require dense-merge or
+  dequantization support.
+- Make complete parameter values independent of adapter strength by default.
+  Set `scale_parameter_values=True` on `Adapter.from_state_dict()` or
+  `AdapterSpec`, or `scale_with_strength=True` on an individual
+  `ParameterValue`, to opt into scaling. Non-unit scaling uses the existing
+  dequantize and dense-merge capabilities for one terminal requantization;
+  zero-strength adapters remain inactive.
+- Replace activation-time post-copy hook registries and backing overrides with
+  immutable parameter load plans. Adapter overrides select a source, an
+  update, or both; each component resolves them against model backing before
+  allocation so resident, streaming, and rolling execution share one explicit
+  load path.
+
+### Changed
+
+- Treat `ParameterValue` payload numerical validity as the caller's
+  responsibility. Construction, activation, and permanent merge no longer
+  scan complete values for NaN or infinity.
 
 ## [0.9.0rc1] - 2026-09-02
 

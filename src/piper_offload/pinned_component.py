@@ -53,7 +53,7 @@ Class-specific caveats
 
 import contextlib
 import weakref
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Generator, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Self
 
@@ -66,11 +66,12 @@ from .host_backing import (
     validate_host_backing,
 )
 from .pinned_module import (
+    ParameterOverride,
     PinnedModuleInstance,
+    PinnedModuleLoadPlan,
     PinnedModuleStore,
-    PostCopyHook,
 )
-from .target_lease import _CudaTargetLease
+from .target_lease import CudaTargetLease
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,7 +169,8 @@ class PinnedComponent:
         self._buffer_names = frozenset(instance.buffers)
         self._has_trainables = instance.has_trainables
         self._active_device: torch.device | None = None
-        self._lease: _CudaTargetLease | None = None
+        self._load_plan: PinnedModuleLoadPlan | None = None
+        self._lease: CudaTargetLease | None = None
         self._use_hook: torch.utils.hooks.RemovableHandle | None = None
         self._optimizer_step_active: bool = False
 
@@ -186,17 +188,13 @@ class PinnedComponent:
         """Pinned buffer names managed by this instance."""
         return self._buffer_names
 
-    def register_post_copy_hook(
-        self, name: str, hook: PostCopyHook,
-    ) -> Callable[[], None]:
-        """Register a hook after this component copies ``name`` to GPU.
-
-        Package-internal: used by :class:`ModelOffloader` for merge-mode
-        LoRA. Returns a callable that unregisters the hook.
-        """
-        return self._instance.register_post_copy_hook(name, hook)
-
-    def activate(self, device: torch.device, **kwargs: object) -> None:
+    def activate(
+        self,
+        device: torch.device,
+        *,
+        parameter_overrides: Mapping[str, ParameterOverride] | None = None,
+        **kwargs: object,
+    ) -> None:
         """Activate the managed tensors on ``device``.
 
         CUDA activation bulk-DMAs pinned weights to GPU: per-tensor
@@ -224,10 +222,17 @@ class PinnedComponent:
             )
         active_device = canonical_device(device)
         if active_device.type == "cpu":
+            if parameter_overrides:
+                raise ValueError(
+                    "Parameter overrides require CUDA activation."
+                )
             self._instance.install_pinned()
             self._active_device = active_device
             return
         if active_device.type == "cuda":
+            self._load_plan = self._instance.resolve_load_plan(
+                parameter_overrides,
+            )
             self._active_device = active_device
             self.acquire()
             return
@@ -251,14 +256,16 @@ class PinnedComponent:
         if active_device.type == "cpu" or self._lease is not None:
             return
 
+        plan = self._load_plan
+        if plan is None:
+            raise RuntimeError("PinnedComponent CUDA session has no load plan.")
         current_stream = torch.cuda.current_stream(active_device)
-        lease = _CudaTargetLease.allocate(self._instance, active_device)
+        lease = CudaTargetLease.allocate(plan, active_device)
         self._lease = lease
         try:
             lease.stage(
-                self._instance,
+                plan,
                 current_stream,
-                run_post_copy_hooks=True,
                 non_blocking=True,
             )
             self._instance.install_target(lease.acquire(current_stream))
@@ -343,6 +350,7 @@ class PinnedComponent:
             self.release()
         finally:
             self._active_device = None
+            self._load_plan = None
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Generator[None]:

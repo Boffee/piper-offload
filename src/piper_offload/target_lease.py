@@ -5,10 +5,10 @@ from typing import cast
 
 import torch
 
-from .pinned_module import PinnedModuleInstance, PinnedModuleTarget
+from .pinned_module import PinnedModuleLoadPlan, PinnedModuleTarget
 
 
-class _CudaTargetLease:
+class CudaTargetLease:
     """Own one target plus the ordering needed to copy, use, and reuse it.
 
     The caller chooses the allocation-owner stream: short-lived staged
@@ -36,20 +36,18 @@ class _CudaTargetLease:
     @classmethod
     def allocate(
         cls,
-        instance: PinnedModuleInstance,
+        plan: PinnedModuleLoadPlan,
         device: torch.device,
         *,
         allocation_stream: torch.cuda.Stream | None = None,
-        param_names: Iterable[str] | None = None,
         buffer_names: Iterable[str] | None = None,
-    ) -> _CudaTargetLease:
+    ) -> CudaTargetLease:
         """Allocate a target from the requested CUDA stream's pool."""
         if allocation_stream is None:
             allocation_stream = torch.cuda.default_stream(device)
         with torch.cuda.stream(allocation_stream):
-            target = instance.allocate_target(
+            target = plan.allocate_target(
                 device,
-                param_names=param_names,
                 buffer_names=buffer_names,
             )
         return cls(target, allocation_stream)
@@ -63,10 +61,9 @@ class _CudaTargetLease:
 
     def stage(
         self,
-        instance: PinnedModuleInstance,
+        plan: PinnedModuleLoadPlan,
         stream: torch.cuda.Stream,
         *,
-        run_post_copy_hooks: bool = False,
         non_blocking: bool = True,
     ) -> None:
         """Refill this target on ``stream`` without changing a module."""
@@ -83,14 +80,13 @@ class _CudaTargetLease:
                     stream.wait_stream(recorded)
             self._recorded_streams.clear()
             try:
-                instance.copy_to_target(
+                plan.copy_to_target(
                     target,
-                    run_post_copy_hooks=run_post_copy_hooks,
                     non_blocking=non_blocking,
                 )
                 self._staged = True
             finally:
-                # A hook or later tensor copy can fail after earlier async
+                # An update or later tensor copy can fail after earlier async
                 # copies were enqueued. Preserve a completion marker so
                 # cleanup still hands the allocation back safely.
                 self._ready_event = cast(
@@ -138,3 +134,6 @@ class _CudaTargetLease:
             self._ready_event = None
             self._staged = False
             self._recorded_streams.clear()
+
+
+__all__ = ["CudaTargetLease"]
