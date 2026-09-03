@@ -103,7 +103,9 @@ class Adapter:
     only frozen floating-point meta parameters.
 
     Strength is extrinsic and supplied when the adapter is activated or
-    permanently merged.
+    permanently merged. By default it scales both parameter deltas and
+    parameter values. Parameter-value scaling can be disabled when complete
+    values should remain unchanged for every active adapter strength.
 
     ``state_dict`` keys must already use model parameter paths. Any key
     remapping and removal of non-adapter metadata are the caller's
@@ -145,6 +147,7 @@ class Adapter:
         dtype: torch.dtype | None = None,
         host_backing: HostBacking = "pinned",
         allow_partial_targets: bool = False,
+        scale_parameter_values: bool = True,
     ) -> Self:
         """Validate and capture factor and/or parameter-value tensors.
 
@@ -153,7 +156,9 @@ class Adapter:
         full-rank additive updates targeting the corresponding model weight or
         bias. Every other key is an exact model parameter name whose tensor is
         the complete value for a meta parameter. ``dtype`` casts every input
-        before host capture.
+        before host capture. ``scale_parameter_values=False`` materializes
+        those complete values unchanged instead of multiplying them by an
+        active adapter's strength. A zero-strength adapter remains inactive.
         ``host_backing="adopt"`` strictly adopts existing CPU storage and
         therefore rejects conversions.
         """
@@ -167,6 +172,7 @@ class Adapter:
             sources,
             dtype=dtype,
             pin_memory=backing == "pinned",
+            scale_parameter_values=scale_parameter_values,
         )
         return cls(targets, allow_partial_targets=allow_partial_targets)
 
@@ -262,6 +268,7 @@ def _build_adapter_targets(
     *,
     dtype: torch.dtype | None = None,
     pin_memory: bool = True,
+    scale_parameter_values: bool = True,
 ) -> dict[str, AdapterTarget]:
     """Capture parsed sources into one target value per parameter name."""
     targets: dict[str, AdapterTarget] = {}
@@ -284,5 +291,6 @@ def _build_adapter_targets(
             source,
             dtype=dtype,
             pin_memory=pin_memory,
+            scale_with_strength=scale_parameter_values,
         )
     return targets

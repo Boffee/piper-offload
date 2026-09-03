@@ -5,6 +5,15 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add opt-out parameter-value strength scaling. Set
+  `scale_parameter_values=False` on `Adapter.from_state_dict()` or
+  `AdapterSpec` to materialize exact-name values unchanged for every active
+  adapter strength, or set `scale_with_strength=False` on an individual
+  `ParameterValue`. Default scaling and zero-strength inactivity are
+  unchanged.
+
 ## [0.9.0rc1] - 2026-09-02
 
 ### Added

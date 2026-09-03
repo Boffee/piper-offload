@@ -78,10 +78,9 @@ def merge_adapter(
     Quantized targets use terminal-code stochastic rounding by default so
     sub-step additive updates are not systematically rounded away; pass
     ``stochastic_rounding=False`` for deterministic rounding. Parameter values
-    populate frozen floating-point
-    meta targets and are scaled during materialization. A populated meta
-    target is replaced by one frozen CPU parameter, preserving any tied
-    aliases of the original parameter.
+    populate frozen floating-point meta targets according to their strength
+    policy. A populated meta target is replaced by one frozen CPU parameter,
+    preserving any tied aliases of the original parameter.
     """
     # Filtering here avoids target lookup, staging, validation, and
     # requantization for work that cannot modify a parameter.
