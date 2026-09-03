@@ -26,6 +26,7 @@ from .parameter_delta import ParameterDeltaTransform
 from .parameter_transform import ParameterTransform
 from .parameter_value import ParameterValueTransform
 from .pinned_component import PinnedComponent
+from .pinned_param import PinnedParam
 
 type _ParameterUpdateMap = dict[str, AdapterTargetUpdates]
 type _TransientComponent = PinnedComponent | BlockComponent
@@ -297,13 +298,22 @@ class ModelOffloader:
                 )
             else:
                 assert contributions.value is not None
-                transform = ParameterValueTransform(contributions.value)
+                transform = ParameterValueTransform(
+                    contributions.value,
+                    stochastic_rounding=stochastic_rounding,
+                    target_key=param_name,
+                )
 
             transform.validate_parameter(params_by_name[param_name])
 
             remove_hook = self._register_post_copy_hook(
                 param_name,
                 transform.apply_parameter,
+                materialization_backing=(
+                    transform.materialization_backing
+                    if isinstance(transform, ParameterValueTransform)
+                    else None
+                ),
             )
             self._adapter_hook_removers.append(remove_hook)
 
@@ -352,8 +362,14 @@ class ModelOffloader:
         self,
         param_name: str,
         hook: Callable[[nn.Parameter], None],
+        *,
+        materialization_backing: PinnedParam | None = None,
     ) -> Callable[[], None]:
-        return self._composite.register_post_copy_hook(param_name, hook)
+        return self._composite.register_post_copy_hook(
+            param_name,
+            hook,
+            materialization_backing=materialization_backing,
+        )
 
     def register_post_copy_hook(
         self,
@@ -495,8 +511,9 @@ class ModelOffloader:
         ``stochastic_rounding`` uses stochastic requantization for quantized
         merge targets by default; pass ``False`` for deterministic rounding.
         Parameter values are merge-only and populate frozen floating-point
-        meta parameters; routed mode never requantizes. Such a meta target is
-        materialized only while its parameter value is active.
+        meta parameters from dense or supported prequantized representations;
+        routed mode never requantizes. Such a meta target is materialized only
+        while its parameter value is active.
         Because the offloader owns one model runtime, a
         second activation before :meth:`deactivate` raises
         :class:`ModelRuntimeInUseError` immediately.

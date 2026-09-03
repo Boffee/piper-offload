@@ -1,13 +1,24 @@
-"""Exact values that populate frozen floating-point meta parameters."""
+"""Exact dense or quantized values that populate frozen meta parameters."""
 
 import math
 from dataclasses import dataclass
+from typing import Any, cast
 
 import torch
 from torch import nn
 
 from .pinned_param import PinnedParam
-from .tensor_adapter_registry import param_representation
+from .seeding import derive_seed
+from .tensor_adapter_registry import param_representation, select_adapter
+from .tensor_adapters import (
+    DenseMergeTargetValidationTensorAdapter,
+    DenseMergeTensorAdapter,
+    DenseMergeValidationTensorAdapter,
+    DequantizeTensorAdapter,
+    RegularAdapter,
+    TensorAdapter,
+    adapter_name,
+)
 
 __all__ = [
     "ParameterValue",
@@ -16,15 +27,44 @@ __all__ = [
 ]
 
 
-def _validate_value_tensor(source: torch.Tensor) -> None:
-    if type(source) is not torch.Tensor:
-        raise ValueError(f"Parameter values must be plain torch.Tensor values; got {type(source).__name__}.")
+def _validate_value_representation(
+    source: torch.Tensor,
+) -> TensorAdapter[Any, Any]:
+    """Validate one physical value and return its registered adapter."""
     if source.is_meta:
         raise ValueError("Parameter values must own physical values, not meta storage.")
-    if not source.is_floating_point():
-        raise ValueError(f"Parameter values must be floating-point; got {source.dtype}.")
-    if torch.finfo(source.dtype).bits == 8:
+    try:
+        adapter = select_adapter(source)
+    except NotImplementedError as exc:
+        raise ValueError(
+            f"Parameter value tensor type {type(source).__name__} has no "
+            "registered tensor adapter."
+        ) from exc
+    compute_dtype = adapter.compute_dtype(source)
+    if not compute_dtype.is_floating_point:
+        raise ValueError(
+            "Parameter values must have a floating-point compute dtype; "
+            f"got {compute_dtype}."
+        )
+    if isinstance(adapter, RegularAdapter) and torch.finfo(compute_dtype).bits == 8:
         raise ValueError(f"Parameter values do not support float8 sources; got {source.dtype}.")
+    if not (
+        isinstance(adapter, DenseMergeTensorAdapter)
+        and isinstance(adapter, DequantizeTensorAdapter)
+    ):
+        raise ValueError(
+            f"{adapter_name(adapter)} cannot be used as a parameter value: "
+            "structured values require both dense merge and dequantize support."
+        )
+    if not isinstance(adapter, RegularAdapter) and isinstance(
+        adapter,
+        DenseMergeTargetValidationTensorAdapter,
+    ):
+        # Composing adapters such as DTensor advertise the outer capability
+        # structurally, then validate that the concrete inner representation
+        # supports it here.
+        adapter.validate_dense_merge_target(source)
+    return adapter
 
 
 @dataclass(slots=True, frozen=True)
@@ -42,7 +82,16 @@ class ParameterValue:
 
     def __post_init__(self) -> None:
         """Keep direct construction subject to the source-value invariant."""
-        _validate_value_tensor(param_representation(self.backing.make_cpu_param()))
+        if not isinstance(self.backing, PinnedParam):
+            raise ValueError(
+                "ParameterValue backing must be a PinnedParam; "
+                f"got {type(self.backing).__name__}."
+            )
+        if self.backing.requires_grad:
+            raise ValueError("Parameter values are inference-only and must be frozen.")
+        _validate_value_representation(
+            param_representation(self.backing.make_cpu_param())
+        )
 
     @classmethod
     def from_tensor(
@@ -54,11 +103,38 @@ class ParameterValue:
         scale_with_strength: bool = True,
     ) -> ParameterValue:
         """Validate and capture one parameter value and its scaling policy."""
-        _validate_value_tensor(source)
-        tensor = source if dtype is None or source.dtype is dtype else source.to(dtype=dtype)
+        if not isinstance(source, torch.Tensor):
+            raise ValueError(
+                "Parameter values must be tensor representations; "
+                f"got {type(source).__name__}."
+            )
+        if issubclass(type(source), nn.Parameter) and source.requires_grad:
+            raise ValueError("Parameter values are inference-only and must be frozen.")
+        adapter = _validate_value_representation(source)
+        compute_dtype = adapter.compute_dtype(source)
+        if isinstance(adapter, RegularAdapter):
+            tensor = (
+                source
+                if dtype is None or source.dtype is dtype
+                else source.to(dtype=dtype)
+            )
+        else:
+            if dtype is not None and dtype is not compute_dtype:
+                raise ValueError(
+                    "A structured parameter value is already encoded for "
+                    f"compute dtype {compute_dtype}; dtype={dtype} would discard "
+                    "its representation. Prequantize the value with the desired "
+                    "logical dtype instead."
+                )
+            tensor = source
+        parameter = (
+            cast(nn.Parameter, tensor)
+            if issubclass(type(tensor), nn.Parameter)
+            else nn.Parameter(tensor, requires_grad=False)
+        )
         return cls(
             PinnedParam(
-                nn.Parameter(tensor, requires_grad=False),
+                parameter,
                 pin_memory=pin_memory,
             ),
             scale_with_strength=scale_with_strength,
@@ -92,7 +168,7 @@ class ScaledParameterValue:
 
 
 @dataclass(slots=True, frozen=True)
-class _ParameterValuePlan:
+class _PlainParameterValuePlan:
     """Validated source and layout for one meta target."""
 
     source: torch.Tensor
@@ -102,22 +178,63 @@ class _ParameterValuePlan:
     dtype: torch.dtype
 
 
+@dataclass(slots=True, frozen=True)
+class _StructuredParameterValuePlan:
+    """Validated structured representation for one logical meta target."""
+
+    adapter: TensorAdapter[Any, Any]
+    strength: float
+    logical_shape: tuple[int, ...]
+    compute_dtype: torch.dtype
+
+
+type _ParameterValuePlan = (
+    _PlainParameterValuePlan | _StructuredParameterValuePlan
+)
+
+
 class ParameterValueTransform:
     """Populate one frozen floating-point meta parameter.
 
     Validation runs against the model's storage-free meta placeholder. During
     activation, :meth:`apply_parameter` fills the physical storage allocated
     for that placeholder. Permanent merge uses :meth:`materialize` to create a
-    CPU parameter with the same logical layout. Targets must have a strided,
-    non-overlapping dense layout with zero storage offset so every logical
-    element has one independently writable physical location.
+    CPU parameter. Dense values preserve the placeholder's logical layout,
+    which must be strided and non-overlapping with zero storage offset.
+    Structured values instead retain their source adapter's complete storage
+    representation and metadata.
     """
 
-    __slots__ = ("_plan", "_value")
+    __slots__ = (
+        "_merge_index",
+        "_plan",
+        "_stochastic_rounding",
+        "_target_key",
+        "_value",
+    )
 
-    def __init__(self, value: ScaledParameterValue) -> None:
+    def __init__(
+        self,
+        value: ScaledParameterValue,
+        *,
+        stochastic_rounding: bool = False,
+        target_key: str = "",
+    ) -> None:
+        if stochastic_rounding and not target_key:
+            raise ValueError(
+                "Stochastic ParameterValueTransform requires a non-empty target_key."
+            )
         self._value = value
+        self._stochastic_rounding = stochastic_rounding
+        self._target_key = target_key
+        self._merge_index = 0
         self._plan: _ParameterValuePlan | None = None
+
+    @property
+    def materialization_backing(self) -> PinnedParam | None:
+        """Backing that defines active storage for a structured value."""
+        backing = self._value.value.backing
+        return None if isinstance(backing.adapter, RegularAdapter) else backing
 
     def validate_parameter(self, param: nn.Parameter) -> None:
         """Validate a meta target and prepare repeated fills."""
@@ -130,29 +247,47 @@ class ParameterValueTransform:
             )
         if not target.is_floating_point():
             raise ValueError(f"Parameter values require a floating-point meta target; got {target.dtype}.")
-        if torch.finfo(target.dtype).bits == 8:
-            raise ValueError(f"Parameter values do not support float8 targets; got {target.dtype}.")
         if param.requires_grad:
             raise ValueError("Parameter values are inference-only and require requires_grad=False.")
-        _validate_target_layout(target)
 
-        source = param_representation(self._value.value.backing.make_cpu_param())
-        assert type(source) is torch.Tensor
-        assert source.device.type == "cpu"
-        if tuple(source.shape) != tuple(target.shape):
+        backing = self._value.value.backing
+        source = param_representation(backing.make_cpu_param())
+        adapter = backing.adapter
+        logical_shape = backing.logical_shape
+        if logical_shape != tuple(target.shape):
             raise ValueError(
                 "Parameter value shape mismatch: "
-                f"source shape is {tuple(source.shape)}, "
+                f"source shape is {logical_shape}, "
                 f"target shape is {tuple(target.shape)}."
             )
 
         materialization_strength = self._value.materialization_strength
+        if not isinstance(adapter, RegularAdapter):
+            compute_dtype = adapter.compute_dtype(source)
+            self._validate_structured_merge(
+                source,
+                adapter,
+                materialization_strength,
+            )
+            self._plan = _StructuredParameterValuePlan(
+                adapter,
+                materialization_strength,
+                logical_shape,
+                compute_dtype,
+            )
+            return
+
+        if torch.finfo(target.dtype).bits == 8:
+            raise ValueError(f"Parameter values do not support float8 targets; got {target.dtype}.")
+        _validate_target_layout(target)
+        assert type(source) is torch.Tensor
+        assert source.device.type == "cpu"
         _validate_target_range(
             source,
             target_dtype=target.dtype,
             strength=materialization_strength,
         )
-        self._plan = _ParameterValuePlan(
+        self._plan = _PlainParameterValuePlan(
             source,
             materialization_strength,
             tuple(target.shape),
@@ -163,6 +298,9 @@ class ParameterValueTransform:
     def apply_parameter(self, param: nn.Parameter) -> None:
         """Fill active storage for a previously validated meta parameter."""
         plan = self._require_plan()
+        if isinstance(plan, _StructuredParameterValuePlan):
+            self._apply_structured(param, plan)
+            return
         target = param_representation(param)
         if (
             type(target) is not torch.Tensor
@@ -186,6 +324,15 @@ class ParameterValueTransform:
         """Materialize a validated value on ``device`` (CPU by default)."""
         plan = self._require_plan()
         target_device = torch.device("cpu") if device is None else device
+        if isinstance(plan, _StructuredParameterValuePlan):
+            backing = self._value.value.backing
+            param = (
+                backing.clone_cpu_param()
+                if target_device.type == "cpu"
+                else backing.materialize(target_device)
+            )
+            self._apply_structured(param, plan)
+            return param
         param = nn.Parameter(
             torch.empty_strided(
                 plan.shape,
@@ -205,10 +352,88 @@ class ParameterValueTransform:
         return plan
 
     @staticmethod
-    def _fill(target: torch.Tensor, plan: _ParameterValuePlan) -> None:
+    def _fill(target: torch.Tensor, plan: _PlainParameterValuePlan) -> None:
         target.copy_(plan.source, non_blocking=True)
         if plan.strength != 1.0:
             target.mul_(plan.strength)
+
+    def _validate_structured_merge(
+        self,
+        source: torch.Tensor,
+        adapter: TensorAdapter[Any, Any],
+        strength: float,
+    ) -> None:
+        """Preflight the optional scaling merge against source metadata."""
+        if strength == 1.0:
+            return
+        assert isinstance(adapter, DenseMergeTensorAdapter)
+        assert isinstance(adapter, DequantizeTensorAdapter)
+        rounding_seed = self._rounding_seed()
+        requires_update_validation = isinstance(
+            adapter,
+            DenseMergeValidationTensorAdapter,
+        )
+        if isinstance(adapter, DenseMergeTargetValidationTensorAdapter):
+            requires_update_validation = adapter.validate_dense_merge_target(
+                source,
+                rounding_seed=rounding_seed,
+            )
+        if requires_update_validation:
+            if not isinstance(adapter, DenseMergeValidationTensorAdapter):
+                raise ValueError(
+                    f"{adapter_name(adapter)} requested staged dense-update "
+                    "validation without implementing validate_dense_merge()."
+                )
+            dense = adapter.dequantize(source)
+            adapter.validate_dense_merge(
+                source,
+                dense,
+                strength - 1.0,
+                rounding_seed=rounding_seed,
+            )
+
+    def _apply_structured(
+        self,
+        param: nn.Parameter,
+        plan: _StructuredParameterValuePlan,
+    ) -> None:
+        target = param_representation(param)
+        try:
+            adapter = select_adapter(target)
+        except NotImplementedError as exc:
+            raise RuntimeError(
+                "Structured parameter value application target no longer has "
+                "a registered tensor adapter."
+            ) from exc
+        if (
+            target.is_meta
+            or type(adapter) is not type(plan.adapter)
+            or adapter.compute_dtype(target) is not plan.compute_dtype
+            or not isinstance(adapter, DenseMergeTensorAdapter)
+            or not isinstance(adapter, DequantizeTensorAdapter)
+            or adapter.logical_shape(target) != plan.logical_shape
+        ):
+            raise RuntimeError(
+                "Structured parameter value application requires physical "
+                "storage matching the validated value representation."
+            )
+        if plan.strength == 1.0:
+            return
+        dense = adapter.dequantize(target)
+        if dense.numel() and not bool(torch.isfinite(dense).all()):
+            raise ValueError("Parameter values must contain only finite values.")
+        adapter.merge_dense_(
+            target,
+            dense,
+            plan.strength - 1.0,
+            rounding_seed=self._rounding_seed(),
+        )
+        self._merge_index += 1
+
+    def _rounding_seed(self) -> int | None:
+        if not self._stochastic_rounding:
+            return None
+        return derive_seed(self._target_key, self._merge_index)
 
 
 def _validate_target_layout(target: torch.Tensor) -> None:

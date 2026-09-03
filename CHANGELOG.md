@@ -7,6 +7,15 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Allow exact-name `ParameterValue` sources to retain any prequantized
+  representation whose tensor adapter supports both dense merge and
+  dequantization. Unit-strength activation/permanent merge copies packed
+  storage exactly; non-unit strength applies `W + (strength - 1) * W` through
+  the existing dense merge path for one terminal requantization. Support now
+  mirrors dense parameter deltas across Quanto, bitsandbytes 4/8-bit, TorchAO
+  scaled/static FP8, INT8, MX and NVFP4, Piper ConvRot INT8/NVFP4, and
+  supported DTensor compositions. GGUF and TorchAO INT4 tile-packed remain
+  excluded.
 - Add opt-out parameter-value strength scaling. Set
   `scale_parameter_values=False` on `Adapter.from_state_dict()` or
   `AdapterSpec` to materialize exact-name values unchanged for every active

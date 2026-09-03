@@ -1,11 +1,11 @@
 """Permanent adapter merge into model weights.
 
 Merges additive parameter deltas directly into existing model parameters and
-materializes parameter values for meta targets. Plain floating-point targets
-support combined low-rank and full-rank deltas. Quantized adapters own their
-factorized and dense encoding paths and may select a format-specific kernel or
-a dequantize/requantize fallback. Mixed deltas are staged as one full-rank
-update so the quantized base is encoded once.
+materializes dense or prequantized parameter values for meta targets. Plain
+floating-point targets support combined low-rank and full-rank deltas.
+Quantized adapters own their factorized and dense encoding paths and may select
+a format-specific kernel or a dequantize/requantize fallback. Mixed deltas and
+scaled quantized values encode the target once.
 
 Permanent and activation merge use the same parameter-delta and
 parameter-value transforms. Permanent merge applies them to resident model
@@ -79,8 +79,10 @@ def merge_adapter(
     sub-step additive updates are not systematically rounded away; pass
     ``stochastic_rounding=False`` for deterministic rounding. Parameter values
     populate frozen floating-point meta targets according to their strength
-    policy. A populated meta target is replaced by one frozen CPU parameter,
-    preserving any tied aliases of the original parameter.
+    policy. Supported prequantized values retain their representation and use
+    dense merge for non-unit scaling. A populated meta target is replaced by
+    one independent frozen CPU parameter, preserving any tied aliases of the
+    original parameter.
     """
     # Filtering here avoids target lookup, staging, validation, and
     # requantization for work that cannot modify a parameter.
@@ -211,7 +213,11 @@ def _build_merge_ops(
             )
         else:
             assert group.updates.value is not None
-            transform = ParameterValueTransform(group.updates.value)
+            transform = ParameterValueTransform(
+                group.updates.value,
+                stochastic_rounding=stochastic_rounding,
+                target_key=target_key,
+            )
         merge_ops.append(
             _MergeOp(
                 aliases,

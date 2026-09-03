@@ -93,6 +93,11 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
         return t.dtype
 
     @staticmethod
+    def dequantize(t: torch.Tensor) -> torch.Tensor:
+        """Return ConvRot's dense logical weight."""
+        return require_convrot_int8_tensor(t).dequantize()
+
+    @staticmethod
     def merge_lora_(
         target: torch.Tensor,
         b: torch.Tensor,

@@ -15,6 +15,7 @@ from .host_backing import HostBacking
 from .module_names import buffer_names, parameter_names
 from .pinned_component import PinnedComponent, PinnedComponentStore
 from .pinned_module import PostCopyHook
+from .pinned_param import PinnedParam
 
 
 class CompositeComponent:
@@ -78,10 +79,13 @@ class CompositeComponent:
         self,
         name: str,
         hook: PostCopyHook,
+        *,
+        materialization_backing: PinnedParam | None = None,
     ) -> Callable[[], None]:
         return self.component_for_param_name(name).register_post_copy_hook(
             name,
             hook,
+            materialization_backing=materialization_backing,
         )
 
     def activate(

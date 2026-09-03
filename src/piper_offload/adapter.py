@@ -7,7 +7,7 @@ storage and target metadata only; merge and routed execution live in their
 respective transform modules.
 """
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Literal, Self
@@ -18,6 +18,8 @@ from .host_backing import HostBacking, validate_host_backing
 from .lora import ScaledLoRAFactor
 from .parameter_delta import ParameterDelta, ScaledParameterDelta
 from .parameter_value import ParameterValue, ScaledParameterValue
+from .tensor_adapter_registry import select_adapter
+from .tensor_adapters import RegularAdapter
 
 __all__ = [
     "Adapter",
@@ -91,10 +93,12 @@ class Adapter:
     Build once from a flat canonical ``state_dict``. Exact LoRA and delta
     suffixes identify low-rank factors and full-rank additive updates; every
     other key is the complete value for an exact-name meta parameter.
-    Inputs are validated, cast to the optional storage ``dtype``, and pinned
-    directly by default. Adopt mode retains compatible CPU storage without
-    copying it. The resource retains the resulting tensors but not the raw
-    input mapping.
+    Inputs are validated and pinned directly by default. The optional
+    ``dtype`` casts dense inputs; a structured parameter value must already
+    have that logical compute dtype because casting would discard its encoded
+    representation. Adopt mode retains compatible CPU storage without copying
+    it. The resource retains the resulting tensors but not the raw input
+    mapping.
 
     Satisfies :class:`~piper_offload.protocols.ResourceStore`, so it can be
     registered in :class:`~piper_offload.ResourceCache` for budget tracking and
@@ -155,10 +159,12 @@ class Adapter:
         targets. Keys ending in ``.delta.weight`` or ``.delta.bias`` are
         full-rank additive updates targeting the corresponding model weight or
         bias. Every other key is an exact model parameter name whose tensor is
-        the complete value for a meta parameter. ``dtype`` casts every input
-        before host capture. ``scale_parameter_values=False`` materializes
-        those complete values unchanged instead of multiplying them by an
-        active adapter's strength. A zero-strength adapter remains inactive.
+        the complete dense or supported prequantized value for a meta
+        parameter. ``dtype`` casts dense inputs; structured values must already
+        use it as their logical compute dtype.
+        ``scale_parameter_values=False`` materializes those complete values
+        unchanged instead of multiplying them by an active adapter's strength.
+        A zero-strength adapter remains inactive.
         ``host_backing="adopt"`` strictly adopts existing CPU storage and
         therefore rejects conversions.
         """
@@ -167,7 +173,11 @@ class Adapter:
             raise ValueError(f"Adapter dtype must be floating-point, got {dtype}.")
         sources = _parse_adapter_state_dict(state_dict)
         if backing == "adopt":
-            _validate_adopted_dtype(state_dict, dtype=dtype)
+            _validate_adopted_dtype(
+                state_dict,
+                value_keys=sources.values.keys(),
+                dtype=dtype,
+            )
         targets = _build_adapter_targets(
             sources,
             dtype=dtype,
@@ -247,13 +257,34 @@ def _validate_delta_base(base: str) -> None:
 def _validate_adopted_dtype(
     state_dict: Mapping[str, torch.Tensor],
     *,
+    value_keys: Collection[str],
     dtype: torch.dtype | None,
 ) -> None:
     """Reject a requested conversion that would defeat source adoption."""
     if dtype is None:
         return
-    entries = state_dict.items()
-    incompatible = [key for key, tensor in entries if isinstance(tensor, torch.Tensor) and tensor.dtype is not dtype]
+    value_key_set = set(value_keys)
+    incompatible: list[str] = []
+    for key, tensor in state_dict.items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if key not in value_key_set:
+            if tensor.dtype is not dtype:
+                incompatible.append(key)
+            continue
+        try:
+            adapter = select_adapter(tensor)
+        except NotImplementedError:
+            # Source validation will report the missing adapter with the
+            # parameter-value-specific error.
+            continue
+        value_dtype = (
+            tensor.dtype
+            if isinstance(adapter, RegularAdapter)
+            else adapter.compute_dtype(tensor)
+        )
+        if value_dtype is not dtype:
+            incompatible.append(key)
     if incompatible:
         raise ValueError(
             "adopted adapter host backing cannot convert adapter tensor dtype "

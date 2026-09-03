@@ -25,6 +25,7 @@ from .tensor_adapters import (
     AdoptableTensorAdapter,
     BindLayoutTensorAdapter,
     CpuRoundTripTensorAdapter,
+    LogicalShapeTensorAdapter,
     ParameterDataSwapTensorAdapter,
     PostLoadRearmTensorAdapter,
     TensorAdapter,
@@ -80,6 +81,7 @@ class PinnedParam:
 
     __slots__ = (
         "_bind_layout",
+        "_logical_shape",
         "_needs_rearm",
         "_shape",
         "_target_layout",
@@ -120,6 +122,11 @@ class PinnedParam:
                     "requires_grad=False."
                 )
         self.adapter: TensorAdapter[Any, Any] = select_adapter(representation)
+        self._logical_shape = (
+            self.adapter.logical_shape(representation)
+            if isinstance(self.adapter, LogicalShapeTensorAdapter)
+            else tuple(representation.shape)
+        )
         # Precompute the rearm capability once: the per-load check is a hot
         # path (every param, every block rotation), and a runtime_checkable
         # Protocol isinstance structurally probes every member each call.
@@ -231,6 +238,11 @@ class PinnedParam:
     def shape(self) -> torch.Size:
         """Shape of the source parameter representation at pin time."""
         return self._shape
+
+    @property
+    def logical_shape(self) -> tuple[int, ...]:
+        """Dense logical shape represented by this pinned parameter."""
+        return self._logical_shape
 
     @property
     def is_meta(self) -> bool:
@@ -359,6 +371,22 @@ class PinnedParam:
         self.copy_to_gpu(state, non_blocking=non_blocking)
         self.rearm_after_load(param, state)
         return param
+
+    def clone_cpu_param(self) -> nn.Parameter:
+        """Return an independent CPU clone of this representation.
+
+        Unlike CPU :meth:`materialize`, this never aliases the immutable host
+        backing. It is used when a parameter value becomes permanent model
+        state and may subsequently be mutated by strength scaling.
+        """
+        if self.is_meta:
+            raise RuntimeError(
+                "A meta parameter cannot be cloned without an active "
+                "parameter value."
+            )
+        representation = param_representation(self.make_cpu_param())
+        cloned_state = self.adapter.clone_pin(representation)
+        return self.adapter.cpu_param(cloned_state, requires_grad=False)
 
     @property
     def compute_dtype(self) -> torch.dtype:

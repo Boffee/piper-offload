@@ -45,6 +45,7 @@ __all__ = [
     "DenseMergeTensorAdapter",
     "DenseMergeValidationTensorAdapter",
     "DequantRequantTensorAdapter",
+    "DequantizeTensorAdapter",
     "LoRAMergeTensorAdapter",
     "LoRAMergeValidationTensorAdapter",
     "LogicalShapeTensorAdapter",
@@ -356,8 +357,26 @@ class MergeLocalityTensorAdapter(Protocol):
 
 
 @runtime_checkable
-class DequantRequantTensorAdapter[PinnedStateT, GpuStateT](
+class DequantizeTensorAdapter[PinnedStateT, GpuStateT](
     TensorAdapter[PinnedStateT, GpuStateT],
+    Protocol,
+):
+    """Optional capability for exposing a dense logical representation.
+
+    The returned tensor must be accepted as a local or global update by the
+    same adapter's :class:`DenseMergeTensorAdapter` implementation. Composing
+    distributed adapters may therefore return the dense local shard.
+    """
+
+    @staticmethod
+    def dequantize(t: torch.Tensor) -> torch.Tensor:
+        """Return the dense logical value represented by ``t``."""
+        ...
+
+
+@runtime_checkable
+class DequantRequantTensorAdapter[PinnedStateT, GpuStateT](
+    DequantizeTensorAdapter[PinnedStateT, GpuStateT],
     Protocol,
 ):
     """Optional capability for shape-preserving dequantize/requantize conversion.
@@ -378,12 +397,12 @@ class DequantRequantTensorAdapter[PinnedStateT, GpuStateT](
     """
 
     @staticmethod
-    def dequantize(t: torch.Tensor) -> torch.Tensor:
-        """Return a dense logical tensor in ``compute_dtype(t)``."""
-        ...
-
-    @staticmethod
-    def requantize(t: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
+    def requantize(
+        t: torch.Tensor,
+        *,
+        like: torch.Tensor,
+        rounding_seed: int | None = None,
+    ) -> torch.Tensor:
         """Return ``t`` encoded in the same representation as ``like``."""
         ...
 
@@ -759,6 +778,11 @@ class RegularAdapter:
     @staticmethod
     def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
         return tuple(t.shape)
+
+    @staticmethod
+    def dequantize(t: torch.Tensor) -> torch.Tensor:
+        """Return an independent dense logical value."""
+        return t.clone()
 
     @staticmethod
     def merge_lora_(

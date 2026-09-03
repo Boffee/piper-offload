@@ -30,12 +30,21 @@ from .tensor_adapter_registry import (
 type PostCopyHook = Callable[[nn.Parameter], None]
 
 
+@dataclass(frozen=True, slots=True)
+class _PostCopyAction:
+    """A transform plus optional backing for a storage-free model target."""
+
+    hook: PostCopyHook
+    materialization_backing: PinnedParam | None = None
+
+
 @dataclass(slots=True)
 class PinnedParamTarget:
     """Active adapter storage for one pinned parameter backing."""
 
     _state: object
     param: nn.Parameter
+    _backing: PinnedParam
 
 
 @dataclass(slots=True)
@@ -171,7 +180,7 @@ class PinnedModuleInstance:
     module: nn.Module
     params: Mapping[str, PinnedParam]
     buffers: Mapping[str, PinnedBuffer]
-    _post_copy_hooks: dict[int, PostCopyHook] = field(
+    _post_copy_hooks: dict[int, _PostCopyAction] = field(
         default_factory=dict,
         init=False,
         repr=False,
@@ -222,11 +231,12 @@ class PinnedModuleInstance:
         pinned = self.params.get(name)
         if pinned is None:
             raise ValueError(f"param name {name!r} is not owned by this PinnedModuleInstance")
-        pinned.copy_to_gpu(target._state, non_blocking=True)
-        pinned.rearm_after_load(target.param, target._state)
-        hook = self._post_copy_hooks.get(id(pinned))
-        if hook is not None:
-            hook(target.param)
+        action = self._post_copy_hooks.get(id(pinned))
+        source = _materialization_source(pinned, action)
+        if source is not None:
+            _copy_param_to_target(source, target, non_blocking=True)
+        if action is not None:
+            action.hook(target.param)
 
     def allocate_target(
         self,
@@ -234,17 +244,39 @@ class PinnedModuleInstance:
         *,
         param_names: Iterable[str] | None = None,
         buffer_names: Iterable[str] | None = None,
+        param_backings: Mapping[str, PinnedParam] | None = None,
     ) -> PinnedModuleTarget:
         """Allocate active storage for selected bound entries on ``device``."""
         _validate_cuda_device(device)
-        params = (
-            self.materialized_params
-            if param_names is None
-            else _select_known_names(self.params, param_names)
-        )
+        materialized = self.materialized_params
+        if param_names is None:
+            params = materialized
+        else:
+            selected = _select_known_names(self.params, param_names)
+            params = {
+                name: materialized.get(name, pinned)
+                for name, pinned in selected.items()
+            }
+        if param_backings is not None:
+            unknown = sorted(set(param_backings) - set(self.params))
+            if unknown:
+                raise ValueError(
+                    f"Cannot provide backings for unknown names: {_format_names(unknown)}."
+                )
+            missing = sorted(set(params) - set(param_backings))
+            if missing:
+                raise ValueError(
+                    "Explicit parameter backings are missing selected names: "
+                    f"{_format_names(missing)}."
+                )
+            params = {name: param_backings[name] for name in params}
         buffers = _select_known_names(self.buffers, buffer_names)
         return PinnedModuleTarget(
-            param_targets=_allocate_param_targets(params, device),
+            param_targets=_allocate_param_targets(
+                params,
+                _items_for_names(self.params, params),
+                device,
+            ),
             buffer_targets=_allocate_buffer_targets(buffers, device),
         )
 
@@ -255,17 +287,26 @@ class PinnedModuleInstance:
         Physical parameters always require a target. Meta parameters require
         one only while a post-copy transform is registered to populate them.
         """
-        return {
-            name: pinned
-            for name, pinned in self.params.items()
-            if not pinned.is_meta
-            or id(pinned) in self._post_copy_hooks
-        }
+        materialized: dict[str, PinnedParam] = {}
+        for name, pinned in self.params.items():
+            action = self._post_copy_hooks.get(id(pinned))
+            if pinned.is_meta and action is None:
+                continue
+            materialized[name] = (
+                action.materialization_backing
+                if pinned.is_meta
+                and action is not None
+                and action.materialization_backing is not None
+                else pinned
+            )
+        return materialized
 
     def register_post_copy_hook(
         self,
         name: str,
         hook: PostCopyHook,
+        *,
+        materialization_backing: PinnedParam | None = None,
     ) -> Callable[[], None]:
         """Register a post-copy hook and return a callable that removes it."""
         key = self.post_copy_hook_key(name)
@@ -275,7 +316,25 @@ class PinnedModuleInstance:
                 f"param name {name!r}. Duplicate or shared adapter "
                 "targets for the same parameter backing are unsupported."
             )
-        self._post_copy_hooks[key] = hook
+        pinned = self.params[name]
+        if materialization_backing is not None:
+            if not pinned.is_meta:
+                raise ValueError(
+                    "A post-copy materialization backing is only valid for a "
+                    f"meta parameter; {name!r} already owns physical storage."
+                )
+            if materialization_backing.is_meta:
+                raise ValueError(
+                    "A post-copy materialization backing must own physical storage."
+                )
+            if materialization_backing.requires_grad:
+                raise ValueError(
+                    "A post-copy materialization backing must be frozen."
+                )
+        self._post_copy_hooks[key] = _PostCopyAction(
+            hook,
+            materialization_backing,
+        )
         hooks = self._post_copy_hooks
         removed = False
 
@@ -336,6 +395,7 @@ class PinnedModuleInstance:
         _copy_params_to_target(
             params,
             target.param_targets,
+            self._post_copy_hooks,
             non_blocking=non_blocking,
         )
         if run_post_copy_hooks:
@@ -636,18 +696,20 @@ def _validate_names_present(
 
 def _allocate_param_targets(
     params: Mapping[str, PinnedParam],
+    identities: Mapping[str, PinnedParam],
     device: torch.device,
 ) -> dict[str, PinnedParamTarget]:
     targets_by_pinned_id: dict[int, PinnedParamTarget] = {}
     targets_by_name: dict[str, PinnedParamTarget] = {}
     for name, pinned in params.items():
-        key = id(pinned)
+        key = id(identities[name])
         target = targets_by_pinned_id.get(key)
         if target is None:
             state = pinned.allocate_gpu_storage(device)
             target = PinnedParamTarget(
                 _state=state,
                 param=pinned.make_gpu_param(state),
+                _backing=pinned,
             )
             targets_by_pinned_id[key] = target
         targets_by_name[name] = target
@@ -686,19 +748,53 @@ def _allocate_buffer_targets(
 def _copy_params_to_target(
     params: Mapping[str, PinnedParam],
     targets: Mapping[str, PinnedParamTarget],
+    hooks: Mapping[int, _PostCopyAction],
     *,
     non_blocking: bool,
 ) -> None:
     copied: set[int] = set()
     for name, pinned in params.items():
-        key = id(pinned)
+        target = targets[name]
+        key = id(target)
         if key in copied:
             continue
-        pinned.copy_to_gpu(targets[name]._state, non_blocking=non_blocking)
-        # Re-arm the reused wrapper at the freshly-loaded buffers (no-op
-        # unless the adapter migrates state off the wrapper, e.g. bnb int8).
-        pinned.rearm_after_load(targets[name].param, targets[name]._state)
+        source = _materialization_source(
+            pinned,
+            hooks.get(id(pinned)),
+        )
+        if source is not None:
+            _copy_param_to_target(source, target, non_blocking=non_blocking)
         copied.add(key)
+
+
+def _materialization_source(
+    pinned: PinnedParam,
+    action: _PostCopyAction | None,
+) -> PinnedParam | None:
+    """Select bytes copied before a target's post-copy transform."""
+    if not pinned.is_meta:
+        return pinned
+    if action is None:
+        return None
+    return action.materialization_backing
+
+
+def _copy_param_to_target(
+    source: PinnedParam,
+    target: PinnedParamTarget,
+    *,
+    non_blocking: bool,
+) -> None:
+    """Copy one representation into a compatible preallocated target."""
+    if source.target_layout != target._backing.target_layout:
+        raise RuntimeError(
+            "Parameter target layout does not match the active materialization "
+            "backing. Reallocate the target for the current parameter value."
+        )
+    source.copy_to_gpu(target._state, non_blocking=non_blocking)
+    # Re-arm the reused wrapper at the freshly-loaded buffers (no-op unless
+    # the adapter migrates state off the wrapper, e.g. bitsandbytes int8).
+    source.rearm_after_load(target.param, target._state)
 
 
 def _copy_buffers_to_target(
@@ -736,17 +832,18 @@ def _copy_trainable_params_from_target(
 def _run_post_copy_hooks(
     params: Mapping[str, PinnedParam],
     targets: Mapping[str, PinnedParamTarget],
-    hooks: Mapping[int, PostCopyHook],
+    hooks: Mapping[int, _PostCopyAction],
 ) -> None:
     seen: set[int] = set()
     for name, pinned in params.items():
-        key = id(pinned)
+        target = targets[name]
+        key = id(target)
         if key in seen:
             continue
         seen.add(key)
-        hook = hooks.get(key)
-        if hook is not None:
-            hook(targets[name].param)
+        action = hooks.get(id(pinned))
+        if action is not None:
+            action.hook(target.param)
 
 
 def _install_pinned_params(

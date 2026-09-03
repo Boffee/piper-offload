@@ -524,6 +524,7 @@ class TestPinnedModuleInstance:
                 "extra": PinnedParamTarget(
                     object(),
                     nn.Parameter(torch.empty(2)),
+                    cast(PinnedParam, pinned),
                 ),
             },
             buffer_targets={},

@@ -788,6 +788,8 @@ class BlockComponent:
         self,
         name: str,
         hook: PostCopyHook,
+        *,
+        materialization_backing: PinnedParam | None = None,
     ) -> Callable[[], None]:
         """Register a hook after this component copies ``name`` to GPU.
 
@@ -795,7 +797,11 @@ class BlockComponent:
         LoRA. Returns a callable that unregisters the hook.
         """
         instance, name = self._resolve_param_name(name)
-        return instance.register_post_copy_hook(name, hook)
+        return instance.register_post_copy_hook(
+            name,
+            hook,
+            materialization_backing=materialization_backing,
+        )
 
     def _resolve_param_name(
         self,

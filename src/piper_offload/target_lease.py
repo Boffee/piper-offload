@@ -1,11 +1,12 @@
 """Stream-aware ownership for reusable CUDA module targets."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import cast
 
 import torch
 
 from .pinned_module import PinnedModuleInstance, PinnedModuleTarget
+from .pinned_param import PinnedParam
 
 
 class _CudaTargetLease:
@@ -42,6 +43,7 @@ class _CudaTargetLease:
         allocation_stream: torch.cuda.Stream | None = None,
         param_names: Iterable[str] | None = None,
         buffer_names: Iterable[str] | None = None,
+        param_backings: Mapping[str, PinnedParam] | None = None,
     ) -> _CudaTargetLease:
         """Allocate a target from the requested CUDA stream's pool."""
         if allocation_stream is None:
@@ -51,6 +53,7 @@ class _CudaTargetLease:
                 device,
                 param_names=param_names,
                 buffer_names=buffer_names,
+                param_backings=param_backings,
             )
         return cls(target, allocation_stream)
 

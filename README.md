@@ -494,8 +494,8 @@ wrappers may independently opt into staged factorized and full-rank merges
 whose implementations select a format-specific kernel or framework fallback.
 Dense-only and mixed dense + LoRA updates use the full-rank capability; the
 mixed form re-encodes a quantized base once. Plain float8 targets remain
-unsupported. Frozen plain
-floating-point meta tensors can instead be populated by parameter values.
+unsupported. Frozen plain floating-point meta tensors can instead be populated
+by dense or prequantized parameter values.
 Routed mode remains factor-only and requires a compatible logical `nn.Linear`
 shape and compute dtype.
 `PinnedParam` remains a storage primitive; transforms ask the selected tensor
@@ -507,9 +507,11 @@ for full-rank additive updates. `module.delta.weight` targets `module.weight`,
 while `module.delta.bias` targets `module.bias`. LoRA and dense terms for the
 same parameter form one `ParameterDelta`. Every other entry is a
 `ParameterValue` whose key is the exact model parameter name and whose source
-is the complete value for a conventional floating-point meta parameter. Plain
-float8 parameter values are not supported. Construct `Adapter(targets=...)`
-directly if a model parameter name itself ends in one of the reserved suffixes.
+is the complete value for a plain floating-point meta parameter. The source may
+be a conventional dense tensor or a registered prequantized representation
+that exposes both `dequantize()` and `merge_dense_()`. Plain float8 storage is
+not supported. Construct `Adapter(targets=...)` directly if a model parameter
+name itself ends in one of the reserved suffixes.
 
 ```python
 feature_adapter = Adapter.from_state_dict(
@@ -544,21 +546,40 @@ The resource-level API uses `Adapter`, `AdapterMode`, `AdapterSpec`, and
 Parameter values are merge-only: routed mode rejects the request. For a meta
 target, merge mode materializes the value according to its strength policy.
 Only one active parameter value may own a target; repeated or competing values
-are rejected. Parameter values do not apply to existing physical parameters,
-quantized tensors, DTensors, or tensor subclasses. Their meta targets must
-have strided, non-overlapping dense layouts with zero storage offset; this
-includes ordinary contiguous and transposed dense parameters but excludes
-overlapping or gapped views that cannot be populated while preserving the
-declared layout.
+are rejected. Parameter values do not apply to existing physical model
+parameters: the model-side target remains a storage-free plain floating-point
+meta placeholder. For a dense source, that placeholder's dtype and strided,
+non-overlapping dense layout are preserved; zero storage offset is required.
+For a structured source, the value's tensor adapter owns its packed storage,
+quantization metadata, logical compute dtype, and DTensor composition. The
+meta placeholder supplies only the target name and logical shape, so its dtype
+does not need to match the prequantized source. Supplying `dtype=` while
+constructing an adapter cannot convert a structured value; it must either
+match the representation's compute dtype or the value must be prequantized
+again by the caller.
+
+Structured parameter-value support intentionally mirrors dense-delta support:
+Quanto, bitsandbytes 4-bit and 8-bit, TorchAO scaled/static FP8, INT8, MX and
+NVFP4, Piper ConvRot INT8/NVFP4, and supported DTensor compositions opt in.
+GGUF and TorchAO INT4 tile-packed values remain unsupported because their
+adapters do not expose dense merge. This uses the existing tensor-adapter
+contracts; `ParameterValue` does not define a second quantization metadata
+schema.
 
 A frozen plain floating-point meta parameter has no host backing and
 contributes zero bytes to model cache accounting.
 Without an active parameter value it stays meta and no CUDA slot is allocated;
 executing a module that still references it is the caller's error. With a
-parameter value, resident, streaming, rolling, and automatic block modes allocate
-active storage and fill it directly from the scaled source—there is no base
-storage to allocate or copy. Deactivation restores the meta parameter. Low-rank
-A/B factors cannot materialize a meta target. Rolling allocates the union
+parameter value, resident, streaming, rolling, and automatic block modes
+allocate active storage—there is no model base storage to copy. Dense values
+are filled in the placeholder's declared layout. Structured values allocate
+from their own backing and copy the packed representation exactly. Unit
+strength (or disabled strength scaling) therefore performs no
+dequantize/requantize round trip. A non-unit strength reuses dense merge as
+`W + (strength - 1) * W`, producing one terminal requantization. Permanent
+merge follows the same rule and installs an independent representation rather
+than aliasing immutable adapter backing. Deactivation restores the meta
+parameter. Low-rank A/B factors cannot materialize a meta target. Rolling allocates the union
 of slots needed by its homogeneous block group. If another block requires the
 same rolling slot, inactive blocks may temporarily reference that already
 allocated storage; its inactive contents are unspecified and consume no

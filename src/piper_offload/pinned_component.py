@@ -70,6 +70,7 @@ from .pinned_module import (
     PinnedModuleStore,
     PostCopyHook,
 )
+from .pinned_param import PinnedParam
 from .target_lease import _CudaTargetLease
 
 
@@ -187,14 +188,22 @@ class PinnedComponent:
         return self._buffer_names
 
     def register_post_copy_hook(
-        self, name: str, hook: PostCopyHook,
+        self,
+        name: str,
+        hook: PostCopyHook,
+        *,
+        materialization_backing: PinnedParam | None = None,
     ) -> Callable[[], None]:
         """Register a hook after this component copies ``name`` to GPU.
 
         Package-internal: used by :class:`ModelOffloader` for merge-mode
         LoRA. Returns a callable that unregisters the hook.
         """
-        return self._instance.register_post_copy_hook(name, hook)
+        return self._instance.register_post_copy_hook(
+            name,
+            hook,
+            materialization_backing=materialization_backing,
+        )
 
     def activate(self, device: torch.device, **kwargs: object) -> None:
         """Activate the managed tensors on ``device``.

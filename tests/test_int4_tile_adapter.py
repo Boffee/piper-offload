@@ -14,6 +14,7 @@ from torch import nn
 from piper_offload import (
     Adapter,
     ModelOffloader,
+    ParameterValue,
     merge_adapter,
 )
 from piper_offload.int4_tile_adapter import Int4TilePackedAdapter
@@ -127,6 +128,13 @@ class TestInt4TilePackedAdapter:
             pinned_param.copy_to_cpu(state)
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
             pinned_param.validate_parameter_data_swap_target()
+
+    def test_parameter_value_rejects_format_without_dense_merge(self) -> None:
+        with pytest.raises(ValueError, match="dense merge and dequantize"):
+            ParameterValue.from_tensor(
+                _make_int4_tile(),
+                pin_memory=False,
+            )
 
     def test_merge_lora_rejects_int4_tile_weight(self) -> None:
         class M(nn.Module):

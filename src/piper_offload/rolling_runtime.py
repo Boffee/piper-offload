@@ -3,6 +3,7 @@
 import contextlib
 import functools
 import logging
+import math
 import weakref
 from collections.abc import Generator, Sequence
 
@@ -17,6 +18,7 @@ from .int8_adapter import Int8Adapter
 from .mx_adapter import MxAdapter
 from .nvfp4_adapter import Nvfp4Adapter
 from .pinned_module import PinnedModuleInstance
+from .pinned_param import PinnedParam
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from .piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
 from .quanto_adapter import QuantoAdapter
@@ -81,10 +83,13 @@ class RollingBlockRuntime:
         if self.acquired:
             raise RuntimeError("rolling block runtime is already acquired")
         self._stream = torch.cuda.Stream(device=device, priority=-1)
+        materialized_by_instance = tuple(
+            instance.materialized_params for instance in self._instances
+        )
         materialized_names = {
             name
-            for instance in self._instances
-            for name in instance.materialized_params
+            for params in materialized_by_instance
+            for name in params
         }
         self._slot_names = tuple(
             name
@@ -103,11 +108,38 @@ class RollingBlockRuntime:
             return
 
         self._fallback_event = torch.cuda.Event()
+        slot_backings: dict[str, PinnedParam] = {}
+        for name in self._slot_names:
+            active = [
+                backing for params in materialized_by_instance
+                if (backing := params.get(name)) is not None
+            ]
+            assert active
+            backing = active[0]
+            if any(
+                candidate.target_layout != backing.target_layout
+                for candidate in active[1:]
+            ):
+                raise NotImplementedError(
+                    "rolling compilation requires identical active parameter "
+                    f"layouts for slot {name!r} in every materialized block"
+                )
+            if type(backing.adapter) not in _ROLLING_ADAPTER_TYPES:
+                raise NotImplementedError(
+                    "rolling compilation does not support active parameter "
+                    f"adapter {type(backing.adapter).__name__} for slot {name!r}"
+                )
+            if math.prod(backing.logical_shape) == 0:
+                raise NotImplementedError(
+                    "rolling compilation does not support zero-sized parameter slots"
+                )
+            slot_backings[name] = backing
         self._lease = _CudaTargetLease.allocate(
             self._instances[0],
             device,
             param_names=self._slot_names,
             buffer_names=(),
+            param_backings=slot_backings,
         )
         target = self._lease.target
         register_rolling_target(

@@ -30,7 +30,10 @@ def _instance_target_signature(instance: PinnedModuleInstance) -> BlockSignature
             params[names[0]].requires_grad,
             params[names[0]].target_layout,
         )
-        for names in group_names(params.keys(), lambda name: id(params[name]))
+        for names in group_names(
+            params.keys(),
+            lambda name: id(instance.params[name]),
+        )
     )
     buffers = instance.buffers
     buffer_sig = tuple(

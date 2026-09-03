@@ -75,7 +75,8 @@ class AdapterSpec:
     routed per-forward transfer volume when using pinned backing. Adopted
     backing strictly retains compatible CPU tensors. The factory's reserved
     LoRA-suffixed entries form factor pairs; every other entry is an exact
-    parameter-name value used to populate a frozen floating-point meta target.
+    parameter-name dense or supported prequantized value used to populate a
+    frozen floating-point meta target.
     ``allow_partial_targets`` opts the built resource into applying only the
     intersection of its targets and a model's parameters.
     ``scale_parameter_values`` controls whether adapter strength scales those

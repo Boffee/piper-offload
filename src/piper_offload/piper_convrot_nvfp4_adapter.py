@@ -114,6 +114,11 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
         return t.orig_dtype
 
     @staticmethod
+    def dequantize(t: torch.Tensor) -> torch.Tensor:
+        """Return ConvRot's dense logical weight."""
+        return require_convrot_nvfp4_tensor(t).dequantize()
+
+    @staticmethod
     def merge_lora_(
         target: torch.Tensor,
         b: torch.Tensor,
