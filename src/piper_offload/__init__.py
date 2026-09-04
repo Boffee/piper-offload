@@ -54,10 +54,11 @@ tensor-parallel ``DTensor`` weights wrapping any of the above).
 implement the :class:`ResourceBinding` Protocol. Each owns exactly one model
 runtime and is reused sequentially.
 
-Host capture takes ownership of compatible complete pageable CPU allocations,
-preserving checkpoint file mappings and each tensor adapter's physical
-representation. Device, pinned, partial-view, and incompatible-layout sources
-are copied into pageable CPU allocations. Package resources make
+Host capture takes ownership of compatible complete pageable CPU allocations
+and non-empty views into non-resizable storage, preserving checkpoint file
+mappings and each tensor adapter's physical representation. Device, pinned,
+ordinary resizable partial-view, and incompatible-layout sources are copied
+into pageable CPU allocations. Package resources make
 ``cache_bytes`` final during construction.
 ``activate(device)`` then makes the resource usable on the requested device. For
 :class:`ModelOffloader`, ``deactivate()`` returns managed tensors to
@@ -107,18 +108,19 @@ values are merge-only and populate storage-free frozen plain floating-point
 meta parameters; parameter deltas require existing physical parameters.
 
 :class:`Adapter` owns immutable parameter-delta and parameter-value storage.
-Compatible complete CPU allocations supplied to its factory transfer to that
-backing, so callers must not mutate them after construction. Compatible
-consumers read the backing directly and may overlap; routed hooks stage their
-own per-forward device copies.
+Compatible complete CPU allocations and non-empty views into non-resizable
+storage supplied to its factory transfer to that backing, so callers must not
+mutate them after construction. Compatible consumers read the backing directly
+and may overlap; routed hooks stage their own per-forward device copies.
 
 Downstream tensor subclasses can participate in capture and movement without
 adding format-specific dependencies here: implement the public
 :class:`TensorAdapter` contract and register it during application startup with
 :func:`register_adapter`. Registered adapters are used for both movement and
 tied-storage identity. ``capture_host()`` returns owned pageable CPU state,
-retaining compatible complete allocations where supported, that the adapter
-can copy and reconstruct without changing its encoding.
+retaining compatible complete allocations and non-empty views into
+non-resizable storage where supported, that the adapter can copy and
+reconstruct without changing its encoding.
 ``storage_tensors(state)`` exposes that state's physical CPU tensors directly,
 including tensor-valued metadata, without copying or rebuilding wrappers.
 

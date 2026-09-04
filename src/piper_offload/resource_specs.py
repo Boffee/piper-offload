@@ -69,11 +69,12 @@ class AdapterSpec:
 
     ``dtype`` is forwarded to :meth:`Adapter.from_state_dict`; matching the
     model's compute dtype reduces routed per-forward transfer volume.
-    Compatible complete pageable CPU allocations transfer to the resource, so
-    the caller must not mutate factory values after construction. The factory's
-    reserved LoRA-suffixed entries form factor pairs; every other entry is an
-    exact parameter-name physical value used to populate a
-    frozen floating-point meta target.
+    Compatible complete pageable CPU allocations and non-empty views into
+    non-resizable storage transfer to the resource, so the caller must not
+    mutate factory values after construction. The factory's reserved
+    LoRA-suffixed entries form factor pairs; every other entry is an exact
+    parameter-name physical value used to populate a frozen floating-point
+    meta target.
     ``allow_partial_targets`` opts the built resource into applying only the
     intersection of its targets and a model's parameters.
     ``scale_parameter_values`` opts complete values into adapter-strength

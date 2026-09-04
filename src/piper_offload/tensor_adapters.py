@@ -127,9 +127,10 @@ class TensorAdapter[HostStateT, GpuStateT](Protocol):
     def capture_host(t: torch.Tensor) -> HostStateT:
         """Capture a pageable CPU representation of ``t``.
 
-        Implementations may retain compatible complete CPU allocations so
-        file mappings survive capture. Preserve the encoded data and metadata
-        required by this adapter's movement and reconstruction operations.
+        Implementations may retain compatible complete CPU allocations and
+        views into non-resizable storage so file mappings survive capture.
+        Preserve the encoded data and metadata required by this adapter's
+        movement and reconstruction operations.
         """
         ...
 
@@ -545,32 +546,41 @@ def capture_host_tensor(
 ) -> torch.Tensor:
     """Transfer ownership of compatible CPU storage or copy into host memory.
 
-    Complete CPU allocations with the requested layout are retained directly.
-    This preserves checkpoint-backed mappings instead of replacing them with
-    anonymous clones. Device tensors and CPU views that expose only part of an
-    allocation are normalized into a new CPU allocation.
+    Complete CPU allocations and non-empty views into non-resizable CPU storage
+    with the requested layout are retained directly. Safetensors and file-backed
+    storages are non-resizable, so split checkpoint views keep their mappings.
+    Device tensors and partial views into ordinary resizable allocations are
+    normalized into a new CPU allocation.
     """
     source = t.detach()
+    source_storage = (
+        source.untyped_storage() if source.layout is torch.strided else None
+    )
     owns_complete_storage = False
-    if source.layout is torch.strided:
+    if source_storage is not None:
         storage_span = 0 if source.numel() == 0 else 1 + sum(
             (size - 1) * stride
             for size, stride in zip(source.shape, source.stride(), strict=True)
         )
         owns_complete_storage = (
             source.storage_offset() == 0
-            and source.untyped_storage().nbytes()
-            == storage_span * source.element_size()
+            and source_storage.nbytes() == storage_span * source.element_size()
         )
     requested_layout = (
         memory_format is torch.preserve_format
         or source.is_contiguous(memory_format=memory_format)
     )
+    transferable_storage = owns_complete_storage or (
+        source.device.type == "cpu"
+        and source_storage is not None
+        and source.numel() > 0
+        and not source_storage.resizable()
+    )
     if (
         not _force_host_copy.get()
         and source.device.type == "cpu"
         and not source.is_pinned()
-        and owns_complete_storage
+        and transferable_storage
         and requested_layout
     ):
         return source

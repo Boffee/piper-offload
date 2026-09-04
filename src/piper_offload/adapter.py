@@ -91,12 +91,12 @@ class Adapter:
     suffixes identify low-rank factors and full-rank additive updates; every
     other key is the complete value for an exact-name meta parameter.
     Inputs are validated and captured in pageable CPU storage. Compatible
-    complete CPU allocations transfer to the resource; device tensors and
-    incompatible CPU layouts are copied. The optional ``dtype`` casts dense
-    inputs; a structured parameter value must already
-    have that logical compute dtype because casting would discard its encoded
-    representation. The resource retains the resulting tensors but not the
-    raw input mapping.
+    complete CPU allocations and non-empty views into non-resizable storage
+    transfer to the resource; device tensors and incompatible CPU layouts are
+    copied. The optional ``dtype`` casts dense inputs; a structured parameter
+    value must already have that logical compute dtype because casting would
+    discard its encoded representation. The resource retains the resulting
+    tensors but not the raw input mapping.
 
     Satisfies :class:`~piper_offload.protocols.ResourceStore`, so it can be
     registered in :class:`~piper_offload.ResourceCache` for budget tracking and
@@ -162,9 +162,10 @@ class Adapter:
         ``scale_parameter_values=True`` multiplies those complete values by
         an active adapter's strength; by default they remain unchanged.
         A zero-strength adapter remains inactive.
-        Compatible complete pageable CPU allocations transfer to the
-        resulting resource. The caller must not mutate input tensors after
-        construction. Device tensors and incompatible CPU layouts are copied.
+        Compatible complete pageable CPU allocations and non-empty views into
+        non-resizable storage transfer to the resulting resource. The caller
+        must not mutate input tensors after construction. Device tensors and
+        incompatible CPU layouts are copied.
         """
         if dtype is not None and not dtype.is_floating_point:
             raise ValueError(f"Adapter dtype must be floating-point, got {dtype}.")

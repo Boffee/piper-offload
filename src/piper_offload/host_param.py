@@ -38,7 +38,8 @@ class HostParam:
 
     Construction picks an adapter via :func:`select_adapter` based on
     the parameter's tensor type, then takes ownership of compatible pageable
-    CPU storage or normalizes it into CPU storage when required.
+    CPU allocations or non-resizable views and normalizes other sources into
+    CPU storage when required.
     Model-bound callers create their own
     deactivated-state :class:`nn.Parameter` wrappers with
     :meth:`make_cpu_param`.
@@ -60,15 +61,15 @@ class HostParam:
     persistent Parameter — both are supported.
 
     Low-peak host construction behavior: compatible complete CPU allocations
-    are retained directly, preserving file mappings without a copy. For plain
-    ``torch.Tensor`` parameters, construction immediately repoints the source
-    ``Parameter.data`` at the captured backing. This promptly releases replaced
-    GPU or incompatible CPU storage before the owning store finishes. It also means host
-    construction is not rollback-safe after copying has started: if a later
-    parameter fails to capture, recovery of the partially constructed store/model
-    is unsupported. Drop those references and rebuild from a fresh model
-    instance. Tensor subclasses skip this optimization because ``.data =``
-    can drop wrapper state.
+    and views into non-resizable storage are retained directly, preserving file
+    mappings without a copy. For plain ``torch.Tensor`` parameters, construction
+    immediately repoints the source ``Parameter.data`` at the captured backing.
+    This promptly releases replaced GPU or incompatible CPU storage before the
+    owning store finishes. It also means host construction is not rollback-safe
+    after copying has started: if a later parameter fails to capture, recovery
+    of the partially constructed store/model is unsupported. Drop those
+    references and rebuild from a fresh model instance. Tensor subclasses skip
+    this optimization because ``.data =`` can drop wrapper state.
 
     A frozen plain floating-point meta parameter retains its shape, dtype, and
     stride without host backing or cache charge. It remains meta unless a

@@ -1444,34 +1444,50 @@ class TestResourceCacheIntegration:
         with pytest.raises(TypeError):
             ModelCache(max_cache_bytes=10_000_000)
 
-    def test_model_cache_preserves_factory_file_mapping(self, tmp_path: Path) -> None:
+    def test_model_cache_preserves_factory_split_file_mapping(self, tmp_path: Path) -> None:
         from piper_offload import ModelCache, ModelSpec
 
         path = tmp_path / "weight.bin"
         path.touch()
-        seed = torch.from_file(str(path), shared=True, size=16, dtype=torch.float32)
-        seed.copy_(torch.arange(16, dtype=torch.float32))
+        seed = torch.from_file(str(path), shared=True, size=24, dtype=torch.float32)
+        seed.copy_(torch.arange(24, dtype=torch.float32))
         del seed
-        captured_pointer = 0
+        captured_storage_pointer = 0
 
         def factory() -> nn.Module:
-            nonlocal captured_pointer
-            weight = torch.from_file(str(path), shared=False, size=16, dtype=torch.float32).reshape(4, 4)
-            captured_pointer = weight.data_ptr()
-            model = nn.Linear(4, 4, bias=False, device="meta")
-            model.weight = nn.Parameter(weight, requires_grad=False)
+            nonlocal captured_storage_pointer
+            fused = torch.from_file(
+                str(path),
+                shared=False,
+                size=24,
+                dtype=torch.float32,
+            ).reshape(3, 2, 4)
+            captured_storage_pointer = fused.untyped_storage().data_ptr()
+            model = nn.Module()
+            model.q = nn.Parameter(fused[0], requires_grad=False)
+            model.k = nn.Parameter(fused[1], requires_grad=False)
+            model.v = nn.Parameter(fused[2], requires_grad=False)
             return model
 
         cache = ModelCache()
         spec = ModelSpec(key="mapped", factory=factory)
 
         with cache.use(spec, device="cpu") as model:
-            assert model.weight.data_ptr() == captured_pointer
-            assert not model.weight.untyped_storage().resizable()
-            torch.testing.assert_close(model(torch.eye(4)), torch.arange(16, dtype=torch.float32).reshape(4, 4).t())
+            params = (model.q, model.k, model.v)
+            storage_pointers = {
+                param.untyped_storage().data_ptr() for param in params
+            }
+            assert storage_pointers == {captured_storage_pointer}
+            assert tuple(param.storage_offset() for param in params) == (0, 8, 16)
+            assert all(not param.untyped_storage().resizable() for param in params)
+            torch.testing.assert_close(
+                torch.stack(params),
+                torch.arange(24, dtype=torch.float32).reshape(3, 2, 4),
+            )
 
         assert cache.info("mapped").cached
         assert cache.info("mapped").estimated_cache_bytes == 0
+        assert cache.info("mapped").cache_bytes == 24 * torch.float32.itemsize
         cache.clear()
 
     def test_model_spec_trainable_reuses_primary_model(self) -> None:

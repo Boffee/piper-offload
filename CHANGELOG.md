@@ -44,9 +44,10 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 - Make `ModelCache` unbounded: its constructor no longer accepts a host-byte
   limit, and built model and adapter stores remain cached until explicit
-  eviction. Compatible complete pageable CPU allocations now transfer from
-  resource factories into host backing, preserving checkpoint file mappings;
-  the OS controls their pageable residency while `host_pin_manager` separately
+  eviction. Compatible complete pageable CPU allocations and non-empty views
+  into non-resizable storage now transfer from resource factories into host
+  backing, preserving checkpoint file mappings through split parameters. The
+  OS controls their pageable residency while `host_pin_manager` separately
   bounds registered pages. `ModelSpec` and `AdapterSpec` byte estimates now
   default to zero because model-cache admission no longer uses them.
 

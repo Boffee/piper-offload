@@ -137,12 +137,13 @@ any escaped model references.
 ### Host backing
 
 Model and adapter factories transfer ownership of compatible complete pageable
-CPU allocations to the cached resource. This preserves checkpoint mmap backing
-for loaders that assign mapped tensors directly into the model. Callers must
-not mutate factory-produced tensors after construction. Device tensors, pinned
-CPU tensors, partial allocation views, and incompatible layouts are copied into
-pageable CPU allocations. Tensor adapters preserve packed quantized data,
-scales, and reconstruction metadata.
+CPU allocations and non-empty views into non-resizable storage to the cached
+resource. This preserves checkpoint mmap backing when loaders assign mapped
+tensors or splits of mapped tensors directly into the model. Callers must not
+mutate factory-produced tensors after construction. Device tensors, pinned CPU
+tensors, partial views into ordinary resizable allocations, and incompatible
+layouts are copied into pageable CPU allocations. Tensor adapters preserve
+packed quantized data, scales, and reconstruction metadata.
 
 Host storage is shared by bound wrappers and counted once per stored object.
 Capture does not register memory for accelerated transfers. The old
@@ -1164,10 +1165,11 @@ host storage.
 until its resource is evicted or otherwise released.
 
 Construction transfers compatible complete pageable CPU allocations and
-preserves their file mappings. Other sources are copied into pageable CPU
-storage. For plain `torch.Tensor` parameters, the source `Parameter.data` may
-be immediately repointed at the captured backing as soon as that host parameter
-is created. This releases replaced source storage early and promptly frees GPU
+non-empty views into non-resizable storage, preserving checkpoint file mappings
+through split parameters. Other sources are copied into pageable CPU storage.
+For plain `torch.Tensor` parameters, the source `Parameter.data` may be
+immediately repointed at the captured backing as soon as that host parameter is
+created. This releases replaced source storage early and promptly frees GPU
 storage for CUDA-origin models. Tensor subclasses such as quanto, GGUF, and
 NVFP4 do not use this `.data` swap when it would lose wrapper state.
 

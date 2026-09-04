@@ -42,13 +42,13 @@ device when device-aware) ->
 ``deactivate()`` (release transient compute resources while store
 ``cache_bytes`` remains resident).
 
-Package model resources transfer compatible complete pageable CPU storage,
-which preserves checkpoint file mappings. Plain ``torch.Tensor`` parameters
-may be repointed to captured host storage while construction is still in
-progress. If construction raises after capture has
-started, recovery of the partially constructed model/resource is
-unsupported; drop those references and rebuild from a fresh model
-instance.
+Package model resources transfer compatible complete pageable CPU storage and
+non-empty views into non-resizable storage, which preserves checkpoint file
+mappings through split parameters. Plain ``torch.Tensor`` parameters may be
+repointed to captured host storage while construction is still in progress. If
+construction raises after capture has started, recovery of the partially
+constructed model/resource is unsupported; drop those references and rebuild
+from a fresh model instance.
 
 ``activate()/deactivate()`` may be repeated as many times as you want.
 :class:`~piper_offload.ModelCache` combines cache leases with an

@@ -189,9 +189,9 @@ class ModelOffloader:
         Each module named by ``transient_paths`` similarly owns a separate
         CUDA working set that releases after that module's forward.
         Takes ownership of compatible pageable CPU backing for every managed
-        parameter and buffer, preserving checkpoint mappings and each adapter's
-        physical representation. Other devices and incompatible views are
-        normalized into CPU storage.
+        parameter and buffer, including non-resizable checkpoint views, while
+        preserving mappings and each adapter's physical representation. Other
+        devices and incompatible views are normalized into CPU storage.
         """
         composite_store = CompositeComponentStore.from_module(
             model,

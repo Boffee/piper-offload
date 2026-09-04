@@ -1,5 +1,7 @@
 """Tests for ``piper_offload.host_param.HostParam``."""
 
+from pathlib import Path
+
 import pytest
 import torch
 from torch import nn
@@ -149,6 +151,31 @@ class TestHostParam:
         assert host.data_ptr() != source.data_ptr()
         assert host.untyped_storage().nbytes() == host.numel() * host.element_size()
         assert host.is_contiguous()
+        torch.testing.assert_close(host, source)
+
+    def test_capture_host_tensor_retains_mapped_split_view(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_path / "split.bin"
+        path.touch()
+        mapped = torch.from_file(
+            str(path),
+            shared=True,
+            size=24,
+            dtype=torch.float32,
+        )
+        mapped.copy_(torch.arange(24, dtype=torch.float32))
+        source = mapped[6:18].reshape(3, 4)
+        monkeypatch.setattr(torch, "empty_like", _unexpected_allocation)
+
+        host = capture_host_tensor(source)
+
+        assert host.data_ptr() == source.data_ptr()
+        assert host.untyped_storage().data_ptr() == mapped.untyped_storage().data_ptr()
+        assert host.storage_offset() == 6
+        assert not host.untyped_storage().resizable()
         torch.testing.assert_close(host, source)
 
     @CUDA
