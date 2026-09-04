@@ -232,6 +232,10 @@ class Bnb8bitAdapter:
         )
 
     @staticmethod
+    def storage_tensors(state: _Bnb8bitHost) -> tuple[torch.Tensor, ...]:
+        return (state.data, state.scb)
+
+    @staticmethod
     def cpu_param(
         state: _Bnb8bitHost, *, requires_grad: bool = False
     ) -> nn.Parameter:

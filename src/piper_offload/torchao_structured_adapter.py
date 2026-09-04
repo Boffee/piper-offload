@@ -241,6 +241,10 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         )
         return TorchaoHost(storage=storage, meta=cls._meta_of(w))
 
+    @staticmethod
+    def storage_tensors(state: TorchaoHost[MetaT]) -> tuple[torch.Tensor, ...]:
+        return tuple(tensor for tensor in state.storage if tensor is not None)
+
     @classmethod
     def cpu_param(
         cls, state: TorchaoHost[MetaT], *, requires_grad: bool = False

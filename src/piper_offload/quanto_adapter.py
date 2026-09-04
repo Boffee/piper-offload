@@ -303,6 +303,10 @@ class QuantoAdapter:
         )
 
     @staticmethod
+    def storage_tensors(state: _QuantoHost) -> tuple[torch.Tensor, ...]:
+        return (state.data, state.scale)
+
+    @staticmethod
     def cpu_param(
         state: _QuantoHost, *, requires_grad: bool = False
     ) -> nn.Parameter:

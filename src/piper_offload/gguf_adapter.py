@@ -155,6 +155,10 @@ class GgufAdapter:
         )
 
     @staticmethod
+    def storage_tensors(state: _GgufHost) -> tuple[torch.Tensor, ...]:
+        return (state.data,)
+
+    @staticmethod
     def cpu_param(
         state: _GgufHost,
         *,

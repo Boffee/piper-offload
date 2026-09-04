@@ -164,6 +164,18 @@ class TestBnb4bitAdapter:
         assert key == tensor_id(p)
         assert key != tensor_id(_make_nf4())
 
+    @pytest.mark.parametrize("double_quant", [False, True])
+    def test_storage_enumeration_includes_metadata_and_nested_offset(self, double_quant: bool) -> None:
+        host = HostParam(_make_nf4(double_quant=double_quant))
+        state = host.host_state
+        tensors = host.storage_tensors()
+
+        assert any(tensor is state.blob for tensor in tensors)
+        assert (state.offset is not None) == double_quant
+        if double_quant:
+            assert any(tensor is state.offset for tensor in tensors)
+        assert sum(tensor.nbytes for tensor in tensors) == host.cache_bytes
+
     def test_target_layout_ignores_tensor_id(self) -> None:
         p1 = _make_nf4()
         p2 = _make_nf4()

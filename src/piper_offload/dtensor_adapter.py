@@ -452,6 +452,10 @@ class DTensorAdapter:
         )
 
     @staticmethod
+    def storage_tensors(state: _DTensorHost) -> tuple[torch.Tensor, ...]:
+        return state.inner.storage_tensors(state.inner_state)
+
+    @staticmethod
     def cpu_param(state: _DTensorHost, *, requires_grad: bool = False) -> nn.Parameter:
         # The resting weight stays a DTensor (so its adapter/layout matches the
         # store and a deactivated block is still a DTensor), but on a CPU mesh

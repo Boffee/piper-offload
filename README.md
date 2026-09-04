@@ -145,6 +145,15 @@ Host storage is shared by bound wrappers and counted once per stored object.
 Capture does not register memory for accelerated transfers. The old
 construction-time backing modes have been removed.
 
+`HostParam.storage_tensors()` and `HostBuffer.storage_tensors()` expose the
+existing physical CPU tensors, including packed quantized data, scales, and
+tensor-valued metadata. Enumeration makes no copies and preserves views;
+DTensor delegates to its local shard, and meta parameters return an empty
+tuple. Consumers must deduplicate underlying allocations themselves. Use
+`tensor.untyped_storage()` for allocation addresses and sizes; a tensor's
+`data_ptr()` and `nbytes` describe its view. Enumeration does not register or
+pin memory.
+
 ## Manual offloader lifecycle
 
 Use `ModelOffloader` directly when you want explicit lifecycle control without
@@ -1018,7 +1027,7 @@ This lets higher-level runtimes coordinate component lifetimes at model
 execution boundaries without adding policy to component internals.
 
 `TensorAdapter` is the per-parameter extension point. Its base contract
-only covers inference movement: host capture, H2D copy, GPU wrapper rebuild,
+only covers inference movement: host capture, storage enumeration, H2D copy, GPU wrapper rebuild,
 cache bytes, logical compute dtype, and block-layout signatures. Extra
 behaviors are explicit capabilities: CPU round-trip for optimizer-step
 sync, `Parameter.data` swap for trainable streaming, shape-preserving
@@ -1042,7 +1051,13 @@ or passing `None` preserves deterministic behavior. An adapter that needs a
 reproducible substream can derive one with the public `derive_seed()` utility.
 
 Downstream tensor subclasses can provide their adapter without adding a
-format-specific dependency to piper-offload:
+format-specific dependency to piper-offload.
+
+Every adapter must implement `storage_tensors(state)` alongside
+`capture_host()`. Return the captured state's existing plain CPU storage
+tensors, including tensor-valued metadata that stays on the CPU. Omit absent
+optional tensors, preserve shared allocations and views, and delegate through
+composing wrappers instead of reconstructing them.
 
 ```python
 from piper_offload import (

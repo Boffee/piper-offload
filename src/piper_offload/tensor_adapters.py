@@ -16,9 +16,9 @@ across the CPU↔GPU boundary while preserving correctness:
 Each adapter encapsulates the mechanics for one tensor type. The rest
 of the package is type-agnostic and dispatches through
 ``tensor_adapter_registry.select_adapter``. The base adapter contract is
-intentionally small: host capture, move to GPU, rebuild wrappers, report
-cache bytes, and report the logical compute dtype. Adapters also
-provide a layout signature for block-pool compatibility checks. Extra
+intentionally small: host capture and storage enumeration, move to GPU,
+rebuild wrappers, report cache bytes, and report the logical compute dtype.
+Adapters also provide a layout signature for block-pool compatibility checks. Extra
 operations are expressed as small optional protocols so callers ask for
 the exact capability they need instead of hard-coding tensor classes.
 
@@ -110,6 +110,21 @@ class TensorAdapter[HostStateT, GpuStateT](Protocol):
 
         Preserve the encoded data and metadata required by this adapter's
         movement and reconstruction operations.
+        """
+        ...
+
+    @staticmethod
+    def storage_tensors(state: HostStateT) -> tuple[torch.Tensor, ...]:
+        """Return the physical CPU tensors retained by captured host state.
+
+        Return existing plain strided tensors, including packed data, scales,
+        and tensor-valued metadata even when that metadata stays on the CPU.
+        Do not copy, dequantize, reconstruct wrappers, or move data. Composing
+        adapters delegate to their local representation.
+
+        Preserve views and empty tensors. Entries may share allocations;
+        callers must deduplicate underlying storage when accounting for or
+        registering memory. Tuple order has no cross-adapter meaning.
         """
         ...
 
@@ -677,6 +692,10 @@ class RegularAdapter:
                 memory_format=torch.contiguous_format,
             )
         )
+
+    @staticmethod
+    def storage_tensors(state: _RegularHost) -> tuple[torch.Tensor, ...]:
+        return (state.data,)
 
     @staticmethod
     def cpu_param(

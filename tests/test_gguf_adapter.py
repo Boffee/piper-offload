@@ -71,6 +71,12 @@ class TestGGUFSource:
         assert state.group_size == 64
         assert GgufAdapter.cache_bytes(state) == state.data.nbytes
 
+        (packed,) = GgufAdapter.storage_tensors(state)
+        assert packed is state.data
+        assert type(packed) is torch.Tensor
+        assert packed.dtype is torch.uint8
+        assert tuple(packed.shape) == tuple(w.as_tensor().shape)
+
     def test_matches_existing_gguf_parameter_contract(self) -> None:
         weight, packed, _quant_type = _quantized_weight(0)
         assert isinstance(weight, GGUFParameter)

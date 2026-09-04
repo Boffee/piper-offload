@@ -342,6 +342,11 @@ class Bnb4bitAdapter:
         )
 
     @staticmethod
+    def storage_tensors(state: _Bnb4bitHost) -> tuple[torch.Tensor, ...]:
+        tensors = (state.data, *state.buffers.values(), state.blob)
+        return tensors if state.offset is None else (*tensors, state.offset)
+
+    @staticmethod
     def cpu_param(
         state: _Bnb4bitHost, *, requires_grad: bool = False
     ) -> nn.Parameter:

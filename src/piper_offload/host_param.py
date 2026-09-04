@@ -229,6 +229,17 @@ class HostParam:
         """Whether the resting parameter representation is meta."""
         return type(self.host_state) is torch.Tensor and self.host_state.is_meta
 
+    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Enumerate existing CPU backing tensors without rebuilding wrappers.
+
+        Includes tensor-valued metadata. Views and shared allocations are
+        preserved; consumers own storage deduplication. Meta parameters have
+        no physical backing and return an empty tuple.
+        """
+        if self.is_meta:
+            return ()
+        return self.adapter.storage_tensors(self.host_state)
+
     def make_cpu_param(self) -> nn.Parameter:
         """Build a CPU :class:`nn.Parameter` wrapper over this host state.
 

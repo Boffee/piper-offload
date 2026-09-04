@@ -113,6 +113,25 @@ class TestDTensorAdapter:
         assert isinstance(host_param.host_state.inner, RegularAdapter)
         assert isinstance(host_param.host_state.inner, LoRAMergeTensorAdapter)
 
+    def test_storage_enumeration_reads_local_backing_without_rebuilding_dtensor(
+        self,
+        tp_mesh: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        dt, full = _dtensor_weight(tp_mesh)
+        host = HostParam(nn.Parameter(dt, requires_grad=False))
+
+        def unexpected_rebuild(*args: object, **kwargs: object) -> None:
+            raise AssertionError("storage enumeration must not rebuild DTensor")
+
+        monkeypatch.setattr(dtensor_adapter_module, "rebuild_dtensor", unexpected_rebuild)
+        (local,) = host.storage_tensors()
+
+        assert type(local) is torch.Tensor
+        assert local.device.type == "cpu"
+        assert local is host.host_state.inner_state.data
+        torch.testing.assert_close(local, full.cpu())
+
     def test_host_param_roundtrip_reconstructs_dtensor(self, tp_mesh: Any) -> None:
         dt, full = _dtensor_weight(tp_mesh)
         host_param = HostParam(nn.Parameter(dt, requires_grad=False))
@@ -651,6 +670,13 @@ class TestDTensorAdapter:
 
         host_param = HostParam(nn.Parameter(dt, requires_grad=False))
         assert isinstance(host_param.host_state.inner, Float8Adapter)
+
+        qdata, scale = host_param.storage_tensors()
+        assert type(qdata) is torch.Tensor and type(scale) is torch.Tensor
+        assert qdata is host_param.host_state.inner_state.storage[0]
+        assert scale is host_param.host_state.inner_state.storage[1]
+        assert qdata.dtype == f8.qdata.dtype
+        assert qdata.nbytes + scale.nbytes == host_param.cache_bytes
 
         gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
         host_param.copy_to_gpu(gpu_state, non_blocking=True)

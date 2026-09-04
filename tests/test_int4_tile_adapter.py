@@ -84,6 +84,17 @@ class TestInt4TilePackedAdapter:
         assert not Int4TilePackedAdapter.matches(torch.zeros(16, 16, dtype=torch.bfloat16))
         assert isinstance(select_adapter(qt), Int4TilePackedAdapter)
 
+    def test_storage_enumeration_retains_packed_representation(self) -> None:
+        host = HostParam(nn.Parameter(_make_int4_tile(), requires_grad=False))
+        cpu = host.make_cpu_param().data
+        packed, scales = host.storage_tensors()
+
+        assert packed.data_ptr() == cpu.qdata.data_ptr()
+        assert packed.shape == cpu.qdata.shape
+        assert packed.dtype == cpu.qdata.dtype
+        assert scales.data_ptr() == cpu.scale_and_zero.data_ptr()
+        assert packed.nbytes + scales.nbytes == host.cache_bytes
+
     def test_capture_preserves_storage_and_metadata(self) -> None:
         int4_cls = _int4_tile_cls()
         qt = _make_int4_tile()

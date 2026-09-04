@@ -7,6 +7,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Add required `TensorAdapter.storage_tensors(state)` enumeration and expose
+  it through `HostParam.storage_tensors()` and `HostBuffer.storage_tensors()`.
+  Enumeration returns existing physical CPU tensors, including quantized
+  payloads and tensor-valued metadata, without copying or materialization.
+  DTensor delegates to local shard storage; meta parameters return no tensors.
+
 - Add direct GGUF-to-ConvRot INT8 offload for existing Diffusers
   `GGUFParameter` objects. Packed GGUF bytes remain in host backing and in a
   reusable GPU staging buffer; Piper Kernels decodes, rotates, and requantizes

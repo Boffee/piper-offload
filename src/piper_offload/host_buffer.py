@@ -55,5 +55,9 @@ class HostBuffer:
     def cache_bytes(self) -> int:
         return self.tensor.nbytes
 
+    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return the existing backing tensor, preserving its storage and view."""
+        return (self.tensor,)
+
 
 __all__ = ["HostBuffer"]

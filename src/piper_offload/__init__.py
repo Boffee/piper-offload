@@ -114,6 +114,8 @@ adding format-specific dependencies here: implement the public
 :func:`register_adapter`. Registered adapters are used for both movement and
 tied-storage identity. ``capture_host()`` returns owned pageable CPU state
 that the adapter can copy and reconstruct without changing its encoding.
+``storage_tensors(state)`` exposes that state's physical CPU tensors directly,
+including tensor-valued metadata, without copying or rebuilding wrappers.
 
 :class:`ResourceCache` manages cached backing stores with policy-driven
 eviction, reference-counted leases, and transactional admission.
