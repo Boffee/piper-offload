@@ -137,7 +137,14 @@ def test_another_component_evicts_only_released_registrations(pins) -> None:
         first.deactivate()
 
 
-@pytest.mark.parametrize(("device", "mode"), [("cpu", "streaming"), ("cuda", "resident"), ("cuda", "host")])
+@pytest.mark.parametrize(
+    ("device", "mode"),
+    [
+        ("cpu", "streaming"),
+        pytest.param("cuda", "resident", marks=CUDA),
+        pytest.param("cuda", "host", marks=CUDA),
+    ],
+)
 def test_cpu_and_resident_execution_do_not_acquire_pins(device: str, mode: str, pins, monkeypatch) -> None:
     manager, _backend = pins
 
