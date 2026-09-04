@@ -1,13 +1,13 @@
-"""Tensor-type adapters: per-type pin/move/wrap mechanics.
+"""Tensor-type adapters: per-type capture/move/wrap mechanics.
 
 Different tensor subclasses need different machinery to move bytes
 across the CPU↔GPU boundary while preserving correctness:
 
-- Plain ``torch.Tensor``: single contiguous pinned
+- Plain ``torch.Tensor``: single contiguous host
   buffer; consumers either replace ``module._parameters[leaf]`` with a
   fresh :class:`nn.Parameter` wrapping it, or ``.data``-swap to preserve
   identity for trainable params.
-- Quanto ``WeightQBytesTensor``: two pinned tensors (``_data`` + ``_scale``)
+- Quanto ``WeightQBytesTensor``: two host tensors (``_data`` + ``_scale``)
   plus quant metadata; the wrapper must be reconstructed on each move.
   ``.data``-swap doesn't work for quanto — its quant state is part of
   the Parameter's wrapped object, not its bytes — so quanto stays
@@ -16,7 +16,7 @@ across the CPU↔GPU boundary while preserving correctness:
 Each adapter encapsulates the mechanics for one tensor type. The rest
 of the package is type-agnostic and dispatches through
 ``tensor_adapter_registry.select_adapter``. The base adapter contract is
-intentionally small: clone/pin, move to GPU, rebuild wrappers, report
+intentionally small: host capture, move to GPU, rebuild wrappers, report
 cache bytes, and report the logical compute dtype. Adapters also
 provide a layout signature for block-pool compatibility checks. Extra
 operations are expressed as small optional protocols so callers ask for
@@ -29,7 +29,6 @@ capability protocols, and plain tensor implementation live here; built-in and
 external adapter selection lives in :mod:`tensor_adapter_registry`.
 """
 
-import sys
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -38,7 +37,6 @@ import torch
 from torch import nn
 
 __all__ = [
-    "AdoptableTensorAdapter",
     "BindLayoutTensorAdapter",
     "CpuRoundTripTensorAdapter",
     "DenseMergeTargetValidationTensorAdapter",
@@ -56,8 +54,7 @@ __all__ = [
     "TensorAdapter",
     "TensorCopyIntoAdapter",
     "adapter_name",
-    "adopt_cpu_storage",
-    "clone_to_pinned_cpu",
+    "clone_to_host_cpu",
     "empty_like_strided",
     "metadata_key",
     "optional_tensor_id",
@@ -65,14 +62,14 @@ __all__ = [
 ]
 
 @runtime_checkable
-class TensorAdapter[PinnedStateT, GpuStateT](Protocol):
-    """Adapter encoding the mechanics of pinning, moving, and wrapping
+class TensorAdapter[HostStateT, GpuStateT](Protocol):
+    """Adapter encoding the mechanics of host capture, movement, and wrapping
     one tensor type. Adapter instances are stateless; they hold no
     per-param data.
 
-    Generic over two opaque state types: ``PinnedStateT`` (the pinned
-    host representation) and ``GpuStateT`` (the GPU storage). Each
-    adapter pins these to its own concrete dataclasses; consumers
+    Generic over two opaque state types: ``HostStateT`` (the CPU
+    representation) and ``GpuStateT`` (the GPU storage). Each
+    adapter specializes these with its own concrete dataclasses; consumers
     round-trip the opaque types without inspecting them.
 
     The Protocol is methods-only — capability is determined by what an
@@ -108,14 +105,17 @@ class TensorAdapter[PinnedStateT, GpuStateT](Protocol):
         ...
 
     @staticmethod
-    def clone_pin(t: torch.Tensor) -> PinnedStateT:
-        """Clone ``t`` into pinned (or regular) host memory. Returns
-        opaque adapter-specific state used by subsequent operations."""
+    def capture_host(t: torch.Tensor) -> HostStateT:
+        """Capture an independent pageable CPU representation of ``t``.
+
+        Preserve the encoded data and metadata required by this adapter's
+        movement and reconstruction operations.
+        """
         ...
 
     @staticmethod
     def cpu_param(
-        state: PinnedStateT, *, requires_grad: bool = False
+        state: HostStateT, *, requires_grad: bool = False
     ) -> nn.Parameter:
         """Build a stable :class:`nn.Parameter` wrapping the host state.
         Used as the deactivated-state registry value
@@ -128,22 +128,22 @@ class TensorAdapter[PinnedStateT, GpuStateT](Protocol):
         ...
 
     @staticmethod
-    def alloc_gpu(state: PinnedStateT, device: torch.device) -> GpuStateT:
+    def alloc_gpu(state: HostStateT, device: torch.device) -> GpuStateT:
         """Allocate empty GPU storage mirroring this state's layout.
         Returns opaque adapter-specific state."""
         ...
 
     @staticmethod
     def gpu_param(
-        pinned: PinnedStateT, gpu_state: GpuStateT, *, requires_grad: bool = False
+        host: HostStateT, gpu_state: GpuStateT, *, requires_grad: bool = False
     ) -> nn.Parameter:
         """Build a stable :class:`nn.Parameter` wrapping the GPU state.
         Reused across many :meth:`copy_to_gpu` calls.
 
-        Takes both the pinned host state and the GPU state because
-        adapters with structured tensors (e.g. quanto) need metadata
-        captured at pin time to reconstruct the GPU-side wrapper. Plain
-        adapters ignore ``pinned``.
+        Takes both the host state and the GPU state because
+        adapters with structured tensors (e.g. quanto) need captured metadata
+        to reconstruct the GPU-side wrapper. Plain
+        adapters ignore ``host``.
 
         ``requires_grad`` defaults to ``False``; pass ``True`` for
         trainable use cases where the wrapper participates in autograd.
@@ -152,9 +152,9 @@ class TensorAdapter[PinnedStateT, GpuStateT](Protocol):
 
     @staticmethod
     def copy_to_gpu(
-        src: PinnedStateT, dst: GpuStateT, *, non_blocking: bool = False
+        src: HostStateT, dst: GpuStateT, *, non_blocking: bool = False
     ) -> None:
-        """Bulk DMA the pinned state's bytes into pre-allocated GPU storage."""
+        """Bulk DMA the host state's bytes into pre-allocated GPU storage."""
         ...
 
     @staticmethod
@@ -168,47 +168,31 @@ class TensorAdapter[PinnedStateT, GpuStateT](Protocol):
         ...
 
     @staticmethod
-    def cache_bytes(state: PinnedStateT) -> int:
+    def cache_bytes(state: HostStateT) -> int:
         """Logical representation bytes charged to :class:`ResourceCache`.
 
-        Count the tensor bytes represented by ``state``. This is deliberately
-        independent of an adopted tensor's underlying allocation capacity,
-        checkpoint file size, and current mmap residency.
+        Count the physical representation tensors, including auxiliary
+        storage and metadata retained by the adapter.
         """
         ...
 
-
 @runtime_checkable
-class AdoptableTensorAdapter[PinnedStateT](Protocol):
-    """Optional capability for adopting existing CPU host state.
-
-    This stays separate from :class:`TensorAdapter` so existing third-party
-    adapters remain compatible with the default pinned path.
-    """
-
-    @staticmethod
-    def adopt_host(t: torch.Tensor) -> PinnedStateT:
-        """Return adapter state that aliases existing CPU storage."""
-        ...
-
-
-@runtime_checkable
-class CpuRoundTripTensorAdapter[PinnedStateT, GpuStateT](
-    TensorAdapter[PinnedStateT, GpuStateT],
+class CpuRoundTripTensorAdapter[HostStateT, GpuStateT](
+    TensorAdapter[HostStateT, GpuStateT],
     Protocol,
 ):
     """Optional D2H counterpart to the base H2D movement contract."""
 
     @staticmethod
     def copy_to_cpu(
-        src: GpuStateT, dst: PinnedStateT, *, non_blocking: bool = False
+        src: GpuStateT, dst: HostStateT, *, non_blocking: bool = False
     ) -> None:
-        """Bulk D2H the GPU state's bytes into pinned host storage.
+        """Bulk D2H the GPU state's bytes into host storage.
 
         Symmetric counterpart to :meth:`copy_to_gpu`. Used to sync the
-        pinned host clone with post-update GPU contents — e.g., after
+        host clone with post-update GPU contents — e.g., after
         an optimizer step has written into the GPU param, scatter the
-        update back to the pinned state so the next H2D reads it.
+        update back to the host state so the next H2D reads it.
 
         Adapters whose GPU representation is not round-trippable should
         not implement this capability.
@@ -217,8 +201,8 @@ class CpuRoundTripTensorAdapter[PinnedStateT, GpuStateT](
 
 
 @runtime_checkable
-class LogicalShapeTensorAdapter[PinnedStateT, GpuStateT](
-    TensorAdapter[PinnedStateT, GpuStateT],
+class LogicalShapeTensorAdapter[HostStateT, GpuStateT](
+    TensorAdapter[HostStateT, GpuStateT],
     Protocol,
 ):
     """Optional capability for reading logical shape without materialization.
@@ -251,8 +235,8 @@ class PermanentUpdateValidationTensorAdapter(Protocol):
 
 
 @runtime_checkable
-class LoRAMergeTensorAdapter[PinnedStateT, GpuStateT](
-    LogicalShapeTensorAdapter[PinnedStateT, GpuStateT],
+class LoRAMergeTensorAdapter[HostStateT, GpuStateT](
+    LogicalShapeTensorAdapter[HostStateT, GpuStateT],
     Protocol,
 ):
     """Optional capability for an in-place staged LoRA merge.
@@ -300,8 +284,8 @@ class LoRAMergeValidationTensorAdapter(Protocol):
 
 
 @runtime_checkable
-class DenseMergeTensorAdapter[PinnedStateT, GpuStateT](
-    LogicalShapeTensorAdapter[PinnedStateT, GpuStateT],
+class DenseMergeTensorAdapter[HostStateT, GpuStateT](
+    LogicalShapeTensorAdapter[HostStateT, GpuStateT],
     Protocol,
 ):
     """Optional capability for an in-place staged full-rank merge.
@@ -373,8 +357,8 @@ class MergeLocalityTensorAdapter(Protocol):
 
 
 @runtime_checkable
-class DequantizeTensorAdapter[PinnedStateT, GpuStateT](
-    TensorAdapter[PinnedStateT, GpuStateT],
+class DequantizeTensorAdapter[HostStateT, GpuStateT](
+    TensorAdapter[HostStateT, GpuStateT],
     Protocol,
 ):
     """Optional capability for exposing a dense logical representation.
@@ -391,8 +375,8 @@ class DequantizeTensorAdapter[PinnedStateT, GpuStateT](
 
 
 @runtime_checkable
-class DequantRequantTensorAdapter[PinnedStateT, GpuStateT](
-    DequantizeTensorAdapter[PinnedStateT, GpuStateT],
+class DequantRequantTensorAdapter[HostStateT, GpuStateT](
+    DequantizeTensorAdapter[HostStateT, GpuStateT],
     Protocol,
 ):
     """Optional capability for shape-preserving dequantize/requantize conversion.
@@ -424,8 +408,8 @@ class DequantRequantTensorAdapter[PinnedStateT, GpuStateT](
 
 
 @runtime_checkable
-class ParameterDataSwapTensorAdapter[PinnedStateT, GpuStateT](
-    TensorAdapter[PinnedStateT, GpuStateT],
+class ParameterDataSwapTensorAdapter[HostStateT, GpuStateT](
+    TensorAdapter[HostStateT, GpuStateT],
     Protocol,
 ):
     """Optional capability for trainable streaming via ``Parameter.data`` swap."""
@@ -442,8 +426,8 @@ class ParameterDataSwapTensorAdapter[PinnedStateT, GpuStateT](
 
 
 @runtime_checkable
-class TensorCopyIntoAdapter[PinnedStateT, GpuStateT](
-    TensorAdapter[PinnedStateT, GpuStateT],
+class TensorCopyIntoAdapter[HostStateT, GpuStateT](
+    TensorAdapter[HostStateT, GpuStateT],
     Protocol,
 ):
     """Optional capability for representation-preserving copy into ``target``.
@@ -461,8 +445,8 @@ class TensorCopyIntoAdapter[PinnedStateT, GpuStateT](
 
 
 @runtime_checkable
-class BindLayoutTensorAdapter[PinnedStateT, GpuStateT](
-    TensorAdapter[PinnedStateT, GpuStateT],
+class BindLayoutTensorAdapter[HostStateT, GpuStateT](
+    TensorAdapter[HostStateT, GpuStateT],
     Protocol,
 ):
     """Optional capability: relaxed layout for store↔module bind validation.
@@ -470,7 +454,7 @@ class BindLayoutTensorAdapter[PinnedStateT, GpuStateT](
     Binding replaces every managed tensor in the target module with
     store-backed storage, so a placeholder's dtype carries no information
     past validation — a meta skeleton built from config alone (e.g. fp32
-    defaults) is structurally compatible with a store pinned from natively
+    defaults) is structurally compatible with a store captured from natively
     loaded bf16 or mixed-precision weights. Adapters that opt in supply a
     bind signature without the fields binding discards; adapters that
     don't (quantized wrappers, whose placeholder representation is
@@ -486,8 +470,8 @@ class BindLayoutTensorAdapter[PinnedStateT, GpuStateT](
 
 
 @runtime_checkable
-class PostLoadRearmTensorAdapter[PinnedStateT, GpuStateT](
-    TensorAdapter[PinnedStateT, GpuStateT],
+class PostLoadRearmTensorAdapter[HostStateT, GpuStateT](
+    TensorAdapter[HostStateT, GpuStateT],
     Protocol,
 ):
     """Optional capability: re-arm the active GPU wrapper after each load.
@@ -519,81 +503,32 @@ class PostLoadRearmTensorAdapter[PinnedStateT, GpuStateT](
 # ---------------------------------------------------------------------------
 
 
-def clone_to_pinned_cpu(
+def clone_to_host_cpu(
     t: torch.Tensor,
     *,
     memory_format: torch.memory_format = torch.preserve_format,
 ) -> torch.Tensor:
-    """Clone ``t`` into pinned CPU memory from any source device."""
-    if sys.platform == "win32" and not torch.cuda.is_available():
-        # CUDA PyTorch wheels can terminate the process with a native access
-        # violation when their pinned allocator is entered on a GPU-less
-        # Windows host. Fail in Python before calling an allocation factory.
-        raise RuntimeError(
-            "CUDA pinned memory is unavailable on this Windows host."
-        )
+    """Clone ``t`` into owned pageable CPU memory from any source device."""
     source = t.detach()
-    # Allocate the final destination in pinned memory. ``clone().pin_memory()``
-    # first materializes a complete pageable clone and then copies it again
-    # into a pinned allocation, adding one source-tensor-sized construction
-    # temporary. Preserve the existing exact-stride behavior for CUDA sources;
-    # the CPU path follows ``clone(memory_format=...)`` normalization via
-    # ``empty_like``.
+    # Preserve exact strides for device sources and clone-style layout
+    # normalization for CPU sources. Allocate the final host destination once.
     if source.device.type != "cpu" and memory_format == torch.preserve_format:
-        pinned = torch.empty_strided(
+        host = torch.empty_strided(
             tuple(source.shape),
             source.stride(),
             dtype=source.dtype,
             device="cpu",
-            pin_memory=True,
+            pin_memory=False,
         )
     else:
-        pinned = torch.empty_like(
+        host = torch.empty_like(
             source,
             device="cpu",
             memory_format=memory_format,
-            pin_memory=True,
+            pin_memory=False,
         )
-    pinned.copy_(source)
-    return pinned
-
-
-def adopt_cpu_storage(
-    t: torch.Tensor,
-    *,
-    memory_format: torch.memory_format = torch.preserve_format,
-) -> torch.Tensor:
-    """Return a detached alias of compatible existing CPU storage.
-
-    Adoption is deliberately strict: callers are asking to retain the source
-    allocation (including mmap/file backing), so this helper never moves,
-    clones, or normalizes a tensor implicitly.
-    """
-    source = t.detach()
-    if source.device.type != "cpu":
-        raise ValueError(
-            "adopted host backing requires an existing CPU tensor; "
-            f"got device {source.device}. Move the model to CPU first or use "
-            "host_backing='pinned'."
-        )
-    if (
-        memory_format == torch.contiguous_format
-        and not source.is_contiguous()
-    ):
-        raise ValueError(
-            "adopted host backing cannot retain a non-contiguous tensor "
-            "where this adapter requires contiguous storage; materialize a "
-            "contiguous CPU tensor before constructing the offloader."
-        )
-    if memory_format not in (
-        torch.preserve_format,
-        torch.contiguous_format,
-    ):
-        raise ValueError(
-            "adopted host backing only supports preserve_format or "
-            "contiguous_format adoption."
-        )
-    return source
+    host.copy_(source)
+    return host
 
 
 # ---------------------------------------------------------------------------
@@ -674,8 +609,8 @@ def _make_hashable(value: object) -> object:
 
 
 @dataclass(slots=True)
-class _RegularPinned:
-    """Pinned-CPU state for a regular tensor: one contiguous host buffer."""
+class _RegularHost:
+    """CPU state for a regular tensor: one contiguous host buffer."""
 
     data: torch.Tensor
 
@@ -690,9 +625,9 @@ class _RegularGpu:
 class RegularAdapter:
     """Adapter for plain ``torch.Tensor`` (no subclass machinery).
 
-    Builds fresh :class:`nn.Parameter` objects wrapping the pinned-CPU
+    Builds fresh :class:`nn.Parameter` objects wrapping the CPU
     and GPU storages. Frozen model-bound callers replace the module registry via
-    ``module._parameters[leaf] = ...`` with a pinned CPU wrapper or
+    ``module._parameters[leaf] = ...`` with a CPU wrapper or
     active GPU wrapper; trainable callers preserve Parameter identity
     by skipping registry replacement and ``.data``-swapping into their own
     persistent Parameter. Both paths are supported by the shape of this
@@ -735,18 +670,9 @@ class RegularAdapter:
         return (tuple(t.shape),)
 
     @staticmethod
-    def clone_pin(t: torch.Tensor) -> _RegularPinned:
-        return _RegularPinned(
-            data=clone_to_pinned_cpu(
-                t.data,
-                memory_format=torch.contiguous_format,
-            )
-        )
-
-    @staticmethod
-    def adopt_host(t: torch.Tensor) -> _RegularPinned:
-        return _RegularPinned(
-            data=adopt_cpu_storage(
+    def capture_host(t: torch.Tensor) -> _RegularHost:
+        return _RegularHost(
+            data=clone_to_host_cpu(
                 t.data,
                 memory_format=torch.contiguous_format,
             )
@@ -754,36 +680,36 @@ class RegularAdapter:
 
     @staticmethod
     def cpu_param(
-        state: _RegularPinned, *, requires_grad: bool = False
+        state: _RegularHost, *, requires_grad: bool = False
     ) -> nn.Parameter:
         return nn.Parameter(state.data, requires_grad=requires_grad)
 
     @staticmethod
-    def alloc_gpu(state: _RegularPinned, device: torch.device) -> _RegularGpu:
+    def alloc_gpu(state: _RegularHost, device: torch.device) -> _RegularGpu:
         return _RegularGpu(data=torch.empty_like(state.data, device=device))
 
     @staticmethod
     def gpu_param(
-        pinned: _RegularPinned,
+        host: _RegularHost,
         gpu_state: _RegularGpu,
         *,
         requires_grad: bool = False,
     ) -> nn.Parameter:
-        _ = pinned
-        # pinned unused: regular tensors carry no metadata beyond storage.
+        _ = host
+        # host unused: regular tensors carry no metadata beyond storage.
         # Argument kept for Protocol parity with TensorAdapter — quanto
         # and other structured tensors need it to reconstruct wrappers.
         return nn.Parameter(gpu_state.data, requires_grad=requires_grad)
 
     @staticmethod
     def copy_to_gpu(
-        src: _RegularPinned, dst: _RegularGpu, *, non_blocking: bool = False
+        src: _RegularHost, dst: _RegularGpu, *, non_blocking: bool = False
     ) -> None:
         dst.data.copy_(src.data, non_blocking=non_blocking)
 
     @staticmethod
     def copy_to_cpu(
-        src: _RegularGpu, dst: _RegularPinned, *, non_blocking: bool = False
+        src: _RegularGpu, dst: _RegularHost, *, non_blocking: bool = False
     ) -> None:
         dst.data.copy_(src.data, non_blocking=non_blocking)
 
@@ -846,7 +772,7 @@ class RegularAdapter:
             )
 
     @staticmethod
-    def cache_bytes(state: _RegularPinned) -> int:
+    def cache_bytes(state: _RegularHost) -> int:
         return state.data.numel() * state.data.element_size()
 
 

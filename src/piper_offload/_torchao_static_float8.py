@@ -216,7 +216,7 @@ def validate_layout(t: torch.Tensor) -> None:
     if missing:
         raise RuntimeError(
             "PrototypeFloat8Tensor is missing expected attributes "
-            f"{missing!r}; this repo is pinned to a layout that exposes "
+            f"{missing!r}; this repo requires a layout that exposes "
             f"{LAYOUT_ATTRS}. TorchAO likely refactored the prototype "
             "wrapper class — upgrade piper-offload to match."
         )

@@ -23,7 +23,7 @@ Lower-level resource bindings:
   activation checkpointing through autograd backward when block compilation
   is disabled. By default,
   trainable params are managed by
-  :class:`PinnedComponent` and stay GPU-resident while active; set
+  :class:`HostComponent` and stay GPU-resident while active; set
   ``include_block_trainables=True`` to stream in-block trainable weights
   and materialize them only around ``optimizer.step()``. That step runs on
   the GPU via the ``optimizer_step()`` context; calling ``optimizer.step()``
@@ -41,7 +41,7 @@ Lower-level resource bindings:
 
 The CUDA-oriented :class:`ModelOffloader` shares the underlying
 per-parameter host storage from
-:class:`~piper_offload.pinned_param.PinnedParam` (clone + pin
+:class:`~piper_offload.host_param.HostParam` (host capture
 + optional quanto ``WeightQBytesTensor`` decomposition, bitsandbytes
 4-bit ``Params4bit`` (NF4/FP4) and 8-bit ``Int8Params`` (LLM.int8)
 decomposition, GGUF packed weights, Piper ConvRot INT8 / NVFP4, TorchAO NVFP4 / MX
@@ -53,37 +53,28 @@ tensor-parallel ``DTensor`` weights wrapping any of the above).
 implement the :class:`ResourceBinding` Protocol. Each owns exactly one model
 runtime and is reused sequentially.
 
-``ModelOffloader.from_module(..., host_backing="adopt")`` adopts frozen
-model state already in CPU RAM without copying it. Anonymous pageable and
-file-backed/mmap tensors therefore share one path and retain their original
-storage. Copies go directly into the same GPU targets; CUDA performs any
-implicit staging. Unsupported adoption raises rather than materializing a
-hidden copy. Capture completes for the entire adopted store before binding
-changes any module registry, so adoption failures leave the supplied model
-untouched. Adopted tensors and writable mmap contents must remain immutable for
-the offloader's lifetime. The default ``"pinned"`` policy preserves the
-full-bandwidth asynchronous path. Package resources make ``cache_bytes`` final
-during construction.
+Host capture creates independent pageable CPU copies of model and adapter
+state while preserving each tensor adapter's physical representation.
+Package resources make ``cache_bytes`` final during construction.
 ``activate(device)`` then makes the resource usable on the requested device. For
 :class:`ModelOffloader`, ``deactivate()`` returns managed tensors to
-their configured host backing. For :class:`MpsWeights`,
+their host backing. For :class:`MpsWeights`,
 construction has already materialized the model on MPS, so
 ``activate('mps')`` and ``deactivate()`` are lifecycle-only.
 
-Pinned host-store construction intentionally optimizes peak host memory. For
+Host-store construction intentionally optimizes peak host memory. For
 plain ``torch.Tensor`` parameters, it may immediately repoint the source
-``Parameter.data`` at each pinned clone so the original source storage can be
+``Parameter.data`` at each host clone so the original source storage can be
 freed before all buffers finish. This avoids a temporary 2x host-memory peak
 for CPU-origin models and promptly frees GPU storage for CUDA-origin models.
-Adopted inference instead retains the existing CPU allocation. If pinned
-construction raises after pinning has started, recovery of the partially
+If host construction raises after capture has started, recovery of the partially
 constructed resource/model is unsupported; drop those references and rebuild
 from a fresh model instance.
 
 :class:`ModelOffloader` composes:
-  1. A resident :class:`PinnedComponent` for non-streamed state, including
+  1. A resident :class:`HostComponent` for non-streamed state, including
      trainables skipped by block streaming.
-  2. One :class:`PinnedComponent` per stateful path in ``transient_paths``.
+  2. One :class:`HostComponent` per stateful path in ``transient_paths``.
   3. One :class:`BlockComponent` per path in ``block_paths`` or
      ``transient_block_paths`` when block residency is configured.
      ``block_mode`` selects resident, whole-block streaming, rolling, or
@@ -113,17 +104,16 @@ values are merge-only and populate storage-free frozen plain floating-point
 meta parameters; parameter deltas require existing physical parameters.
 
 :class:`Adapter` owns immutable parameter-delta and parameter-value storage,
-pinned by default or strictly adopted from existing CPU backing. Compatible
+in independent pageable CPU allocations. Compatible
 consumers read that backing directly and may overlap; routed hooks stage their
 own per-forward device copies.
 
-Downstream tensor subclasses can participate in pinning and movement without
+Downstream tensor subclasses can participate in capture and movement without
 adding format-specific dependencies here: implement the public
 :class:`TensorAdapter` contract and register it during application startup with
 :func:`register_adapter`. Registered adapters are used for both movement and
-tied-storage identity. To additionally support ``host_backing="adopt"``,
-implement :class:`AdoptableTensorAdapter`; its ``adopt_host()`` method returns
-adapter state that aliases the retained source storage.
+tied-storage identity. ``capture_host()`` returns owned pageable CPU state
+that the adapter can copy and reconstruct without changing its encoding.
 
 :class:`ResourceCache` manages cached backing stores with policy-driven
 eviction, reference-counted leases, and transactional admission.
@@ -155,7 +145,7 @@ from .adapter import Adapter, AdapterMode, AdapterTarget
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent, BlockComponentStore
 from .block_mode import BlockMode
-from .host_backing import HostBacking
+from .host_component import HostComponent, HostComponentStore
 from .lora import LoRAFactor, LoRATransform, ScaledLoRAFactor
 from .merge import merge_adapter
 from .model_cache import ModelCache
@@ -168,7 +158,6 @@ from .parameter_value import (
     ParameterValueTransform,
     ScaledParameterValue,
 )
-from .pinned_component import PinnedComponent, PinnedComponentStore
 from .protocols import (
     ResourceBinding,
     ResourceSpec,
@@ -193,7 +182,6 @@ from .resource_specs import AdapterSpec, ModelSpec, ObjectSpec
 from .seeding import derive_seed
 from .tensor_adapter_registry import register_adapter
 from .tensor_adapters import (
-    AdoptableTensorAdapter,
     TensorAdapter,
 )
 
@@ -202,7 +190,6 @@ __all__ = [
     "AdapterMode",
     "AdapterSpec",
     "AdapterTarget",
-    "AdoptableTensorAdapter",
     "BlockCompileConfig",
     "BlockComponent",
     "BlockComponentStore",
@@ -213,7 +200,8 @@ __all__ = [
     "EvictionContext",
     "EvictionPolicy",
     "EvictionPolicyError",
-    "HostBacking",
+    "HostComponent",
+    "HostComponentStore",
     "LRUEvictionPolicy",
     "LoRAFactor",
     "LoRATransform",
@@ -228,8 +216,6 @@ __all__ = [
     "ParameterTransform",
     "ParameterValue",
     "ParameterValueTransform",
-    "PinnedComponent",
-    "PinnedComponentStore",
     "ResourceBinding",
     "ResourceCache",
     "ResourceCachedError",

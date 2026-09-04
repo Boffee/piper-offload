@@ -5,7 +5,7 @@ FP4 bytes (``qdata``), FP8 block scales (``scale``), optional global
 per-tensor scales (``per_tensor_scale`` / ``act_per_tensor_scale``), and
 metadata controlling the matmul dispatch. The shared
 :class:`~piper_offload.torchao_structured_adapter.TorchaoStructuredAdapter`
-base preserves that representation across pinned CPU and GPU storage;
+base preserves that representation across CPU and GPU storage;
 this module supplies the NVFP4-specific hooks. The two global scales are
 optional, represented as ``None`` entries in the storage tuple so the
 base's clone/alloc/copy/accounting skip them.

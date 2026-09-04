@@ -14,15 +14,15 @@ from .block_compile import CompileBackend
 from .block_runtime import validate_load_plans
 from .float8_adapter import Float8Adapter
 from .gguf_adapter import GgufAdapter
+from .host_module import (
+    HostModuleInstance,
+    HostModuleLoadPlan,
+    ParameterLoad,
+)
 from .int4_tile_adapter import Int4TilePackedAdapter
 from .int8_adapter import Int8Adapter
 from .mx_adapter import MxAdapter
 from .nvfp4_adapter import Nvfp4Adapter
-from .pinned_module import (
-    ParameterLoad,
-    PinnedModuleInstance,
-    PinnedModuleLoadPlan,
-)
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from .piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
 from .quanto_adapter import QuantoAdapter
@@ -53,9 +53,9 @@ _ROLLING_ADAPTER_TYPES = (
 
 
 def _resolve_rolling_loads(
-    instances: Sequence[PinnedModuleInstance],
-    load_plans: Sequence[PinnedModuleLoadPlan],
-) -> tuple[tuple[PinnedModuleLoadPlan, ...], dict[str, ParameterLoad]]:
+    instances: Sequence[HostModuleInstance],
+    load_plans: Sequence[HostModuleLoadPlan],
+) -> tuple[tuple[HostModuleLoadPlan, ...], dict[str, ParameterLoad]]:
     """Validate active sources and build the shared-target allocation loads."""
     plans = validate_load_plans(instances, load_plans)
     source_names = {name for plan in plans for name in plan.loads}
@@ -98,7 +98,7 @@ class RollingBlockRuntime:
 
     def __init__(
         self,
-        instances: tuple[PinnedModuleInstance, ...],
+        instances: tuple[HostModuleInstance, ...],
         *,
         wraparound: bool = True,
     ) -> None:
@@ -114,7 +114,7 @@ class RollingBlockRuntime:
         self._fallback_event: torch.cuda.Event | None = None
         self._owners: list[int] | None = None
         self._slot_names: tuple[str, ...] = ()
-        self._load_plans: tuple[PinnedModuleLoadPlan, ...] = ()
+        self._load_plans: tuple[HostModuleLoadPlan, ...] = ()
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
 
     @property
@@ -127,7 +127,7 @@ class RollingBlockRuntime:
 
     def validate_load_plans(
         self,
-        load_plans: Sequence[PinnedModuleLoadPlan],
+        load_plans: Sequence[HostModuleLoadPlan],
     ) -> None:
         """Raise when active loads cannot use one compiled rolling target."""
         _resolve_rolling_loads(self._instances, load_plans)
@@ -135,7 +135,7 @@ class RollingBlockRuntime:
     def acquire(
         self,
         device: torch.device,
-        load_plans: Sequence[PinnedModuleLoadPlan],
+        load_plans: Sequence[HostModuleLoadPlan],
     ) -> None:
         if self.acquired:
             raise RuntimeError("rolling block runtime is already acquired")
@@ -158,7 +158,7 @@ class RollingBlockRuntime:
             return
 
         self._fallback_event = torch.cuda.Event()
-        allocation_plan = PinnedModuleLoadPlan(
+        allocation_plan = HostModuleLoadPlan(
             plans[0].instance,
             allocation_loads,
         )
@@ -287,7 +287,7 @@ class RollingBlockRuntime:
             unregister_rolling_target(self)
         for instance in self._instances:
             try:
-                instance.install_pinned()
+                instance.install_host()
             except BaseException as exc:
                 if first_error is None:
                     first_error = exc
@@ -313,7 +313,7 @@ class RollingBlockRuntime:
 
 
 def _validate_instance(
-    instance: PinnedModuleInstance,
+    instance: HostModuleInstance,
     param_names: tuple[str, ...],
     reference_layouts: tuple[tuple[object, object], ...],
 ) -> None:
@@ -324,22 +324,22 @@ def _validate_instance(
         raise NotImplementedError("rolling compilation does not yet support block buffers")
     if tuple(params) != param_names:
         raise NotImplementedError("rolling compilation requires identical parameter names and ordering in every block")
-    if len({id(pinned) for pinned in params.values()}) != len(params):
+    if len({id(host) for host in params.values()}) != len(params):
         raise NotImplementedError("rolling compilation does not yet support tied parameters inside blocks")
-    layouts = tuple(pinned.target_layout for pinned in params.values())
+    layouts = tuple(host.target_layout for host in params.values())
     if layouts != reference_layouts:
         raise NotImplementedError("rolling compilation requires identical parameter layouts in every block")
-    if any(type(pinned.adapter) not in _ROLLING_ADAPTER_TYPES for pinned in params.values()):
+    if any(type(host.adapter) not in _ROLLING_ADAPTER_TYPES for host in params.values()):
         raise NotImplementedError(
             "rolling compilation supports only regular dense, TorchAO-family, "
             "Quanto, GGUF, and Piper ConvRot INT8 parameters"
         )
-    if any(pinned.shape.numel() == 0 for pinned in params.values()):
+    if any(host.shape.numel() == 0 for host in params.values()):
         raise NotImplementedError("rolling compilation does not support zero-sized parameter slots")
 
 
 def create_rolling_block_runtime(
-    instances: Sequence[PinnedModuleInstance],
+    instances: Sequence[HostModuleInstance],
     *,
     wraparound: bool = True,
 ) -> RollingBlockRuntime:
@@ -353,7 +353,7 @@ def create_rolling_block_runtime(
     param_names = tuple(reference_params)
     if not param_names:
         raise NotImplementedError("rolling compilation requires block parameters")
-    reference_layouts = tuple(pinned.target_layout for pinned in reference_params.values())
+    reference_layouts = tuple(host.target_layout for host in reference_params.values())
     for instance in instances:
         _validate_instance(
             instance,

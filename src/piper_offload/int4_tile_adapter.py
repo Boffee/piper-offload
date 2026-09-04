@@ -6,12 +6,12 @@ differs from the logical weight shape), a combined ``scale_and_zero``
 tensor, an optional ``act_pre_scale``, and metadata ``block_size`` plus
 the logical ``shape``. The shared
 :class:`~piper_offload.torchao_structured_adapter.TorchaoStructuredAdapter`
-base preserves that representation across pinned CPU and GPU storage;
+base preserves that representation across CPU and GPU storage;
 this module supplies the tile-packed-specific hooks.
 
 This is the CUDA-native (tinygemm) int4 variant — it needs no external
 kernel library. The matmul runs on CUDA; re-wrapping already-packed bytes
-is a pure constructor call, so the pinned-CPU representation round-trips
+is a pure constructor call, so the CPU representation round-trips
 cleanly.
 
 The adapter exposes inference movement only. INT4 model weights are

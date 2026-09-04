@@ -16,7 +16,7 @@ from piper_offload import (
     merge_adapter,
 )
 from piper_offload.bnb4bit_adapter import Bnb4bitAdapter
-from piper_offload.pinned_param import PinnedParam
+from piper_offload.host_param import HostParam
 from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import tensor_id
 from tests.conftest import activated_model
@@ -123,57 +123,37 @@ class TestBnb4bitAdapter:
         # An unquantized Params4bit (quant_state is None) is a legitimate bind
         # target — a config-built meta skeleton carries one. matches is pure
         # type recognition, so it accepts it; the "must be quantized" guard
-        # moves to the pin/read path (test_pin_rejects_unquantized_placeholder).
+        # moves to the capture/read path (test_capture_rejects_unquantized_placeholder).
         assert Bnb4bitAdapter.matches(_unquantized_params4bit())
 
-    def test_pin_rejects_unquantized_placeholder(self) -> None:
-        # Pinning decomposes the quant state, so an unquantized placeholder
+    def test_capture_rejects_unquantized_placeholder(self) -> None:
+        # Capture decomposes the quant state, so an unquantized placeholder
         # still fails loudly — just at the read path now, not at matches.
         with pytest.raises(RuntimeError, match="not quantized"):
-            PinnedParam(_unquantized_params4bit())
+            HostParam(_unquantized_params4bit())
 
-    def test_pin_preserves_storage_and_metadata(self) -> None:
+    def test_capture_preserves_storage_and_metadata(self) -> None:
         pytest.importorskip("bitsandbytes")
         from bitsandbytes.nn import Params4bit
 
         # Params4bit is itself an nn.Parameter; pass it directly (wrapping it
         # in nn.Parameter raises, since its detach() returns a plain Tensor).
         p = _make_nf4()
-        pinned_param = PinnedParam(p)
+        host_param = HostParam(p)
 
         # make_cpu_param() returns the Params4bit itself (a Parameter); its
         # .data is the packed uint8 weight, quant_state holds the scales.
-        pinned = pinned_param.make_cpu_param()
-        assert isinstance(pinned, Params4bit)
-        assert pinned.data.is_pinned()
-        assert pinned.quant_state.absmax.is_pinned()
-        assert pinned.data.data_ptr() == pinned_param.pinned_state.data.data_ptr()
-        assert pinned.quant_state.absmax.data_ptr() == pinned_param.pinned_state.buffers["absmax"].data_ptr()
-        assert pinned.quant_state.blocksize == p.quant_state.blocksize
-        assert pinned.quant_state.quant_type == p.quant_state.quant_type
-        assert tuple(pinned.quant_state.shape) == tuple(p.quant_state.shape)
-        assert pinned_param.compute_dtype is torch.bfloat16
-        assert torch.equal(Bnb4bitAdapter.dequantize(pinned), Bnb4bitAdapter.dequantize(p))
-
-    def test_adopted_backing_retains_storage_and_metadata(self) -> None:
-        p = _make_nf4()
-        data_ptr = p.data.data_ptr()
-        absmax_ptr = p.quant_state.absmax.data_ptr()
-        pageable_param = PinnedParam(p, pin_memory=False)
-        pageable = pageable_param.make_cpu_param()
-
-        assert not pageable.data.is_pinned()
-        assert not pageable.quant_state.absmax.is_pinned()
-        assert pageable_param.pinned_state.data.data_ptr() == data_ptr
-        assert (
-            pageable_param.pinned_state.buffers["absmax"].data_ptr()
-            == absmax_ptr
-        )
-        assert pageable.quant_state.quant_type == p.quant_state.quant_type
-        assert torch.equal(
-            Bnb4bitAdapter.dequantize(pageable),
-            Bnb4bitAdapter.dequantize(p),
-        )
+        host = host_param.make_cpu_param()
+        assert isinstance(host, Params4bit)
+        assert not host.data.is_pinned()
+        assert not host.quant_state.absmax.is_pinned()
+        assert host.data.data_ptr() == host_param.host_state.data.data_ptr()
+        assert host.quant_state.absmax.data_ptr() == host_param.host_state.buffers["absmax"].data_ptr()
+        assert host.quant_state.blocksize == p.quant_state.blocksize
+        assert host.quant_state.quant_type == p.quant_state.quant_type
+        assert tuple(host.quant_state.shape) == tuple(p.quant_state.shape)
+        assert host_param.compute_dtype is torch.bfloat16
+        assert torch.equal(Bnb4bitAdapter.dequantize(host), Bnb4bitAdapter.dequantize(p))
 
     def test_tensor_id_tracks_packed_and_scales(self) -> None:
         p = _make_nf4()
@@ -204,7 +184,7 @@ class TestBnb4bitAdapter:
 
     def test_bind_layout_matches_real_param_and_placeholder(self) -> None:
         # The enabling check: a config-built placeholder (quant_state is None,
-        # logical .shape) must bind against a store pinned from a real
+        # logical .shape) must bind against a store captured from a real
         # quantized param (packed .shape, logical quant_state.shape). Both
         # sides must yield the same bind layout — the logical [out, in] shape.
         real = _make_nf4(rows=64, cols=32)
@@ -245,13 +225,13 @@ class TestBnb4bitAdapter:
         assert Bnb4bitAdapter.bind_layout_signature(placeholder) == ((64, 32),)
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
-        pinned_param = PinnedParam(_make_nf4())
-        state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
+        host_param = HostParam(_make_nf4())
+        state = host_param.allocate_gpu_storage(torch.device("cpu"))
 
         with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            pinned_param.copy_to_cpu(state)
+            host_param.copy_to_cpu(state)
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            pinned_param.validate_parameter_data_swap_target()
+            host_param.validate_parameter_data_swap_target()
 
     @pytest.mark.parametrize("double_quant", [False, True])
     def test_dequantize_requantize_preserves_representation(self, double_quant: bool) -> None:
@@ -903,22 +883,22 @@ class TestBnb4bitAdapter:
         pytest.importorskip("bitsandbytes")
         from bitsandbytes.nn import Params4bit
 
-        pinned_param = PinnedParam(_make_nf4(device="cuda"))
+        host_param = HostParam(_make_nf4(device="cuda"))
 
-        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
-        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
-        gpu_param = pinned_param.make_gpu_param(gpu_state)
+        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
+        host_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu_param = host_param.make_gpu_param(gpu_state)
         torch.cuda.synchronize()
         # Both wrappers are Params4bit (Parameters); .data is the packed weight.
-        pinned = pinned_param.make_cpu_param()
+        host = host_param.make_cpu_param()
 
         assert isinstance(gpu_param, Params4bit)
         assert gpu_param.data.is_cuda
         assert gpu_param.quant_state.absmax.is_cuda
-        assert gpu_param.quant_state.blocksize == pinned.quant_state.blocksize
-        assert gpu_param.quant_state.quant_type == pinned.quant_state.quant_type
-        assert torch.equal(gpu_param.data.cpu(), pinned.data)
-        assert torch.equal(gpu_param.quant_state.absmax.cpu(), pinned.quant_state.absmax)
+        assert gpu_param.quant_state.blocksize == host.quant_state.blocksize
+        assert gpu_param.quant_state.quant_type == host.quant_state.quant_type
+        assert torch.equal(gpu_param.data.cpu(), host.data)
+        assert torch.equal(gpu_param.quant_state.absmax.cpu(), host.quant_state.absmax)
 
     @CUDA
     def test_double_quant_full_gpu_lifecycle_round_trip(self) -> None:
@@ -930,11 +910,11 @@ class TestBnb4bitAdapter:
         assert p.quant_state.nested
         ref = Bnb4bitAdapter.dequantize(p).clone()
 
-        pinned_param = PinnedParam(p)
-        assert "nested_absmax" in pinned_param.pinned_state.buffers
-        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
-        gpu_param = pinned_param.make_gpu_param(gpu_state)
-        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
+        host_param = HostParam(p)
+        assert "nested_absmax" in host_param.host_state.buffers
+        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
+        gpu_param = host_param.make_gpu_param(gpu_state)
+        host_param.copy_to_gpu(gpu_state, non_blocking=True)
         torch.cuda.synchronize()
 
         assert gpu_param.quant_state.nested

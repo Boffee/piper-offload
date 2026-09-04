@@ -1,6 +1,6 @@
-"""Name-based pinned module store and instance primitives.
+"""Name-based host module store and instance primitives.
 
-This module supports sharing one pinned CPU cache across multiple
+This module supports sharing one CPU cache across multiple
 concrete model instances. Names are the durable relationship between a
 store and an instance.
 """
@@ -19,9 +19,9 @@ from typing import Self, cast
 import torch
 from torch import nn
 
+from .host_buffer import HostBuffer
+from .host_param import HostParam
 from .module_names import group_names, resolve_parent_leaf
-from .pinned_buffer import PinnedBuffer
-from .pinned_param import PinnedParam
 from .tensor_adapter_registry import (
     buffer_tensor_id,
     param_representation,
@@ -35,7 +35,7 @@ type ParameterUpdate = Callable[[nn.Parameter], None]
 class ParameterOverride:
     """Activation-scoped replacement source and/or in-place update."""
 
-    source: PinnedParam | None = None
+    source: HostParam | None = None
     update: ParameterUpdate | None = None
 
     def __post_init__(self) -> None:
@@ -50,51 +50,51 @@ class ParameterOverride:
 class ParameterLoad:
     """Resolved source and optional update for one active parameter."""
 
-    source: PinnedParam
+    source: HostParam
     update: ParameterUpdate | None = None
 
 
 @dataclass(slots=True)
-class PinnedParamTarget:
-    """Active adapter storage for one pinned parameter backing."""
+class HostParamTarget:
+    """Active adapter storage for one host parameter backing."""
 
     _state: object
     param: nn.Parameter
-    _backing: PinnedParam
+    _backing: HostParam
 
 
 @dataclass(slots=True)
-class PinnedBufferTarget:
-    """Active tensor storage for one pinned buffer backing."""
+class HostBufferTarget:
+    """Active tensor storage for one host buffer backing."""
 
     tensor: torch.Tensor
 
 
 @dataclass(slots=True)
-class PinnedModuleTarget:
-    """Name-keyed active storage for a :class:`PinnedModuleStore`.
+class HostModuleTarget:
+    """Name-keyed active storage for a :class:`HostModuleStore`.
 
     Targets may contain the whole store or a validated subset of it.
-    Names mapped to the same pinned object also point at the same
+    Names mapped to the same host object also point at the same
     target object.
     """
 
-    param_targets: dict[str, PinnedParamTarget]
-    buffer_targets: dict[str, PinnedBufferTarget]
+    param_targets: dict[str, HostParamTarget]
+    buffer_targets: dict[str, HostBufferTarget]
 
 
 @dataclass(slots=True)
-class PinnedModuleStore:
-    """Pinned backing bytes for one module layout.
+class HostModuleStore:
+    """Host backing bytes for one module layout.
 
     ``params`` and ``buffers`` are keyed by PyTorch logical names from
     ``named_parameters(remove_duplicate=False)`` and
     ``named_buffers(remove_duplicate=False)``. Selected names sharing
-    storage point at the same pinned object.
+    storage point at the same host object.
     """
 
-    params: dict[str, PinnedParam]
-    buffers: dict[str, PinnedBuffer]
+    params: dict[str, HostParam]
+    buffers: dict[str, HostBuffer]
 
     @classmethod
     def from_module(
@@ -103,20 +103,8 @@ class PinnedModuleStore:
         *,
         include_param_names: Iterable[str] | None = None,
         include_buffer_names: Iterable[str] | None = None,
-        pin_memory: bool = True,
-        install_backing: bool = True,
     ) -> Self:
-        """Capture ``module`` into a name-keyed host store.
-
-        For adopted capture, ``install_backing=False`` leaves module
-        registries untouched. Composite construction uses that two-phase path
-        so all source tensors can be adopted successfully before :meth:`bind`
-        commits any replacement wrappers. Pinned callers retain the existing
-        eager-install behavior and cannot defer it because pinning may release
-        source allocations incrementally.
-        """
-        if pin_memory and not install_backing:
-            raise ValueError("deferred host-backing installation is only supported for host adoption.")
+        """Capture and install owned CPU copies keyed by module names."""
         all_params = _named_parameters(module)
         params = _select_known_names(
             all_params,
@@ -129,23 +117,13 @@ class PinnedModuleStore:
             include_buffer_names,
         )
 
-        if not pin_memory:
-            trainable_names = [name for name, param in params.items() if param.requires_grad]
-            if trainable_names:
-                raise ValueError(
-                    "adopted host backing is inference-only; freeze the "
-                    "selected parameters before constructing the store. "
-                    f"Trainable parameters: {trainable_names!r}."
-                )
-
         store = cls(
-            params=_pin_params(params, pin_memory=pin_memory),
-            buffers=_pin_buffers(buffers, pin_memory=pin_memory),
+            params=_capture_params(params),
+            buffers=_capture_buffers(buffers),
         )
         _validate_trainable_param_data_swaps(store.params)
-        if install_backing:
-            _install_pinned_params(module, store.params)
-            _install_pinned_buffers(module, store.buffers)
+        _install_host_params(module, store.params)
+        _install_host_buffers(module, store.buffers)
         return store
 
     @property
@@ -158,42 +136,42 @@ class PinnedModuleStore:
 
     @property
     def trainable_param_names(self) -> tuple[str, ...]:
-        return tuple(name for name, pinned in self.params.items() if pinned.requires_grad)
+        return tuple(name for name, host in self.params.items() if host.requires_grad)
 
-    def bind(self, module: nn.Module) -> PinnedModuleInstance:
+    def bind(self, module: nn.Module) -> HostModuleInstance:
         """Validate ``module`` and bind this store's backing bytes to it.
 
         The sole instance factory: layout-checks ``module`` against this
-        store, constructs a :class:`PinnedModuleInstance` that owns
-        ``module`` and shares this store's pinned host bytes, then installs
-        those pinned bytes onto ``module`` via
-        :meth:`PinnedModuleInstance.install_pinned`.
+        store, constructs a :class:`HostModuleInstance` that owns
+        ``module`` and shares this store's host bytes, then installs
+        those host bytes onto ``module`` via
+        :meth:`HostModuleInstance.install_host`.
         """
         _validate_module_matches(self.params, self.buffers, module)
-        instance = PinnedModuleInstance(
+        instance = HostModuleInstance(
             module=module,
             params=self.params,
             buffers=self.buffers,
         )
-        instance.install_pinned()
+        instance.install_host()
         return instance
 
 
 @dataclass(slots=True)
-class PinnedModuleInstance:
-    """One concrete module bound to pinned parameter and buffer backings.
+class HostModuleInstance:
+    """One concrete module bound to host parameter and buffer backings.
 
     Owns the :class:`nn.Module` whose managed params and buffers are backed by
-    this instance's pinned host bytes, including trainable target-to-host
+    this instance's host bytes, including trainable target-to-host
     synchronization. :meth:`resolve_load_plan` combines activation-scoped
     overrides with immutable model backing; the resulting plan owns target
-    allocation and loading. :meth:`install_pinned` restores the pinned host
+    allocation and loading. :meth:`install_host` restores the host
     bytes onto :attr:`module`.
     """
 
     module: nn.Module
-    params: Mapping[str, PinnedParam]
-    buffers: Mapping[str, PinnedBuffer]
+    params: Mapping[str, HostParam]
+    buffers: Mapping[str, HostBuffer]
 
     @property
     def has_trainables(self) -> bool:
@@ -201,20 +179,20 @@ class PinnedModuleInstance:
 
     @property
     def trainable_param_names(self) -> tuple[str, ...]:
-        return tuple(name for name, pinned in self.params.items() if pinned.requires_grad)
+        return tuple(name for name, host in self.params.items() if host.requires_grad)
 
-    def install_pinned(self) -> None:
-        """Install the pinned host bytes onto :attr:`module`'s attributes.
+    def install_host(self) -> None:
+        """Install the host bytes onto :attr:`module`'s attributes.
 
-        Pure pinned-CPU repoint: materializes the pinned CPU wrappers on
-        demand (deduped by ``id(pinned)`` so tied names share one wrapper)
+        Pure CPU repoint: materializes the CPU wrappers on
+        demand (deduped by ``id(host)`` so tied names share one wrapper)
         and installs them onto :attr:`module`, leaving its managed state on
-        the pinned host bytes. Mutates :attr:`module` in place.
+        the host bytes. Mutates :attr:`module` in place.
         """
-        _install_pinned_params(self.module, self.params)
-        _install_pinned_buffers(self.module, self.buffers)
+        _install_host_params(self.module, self.params)
+        _install_host_buffers(self.module, self.buffers)
 
-    def install_target(self, target: PinnedModuleTarget) -> None:
+    def install_target(self, target: HostModuleTarget) -> None:
         """Install already-filled active storage without copying into it."""
         _validate_target_names_known(self.params, self.buffers, target)
         _set_params(
@@ -229,7 +207,7 @@ class PinnedModuleInstance:
     def resolve_load_plan(
         self,
         overrides: Mapping[str, ParameterOverride] | None = None,
-    ) -> PinnedModuleLoadPlan:
+    ) -> HostModuleLoadPlan:
         """Resolve one immutable activation plan against model alias groups."""
         selected = {} if overrides is None else dict(overrides)
         unknown = sorted(set(selected) - set(self.params))
@@ -238,7 +216,7 @@ class PinnedModuleInstance:
                 f"Cannot override unknown parameter names: {_format_names(unknown)}."
             )
 
-        overrides_by_pinned: dict[int, ParameterOverride] = {}
+        overrides_by_host: dict[int, ParameterOverride] = {}
         for name, override in selected.items():
             if not isinstance(override, ParameterOverride):
                 raise ValueError(
@@ -246,39 +224,39 @@ class PinnedModuleInstance:
                     f"instances; {name!r} has {type(override).__name__}."
                 )
             key = id(self.params[name])
-            previous = overrides_by_pinned.get(key)
+            previous = overrides_by_host.get(key)
             if previous is not None and not _same_load_override(previous, override):
                 raise ValueError(
                     "Tied parameter aliases cannot use different activation "
                     f"overrides; conflict at {name!r}."
                 )
-            overrides_by_pinned[key] = override
+            overrides_by_host[key] = override
 
-        loads_by_pinned: dict[int, ParameterLoad | None] = {}
+        loads_by_host: dict[int, ParameterLoad | None] = {}
         parameters: dict[str, ParameterLoad] = {}
         for name, base in self.params.items():
             key = id(base)
-            if key not in loads_by_pinned:
-                override = overrides_by_pinned.get(key)
-                loads_by_pinned[key] = _resolve_parameter_load(
+            if key not in loads_by_host:
+                override = overrides_by_host.get(key)
+                loads_by_host[key] = _resolve_parameter_load(
                     name,
                     base,
                     override,
                 )
-            load = loads_by_pinned[key]
+            load = loads_by_host[key]
             if load is not None:
                 parameters[name] = load
-        return PinnedModuleLoadPlan(self, parameters)
+        return HostModuleLoadPlan(self, parameters)
 
     def copy_trainables_from_target(
         self,
-        target: PinnedModuleTarget,
+        target: HostModuleTarget,
         *,
         non_blocking: bool = False,
     ) -> None:
-        """Copy trainable target params back into pinned host storage.
+        """Copy trainable target params back into host storage.
 
-        This is the explicit pinned-cache mutation path for optimizer-step
+        This is the explicit host-cache mutation path for optimizer-step
         sync. Frozen params and buffers are intentionally not copied back.
         """
         _validate_target_names_known(self.params, self.buffers, target)
@@ -293,7 +271,7 @@ class PinnedModuleInstance:
         """Move each trainable param's ``.grad`` (if any) to ``device``.
 
         During backward, PyTorch's native ``AccumulateGrad`` writes grads on
-        the param's data device. As ``.data`` is moved between pinned CPU and
+        the param's data device. As ``.data`` is moved between CPU and
         a GPU target, ``.grad`` keeps living wherever ``AccumulateGrad`` placed
         it; this realigns grad with data so the optimizer reads both on the
         same device. Tied params are deduplicated, and ``None`` grads (no
@@ -308,15 +286,15 @@ class PinnedModuleInstance:
                 param.grad = moved
             else:
                 # PyTorch's grad setter rejects cross-device grad/data pairs.
-                # A trainable can transiently have offloaded (pinned-CPU) data
+                # A trainable can transiently have offloaded (CPU) data
                 # and a GPU grad, so move the grad storage in place instead.
                 grad.data = moved.data
 
     def _iter_trainable_params(self) -> Iterator[nn.Parameter]:
         params = dict(self.module.named_parameters(remove_duplicate=False))
         seen: set[int] = set()
-        for name, pinned in self.params.items():
-            if not pinned.requires_grad:
+        for name, host in self.params.items():
+            if not host.requires_grad:
                 continue
             param = params[name]
             param_id = id(param)
@@ -327,7 +305,7 @@ class PinnedModuleInstance:
 
 
 @dataclass(frozen=True, slots=True, init=False)
-class PinnedModuleLoadPlan:
+class HostModuleLoadPlan:
     """Resolved parameter loads for one module activation.
 
     The bound instance retains model-name and alias ownership. This plan owns
@@ -335,12 +313,12 @@ class PinnedModuleLoadPlan:
     copying, and mutation all consume the same immutable description.
     """
 
-    instance: PinnedModuleInstance
+    instance: HostModuleInstance
     loads: Mapping[str, ParameterLoad]
 
     def __init__(
         self,
-        instance: PinnedModuleInstance,
+        instance: HostModuleInstance,
         loads: Mapping[str, ParameterLoad],
     ) -> None:
         selected = dict(loads)
@@ -360,16 +338,16 @@ class PinnedModuleLoadPlan:
         object.__setattr__(self, "loads", MappingProxyType(selected))
 
     @property
-    def sources(self) -> dict[str, PinnedParam]:
+    def sources(self) -> dict[str, HostParam]:
         """Effective source backing for every parameter loaded by this plan."""
         return {name: load.source for name, load in self.loads.items()}
 
     def select_parameters(
         self,
         names: Iterable[str],
-    ) -> PinnedModuleLoadPlan:
+    ) -> HostModuleLoadPlan:
         """Return a plan containing only the requested active parameters."""
-        return PinnedModuleLoadPlan(
+        return HostModuleLoadPlan(
             self.instance,
             _select_known_names(self.loads, names),
         )
@@ -379,12 +357,12 @@ class PinnedModuleLoadPlan:
         device: torch.device,
         *,
         buffer_names: Iterable[str] | None = None,
-    ) -> PinnedModuleTarget:
+    ) -> HostModuleTarget:
         """Allocate target storage from this plan's effective sources."""
         _validate_cuda_device(device)
         params = self.sources
         buffers = _select_known_names(self.instance.buffers, buffer_names)
-        return PinnedModuleTarget(
+        return HostModuleTarget(
             param_targets=_allocate_param_targets(
                 params,
                 _items_for_names(self.instance.params, params),
@@ -396,14 +374,14 @@ class PinnedModuleLoadPlan:
     def refill_param_target(
         self,
         name: str,
-        target: PinnedParamTarget,
+        target: HostParamTarget,
         *,
         non_blocking: bool = True,
     ) -> None:
         """Refill one target and immediately apply its planned update."""
         if name not in self.instance.params:
             raise ValueError(
-                f"param name {name!r} is not owned by this PinnedModuleInstance"
+                f"param name {name!r} is not owned by this HostModuleInstance"
             )
         load = self.loads.get(name)
         if load is None:
@@ -412,7 +390,7 @@ class PinnedModuleLoadPlan:
 
     def load_to_target(
         self,
-        target: PinnedModuleTarget,
+        target: HostModuleTarget,
         *,
         non_blocking: bool = False,
     ) -> None:
@@ -422,7 +400,7 @@ class PinnedModuleLoadPlan:
 
     def copy_to_target(
         self,
-        target: PinnedModuleTarget,
+        target: HostModuleTarget,
         *,
         non_blocking: bool = False,
     ) -> None:
@@ -443,25 +421,23 @@ class PinnedModuleLoadPlan:
         )
 
 
-def _pin_params(
+def _capture_params(
     params: Mapping[str, nn.Parameter],
-    *,
-    pin_memory: bool,
-) -> dict[str, PinnedParam]:
-    pinned_by_name: dict[str, PinnedParam] = {}
+) -> dict[str, HostParam]:
+    host_by_name: dict[str, HostParam] = {}
     for names in group_names(
         params.keys(),
         lambda name: param_tensor_id(params[name]),
     ):
         _validate_param_storage_group_requires_grad(names, params)
-        pinned = PinnedParam(params[names[0]], pin_memory=pin_memory)
-        _validate_param_storage_group_tieable(names, pinned)
+        host = HostParam(params[names[0]])
+        _validate_param_storage_group_tieable(names, host)
         for name in names:
-            pinned_by_name[name] = pinned
-    return pinned_by_name
+            host_by_name[name] = host
+    return host_by_name
 
 
-def _validate_param_storage_group_tieable(names: Sequence[str], pinned: PinnedParam) -> None:
+def _validate_param_storage_group_tieable(names: Sequence[str], host: HostParam) -> None:
     """Reject tied weights whose adapter migrates wrapper state on forward.
 
     A migrate-state adapter (bitsandbytes int8) shares one reconstructed
@@ -471,33 +447,30 @@ def _validate_param_storage_group_tieable(names: Sequence[str], pinned: PinnedPa
     The per-load rearm cannot fix this: it fires once per load, not once per
     consuming module. ``_needs_rearm`` flags exactly these adapters.
     """
-    if len(names) > 1 and pinned._needs_rearm:
+    if len(names) > 1 and host._needs_rearm:
         raise NotImplementedError(
             f"Tied weights {sorted(names)!r} use an adapter whose quant state "
             f"migrates onto the owning module on first forward "
-            f"({type(pinned.adapter).__name__}); one shared wrapper cannot "
+            f"({type(host.adapter).__name__}); one shared wrapper cannot "
             "serve multiple tied modules. Untie these weights, or keep them "
             "resident instead of offloading."
         )
 
 
-def _pin_buffers(
+def _capture_buffers(
     buffers: Mapping[str, torch.Tensor],
-    *,
-    pin_memory: bool,
-) -> dict[str, PinnedBuffer]:
-    pinned_by_name: dict[str, PinnedBuffer] = {}
+) -> dict[str, HostBuffer]:
+    host_by_name: dict[str, HostBuffer] = {}
     for names in group_names(
         buffers.keys(),
         lambda name: buffer_tensor_id(buffers[name]),
     ):
-        pinned = PinnedBuffer.clone(
+        host = HostBuffer.clone(
             buffers[names[0]],
-            pin_memory=pin_memory,
         )
         for name in names:
-            pinned_by_name[name] = pinned
-    return pinned_by_name
+            host_by_name[name] = host
+    return host_by_name
 
 
 def _select_known_names[NamedT](
@@ -523,33 +496,33 @@ def _items_for_names[NamedT](
 
 
 def _validate_module_matches(
-    pinned_params: Mapping[str, PinnedParam],
-    pinned_buffers: Mapping[str, PinnedBuffer],
+    host_params: Mapping[str, HostParam],
+    host_buffers: Mapping[str, HostBuffer],
     module: nn.Module,
 ) -> None:
     """Validate that ``module`` is a structurally compatible bind target.
 
     Compares bind layouts, not full target layouts: binding replaces every
-    managed tensor with the pinned backing storage, so placeholder fields
+    managed tensor with the host backing storage, so placeholder fields
     the bind overwrites (dtype, for plain tensors) are not required to
-    match — a config-built meta skeleton binds against bytes pinned from
+    match — a config-built meta skeleton binds against bytes captured from
     natively loaded weights.
     """
     params = _named_parameters(module)
     buffers = _named_buffers(module)
 
-    _validate_names_present(pinned_params, pinned_buffers, params, buffers)
+    _validate_names_present(host_params, host_buffers, params, buffers)
 
-    for name, pinned in pinned_params.items():
+    for name, host in host_params.items():
         param = params[name]
-        if param.requires_grad != pinned.requires_grad:
+        if param.requires_grad != host.requires_grad:
             raise ValueError(
                 f"Param {name!r} requires_grad mismatch: store has "
-                f"{pinned.requires_grad}, module has {param.requires_grad}."
+                f"{host.requires_grad}, module has {param.requires_grad}."
             )
-        if pinned.is_meta:
+        if host.is_meta:
             representation = param_representation(param)
-            pinned_representation = cast(torch.Tensor, pinned.pinned_state)
+            host_representation = cast(torch.Tensor, host.host_state)
             if (
                 type(representation) is not torch.Tensor
                 or not representation.is_meta
@@ -562,54 +535,54 @@ def _validate_module_matches(
                     f"device={representation.device}, layout={representation.layout}."
                 )
             if (
-                tuple(representation.shape) != tuple(pinned.shape)
-                or representation.dtype is not pinned.compute_dtype
-                or representation.stride() != pinned_representation.stride()
+                tuple(representation.shape) != tuple(host.shape)
+                or representation.dtype is not host.compute_dtype
+                or representation.stride() != host_representation.stride()
                 or representation.storage_offset()
-                != pinned_representation.storage_offset()
+                != host_representation.storage_offset()
             ):
                 raise ValueError(
                     f"Param {name!r} meta layout mismatch: store has "
-                    f"shape={tuple(pinned.shape)}, dtype={pinned.compute_dtype}, "
-                    f"stride={pinned_representation.stride()}, "
-                    f"storage_offset={pinned_representation.storage_offset()}, "
+                    f"shape={tuple(host.shape)}, dtype={host.compute_dtype}, "
+                    f"stride={host_representation.stride()}, "
+                    f"storage_offset={host_representation.storage_offset()}, "
                     f"module has type={type(representation).__name__}, "
                     f"device={representation.device}, shape={tuple(representation.shape)}, "
                     f"dtype={representation.dtype}, stride={representation.stride()}, "
                     f"storage_offset={representation.storage_offset()}."
                 )
             continue
-        layout = PinnedParam.bind_layout_for(param)
-        if layout != pinned.bind_layout:
+        layout = HostParam.bind_layout_for(param)
+        if layout != host.bind_layout:
             raise ValueError(
-                f"Param {name!r} layout mismatch: store has {pinned.bind_layout!r}, module has {layout!r}."
+                f"Param {name!r} layout mismatch: store has {host.bind_layout!r}, module has {layout!r}."
             )
 
-    for name, pinned in pinned_buffers.items():
-        layout = PinnedBuffer.bind_layout_for(buffers[name])
-        if layout != PinnedBuffer.bind_layout_for(pinned.tensor):
+    for name, host in host_buffers.items():
+        layout = HostBuffer.bind_layout_for(buffers[name])
+        if layout != HostBuffer.bind_layout_for(host.tensor):
             raise ValueError(
                 f"Buffer {name!r} layout mismatch: store has "
-                f"{PinnedBuffer.bind_layout_for(pinned.tensor)!r}, module has {layout!r}."
+                f"{HostBuffer.bind_layout_for(host.tensor)!r}, module has {layout!r}."
             )
 
 
 def _validate_target_has_trainable_params(
-    params: Mapping[str, PinnedParam],
-    target: PinnedModuleTarget,
+    params: Mapping[str, HostParam],
+    target: HostModuleTarget,
 ) -> None:
     trainable_params = _trainable_params(params)
     expected_names = set(trainable_params)
     actual_names = set(target.param_targets)
     missing = sorted(expected_names - actual_names)
     if missing:
-        raise ValueError(f"PinnedModuleTarget trainable param target names mismatch: missing {_format_names(missing)}.")
+        raise ValueError(f"HostModuleTarget trainable param target names mismatch: missing {_format_names(missing)}.")
 
 
 def _validate_target_names_known(
-    params: Mapping[str, PinnedParam],
-    buffers: Mapping[str, PinnedBuffer],
-    target: PinnedModuleTarget,
+    params: Mapping[str, HostParam],
+    buffers: Mapping[str, HostBuffer],
+    target: HostModuleTarget,
 ) -> None:
     extra_params = sorted(set(target.param_targets) - set(params))
     extra_buffers = sorted(set(target.buffer_targets) - set(buffers))
@@ -621,7 +594,7 @@ def _validate_target_names_known(
         details.append(f"params {_format_names(extra_params)}")
     if extra_buffers:
         details.append(f"buffers {_format_names(extra_buffers)}")
-    raise ValueError(f"PinnedModuleTarget contains entries outside the store: {'; '.join(details)}.")
+    raise ValueError(f"HostModuleTarget contains entries outside the store: {'; '.join(details)}.")
 
 
 def _validate_param_storage_group_requires_grad(
@@ -632,34 +605,34 @@ def _validate_param_storage_group_requires_grad(
     requires_grad = {params[name].requires_grad for name in names}
     if len(requires_grad) <= 1:
         return
-    raise ValueError(f"PinnedModuleStore cannot group params with mixed requires_grad: {_format_names(names)}.")
+    raise ValueError(f"HostModuleStore cannot group params with mixed requires_grad: {_format_names(names)}.")
 
 
 def _validate_trainable_param_data_swaps(
-    params: Mapping[str, PinnedParam],
+    params: Mapping[str, HostParam],
 ) -> None:
     seen: set[int] = set()
-    for name, pinned in params.items():
-        if not pinned.requires_grad:
+    for name, host in params.items():
+        if not host.requires_grad:
             continue
-        key = id(pinned)
+        key = id(host)
         if key in seen:
             continue
         seen.add(key)
         try:
-            pinned.validate_parameter_data_swap_target()
+            host.validate_parameter_data_swap_target()
         except NotImplementedError as exc:
             raise NotImplementedError(f"Trainable param {name!r} cannot use Parameter.data swap: {exc}") from exc
 
 
 def _validate_names_present(
-    pinned_params: Mapping[str, PinnedParam],
-    pinned_buffers: Mapping[str, PinnedBuffer],
+    host_params: Mapping[str, HostParam],
+    host_buffers: Mapping[str, HostBuffer],
     params: Mapping[str, nn.Parameter],
     buffers: Mapping[str, torch.Tensor],
 ) -> None:
-    missing_params = sorted(set(pinned_params) - set(params))
-    missing_buffers = sorted(set(pinned_buffers) - set(buffers))
+    missing_params = sorted(set(host_params) - set(params))
+    missing_buffers = sorted(set(host_buffers) - set(buffers))
     if not missing_params and not missing_buffers:
         return
 
@@ -668,7 +641,7 @@ def _validate_names_present(
         details.append(f"params {_format_names(missing_params)}")
     if missing_buffers:
         details.append(f"buffers {_format_names(missing_buffers)}")
-    raise ValueError(f"Module is missing pinned names: {'; '.join(details)}.")
+    raise ValueError(f"Module is missing host names: {'; '.join(details)}.")
 
 
 def _same_load_override(
@@ -680,7 +653,7 @@ def _same_load_override(
 
 def _resolve_parameter_load(
     name: str,
-    base: PinnedParam,
+    base: HostParam,
     override: ParameterOverride | None,
 ) -> ParameterLoad | None:
     if override is None:
@@ -693,9 +666,9 @@ def _resolve_parameter_load(
                 f"Meta parameter {name!r} requires a physical replacement source."
             )
         source = base
-    elif not isinstance(source, PinnedParam):
+    elif not isinstance(source, HostParam):
         raise ValueError(
-            f"Parameter load source for {name!r} must be a PinnedParam; "
+            f"Parameter load source for {name!r} must be a HostParam; "
             f"got {type(source).__name__}."
         )
     if source.is_meta:
@@ -716,7 +689,7 @@ def _resolve_parameter_load(
 
 
 def _validate_alias_loads(
-    identities: Mapping[str, PinnedParam],
+    identities: Mapping[str, HostParam],
     loads: Mapping[str, ParameterLoad],
 ) -> None:
     by_identity: dict[int, ParameterLoad] = {}
@@ -735,59 +708,59 @@ def _validate_alias_loads(
 
 
 def _allocate_param_targets(
-    params: Mapping[str, PinnedParam],
-    identities: Mapping[str, PinnedParam],
+    params: Mapping[str, HostParam],
+    identities: Mapping[str, HostParam],
     device: torch.device,
-) -> dict[str, PinnedParamTarget]:
-    targets_by_pinned_id: dict[int, PinnedParamTarget] = {}
-    targets_by_name: dict[str, PinnedParamTarget] = {}
-    for name, pinned in params.items():
+) -> dict[str, HostParamTarget]:
+    targets_by_host_id: dict[int, HostParamTarget] = {}
+    targets_by_name: dict[str, HostParamTarget] = {}
+    for name, host in params.items():
         key = id(identities[name])
-        target = targets_by_pinned_id.get(key)
+        target = targets_by_host_id.get(key)
         if target is None:
-            state = pinned.allocate_gpu_storage(device)
-            target = PinnedParamTarget(
+            state = host.allocate_gpu_storage(device)
+            target = HostParamTarget(
                 _state=state,
-                param=pinned.make_gpu_param(state),
-                _backing=pinned,
+                param=host.make_gpu_param(state),
+                _backing=host,
             )
-            targets_by_pinned_id[key] = target
+            targets_by_host_id[key] = target
         targets_by_name[name] = target
     return targets_by_name
 
 
 def _validate_cuda_device(device: torch.device) -> None:
     if device.type != "cuda":
-        raise ValueError(f"PinnedModuleTarget requires a CUDA device; got {device}.")
+        raise ValueError(f"HostModuleTarget requires a CUDA device; got {device}.")
 
 
 def _trainable_params(
-    params: Mapping[str, PinnedParam],
-) -> dict[str, PinnedParam]:
-    return {name: pinned for name, pinned in params.items() if pinned.requires_grad}
+    params: Mapping[str, HostParam],
+) -> dict[str, HostParam]:
+    return {name: host for name, host in params.items() if host.requires_grad}
 
 
 def _allocate_buffer_targets(
-    buffers: Mapping[str, PinnedBuffer],
+    buffers: Mapping[str, HostBuffer],
     device: torch.device,
-) -> dict[str, PinnedBufferTarget]:
-    targets_by_pinned_id: dict[int, PinnedBufferTarget] = {}
-    targets_by_name: dict[str, PinnedBufferTarget] = {}
-    for name, pinned in buffers.items():
-        key = id(pinned)
-        target = targets_by_pinned_id.get(key)
+) -> dict[str, HostBufferTarget]:
+    targets_by_host_id: dict[int, HostBufferTarget] = {}
+    targets_by_name: dict[str, HostBufferTarget] = {}
+    for name, host in buffers.items():
+        key = id(host)
+        target = targets_by_host_id.get(key)
         if target is None:
-            target = PinnedBufferTarget(
-                tensor=torch.empty_like(pinned.tensor, device=device),
+            target = HostBufferTarget(
+                tensor=torch.empty_like(host.tensor, device=device),
             )
-            targets_by_pinned_id[key] = target
+            targets_by_host_id[key] = target
         targets_by_name[name] = target
     return targets_by_name
 
 
 def _load_params_to_target(
     loads: Mapping[str, ParameterLoad],
-    targets: Mapping[str, PinnedParamTarget],
+    targets: Mapping[str, HostParamTarget],
     *,
     non_blocking: bool,
 ) -> None:
@@ -807,7 +780,7 @@ def _load_params_to_target(
 
 def _load_param_target(
     load: ParameterLoad,
-    target: PinnedParamTarget,
+    target: HostParamTarget,
     *,
     non_blocking: bool,
 ) -> None:
@@ -827,53 +800,53 @@ def _load_param_target(
 
 
 def _copy_buffers_to_target(
-    buffers: Mapping[str, PinnedBuffer],
-    targets: Mapping[str, PinnedBufferTarget],
+    buffers: Mapping[str, HostBuffer],
+    targets: Mapping[str, HostBufferTarget],
     *,
     non_blocking: bool,
 ) -> None:
     copied: set[int] = set()
-    for name, pinned in buffers.items():
-        key = id(pinned)
+    for name, host in buffers.items():
+        key = id(host)
         if key in copied:
             continue
-        targets[name].tensor.copy_(pinned.tensor, non_blocking=non_blocking)
+        targets[name].tensor.copy_(host.tensor, non_blocking=non_blocking)
         copied.add(key)
 
 
 def _copy_trainable_params_from_target(
-    params: Mapping[str, PinnedParam],
-    targets: Mapping[str, PinnedParamTarget],
+    params: Mapping[str, HostParam],
+    targets: Mapping[str, HostParamTarget],
     *,
     non_blocking: bool,
 ) -> None:
     copied: set[int] = set()
-    for name, pinned in params.items():
-        if not pinned.requires_grad:
+    for name, host in params.items():
+        if not host.requires_grad:
             continue
-        key = id(pinned)
+        key = id(host)
         if key in copied:
             continue
-        pinned.copy_to_cpu(targets[name]._state, non_blocking=non_blocking)
+        host.copy_to_cpu(targets[name]._state, non_blocking=non_blocking)
         copied.add(key)
 
 
-def _install_pinned_params(
+def _install_host_params(
     module: nn.Module,
-    params: Mapping[str, PinnedParam],
+    params: Mapping[str, HostParam],
 ) -> None:
-    # Build the materialized CPU params on demand, deduped by ``id(pinned)``
+    # Build the materialized CPU params on demand, deduped by ``id(host)``
     # so tied names share one wrapper (preserving tied-weight behavior).
     # ``make_cpu_param`` is cheap/zero-copy for every adapter (a plain
-    # wrapper / metadata reconstruction aliasing the pinned tensors), so
+    # wrapper / metadata reconstruction aliasing the host tensors), so
     # per-install construction is fine.
     materialized: dict[str, nn.Parameter] = {}
-    by_pinned: dict[int, nn.Parameter] = {}
-    for name, pinned in params.items():
-        cpu_param = by_pinned.get(id(pinned))
+    by_host: dict[int, nn.Parameter] = {}
+    for name, host in params.items():
+        cpu_param = by_host.get(id(host))
         if cpu_param is None:
-            cpu_param = pinned.make_cpu_param()
-            by_pinned[id(pinned)] = cpu_param
+            cpu_param = host.make_cpu_param()
+            by_host[id(host)] = cpu_param
         materialized[name] = cpu_param
     _set_params(module, materialized)
 
@@ -895,13 +868,13 @@ def _set_params(
             _set_param(parent, leaf, materialized)
 
 
-def _install_pinned_buffers(
+def _install_host_buffers(
     module: nn.Module,
-    buffers: Mapping[str, PinnedBuffer],
+    buffers: Mapping[str, HostBuffer],
 ) -> None:
     _set_buffers(
         module,
-        {name: pinned.tensor for name, pinned in buffers.items()},
+        {name: host.tensor for name, host in buffers.items()},
     )
 
 
@@ -948,7 +921,7 @@ def _set_param(parent: nn.Module, leaf: str, param: nn.Parameter) -> None:
 
 
 def _unique_cache_bytes(
-    items: Mapping[str, PinnedParam] | Mapping[str, PinnedBuffer],
+    items: Mapping[str, HostParam] | Mapping[str, HostBuffer],
 ) -> int:
     total = 0
     seen: set[int] = set()
@@ -966,13 +939,13 @@ def _format_names(names: Iterable[str]) -> str:
 
 
 __all__ = [
+    "HostBufferTarget",
+    "HostModuleInstance",
+    "HostModuleLoadPlan",
+    "HostModuleStore",
+    "HostModuleTarget",
+    "HostParamTarget",
     "ParameterLoad",
     "ParameterOverride",
     "ParameterUpdate",
-    "PinnedBufferTarget",
-    "PinnedModuleInstance",
-    "PinnedModuleLoadPlan",
-    "PinnedModuleStore",
-    "PinnedModuleTarget",
-    "PinnedParamTarget",
 ]

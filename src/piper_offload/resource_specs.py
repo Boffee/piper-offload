@@ -15,7 +15,6 @@ from torch import nn
 from .adapter import Adapter
 from .block_compile import BlockCompileConfig
 from .block_mode import BlockMode
-from .host_backing import HostBacking
 from .model_offloader import ModelOffloader
 from .protocols import ResourceStore
 
@@ -33,8 +32,8 @@ class ModelSpec[M: nn.Module]:
     execution for every block group. Transient block groups release their CUDA
     working sets after their final blocks.
     ``transient_paths`` gives named modules independent CUDA working sets
-    scoped to their forwards. ``host_backing`` selects pinned copies (the
-    default) or strict zero-copy adoption of existing CPU model backing.
+    scoped to their forwards. Model state is captured into owned pageable
+    CPU backing.
     """
 
     key: str
@@ -45,11 +44,10 @@ class ModelSpec[M: nn.Module]:
     include_block_trainables: bool = False
     block_mode: BlockMode = "streaming"
     block_compile: BlockCompileConfig | None = None
-    host_backing: HostBacking = "pinned"
     transient_paths: tuple[str, ...] = ()
 
     def build_store(self) -> ModelOffloader:
-        """Build, pin, and bind the cached model runtime."""
+        """Build, capture, and bind the cached model runtime."""
         return ModelOffloader.from_module(
             self.factory(),
             block_paths=self.block_paths,
@@ -57,7 +55,6 @@ class ModelSpec[M: nn.Module]:
             include_block_trainables=self.include_block_trainables,
             block_mode=self.block_mode,
             block_compile=self.block_compile,
-            host_backing=self.host_backing,
             transient_paths=self.transient_paths,
         )
 
@@ -70,10 +67,9 @@ class ModelSpec[M: nn.Module]:
 class AdapterSpec:
     """Adapter resource built from a state-dict factory.
 
-    ``dtype`` and ``host_backing`` are forwarded to
-    :meth:`Adapter.from_state_dict`; matching the model's compute dtype reduces
-    routed per-forward transfer volume when using pinned backing. Adopted
-    backing strictly retains compatible CPU tensors. The factory's reserved
+    ``dtype`` is forwarded to :meth:`Adapter.from_state_dict`; matching the
+    model's compute dtype reduces routed per-forward transfer volume.
+    Captured state owns independent pageable CPU storage. The factory's reserved
     LoRA-suffixed entries form factor pairs; every other entry is an exact
     parameter-name physical value used to populate a
     frozen floating-point meta target.
@@ -87,16 +83,14 @@ class AdapterSpec:
     estimated_cache_bytes: int
     factory: Callable[[], Mapping[str, torch.Tensor]]
     dtype: torch.dtype | None = None
-    host_backing: HostBacking = "pinned"
     allow_partial_targets: bool = False
     scale_parameter_values: bool = False
 
     def build_store(self) -> Adapter:
-        """Build and pin this reusable adapter resource."""
+        """Build and capture this reusable adapter resource."""
         return Adapter.from_state_dict(
             self.factory(),
             dtype=self.dtype,
-            host_backing=self.host_backing,
             allow_partial_targets=self.allow_partial_targets,
             scale_parameter_values=self.scale_parameter_values,
         )
@@ -119,7 +113,7 @@ class ObjectSpec[T]:
     """Resource spec for a tokenizer, processor, config, or other object.
 
     Every lease yields the same object instance. The default zero-byte charge
-    keeps ordinary heap objects outside the pinned-host-memory budget.
+    keeps ordinary heap objects outside the host-memory budget.
     """
 
     key: str

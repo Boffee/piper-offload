@@ -18,7 +18,21 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   packed GGUF sources during preflight, while exact parameter-value replacement
   remains supported.
 
+### Changed
+
+- Unify model and adapter backing as owned pageable CPU storage. Rename the
+  `Pinned*` storage primitives and modules to `Host*`, and replace the tensor
+  adapter's `clone_pin()` contract with `capture_host()`. Packed quantized
+  representations and their movement and merge capabilities are preserved.
+  Host capture no longer allocates pinned memory; runtime registration will
+  be introduced separately.
+
 ### Removed
+
+- Remove `HostBacking`, construction-time `host_backing` / `pin_memory`
+  switches, and the `AdoptableTensorAdapter.adopt_host()` contract. Remove
+  `ResourceCache.empty_host_cache` and its PyTorch host-allocator flush path.
+  The old APIs have no compatibility aliases.
 
 - Remove the vendored pure-PyTorch GGUF-to-dense dequantization path in favor
   of the direct Piper Kernels conversion contract.

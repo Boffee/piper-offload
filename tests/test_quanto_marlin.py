@@ -6,7 +6,7 @@ from torch import nn
 
 import piper_offload.quanto_adapter as quanto_adapter_module
 from piper_offload import Adapter, ModelOffloader
-from piper_offload.pinned_param import PinnedParam
+from piper_offload.host_param import HostParam
 from piper_offload.quanto_adapter import QuantoAdapter
 from piper_offload.tensor_adapter_registry import tensor_id
 from tests.conftest import activated_model
@@ -119,7 +119,7 @@ class TestQuantoMarlin:
         assert first_id != second_id
 
     @CUDA
-    def test_pin_canonicalizes_marlin_before_gpu_wrapper_construction(
+    def test_capture_canonicalizes_marlin_before_gpu_wrapper_construction(
         self,
     ) -> None:
         assert WeightQBytesTensor is not None
@@ -128,30 +128,30 @@ class TestQuantoMarlin:
         original = marlin.dequantize().clone()
         assert marlin.activation_qtype is quanto.qfloat8
 
-        pinned = PinnedParam(model[0].weight)
-        assert pinned.pinned_state.data.dtype is torch.float8_e4m3fn
-        assert tuple(pinned.pinned_state.data.shape) == (128, 128)
-        assert tuple(pinned.pinned_state.scale.shape) == (128, 1)
+        host = HostParam(model[0].weight)
+        assert host.host_state.data.dtype is torch.float8_e4m3fn
+        assert tuple(host.host_state.data.shape) == (128, 128)
+        assert tuple(host.host_state.scale.shape) == (128, 1)
 
-        cpu_param = pinned.make_cpu_param()
+        cpu_param = host.make_cpu_param()
         assert type(cpu_param.data) is WeightQBytesTensor
-        assert cpu_param.data._data.data_ptr() == pinned.pinned_state.data.data_ptr()
-        assert cpu_param.data._scale.data_ptr() == pinned.pinned_state.scale.data_ptr()
+        assert cpu_param.data._data.data_ptr() == host.host_state.data.data_ptr()
+        assert cpu_param.data._scale.data_ptr() == host.host_state.scale.data_ptr()
         assert cpu_param.data.activation_qtype is marlin.activation_qtype
         assert torch.equal(cpu_param.data.dequantize().cuda(), original)
 
-        gpu_state = pinned.allocate_gpu_storage(torch.device("cuda"))
+        gpu_state = host.allocate_gpu_storage(torch.device("cuda"))
         # Pool targets construct their wrapper before the first H2D fill.
-        gpu_param = pinned.make_gpu_param(gpu_state)
+        gpu_param = host.make_gpu_param(gpu_state)
         assert type(gpu_param.data) is WeightQBytesTensor
         assert gpu_param.data._data.data_ptr() == gpu_state.data.data_ptr()
         assert gpu_param.data._scale.data_ptr() == gpu_state.scale.data_ptr()
         assert gpu_param.data.activation_qtype is marlin.activation_qtype
-        pinned.copy_to_gpu(gpu_state)
+        host.copy_to_gpu(gpu_state)
         torch.cuda.synchronize()
 
         assert torch.equal(gpu_param.data.dequantize(), original)
-        assert PinnedParam.target_layout_for(gpu_param) == pinned.target_layout
+        assert HostParam.target_layout_for(gpu_param) == host.target_layout
 
     @CUDA
     def test_copy_into_repacks_existing_marlin_storage_in_place(self) -> None:

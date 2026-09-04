@@ -7,7 +7,7 @@ from typing import Any, cast
 import torch
 from torch import nn
 
-from .pinned_param import PinnedParam
+from .host_param import HostParam
 from .seeding import derive_seed
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
@@ -61,13 +61,13 @@ class ParameterValue:
     or infinity.
     """
 
-    backing: PinnedParam
+    backing: HostParam
     scale_with_strength: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.backing, PinnedParam):
+        if not isinstance(self.backing, HostParam):
             raise ValueError(
-                "ParameterValue backing must be a PinnedParam; "
+                "ParameterValue backing must be a HostParam; "
                 f"got {type(self.backing).__name__}."
             )
         if self.backing.requires_grad:
@@ -82,7 +82,6 @@ class ParameterValue:
         source: torch.Tensor,
         *,
         dtype: torch.dtype | None = None,
-        pin_memory: bool = True,
         scale_with_strength: bool = False,
     ) -> ParameterValue:
         """Validate and capture one physical replacement representation."""
@@ -94,7 +93,7 @@ class ParameterValue:
         if issubclass(type(source), nn.Parameter) and source.requires_grad:
             raise ValueError("Parameter values are inference-only and must be frozen.")
         # Inspect only the source representation and dtype policy here. The
-        # final converted and pinned representation is validated once by
+        # final captured representation is validated once by
         # ``ParameterValue.__post_init__``.
         adapter = _select_value_adapter(source)
         compute_dtype = adapter.compute_dtype(source)
@@ -119,7 +118,7 @@ class ParameterValue:
             else nn.Parameter(tensor, requires_grad=False)
         )
         return cls(
-            PinnedParam(parameter, pin_memory=pin_memory),
+            HostParam(parameter),
             scale_with_strength=scale_with_strength,
         )
 
@@ -197,7 +196,7 @@ class ParameterValueTransform:
         self._plan: _ParameterValuePlan | None = None
 
     @property
-    def backing(self) -> PinnedParam:
+    def backing(self) -> HostParam:
         """Physical source that defines allocation and copied bytes."""
         return self._value.value.backing
 

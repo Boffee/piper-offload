@@ -5,13 +5,13 @@ fp8 bytes (``qdata``), per-row or per-tensor fp32 scales (``scale``),
 and metadata controlling the matmul dispatch (``block_size``,
 ``mm_config``, ``kernel_preference``, ``act_quant_kwargs``). The shared
 :class:`~piper_offload.torchao_structured_adapter.TorchaoStructuredAdapter`
-base preserves that representation across pinned CPU and GPU storage;
+base preserves that representation across CPU and GPU storage;
 this module supplies the Float8-specific hooks.
 
 Beyond inference movement, this adapter opts into:
 
 - CPU round-trip: GPU storage is the identical fp8 bytes, so D2H back
-  into the pinned host state is lossless.
+  into the host state is lossless.
 - Format-specific LoRA merge: CUDA per-row, per-tensor, and standard
   per-group weights use raw Triton kernels when available. Other layouts
   and installations without Triton use the existing
@@ -44,7 +44,7 @@ from ._torchao_float8 import (
 from .tensor_adapters import metadata_key
 from .torchao_structured_adapter import (
     TorchaoGpu,
-    TorchaoPinned,
+    TorchaoHost,
     TorchaoStructuredAdapter,
     copy_storage,
 )
@@ -244,9 +244,9 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
     # --- capabilities beyond inference movement ---------------------------
 
     @staticmethod
-    def copy_to_cpu(src: TorchaoGpu, dst: TorchaoPinned[_Float8Meta], *, non_blocking: bool = False) -> None:
+    def copy_to_cpu(src: TorchaoGpu, dst: TorchaoHost[_Float8Meta], *, non_blocking: bool = False) -> None:
         # GPU storage is the identical fp8 bytes + scales, so D2H is a
-        # lossless byte copy. Quant metadata lives on the pinned state.
+        # lossless byte copy. Quant metadata lives on the host state.
         copy_storage(src.storage, dst.storage, non_blocking=non_blocking)
 
     @staticmethod

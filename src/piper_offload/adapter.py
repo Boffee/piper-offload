@@ -7,19 +7,16 @@ storage and target metadata only; merge and routed execution live in their
 respective transform modules.
 """
 
-from collections.abc import Collection, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Literal, Self
 
 import torch
 
-from .host_backing import HostBacking, validate_host_backing
 from .lora import ScaledLoRAFactor
 from .parameter_delta import ParameterDelta, ScaledParameterDelta
 from .parameter_value import ParameterValue, ScaledParameterValue
-from .tensor_adapter_registry import select_adapter
-from .tensor_adapters import RegularAdapter
 
 __all__ = [
     "Adapter",
@@ -93,12 +90,11 @@ class Adapter:
     Build once from a flat canonical ``state_dict``. Exact LoRA and delta
     suffixes identify low-rank factors and full-rank additive updates; every
     other key is the complete value for an exact-name meta parameter.
-    Inputs are validated and pinned directly by default. The optional
+    Inputs are validated and copied to pageable CPU storage. The optional
     ``dtype`` casts dense inputs; a structured parameter value must already
     have that logical compute dtype because casting would discard its encoded
-    representation. Adopt mode retains compatible CPU storage without copying
-    it. The resource retains the resulting tensors but not the raw input
-    mapping.
+    representation. The resource retains the resulting tensors but not the
+    raw input mapping.
 
     Satisfies :class:`~piper_offload.protocols.ResourceStore`, so it can be
     registered in :class:`~piper_offload.ResourceCache` for budget tracking and
@@ -149,7 +145,6 @@ class Adapter:
         state_dict: Mapping[str, torch.Tensor],
         *,
         dtype: torch.dtype | None = None,
-        host_backing: HostBacking = "pinned",
         allow_partial_targets: bool = False,
         scale_parameter_values: bool = False,
     ) -> Self:
@@ -165,23 +160,14 @@ class Adapter:
         ``scale_parameter_values=True`` multiplies those complete values by
         an active adapter's strength; by default they remain unchanged.
         A zero-strength adapter remains inactive.
-        ``host_backing="adopt"`` strictly adopts existing CPU storage and
-        therefore rejects conversions.
+        Captured values own independent pageable CPU storage.
         """
-        backing = validate_host_backing(host_backing)
         if dtype is not None and not dtype.is_floating_point:
             raise ValueError(f"Adapter dtype must be floating-point, got {dtype}.")
         sources = _parse_adapter_state_dict(state_dict)
-        if backing == "adopt":
-            _validate_adopted_dtype(
-                state_dict,
-                value_keys=sources.values.keys(),
-                dtype=dtype,
-            )
         targets = _build_adapter_targets(
             sources,
             dtype=dtype,
-            pin_memory=backing == "pinned",
             scale_parameter_values=scale_parameter_values,
         )
         return cls(targets, allow_partial_targets=allow_partial_targets)
@@ -254,51 +240,10 @@ def _validate_delta_base(base: str) -> None:
         raise ValueError("Parameter delta target names must be non-empty")
 
 
-def _validate_adopted_dtype(
-    state_dict: Mapping[str, torch.Tensor],
-    *,
-    value_keys: Collection[str],
-    dtype: torch.dtype | None,
-) -> None:
-    """Reject a requested conversion that would defeat source adoption."""
-    if dtype is None:
-        return
-    value_key_set = set(value_keys)
-    incompatible: list[str] = []
-    for key, tensor in state_dict.items():
-        if not isinstance(tensor, torch.Tensor):
-            continue
-        if key not in value_key_set:
-            if tensor.dtype is not dtype:
-                incompatible.append(key)
-            continue
-        try:
-            adapter = select_adapter(tensor)
-        except NotImplementedError:
-            # Source validation will report the missing adapter with the
-            # parameter-value-specific error.
-            continue
-        value_dtype = (
-            tensor.dtype
-            if isinstance(adapter, RegularAdapter)
-            else adapter.compute_dtype(tensor)
-        )
-        if value_dtype is not dtype:
-            incompatible.append(key)
-    if incompatible:
-        raise ValueError(
-            "adopted adapter host backing cannot convert adapter tensor dtype "
-            "without copying and losing source/mmap backing. Remove dtype=, "
-            "convert the source before loading, or use host_backing='pinned'. "
-            f"Mismatched tensors: {incompatible!r}."
-        )
-
-
 def _build_adapter_targets(
     sources: _AdapterSources,
     *,
     dtype: torch.dtype | None = None,
-    pin_memory: bool = True,
     scale_parameter_values: bool = False,
 ) -> dict[str, AdapterTarget]:
     """Capture parsed sources into one target value per parameter name."""
@@ -312,7 +257,6 @@ def _build_adapter_targets(
             b=None if base is None else sources.b[base],
             dense=sources.deltas.get(target_key),
             dtype=dtype,
-            pin_memory=pin_memory,
         )
 
     for target_key, source in sources.values.items():
@@ -321,7 +265,6 @@ def _build_adapter_targets(
         targets[target_key] = ParameterValue.from_tensor(
             source,
             dtype=dtype,
-            pin_memory=pin_memory,
             scale_with_strength=scale_parameter_values,
         )
     return targets

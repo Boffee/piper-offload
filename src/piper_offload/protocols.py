@@ -19,11 +19,11 @@ Top-level :class:`ResourceBinding` implementations in this package:
 block offload) and :class:`~piper_offload.MpsWeights` (whole-model
 CPU->MPS materialization without a second CPU cache). An
 :class:`~piper_offload.Adapter` is itself the cached adapter resource. Merge
-and routed consumers read its immutable pinned backing directly; routed
+and routed consumers read its immutable host backing directly; routed
 device copies belong to activation-scoped model hooks.
 
 Composable lifecycle pieces inside a model runtime include
-:class:`~piper_offload.PinnedComponent` and
+:class:`~piper_offload.HostComponent` and
 :class:`~piper_offload.BlockComponent`.
 
 Lifecycle
@@ -41,8 +41,8 @@ device when device-aware) ->
 ``cache_bytes`` remains resident).
 
 Package model resources optimize construction peak memory: plain
-``torch.Tensor`` parameters may be repointed to pinned storage while
-pinning is still in progress. If construction raises after pinning has
+``torch.Tensor`` parameters may be repointed to host storage while
+capture is still in progress. If construction raises after capture has
 started, recovery of the partially constructed model/resource is
 unsupported; drop those references and rebuild from a fresh model
 instance.
@@ -52,8 +52,8 @@ instance.
 exception-safe model activation scope.
 
 There is no ``close()``. To release store ``cache_bytes`` (typically
-pinned host memory), drop the store reference. Python's refcount-based
-GC frees pinned tensors immediately. Bindings release what they own on
+host memory), drop the store reference. Python's refcount-based
+GC frees host tensors immediately. Bindings release what they own on
 deactivate; ownership of any user-held model references is the user's
 concern.
 """

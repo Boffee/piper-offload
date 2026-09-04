@@ -10,7 +10,7 @@ from piper_offload import Adapter, ModelOffloader, merge_adapter
 from piper_offload.gguf_adapter import GgufAdapter
 from piper_offload.lora import LoRATransform, ScaledLoRAFactor
 from piper_offload.parameter_delta import ParameterDelta, ParameterDeltaTransform
-from piper_offload.pinned_param import PinnedParam
+from piper_offload.host_param import HostParam
 from piper_offload.tensor_adapter_registry import param_representation
 from tests._gguf_helpers import GGUFParameter
 
@@ -48,14 +48,14 @@ def _quantized_weight(
     )
 
 
-def _materialize(weight: torch.Tensor) -> tuple[PinnedParam, Any, torch.Tensor]:
+def _materialize(weight: torch.Tensor) -> tuple[HostParam, Any, torch.Tensor]:
     assert isinstance(weight, nn.Parameter)
-    pinned = PinnedParam(weight, pin_memory=False)
-    state = pinned.allocate_gpu_storage(torch.device("cuda"))
-    param = pinned.make_gpu_param(state)
-    pinned.copy_to_gpu(state)
+    host = HostParam(weight)
+    state = host.allocate_gpu_storage(torch.device("cuda"))
+    param = host.make_gpu_param(state)
+    host.copy_to_gpu(state)
     torch.cuda.synchronize()
-    return pinned, state, param_representation(param)
+    return host, state, param_representation(param)
 
 
 class TestGGUFSource:
@@ -63,8 +63,9 @@ class TestGGUFSource:
         assert GgufAdapter.logical_shape(w) == (4, 64)
         assert GgufAdapter.compute_dtype(w) is torch.bfloat16
 
-        state = GgufAdapter.adopt_host(w)
-        assert state.data.data_ptr() == w.as_tensor().data_ptr()
+        state = GgufAdapter.capture_host(w)
+        assert state.data.data_ptr() != w.as_tensor().data_ptr()
+        torch.testing.assert_close(state.data, w.as_tensor().view(torch.uint8))
         assert state.quant_type == QUANT_TYPE
         assert state.logical_shape == (4, 64)
         assert state.group_size == 64
@@ -75,12 +76,14 @@ class TestGGUFSource:
         assert isinstance(weight, GGUFParameter)
         assert GgufAdapter.matches(weight)
 
-        state = GgufAdapter.adopt_host(weight)
+        state = GgufAdapter.capture_host(weight)
         rebuilt = GgufAdapter.cpu_param(state)
         assert isinstance(rebuilt, GGUFParameter)
         assert rebuilt.quant_type == weight.quant_type
         assert rebuilt.quant_shape == weight.quant_shape
-        assert rebuilt.as_tensor().data_ptr() == packed.data_ptr()
+        assert rebuilt.as_tensor().data_ptr() == state.data.data_ptr()
+        assert rebuilt.as_tensor().data_ptr() != packed.data_ptr()
+        torch.testing.assert_close(rebuilt.as_tensor(), packed)
 
     def test_does_not_match_arbitrary_packed_tensor(self) -> None:
         assert not GgufAdapter.matches(torch.zeros((4, 36), dtype=torch.uint8))
@@ -122,7 +125,7 @@ class TestGGUFSource:
             features=features,
         )
 
-        state = GgufAdapter.adopt_host(weight)
+        state = GgufAdapter.capture_host(weight)
 
         assert state.group_size == expected_group_size
 
@@ -134,7 +137,7 @@ class TestGGUFSource:
         )
 
         with pytest.raises(ValueError, match="in_features divisible by 16"):
-            GgufAdapter.adopt_host(weight)
+            GgufAdapter.capture_host(weight)
 
 
 class TestPermanentMerge:
@@ -212,7 +215,7 @@ class TestDirectConversion:
         weight, packed, quant_type = _quantized_weight(1)
         model = nn.Linear(64, 64, bias=False)
         model.weight = weight
-        offloader = ModelOffloader.from_module(model, host_backing="adopt")
+        offloader = ModelOffloader.from_module(model)
 
         offloader.activate("cuda")
         try:
@@ -243,10 +246,9 @@ class TestDirectConversion:
             dtype=torch.bfloat16,
         )
         model.weight.requires_grad_(False)
-        offloader = ModelOffloader.from_module(model, host_backing="adopt")
+        offloader = ModelOffloader.from_module(model)
         adapter = Adapter.from_state_dict(
             {"weight": weight},
-            host_backing="adopt",
         )
 
         offloader.activate(
@@ -282,10 +284,9 @@ class TestDirectConversion:
             dtype=torch.bfloat16,
         )
         model.weight.requires_grad_(False)
-        offloader = ModelOffloader.from_module(model, host_backing="adopt")
+        offloader = ModelOffloader.from_module(model)
         adapter = Adapter.from_state_dict(
             {"weight": weight},
-            host_backing="adopt",
             scale_parameter_values=True,
         )
 
@@ -327,7 +328,7 @@ class TestDirectConversion:
         qdata_ptr = actual.qdata.data_ptr()
         scale_ptr = actual.scale.data_ptr()
         assert isinstance(second, nn.Parameter)
-        second_backing = PinnedParam(second, pin_memory=False)
+        second_backing = HostParam(second)
         second_backing.copy_to_gpu(state)
         torch.cuda.synchronize()
         expected_second = ConvRotInt8Tensor.from_gguf(
@@ -352,7 +353,7 @@ class TestDirectConversion:
         weight, packed, quant_type = _quantized_weight(6)
         assert isinstance(weight, nn.Parameter)
         source_param = weight
-        backing = PinnedParam(source_param, pin_memory=False)
+        backing = HostParam(source_param)
         rank = 4
         a = torch.randn(rank, 64)
         b = torch.randn(64, rank)
@@ -388,14 +389,13 @@ class TestDirectConversion:
         weight, packed, quant_type = _quantized_weight(7)
         assert isinstance(weight, nn.Parameter)
         source_param = weight
-        backing = PinnedParam(source_param, pin_memory=False)
+        backing = HostParam(source_param)
         dense = torch.randn(64, 64)
         strength = 0.125
         transform = ParameterDeltaTransform(
             [
                 ParameterDelta.from_tensors(
                     dense=dense,
-                    pin_memory=False,
                 ).scaled(strength)
             ]
         )

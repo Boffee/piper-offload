@@ -1,13 +1,13 @@
 """Block-residency primitive for memory-efficient training and inference.
 
-A :class:`BlockComponentStore` manages reusable pinned CPU backing
+A :class:`BlockComponentStore` manages reusable CPU backing
 storage for a single structurally compatible block list.
 Binding that store to a compatible model creates a
 :class:`BlockComponent` that either streams the resolved blocks to GPU on
 demand or keeps every block resident. Ordinary streaming uses a reusable GPU
 target pool and background prefetcher; rolling compilation selects a
 single-target parameter runtime; resident mode loads every target once. On
-CPU, the host-backed pinned state is used directly without streaming.
+CPU, the host-backed state is used directly without streaming.
 
 Blocks in one list may be heterogeneously quantized (mixed dtypes or
 quant formats on the same-named weights): the GPU target pool keys its
@@ -19,7 +19,7 @@ into multiple :class:`BlockComponent` instances composed via
 :class:`ModelOffloader`.
 
 In-block trainable params (LoRA adapters) flow through the same target
-pool; pinned module instances branch on the source trainable flag to swap
+pool; host module instances branch on the source trainable flag to swap
 ``.data`` (preserves user Parameter identity for autograd / optimizer
 state) instead of replacing the Parameter wrapper. Gradients live on GPU
 during backward via PyTorch's native ``AccumulateGrad``; only ``.data``
@@ -28,13 +28,13 @@ is materialized around ``optimizer.step()`` via :meth:`optimizer_step`.
 This is the sharp, low-level primitive. It does NOT manage:
 
 - Non-block parts of the model (parent-module state, sibling
-  modules) — caller derives :class:`PinnedComponent` include-name sets
+  modules) — caller derives :class:`HostComponent` include-name sets
   by excluding the block component's owned names.
 - Out-of-block trainable parameter movement — caller handles that
-  alongside non-streamed parameters, usually with :class:`PinnedComponent`.
+  alongside non-streamed parameters, usually with :class:`HostComponent`.
 - Shared storage with tensors outside the block list — caller
   must choose a valid composition; use whole-model
-  :class:`PinnedComponent` if sharing must be preserved.
+  :class:`HostComponent` if sharing must be preserved.
 - Activation-checkpointing enforcement — required for in-block
   trainable streaming, but checked at the composer level.
 
@@ -58,18 +58,14 @@ from ._devices import canonical_device
 from .block_compile import BlockCompileConfig, _BlockCompileState
 from .block_mode import BlockMode
 from .block_runtime import BlockRuntime
-from .host_backing import (
-    HostBacking,
-    validate_host_backing,
-)
-from .module_names import walk_attr_path
-from .pinned_module import (
+from .host_module import (
+    HostModuleInstance,
+    HostModuleLoadPlan,
+    HostModuleStore,
     ParameterOverride,
-    PinnedModuleInstance,
-    PinnedModuleLoadPlan,
-    PinnedModuleStore,
 )
-from .pinned_param import PinnedParam
+from .host_param import HostParam
+from .module_names import walk_attr_path
 from .resident_runtime import ResidentBlockRuntime
 from .rolling_runtime import RollingBlockRuntime, create_rolling_block_runtime
 from .streaming_runtime import StreamingBlockRuntime
@@ -80,7 +76,7 @@ logger = logging.getLogger(__name__)
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
     # Process-wide PyTorch CUDA allocator cache is the only state the
     # refcount-based GC of a block component can't release on its own. Without
-    # this, freed pinned/GPU pages stay held by the allocator until the
+    # this, freed GPU pages stay held by the allocator until the
     # next allocation pressure event, which manifests as OOMs at
     # workload boundaries (e.g. successive trainers in one process).
     # ``empty_cache()`` is process-global (not per-device), so a single
@@ -100,7 +96,7 @@ def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
 
 
 def _param_target_layout(p: nn.Parameter) -> tuple[object, object]:
-    """Per-parameter target-compatibility layout, computed pre-pin.
+    """Per-parameter target-compatibility layout, computed pre-capture.
 
     Two params with equal values pool into structurally identical GPU
     targets, so a refill is a plain ``Tensor.copy_``; unequal values must
@@ -109,18 +105,18 @@ def _param_target_layout(p: nn.Parameter) -> tuple[object, object]:
     axis, activation_qtype, quant_type) is similarly invisible to it.
 
     This is the standalone form of the same value
-    :attr:`PinnedParam.target_layout` supplies the same value to the block
+    :attr:`HostParam.target_layout` supplies the same value to the block
     runtime's target-pool signature; this helper is not called on the
     streaming path. Kept as the package's documented
     way to compare two params' target compatibility directly (e.g. in
-    adapter tests) without pinning either.
+    adapter tests) without capturing either.
 
-    :class:`PinnedParam` owns the tensor-adapter details because wrapper
+    :class:`HostParam` owns the tensor-adapter details because wrapper
     metadata is type-specific. The returned value intentionally excludes
     tensor identity so distinct blocks with the same layout share one
     pooled target.
     """
-    return PinnedParam.target_layout_for(p)
+    return HostParam.target_layout_for(p)
 
 
 def _collect_block_schemas(
@@ -130,11 +126,11 @@ def _collect_block_schemas(
 ) -> tuple[list[dict[str, bool]], list[set[str]]]:
     """Snapshot the cross-block contract without retaining tensor objects.
 
-    Pinned construction replaces each completed block's source wrappers so
+    Host construction replaces each completed block's source wrappers so
     their pageable/file-backed storage can be released before the next block
     is copied. Keeping ``Parameter`` or buffer objects in this pre-validation
     snapshot would extend every source storage's lifetime until the complete
-    block list finished pinning, producing an approximately 2x model-sized
+    block list finished capture, producing an approximately 2x model-sized
     peak for structured tensor adapters.
     """
     block_param_schemas: list[dict[str, bool]] = []
@@ -204,7 +200,7 @@ def _check_block_requires_grad_consistent(
     name in one block group is unsupported: trainable streaming swaps
     ``.data`` under an activation-checkpointing guard, so a half-trainable
     group has no coherent optimizer-step / checkpointing contract.
-    Validated before pinning so a mismatch leaves the model unmutated.
+    Validated before capture so a mismatch leaves the model unmutated.
     """
     if len(block_param_schemas) <= 1:
         return
@@ -224,22 +220,21 @@ def _check_block_requires_grad_consistent(
                 )
 
 
-def _pin_block_module_stores(
+def _capture_block_module_stores(
     blocks: Sequence[nn.Module],
     *,
     managed_param_names: set[str] | None = None,
     managed_buffer_names: set[str] | None = None,
-    pin_memory: bool = True,
-) -> list[PinnedModuleStore]:
-    """Collect, validate, and pin one :class:`PinnedModuleStore` per block.
+) -> list[HostModuleStore]:
+    """Collect, validate, and capture one :class:`HostModuleStore` per block.
 
-    Pre-pin validation failures do not pin and do not mutate module
-    parameters or buffers. Once pinning starts, :class:`PinnedParam` may use its
+    Validation failures before capture do not mutate module parameters or
+    buffers. Once capture starts, :class:`HostParam` may use its
     low-peak ``Parameter.data`` repointing optimization; recovery from
-    a pin-time failure is unsupported, matching :class:`PinnedComponent`.
+    a capture-time failure is unsupported, matching :class:`HostComponent`.
     """
     # Walk each block to snapshot selected names and requires_grad flags
-    # WITHOUT retaining the Parameter/buffer objects or pinning anything.
+    # WITHOUT retaining the Parameter/buffer objects or capturing anything.
     # Cross-block name consistency is enforced upstream
     # (``_block_param_names_for_blocks`` / ``_block_buffer_names_for_blocks``);
     # per-block tensor *layouts* may differ (heterogeneous quantization),
@@ -253,14 +248,14 @@ def _pin_block_module_stores(
     )
     _check_block_requires_grad_consistent(block_param_schemas)
 
-    # Only lightweight name collections cross into pinning. Pin and install
+    # Only lightweight name collections cross into capture. Capture and install
     # each block before resolving the next block's live tensors so structured
     # source wrappers from completed blocks can be reclaimed immediately.
     param_names_by_block = [set(schema) for schema in block_param_schemas]
     buffer_names_by_block = block_buffer_schemas
     del block_param_schemas, block_buffer_schemas
 
-    stores: list[PinnedModuleStore] = []
+    stores: list[HostModuleStore] = []
     for block, param_names, buffer_names in zip(
         blocks,
         param_names_by_block,
@@ -268,19 +263,17 @@ def _pin_block_module_stores(
         strict=True,
     ):
         stores.append(
-            PinnedModuleStore.from_module(
+            HostModuleStore.from_module(
                 block,
                 include_param_names=param_names,
                 include_buffer_names=buffer_names,
-                pin_memory=pin_memory,
-                install_backing=pin_memory,
             )
         )
     return stores
 
 
 def _build_param_name_index(
-    instances: Sequence[PinnedModuleInstance],
+    instances: Sequence[HostModuleInstance],
     prefix: str | None,
     block_indices: Sequence[int],
 ) -> dict[str, tuple[int, str]]:
@@ -299,7 +292,7 @@ def _build_param_name_index(
 
 
 def _build_buffer_name_index(
-    instances: Sequence[PinnedModuleInstance],
+    instances: Sequence[HostModuleInstance],
     prefix: str | None,
     block_indices: Sequence[int],
 ) -> dict[str, tuple[int, str]]:
@@ -393,7 +386,7 @@ def _block_is_empty(block: nn.Module) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class BlockComponentStore:
-    """Reusable pinned backing storage for a block group.
+    """Reusable host backing storage for a block group.
 
     Built via :meth:`from_module`: the tensor source is the model's block list,
     resolved by ``blocks_path``.
@@ -404,7 +397,7 @@ class BlockComponentStore:
     its true externally-visible index.
     """
 
-    _block_stores: tuple[PinnedModuleStore, ...]
+    _block_stores: tuple[HostModuleStore, ...]
     blocks_path: str
     block_indices: tuple[int, ...]
 
@@ -415,16 +408,14 @@ class BlockComponentStore:
         *,
         blocks_path: str,
         include_block_trainables: bool = False,
-        host_backing: HostBacking = "pinned",
     ) -> Self:
-        """Resolve ``blocks_path`` on ``model`` and pin its managed blocks.
+        """Resolve ``blocks_path`` on ``model`` and capture its managed blocks.
 
         Structurally-empty positions (no parameters or buffers) are skipped and
         dropped from :attr:`block_indices`. The surviving blocks must still
         agree on selected names (see
         :func:`_block_param_names_for_blocks`).
         """
-        backing = validate_host_backing(host_backing)
         all_blocks = _resolve_blocks(model, blocks_path)
         kept = [(idx, block) for idx, block in enumerate(all_blocks) if not _block_is_empty(block)]
         if not kept:
@@ -438,11 +429,10 @@ class BlockComponentStore:
             include_trainables=include_block_trainables,
         )
         managed_buffer_names = _block_buffer_names_for_blocks(blocks)
-        block_stores = _pin_block_module_stores(
+        block_stores = _capture_block_module_stores(
             blocks,
             managed_param_names=managed_param_names,
             managed_buffer_names=managed_buffer_names,
-            pin_memory=backing == "pinned",
         )
         return cls(
             _block_stores=tuple(block_stores),
@@ -466,7 +456,7 @@ class BlockComponentStore:
 
         Named by TRUE block index (:attr:`block_indices`), not the compact
         store position — so a sparse group's factors are advertised at their
-        real path (``blocks.2...``) and the pinned-remainder subtraction in
+        real path (``blocks.2...``) and the host-remainder subtraction in
         :meth:`CompositeComponentStore.from_module` lines up correctly.
         """
         names = {
@@ -559,13 +549,13 @@ class BlockComponentStore:
 
 
 class BlockComponent:
-    """Manages a block list between pinned CPU and CUDA.
+    """Manages a block list between CPU and CUDA.
 
     The sharp, low-level block-residency primitive. Manages bound block
-    instances whose owned params and buffers are pinned to CPU. By default it
+    instances whose owned params and buffers are stored on CPU. By default it
     streams them to CUDA via forward-pre hooks on :meth:`activate`; with
     resident mode loads every block once and installs no scheduling hooks.
-    CPU activation is pass-through over that pinned host-backed state:
+    CPU activation is pass-through over that host-backed state:
     no pool, no hooks, no copies. Frozen params use parameter
     replacement; trainable params keep Parameter identity and swap only
     ``.data``.
@@ -579,11 +569,11 @@ class BlockComponent:
     model). For top-level use, build a model runtime via
     :class:`~piper_offload.model_offloader.ModelOffloader`.
 
-    Lifecycle is uniform with :class:`PinnedComponent`: store construction
-    pins (so ``cache_bytes`` is final at construction time, ready
+    Lifecycle is uniform with :class:`HostComponent`: store construction
+    captures host storage (so ``cache_bytes`` is final at construction time, ready
     for :class:`~piper_offload.resource_cache.ResourceCache` admission), and
     ``activate`` starts a device session and initially acquires its CUDA working
-    set, while ``deactivate`` releases that working set, returns state to pinned
+    set, while ``deactivate`` releases that working set, returns state to host
     CPU, removes hooks, and restores eager forwards. :meth:`release` and
     :meth:`acquire` may cycle the CUDA working set without ending the session.
     Optional
@@ -593,17 +583,17 @@ class BlockComponent:
     owns one target per block, and rolling compilation owns one shared
     parameter target. Streaming strategies wrap to block 0 by default;
     transient model scheduling disables that wraparound.
-    There is no ``close()``; pinned memory in module state is freed when the
+    There is no ``close()``; host memory in module state is freed when the
     caller drops the binding and model references.
 
     **Calling deactivate() before dropping the binding is preferred**
     — it removes the forward hooks (cleaner model state) and reverts
-    GPU-resident blocks back to pinned CPU. The hook closure uses
+    GPU-resident blocks back to CPU. The hook closure uses
     ``weakref.ref(self)`` so dropping the binding without deactivate
     is non-fatal: the orphaned hooks remain installed on the model
     but no-op; resident blocks stay on GPU until the model itself is
     dropped. Forward calls through still-resident blocks work; calls
-    through previously-evicted blocks find pinned-CPU tensors (slow but
+    through previously-evicted blocks find CPU tensors (slow but
     functional).
 
     Instances are usually created by binding a
@@ -645,7 +635,7 @@ class BlockComponent:
 
     def __init__(
         self,
-        block_instances: Sequence[PinnedModuleInstance],
+        block_instances: Sequence[HostModuleInstance],
         *,
         name: str | None = None,
         block_indices: Sequence[int] | None = None,
@@ -725,7 +715,7 @@ class BlockComponent:
         self._auto_fallback_compile: _BlockCompileState | None = None
         self._active_device: torch.device | None = None
         self._active_runtime: BlockRuntime | None = None
-        self._load_plans: tuple[PinnedModuleLoadPlan, ...] = ()
+        self._load_plans: tuple[HostModuleLoadPlan, ...] = ()
         self._param_name_to_block_param = _build_param_name_index(
             self._block_instances,
             name,
@@ -792,7 +782,7 @@ class BlockComponent:
     def _resolve_param_name(
         self,
         name: str,
-    ) -> tuple[PinnedModuleInstance, str]:
+    ) -> tuple[HostModuleInstance, str]:
         ref = self._param_name_to_block_param.get(name)
         if ref is None:
             raise ValueError(f"param name {name!r} is not owned by this block component")
@@ -802,7 +792,7 @@ class BlockComponent:
     def _resolve_buffer_name(
         self,
         name: str,
-    ) -> tuple[PinnedModuleInstance, str]:
+    ) -> tuple[HostModuleInstance, str]:
         ref = self._buffer_name_to_block_buffer.get(name)
         if ref is None:
             raise ValueError(f"buffer name {name!r} is not owned by this block component")
@@ -813,7 +803,7 @@ class BlockComponent:
         self,
         block_idx: int,
         name: str,
-    ) -> tuple[PinnedModuleInstance, str]:
+    ) -> tuple[HostModuleInstance, str]:
         if block_idx < 0 or block_idx >= len(self._block_instances):
             raise ValueError(f"block index {block_idx} is out of range")
         instance = self._block_instances[block_idx]
@@ -825,7 +815,7 @@ class BlockComponent:
         self,
         block_idx: int,
         name: str,
-    ) -> tuple[PinnedModuleInstance, str]:
+    ) -> tuple[HostModuleInstance, str]:
         if block_idx < 0 or block_idx >= len(self._block_instances):
             raise ValueError(f"block index {block_idx} is out of range")
         instance = self._block_instances[block_idx]
@@ -848,7 +838,7 @@ class BlockComponent:
 
         CUDA activation selects the ordinary, all-resident, or compiled rolling
         block runtime, then installs optional compiled block forwards. CPU
-        activation is pass-through over pinned host-backed state.
+        activation is pass-through over host-backed state.
         The composite's :meth:`activate` returns the model — this
         method returns ``None`` because the component doesn't own one.
 
@@ -890,7 +880,7 @@ class BlockComponent:
     def _resolve_load_plans(
         self,
         overrides: Mapping[str, ParameterOverride] | None,
-    ) -> tuple[PinnedModuleLoadPlan, ...]:
+    ) -> tuple[HostModuleLoadPlan, ...]:
         by_block: list[dict[str, ParameterOverride]] = [
             {} for _instance in self._block_instances
         ]
@@ -1000,7 +990,7 @@ class BlockComponent:
         """Tear down active resources idempotently — safe to call
         before activate or multiple times. The selected runtime owns cleanup
         of any partial acquisition state. Drop the binding reference after
-        deactivate to release pinned memory."""
+        deactivate to release host memory."""
         self._block_compile.restore()
         if self._auto_fallback_compile is not None:
             self._auto_fallback_compile.restore()

@@ -5,7 +5,7 @@ from typing import cast
 
 import torch
 
-from .pinned_module import PinnedModuleLoadPlan, PinnedModuleTarget
+from .host_module import HostModuleLoadPlan, HostModuleTarget
 
 
 class CudaTargetLease:
@@ -23,10 +23,10 @@ class CudaTargetLease:
 
     def __init__(
         self,
-        target: PinnedModuleTarget,
+        target: HostModuleTarget,
         allocation_stream: torch.cuda.Stream,
     ) -> None:
-        self._target: PinnedModuleTarget | None = target
+        self._target: HostModuleTarget | None = target
         self._allocation_stream = allocation_stream
         self._ready_event: torch.cuda.Event | None = None
         self._staged = False
@@ -36,7 +36,7 @@ class CudaTargetLease:
     @classmethod
     def allocate(
         cls,
-        plan: PinnedModuleLoadPlan,
+        plan: HostModuleLoadPlan,
         device: torch.device,
         *,
         allocation_stream: torch.cuda.Stream | None = None,
@@ -53,7 +53,7 @@ class CudaTargetLease:
         return cls(target, allocation_stream)
 
     @property
-    def target(self) -> PinnedModuleTarget:
+    def target(self) -> HostModuleTarget:
         target = self._target
         if target is None:
             raise RuntimeError("CUDA target lease is closed")
@@ -61,7 +61,7 @@ class CudaTargetLease:
 
     def stage(
         self,
-        plan: PinnedModuleLoadPlan,
+        plan: HostModuleLoadPlan,
         stream: torch.cuda.Stream,
         *,
         non_blocking: bool = True,
@@ -94,7 +94,7 @@ class CudaTargetLease:
                     stream.record_event(),
                 )
 
-    def acquire(self, stream: torch.cuda.Stream) -> PinnedModuleTarget:
+    def acquire(self, stream: torch.cuda.Stream) -> HostModuleTarget:
         """Order ``stream`` after staging and mark it as the consumer."""
         if self._acquired:
             raise RuntimeError("CUDA target is already in use")

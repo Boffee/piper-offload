@@ -2,7 +2,7 @@
 
 Creating a tile-packed int4 weight runs TorchAO's CUDA-only int4-pack
 kernel, so the whole module requires CUDA. Re-wrapping the already-packed
-bytes (the pinned-CPU path the adapter exercises) works on CPU, but the
+bytes (the CPU path the adapter exercises) works on CPU, but the
 source tensor still has to be built on the GPU.
 """
 
@@ -18,7 +18,7 @@ from piper_offload import (
     merge_adapter,
 )
 from piper_offload.int4_tile_adapter import Int4TilePackedAdapter
-from piper_offload.pinned_param import PinnedParam
+from piper_offload.host_param import HostParam
 from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from tests.conftest import activated_model
@@ -84,24 +84,24 @@ class TestInt4TilePackedAdapter:
         assert not Int4TilePackedAdapter.matches(torch.zeros(16, 16, dtype=torch.bfloat16))
         assert isinstance(select_adapter(qt), Int4TilePackedAdapter)
 
-    def test_pin_preserves_storage_and_metadata(self) -> None:
+    def test_capture_preserves_storage_and_metadata(self) -> None:
         int4_cls = _int4_tile_cls()
         qt = _make_int4_tile()
-        pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
+        host_param = HostParam(nn.Parameter(qt, requires_grad=False))
 
-        pinned = pinned_param.make_cpu_param().data
-        assert isinstance(pinned, int4_cls)
-        assert pinned.qdata.is_pinned()
-        assert pinned.scale_and_zero.is_pinned()
-        assert pinned.qdata.data_ptr() == pinned_param.pinned_state.storage[0].data_ptr()
-        assert pinned.scale_and_zero.data_ptr() == pinned_param.pinned_state.storage[1].data_ptr()
+        host = host_param.make_cpu_param().data
+        assert isinstance(host, int4_cls)
+        assert not host.qdata.is_pinned()
+        assert not host.scale_and_zero.is_pinned()
+        assert host.qdata.data_ptr() == host_param.host_state.storage[0].data_ptr()
+        assert host.scale_and_zero.data_ptr() == host_param.host_state.storage[1].data_ptr()
         # Logical shape is preserved even though qdata is packed to a
         # different (4-D) shape.
-        assert tuple(pinned.shape) == tuple(qt.shape)
-        assert tuple(pinned.qdata.shape) == tuple(qt.qdata.shape)
-        assert pinned.block_size == qt.block_size
-        assert pinned.dtype == qt.dtype
-        assert pinned_param.compute_dtype is torch.bfloat16
+        assert tuple(host.shape) == tuple(qt.shape)
+        assert tuple(host.qdata.shape) == tuple(qt.qdata.shape)
+        assert host.block_size == qt.block_size
+        assert host.dtype == qt.dtype
+        assert host_param.compute_dtype is torch.bfloat16
 
     def test_tensor_id_tracks_buffers(self) -> None:
         qt = _make_int4_tile()
@@ -119,15 +119,15 @@ class TestInt4TilePackedAdapter:
         assert _param_target_layout(p1) == _param_target_layout(p2)
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
-        pinned_param = PinnedParam(
+        host_param = HostParam(
             nn.Parameter(_make_int4_tile(), requires_grad=True),
         )
-        state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
+        state = host_param.allocate_gpu_storage(torch.device("cpu"))
 
         with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            pinned_param.copy_to_cpu(state)
+            host_param.copy_to_cpu(state)
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            pinned_param.validate_parameter_data_swap_target()
+            host_param.validate_parameter_data_swap_target()
 
     def test_exact_parameter_value_accepts_format_without_dense_merge(self) -> None:
         value = ParameterValue.from_tensor(_make_int4_tile())
@@ -175,21 +175,21 @@ class TestInt4TilePackedAdapter:
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:
         int4_cls = _int4_tile_cls()
         qt = _make_int4_tile()
-        pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
+        host_param = HostParam(nn.Parameter(qt, requires_grad=False))
 
-        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
-        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
-        gpu_param = pinned_param.make_gpu_param(gpu_state)
+        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
+        host_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu_param = host_param.make_gpu_param(gpu_state)
         torch.cuda.synchronize()
-        pinned = pinned_param.make_cpu_param().data
+        host = host_param.make_cpu_param().data
 
         assert isinstance(gpu_param.data, int4_cls)
         assert gpu_param.data.qdata.is_cuda
         assert gpu_param.data.scale_and_zero.is_cuda
-        assert tuple(gpu_param.data.shape) == tuple(pinned.shape)
-        assert gpu_param.data.block_size == pinned.block_size
-        assert torch.equal(gpu_param.data.qdata.cpu(), pinned.qdata)
-        assert torch.equal(gpu_param.data.scale_and_zero.cpu(), pinned.scale_and_zero)
+        assert tuple(gpu_param.data.shape) == tuple(host.shape)
+        assert gpu_param.data.block_size == host.block_size
+        assert torch.equal(gpu_param.data.qdata.cpu(), host.qdata)
+        assert torch.equal(gpu_param.data.scale_and_zero.cpu(), host.scale_and_zero)
 
     def test_model_offloader_cuda_forward(self) -> None:
         layer = nn.Linear(256, 256, bias=False, dtype=torch.bfloat16)

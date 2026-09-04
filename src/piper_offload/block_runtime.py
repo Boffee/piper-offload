@@ -7,13 +7,13 @@ from typing import Protocol
 import torch
 
 from .block_compile import CompileBackend
-from .pinned_module import PinnedModuleInstance, PinnedModuleLoadPlan
+from .host_module import HostModuleInstance, HostModuleLoadPlan
 
 
 def validate_load_plans(
-    instances: Sequence[PinnedModuleInstance],
-    load_plans: Sequence[PinnedModuleLoadPlan],
-) -> tuple[PinnedModuleLoadPlan, ...]:
+    instances: Sequence[HostModuleInstance],
+    load_plans: Sequence[HostModuleLoadPlan],
+) -> tuple[HostModuleLoadPlan, ...]:
     """Return plans after validating one positional plan per instance."""
     plans = tuple(load_plans)
     if len(plans) != len(instances) or any(
@@ -46,7 +46,7 @@ class BlockRuntime(Protocol):
     def acquire(
         self,
         device: torch.device,
-        load_plans: Sequence[PinnedModuleLoadPlan],
+        load_plans: Sequence[HostModuleLoadPlan],
     ) -> None:
         """Allocate the CUDA working set and install execution hooks."""
         ...

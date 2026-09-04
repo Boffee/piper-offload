@@ -73,7 +73,7 @@ def cpu_mesh_for(mesh: Any) -> Any:  # noqa: ANN401
     mesh would re-allocate GPU memory; a CPU mesh keeps the local on the host.
     Constructing a ``DeviceMesh`` initializes a (gloo) process group, but torch
     deduplicates the underlying group across equivalent meshes — so the adapter
-    builds one per pinned param (held in its state) with no global cache."""
+    builds one per host param (held in its state) with no global cache."""
     from torch.distributed.device_mesh import DeviceMesh  # noqa: PLC0415
 
     return DeviceMesh("cpu", mesh.mesh.cpu())

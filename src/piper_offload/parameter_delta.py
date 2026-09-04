@@ -8,6 +8,7 @@ from typing import Any, Self
 import torch
 from torch import nn
 
+from .host_param import HostParam
 from .lora import (
     LoRAFactor,
     LoRATransform,
@@ -19,7 +20,6 @@ from .lora import (
     _validate_factor_shapes,
     _validate_materialized_weight_factors,
 )
-from .pinned_param import PinnedParam
 from .seeding import derive_seed
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
@@ -51,13 +51,11 @@ def _capture_dense_tensor(
     source: torch.Tensor,
     *,
     dtype: torch.dtype | None,
-    pin_memory: bool,
-) -> PinnedParam:
+) -> HostParam:
     _validate_dense_tensor(source)
     tensor = source if dtype is None or source.dtype is dtype else source.to(dtype=dtype)
-    return PinnedParam(
+    return HostParam(
         nn.Parameter(tensor, requires_grad=False),
-        pin_memory=pin_memory,
     )
 
 
@@ -74,7 +72,7 @@ class ParameterDelta:
     """
 
     lora: LoRAFactor | None = None
-    dense: PinnedParam | None = None
+    dense: HostParam | None = None
 
     def __post_init__(self) -> None:
         if self.lora is None and self.dense is None:
@@ -82,8 +80,8 @@ class ParameterDelta:
         if self.lora is not None and not isinstance(self.lora, LoRAFactor):
             raise ValueError(f"ParameterDelta lora must be a LoRAFactor; got {type(self.lora).__name__}.")
         if self.dense is not None:
-            if not isinstance(self.dense, PinnedParam):
-                raise ValueError(f"ParameterDelta dense must be a PinnedParam; got {type(self.dense).__name__}.")
+            if not isinstance(self.dense, HostParam):
+                raise ValueError(f"ParameterDelta dense must be a HostParam; got {type(self.dense).__name__}.")
             _validate_dense_tensor(param_representation(self.dense.make_cpu_param()))
 
     @classmethod
@@ -94,7 +92,6 @@ class ParameterDelta:
         b: torch.Tensor | None = None,
         dense: torch.Tensor | None = None,
         dtype: torch.dtype | None = None,
-        pin_memory: bool = True,
     ) -> Self:
         """Validate and capture an optional LoRA pair and dense contribution."""
         if (a is None) != (b is None):
@@ -106,7 +103,6 @@ class ParameterDelta:
                 a,
                 b,
                 dtype=dtype,
-                pin_memory=pin_memory,
             )
         )
         dense_backing = (
@@ -115,7 +111,6 @@ class ParameterDelta:
             else _capture_dense_tensor(
                 dense,
                 dtype=dtype,
-                pin_memory=pin_memory,
             )
         )
         return cls(lora=lora, dense=dense_backing)

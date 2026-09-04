@@ -1,7 +1,7 @@
 """Internal optional-import module for TorchAO INT8 support.
 
 Single source of truth for the TorchAO ``Int8Tensor`` layout this repo
-needs to move int8-quantized weights through :class:`PinnedParam` and to
+needs to move int8-quantized weights through :class:`HostParam` and to
 expose the dequantize/requantize adapter capability. TorchAO's public
 workflow creates ``Int8Tensor`` weights via
 ``quantize_(..., Int8WeightOnlyConfig(version=2) /
@@ -104,7 +104,7 @@ def validate_layout(t: torch.Tensor) -> None:
         return
     raise RuntimeError(
         f"Int8Tensor is missing expected attributes {missing!r}; "
-        f"this repo is pinned to a layout that exposes {LAYOUT_ATTRS}. "
+        f"this repo requires a layout that exposes {LAYOUT_ATTRS}. "
         "TorchAO likely refactored the wrapper class — upgrade "
         "piper-offload to match."
     )

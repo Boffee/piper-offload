@@ -7,10 +7,10 @@ import pytest
 import torch
 from torch import nn
 
-from piper_offload.pinned_module import (
-    PinnedModuleLoadPlan,
-    PinnedModuleStore,
-    PinnedModuleTarget,
+from piper_offload.host_module import (
+    HostModuleLoadPlan,
+    HostModuleStore,
+    HostModuleTarget,
 )
 from piper_offload.target_lease import CudaTargetLease
 
@@ -27,8 +27,8 @@ def test_stage_is_registry_pure_and_reuse_waits_for_consumer() -> None:
     value = torch.randn(4, 32)
     expected_first = first(value).cuda()
     expected_second = second(value).cuda()
-    first_instance = PinnedModuleStore.from_module(first).bind(first)
-    second_instance = PinnedModuleStore.from_module(second).bind(second)
+    first_instance = HostModuleStore.from_module(first).bind(first)
+    second_instance = HostModuleStore.from_module(second).bind(second)
     device = torch.device("cuda")
     copy_stream = torch.cuda.Stream(device=device)
     compute_stream = torch.cuda.Stream(device=device)
@@ -41,7 +41,7 @@ def test_stage_is_registry_pure_and_reuse_waits_for_consumer() -> None:
     with torch.cuda.stream(compute_stream):
         first_instance.install_target(lease.acquire(compute_stream))
         actual_first = first(value.cuda())
-    first_instance.install_pinned()
+    first_instance.install_host()
     lease.release()
 
     lease.stage(second_plan, copy_stream)
@@ -49,7 +49,7 @@ def test_stage_is_registry_pure_and_reuse_waits_for_consumer() -> None:
     with torch.cuda.stream(compute_stream):
         second_instance.install_target(lease.acquire(compute_stream))
         actual_second = second(value.cuda())
-    second_instance.install_pinned()
+    second_instance.install_host()
     lease.release()
     lease.close()
 
@@ -78,7 +78,7 @@ def test_close_synchronizes_target_work_before_drop() -> None:
     consumer_stream = Stream()
     ready = Event()
     lease = CudaTargetLease(
-        cast(PinnedModuleTarget, object()),
+        cast(HostModuleTarget, object()),
         cast(torch.cuda.Stream, allocation_stream),
     )
     lease._ready_event = cast(torch.cuda.Event, ready)
@@ -128,7 +128,7 @@ def test_restage_waits_for_every_actual_use_stream(
     ready = object()
     plan = Plan()
     lease = CudaTargetLease(
-        cast(PinnedModuleTarget, object()),
+        cast(HostModuleTarget, object()),
         cast(torch.cuda.Stream, allocation_stream),
     )
     lease._ready_event = cast(torch.cuda.Event, ready)
@@ -143,7 +143,7 @@ def test_restage_waits_for_every_actual_use_stream(
     )
 
     lease.stage(
-        cast(PinnedModuleLoadPlan, plan),
+        cast(HostModuleLoadPlan, plan),
         cast(torch.cuda.Stream, copy_stream),
     )
 

@@ -7,7 +7,7 @@ and metadata controlling the matmul dispatch (``elem_dtype``,
 ``block_size``, ``kernel_preference``, ``act_quant_kwargs``,
 ``is_swizzled_scales``). The shared
 :class:`~piper_offload.torchao_structured_adapter.TorchaoStructuredAdapter`
-base preserves that representation across pinned CPU and GPU storage;
+base preserves that representation across CPU and GPU storage;
 this module supplies the MX-specific hooks. One adapter covers both MXFP8
 and MXFP4 because TorchAO models them as the same ``MXTensor`` subclass
 parameterized by ``elem_dtype``.

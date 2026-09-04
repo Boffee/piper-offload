@@ -1,16 +1,16 @@
-"""Per-parameter pinned-CPU storage primitive.
+"""Per-parameter CPU storage primitive.
 
 Internal to the ``piper_offload`` subpackage. Shared by
-:class:`ModelOffloader` (whole-model bulk pin) and :class:`BlockComponent`
+:class:`ModelOffloader` (whole-model bulk capture) and :class:`BlockComponent`
 (per-block streaming). Both consumers reach this through the same
 abstraction so the addition of new tensor types only requires writing
 a new :class:`TensorAdapter`, not editing the consumers.
 
 Per-parameter mechanics live in the tensor adapter
 (:mod:`tensor_adapters` for plain tensors, :mod:`quanto_adapter` for
-quanto). :class:`PinnedParam` is a thin holder that pairs one
+quanto). :class:`HostParam` is a thin holder that pairs one
 :class:`nn.Parameter` with the adapter that handles its tensor type
-plus the pinned-host state that adapter produced. Optional operations
+plus the host state that adapter produced. Optional operations
 such as D2H round-trip, trainable ``.data`` swap, and in-place updates
 are exposed through adapter capability methods.
 """
@@ -22,7 +22,6 @@ from torch import nn
 
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
-    AdoptableTensorAdapter,
     BindLayoutTensorAdapter,
     CpuRoundTripTensorAdapter,
     LogicalShapeTensorAdapter,
@@ -33,13 +32,12 @@ from .tensor_adapters import (
 )
 
 
-class PinnedParam:
-    """Pinned host storage for one parameter, with GPU-load helpers.
+class HostParam:
+    """Host storage for one parameter, with GPU-load helpers.
 
     Construction picks an adapter via :func:`select_adapter` based on
-    the parameter's tensor type, then uses the adapter to clone-and-pin
-    the bytes or strictly adopt frozen CPU storage. Model-bound callers create
-    their own
+    the parameter's tensor type, then captures an owned pageable CPU copy.
+    Model-bound callers create their own
     deactivated-state :class:`nn.Parameter` wrappers with
     :meth:`make_cpu_param`.
 
@@ -48,30 +46,28 @@ class PinnedParam:
     :meth:`copy_to_gpu`, :meth:`copy_to_cpu`) all dispatch through the
     adapter. This primitive works with the opaque state returned by
     :meth:`allocate_gpu_storage`; model-bound callers should normally
-    use :class:`~piper_offload.pinned_module.PinnedModuleStore` and
-    :class:`~piper_offload.pinned_module.PinnedModuleInstance`, which wrap
+    use :class:`~piper_offload.host_module.HostModuleStore` and
+    :class:`~piper_offload.host_module.HostModuleInstance`, which wrap
     active storage in target objects.
 
-    The pinned parameter captures the source parameter's ``requires_grad`` at
+    The host parameter captures the source parameter's ``requires_grad`` at
     construction time and threads it through to the adapter when
     building CPU and GPU parameter wrappers. Model-bound callers can
     either replace frozen params with those wrappers or preserve
     trainable Parameter identity by ``.data``-swapping into the user's
     persistent Parameter — both are supported.
 
-    Low-peak pinned construction behavior: for plain ``torch.Tensor``
+    Low-peak host construction behavior: for plain ``torch.Tensor``
     parameters, construction immediately repoints the source
-    ``Parameter.data`` at the pinned clone. This releases the original source
-    storage before the owning store finishes constructing every pinned
+    ``Parameter.data`` at the host clone. This releases the original source
+    storage before the owning store finishes constructing every host
     parameter, avoiding a temporary 2x peak for large CPU-resident models and
-    promptly freeing GPU storage for CUDA-origin models. It also means pinned
+    promptly freeing GPU storage for CUDA-origin models. It also means host
     construction is not rollback-safe after copying has started: if a later
-    parameter fails to pin, recovery of the partially constructed store/model
+    parameter fails to capture, recovery of the partially constructed store/model
     is unsupported. Drop those references and rebuild from a fresh model
     instance. Tensor subclasses skip this optimization because ``.data =``
-    can drop wrapper state. Adopted construction instead aliases existing
-    frozen CPU storage, never copies or normalizes it, and leaves the source
-    parameter untouched until the owning store binds successfully.
+    can drop wrapper state.
 
     A frozen plain floating-point meta parameter retains its shape, dtype, and
     stride without host backing or cache charge. It remains meta unless a
@@ -86,11 +82,11 @@ class PinnedParam:
         "_shape",
         "_target_layout",
         "adapter",
-        "pinned_state",
+        "host_state",
         "requires_grad",
     )
 
-    def __init__(self, param: nn.Parameter, *, pin_memory: bool = True) -> None:
+    def __init__(self, param: nn.Parameter) -> None:
         # The adapter operates on the tensor that carries the parameter's
         # representation: ``param.data`` for plain Parameters (including ones
         # wrapping a quant subclass), but the param object itself for a
@@ -142,33 +138,17 @@ class PinnedParam:
         if is_meta:
             # A meta tensor is the complete resting representation: it records
             # shape, dtype, and stride without owning physical host bytes.
-            self.pinned_state = representation.detach()
-        elif pin_memory:
-            self.pinned_state = self.adapter.clone_pin(representation)
-        elif self.requires_grad:
-            raise ValueError(
-                "adopted host backing is inference-only and cannot retain "
-                "a parameter with requires_grad=True. Freeze the parameter "
-                "or use host_backing='pinned'."
-            )
-        elif isinstance(self.adapter, AdoptableTensorAdapter):
-            self.pinned_state = self.adapter.adopt_host(representation)
+            self.host_state = representation.detach()
         else:
-            raise NotImplementedError(
-                f"{adapter_name(self.adapter)} does not support zero-copy "
-                "host adoption; implement adopt_host() on the tensor adapter "
-                "or use host_backing='pinned'."
-            )
-        # Low-peak pinned construction optimization: release the original
+            self.host_state = self.adapter.capture_host(representation)
+        # Low-peak host construction optimization: release the original
         # source storage by repointing the source Parameter at the selected
-        # host backing immediately. Adopted backing deliberately skips this
-        # assignment so store capture remains non-mutating until bind commits
-        # replacement wrappers. The pinned assignment is an intentional
+        # host backing immediately. The assignment is an intentional
         # mutation of the caller's model before the owning store has finished
         # construction; see the class docstring for failure semantics.
         # Only safe for plain tensors; subclass wrappers (and Parameter
         # subclasses) can lose metadata or ignore .data assignment.
-        if pin_memory and not is_meta and type(representation) is torch.Tensor:
+        if not is_meta and type(representation) is torch.Tensor:
             param.data = self.make_cpu_param().data
 
     @staticmethod
@@ -202,8 +182,8 @@ class PinnedParam:
     def target_layout_for(cls, param: nn.Parameter) -> tuple[object, object]:
         """Opaque target-compatibility layout for ``param``.
 
-        Used by pre-pin validation paths that must fail before
-        :class:`PinnedParam` mutates the source parameter. Callers should
+        Used by pre-capture validation paths that must fail before
+        :class:`HostParam` mutates the source parameter. Callers should
         compare the returned value for equality only.
         """
         representation = param_representation(param)
@@ -218,7 +198,7 @@ class PinnedParam:
         bind validation: adapters opting into
         :class:`BindLayoutTensorAdapter` drop fields that binding
         overwrites (dtype for plain tensors), so config-built skeletons
-        bind against stores pinned from natively loaded weights.
+        bind against stores captured from natively loaded weights.
         """
         representation = param_representation(param)
         adapter = select_adapter(representation)
@@ -226,84 +206,84 @@ class PinnedParam:
 
     @property
     def target_layout(self) -> tuple[object, object]:
-        """Opaque target-compatibility layout for this pinned backing."""
+        """Opaque target-compatibility layout for this host backing."""
         return self._target_layout
 
     @property
     def bind_layout(self) -> tuple[object, object]:
-        """Opaque bind-compatibility layout for this pinned backing."""
+        """Opaque bind-compatibility layout for this host backing."""
         return self._bind_layout
 
     @property
     def shape(self) -> torch.Size:
-        """Shape of the source parameter representation at pin time."""
+        """Shape of the source parameter representation at capture time."""
         return self._shape
 
     @property
     def logical_shape(self) -> tuple[int, ...]:
-        """Dense logical shape represented by this pinned parameter."""
+        """Dense logical shape represented by this host parameter."""
         return self._logical_shape
 
     @property
     def is_meta(self) -> bool:
         """Whether the resting parameter representation is meta."""
-        return type(self.pinned_state) is torch.Tensor and self.pinned_state.is_meta
+        return type(self.host_state) is torch.Tensor and self.host_state.is_meta
 
     def make_cpu_param(self) -> nn.Parameter:
-        """Build a CPU :class:`nn.Parameter` wrapper over this pinned state.
+        """Build a CPU :class:`nn.Parameter` wrapper over this host state.
 
         Each model-bound binding owns its own wrapper object, while the
-        underlying pinned storage remains shared through this
-        :class:`PinnedParam`.
+        underlying host storage remains shared through this
+        :class:`HostParam`.
         """
         if self.is_meta:
             return nn.Parameter(
-                cast(torch.Tensor, self.pinned_state),
+                cast(torch.Tensor, self.host_state),
                 requires_grad=False,
             )
         return self.adapter.cpu_param(
-            self.pinned_state, requires_grad=self.requires_grad,
+            self.host_state, requires_grad=self.requires_grad,
         )
 
     def allocate_gpu_storage(self, device: torch.device) -> object:
-        """Allocate empty GPU storage mirroring this pinned parameter's layout.
+        """Allocate empty GPU storage mirroring this host parameter's layout.
         Returns an opaque adapter-specific handle; pass it back to
         :meth:`make_gpu_param`, :meth:`copy_to_gpu`, and
         :meth:`copy_to_cpu`."""
         if self.is_meta:
-            source = cast(torch.Tensor, self.pinned_state)
+            source = cast(torch.Tensor, self.host_state)
             return torch.empty_strided(
                 tuple(source.shape),
                 source.stride(),
                 dtype=source.dtype,
                 device=device,
             )
-        return self.adapter.alloc_gpu(self.pinned_state, device)
+        return self.adapter.alloc_gpu(self.host_state, device)
 
     def make_gpu_param(self, gpu_state: object) -> nn.Parameter:
-        """Build the GPU-side :class:`nn.Parameter` for this pinned parameter.
-        Adapter receives the paired pinned state so structured tensor
+        """Build the GPU-side :class:`nn.Parameter` for this host parameter.
+        Adapter receives the paired host state so structured tensor
         types (quanto) can reconstruct their wrappers. The wrapper's
-        ``requires_grad`` matches the source parameter's at pin time."""
+        ``requires_grad`` matches the source parameter's at capture time."""
         if self.is_meta:
             return nn.Parameter(cast(torch.Tensor, gpu_state), requires_grad=False)
         return self.adapter.gpu_param(
-            self.pinned_state, gpu_state, requires_grad=self.requires_grad,
+            self.host_state, gpu_state, requires_grad=self.requires_grad,
         )
 
     def copy_to_gpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
-        """Bulk DMA pinned host bytes into pre-allocated GPU storage."""
+        """Bulk DMA host bytes into pre-allocated GPU storage."""
         if self.is_meta:
             # The activation-scoped parameter-value hook populates this storage
             # directly. There are deliberately no zero bytes to transfer.
             return
-        self.adapter.copy_to_gpu(self.pinned_state, gpu_state, non_blocking=non_blocking)
+        self.adapter.copy_to_gpu(self.host_state, gpu_state, non_blocking=non_blocking)
 
     def copy_to_cpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
-        """Bulk D2H GPU bytes back into the pinned host state.
+        """Bulk D2H GPU bytes back into the host state.
 
         Optional symmetric counterpart to :meth:`copy_to_gpu`. The
-        pinned state is overwritten in place with the current GPU
+        host state is overwritten in place with the current GPU
         contents — useful for syncing the host clone after an in-place
         GPU update (e.g., an optimizer step). Adapters whose GPU
         representation is not round-trippable do not expose this
@@ -317,10 +297,10 @@ class PinnedParam:
             raise NotImplementedError(
                 f"{adapter_name(self.adapter)} does not support CPU round-trip: "
                 "its GPU representation cannot be copied back into the "
-                "pinned host state without adapter-specific conversion."
+                "host state without adapter-specific conversion."
             )
         self.adapter.copy_to_cpu(
-            gpu_state, self.pinned_state, non_blocking=non_blocking
+            gpu_state, self.host_state, non_blocking=non_blocking
         )
 
     def rearm_after_load(self, param: nn.Parameter, gpu_state: object) -> None:
@@ -362,7 +342,7 @@ class PinnedParam:
             return self.make_cpu_param()
         if device.type != "cuda":
             raise ValueError(
-                "PinnedParam materialization supports CPU and CUDA devices; "
+                "HostParam materialization supports CPU and CUDA devices; "
                 f"got {device}."
             )
 
@@ -385,21 +365,21 @@ class PinnedParam:
                 "parameter value."
             )
         representation = param_representation(self.make_cpu_param())
-        cloned_state = self.adapter.clone_pin(representation)
+        cloned_state = self.adapter.capture_host(representation)
         return self.adapter.cpu_param(cloned_state, requires_grad=False)
 
     @property
     def compute_dtype(self) -> torch.dtype:
-        """Logical compute dtype reported by this pinned parameter's adapter."""
+        """Logical compute dtype reported by this host parameter's adapter."""
         return self.adapter.compute_dtype(
             param_representation(self.make_cpu_param())
         )
 
     def validate_parameter_data_swap_target(self) -> None:
-        """Raise if this pinned parameter cannot use trainable streaming.
+        """Raise if this host parameter cannot use trainable streaming.
 
         CUDA trainable streaming requires both Parameter.data swap
-        compatibility and a D2H path back into pinned host state after
+        compatibility and a D2H path back into host state after
         optimizer updates.
         """
         if self.is_meta:
@@ -433,4 +413,4 @@ class PinnedParam:
         """Logical host bytes reported by this parameter's adapter."""
         if self.is_meta:
             return 0
-        return self.adapter.cache_bytes(self.pinned_state)
+        return self.adapter.cache_bytes(self.host_state)

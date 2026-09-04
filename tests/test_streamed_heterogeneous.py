@@ -47,7 +47,7 @@ class _Model(nn.Module):
 def _frozen_model(dim: int, dtypes: Sequence[torch.dtype]) -> _Model:
     # Heterogeneous-quant weights are frozen in practice; freezing also
     # routes them through the streamer (trainables are not streamed by
-    # default) rather than the resident PinnedComponent.
+    # default) rather than the resident HostComponent.
     torch.manual_seed(0)
     model = _Model(dim, dtypes)
     for param in model.parameters():
@@ -70,7 +70,7 @@ def _signatures(offloader: object) -> tuple[object, ...]:
 
 
 def test_heterogeneous_block_list_builds_and_partitions_signatures() -> None:
-    """Construction (CPU pinning) no longer rejects mixed-layout blocks, and
+    """Construction (CPU capture) no longer rejects mixed-layout blocks, and
     blocks partition into one pool signature per distinct layout."""
     dtypes = [
         torch.float32,

@@ -4,7 +4,7 @@ bitsandbytes 8-bit weights are ``Int8Params`` tensors (an ``nn.Parameter``
 subclass) carrying two pieces: ``CB`` (the row-major int8 weight, also
 ``weight.data``) and ``SCB`` (the per-output-row float32 scale). Like
 :class:`~piper_offload.bnb4bit_adapter.Bnb4bitAdapter` this is a
-decompose-on-pin / reconstruct-on-move, inference-only adapter: each
+decompose-on-capture / reconstruct-on-move, inference-only adapter: each
 activate builds a fresh ``Int8Params`` installed via registry replacement,
 so optimizers keyed on the pre-wrap Parameter are orphaned.
 
@@ -16,8 +16,8 @@ Two things differ from 4-bit, both because int8 keeps no self-describing
 - ``Int8Params`` carries ``CB``/``SCB`` only **before** the owning
   ``Linear8bitLt`` runs its first forward. The first forward migrates them
   onto the module's ``MatmulLtState`` and nulls them on the weight. A
-  tensor-scoped adapter cannot see the module, so it must pin a pre-forward
-  weight; the pin/read path (``require_int8_params``) raises on a post-forward
+  tensor-scoped adapter cannot see the module, so it must capture a pre-forward
+  weight; the capture/read path (``require_int8_params``) raises on a post-forward
   weight rather than silently capturing ``None``, while
   :meth:`Bnb8bitAdapter.matches` stays pure type recognition so an unquantized
   placeholder can still serve as a bind target.
@@ -28,13 +28,12 @@ the module state from the freshly-installed weight — the offloader never
 has to touch the owning module.
 
 Reaches into bitsandbytes' int8 layout through :mod:`._bnb`; if
-bitsandbytes refactors, the pin/read path fails with a clear validation error
+bitsandbytes refactors, the capture/read path fails with a clear validation error
 (``require_int8_params`` checks the layout before reading CB/SCB). Selected by
 :mod:`tensor_adapter_registry`. Importing fails silently if bitsandbytes is
 not installed — 8-bit support is optional.
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -50,8 +49,7 @@ from ._bnb import (
 )
 from ._dense_merge import merge_dense_requantize_
 from .tensor_adapters import (
-    adopt_cpu_storage,
-    clone_to_pinned_cpu,
+    clone_to_host_cpu,
     empty_like_strided,
     optional_tensor_id,
     tensor_layout,
@@ -144,12 +142,12 @@ def _can_use_triton_dense_merge(
 
 
 @dataclass(slots=True)
-class _Bnb8bitPinned:
-    """Pinned-CPU state for an 8-bit tensor: the int8 weight (``CB``) and
+class _Bnb8bitHost:
+    """CPU state for an 8-bit tensor: the int8 weight (``CB``) and
     the per-row float32 scale (``SCB``)."""
 
-    data: torch.Tensor  # pinned int8 CB (== weight.data)
-    scb: torch.Tensor   # pinned float32 per-row scale
+    data: torch.Tensor  # host int8 CB (== weight.data)
+    scb: torch.Tensor   # host float32 per-row scale
 
 
 @dataclass(slots=True)
@@ -163,8 +161,8 @@ class _Bnb8bitGpu:
 class Bnb8bitAdapter:
     """Adapter for ``bitsandbytes.nn.Int8Params`` (LLM.int8).
 
-    Decompose-on-pin (``CB`` + ``SCB``), reconstruct a fresh ``Int8Params``
-    on each activate. Inference-only. Must pin a pre-forward weight — int8
+    Decompose-on-capture (``CB`` + ``SCB``), reconstruct a fresh ``Int8Params``
+    on each activate. Inference-only. Must capture a pre-forward weight — int8
     quant state migrates onto the owning module after the first forward,
     out of a tensor-scoped adapter's reach.
     """
@@ -176,9 +174,9 @@ class Bnb8bitAdapter:
         # target*: binding replaces it wholesale with a store-reconstructed
         # Int8Params. The pre-forward / quantized validation that *reading*
         # CB/SCB needs lives in require_int8_params, so it still fires on every
-        # pin/read path (clone_pin, layout_signature, tensor_id, …) — rejecting
+        # capture/read path (capture_host, layout_signature, tensor_id, …) — rejecting
         # a post-forward or unquantized weight there — without rejecting a
-        # placeholder that is only ever bound, never pinned.
+        # placeholder that is only ever bound, never host.
         return is_int8_params(t)
 
     @staticmethod
@@ -216,35 +214,26 @@ class Bnb8bitAdapter:
         # sub-byte packing), so ``.shape`` is logical whether CB is present
         # (real, ``.shape == CB.shape``) or None (unquantized placeholder). The
         # only CB-None tensor that reaches bind is the skeleton placeholder; a
-        # post-forward real weight is rejected earlier on the pin/target path.
+        # post-forward real weight is rejected earlier on the capture/target path.
         return (tuple(t.shape),)
 
     @staticmethod
-    def clone_pin(t: torch.Tensor) -> _Bnb8bitPinned:
-        return Bnb8bitAdapter._host_state(t, clone_to_pinned_cpu)
-
-    @staticmethod
-    def adopt_host(t: torch.Tensor) -> _Bnb8bitPinned:
-        return Bnb8bitAdapter._host_state(t, adopt_cpu_storage)
-
-    @staticmethod
-    def _host_state(
+    def capture_host(
         t: torch.Tensor,
-        clone: Callable[..., torch.Tensor],
-    ) -> _Bnb8bitPinned:
+    ) -> _Bnb8bitHost:
         qt = require_int8_params(t)
-        return _Bnb8bitPinned(
-            data=clone(
+        return _Bnb8bitHost(
+            data=clone_to_host_cpu(
                 qt.CB, memory_format=torch.contiguous_format
             ),
-            scb=clone(
+            scb=clone_to_host_cpu(
                 qt.SCB, memory_format=torch.contiguous_format
             ),
         )
 
     @staticmethod
     def cpu_param(
-        state: _Bnb8bitPinned, *, requires_grad: bool = False
+        state: _Bnb8bitHost, *, requires_grad: bool = False
     ) -> nn.Parameter:
         # Int8Params is itself an nn.Parameter subclass.
         return build_int8_params(
@@ -252,7 +241,7 @@ class Bnb8bitAdapter:
         )
 
     @staticmethod
-    def alloc_gpu(state: _Bnb8bitPinned, device: torch.device) -> _Bnb8bitGpu:
+    def alloc_gpu(state: _Bnb8bitHost, device: torch.device) -> _Bnb8bitGpu:
         return _Bnb8bitGpu(
             data=empty_like_strided(state.data, device),
             scb=empty_like_strided(state.scb, device),
@@ -260,12 +249,12 @@ class Bnb8bitAdapter:
 
     @staticmethod
     def gpu_param(
-        pinned: _Bnb8bitPinned,
+        host: _Bnb8bitHost,
         gpu_state: _Bnb8bitGpu,
         *,
         requires_grad: bool = False,
     ) -> nn.Parameter:
-        _ = pinned
+        _ = host
         # int8 carries no host-resident metadata (unlike the 4-bit blob), so
         # the wrapper is built purely from the GPU buffers. Reconstruction
         # aliases them, so the later copy_to_gpu DMA is visible here, and the
@@ -276,7 +265,7 @@ class Bnb8bitAdapter:
 
     @staticmethod
     def copy_to_gpu(
-        src: _Bnb8bitPinned, dst: _Bnb8bitGpu, *, non_blocking: bool = False
+        src: _Bnb8bitHost, dst: _Bnb8bitGpu, *, non_blocking: bool = False
     ) -> None:
         dst.data.copy_(src.data, non_blocking=non_blocking)
         dst.scb.copy_(src.scb, non_blocking=non_blocking)
@@ -392,7 +381,7 @@ class Bnb8bitAdapter:
         target_qt.SCB.copy_(src_qt.SCB)
 
     @staticmethod
-    def cache_bytes(state: _Bnb8bitPinned) -> int:
+    def cache_bytes(state: _Bnb8bitHost) -> int:
         return (
             state.data.numel() * state.data.element_size()
             + state.scb.numel() * state.scb.element_size()

@@ -1,6 +1,6 @@
 """Shared test configuration.
 
-Piper Offload is a GPU offloading library — pinned host memory and device
+Piper Offload is a GPU offloading library — host memory and device
 transfers are CUDA features — so most of the suite genuinely needs a GPU.
 The CPU-runnable subset (registry/dispatch, specs, caching, dequant math,
 layout signatures) is what a CPU-only gate (and CI runner) can cover.
@@ -33,7 +33,7 @@ def _windows_cuda_current_device_unavailable() -> int:
 if sys.platform == "win32" and not torch.cuda.is_available():
     # CUDA PyTorch wheels can terminate the process with a native access
     # violation when current_device() enters CUDA internals on GPU-less
-    # Windows hosts. Pinned allocation is guarded in clone_to_pinned_cpu;
+    # Windows hosts. Host allocation is guarded in clone_to_host_cpu;
     # guard this remaining direct CUDA entry point for tests as well.
     torch.cuda.current_device = _windows_cuda_current_device_unavailable
 
@@ -71,7 +71,7 @@ def block_components(offloader: object) -> list:
     return list(offloader._composite.blocks)  # type: ignore[attr-defined]
 
 
-def pinned_component(offloader: object):
+def host_component(offloader: object):
     """A ModelOffloader's resident component, or None."""
     return offloader._composite.resident  # type: ignore[attr-defined]
 

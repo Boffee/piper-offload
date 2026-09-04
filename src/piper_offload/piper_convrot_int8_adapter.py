@@ -1,7 +1,7 @@
 """Piper ``ConvRotInt8Tensor`` offload adapter.
 
 ``piper-kernels`` owns ConvRot's tensor semantics and execution backends.
-Piper Offload owns the movement and merge integration: pin the public ``qdata``
+Piper Offload owns the movement and merge integration: capture the public ``qdata``
 and ``scale`` storage tensors, move those bytes, reconstruct the wrapper with
 its ``group_size`` and logical ``dtype`` metadata, and delegate staged LoRA
 and dense updates to the public in-place ``ConvRotInt8Tensor.addmm_`` and

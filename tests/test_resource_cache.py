@@ -551,29 +551,6 @@ class TestObservabilityAndRelease:
         with pytest.raises(ResourceNotRegisteredError):
             ResourceCache(100).info("missing")
 
-    def test_host_cache_callback_runs_after_positive_size_eviction(self) -> None:
-        calls = 0
-
-        def callback() -> None:
-            nonlocal calls
-            calls += 1
-
-        cache = ResourceCache(100, empty_host_cache=callback)
-        with cache.lease(_spec("a", 50)):
-            pass
-        assert calls == 0
-        cache.evict("a")
-        assert calls == 1
-
-    def test_host_cache_callback_failure_is_ignored(self) -> None:
-        def callback() -> None:
-            raise RuntimeError("flush failed")
-
-        cache = ResourceCache(100, empty_host_cache=callback)
-        with cache.lease(_spec("a", 50)):
-            pass
-        cache.evict("a")
-
 
 class FakeTokenizer:
     def __init__(self) -> None:

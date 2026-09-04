@@ -8,9 +8,7 @@ Most lifecycle tests run on CPU (the merge math is device-agnostic);
 CUDA-only tests gate on availability.
 """
 
-from array import array
 from collections.abc import Sequence
-from pathlib import Path
 from weakref import WeakKeyDictionary
 
 import pytest
@@ -39,7 +37,7 @@ from piper_offload import (
     ParameterValueTransform,
     ResourceNotRegisteredError,
     ResourceTooLargeError,
-    PinnedComponent,
+    HostComponent,
     AdapterSpec,
     ScaledLoRAFactor,
     ScaledParameterValue,
@@ -48,8 +46,8 @@ from piper_offload import (
     merge_adapter,
 )
 from piper_offload.int4_tile_adapter import Int4TilePackedAdapter
-from piper_offload.pinned_module import ParameterOverride, PinnedModuleInstance
-from piper_offload.pinned_param import PinnedParam
+from piper_offload.host_module import ParameterOverride, HostModuleInstance
+from piper_offload.host_param import HostParam
 from piper_offload.quanto_adapter import QuantoAdapter
 from piper_offload.protocols import (
     ResourceBinding,
@@ -86,7 +84,7 @@ def _require_factor(target: AdapterTarget) -> LoRAFactor:
 def _factor_tensors(
     target: AdapterTarget,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Materialize a pinned :class:`LoRAFactor`'s ``(a, b)`` as CPU tensors."""
+    """Materialize a host :class:`LoRAFactor`'s ``(a, b)`` as CPU tensors."""
     factor = _require_factor(target)
     return factor.a.make_cpu_param().data, factor.b.make_cpu_param().data
 
@@ -363,7 +361,7 @@ def _has_parameter_update(strategy: ModelOffloader, target_key: str) -> bool:
             for name, override in overrides.items()
             if name in component.param_names
         }
-        if isinstance(component, PinnedComponent):
+        if isinstance(component, HostComponent):
             load = component._instance.resolve_load_plan(
                 local_overrides
             ).loads.get(target_key)
@@ -393,7 +391,7 @@ def _activate_loras_for_test(
                     for name, override in overrides.items()
                     if name in component.param_names
                 }
-                if isinstance(component, PinnedComponent):
+                if isinstance(component, HostComponent):
                     component._instance.resolve_load_plan(local_overrides)
                 elif isinstance(component, BlockComponent):
                     component._resolve_load_plans(local_overrides)
@@ -492,108 +490,29 @@ class TestLoRAConstruction:
         with pytest.raises(ValueError, match="shape mismatch"):
             Adapter.from_state_dict(state_dict=sd)
 
-    def test_factors_are_pinned(self) -> None:
+    def test_factors_are_host(self) -> None:
         lora = _make_lora(4, 16)
         for factor in lora.targets.values():
             a, b = _factor_tensors(factor)
-            assert a.is_pinned()
-            assert b.is_pinned()
+            assert not a.is_pinned()
+            assert not b.is_pinned()
 
-    def test_adopted_factors_retain_source_storage(self) -> None:
-        sd = _make_lora_sd(num_blocks=1, dim=16, rank=4)
-        a_source = sd["transformer_blocks.0.attn.lora_A.weight"]
-        b_source = sd["transformer_blocks.0.attn.lora_B.weight"]
-
-        lora = Adapter.from_state_dict(
-            state_dict=sd,
-            dtype=torch.float32,
-            host_backing="adopt",
-        )
-        a, b = _factor_tensors(lora.targets["transformer_blocks.0.attn.weight"])
-
-        assert not a.is_pinned()
-        assert not b.is_pinned()
-        assert a.data_ptr() == a_source.data_ptr()
-        assert b.data_ptr() == b_source.data_ptr()
-
-    def test_adopted_factors_preserve_mmap_storage(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        rank, dim = 2, 4
-        factor_elements = rank * dim
-        mapped_elements = factor_elements * 2 + 7
-        path = tmp_path / "lora.bin"
-        path.write_bytes(array("f", map(float, range(mapped_elements))).tobytes())
-        mapped = torch.from_file(
-            str(path),
-            shared=False,
-            size=mapped_elements,
-            dtype=torch.float32,
-        )
-        a_source = mapped[:factor_elements].view(rank, dim)
-        b_source = mapped[factor_elements : factor_elements * 2].view(dim, rank)
-
-        lora = Adapter.from_state_dict(
-            state_dict={
-                "target.lora_A.weight": a_source,
-                "target.lora_B.weight": b_source,
-            },
-            host_backing="adopt",
-        )
-        a, b = _factor_tensors(lora.targets["target.weight"])
-
-        assert a.data_ptr() == a_source.data_ptr()
-        assert b.data_ptr() == b_source.data_ptr()
-        assert lora.cache_bytes == a_source.nbytes + b_source.nbytes
-
-    def test_adoption_rejects_dtype_conversion(self) -> None:
-        sd = _make_lora_sd(num_blocks=1, dim=16, rank=4)
-
-        with pytest.raises(ValueError, match="cannot convert adapter tensor dtype"):
-            Adapter.from_state_dict(
-                state_dict=sd,
-                dtype=torch.bfloat16,
-                host_backing="adopt",
-            )
-
-    def test_rejects_invalid_host_backing(self) -> None:
-        sd = _make_lora_sd(num_blocks=1, dim=16, rank=4)
-
-        with pytest.raises(ValueError, match="host_backing"):
-            Adapter.from_state_dict(
-                state_dict=sd,
-                host_backing="invalid",
-            )
-
-    def test_adoption_rejects_non_contiguous_factor(self) -> None:
-        sd = {
-            "target.lora_A.weight": torch.randn(16, 4).t(),
-            "target.lora_B.weight": torch.randn(16, 4),
-        }
-
-        with pytest.raises(ValueError, match="non-contiguous"):
-            Adapter.from_state_dict(
-                state_dict=sd,
-                host_backing="adopt",
-            )
-
-    def test_factor_pinned_params_build_instance_without_repin(self) -> None:
-        """Pinned factors can be consumed without cloning or re-pinning."""
+    def test_factor_host_params_build_instance_without_repin(self) -> None:
+        """Host factors can be consumed without cloning or recapturing."""
         lora = _make_lora(1, 16, rank=4)
         factor = _require_factor(lora.targets["transformer_blocks.0.attn.weight"])
-        assert isinstance(factor.a, PinnedParam)
-        assert isinstance(factor.b, PinnedParam)
+        assert isinstance(factor.a, HostParam)
+        assert isinstance(factor.b, HostParam)
 
         holder = nn.Module()
         holder.register_parameter("a", factor.a.make_cpu_param())
         holder.register_parameter("b", factor.b.make_cpu_param())
-        instance = PinnedModuleInstance(
+        instance = HostModuleInstance(
             module=holder,
             params={"a": factor.a, "b": factor.b},
             buffers={},
         )
-        # Consumers retain the exact pinned objects.
+        # Consumers retain the exact host objects.
         assert instance.params["a"] is factor.a
         assert instance.params["b"] is factor.b
 
@@ -634,7 +553,7 @@ class TestLoRAConstruction:
         self,
         target_key: object,
     ) -> None:
-        value = ParameterValue.from_tensor(torch.randn(2, 2), pin_memory=False)
+        value = ParameterValue.from_tensor(torch.randn(2, 2))
 
         with pytest.raises(ValueError, match="non-empty strings"):
             Adapter({target_key: value})  # type: ignore[dict-item]
@@ -654,7 +573,6 @@ class TestLoRAConstruction:
                 "target.lora_B.weight": b,
                 "target.delta.weight": dense,
             },
-            host_backing="adopt",
         )
 
         assert tuple(adapter.targets) == ("target.weight",)
@@ -662,9 +580,10 @@ class TestLoRAConstruction:
         assert isinstance(delta, ParameterDelta)
         assert delta.lora is not None
         assert delta.dense is not None
-        assert delta.lora.a.make_cpu_param().data.data_ptr() == a.data_ptr()
-        assert delta.lora.b.make_cpu_param().data.data_ptr() == b.data_ptr()
-        assert delta.dense.make_cpu_param().data.data_ptr() == dense.data_ptr()
+        for backing, source in ((delta.lora.a, a), (delta.lora.b, b), (delta.dense, dense)):
+            captured = backing.make_cpu_param()
+            assert captured.data_ptr() != source.data_ptr()
+            torch.testing.assert_close(captured, source)
         assert delta.cache_bytes == a.nbytes + b.nbytes + dense.nbytes
 
     def test_parameter_delta_uses_final_component_as_exact_parameter_leaf(self) -> None:
@@ -777,7 +696,6 @@ class TestLoRAConstruction:
 
         direct = ParameterValue.from_tensor(
             source,
-            pin_memory=False,
             scale_with_strength=True,
         )
         assert direct.scale_with_strength
@@ -808,32 +726,6 @@ class TestLoRAConstruction:
     ) -> None:
         with pytest.raises(ValueError, match=message):
             Adapter.from_state_dict({"target.weight": diff})
-
-    def test_parameter_values_obey_dtype_and_adoption_policy(self) -> None:
-        source = torch.randn(3, 4)
-        adopted = Adapter.from_state_dict(
-            {"target.weight": source},
-            host_backing="adopt",
-        )
-        adopted_value = adopted.targets["target.weight"]
-        assert isinstance(adopted_value, ParameterValue)
-        adopted_tensor = adopted_value.backing.make_cpu_param().data
-        assert adopted_tensor.data_ptr() == source.data_ptr()
-
-        cast = Adapter.from_state_dict(
-            {"target.weight": source},
-            dtype=torch.bfloat16,
-        )
-        cast_value = cast.targets["target.weight"]
-        assert isinstance(cast_value, ParameterValue)
-        assert cast_value.backing.compute_dtype is torch.bfloat16
-
-        with pytest.raises(ValueError, match="cannot convert adapter tensor dtype"):
-            Adapter.from_state_dict(
-                {"target.weight": source},
-                dtype=torch.bfloat16,
-                host_backing="adopt",
-            )
 
     def test_parameter_value_payload_finiteness_is_caller_owned(self) -> None:
         nan_value = Adapter.from_state_dict(
@@ -876,13 +768,11 @@ class TestParameterDelta:
         delta = ParameterDelta.from_tensors(
             a=torch.randn(1, 3),
             b=torch.randn(2, 1),
-            pin_memory=False,
         )
-        value = ParameterValue.from_tensor(torch.randn(2, 3), pin_memory=False)
+        value = ParameterValue.from_tensor(torch.randn(2, 3))
         factor = LoRAFactor.from_tensors(
             torch.randn(1, 3),
             torch.randn(2, 1),
-            pin_memory=False,
         )
 
         for representation in (delta, value, factor):
@@ -971,7 +861,6 @@ class TestParameterDelta:
                     a=torch.ones(1, 1, dtype=dtype),
                     b=torch.ones(1, 1, dtype=dtype),
                     dense=-torch.ones(1, 1, dtype=dtype),
-                    pin_memory=False,
                 )
             }
         )
@@ -1059,7 +948,6 @@ class TestParameterDelta:
             {
                 "weight": ParameterDelta.from_tensors(
                     dense=dense,
-                    pin_memory=False,
                 )
             }
         )
@@ -1316,7 +1204,6 @@ class TestParameterDelta:
         target = nn.Parameter(torch.zeros(2, 3), requires_grad=False)
         delta = ParameterDelta.from_tensors(
             dense=torch.ones_like(target),
-            pin_memory=False,
         )
         transform = ParameterDeltaTransform([delta.scaled(0.5)])
 
@@ -1689,14 +1576,14 @@ class TestLifecycle:
             s.deactivate()
 
     @CUDA
-    def test_deactivate_returns_to_pinned(self) -> None:
+    def test_deactivate_returns_to_host(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         _request_loras(s, [(_make_lora(4, 16), 1.0)])
         _activate(s, "cuda")
         s.deactivate()
-        assert m.embed.weight.is_pinned()
-        assert m.head.weight.is_pinned()
+        assert not m.embed.weight.is_pinned()
+        assert not m.head.weight.is_pinned()
 
     @CUDA
     def test_reactivation_with_different_loras(self) -> None:
@@ -1708,7 +1595,7 @@ class TestLifecycle:
         _request_loras(s, [(_make_lora(4, 16, seed=2), 1.0)])
         _activate(s, "cuda")
         s.deactivate()
-        assert m.embed.weight.is_pinned()
+        assert not m.embed.weight.is_pinned()
 
     @CUDA
     def test_base_only_reactivation_does_not_reuse_previous_merge_hooks(self) -> None:
@@ -1908,40 +1795,6 @@ class TestMergeCorrectness:
                 torch.testing.assert_close(actual, expected + delta)
         finally:
             strategy.deactivate()
-
-    @CUDA
-    @pytest.mark.parametrize("mode", ["merge", "routed"])
-    def test_adopted_lora_matches_pinned_lora(
-        self,
-        mode: AdapterMode,
-    ) -> None:
-        torch.manual_seed(42)
-        pinned_model = _make_bf16_model(num_blocks=2, dim=16)
-        pageable_model = _make_bf16_model(num_blocks=2, dim=16)
-        pageable_model.load_state_dict(pinned_model.state_dict())
-        sd = _make_lora_sd(num_blocks=2, dim=16, rank=4, seed=7)
-        pinned_lora = Adapter.from_state_dict(state_dict=sd)
-        pageable_lora = Adapter.from_state_dict(
-            state_dict=sd,
-            host_backing="adopt",
-        )
-        x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
-
-        def run(model: nn.Module, lora: Adapter) -> torch.Tensor:
-            strategy = _make_strategy(model)
-            _request_loras(strategy, [(lora, 0.75)], mode=mode)
-            _activate(strategy, "cuda")
-            try:
-                output = model(x)
-                torch.cuda.synchronize()
-                return output.detach().cpu()
-            finally:
-                strategy.deactivate()
-
-        torch.testing.assert_close(
-            run(pageable_model, pageable_lora),
-            run(pinned_model, pinned_lora),
-        )
 
     @CUDA
     def test_merged_weights_match_manual_baseline(self) -> None:
@@ -3698,7 +3551,7 @@ class TestPermanentMerge:
 
     def test_parameter_value_rejects_physical_target_with_wrong_layout(self) -> None:
         source = torch.arange(6, dtype=torch.float32).view(2, 3)
-        value = ParameterValue.from_tensor(source, pin_memory=False)
+        value = ParameterValue.from_tensor(source)
         transform = ParameterValueTransform(value.scaled(1.0))
         meta_target = nn.Parameter(
             torch.empty_strided((2, 3), (1, 2), device="meta"),
@@ -3719,7 +3572,7 @@ class TestPermanentMerge:
 
     def test_parameter_value_accepts_float8_source(self) -> None:
         source = torch.tensor([1.0], dtype=torch.float8_e4m3fn)
-        value = ParameterValue.from_tensor(source, pin_memory=False)
+        value = ParameterValue.from_tensor(source)
         transform = ParameterValueTransform(value.scaled(0.5))
         transform.validate_parameter(
             nn.Parameter(torch.empty(1, device="meta"), requires_grad=False)
@@ -4844,7 +4697,7 @@ class TestRoutedMode:
 
 
 class TestRoutedStaging:
-    """Routed LoRA stages pinned factors in target PRE hooks."""
+    """Routed LoRA stages host factors in target PRE hooks."""
 
     def test_multi_lora_stacked_hooks_compose_additively(self) -> None:
         # One block (so the two adapters don't feed each other across blocks)
@@ -5163,7 +5016,6 @@ class TestLoRAResource:
             key="adapter:value",
             estimated_cache_bytes=value.nbytes,
             factory=lambda: {"target.weight": value},
-            host_backing="adopt",
         )
 
         lora = spec.build_store()
@@ -5173,24 +5025,6 @@ class TestLoRAResource:
         assert isinstance(target, ParameterValue)
         assert not target.scale_with_strength
         assert lora.cache_bytes == value.nbytes
-
-    def test_lora_spec_propagates_adopted_host_backing(self) -> None:
-        sd = _make_lora_sd(num_blocks=1, dim=8, rank=2)
-        spec = AdapterSpec(
-            key="lora:adopted",
-            estimated_cache_bytes=1000,
-            factory=lambda: sd,
-            host_backing="adopt",
-        )
-
-        lora = spec.build_store()
-        factor = lora.targets["transformer_blocks.0.attn.weight"]
-        a, b = _factor_tensors(factor)
-
-        assert not a.is_pinned()
-        assert not b.is_pinned()
-        assert a.data_ptr() == sd["transformer_blocks.0.attn.lora_A.weight"].data_ptr()
-        assert b.data_ptr() == sd["transformer_blocks.0.attn.lora_B.weight"].data_ptr()
 
     def test_lora_spec_propagates_partial_target_policy(self) -> None:
         spec = AdapterSpec(

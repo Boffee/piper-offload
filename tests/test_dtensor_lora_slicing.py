@@ -73,7 +73,6 @@ def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
                         a=a,
                         b=b,
                         dense=dense,
-                        pin_memory=False,
                     ).scaled(strength)
                 ]
             )

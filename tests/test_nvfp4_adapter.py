@@ -15,7 +15,7 @@ from piper_offload import (
     merge_adapter,
 )
 from piper_offload.nvfp4_adapter import Nvfp4Adapter
-from piper_offload.pinned_param import PinnedParam
+from piper_offload.host_param import HostParam
 from piper_offload.tensor_adapter_registry import tensor_id
 from piper_offload.block_component import _param_target_layout
 from tests.conftest import activated_model
@@ -176,37 +176,37 @@ class TestNvfp4Adapter:
         assert Nvfp4Adapter.matches(qt)
         assert not Nvfp4Adapter.matches(torch.zeros(16, 16, dtype=torch.bfloat16))
 
-    def test_pin_preserves_storage_and_metadata(self) -> None:
+    def test_capture_preserves_storage_and_metadata(self) -> None:
         nvfp4_tensor_cls, _ = _nvfp4_modules()
         qt = _make_nvfp4(swizzled=True)
         p = nn.Parameter(qt, requires_grad=False)
-        pinned_param = PinnedParam(p)
+        host_param = HostParam(p)
 
-        pinned = pinned_param.make_cpu_param().data
-        assert isinstance(pinned, nvfp4_tensor_cls)
-        assert pinned.qdata.is_pinned()
-        assert pinned.scale.is_pinned()
-        assert pinned.per_tensor_scale is not None
-        assert pinned.per_tensor_scale.is_pinned()
-        assert pinned.qdata.data_ptr() == pinned_param.pinned_state.storage[0].data_ptr()
-        assert pinned.scale.data_ptr() == pinned_param.pinned_state.storage[1].data_ptr()
-        assert pinned.per_tensor_scale.data_ptr() == pinned_param.pinned_state.storage[2].data_ptr()
-        assert pinned.block_size == qt.block_size
-        assert pinned.orig_dtype == qt.orig_dtype
-        assert pinned.is_swizzled_scales == qt.is_swizzled_scales
-        assert pinned.use_triton_kernel == qt.use_triton_kernel
-        assert pinned.act_quant_kwargs == qt.act_quant_kwargs
-        assert pinned_param.compute_dtype is torch.bfloat16
+        host = host_param.make_cpu_param().data
+        assert isinstance(host, nvfp4_tensor_cls)
+        assert not host.qdata.is_pinned()
+        assert not host.scale.is_pinned()
+        assert host.per_tensor_scale is not None
+        assert not host.per_tensor_scale.is_pinned()
+        assert host.qdata.data_ptr() == host_param.host_state.storage[0].data_ptr()
+        assert host.scale.data_ptr() == host_param.host_state.storage[1].data_ptr()
+        assert host.per_tensor_scale.data_ptr() == host_param.host_state.storage[2].data_ptr()
+        assert host.block_size == qt.block_size
+        assert host.orig_dtype == qt.orig_dtype
+        assert host.is_swizzled_scales == qt.is_swizzled_scales
+        assert host.use_triton_kernel == qt.use_triton_kernel
+        assert host.act_quant_kwargs == qt.act_quant_kwargs
+        assert host_param.compute_dtype is torch.bfloat16
 
     def test_transposed_qdata_stride_is_preserved(self) -> None:
         qt = _make_nvfp4(rows=16, cols=32).t()
-        pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
-        pinned = pinned_param.make_cpu_param().data
+        host_param = HostParam(nn.Parameter(qt, requires_grad=False))
+        host = host_param.make_cpu_param().data
 
-        assert pinned.shape == qt.shape
-        assert pinned.qdata.stride() == qt.qdata.stride()
-        assert pinned.scale.stride() == qt.scale.stride()
-        assert pinned.dequantize().shape == qt.dequantize().shape
+        assert host.shape == qt.shape
+        assert host.qdata.stride() == qt.qdata.stride()
+        assert host.scale.stride() == qt.scale.stride()
+        assert host.dequantize().shape == qt.dequantize().shape
 
     def test_tensor_id_tracks_optional_scale_tensor(self) -> None:
         qt = _make_nvfp4()
@@ -230,18 +230,18 @@ class TestNvfp4Adapter:
     def test_reconstruction_and_requantization_preserve_concrete_wrapper_type(self) -> None:
         source = _piper_nvfp4(_make_nvfp4(swizzled=True))
         source_type = type(source)
-        pinned_param = PinnedParam(nn.Parameter(source, requires_grad=False))
+        host_param = HostParam(nn.Parameter(source, requires_grad=False))
 
-        pinned = pinned_param.make_cpu_param().data
-        device_state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
-        pinned_param.copy_to_gpu(device_state)
-        reconstructed = pinned_param.make_gpu_param(device_state).data
+        host = host_param.make_cpu_param().data
+        device_state = host_param.allocate_gpu_storage(torch.device("cpu"))
+        host_param.copy_to_gpu(device_state)
+        reconstructed = host_param.make_gpu_param(device_state).data
         requantized = Nvfp4Adapter.requantize(
             Nvfp4Adapter.dequantize(reconstructed),
             like=reconstructed,
         )
 
-        assert type(pinned) is source_type
+        assert type(host) is source_type
         assert type(reconstructed) is source_type
         assert type(requantized) is source_type
 
@@ -258,15 +258,15 @@ class TestNvfp4Adapter:
         assert _param_target_layout(with_activation) != _param_target_layout(weight_only)
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
-        pinned_param = PinnedParam(
+        host_param = HostParam(
             nn.Parameter(_make_nvfp4(), requires_grad=True),
         )
-        state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
+        state = host_param.allocate_gpu_storage(torch.device("cpu"))
 
         with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            pinned_param.copy_to_cpu(state)
+            host_param.copy_to_cpu(state)
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            pinned_param.validate_parameter_data_swap_target()
+            host_param.validate_parameter_data_swap_target()
 
     @pytest.mark.parametrize("swizzled", [False, True])
     def test_dequantize_requantize_preserves_representation(self, swizzled: bool) -> None:
@@ -719,29 +719,29 @@ class TestNvfp4Adapter:
     @CUDA
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:
         nvfp4_tensor_cls, _ = _nvfp4_modules()
-        pinned_param = PinnedParam(
+        host_param = HostParam(
             nn.Parameter(_make_nvfp4(swizzled=True), requires_grad=False),
         )
 
-        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
-        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
-        gpu_param = pinned_param.make_gpu_param(gpu_state)
+        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
+        host_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu_param = host_param.make_gpu_param(gpu_state)
         torch.cuda.synchronize()
-        pinned = pinned_param.make_cpu_param().data
+        host = host_param.make_cpu_param().data
 
         assert isinstance(gpu_param.data, nvfp4_tensor_cls)
         assert gpu_param.data.qdata.is_cuda
         assert gpu_param.data.scale.is_cuda
         assert gpu_param.data.per_tensor_scale is not None
         assert gpu_param.data.per_tensor_scale.is_cuda
-        assert gpu_param.data.block_size == pinned.block_size
-        assert gpu_param.data.orig_dtype == pinned.orig_dtype
-        assert gpu_param.data.is_swizzled_scales == pinned.is_swizzled_scales
-        assert torch.equal(gpu_param.data.qdata.cpu(), pinned.qdata)
-        assert torch.equal(gpu_param.data.scale.cpu(), pinned.scale)
+        assert gpu_param.data.block_size == host.block_size
+        assert gpu_param.data.orig_dtype == host.orig_dtype
+        assert gpu_param.data.is_swizzled_scales == host.is_swizzled_scales
+        assert torch.equal(gpu_param.data.qdata.cpu(), host.qdata)
+        assert torch.equal(gpu_param.data.scale.cpu(), host.scale)
         assert torch.equal(
             gpu_param.data.per_tensor_scale.cpu(),
-            pinned.per_tensor_scale,
+            host.per_tensor_scale,
         )
 
     @CUDA

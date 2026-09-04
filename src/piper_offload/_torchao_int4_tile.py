@@ -2,7 +2,7 @@
 
 Single source of truth for the TorchAO ``Int4TilePackedTo4dTensor``
 layout this repo needs to move int4 weight-only weights through
-:class:`PinnedParam`. TorchAO's public workflow creates these weights via
+:class:`HostParam`. TorchAO's public workflow creates these weights via
 ``quantize_(..., Int4WeightOnlyConfig(int4_packing_format=
 Int4PackingFormat.TILE_PACKED_TO_4D))``; the adapter only preserves and
 moves those already-quantized tensors.
@@ -88,7 +88,7 @@ def validate_layout(t: torch.Tensor) -> None:
         return
     raise RuntimeError(
         f"Int4TilePackedTo4dTensor is missing expected attributes "
-        f"{missing!r}; this repo is pinned to a layout that exposes "
+        f"{missing!r}; this repo requires a layout that exposes "
         f"{LAYOUT_ATTRS}. TorchAO likely refactored the wrapper class — "
         "upgrade piper-offload to match."
     )

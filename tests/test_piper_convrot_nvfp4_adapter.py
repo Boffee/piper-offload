@@ -15,7 +15,7 @@ from piper_offload import (
 )
 from piper_offload.block_component import _param_target_layout
 from piper_offload.nvfp4_adapter import Nvfp4Adapter
-from piper_offload.pinned_param import PinnedParam
+from piper_offload.host_param import HostParam
 from piper_offload.piper_convrot_nvfp4_adapter import (
     PiperConvRotNVFP4Adapter,
 )
@@ -97,24 +97,24 @@ class TestPiperConvRotNVFP4Adapter:
         assert Nvfp4Adapter.matches(convrot)
         assert isinstance(select_adapter(convrot), PiperConvRotNVFP4Adapter)
 
-    def test_pin_preserves_storage_and_all_metadata(self) -> None:
+    def test_capture_preserves_storage_and_all_metadata(self) -> None:
         convrot, _dense = _make_convrot_nvfp4(group_size=64)
-        pinned_param = PinnedParam(nn.Parameter(convrot, requires_grad=False))
-        pinned = pinned_param.make_cpu_param().data
+        host_param = HostParam(nn.Parameter(convrot, requires_grad=False))
+        host = host_param.make_cpu_param().data
 
-        assert type(pinned) is type(convrot)
-        assert pinned.qdata.is_pinned()
-        assert pinned.scale.is_pinned()
-        assert pinned.per_tensor_scale is not None
-        assert pinned.per_tensor_scale.is_pinned()
-        assert pinned.group_size == 64
-        assert pinned.block_size == convrot.block_size
-        assert pinned.orig_dtype is convrot.orig_dtype
-        assert pinned.is_swizzled_scales is convrot.is_swizzled_scales
-        assert pinned.use_triton_kernel is convrot.use_triton_kernel
-        assert pinned.act_quant_kwargs == convrot.act_quant_kwargs
-        assert pinned_param.compute_dtype is convrot.orig_dtype
-        assert pinned_param.cache_bytes == sum(
+        assert type(host) is type(convrot)
+        assert not host.qdata.is_pinned()
+        assert not host.scale.is_pinned()
+        assert host.per_tensor_scale is not None
+        assert not host.per_tensor_scale.is_pinned()
+        assert host.group_size == 64
+        assert host.block_size == convrot.block_size
+        assert host.orig_dtype is convrot.orig_dtype
+        assert host.is_swizzled_scales is convrot.is_swizzled_scales
+        assert host.use_triton_kernel is convrot.use_triton_kernel
+        assert host.act_quant_kwargs == convrot.act_quant_kwargs
+        assert host_param.compute_dtype is convrot.orig_dtype
+        assert host_param.cache_bytes == sum(
             storage.nbytes
             for storage in (
                 convrot.qdata,
@@ -127,11 +127,11 @@ class TestPiperConvRotNVFP4Adapter:
 
     def test_reconstructs_same_wrapper_into_reusable_device_storage(self) -> None:
         convrot, _dense = _make_convrot_nvfp4(group_size=16)
-        pinned_param = PinnedParam(nn.Parameter(convrot, requires_grad=False))
-        state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
+        host_param = HostParam(nn.Parameter(convrot, requires_grad=False))
+        state = host_param.allocate_gpu_storage(torch.device("cpu"))
 
-        pinned_param.copy_to_gpu(state)
-        reconstructed = pinned_param.make_gpu_param(state).data
+        host_param.copy_to_gpu(state)
+        reconstructed = host_param.make_gpu_param(state).data
 
         assert type(reconstructed) is type(convrot)
         assert reconstructed.group_size == 16
@@ -221,7 +221,6 @@ class TestPiperConvRotNVFP4Adapter:
         scale_ptr = convrot.scale.data_ptr()
         adapter = Adapter.from_state_dict(
             state_dict,
-            host_backing="adopt",
         )
 
         assert (
