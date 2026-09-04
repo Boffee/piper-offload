@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.9.0rc2] - 2026-09-03
+
 ### Added
 
 - Allow exact-name `ParameterValue` sources to retain offload-capable physical
@@ -349,7 +351,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - Python 3.14, PyTorch 2.13, TorchAO 0.18, Apache-2.0 licensing, and the Piper Offload package
   identity.
 
-[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.9.0rc1...HEAD
+[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.9.0rc2...HEAD
+[0.9.0rc2]: https://github.com/Boffee/piper-offload/compare/v0.9.0rc1...v0.9.0rc2
 [0.9.0rc1]: https://github.com/Boffee/piper-offload/compare/v0.8.0...v0.9.0rc1
 [0.8.0]: https://github.com/Boffee/piper-offload/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Boffee/piper-offload/compare/v0.6.1...v0.7.0
