@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 from .block_compile import CompileBackend
-from .block_runtime import host_transfer_tensors, validate_load_plans
+from .block_runtime import validate_load_plans
 from .float8_adapter import Float8Adapter
 from .gguf_adapter import GgufAdapter
 from .host_module import (
@@ -23,7 +23,6 @@ from .int4_tile_adapter import Int4TilePackedAdapter
 from .int8_adapter import Int8Adapter
 from .mx_adapter import MxAdapter
 from .nvfp4_adapter import Nvfp4Adapter
-from .pin_manager import PinLease, host_pin_manager
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from .piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
 from .quanto_adapter import QuantoAdapter
@@ -109,7 +108,6 @@ class RollingBlockRuntime:
 
     def _reset_acquired_state(self) -> None:
         self._lease: CudaTargetLease | None = None
-        self._host_lease: PinLease | None = None
         self._stream: torch.cuda.Stream | None = None
         self._events: tuple[torch.cuda.Event, ...] = ()
         self._ready_events: tuple[torch.cuda.Event, ...] = ()
@@ -121,7 +119,7 @@ class RollingBlockRuntime:
 
     @property
     def acquired(self) -> bool:
-        return self._lease is not None or self._stream is not None or self._host_lease is not None
+        return self._lease is not None or self._stream is not None
 
     @property
     def compile_backend(self) -> CompileBackend:
@@ -147,9 +145,7 @@ class RollingBlockRuntime:
         )
         self._load_plans = plans
         self._slot_names = tuple(allocation_loads)
-        self._host_lease = host_pin_manager.acquire(host_transfer_tensors(plans))
         self._stream = torch.cuda.Stream(device=device, priority=-1)
-        self._host_lease.record_stream(self._stream)
         self._events = tuple(torch.cuda.Event() for _name in self._slot_names)
         self._ready_events = tuple(torch.cuda.Event() for _name in self._slot_names)
         self._owners = [0] * len(self._slot_names)
@@ -295,19 +291,17 @@ class RollingBlockRuntime:
             except BaseException as exc:
                 if first_error is None:
                     first_error = exc
+        target_quiesced = lease is None
         if lease is not None:
             try:
                 lease.close()
             except BaseException as exc:
                 if first_error is None:
                     first_error = exc
-        if self._host_lease is not None:
-            try:
-                self._host_lease.close()
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
-        self._reset_acquired_state()
+            else:
+                target_quiesced = True
+        if target_quiesced:
+            self._reset_acquired_state()
         if first_error is not None:
             raise first_error
 

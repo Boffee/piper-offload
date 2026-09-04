@@ -1,4 +1,4 @@
-"""Registration ownership, page accounting, and transfer-safe pin leases."""
+"""Registration ownership, page accounting, and explicit pin leases."""
 
 import gc
 import mmap
@@ -52,17 +52,6 @@ class FakeBackend:
         if pointer in self.unregister_errors:
             raise HostRegistrationError("unregistration", 700)
         del self.registered[pointer]
-
-
-class FakeStream:
-    def __init__(self, *, fail: bool = False) -> None:
-        self.fail = fail
-        self.waits = 0
-
-    def synchronize(self) -> None:
-        self.waits += 1
-        if self.fail:
-            raise RuntimeError("stream synchronization failed")
 
 
 @pytest.fixture
@@ -395,55 +384,25 @@ def test_failed_eviction_does_not_oversubscribe_budget(backend: FakeBackend) -> 
     manager.clear()
 
 
-def test_failed_stream_wait_keeps_sources_and_registrations_protected(manager: PinManager) -> None:
-    (tensor,) = _tensors((0, PAGE))
-    tensor_ref = weakref.ref(tensor)
-    lease = manager.acquire([tensor])
-    stream = FakeStream(fail=True)
-    lease.record_stream(stream)
-    del tensor
-    with pytest.raises(RuntimeError, match="synchronization"):
-        lease.close()
-    manager.max_pinned_bytes = 0
-    manager.clear()
-    assert tensor_ref() is not None
-    assert not lease.closed
-    assert manager.stats.active_leases == 1
-    assert manager.stats.pinned_bytes == PAGE
-    stream.fail = False
-    lease.close()
-    assert lease.closed
-    assert tensor_ref() is None
-    assert manager.stats.pinned_bytes == 0
-    with pytest.raises(RuntimeError, match="closed"):
-        lease.record_stream(stream)
-
-
-def test_abandoned_failed_lease_retains_pageable_sources_until_retry(backend: FakeBackend) -> None:
+def test_lease_retains_pageable_sources_until_close(backend: FakeBackend) -> None:
     manager = PinManager(0, backend=backend)
     tensor = torch.ones(8)
     tensor_ref = weakref.ref(tensor)
     lease = manager.acquire([tensor])
-    stream = FakeStream(fail=True)
-    lease.record_stream(stream)
-    del tensor, lease
+    del tensor
     gc.collect()
     assert tensor_ref() is not None
     assert manager.stats.active_leases == 1
-    stream.fail = False
-    manager.clear()
+    lease.close()
     assert tensor_ref() is None
     assert manager.stats.active_leases == 0
 
 
-def test_abandoned_lease_waits_before_releasing_registration(manager: PinManager) -> None:
+def test_abandoned_lease_releases_registration_protection(manager: PinManager) -> None:
     (tensor,) = _tensors((0, PAGE))
     lease = manager.acquire([tensor])
-    stream = FakeStream()
-    lease.record_stream(stream)
     del lease
     gc.collect()
-    assert stream.waits == 1
     assert manager.stats.active_leases == 0
     assert manager.stats.idle_registrations == 1
 
@@ -616,9 +575,9 @@ def test_real_registration_copy_and_unregistration() -> None:
     try:
         assert lease.registered_bytes == tensor.nbytes
         assert tensor.is_pinned()
-        lease.record_stream(stream)
         with torch.cuda.stream(stream):
             target = tensor.to("cuda", non_blocking=True)
+        stream.synchronize()
         lease.close()
         assert tensor.data_ptr() == pointer
         torch.testing.assert_close(target.cpu(), tensor)
@@ -637,9 +596,9 @@ def test_real_fallback_can_copy_allocation_sharing_a_registered_page() -> None:
         assert lease.registered_bytes == pinned.nbytes
         assert lease.pageable_bytes == pageable.nbytes
         stream = torch.cuda.Stream()
-        lease.record_stream(stream)
         with torch.cuda.stream(stream):
             target = pageable.to("cuda", non_blocking=True)
+        stream.synchronize()
     manager.clear()
     torch.testing.assert_close(target.cpu(), pageable)
 

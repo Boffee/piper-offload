@@ -1,7 +1,7 @@
 """Shared contract for CUDA block-residency runtimes."""
 
 import contextlib
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from typing import Protocol
 
 import torch
@@ -24,23 +24,6 @@ def validate_load_plans(
             "block runtime requires one matching load plan per block"
         )
     return plans
-
-
-def host_transfer_tensors(load_plans: Sequence[HostModuleLoadPlan]) -> Iterator[torch.Tensor]:
-    """Enumerate resolved upload sources and trainable optimizer backing.
-
-    Replacements supersede frozen model sources. Optimizer steps still gather
-    and scatter the instance's own trainable backing, so retain that too.
-    The pin manager deduplicates aliases and whole storage allocations.
-    """
-    for plan in load_plans:
-        for load in plan.loads.values():
-            yield from load.source.storage_tensors()
-        for buffer in plan.instance.buffers.values():
-            yield from buffer.storage_tensors()
-        for host in plan.instance.params.values():
-            if host.requires_grad:
-                yield from host.storage_tensors()
 
 
 class BlockRuntime(Protocol):
@@ -69,10 +52,17 @@ class BlockRuntime(Protocol):
         ...
 
     def release(self) -> None:
-        """Idempotently release the CUDA working set from any state."""
+        """Release the CUDA working set and all host-read dependencies.
+
+        If cleanup cannot prove that queued host reads have completed, this
+        method must raise while leaving :attr:`acquired` true so its owner
+        retains host storage. That failure is terminal for the CUDA session.
+        Once ``acquired`` is false, no queued operation may still read any
+        source in the activation load plans.
+        """
         ...
 
     def optimizer_step(self) -> contextlib.AbstractContextManager[None]: ...
 
 
-__all__ = ["BlockRuntime", "host_transfer_tensors", "validate_load_plans"]
+__all__ = ["BlockRuntime", "validate_load_plans"]

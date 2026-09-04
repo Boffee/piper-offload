@@ -47,7 +47,7 @@ when you need bespoke composition (e.g., multiple block lists like Flux's
 import contextlib
 import logging
 import weakref
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Self, cast
 
@@ -66,11 +66,31 @@ from .host_module import (
 )
 from .host_param import HostParam
 from .module_names import walk_attr_path
+from .pin_manager import PinLease, host_pin_manager
 from .resident_runtime import ResidentBlockRuntime
 from .rolling_runtime import RollingBlockRuntime, create_rolling_block_runtime
 from .streaming_runtime import StreamingBlockRuntime
 
 logger = logging.getLogger(__name__)
+
+
+def _host_transfer_tensors(
+    load_plans: Sequence[HostModuleLoadPlan],
+) -> Iterator[torch.Tensor]:
+    """Enumerate host storage that a streamed activation may read.
+
+    Replacements supersede frozen model sources. Optimizer steps still gather
+    and scatter the instance's own trainable backing, so retain that too. The
+    pin manager deduplicates aliases and whole storage allocations.
+    """
+    for plan in load_plans:
+        for load in plan.loads.values():
+            yield from load.source.storage_tensors()
+        for buffer in plan.instance.buffers.values():
+            yield from buffer.storage_tensors()
+        for host in plan.instance.params.values():
+            if host.requires_grad:
+                yield from host.storage_tensors()
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -716,6 +736,7 @@ class BlockComponent:
         self._active_device: torch.device | None = None
         self._active_runtime: BlockRuntime | None = None
         self._load_plans: tuple[HostModuleLoadPlan, ...] = ()
+        self._pin_lease: PinLease | None = None
         self._param_name_to_block_param = _build_param_name_index(
             self._block_instances,
             name,
@@ -726,8 +747,10 @@ class BlockComponent:
             name,
             block_indices,
         )
-        self._param_names = frozenset(self._param_name_to_block_param)
-        self._buffer_names = frozenset(self._buffer_name_to_block_buffer)
+        self._param_names, self._buffer_names = (
+            frozenset(self._param_name_to_block_param),
+            frozenset(self._buffer_name_to_block_buffer),
+        )
         self._cpu_optimizer_step_active = False
 
         # Auto-flush the CUDA allocator cache when the component is GC'd,
@@ -861,6 +884,11 @@ class BlockComponent:
                 "active. Deactivate first, or check for a leaked "
                 "context manager."
             )
+        if self._pin_lease is not None:
+            raise RuntimeError(
+                "BlockComponent cannot activate after its prior CUDA session "
+                "failed to finish host transfers. Recreate the CUDA worker."
+            )
         active_device = canonical_device(device)
         if active_device.type == "cpu":
             if parameter_overrides:
@@ -960,8 +988,9 @@ class BlockComponent:
         Idempotent when already acquired. CPU sessions have no CUDA working
         set and therefore need no acquisition. The activation session and any
         installed compiled forwards remain intact across release/acquire
-        cycles. Streaming and rolling runtimes lease their host transfer
-        storage under the global pin budget; resident mode does not.
+        cycles. The component leases streaming and rolling host storage under
+        the global pin budget before the selected runtime starts. Resident
+        mode does not use a host pin lease.
         """
         active_device = self._active_device
         if active_device is None:
@@ -971,8 +1000,17 @@ class BlockComponent:
         runtime = self._active_runtime
         if runtime is None:
             raise RuntimeError("BlockComponent CUDA session has no selected runtime.")
-        if not runtime.acquired:
-            runtime.acquire(active_device, self._load_plans)
+        if runtime.acquired:
+            return
+        if self._pin_lease is not None:
+            raise RuntimeError(
+                "BlockComponent cannot acquire while prior pin cleanup is incomplete."
+            )
+        if self._block_mode != "resident":
+            self._pin_lease = host_pin_manager.acquire(
+                _host_transfer_tensors(self._load_plans)
+            )
+        runtime.acquire(active_device, self._load_plans)
 
     def release(self) -> None:
         """Idempotently release this session's CUDA working set.
@@ -982,27 +1020,32 @@ class BlockComponent:
         and compiled forwards remain installed, so :meth:`acquire` can prepare
         the same session for another traversal. Target retirement completes
         recorded CUDA work, so release is safe immediately after a forward.
-        Streaming host pin leases are released after copies complete. Their
+        Streaming host pin leases are released after the runtime confirms all
+        copies have completed. Their
         registrations remain in the idle LRU for reuse until budget pressure,
         explicit clearing, or source disposal unregisters them.
         """
         runtime = self._active_runtime
-        if runtime is not None:
+        if runtime is None:
+            return
+        try:
             runtime.release()
+        finally:
+            if not runtime.acquired:
+                lease = self._pin_lease
+                if lease is not None:
+                    lease.close()
+                    self._pin_lease = None
 
     def deactivate(self) -> None:
         """Tear down active resources idempotently — safe to call
         before activate or multiple times. The selected runtime owns cleanup
-        of any partial acquisition state. Drop the binding reference after
-        deactivate to release host memory."""
+        of any partial acquisition state. A terminal CUDA synchronization
+        failure retains its pin lease but clears session metadata. Drop the
+        binding reference after deactivate to release host memory."""
         self._block_compile.restore()
         if self._auto_fallback_compile is not None:
             self._auto_fallback_compile.restore()
-        if self._active_device == torch.device("cpu"):
-            self._active_device = None
-            self._load_plans = ()
-            return
-
         try:
             self.release()
         finally:

@@ -13,17 +13,19 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   and leaves registrations in the idle LRU for reactivation. CPU and resident
   execution do not acquire pins. The default pin budget remains zero.
   Initial uploads on a separate stream wait for prior work on reused CUDA
-  allocations before writing the target.
+  allocations before writing the target. Pin ownership now lives uniformly in
+  the block component; CUDA runtimes own transfer completion and remain
+  independent of registration policy.
 
 - Add `PinManager`, `PinLease`, `PinStats`, and the process-wide
   `host_pin_manager` for in-place CUDA/HIP host registration. Whole allocations
   share reference-counted leases and an idle LRU under a finite page-rounded
   budget or opportunistically up to native capacity. Capacity failures reclaim
   unrelated idle registrations before leaving the rest of an acquisition
-  pageable without repeated native calls. Leases wait for recorded streams,
-  source disposal retires registrations, and failed cleanup retains storage and
-  accounting for retry. The native backend clears handled runtime errors without
-  hiding prior GPU failures. Registration has a zero-byte default budget.
+  pageable without repeated native calls. Source disposal retires registrations,
+  and failed cleanup retains storage and accounting for retry. The native
+  backend clears handled runtime errors without hiding prior GPU failures.
+  Registration has a zero-byte default budget.
 
 - Add required `TensorAdapter.storage_tensors(state)` enumeration and expose
   it through `HostParam.storage_tensors()` and `HostBuffer.storage_tensors()`.

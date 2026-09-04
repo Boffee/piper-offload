@@ -69,18 +69,17 @@ class _LeaseState:
     registrations: tuple[_Registration, ...]
     pageable: tuple[int, ...]
     tensors: tuple[torch.Tensor, ...]
-    streams: set[torch.cuda.Stream] = field(default_factory=set)
-    abandoned: bool = False
 
 
 class PinLease:
-    """Protect registrations and source tensors until recorded copies finish.
+    """Protect registrations and source tensors until explicitly released.
 
     ``registered_bytes`` and ``pageable_bytes`` count unique requested storage
-    bytes, without page rounding. Record every stream before enqueueing copies
-    so exception cleanup also waits. Closing synchronizes those streams before releasing
-    protection; callers that already waited for transfers need not record them.
-    A failed synchronization keeps the lease protected and permits retry.
+    bytes, without page rounding. The owner must keep the lease open until no
+    asynchronous operation can read its host tensors. CUDA ordering belongs to
+    the runtime that enqueues those operations; the pin manager does not track
+    or synchronize accelerator streams. Dropping the token also releases its
+    protection, so asynchronous owners must retain it through completion.
     """
 
     def __init__(
@@ -90,28 +89,18 @@ class PinLease:
         registered_bytes: int,
         pageable_bytes: int,
     ) -> None:
-        self._manager = manager
-        self._key = key
         self.registered_bytes = registered_bytes
         self.pageable_bytes = pageable_bytes
-        self._finalizer = weakref.finalize(self, manager._abandon_lease, key)
+        self._finalizer = weakref.finalize(self, manager._close_lease, key)
         self._finalizer.atexit = False
 
     @property
     def closed(self) -> bool:
         return not self._finalizer.alive
 
-    def record_stream(self, stream: torch.cuda.Stream) -> None:
-        """Protect copies enqueued on ``stream`` until this lease closes."""
-        with self._manager._lock:
-            if self.closed:
-                raise RuntimeError("Pin lease is closed")
-            self._manager._leases[self._key].streams.add(stream)
-
     def close(self) -> None:
-        """Wait for recorded streams and release protection, idempotently."""
-        self._manager._close_lease(self._key)
-        self._finalizer.detach()
+        """Release registration and source protection, idempotently."""
+        self._finalizer()
 
     def __enter__(self) -> Self:
         if self.closed:
@@ -275,16 +264,13 @@ class PinManager:
             return PinLease(self, key, registered, total - registered)
 
     def clear(self) -> None:
-        """Unregister idle entries and retry cleanup of abandoned leases.
+        """Unregister idle entries.
 
         Live leases remain protected. A failed unregistration retains its
         storage and budget charge; cleanup errors propagate so callers can
         retry without losing ownership of registered memory.
         """
         with self._lock:
-            for key, state in tuple(self._leases.items()):
-                if state.abandoned:
-                    self._close_lease(key)
             failed = 0
             for pointer in tuple(self._idle):
                 entry = self._entries.get(pointer)
@@ -438,8 +424,6 @@ class PinManager:
             state = self._leases.get(key)
             if state is None:
                 return
-            for stream in state.streams:
-                stream.synchronize()
             self._release(state.registrations)
             for pointer in state.pageable:
                 allocation = self._pageable[pointer]
@@ -449,17 +433,6 @@ class PinManager:
                     self._starts.pop(bisect_left(self._starts, pointer))
             del self._leases[key]
             self._drop_lifetime_root_if_empty()
-
-    def _abandon_lease(self, key: int) -> None:
-        with self._lock:
-            state = self._leases.get(key)
-            if state is None:
-                return
-            state.abandoned = True
-            try:
-                self._close_lease(key)
-            except Exception as error:
-                logger.warning("Pin lease cleanup failed; retaining sources for clear() to retry: %s", str(error))
 
     def _drop_lifetime_root_if_empty(self) -> None:
         if not self._entries and not self._leases:

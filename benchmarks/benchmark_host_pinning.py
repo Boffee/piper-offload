@@ -33,7 +33,7 @@ from torch import nn
 
 from piper_offload import BlockCompileConfig, BlockMode, ModelOffloader, PinLease, host_pin_manager
 from piper_offload._host_registration import RuntimeHostRegistration
-from piper_offload.block_runtime import host_transfer_tensors
+from piper_offload.block_component import _host_transfer_tensors
 from piper_offload.streaming_runtime import StreamingBlockRuntime
 
 GIB = 1024**3
@@ -175,7 +175,7 @@ def _build_subject(name: str, mode: BlockMode, representation: str, args: argpar
     stores: dict[int, int] = {}
     for component in offloader._composite.blocks:
         plans = [instance.resolve_load_plan() for instance in component._block_instances]
-        for tensor in host_transfer_tensors(plans):
+        for tensor in _host_transfer_tensors(plans):
             if tensor.numel():
                 storage = tensor.untyped_storage()
                 stores[storage.data_ptr()] = storage.nbytes()
@@ -243,9 +243,11 @@ def _session(
     try:
         activation = _phase(activate, backend)
         active = host_pin_manager.stats
-        leases: list[PinLease] = [
-            component._active_runtime._host_lease for component in subject.offloader._composite.blocks
-        ]
+        leases: list[PinLease] = []
+        for component in subject.offloader._composite.blocks:
+            lease = component._pin_lease
+            assert lease is not None
+            leases.append(lease)
         registered_bytes = sum(lease.registered_bytes for lease in leases)
         pageable_bytes = sum(lease.pageable_bytes for lease in leases)
         with torch.inference_mode():

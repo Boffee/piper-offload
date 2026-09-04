@@ -6,13 +6,13 @@ import pytest
 import torch
 from torch import nn
 
-import piper_offload.rolling_runtime as rolling_module
-import piper_offload.streaming_runtime as streaming_module
+import piper_offload.block_component as block_component_module
 from piper_offload import BlockCompileConfig, BlockComponentStore, ModelOffloader, ParameterValue, PinManager
 from piper_offload._host_registration import RuntimeHostRegistration
-from piper_offload.block_runtime import host_transfer_tensors
+from piper_offload.block_component import _host_transfer_tensors
 from piper_offload.host_module import HostModuleStore, ParameterOverride
 from piper_offload.host_param import HostParam
+from piper_offload.target_lease import CudaTargetLease
 from piper_offload.tensor_adapter_registry import param_representation, select_adapter
 from tests._block_compile_helpers import _BlockModel, _make_offloader
 from tests.conftest import activated_model, block_components
@@ -41,8 +41,7 @@ class RecordingBackend(RuntimeHostRegistration):
 def pins(monkeypatch: pytest.MonkeyPatch):
     backend = RecordingBackend()
     manager = PinManager(64 * 1024**2, backend=backend)
-    monkeypatch.setattr(streaming_module, "host_pin_manager", manager)
-    monkeypatch.setattr(rolling_module, "host_pin_manager", manager)
+    monkeypatch.setattr(block_component_module, "host_pin_manager", manager)
     yield manager, backend
     manager.clear()
     assert manager.stats.active_leases == 0
@@ -104,7 +103,8 @@ def test_budget_fallback_keeps_streamed_results_correct(budget: int, pins) -> No
     expected = model(value)
     offloader = _make_offloader(model)
     with activated_model(offloader, "cuda"), torch.inference_mode():
-        lease = block_components(offloader)[0]._runtime._host_lease
+        lease = block_components(offloader)[0]._pin_lease
+        assert lease is not None
         assert lease.pageable_bytes > 0
         assert (lease.registered_bytes > 0) == (budget > 0)
         assert manager.stats.pinned_bytes <= budget
@@ -124,12 +124,14 @@ def test_another_component_evicts_only_released_registrations(pins) -> None:
         manager.max_pinned_bytes = manager.stats.pinned_bytes
         second.activate("cuda")
         assert not backend.unregistrations
-        assert block_components(second)[0]._runtime._host_lease.pageable_bytes > 0
+        lease = block_components(second)[0]._pin_lease
+        assert lease is not None and lease.pageable_bytes > 0
         second.deactivate()
         first.deactivate()
         second.activate("cuda")
         assert backend.unregistrations
-        assert block_components(second)[0]._runtime._host_lease.registered_bytes > 0
+        lease = block_components(second)[0]._pin_lease
+        assert lease is not None and lease.registered_bytes > 0
     finally:
         second.deactivate()
         first.deactivate()
@@ -165,7 +167,7 @@ def test_transfer_sources_include_buffers_and_optimizer_backing() -> None:
         "frozen": ParameterOverride(source=frozen),
         "trainable": ParameterOverride(source=trainable),
     })
-    tensors = list(host_transfer_tensors([plan]))
+    tensors = list(_host_transfer_tensors([plan]))
     identities = {id(tensor) for tensor in tensors}
     assert id(store.params["frozen"].storage_tensors()[0]) not in identities
     for host in (frozen, trainable, store.params["trainable"], store.buffers["buffer"]):
@@ -231,6 +233,55 @@ def test_partial_activation_failure_releases_host_lease(mode: str, pins, monkeyp
     count = len(backend.registrations)
     with activated_model(offloader, "cuda"):
         assert len(backend.registrations) == count
+
+
+@CUDA
+@pytest.mark.parametrize("mode", ["streaming", "rolling"])
+def test_failed_runtime_quiescence_does_not_release_host_lease(
+    mode: str,
+    pins,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _backend = pins
+    offloader = _make_offloader(
+        _BlockModel(),
+        block_mode=mode,
+        block_compile=BlockCompileConfig(fullgraph=True) if mode == "rolling" else None,
+    )
+    component = block_components(offloader)[0]
+    original_close = CudaTargetLease.close
+    failed = False
+
+    def fail_once(lease: CudaTargetLease) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("injected synchronization failure")
+        original_close(lease)
+
+    try:
+        offloader.activate("cuda")
+        runtime = component._active_runtime
+        assert runtime is not None
+        with monkeypatch.context() as patch:
+            patch.setattr(CudaTargetLease, "close", fail_once)
+            with pytest.raises(RuntimeError, match="injected synchronization failure"):
+                offloader.deactivate()
+        assert runtime.acquired
+        assert component._active_device is None
+        assert component._active_runtime is None
+        assert component._pin_lease is not None
+        assert manager.stats.active_leases == 1
+        with pytest.raises(RuntimeError, match="Recreate the CUDA worker"):
+            component.activate(torch.device("cuda"))
+
+        runtime.release()
+        component._pin_lease.close()
+        component._pin_lease = None
+    finally:
+        offloader.deactivate()
+        if mode == "rolling":
+            torch.compiler.reset()
 
 
 @CUDA

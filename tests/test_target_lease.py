@@ -30,7 +30,6 @@ def test_first_pinned_upload_waits_for_prior_work_on_reused_allocation() -> None
     lease = None
     try:
         with manager.acquire(plan.sources["weight"].storage_tensors()) as pins:
-            pins.record_stream(copy_stream)
             assert pins.registered_bytes > 0
             # Warm allocation and fill/copy kernels before enqueueing delayed
             # work, so lazy CUDA module loading cannot serialize the probe.
@@ -50,6 +49,7 @@ def test_first_pinned_upload_waits_for_prior_work_on_reused_allocation() -> None
             assert not allocation_stream.query()
             lease.stage(plan, copy_stream, non_blocking=True)
             actual = lease.acquire(allocation_stream).param_targets["weight"].param.cpu()
+            copy_stream.synchronize()
             torch.testing.assert_close(actual, torch.full((64, 64), 7.0))
     finally:
         if lease is not None:

@@ -187,11 +187,11 @@ source = torch.randn(1024, 1024)
 target = torch.empty_like(source, device="cuda")
 copy_stream = torch.cuda.Stream()
 
-with host_pin_manager.acquire([source]) as pins:
-    pins.record_stream(copy_stream)  # record before enqueueing, including failure paths
+with host_pin_manager.acquire([source]):
     with torch.cuda.stream(copy_stream):
         target.copy_(source, non_blocking=True)
-# Closing the lease waits for recorded streams; source may remain registered in the idle LRU.
+    copy_stream.synchronize()  # finish every host read before closing the lease
+# The source may remain registered in the idle LRU after the lease closes.
 ```
 
 For model backing, pass tensors from `HostParam.storage_tensors()` and
