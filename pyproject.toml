@@ -27,10 +27,13 @@ Changelog = "https://github.com/Boffee/piper-offload/blob/main/CHANGELOG.md"
 [project.optional-dependencies]
 bnb = ["bitsandbytes>=0.49,<0.51"]
 torchao = ["numpy>=2.3.2,<3", "torchao>=0.18,<0.19"]
-gguf = ["gguf>=0.18,<0.20"]
+gguf = [
+    "gguf>=0.18,<0.20",
+    "piper-kernels[convrot,triton]>=0.7.0rc3,<0.8",
+]
 quanto = ["optimum-quanto>=0.2.7,<0.3"]
 convrot = [
-    "piper-kernels[convrot]>=0.7.0rc1,<0.8",
+    "piper-kernels[convrot]>=0.7.0rc3,<0.8",
     "torchao>=0.18,<0.19",
 ]
 triton = [
@@ -42,7 +45,7 @@ all = [
     "gguf>=0.18,<0.20",
     "numpy>=2.3.2,<3",
     "optimum-quanto>=0.2.7,<0.3",
-    "piper-kernels[convrot]>=0.7.0rc1,<0.8",
+    "piper-kernels[convrot]>=0.7.0rc3,<0.8",
     "torchao>=0.18,<0.19",
     "triton>=3.7,<3.8; sys_platform == 'linux'",
     "triton-windows>=3.7,<3.8; sys_platform == 'win32'",

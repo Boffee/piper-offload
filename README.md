@@ -57,7 +57,7 @@ is not required.
 | `seeding.py` | `derive_seed()` — canonical stable unsigned 64-bit seed derivation from typed identity parts |
 | `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, Piper ConvRot INT8 / NVFP4, DTensor, and TorchAO dynamic/static scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
 | `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
-| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `piper_convrot_int8_adapter.py`, `piper_convrot_nvfp4_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `static_float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py`, `gguf_dequant.py` | Tensor adapter contracts/implementations and optional optimum-quanto / gguf / Piper ConvRot / torchao / DTensor support |
+| `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `piper_convrot_int8_adapter.py`, `piper_convrot_nvfp4_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `static_float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py` | Tensor adapter contracts/implementations and optional optimum-quanto / GGUF / Piper ConvRot / torchao / DTensor support |
 | `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (scaled-FP8 / INT8 / MX / NVFP4 / INT4 tile-packed) — common pin/move/identity mechanics + per-format hooks; capabilities beyond inference movement (CPU round-trip, dequant/requant conversion, copy, and staged factorized/dense merge) are opted into per subclass |
 | `dtensor_adapter.py` | Internal: `DTensorAdapter` for tensor-parallel `DTensor` weights — composes with other adapters by delegating local-shard movement and factorized/dense merge to the registry, then replaying the `(mesh, placements)` wrapper; frozen-inference scope (see `_dtensor.py`) |
 | `tensor_adapter_registry.py` | Public external-adapter registration plus adapter dispatch and tensor-identity helpers |
@@ -416,8 +416,10 @@ host effects with late scheduler-only ordering edges. They neither consume
 reader tensors nor model an immutable parameter as mutated, avoiding forced
 intermediate materialization while preserving the ordinary fusion, memory
 coalescing, and kernel-autotuning plan. For factors whose tensor formats
-support merge-mode LoRA, planned updates run after every base refill on the copy stream. GGUF and
-TorchAO INT4 tile-packed weights retain their existing no-merge restriction.
+support merge-mode LoRA, planned updates run after every base refill on the
+copy stream. GGUF sources converted to ConvRot targets use the target's merge
+kernels; TorchAO INT4 tile-packed weights retain their existing no-merge
+restriction.
 
 Explicit rolling deliberately fails closed outside its tested contract: `fullgraph=True`,
 frozen regular dense, TorchAO-family, Quanto, GGUF, or Piper ConvRot INT8 / NVFP4
@@ -1251,7 +1253,7 @@ dtype, no merge capability required.
 | TorchAO INT8 | ✓ | Triton; reference fallback | Triton; reference fallback |
 | TorchAO MX (MXFP8 / MXFP4) | ✓ | Triton; reference fallback † | Triton; reference fallback † |
 | TorchAO NVFP4 | ✓ | Triton; reference fallback † | Triton; reference fallback † |
-| GGUF (k-quants) | ✓ | — routed only | — |
+| GGUF → Piper ConvRot INT8 | ✓ | Piper `addmm_` | Piper `add_` |
 | TorchAO INT4 tile-packed | ✓ | — routed only | — |
 | Piper ConvRot INT8 | ✓ | Piper `addmm_` | Piper `add_` |
 | Piper ConvRot NVFP4 | ✓ | Piper `addmm_` † | Piper `add_` † |
@@ -1326,6 +1328,34 @@ blocks are repaired to a small positive value so qfloat8 never encodes a
 neither attempts native in-place `addmm_` on a `WeightQBytesTensor`. Use
 `adapter_mode="routed"` when the base must remain untouched or adapters need
 to switch without reloading it.
+
+## GGUF source support
+
+Piper Offload recognizes Diffusers `GGUFParameter` objects directly through
+their existing packed tensor, `quant_type`, and `quant_shape` metadata; it does
+not import or depend on Diffusers. Piper Engine can therefore load and remap a
+GGUF model, normalize its GGUF linear modules to ordinary linear behavior, and
+pass the model directly to `ModelOffloader`. No target policy, parameter
+wrapping, or runtime option is required.
+
+On activation, the host backing remains packed GGUF. The GPU target owns one
+same-size packed staging buffer plus reusable ConvRot storage. Every load or
+rolling refill copies the packed bytes and asks Piper Kernels to decode,
+rotate, and requantize directly into that target; it never allocates the full
+dense source weight. The active module parameter is a BF16
+`ConvRotInt8Tensor`. Its group size is the largest of 256, 64, and 16 that
+divides the logical input width, matching H3's group size 256 while retaining
+smaller compatible matrices. Block compilation, rolling storage tracking,
+LoRA merge, and dense/mixed merge use the existing ConvRot path without
+GGUF-specific runtime branches. These updates are activation merges; permanent
+merge cannot update the packed source representation because the ConvRot
+target exists only while the offloader is active.
+
+Direct conversion supports Piper Kernels' GGUF formats: F32, F16, BF16, Q4_0,
+Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS.
+The logical input width must be divisible by 16. Install the `gguf` extra;
+direct conversion requires
+`piper-kernels[convrot]>=0.7.0rc3`.
 
 ## Piper ConvRot INT8 support
 

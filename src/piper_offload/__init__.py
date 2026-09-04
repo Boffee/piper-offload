@@ -155,7 +155,6 @@ from .adapter import Adapter, AdapterMode, AdapterTarget
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent, BlockComponentStore
 from .block_mode import BlockMode
-from .gguf_adapter import GGUFWeight
 from .host_backing import HostBacking
 from .lora import LoRAFactor, LoRATransform, ScaledLoRAFactor
 from .merge import merge_adapter
@@ -214,7 +213,6 @@ __all__ = [
     "EvictionContext",
     "EvictionPolicy",
     "EvictionPolicyError",
-    "GGUFWeight",
     "HostBacking",
     "LRUEvictionPolicy",
     "LoRAFactor",

@@ -24,11 +24,21 @@ from .module_names import resolve_parent_leaf
 from .parameter_delta import ParameterDeltaTransform
 from .parameter_transform import ParameterTransform
 from .parameter_value import ParameterValueTransform
-from .tensor_adapter_registry import param_tensor_id
+from .tensor_adapter_registry import (
+    param_representation,
+    param_tensor_id,
+    select_adapter,
+)
+from .tensor_adapters import PermanentUpdateValidationTensorAdapter
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["merge_adapter"]
+
+
+def _validate_permanent_update(adapter: object) -> None:
+    if isinstance(adapter, PermanentUpdateValidationTensorAdapter):
+        adapter.validate_permanent_update()
 
 
 @dataclass(slots=True)
@@ -46,6 +56,13 @@ class _MergeOp:
 
     def validate(self) -> None:
         """Preflight this operation's parameter."""
+        if isinstance(self.transform, ParameterValueTransform):
+            if self.transform.requires_update:
+                _validate_permanent_update(self.transform.backing.adapter)
+        else:
+            _validate_permanent_update(
+                select_adapter(param_representation(self.param))
+            )
         self.transform.validate_parameter(self.param)
 
     def apply(self, model: nn.Module) -> None:

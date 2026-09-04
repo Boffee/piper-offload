@@ -15,6 +15,7 @@ from .tensor_adapters import (
     DenseMergeTensorAdapter,
     DenseMergeValidationTensorAdapter,
     DequantizeTensorAdapter,
+    LogicalShapeTensorAdapter,
     RegularAdapter,
     TensorAdapter,
     adapter_name,
@@ -154,7 +155,8 @@ class _ParameterValuePlan:
     """Validated replacement representation and optional scaling."""
 
     effective_strength: float
-    target_layout: tuple[object, object]
+    logical_shape: tuple[int, ...]
+    compute_dtype: torch.dtype
 
 
 class ParameterValueTransform:
@@ -242,16 +244,25 @@ class ParameterValueTransform:
         self._validate_scaling(source, adapter, effective_strength)
         self._plan = _ParameterValuePlan(
             effective_strength=effective_strength,
-            target_layout=backing.target_layout,
+            logical_shape=logical_shape,
+            compute_dtype=adapter.compute_dtype(source),
         )
 
     def apply_parameter(self, param: nn.Parameter) -> None:
         """Apply optional scaling to an already-loaded replacement."""
         plan = self._require_plan()
         target = param_representation(param)
+        try:
+            adapter = select_adapter(target)
+        except NotImplementedError as exc:
+            raise RuntimeError(
+                "Parameter value target no longer has a registered tensor adapter."
+            ) from exc
         if (
             target.is_meta
-            or PinnedParam.target_layout_for(param) != plan.target_layout
+            or adapter.compute_dtype(target) is not plan.compute_dtype
+            or not isinstance(adapter, LogicalShapeTensorAdapter)
+            or adapter.logical_shape(target) != plan.logical_shape
         ):
             raise RuntimeError(
                 "Parameter value update requires physical storage matching "
