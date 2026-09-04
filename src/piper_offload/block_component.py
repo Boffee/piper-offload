@@ -960,7 +960,8 @@ class BlockComponent:
         Idempotent when already acquired. CPU sessions have no CUDA working
         set and therefore need no acquisition. The activation session and any
         installed compiled forwards remain intact across release/acquire
-        cycles.
+        cycles. Streaming and rolling runtimes lease their host transfer
+        storage under the global pin budget; resident mode does not.
         """
         active_device = self._active_device
         if active_device is None:
@@ -981,6 +982,9 @@ class BlockComponent:
         and compiled forwards remain installed, so :meth:`acquire` can prepare
         the same session for another traversal. Target retirement completes
         recorded CUDA work, so release is safe immediately after a forward.
+        Streaming host pin leases are released after copies complete. Their
+        registrations remain in the idle LRU for reuse until budget pressure,
+        explicit clearing, or source disposal unregisters them.
         """
         runtime = self._active_runtime
         if runtime is not None:

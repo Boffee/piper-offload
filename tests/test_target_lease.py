@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import nn
 
+from piper_offload import PinManager
 from piper_offload.host_module import (
     HostModuleLoadPlan,
     HostModuleStore,
@@ -15,6 +16,45 @@ from piper_offload.host_module import (
 from piper_offload.target_lease import CudaTargetLease
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+@CUDA
+def test_first_pinned_upload_waits_for_prior_work_on_reused_allocation() -> None:
+    module = nn.Linear(64, 64, bias=False).requires_grad_(False)
+    module.weight.fill_(7)
+    plan = HostModuleStore.from_module(module).bind(module).resolve_load_plan()
+    manager = PinManager(1024**2)
+    device = torch.device("cuda")
+    copy_stream = torch.cuda.Stream(device=device)
+    allocation_stream = torch.cuda.current_stream(device)
+    lease = None
+    try:
+        with manager.acquire(plan.sources["weight"].storage_tensors()) as pins:
+            pins.record_stream(copy_stream)
+            assert pins.registered_bytes > 0
+            # Warm allocation and fill/copy kernels before enqueueing delayed
+            # work, so lazy CUDA module loading cannot serialize the probe.
+            warm = CudaTargetLease.allocate(plan, device, allocation_stream=allocation_stream)
+            warm.stage(plan, copy_stream)
+            warm.close()
+            stale = torch.empty((64, 64), device=device).fill_(0)
+            pointer = stale.data_ptr()
+            torch.cuda._sleep(1)
+            torch.cuda.synchronize(device)
+            torch.cuda._sleep(500_000_000)
+            stale.fill_(123)
+            del stale
+
+            lease = CudaTargetLease.allocate(plan, device, allocation_stream=allocation_stream)
+            assert lease.target.param_targets["weight"].param.data_ptr() == pointer
+            assert not allocation_stream.query()
+            lease.stage(plan, copy_stream, non_blocking=True)
+            actual = lease.acquire(allocation_stream).param_targets["weight"].param.cpu()
+            torch.testing.assert_close(actual, torch.full((64, 64), 7.0))
+    finally:
+        if lease is not None:
+            lease.close()
+        manager.clear()
 
 
 @CUDA

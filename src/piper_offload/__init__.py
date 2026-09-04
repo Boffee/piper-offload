@@ -120,8 +120,10 @@ including tensor-valued metadata, without copying or rebuilding wrappers.
 The process-wide :data:`host_pin_manager` can register that storage in place
 under an explicit page-rounded budget. :class:`PinLease` protects backing
 through recorded stream completion; released registrations enter an idle LRU.
-The default budget is zero, and model runtimes do not yet acquire pin leases
-automatically. Host-data caching remains independent of this registration budget.
+The default budget is zero. Ordinary streaming and compiled rolling acquire
+leases with their CUDA working sets and release them after pending transfers
+finish. CPU and resident execution do not acquire pins. Host-data caching
+remains independent of this registration budget.
 
 :class:`ResourceCache` manages cached backing stores with policy-driven
 eviction, reference-counted leases, and transactional admission.

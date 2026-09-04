@@ -7,14 +7,21 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Wire ordinary streaming and compiled rolling to host pin leases for their
+  acquired CUDA working sets. Leases cover resolved replacement sources,
+  quantized metadata, buffers, and optimizer backing; release waits for copies
+  and leaves registrations in the idle LRU for reactivation. CPU and resident
+  execution do not acquire pins. The default pin budget remains zero.
+  Initial uploads on a separate stream wait for prior work on reused CUDA
+  allocations before writing the target.
+
 - Add `PinManager`, `PinLease`, `PinStats`, and the process-wide
   `host_pin_manager` for in-place CUDA/HIP host registration. Whole allocations
   share reference-counted leases and an idle LRU under a page-rounded budget;
   capacity failures retain pageable backing. Leases wait for recorded streams,
   source disposal retires registrations, and failed cleanup retains storage
   and accounting for retry. The native backend clears handled runtime errors
-  without hiding prior GPU failures. Registration is explicit with a zero-byte
-  default budget; streaming integration follows separately.
+  without hiding prior GPU failures. Registration has a zero-byte default budget.
 
 - Add required `TensorAdapter.storage_tensors(state)` enumeration and expose
   it through `HostParam.storage_tensors()` and `HostBuffer.storage_tensors()`.
@@ -39,8 +46,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   `Pinned*` storage primitives and modules to `Host*`, and replace the tensor
   adapter's `clone_pin()` contract with `capture_host()`. Packed quantized
   representations and their movement and merge capabilities are preserved.
-  Host capture no longer allocates pinned memory; runtime registration will
-  be introduced separately.
+  Host capture no longer allocates pinned memory; streaming runtimes register
+  backing through the separate global pin budget.
 
 ### Removed
 

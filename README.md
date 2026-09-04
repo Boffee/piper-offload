@@ -159,8 +159,20 @@ pin memory.
 
 `host_pin_manager` registers existing CPU storage in place under a separate
 `max_pinned_bytes` budget. Its default budget is zero, and construction and
-configuration do not initialize CUDA. Registration is currently explicit;
-model and block runtimes do not yet acquire pin leases automatically.
+configuration do not initialize CUDA. Ordinary streaming and compiled rolling
+acquire leases automatically with their CUDA working sets. Set the budget
+before activation to enable pinning. CPU execution, resident blocks, and
+non-block components do not acquire pin leases.
+
+Deactivation releases the lease after transfers finish and leaves registrations
+in the idle LRU. Reactivating the same backing reuses its retained registrations
+without native register/unregister calls. `BlockComponent.release()` also
+releases pin protection during a temporary working-set release; `acquire()`
+reuses or registers backing again. This lets transient components share the
+budget. Resolved replacement sources, quantized payloads and metadata, buffers,
+and trainable optimizer backing all participate in the same lease.
+
+Explicit leases are also available for custom transfers:
 
 ```python
 import torch

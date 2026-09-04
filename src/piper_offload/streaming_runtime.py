@@ -11,13 +11,14 @@ import torch
 from torch import nn
 
 from .block_compile import CompileBackend
-from .block_runtime import validate_load_plans
+from .block_runtime import host_transfer_tensors, validate_load_plans
 from .host_module import (
     HostModuleInstance,
     HostModuleLoadPlan,
     HostModuleTarget,
 )
 from .module_names import group_names
+from .pin_manager import PinLease, host_pin_manager
 from .target_lease import CudaTargetLease
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ class StreamingBlockRuntime:
         self._wraparound = wraparound
         self._device: torch.device | None = None
         self._load_plans: tuple[HostModuleLoadPlan, ...] = ()
+        self._host_lease: PinLease | None = None
         self._pool: _MorphingTargetPool | None = None
         self._block_to_lease: dict[int, CudaTargetLease] = {}
         self._active_idx: int | None = None
@@ -130,8 +132,10 @@ class StreamingBlockRuntime:
         num_blocks = len(self._instances)
         self._device = device
         self._load_plans = plans
+        self._host_lease = host_pin_manager.acquire(host_transfer_tensors(plans))
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._stream = torch.cuda.Stream(device=device, priority=-1)
+        self._host_lease.record_stream(self._stream)
         self._pending = {}
         self._last_idx = -1
         self._pool = _MorphingTargetPool(device)
@@ -158,20 +162,29 @@ class StreamingBlockRuntime:
             self._executor.shutdown(wait=True)
             self._executor = None
 
-        first_prefetch_exc = self._drain_and_evict_all()
-        self._stream = None
-        self._move_trainable_grads_to(torch.device("cpu"))
-        if self._pool is not None:
-            self._pool.close()
-        self._pool = None
-        self._block_to_lease.clear()
-        self._active_idx = None
-        self._last_idx = -1
-        self._device = None
-        self._load_plans = ()
+        try:
+            first_prefetch_exc = self._drain_and_evict_all()
+            self._stream = None
+            self._move_trainable_grads_to(torch.device("cpu"))
+            if self._pool is not None:
+                self._pool.close()
+            self._pool = None
+            self._block_to_lease.clear()
+            self._active_idx = None
+            self._last_idx = -1
+            self._device = None
+            self._load_plans = ()
 
-        if first_prefetch_exc is not None:
-            raise first_prefetch_exc
+            if first_prefetch_exc is not None:
+                raise first_prefetch_exc
+        finally:
+            # No worker can enqueue more copies after executor shutdown. The
+            # host lease also waits when target cleanup or an update failed.
+            try:
+                if self._host_lease is not None:
+                    self._host_lease.close()
+            finally:
+                self._host_lease = None
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Generator[None]:
@@ -266,6 +279,8 @@ class StreamingBlockRuntime:
         non_blocking: bool = False,
     ) -> None:
         assert self._pool is not None, "runtime is not acquired"
+        assert self._host_lease is not None, "runtime has no host lease"
+        self._host_lease.record_stream(stream)
         plan = self._load_plans[block_idx]
         lease = self._block_to_lease.get(block_idx)
         if lease is None:
