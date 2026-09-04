@@ -29,6 +29,7 @@ from .tensor_adapters import (
     PostLoadRearmTensorAdapter,
     TensorAdapter,
     adapter_name,
+    independent_host_capture,
 )
 
 
@@ -36,7 +37,8 @@ class HostParam:
     """Host storage for one parameter, with GPU-load helpers.
 
     Construction picks an adapter via :func:`select_adapter` based on
-    the parameter's tensor type, then captures an owned pageable CPU copy.
+    the parameter's tensor type, then takes ownership of compatible pageable
+    CPU storage or normalizes it into CPU storage when required.
     Model-bound callers create their own
     deactivated-state :class:`nn.Parameter` wrappers with
     :meth:`make_cpu_param`.
@@ -57,12 +59,11 @@ class HostParam:
     trainable Parameter identity by ``.data``-swapping into the user's
     persistent Parameter — both are supported.
 
-    Low-peak host construction behavior: for plain ``torch.Tensor``
-    parameters, construction immediately repoints the source
-    ``Parameter.data`` at the host clone. This releases the original source
-    storage before the owning store finishes constructing every host
-    parameter, avoiding a temporary 2x peak for large CPU-resident models and
-    promptly freeing GPU storage for CUDA-origin models. It also means host
+    Low-peak host construction behavior: compatible complete CPU allocations
+    are retained directly, preserving file mappings without a copy. For plain
+    ``torch.Tensor`` parameters, construction immediately repoints the source
+    ``Parameter.data`` at the captured backing. This promptly releases replaced
+    GPU or incompatible CPU storage before the owning store finishes. It also means host
     construction is not rollback-safe after copying has started: if a later
     parameter fails to capture, recovery of the partially constructed store/model
     is unsupported. Drop those references and rebuild from a fresh model
@@ -295,7 +296,7 @@ class HostParam:
 
         Optional symmetric counterpart to :meth:`copy_to_gpu`. The
         host state is overwritten in place with the current GPU
-        contents — useful for syncing the host clone after an in-place
+        contents — useful for syncing host backing after an in-place
         GPU update (e.g., an optimizer step). Adapters whose GPU
         representation is not round-trippable do not expose this
         capability and raise :class:`NotImplementedError` here.
@@ -376,7 +377,8 @@ class HostParam:
                 "parameter value."
             )
         representation = param_representation(self.make_cpu_param())
-        cloned_state = self.adapter.capture_host(representation)
+        with independent_host_capture():
+            cloned_state = self.adapter.capture_host(representation)
         return self.adapter.cpu_param(cloned_state, requires_grad=False)
 
     @property

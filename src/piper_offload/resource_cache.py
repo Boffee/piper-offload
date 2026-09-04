@@ -1,14 +1,14 @@
 """Policy-driven cache for reusable resource stores.
 
 Manages cached CPU (or other resource-owned) backing storage for
-multiple independent resources (models, LoRA adapters, etc.). When a new
-store needs more cache than is free, inactive entries are evicted
-according to the configured :class:`EvictionPolicy` until room is
-available. Leased entries are never evicted.
+multiple independent resources (models, adapters, etc.). A finite cache
+budget evicts inactive entries according to the configured
+:class:`EvictionPolicy` until room is available. An unbounded cache retains
+built stores until explicit eviction. Leased entries are never evicted.
 
 Design highlights
 -----------------
-- **Store-only.** The cache builds, budgets, leases, and evicts
+- **Store-only.** The cache builds, accounts for, leases, and evicts
   :class:`ResourceStore` instances. It does not create runtime bindings,
   choose devices, or know how one resource is applied to another.
 - **Structural specs.** Cache entries implement :class:`ResourceSpec`; concrete
@@ -16,7 +16,7 @@ Design highlights
 - **Reference-counted leases.** A lease protects its store from eviction.
   Multiple callers may lease the same cached store concurrently; whether its
   value supports overlapping use is a separate policy owned by that resource.
-- **Transactional admission, with one caveat.** Eviction is just a
+- **Transactional budgeted admission, with one caveat.** Eviction is just a
   reference drop (no failure path) — host memory is freed when GC runs
   on the dropped store. **Store factory failure**
   preserves the registration but leaves any pre-eviction *committed*
@@ -26,8 +26,8 @@ Design highlights
   mean recapturing the just-released weights, which can OOM the host
   allocator). The cache stays internally consistent; the cost is
   some warm cached entries disappearing.
-- **No runtime or GPU lifecycle.** The cache only enforces logical
-  ``max_cache_bytes`` for cached host backing. Activation and GPU
+- **No runtime or GPU lifecycle.** A configured ``max_cache_bytes`` limit
+  applies only to logical cached backing. Activation and GPU
   residency belong to resources and consumers such as
   :class:`~piper_offload.ModelOffloader` and
   :class:`~piper_offload.ModelCache`.
@@ -241,8 +241,8 @@ class ResourceCache:
     Parameters
     ----------
     max_cache_bytes:
-        Total budget for cached resource backing storage (typically
-        host memory). Must be ≥ 0.
+        Optional total budget for cached resource backing storage. ``None``
+        keeps every built store until explicit eviction or unregistration.
     eviction_policy:
         Optional inactive-entry eviction policy. Defaults to
         :class:`LRUEvictionPolicy`. The cache owns the policy instance
@@ -251,11 +251,11 @@ class ResourceCache:
 
     def __init__(
         self,
-        max_cache_bytes: int,
+        max_cache_bytes: int | None,
         *,
         eviction_policy: EvictionPolicy | None = None,
     ) -> None:
-        if max_cache_bytes < 0:
+        if max_cache_bytes is not None and max_cache_bytes < 0:
             raise ValueError(f"max_cache_bytes must be >= 0, got {max_cache_bytes}")
         self._max_cache_bytes = max_cache_bytes
         self._entries: dict[str, _Entry] = {}
@@ -269,7 +269,7 @@ class ResourceCache:
     # ------------------------------------------------------------------
 
     @property
-    def max_cache_bytes(self) -> int:
+    def max_cache_bytes(self) -> int | None:
         with self._lock:
             return self._max_cache_bytes
 
@@ -283,13 +283,15 @@ class ResourceCache:
             return self._used_bytes
 
     @property
-    def available_cache_bytes(self) -> int:
+    def available_cache_bytes(self) -> int | None:
         """Current cache-budget headroom."""
         with self._lock:
             return self._available_cache_bytes
 
     @property
-    def _available_cache_bytes(self) -> int:
+    def _available_cache_bytes(self) -> int | None:
+        if self._max_cache_bytes is None:
+            return None
         return self._max_cache_bytes - self._used_bytes
 
     def resize(self, max_cache_bytes: int) -> None:
@@ -527,6 +529,7 @@ class ResourceCache:
         return tuple(candidates)
 
     def _build_eviction_context(self, required_cache_bytes: int) -> EvictionContext:
+        assert self._max_cache_bytes is not None
         return EvictionContext(
             required_cache_bytes=required_cache_bytes,
             used_cache_bytes=self._used_bytes,
@@ -538,7 +541,8 @@ class ResourceCache:
         """Evict inactive entries so ``required_cache_bytes`` fits.
         Raises :class:`ResourceTooLargeError` when leased entries block
         sufficient eviction."""
-        if required_cache_bytes <= self._available_cache_bytes:
+        available = self._available_cache_bytes
+        if available is None or required_cache_bytes <= available:
             return
 
         context = self._build_eviction_context(required_cache_bytes)
@@ -548,7 +552,7 @@ class ResourceCache:
             raise ResourceTooLargeError(
                 required=required_cache_bytes,
                 used=self._used_bytes,
-                limit=self._max_cache_bytes,
+                limit=context.max_cache_bytes,
             )
 
         victims = self._eviction.choose_victims(context)
@@ -562,7 +566,9 @@ class ResourceCache:
             )
 
         for victim in victims:
-            if required_cache_bytes <= self._available_cache_bytes:
+            available = self._available_cache_bytes
+            assert available is not None
+            if required_cache_bytes <= available:
                 break
             self._evict_inactive(victim)
 

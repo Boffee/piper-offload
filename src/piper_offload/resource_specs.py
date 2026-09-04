@@ -32,13 +32,13 @@ class ModelSpec[M: nn.Module]:
     execution for every block group. Transient block groups release their CUDA
     working sets after their final blocks.
     ``transient_paths`` gives named modules independent CUDA working sets
-    scoped to their forwards. Model state is captured into owned pageable
-    CPU backing.
+    scoped to their forwards. The factory transfers compatible pageable CPU
+    storage to the cached runtime, preserving checkpoint-backed mappings.
     """
 
     key: str
-    estimated_cache_bytes: int
     factory: Callable[[], M]
+    estimated_cache_bytes: int = 0
     block_paths: tuple[str, ...] = ()
     transient_block_paths: tuple[str, ...] = ()
     include_block_trainables: bool = False
@@ -69,9 +69,10 @@ class AdapterSpec:
 
     ``dtype`` is forwarded to :meth:`Adapter.from_state_dict`; matching the
     model's compute dtype reduces routed per-forward transfer volume.
-    Captured state owns independent pageable CPU storage. The factory's reserved
-    LoRA-suffixed entries form factor pairs; every other entry is an exact
-    parameter-name physical value used to populate a
+    Compatible complete pageable CPU allocations transfer to the resource, so
+    the caller must not mutate factory values after construction. The factory's
+    reserved LoRA-suffixed entries form factor pairs; every other entry is an
+    exact parameter-name physical value used to populate a
     frozen floating-point meta target.
     ``allow_partial_targets`` opts the built resource into applying only the
     intersection of its targets and a model's parameters.
@@ -80,8 +81,8 @@ class AdapterSpec:
     """
 
     key: str
-    estimated_cache_bytes: int
     factory: Callable[[], Mapping[str, torch.Tensor]]
+    estimated_cache_bytes: int = 0
     dtype: torch.dtype | None = None
     allow_partial_targets: bool = False
     scale_parameter_values: bool = False

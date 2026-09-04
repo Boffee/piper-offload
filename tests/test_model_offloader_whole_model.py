@@ -880,17 +880,14 @@ class TestQuanto:
         m.weight = nn.Parameter(qt, requires_grad=False)
         return m
 
-    def test_quanto_constructor_repoints_to_host(self) -> None:
-        # The bug Codex found: the original ModelOffloader did
-        # `p.data = binding.cpu_param.data` which is a no-op for quanto.
-        # The fix: swap module._parameters[leaf] = binding.cpu_param.
-        # Verify the model now references host _data storage.
+    def test_quanto_constructor_rebuilds_from_transferred_host_storage(self) -> None:
+        # Structured parameters still require registry replacement even when
+        # their compatible CPU inner storage is transferred without copying.
         m = self._make_quanto_model()
         original_data_ptr = m.weight._data.data_ptr()
         pw = _make_model_offloader(m)
         try:
-            # Inner _data must now point at host storage, not the original.
-            assert m.weight._data.data_ptr() != original_data_ptr
+            assert m.weight._data.data_ptr() == original_data_ptr
             assert not m.weight._data.is_pinned()
             assert not m.weight._scale.is_pinned()
         finally:

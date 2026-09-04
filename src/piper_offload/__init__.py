@@ -3,8 +3,9 @@
 High-level API:
 
 - :class:`ResourceCache` accepts structural :class:`ResourceSpec` implementations
-  and leases reusable model, adapter, and object stores under a host-memory
-  budget. :class:`ModelCache` specializes it with model-aware use: it composes
+  and leases reusable model, adapter, and object stores with optional byte
+  budgeting. :class:`ModelCache` uses its unbounded mode for model-aware use:
+  it composes
   a leased :class:`ModelSpec` with optional :class:`AdapterSpec` resources and
   activates the cached :class:`ModelOffloader`.
   :class:`ObjectSpec` caches general Python objects (tokenizers,
@@ -53,9 +54,11 @@ tensor-parallel ``DTensor`` weights wrapping any of the above).
 implement the :class:`ResourceBinding` Protocol. Each owns exactly one model
 runtime and is reused sequentially.
 
-Host capture creates independent pageable CPU copies of model and adapter
-state while preserving each tensor adapter's physical representation.
-Package resources make ``cache_bytes`` final during construction.
+Host capture takes ownership of compatible complete pageable CPU allocations,
+preserving checkpoint file mappings and each tensor adapter's physical
+representation. Device, pinned, partial-view, and incompatible-layout sources
+are copied into pageable CPU allocations. Package resources make
+``cache_bytes`` final during construction.
 ``activate(device)`` then makes the resource usable on the requested device. For
 :class:`ModelOffloader`, ``deactivate()`` returns managed tensors to
 their host backing. For :class:`MpsWeights`,
@@ -64,7 +67,7 @@ construction has already materialized the model on MPS, so
 
 Host-store construction intentionally optimizes peak host memory. For
 plain ``torch.Tensor`` parameters, it may immediately repoint the source
-``Parameter.data`` at each host clone so the original source storage can be
+``Parameter.data`` at captured host backing so the original source storage can be
 freed before all buffers finish. This avoids a temporary 2x host-memory peak
 for CPU-origin models and promptly frees GPU storage for CUDA-origin models.
 If host construction raises after capture has started, recovery of the partially
@@ -103,17 +106,19 @@ non-LoRA entry as the complete value for an exact-name parameter. Parameter
 values are merge-only and populate storage-free frozen plain floating-point
 meta parameters; parameter deltas require existing physical parameters.
 
-:class:`Adapter` owns immutable parameter-delta and parameter-value storage,
-in independent pageable CPU allocations. Compatible
-consumers read that backing directly and may overlap; routed hooks stage their
+:class:`Adapter` owns immutable parameter-delta and parameter-value storage.
+Compatible complete CPU allocations supplied to its factory transfer to that
+backing, so callers must not mutate them after construction. Compatible
+consumers read the backing directly and may overlap; routed hooks stage their
 own per-forward device copies.
 
 Downstream tensor subclasses can participate in capture and movement without
 adding format-specific dependencies here: implement the public
 :class:`TensorAdapter` contract and register it during application startup with
 :func:`register_adapter`. Registered adapters are used for both movement and
-tied-storage identity. ``capture_host()`` returns owned pageable CPU state
-that the adapter can copy and reconstruct without changing its encoding.
+tied-storage identity. ``capture_host()`` returns owned pageable CPU state,
+retaining compatible complete allocations where supported, that the adapter
+can copy and reconstruct without changing its encoding.
 ``storage_tensors(state)`` exposes that state's physical CPU tensors directly,
 including tensor-valued metadata, without copying or rebuilding wrappers.
 
@@ -125,9 +130,10 @@ leases with their CUDA working sets and release them after pending transfers
 finish. CPU and resident execution do not acquire pins. Host-data caching
 remains independent of this registration budget.
 
-:class:`ResourceCache` manages cached backing stores with policy-driven
-eviction, reference-counted leases, and transactional admission.
-:class:`ModelCache` owns dependency leasing, adapter attachment, and device
+:class:`ResourceCache` manages cached backing stores with optional
+policy-driven byte eviction, reference-counted leases, and transactional
+finite-budget admission. :class:`ModelCache` keeps stores until explicit
+eviction and owns dependency leasing, adapter attachment, and device
 activation. Each model offloader rejects overlapping use. Custom
 :class:`EvictionPolicy`
 implementations can replace the default LRU behavior. See its docstring

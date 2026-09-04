@@ -36,7 +36,6 @@ from piper_offload import (
     ParameterValue,
     ParameterValueTransform,
     ResourceNotRegisteredError,
-    ResourceTooLargeError,
     HostComponent,
     AdapterSpec,
     ScaledLoRAFactor,
@@ -582,7 +581,7 @@ class TestLoRAConstruction:
         assert delta.dense is not None
         for backing, source in ((delta.lora.a, a), (delta.lora.b, b), (delta.dense, dense)):
             captured = backing.make_cpu_param()
-            assert captured.data_ptr() != source.data_ptr()
+            assert captured.data_ptr() == source.data_ptr()
             torch.testing.assert_close(captured, source)
         assert delta.cache_bytes == a.nbytes + b.nbytes + dense.nbytes
 
@@ -5047,7 +5046,7 @@ class TestLoRAResource:
             factory_calls["lora"] += 1
             return sd
 
-        cache = ModelCache(10**9)
+        cache = ModelCache()
         lora_spec = AdapterSpec(
             key="lora:style",
             estimated_cache_bytes=1000,
@@ -5132,7 +5131,7 @@ class TestLoRAResource:
             estimated_cache_bytes=1000,
             factory=lambda: PartModel("second"),
         )
-        cache = ModelCache(10**9)
+        cache = ModelCache()
         value = torch.randn(2, 3)
 
         for model_spec, target in (
@@ -5165,7 +5164,7 @@ class TestLoRAResource:
         stochastic_rounding: bool | None,
         expected: bool,
     ) -> None:
-        cache = ModelCache(10**9)
+        cache = ModelCache()
         model_spec = ModelSpec(
             key="model:rounding-forward",
             estimated_cache_bytes=10**6,
@@ -5204,7 +5203,7 @@ class TestLoRAResource:
             factory_calls["model"] += 1
             return _make_bf16_model(num_blocks=2, dim=8).to(torch.float32)
 
-        cache = ModelCache(10**9)
+        cache = ModelCache()
         lora_spec = AdapterSpec(
             key="lora:inactive",
             estimated_cache_bytes=1000,
@@ -5230,7 +5229,7 @@ class TestLoRAResource:
             cache.info("lora:inactive")
 
     def test_cached_lora_can_overlap_across_model_runtimes(self) -> None:
-        cache = ModelCache(10**9)
+        cache = ModelCache()
         lora_spec = AdapterSpec(
             key="lora:shared",
             estimated_cache_bytes=1000,
@@ -5286,7 +5285,7 @@ class TestLoRAResource:
             estimated_cache_bytes=10**6,
             factory=model_factory,
         )
-        cache = ModelCache(10**9)
+        cache = ModelCache()
 
         with pytest.raises(ValueError, match="shorter"):
             with cache.use(
@@ -5326,7 +5325,7 @@ class TestLoRAResource:
             estimated_cache_bytes=10**6,
             factory=model_factory,
         )
-        cache = ModelCache(10**9)
+        cache = ModelCache()
         value = torch.randn(2, 8)
 
         with cache.use(
@@ -5362,18 +5361,18 @@ class TestLoRAResource:
             factory=lambda: _make_bf16_model(num_blocks=2, dim=8).to(torch.float32),
         )
 
-        cache = ModelCache(10_000)
-        with pytest.raises(ResourceTooLargeError):
-            with cache.use(
-                model_spec,
-                device="cpu",
-                adapter_specs=[lora_spec],
-                adapter_mode="routed",
-            ):
-                pass
+        cache = ModelCache()
+        with cache.use(
+            model_spec,
+            device="cpu",
+            adapter_specs=[lora_spec],
+            adapter_mode="routed",
+        ):
+            pass
 
         assert cache.info("lora:style").cached
         assert cache.info("lora:style").lease_count == 0
+        assert cache.info("model").cached
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ from typing import Self
 
 import torch
 
-from .tensor_adapters import clone_to_host_cpu
+from .tensor_adapters import capture_host_tensor
 
 
 @dataclass(slots=True, eq=False)
@@ -16,9 +16,9 @@ class HostBuffer:
     target_layout: tuple[object, ...]
 
     @classmethod
-    def clone(cls, buffer: torch.Tensor) -> Self:
-        """Capture an owned contiguous pageable CPU copy."""
-        tensor = clone_to_host_cpu(
+    def capture(cls, buffer: torch.Tensor) -> Self:
+        """Capture contiguous pageable CPU backing, retaining compatible storage."""
+        tensor = capture_host_tensor(
             buffer,
             memory_format=torch.contiguous_format,
         )

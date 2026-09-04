@@ -64,7 +64,7 @@ class TestGGUFSource:
         assert GgufAdapter.compute_dtype(w) is torch.bfloat16
 
         state = GgufAdapter.capture_host(w)
-        assert state.data.data_ptr() != w.as_tensor().data_ptr()
+        assert state.data.data_ptr() == w.as_tensor().data_ptr()
         torch.testing.assert_close(state.data, w.as_tensor().view(torch.uint8))
         assert state.quant_type == QUANT_TYPE
         assert state.logical_shape == (4, 64)
@@ -88,7 +88,7 @@ class TestGGUFSource:
         assert rebuilt.quant_type == weight.quant_type
         assert rebuilt.quant_shape == weight.quant_shape
         assert rebuilt.as_tensor().data_ptr() == state.data.data_ptr()
-        assert rebuilt.as_tensor().data_ptr() != packed.data_ptr()
+        assert rebuilt.as_tensor().data_ptr() == packed.data_ptr()
         torch.testing.assert_close(rebuilt.as_tensor(), packed)
 
     def test_does_not_match_arbitrary_packed_tensor(self) -> None:

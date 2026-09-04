@@ -465,7 +465,7 @@ def _capture_buffers(
         buffers.keys(),
         lambda name: buffer_tensor_id(buffers[name]),
     ):
-        host = HostBuffer.clone(
+        host = HostBuffer.capture(
             buffers[names[0]],
         )
         for name in names:

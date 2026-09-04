@@ -35,7 +35,7 @@ import torch
 from torch import nn
 
 from .tensor_adapters import (
-    clone_to_host_cpu,
+    capture_host_tensor,
     empty_like_strided,
     optional_tensor_id,
     tensor_layout,
@@ -233,10 +233,10 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         t: torch.Tensor,
     ) -> TorchaoHost[MetaT]:
         w = cls._require(t)
-        # preserve_format (clone_to_host_cpu default): inner-tensor stride
+        # preserve_format (capture_host_tensor default): inner-tensor stride
         # ordering can encode a transposed quantized tensor.
         storage = tuple(
-            clone_to_host_cpu(s) if s is not None else None
+            capture_host_tensor(s) if s is not None else None
             for s in cls._storage_of(w)
         )
         return TorchaoHost(storage=storage, meta=cls._meta_of(w))

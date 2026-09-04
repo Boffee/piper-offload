@@ -1,6 +1,5 @@
 """Tests for ``piper_offload.host_param.HostParam``."""
 
-
 import pytest
 import torch
 from torch import nn
@@ -11,11 +10,15 @@ from piper_offload.tensor_adapters import (
     DequantRequantTensorAdapter,
     LoRAMergeTensorAdapter,
     TensorCopyIntoAdapter,
-    clone_to_host_cpu,
+    capture_host_tensor,
 )
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def _unexpected_allocation(*args: object, **kwargs: object) -> None:
+    raise AssertionError(f"unexpected allocation: {args!r} {kwargs!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -124,44 +127,49 @@ class TestHostParam:
         assert first.storage_offset() != second.storage_offset()
         assert HostParam.target_layout_for(first) != HostParam.target_layout_for(second)
 
-    def test_clone_to_host_cpu_allocates_final_destination_directly(
+    def test_capture_host_tensor_retains_complete_cpu_storage(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         source = torch.arange(12, dtype=torch.float32).reshape(3, 4).t()
-        expected = source.clone(memory_format=torch.preserve_format)
-        real_empty_like = torch.empty_like
-        allocations: list[dict[str, object]] = []
+        monkeypatch.setattr(torch, "empty_like", _unexpected_allocation)
 
-        def tracked_empty_like(
-            source_tensor: torch.Tensor,
-            *args: object,
-            **kwargs: object,
-        ) -> torch.Tensor:
-            allocations.append(dict(kwargs))
-            return real_empty_like(source_tensor, *args, **kwargs)
+        host = capture_host_tensor(source)
 
-        monkeypatch.setattr(torch, "empty_like", tracked_empty_like)
-
-        host = clone_to_host_cpu(source)
-
-        assert len(allocations) == 1
-        assert allocations[0]["device"] == "cpu"
-        assert allocations[0]["pin_memory"] is False
-        assert allocations[0]["memory_format"] is torch.preserve_format
+        assert host.data_ptr() == source.data_ptr()
         assert not host.is_pinned()
-        assert host.stride() == expected.stride()
-        torch.testing.assert_close(host, expected)
+        assert host.stride() == source.stride()
+        torch.testing.assert_close(host, source)
+
+    def test_capture_host_tensor_normalizes_partial_cpu_storage(self) -> None:
+        source = torch.arange(24, dtype=torch.float32).reshape(4, 6)[:, ::2]
+
+        host = capture_host_tensor(source)
+
+        assert host.data_ptr() != source.data_ptr()
+        assert host.untyped_storage().nbytes() == host.numel() * host.element_size()
+        assert host.is_contiguous()
+        torch.testing.assert_close(host, source)
 
     @CUDA
-    def test_clone_to_host_cpu_preserves_cuda_source_stride(self) -> None:
+    def test_capture_host_tensor_preserves_cuda_source_stride(self) -> None:
         source = torch.arange(24, device="cuda").reshape(4, 6)[:, ::2]
 
-        host = clone_to_host_cpu(source)
+        host = capture_host_tensor(source)
 
         assert host.stride() == source.stride()
         assert not host.is_pinned()
         torch.testing.assert_close(host, source.cpu())
+
+    @CUDA
+    def test_capture_host_tensor_normalizes_pinned_cpu_storage(self) -> None:
+        source = torch.arange(24, dtype=torch.float32).pin_memory()
+
+        host = capture_host_tensor(source)
+
+        assert host.data_ptr() != source.data_ptr()
+        assert not host.is_pinned()
+        torch.testing.assert_close(host, source)
 
     def test_select_adapter_returns_adapter_for_plain_tensor(self) -> None:
         first = select_adapter(torch.randn(1))
@@ -250,7 +258,7 @@ class TestHostBuffer:
     def test_target_layout_matches_host_tensor_layout(self) -> None:
         source = torch.randn(2, 3).t()
 
-        host = HostBuffer.clone(source)
+        host = HostBuffer.capture(source)
 
         assert not source.is_contiguous()
         assert host.tensor.is_contiguous()

@@ -327,7 +327,7 @@ class TestHostModuleInstance:
 
         monkeypatch.setattr(torch, "empty_like", fake_empty_like)
         host_param = _FakeHostParam(torch.empty(2, 2))
-        host_buffer = HostBuffer.clone(torch.randn(2))
+        host_buffer = HostBuffer.capture(torch.randn(2))
         store = HostModuleStore(
             params={
                 "left.weight": cast(HostParam, host_param),
@@ -580,7 +580,7 @@ class TestHostModuleInstance:
         module = nn.Module()
         module.register_buffer("running", torch.zeros(2))
         original = module.running
-        host = HostBuffer.clone(torch.ones(2))
+        host = HostBuffer.capture(torch.ones(2))
         store = HostModuleStore(
             params={},
             buffers={"running": host},

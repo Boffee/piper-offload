@@ -139,6 +139,20 @@ class TestConstruction:
         assert cache.used_cache_bytes == 0
         assert cache.available_cache_bytes == 0
 
+    def test_unbounded_cache_retains_all_stores(self) -> None:
+        cache = ResourceCache(None)
+
+        with cache.lease(_spec("a", 75)):
+            pass
+        with cache.lease(_spec("b", 125)):
+            pass
+
+        assert cache.max_cache_bytes is None
+        assert cache.available_cache_bytes is None
+        assert cache.used_cache_bytes == 200
+        assert _is_cached(cache, "a")
+        assert _is_cached(cache, "b")
+
 
 class TestResize:
     def test_grow_preserves_cached_entries(self) -> None:

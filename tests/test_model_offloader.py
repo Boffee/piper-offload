@@ -10,6 +10,7 @@ over the host-backed state.
 import copy
 from collections.abc import Sequence
 from concurrent.futures import Future
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -1327,7 +1328,7 @@ class TestResourceCacheIntegration:
             factory_calls += 1
             return _make_block_model(num_blocks=4, width=8)
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ModelCache()
         spec = ModelSpec(
             key="xformer",
             estimated_cache_bytes=1024,
@@ -1393,7 +1394,7 @@ class TestResourceCacheIntegration:
     def test_model_spec_rejects_nested_use(self) -> None:
         from piper_offload import ModelCache, ModelRuntimeInUseError, ModelSpec
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ModelCache()
         spec = ModelSpec(
             key="xformer",
             estimated_cache_bytes=1024,
@@ -1412,7 +1413,7 @@ class TestResourceCacheIntegration:
     def test_model_cache_deactivates_after_body_error(self) -> None:
         from piper_offload import ModelCache, ModelSpec
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ModelCache()
         spec = ModelSpec(
             key="xformer",
             estimated_cache_bytes=1024,
@@ -1432,13 +1433,46 @@ class TestResourceCacheIntegration:
 
         cache.clear()
 
-    def test_model_cache_is_a_resource_cache(self) -> None:
+    def test_model_cache_is_an_unbounded_resource_cache(self) -> None:
         from piper_offload import ModelCache, ResourceCache
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ModelCache()
 
         assert isinstance(cache, ResourceCache)
-        assert cache.max_cache_bytes == 10_000_000
+        assert cache.max_cache_bytes is None
+
+        with pytest.raises(TypeError):
+            ModelCache(max_cache_bytes=10_000_000)
+
+    def test_model_cache_preserves_factory_file_mapping(self, tmp_path: Path) -> None:
+        from piper_offload import ModelCache, ModelSpec
+
+        path = tmp_path / "weight.bin"
+        path.touch()
+        seed = torch.from_file(str(path), shared=True, size=16, dtype=torch.float32)
+        seed.copy_(torch.arange(16, dtype=torch.float32))
+        del seed
+        captured_pointer = 0
+
+        def factory() -> nn.Module:
+            nonlocal captured_pointer
+            weight = torch.from_file(str(path), shared=False, size=16, dtype=torch.float32).reshape(4, 4)
+            captured_pointer = weight.data_ptr()
+            model = nn.Linear(4, 4, bias=False, device="meta")
+            model.weight = nn.Parameter(weight, requires_grad=False)
+            return model
+
+        cache = ModelCache()
+        spec = ModelSpec(key="mapped", factory=factory)
+
+        with cache.use(spec, device="cpu") as model:
+            assert model.weight.data_ptr() == captured_pointer
+            assert not model.weight.untyped_storage().resizable()
+            torch.testing.assert_close(model(torch.eye(4)), torch.arange(16, dtype=torch.float32).reshape(4, 4).t())
+
+        assert cache.info("mapped").cached
+        assert cache.info("mapped").estimated_cache_bytes == 0
+        cache.clear()
 
     def test_model_spec_trainable_reuses_primary_model(self) -> None:
         from piper_offload import ModelCache, ModelSpec
@@ -1451,7 +1485,7 @@ class TestResourceCacheIntegration:
             factory_calls += 1
             return nn.Linear(8, 8, bias=False)
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ModelCache()
         spec = ModelSpec(
             key="trainable",
             estimated_cache_bytes=1024,
@@ -1471,7 +1505,7 @@ class TestResourceCacheIntegration:
     def test_model_spec_trainable_rejects_nested_binding(self) -> None:
         from piper_offload import ModelCache, ModelRuntimeInUseError, ModelSpec
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ModelCache()
         spec = ModelSpec(
             key="trainable",
             estimated_cache_bytes=1024,

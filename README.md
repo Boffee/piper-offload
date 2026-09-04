@@ -1,8 +1,8 @@
 # Piper Offload
 
 A model-agnostic GPU/CPU memory manager for PyTorch. It caches reusable
-model and adapter resources, and swaps independent models in and out of
-GPU memory under a policy-driven cache.
+model and adapter resources, preserves compatible file-backed CPU mappings,
+and swaps independent models in and out of GPU memory.
 
 Piper Offload is self-contained and library-friendly: it has no required
 dependency beyond `torch`. Optional integrations support `bitsandbytes`,
@@ -82,16 +82,16 @@ across many calls. Re-loading from disk every call is too slow
 (seconds per gigabyte). Keeping all models resident on GPU is too
 expensive. `torch.cuda.empty_cache()` plus `.to("meta")` gets you the
 basics; a shared cache adds reusable host storage, managed activation, and
-block streaming under an application-controlled memory budget.
+block streaming.
 
 This library gives you:
 
 1. **Cached resources** that retain reusable model or adapter state to host RAM.
 2. **Activation lifecycles** that move one cached model onto a compute device.
-3. **A resource cache** that evicts least-recently-used unleased entries and
-   protects leased stores from eviction.
-4. **A model-aware cache** that leases model and adapter resources and owns their
-   device lifecycle.
+3. **A resource cache** with reference-counted leases and optional byte-based
+   eviction.
+4. **An unbounded model cache** that leases model and adapter resources, owns
+   their device lifecycle, and leaves mapped-page residency to the OS.
 
 ## When to use what
 
@@ -109,10 +109,9 @@ This library gives you:
 import torch
 from piper_offload import ModelCache, ModelSpec
 
-cache = ModelCache(max_cache_bytes=24 * 1024**3)
+cache = ModelCache()
 model_spec = ModelSpec(
     key="main",
-    estimated_cache_bytes=12 * 1024**3,
     factory=build_my_model,  # returns a fresh nn.Module
 )
 device = torch.device("cuda")
@@ -125,22 +124,25 @@ with cache.use(model_spec, device=device) as gpu_model:
     output = gpu_model(input_tensor_2)
 ```
 
-`ModelCache` inherits the complete `ResourceCache` API, adding model activation
-and adapter coordination to the same registry and memory budget. `ModelSpec`
-factories should build fresh modules. One model cache entry contains one
+`ModelCache` uses an unbounded `ResourceCache`, adding model activation and
+adapter coordination to its registry and lease API. `ModelSpec` factories
+should build fresh modules. One model cache entry contains one
 `ModelOffloader` and one model instance. Uses are sequential:
 an overlapping activation raises `ModelRuntimeInUseError`. Applications that
 need concurrent replicas must register separately constructed models under
-distinct cache keys, which intentionally duplicates their host storage.
+distinct cache keys. Their file mappings can still share physical OS pages.
 To release host memory, evict or clear inactive cache entries and drop
 any escaped model references.
 
 ### Host backing
 
-Model and adapter capture creates independent pageable CPU copies. Tensor
-adapters preserve packed quantized data, scales, and reconstruction metadata.
-CPU sources are copied just like GPU sources; checkpoint mmap backing is not
-retained. Capture may normalize layouts required by a tensor adapter.
+Model and adapter factories transfer ownership of compatible complete pageable
+CPU allocations to the cached resource. This preserves checkpoint mmap backing
+for loaders that assign mapped tensors directly into the model. Callers must
+not mutate factory-produced tensors after construction. Device tensors, pinned
+CPU tensors, partial allocation views, and incompatible layouts are copied into
+pageable CPU allocations. Tensor adapters preserve packed quantized data,
+scales, and reconstruction metadata.
 
 Host storage is shared by bound wrappers and counted once per stored object.
 Capture does not register memory for accelerated transfers. The old
@@ -204,7 +206,8 @@ Released registrations enter an idle LRU. Budget pressure evicts idle entries;
 active leases remain protected. Discarding a source tensor retires its
 registration once active users finish. Storage remains alive until successful
 unregistration, including after cleanup errors; `clear()` retries failed cleanup
-and evicts idle entries. The model cache independently owns host-data retention.
+and evicts idle entries. `ModelCache` retains host stores until explicit
+eviction; unpinned mapped pages remain reclaimable by the OS.
 Do not resize storage or register/unregister it outside the manager while it is
 managed. Use views of one storage for aliases; distinct overlapping byte ranges
 are rejected before mutation.
@@ -895,9 +898,9 @@ CPU storage, and leaves gradients on GPU.
 
 ## Cached model details
 
-`ResourceCache` owns only reusable-resource admission, accounting, leases, and
-eviction. `ModelCache` inherits that API and adds dependency leasing, adapter
-attachment, and device activation for model uses.
+`ResourceCache` owns reusable-resource registration, accounting, leases, and
+eviction. `ModelCache` uses it without a byte limit and adds dependency
+leasing, adapter attachment, and device activation for model uses.
 
 ```python
 from piper_offload import (
@@ -907,23 +910,20 @@ from piper_offload import (
 )
 from safetensors.torch import load_file
 
-cache = ModelCache(max_cache_bytes=80 * 1024**3)
+cache = ModelCache()
 device = "cuda:0"
 
 text_encoder = ModelSpec(
     key="text_encoder",
-    estimated_cache_bytes=12 * 1024**3,
     factory=build_text_encoder,
 )
 diffusion_model = ModelSpec(
     key="diffusion_model",
-    estimated_cache_bytes=24 * 1024**3,
     factory=build_diffusion_model,
     block_paths=("transformer_blocks",),
 )
 style_lora = AdapterSpec(
     key="style-lora",
-    estimated_cache_bytes=512 * 1024**2,
     factory=lambda: load_file("style.safetensors"),
     dtype=torch.bfloat16,
 )
@@ -947,15 +947,13 @@ exact-name mapping and activate it with `adapter_mode="merge"`:
 ```python
 feature_adapter = AdapterSpec(
     key="feature-adapter",
-    estimated_cache_bytes=512 * 1024**2,
     factory=load_parameter_values,
     dtype=torch.bfloat16,
 )
 ```
 
-The model cache leases adapter resources before admitting the model resource. An
-adapter selected for a use therefore cannot be evicted by that same model admission.
-All leases unwind in reverse order if construction or activation
+The model cache leases adapter resources before the model resource. All leases
+unwind in reverse order if construction or activation
 fails. `adapter_strengths` defaults to `1.0` per adapter; when supplied, it must
 have the same length as `adapter_specs`. Exact `0.0` and `-0.0` strengths are
 inactive: they are filtered before target grouping or hook installation, and
@@ -977,9 +975,9 @@ with cache.lease(style_lora) as lora:  # auto-registers on first lease
 > my_kept_model` the cache is no longer the sole owner of the model.
 > Always have the factory build the model itself.
 
-`ResourceCache` accepts custom `EvictionPolicy` implementations. The
-default is `LRUEvictionPolicy` for unleased host-cache eviction. The
-cache builds the eviction candidate set and byte context, then asks the
+For a finite `ResourceCache`, custom `EvictionPolicy` implementations control
+automatic eviction. The default is `LRUEvictionPolicy` for unleased stores.
+The cache builds the eviction candidate set and byte context, then asks the
 eviction policy to choose victims; `ResourceCache` still owns validation,
 accounting, admission, and release. Policies are called under
 the cache lock. `choose_victims()` must return unique keys from
@@ -998,10 +996,10 @@ registration / cache admission
         |
         v
   +-------------+
-  | ModelCache  |  extends ResourceCache with model-aware use
+  | ModelCache  |  unbounded ResourceCache with model-aware use
   +-------------+
         |
-        +-- builds/admit --> ModelOffloader (one model, one runtime)
+        +-- builds/retains -> ModelOffloader (one model, one runtime)
         |                    |
         |                    +-- HostComponent
         |                    |       |  resident non-block state
@@ -1015,11 +1013,9 @@ registration / cache admission
         |                            |
         |                            +-- HostParam(s)
         |
-        +-- builds/admit --> Adapter (CPU-backed LoRA/parameter values)
+        +-- builds/retains -> Adapter (CPU-backed LoRA/parameter values)
         |
-        +-- builds/admit --> custom ResourceStore
-        |
-        +-- chooses inactive victims via EvictionPolicy
+        +-- builds/retains -> custom ResourceStore
 
 ModelCache.use(...)
 -------------------
@@ -1147,8 +1143,8 @@ for tests and scoped integrations.
 ## Cached resource lifecycle
 
 Cached resources own cache accounting. Host capture happens during construction
-so `cache_bytes` is final at admission time; leases protect resources while
-they are used. `ModelOffloader` owns one exclusive activation lifecycle.
+so `cache_bytes` is final once the store is built; leases protect resources
+while they are used. `ModelOffloader` owns one exclusive activation lifecycle.
 `Adapter` remains immutable host backing throughout its lease:
 
 ```
@@ -1167,14 +1163,13 @@ host storage.
 `deactivate()` releases transient device resources. Host backing remains cached
 until its resource is evicted or otherwise released.
 
-Construction optimizes peak host memory. Capture clones managed tensors
-into CPU storage. For plain `torch.Tensor` parameters, the source
-`Parameter.data` may be immediately repointed at the host clone as soon
-as that host parameter is created. This releases the original source
-storage early, avoiding temporarily holding both source and captured
-copies for CPU-origin models and promptly freeing GPU storage for
-CUDA-origin models. Tensor subclasses such as quanto, GGUF, and NVFP4 do
-not use this `.data` swap when it would lose wrapper state.
+Construction transfers compatible complete pageable CPU allocations and
+preserves their file mappings. Other sources are copied into pageable CPU
+storage. For plain `torch.Tensor` parameters, the source `Parameter.data` may
+be immediately repointed at the captured backing as soon as that host parameter
+is created. This releases replaced source storage early and promptly frees GPU
+storage for CUDA-origin models. Tensor subclasses such as quanto, GGUF, and
+NVFP4 do not use this `.data` swap when it would lose wrapper state.
 
 **There is no `close()`.** To release host memory, first let all
 leases end, then evict or clear the cache entry. Python's refcount-based
@@ -1540,11 +1535,12 @@ than silent corruption.
 
 ## State Inspection
 
-Use `cache.used_cache_bytes` and `cache.available_cache_bytes` for
-current cache accounting. Use `cache.info(key)` for per-key state when
-needed.
+Use `cache.used_cache_bytes` for logical backing accounting and
+`cache.info(key)` for per-key state. `ModelCache.available_cache_bytes` is
+`None` because it has no byte limit; release its inactive stores explicitly
+with `evict()` or `clear()`.
 
-The budget can be changed while the cache is running:
+An explicitly finite `ResourceCache` can change its budget while running:
 
 ```python
 cache.resize(40 * 1024**3)

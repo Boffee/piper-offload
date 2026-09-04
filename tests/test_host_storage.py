@@ -64,7 +64,7 @@ def test_meta_parameter_has_no_physical_storage(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_buffer_enumeration_preserves_shared_storage_and_view_layout() -> None:
-    backing = HostBuffer.clone(torch.arange(12))
+    backing = HostBuffer.capture(torch.arange(12))
     view = backing.tensor[3::2]
     viewed = HostBuffer(view, HostBuffer.target_layout_for(view))
 

@@ -33,8 +33,8 @@ Class-specific caveats
 - **Caller owns lifecycle correctness.** Calling :meth:`activate`
   twice without an intervening :meth:`deactivate` raises before registry
   movement or GPU allocation. Host construction optimizes peak host memory
-  by letting :class:`HostParam` repoint plain ``Parameter.data`` at host
-  clones as each host parameter is created; if construction or activation
+  by letting :class:`HostParam` repoint plain ``Parameter.data`` at captured
+  host backing as each host parameter is created; if construction or activation
   raises after that point, retrying the same model/component is unsupported —
   drop references and rebuild from a fresh model instance.
 - There is no ``close()``. Host memory is freed when the caller
@@ -88,7 +88,7 @@ class HostComponentStore:
         include_param_names: Iterable[str] | None = None,
         include_buffer_names: Iterable[str] | None = None,
     ) -> Self:
-        """Create a reusable store of owned pageable CPU copies."""
+        """Create a reusable store that owns captured pageable CPU backing."""
         return cls(
             HostModuleStore.from_module(
                 model,

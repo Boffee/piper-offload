@@ -49,7 +49,7 @@ from ._bnb import (
 )
 from ._dense_merge import merge_dense_requantize_
 from .tensor_adapters import (
-    clone_to_host_cpu,
+    capture_host_tensor,
     empty_like_strided,
     optional_tensor_id,
     tensor_layout,
@@ -223,10 +223,10 @@ class Bnb8bitAdapter:
     ) -> _Bnb8bitHost:
         qt = require_int8_params(t)
         return _Bnb8bitHost(
-            data=clone_to_host_cpu(
+            data=capture_host_tensor(
                 qt.CB, memory_format=torch.contiguous_format
             ),
-            scb=clone_to_host_cpu(
+            scb=capture_host_tensor(
                 qt.SCB, memory_format=torch.contiguous_format
             ),
         )

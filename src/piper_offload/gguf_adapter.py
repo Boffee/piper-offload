@@ -20,7 +20,7 @@ from torch import nn
 
 from ._piper_convrot_int8 import create_convrot_int8_tensor
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
-from .tensor_adapters import clone_to_host_cpu
+from .tensor_adapters import capture_host_tensor
 
 __all__ = ["GgufAdapter"]
 
@@ -144,7 +144,7 @@ class GgufAdapter:
     ) -> _GgufHost:
         source = _source_data(t)
         logical_shape = _logical_shape(t)
-        data = clone_to_host_cpu(source, memory_format=torch.contiguous_format)
+        data = capture_host_tensor(source, memory_format=torch.contiguous_format)
         quant_type = _quant_type(t)
         return _GgufHost(
             data=data,

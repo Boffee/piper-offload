@@ -60,7 +60,7 @@ from ._quanto import (
     require_qbytes_tensor,
     validate_layout,
 )
-from .tensor_adapters import clone_to_host_cpu
+from .tensor_adapters import capture_host_tensor
 
 try:
     from ._triton_quanto_lora import (
@@ -287,11 +287,11 @@ class QuantoAdapter:
         # stride is captured separately and reapplied when rebuilding the
         # canonical WeightQBytesTensor wrapper.
         return _QuantoHost(
-            data=clone_to_host_cpu(
+            data=capture_host_tensor(
                 qt._data,
                 memory_format=torch.contiguous_format,
             ),
-            scale=clone_to_host_cpu(
+            scale=capture_host_tensor(
                 qt._scale,
                 memory_format=torch.contiguous_format,
             ),

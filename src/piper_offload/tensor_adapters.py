@@ -29,7 +29,9 @@ capability protocols, and plain tensor implementation live here; built-in and
 external adapter selection lives in :mod:`tensor_adapter_registry`.
 """
 
-from collections.abc import Mapping
+import contextlib
+from collections.abc import Generator, Mapping
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -54,12 +56,29 @@ __all__ = [
     "TensorAdapter",
     "TensorCopyIntoAdapter",
     "adapter_name",
-    "clone_to_host_cpu",
+    "capture_host_tensor",
     "empty_like_strided",
     "metadata_key",
     "optional_tensor_id",
     "tensor_layout",
 ]
+
+_force_host_copy: ContextVar[bool] = ContextVar("force_host_copy", default=False)
+
+
+@contextlib.contextmanager
+def independent_host_capture() -> Generator[None]:
+    """Force adapter capture to make independent physical CPU storage.
+
+    Ordinary store construction transfers compatible CPU backing. Permanent
+    parameter values need a distinct representation because later scaling may
+    mutate it; this scope makes every nested structured-storage capture copy.
+    """
+    token = _force_host_copy.set(True)
+    try:
+        yield
+    finally:
+        _force_host_copy.reset(token)
 
 @runtime_checkable
 class TensorAdapter[HostStateT, GpuStateT](Protocol):
@@ -106,10 +125,11 @@ class TensorAdapter[HostStateT, GpuStateT](Protocol):
 
     @staticmethod
     def capture_host(t: torch.Tensor) -> HostStateT:
-        """Capture an independent pageable CPU representation of ``t``.
+        """Capture a pageable CPU representation of ``t``.
 
-        Preserve the encoded data and metadata required by this adapter's
-        movement and reconstruction operations.
+        Implementations may retain compatible complete CPU allocations so
+        file mappings survive capture. Preserve the encoded data and metadata
+        required by this adapter's movement and reconstruction operations.
         """
         ...
 
@@ -205,7 +225,7 @@ class CpuRoundTripTensorAdapter[HostStateT, GpuStateT](
         """Bulk D2H the GPU state's bytes into host storage.
 
         Symmetric counterpart to :meth:`copy_to_gpu`. Used to sync the
-        host clone with post-update GPU contents — e.g., after
+        host backing with post-update GPU contents — e.g., after
         an optimizer step has written into the GPU param, scatter the
         update back to the host state so the next H2D reads it.
 
@@ -518,13 +538,43 @@ class PostLoadRearmTensorAdapter[HostStateT, GpuStateT](
 # ---------------------------------------------------------------------------
 
 
-def clone_to_host_cpu(
+def capture_host_tensor(
     t: torch.Tensor,
     *,
     memory_format: torch.memory_format = torch.preserve_format,
 ) -> torch.Tensor:
-    """Clone ``t`` into owned pageable CPU memory from any source device."""
+    """Transfer ownership of compatible CPU storage or copy into host memory.
+
+    Complete CPU allocations with the requested layout are retained directly.
+    This preserves checkpoint-backed mappings instead of replacing them with
+    anonymous clones. Device tensors and CPU views that expose only part of an
+    allocation are normalized into a new CPU allocation.
+    """
     source = t.detach()
+    owns_complete_storage = False
+    if source.layout is torch.strided:
+        storage_span = 0 if source.numel() == 0 else 1 + sum(
+            (size - 1) * stride
+            for size, stride in zip(source.shape, source.stride(), strict=True)
+        )
+        owns_complete_storage = (
+            source.storage_offset() == 0
+            and source.untyped_storage().nbytes()
+            == storage_span * source.element_size()
+        )
+    requested_layout = (
+        memory_format is torch.preserve_format
+        or source.is_contiguous(memory_format=memory_format)
+    )
+    if (
+        not _force_host_copy.get()
+        and source.device.type == "cpu"
+        and not source.is_pinned()
+        and owns_complete_storage
+        and requested_layout
+    ):
+        return source
+
     # Preserve exact strides for device sources and clone-style layout
     # normalization for CPU sources. Allocate the final host destination once.
     if source.device.type != "cpu" and memory_format == torch.preserve_format:
@@ -687,7 +737,7 @@ class RegularAdapter:
     @staticmethod
     def capture_host(t: torch.Tensor) -> _RegularHost:
         return _RegularHost(
-            data=clone_to_host_cpu(
+            data=capture_host_tensor(
                 t.data,
                 memory_format=torch.contiguous_format,
             )

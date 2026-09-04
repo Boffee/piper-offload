@@ -55,7 +55,7 @@ from ._bnb import (
 )
 from ._dense_merge import merge_dense_requantize_
 from .tensor_adapters import (
-    clone_to_host_cpu,
+    capture_host_tensor,
     empty_like_strided,
     optional_tensor_id,
     tensor_layout,
@@ -312,11 +312,11 @@ class Bnb4bitAdapter:
         stats = quant_stats(qt)
         blob_key = metadata_blob_key(stats)
         return _Bnb4bitHost(
-            data=clone_to_host_cpu(
+            data=capture_host_tensor(
                 qt.data, memory_format=torch.contiguous_format
             ),
             buffers={
-                key: clone_to_host_cpu(
+                key: capture_host_tensor(
                     value, memory_format=torch.contiguous_format
                 )
                 for key, value in stats.items()
@@ -325,7 +325,7 @@ class Bnb4bitAdapter:
             blob_key=blob_key,
             # Metadata blob is tiny, constant, and host-resident — capture it
             # once and inject it at reconstruction; it never DMAs.
-            blob=clone_to_host_cpu(
+            blob=capture_host_tensor(
                 stats[blob_key], memory_format=torch.contiguous_format
             ),
             # The nested double-quant offset is data-dependent but lives in
@@ -333,7 +333,7 @@ class Bnb4bitAdapter:
             # across pooled streamed blocks would keep the wrong offset. Capture
             # it separately and alias it per load like the other scales.
             offset=(
-                clone_to_host_cpu(
+                capture_host_tensor(
                     quant_state.offset, memory_format=torch.contiguous_format
                 )
                 if quant_state.nested

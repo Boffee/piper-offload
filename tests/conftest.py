@@ -33,7 +33,7 @@ def _windows_cuda_current_device_unavailable() -> int:
 if sys.platform == "win32" and not torch.cuda.is_available():
     # CUDA PyTorch wheels can terminate the process with a native access
     # violation when current_device() enters CUDA internals on GPU-less
-    # Windows hosts. Host allocation is guarded in clone_to_host_cpu;
+    # Windows hosts. Host allocation is guarded in capture_host_tensor;
     # guard this remaining direct CUDA entry point for tests as well.
     torch.cuda.current_device = _windows_cuda_current_device_unavailable
 

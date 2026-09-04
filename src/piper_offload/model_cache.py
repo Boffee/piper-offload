@@ -1,9 +1,10 @@
 """Model-aware resource cache.
 
-:class:`ResourceCache` owns resource admission, accounting, leases, and
-eviction. :class:`ModelCache` specializes it with activation-scoped model use,
-including adapter dependency leasing and device activation, while keeping the
-generic cache machinery unaware of models and adapters.
+:class:`ResourceCache` owns resource registration, accounting, leases, and
+explicit eviction. :class:`ModelCache` specializes its unbounded mode with
+activation-scoped model use, including adapter dependency leasing and device
+activation, while keeping the generic cache machinery unaware of models and
+adapters.
 """
 
 import contextlib
@@ -22,10 +23,17 @@ from .resource_specs import AdapterSpec, ModelSpec
 class ModelCache(ResourceCache):
     """Resource cache with model activation and adapter coordination.
 
-    Inherits the complete resource-agnostic cache API. Each model entry owns
+    Inherits the resource-agnostic registry and lease API. Each model entry owns
     one :class:`ModelOffloader` and supports sequential reuse only; overlapping
     uses of the same entry fail regardless of which caller initiates them.
+    Model and adapter stores are retained until explicit eviction. Their
+    compatible CPU tensors preserve factory-supplied file mappings, so the OS
+    controls pageable residency while the independent host-pin budget controls
+    locked pages.
     """
+
+    def __init__(self) -> None:
+        super().__init__(max_cache_bytes=None)
 
     @contextlib.contextmanager
     def use[M: nn.Module](
