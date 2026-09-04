@@ -41,6 +41,7 @@ is not required.
 | Module | Role |
 |---|---|
 | `resource_cache.py` | `ResourceCache`, eviction policy, cache metadata, and cache errors |
+| `pin_manager.py` | `PinManager`, `PinLease`, `PinStats`, and the process-wide `host_pin_manager` for budgeted host registration |
 | `model_cache.py` | `ModelCache` — model-aware `ResourceCache` with activation and adapter coordination |
 | `resource_specs.py` | `ModelSpec`, `AdapterSpec`, `ObjectSpec` — standard frozen resource specifications |
 | `protocols.py` | `ResourceSpec`, `ResourceStore`, `ResourceBinding` plug-in contracts |
@@ -153,6 +154,55 @@ tuple. Consumers must deduplicate underlying allocations themselves. Use
 `tensor.untyped_storage()` for allocation addresses and sizes; a tensor's
 `data_ptr()` and `nbytes` describe its view. Enumeration does not register or
 pin memory.
+
+### Optional host registration
+
+`host_pin_manager` registers existing CPU storage in place under a separate
+`max_pinned_bytes` budget. Its default budget is zero, and construction and
+configuration do not initialize CUDA. Registration is currently explicit;
+model and block runtimes do not yet acquire pin leases automatically.
+
+```python
+import torch
+from piper_offload import host_pin_manager
+
+host_pin_manager.max_pinned_bytes = 4 * 1024**3
+source = torch.randn(1024, 1024)
+target = torch.empty_like(source, device="cuda")
+copy_stream = torch.cuda.Stream()
+
+with host_pin_manager.acquire([source]) as pins:
+    pins.record_stream(copy_stream)  # record before enqueueing, including failure paths
+    with torch.cuda.stream(copy_stream):
+        target.copy_(source, non_blocking=True)
+# Closing the lease waits for recorded streams; source may remain registered in the idle LRU.
+```
+
+For model backing, pass tensors from `HostParam.storage_tensors()` and
+`HostBuffer.storage_tensors()`. Acquiring a lease protects existing
+registrations and registers additional whole allocations when capacity allows.
+Budget or supported runtime-capacity failures leave complete allocations
+pageable. They remain pageable until all their active leases close, even if
+another request arrives after capacity becomes available. A lease reports
+`registered_bytes` and `pageable_bytes` for unique
+requested allocations. `host_pin_manager.stats.pinned_bytes` instead counts
+the union of covered OS pages, including shared boundary pages only once.
+
+Released registrations enter an idle LRU. Budget pressure evicts idle entries;
+active leases remain protected. Discarding a source tensor retires its
+registration once active users finish. Storage remains alive until successful
+unregistration, including after cleanup errors; `clear()` retries failed cleanup
+and evicts idle entries. The model cache independently owns host-data retention.
+Do not resize storage or register/unregister it outside the manager while it is
+managed. Use views of one storage for aliases; distinct overlapping byte ranges
+are rejected before mutation.
+
+The backend binds the CUDA or HIP runtime already loaded by PyTorch. It clears
+errors from handled registration failures and reports unexpected errors through
+`HostRegistrationError`, including conflicting foreign registrations. CUDA
+registration semantics follow the [CUDA memory API](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html);
+the corresponding HIP calls are documented in the
+[HIP runtime API](https://rocm.docs.amd.com/projects/HIP/en/latest/doxygen/html/hip__runtime__api_8h.html).
 
 ## Manual offloader lifecycle
 

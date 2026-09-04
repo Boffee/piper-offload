@@ -7,6 +7,15 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Add `PinManager`, `PinLease`, `PinStats`, and the process-wide
+  `host_pin_manager` for in-place CUDA/HIP host registration. Whole allocations
+  share reference-counted leases and an idle LRU under a page-rounded budget;
+  capacity failures retain pageable backing. Leases wait for recorded streams,
+  source disposal retires registrations, and failed cleanup retains storage
+  and accounting for retry. The native backend clears handled runtime errors
+  without hiding prior GPU failures. Registration is explicit with a zero-byte
+  default budget; streaming integration follows separately.
+
 - Add required `TensorAdapter.storage_tensors(state)` enumeration and expose
   it through `HostParam.storage_tensors()` and `HostBuffer.storage_tensors()`.
   Enumeration returns existing physical CPU tensors, including quantized

@@ -117,6 +117,12 @@ that the adapter can copy and reconstruct without changing its encoding.
 ``storage_tensors(state)`` exposes that state's physical CPU tensors directly,
 including tensor-valued metadata, without copying or rebuilding wrappers.
 
+The process-wide :data:`host_pin_manager` can register that storage in place
+under an explicit page-rounded budget. :class:`PinLease` protects backing
+through recorded stream completion; released registrations enter an idle LRU.
+The default budget is zero, and model runtimes do not yet acquire pin leases
+automatically. Host-data caching remains independent of this registration budget.
+
 :class:`ResourceCache` manages cached backing stores with policy-driven
 eviction, reference-counted leases, and transactional admission.
 :class:`ModelCache` owns dependency leasing, adapter attachment, and device
@@ -143,6 +149,7 @@ Compatibility
   backing may be shared.
 """
 
+from ._host_registration import HostRegistrationError
 from .adapter import Adapter, AdapterMode, AdapterTarget
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent, BlockComponentStore
@@ -160,6 +167,7 @@ from .parameter_value import (
     ParameterValueTransform,
     ScaledParameterValue,
 )
+from .pin_manager import PinLease, PinManager, PinStats, host_pin_manager
 from .protocols import (
     ResourceBinding,
     ResourceSpec,
@@ -204,6 +212,7 @@ __all__ = [
     "EvictionPolicyError",
     "HostComponent",
     "HostComponentStore",
+    "HostRegistrationError",
     "LRUEvictionPolicy",
     "LoRAFactor",
     "LoRATransform",
@@ -218,6 +227,9 @@ __all__ = [
     "ParameterTransform",
     "ParameterValue",
     "ParameterValueTransform",
+    "PinLease",
+    "PinManager",
+    "PinStats",
     "ResourceBinding",
     "ResourceCache",
     "ResourceCachedError",
@@ -232,6 +244,7 @@ __all__ = [
     "ScaledParameterValue",
     "TensorAdapter",
     "derive_seed",
+    "host_pin_manager",
     "merge_adapter",
     "register_adapter",
 ]
