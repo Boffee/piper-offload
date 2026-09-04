@@ -651,22 +651,21 @@ class TestCopyToCpu:
 
     @CUDA
     def test_gguf_lacks_cpu_round_trip_capability(self) -> None:
-        # GGUF stores packed quantized bytes on CPU but dequantized
-        # bf16 on GPU — D2H would require re-quantization, which isn't
-        # implemented. Surface it as NotImplementedError, not a silent
-        # corruption of the pinned packed bytes.
+        # GGUF stores packed source bytes on CPU but a different ConvRot
+        # representation on GPU. D2H would require a reverse conversion,
+        # which isn't implemented. Surface it as NotImplementedError, not a
+        # silent corruption of the pinned packed bytes.
         gguf = pytest.importorskip("gguf")
-        from piper_offload.gguf_adapter import GGUFWeight
+        from tests._gguf_helpers import GGUFParameter
 
         # Build minimal GGUF state directly via the adapter — avoids
         # needing a real .gguf file to load. Q4_0 has the simplest
         # block layout and is broadly supported.
         qt_value = int(gguf.GGMLQuantizationType.Q4_0)
         # Q4_0 packs 32 fp16 weights into an 18-byte block (2 scale + 16 quants).
-        packed = torch.zeros(18, dtype=torch.uint8)
-        gguf_t = GGUFWeight(packed, quant_type=qt_value)
-        p = nn.Parameter(gguf_t, requires_grad=False)
-        pinned_param = PinnedParam(p)
+        packed = torch.zeros((1, 36), dtype=torch.uint8)
+        gguf_t = GGUFParameter(packed, quant_type=qt_value)
+        pinned_param = PinnedParam(gguf_t)
         gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
         with pytest.raises(NotImplementedError, match="CPU round-trip"):
             pinned_param.copy_to_cpu(gpu_state)

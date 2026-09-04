@@ -26,6 +26,7 @@ from .tensor_adapters import (
     DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
     DenseMergeValidationTensorAdapter,
+    LogicalShapeTensorAdapter,
     MergeLocalityTensorAdapter,
     adapter_name,
 )
@@ -344,8 +345,8 @@ class ParameterDeltaTransform:
             ) from exc
         if (
             target.is_meta
-            or type(current_adapter) is not type(plan.adapter)
             or current_adapter.compute_dtype(target) is not plan.compute_dtype
+            or not isinstance(current_adapter, LogicalShapeTensorAdapter)
             or current_adapter.logical_shape(target) != plan.logical_shape
         ):
             raise RuntimeError(

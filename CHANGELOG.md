@@ -5,6 +5,22 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add direct GGUF-to-ConvRot INT8 offload for existing Diffusers
+  `GGUFParameter` objects. Packed GGUF bytes remain in host backing and in a
+  reusable GPU staging buffer; Piper Kernels decodes, rotates, and requantizes
+  directly into reusable BF16 ConvRot INT8 storage on every activation or
+  rolling refill without materializing a dense source weight. The adapter
+  derives the largest compatible ConvRot group size from 256, 64, and 16.
+  Active targets use the existing ConvRot LoRA, dense/mixed merge, and compiled
+  block paths without a target-policy API.
+
+### Removed
+
+- Remove the vendored pure-PyTorch GGUF-to-dense dequantization path in favor
+  of the direct Piper Kernels conversion contract.
+
 ## [0.9.0rc2] - 2026-09-03
 
 ### Added

@@ -136,14 +136,18 @@ def _rolling_quant_weight(kind: str) -> tuple[torch.Tensor, int, torch.dtype]:
     if kind == "gguf-q4-0":
         gguf = pytest.importorskip("gguf")
         np = pytest.importorskip("numpy")
-        from piper_offload.gguf_adapter import GGUFWeight
+        from tests._gguf_helpers import GGUFParameter
 
-        width = 32
+        width = 64
         quant_type = gguf.GGMLQuantizationType.Q4_0
         seed = torch.randint(0, torch.iinfo(torch.int32).max, ()).item()
         dense = np.random.default_rng(seed).standard_normal((width, width), dtype=np.float32)
         packed = torch.from_numpy(gguf.quantize(dense, quant_type))
-        return GGUFWeight(packed, quant_type=int(quant_type)), width, torch.bfloat16
+        return (
+            GGUFParameter(packed, quant_type=int(quant_type)),
+            width,
+            torch.bfloat16,
+        )
     raise AssertionError(f"unknown rolling quant test case {kind!r}")
 
 
@@ -154,7 +158,11 @@ def _rolling_quant_model(kind: str) -> tuple[_BlockModel, int, torch.dtype]:
     for _ in range(3):
         weight, width, dtype = _rolling_quant_weight(kind)
         block = _Block(width=width)
-        block.proj.weight = nn.Parameter(weight, requires_grad=False)
+        block.proj.weight = (
+            weight
+            if isinstance(weight, nn.Parameter)
+            else nn.Parameter(weight, requires_grad=False)
+        )
         blocks.append(block)
     return _BlockModel(blocks=blocks), width, dtype
 
@@ -261,7 +269,7 @@ class TestRollingCompile:
         torch.manual_seed(15)
         x = torch.randn(32, width, device="cuda", dtype=dtype)
         activation: dict[str, object] = {}
-        if quant_kind not in ("torchao-int4-tile", "gguf-q4-0"):
+        if quant_kind != "torchao-int4-tile":
             activation.update(
                 adapters=[_lora(3, width)],
                 adapter_strengths=[0.125],

@@ -140,14 +140,14 @@ def param_representation(param: torch.Tensor) -> torch.Tensor:
 
     For a plain :class:`nn.Parameter` (or bare tensor) this is ``param.data``
     — which for a quant tensor wrapped *inside* a Parameter (TorchAO
-    ``Float8Tensor`` / ``NVFP4Tensor``, quanto ``WeightQBytesTensor``,
-    ``GGUFWeight``) is the wrapped subclass itself, exactly what the adapter
+    ``Float8Tensor`` / ``NVFP4Tensor``, quanto ``WeightQBytesTensor``) is the
+    wrapped subclass itself, exactly what the adapter
     needs.
 
     A Parameter *subclass* that is itself the structured tensor — notably
-    bitsandbytes ``Params4bit``, whose ``.data`` strips the quant state down
-    to plain packed bytes — must be adapted as the object itself, or it would
-    silently dispatch to :class:`RegularAdapter` and lose its quant state.
+    bitsandbytes ``Params4bit`` and Diffusers ``GGUFParameter``, whose ``.data``
+    strips quantization metadata — must be adapted as the object itself, or it
+    would silently dispatch to :class:`RegularAdapter` and lose that state.
     """
     if type(param) is nn.Parameter or type(param) is torch.Tensor:
         return param.data

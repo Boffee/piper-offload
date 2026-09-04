@@ -47,7 +47,7 @@ from piper_offload import (
     derive_seed,
     merge_adapter,
 )
-from piper_offload.gguf_adapter import GgufAdapter
+from piper_offload.int4_tile_adapter import Int4TilePackedAdapter
 from piper_offload.pinned_module import ParameterOverride, PinnedModuleInstance
 from piper_offload.pinned_param import PinnedParam
 from piper_offload.quanto_adapter import QuantoAdapter
@@ -2272,7 +2272,7 @@ class TestLoRATransform:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        class ConversionOnlyAdapter(GgufAdapter):
+        class ConversionOnlyAdapter(Int4TilePackedAdapter):
             @staticmethod
             def dequantize(t: torch.Tensor) -> torch.Tensor:
                 return t
@@ -2282,8 +2282,9 @@ class TestLoRATransform:
                 t: torch.Tensor,
                 *,
                 like: torch.Tensor,
+                rounding_seed: int | None = None,
             ) -> torch.Tensor:
-                del like
+                del like, rounding_seed
                 return t
 
             @staticmethod
