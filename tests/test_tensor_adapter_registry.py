@@ -8,7 +8,6 @@ import pytest
 import torch
 
 from piper_offload import (
-    AdoptableTensorAdapter,
     TensorAdapter,
     register_adapter,
 )
@@ -56,6 +55,18 @@ def _external_tensor() -> _ExternalTensor:
 
 
 class _ExternalAdapter(RegularAdapter):
+    @staticmethod
+    def capture_host(t: torch.Tensor):
+        return RegularAdapter.capture_host(t.as_subclass(torch.Tensor))
+
+    @staticmethod
+    def cpu_param(state, *, requires_grad: bool = False):
+        return torch.nn.Parameter(state.data.as_subclass(_ExternalTensor), requires_grad=requires_grad)
+
+    @staticmethod
+    def gpu_param(host, gpu_state, *, requires_grad: bool = False):
+        return torch.nn.Parameter(gpu_state.data.as_subclass(_ExternalTensor), requires_grad=requires_grad)
+
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
         return isinstance(t, _ExternalTensor)
@@ -178,13 +189,3 @@ def test_dtensor_outer_wrapper_precedes_external_adapters(
 
 def test_tensor_adapter_contract_is_public() -> None:
     assert isinstance(_ExternalAdapter(), TensorAdapter)
-
-
-def test_host_adoption_contract_is_public() -> None:
-    tensor = _external_tensor()
-    adapter = _ExternalAdapter()
-
-    assert isinstance(adapter, AdoptableTensorAdapter)
-    state = adapter.adopt_host(tensor)
-
-    assert state.data.data_ptr() == tensor.data_ptr()

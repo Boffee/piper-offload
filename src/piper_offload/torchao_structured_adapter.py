@@ -4,7 +4,7 @@ TorchAO represents each quantized weight as a tensor subclass wrapping a
 handful of inner storage tensors (packed elements + scales) plus opaque
 dispatch metadata. Moving such a weight across the CPU<->GPU boundary is
 the same mechanical dance for every format: clone each inner tensor into
-pinned host memory, allocate stride-matching GPU storage, bulk-copy, and
+host memory, allocate stride-matching GPU storage, bulk-copy, and
 rebuild the wrapper from storage + a metadata snapshot. Only a few things
 vary per format: which inner tensors exist (and whether some are
 optional), how the wrapper is reconstructed, the identity/layout metadata
@@ -28,7 +28,6 @@ defines the extra methods advertises exactly those capabilities.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -36,8 +35,7 @@ import torch
 from torch import nn
 
 from .tensor_adapters import (
-    adopt_cpu_storage,
-    clone_to_pinned_cpu,
+    capture_host_tensor,
     empty_like_strided,
     optional_tensor_id,
     tensor_layout,
@@ -45,15 +43,15 @@ from .tensor_adapters import (
 
 __all__ = [
     "TorchaoGpu",
-    "TorchaoPinned",
+    "TorchaoHost",
     "TorchaoStructuredAdapter",
     "copy_storage",
 ]
 
 
 @dataclass(slots=True, frozen=True)
-class TorchaoPinned[MetaT]:
-    """Pinned-CPU state for a TorchAO structured tensor.
+class TorchaoHost[MetaT]:
+    """CPU state for a TorchAO structured tensor.
 
     ``storage`` holds the inner storage tensors positionally, parallel to
     the adapter's ``_STORAGE_NAMES``; an entry is ``None`` for an absent
@@ -68,7 +66,7 @@ class TorchaoPinned[MetaT]:
 @dataclass(slots=True, frozen=True)
 class TorchaoGpu:
     """GPU state for a TorchAO structured tensor: device storage only;
-    metadata lives in the originating :class:`TorchaoPinned`."""
+    metadata lives in the originating :class:`TorchaoHost`."""
 
     storage: tuple[torch.Tensor | None, ...]
 
@@ -230,31 +228,26 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         )
 
     @classmethod
-    def clone_pin(cls, t: torch.Tensor) -> TorchaoPinned[MetaT]:
-        return cls._host_state(t, clone_to_pinned_cpu)
-
-    @classmethod
-    def adopt_host(cls, t: torch.Tensor) -> TorchaoPinned[MetaT]:
-        return cls._host_state(t, adopt_cpu_storage)
-
-    @classmethod
-    def _host_state(
+    def capture_host(
         cls,
         t: torch.Tensor,
-        clone: Callable[..., torch.Tensor],
-    ) -> TorchaoPinned[MetaT]:
+    ) -> TorchaoHost[MetaT]:
         w = cls._require(t)
-        # preserve_format (clone_to_pinned_cpu default): inner-tensor stride
+        # preserve_format (capture_host_tensor default): inner-tensor stride
         # ordering can encode a transposed quantized tensor.
         storage = tuple(
-            clone(s) if s is not None else None
+            capture_host_tensor(s) if s is not None else None
             for s in cls._storage_of(w)
         )
-        return TorchaoPinned(storage=storage, meta=cls._meta_of(w))
+        return TorchaoHost(storage=storage, meta=cls._meta_of(w))
+
+    @staticmethod
+    def storage_tensors(state: TorchaoHost[MetaT]) -> tuple[torch.Tensor, ...]:
+        return tuple(tensor for tensor in state.storage if tensor is not None)
 
     @classmethod
     def cpu_param(
-        cls, state: TorchaoPinned[MetaT], *, requires_grad: bool = False
+        cls, state: TorchaoHost[MetaT], *, requires_grad: bool = False
     ) -> nn.Parameter:
         return nn.Parameter(
             cls._reconstruct(state.storage, state.meta),
@@ -263,7 +256,7 @@ class TorchaoStructuredAdapter[MetaT](ABC):
 
     @classmethod
     def alloc_gpu(
-        cls, state: TorchaoPinned[MetaT], device: torch.device
+        cls, state: TorchaoHost[MetaT], device: torch.device
     ) -> TorchaoGpu:
         return TorchaoGpu(
             storage=tuple(
@@ -275,20 +268,20 @@ class TorchaoStructuredAdapter[MetaT](ABC):
     @classmethod
     def gpu_param(
         cls,
-        pinned: TorchaoPinned[MetaT],
+        host: TorchaoHost[MetaT],
         gpu_state: TorchaoGpu,
         *,
         requires_grad: bool = False,
     ) -> nn.Parameter:
         return nn.Parameter(
-            cls._reconstruct(gpu_state.storage, pinned.meta),
+            cls._reconstruct(gpu_state.storage, host.meta),
             requires_grad=requires_grad,
         )
 
     @classmethod
     def copy_to_gpu(
         cls,
-        src: TorchaoPinned[MetaT],
+        src: TorchaoHost[MetaT],
         dst: TorchaoGpu,
         *,
         non_blocking: bool = False,
@@ -296,7 +289,7 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         copy_storage(src.storage, dst.storage, non_blocking=non_blocking)
 
     @classmethod
-    def cache_bytes(cls, state: TorchaoPinned[MetaT]) -> int:
+    def cache_bytes(cls, state: TorchaoHost[MetaT]) -> int:
         return sum(s.nbytes for s in state.storage if s is not None)
 
     @classmethod

@@ -68,7 +68,7 @@ def register_adapter(
     :class:`TensorAdapter` protocol and be constructible without arguments.
 
     Registration is process-global and intended for application startup,
-    before constructing models or pinned resources. Returns an idempotent
+    before constructing models or host resources. Returns an idempotent
     callable that removes this registration, primarily for tests and scoped
     integrations.
     """

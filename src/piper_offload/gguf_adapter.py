@@ -12,7 +12,6 @@ dependency or introducing another parameter wrapper.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -21,7 +20,7 @@ from torch import nn
 
 from ._piper_convrot_int8 import create_convrot_int8_tensor
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
-from .tensor_adapters import adopt_cpu_storage, clone_to_pinned_cpu
+from .tensor_adapters import capture_host_tensor
 
 __all__ = ["GgufAdapter"]
 
@@ -90,7 +89,7 @@ def _convrot_group_size(features: int) -> int:
 
 
 @dataclass(slots=True, frozen=True)
-class _GgufPinned:
+class _GgufHost:
     data: torch.Tensor
     quant_type: int
     logical_shape: tuple[int, int]
@@ -140,33 +139,28 @@ class GgufAdapter:
         )
 
     @staticmethod
-    def clone_pin(t: torch.Tensor) -> _GgufPinned:
-        return GgufAdapter._host_state(t, clone_to_pinned_cpu)
-
-    @staticmethod
-    def adopt_host(t: torch.Tensor) -> _GgufPinned:
-        return GgufAdapter._host_state(t, adopt_cpu_storage)
-
-    @staticmethod
-    def _host_state(
-        tensor: torch.Tensor,
-        capture: Callable[..., torch.Tensor],
-    ) -> _GgufPinned:
-        source = _source_data(tensor)
-        logical_shape = _logical_shape(tensor)
-        data = capture(source, memory_format=torch.contiguous_format)
-        quant_type = _quant_type(tensor)
-        return _GgufPinned(
+    def capture_host(
+        t: torch.Tensor,
+    ) -> _GgufHost:
+        source = _source_data(t)
+        logical_shape = _logical_shape(t)
+        data = capture_host_tensor(source, memory_format=torch.contiguous_format)
+        quant_type = _quant_type(t)
+        return _GgufHost(
             data=data,
             quant_type=quant_type,
             logical_shape=logical_shape,
             group_size=_convrot_group_size(logical_shape[1]),
-            parameter_type=cast(type[nn.Parameter], type(tensor)),
+            parameter_type=cast(type[nn.Parameter], type(t)),
         )
 
     @staticmethod
+    def storage_tensors(state: _GgufHost) -> tuple[torch.Tensor, ...]:
+        return (state.data,)
+
+    @staticmethod
     def cpu_param(
-        state: _GgufPinned,
+        state: _GgufHost,
         *,
         requires_grad: bool = False,
     ) -> nn.Parameter:
@@ -182,7 +176,7 @@ class GgufAdapter:
         return parameter
 
     @staticmethod
-    def alloc_gpu(state: _GgufPinned, device: torch.device) -> _GgufGpu:
+    def alloc_gpu(state: _GgufHost, device: torch.device) -> _GgufGpu:
         rows, features = state.logical_shape
         return _GgufGpu(
             staging=torch.empty_like(state.data, device=device),
@@ -196,19 +190,19 @@ class GgufAdapter:
 
     @staticmethod
     def gpu_param(
-        pinned: _GgufPinned,
+        host: _GgufHost,
         gpu_state: _GgufGpu,
         *,
         requires_grad: bool = False,
     ) -> nn.Parameter:
-        del pinned
+        del host
         if requires_grad:
             raise ValueError("GGUF parameters are inference-only")
         return nn.Parameter(gpu_state.target, requires_grad=False)
 
     @staticmethod
     def copy_to_gpu(
-        src: _GgufPinned,
+        src: _GgufHost,
         dst: _GgufGpu,
         *,
         non_blocking: bool = False,
@@ -276,5 +270,5 @@ class GgufAdapter:
         )
 
     @staticmethod
-    def cache_bytes(state: _GgufPinned) -> int:
+    def cache_bytes(state: _GgufHost) -> int:
         return state.data.nbytes

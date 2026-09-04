@@ -21,11 +21,11 @@ from piper_offload import (
 )
 from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from piper_offload.dtensor_adapter import DTensorAdapter
-from piper_offload.pinned_module import PinnedModuleStore
-from piper_offload.pinned_param import PinnedParam
+from piper_offload.host_module import HostModuleStore
+from piper_offload.host_param import HostParam
 from piper_offload.block_component import (
     _param_target_layout,
-    _pin_block_module_stores,
+    _capture_block_module_stores,
 )
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
@@ -141,25 +141,25 @@ class TestPiperConvRotInt8Adapter:
             ((8, 1), torch.float32, (1, 1)),
         )
 
-    def test_pin_preserves_storage_metadata_shape_and_cache_bytes(self) -> None:
+    def test_capture_preserves_storage_metadata_shape_and_cache_bytes(self) -> None:
         convrot_cls = _convrot_cls()
         source = _make_convrot(dtype=torch.float16)
-        pinned_param = PinnedParam(nn.Parameter(source, requires_grad=False))
-        pinned = pinned_param.make_cpu_param().data
+        host_param = HostParam(nn.Parameter(source, requires_grad=False))
+        host = host_param.make_cpu_param().data
 
-        assert isinstance(pinned, convrot_cls)
-        assert pinned.qdata.is_pinned()
-        assert pinned.scale.is_pinned()
-        assert pinned.qdata.data_ptr() == pinned_param.pinned_state.storage[0].data_ptr()
-        assert pinned.scale.data_ptr() == pinned_param.pinned_state.storage[1].data_ptr()
-        assert pinned.group_size == 64
-        assert pinned.dtype is torch.float16
-        assert tuple(pinned.shape) == (8, 64)
-        assert pinned_param.adapter.logical_shape(pinned) == (8, 64)
-        assert pinned_param.compute_dtype is torch.float16
-        assert pinned_param.cache_bytes == source.qdata.nbytes + source.scale.nbytes
-        assert torch.equal(pinned.qdata, source.qdata)
-        assert torch.equal(pinned.scale, source.scale)
+        assert isinstance(host, convrot_cls)
+        assert not host.qdata.is_pinned()
+        assert not host.scale.is_pinned()
+        assert host.qdata.data_ptr() == host_param.host_state.storage[0].data_ptr()
+        assert host.scale.data_ptr() == host_param.host_state.storage[1].data_ptr()
+        assert host.group_size == 64
+        assert host.dtype is torch.float16
+        assert tuple(host.shape) == (8, 64)
+        assert host_param.adapter.logical_shape(host) == (8, 64)
+        assert host_param.compute_dtype is torch.float16
+        assert host_param.cache_bytes == source.qdata.nbytes + source.scale.nbytes
+        assert torch.equal(host.qdata, source.qdata)
+        assert torch.equal(host.scale, source.scale)
 
     def test_streamed_prevalidation_does_not_retain_source_wrappers(
         self,
@@ -175,18 +175,18 @@ class TestPiperConvRotInt8Adapter:
 
         blocks = [Block(), Block()]
         first_source_ref = weakref.ref(blocks[0].weight)
-        original_from_module = PinnedModuleStore.from_module
+        original_from_module = HostModuleStore.from_module
         calls = 0
 
         @classmethod
         def tracked_from_module(
-            cls: type[PinnedModuleStore],
+            cls: type[HostModuleStore],
             module: nn.Module,
             **kwargs: object,
-        ) -> PinnedModuleStore:
+        ) -> HostModuleStore:
             nonlocal calls
             if calls == 1:
-                # The first block has already installed its pinned wrapper.
+                # The first block has already installed its host wrapper.
                 # Pre-validation must not keep the replaced source wrapper
                 # (and therefore its original qdata/scale storage) alive.
                 assert first_source_ref() is None
@@ -194,33 +194,16 @@ class TestPiperConvRotInt8Adapter:
             return original_from_module(module, **kwargs)
 
         monkeypatch.setattr(
-            PinnedModuleStore,
+            HostModuleStore,
             "from_module",
             tracked_from_module,
         )
 
-        stores = _pin_block_module_stores(blocks)
+        stores = _capture_block_module_stores(blocks)
 
         assert len(stores) == 2
         assert calls == 2
         assert first_source_ref() is None
-
-    def test_adopted_backing_retains_storage_and_metadata(self) -> None:
-        source = _make_convrot(dtype=torch.float16)
-        pageable_param = PinnedParam(
-            nn.Parameter(source, requires_grad=False),
-            pin_memory=False,
-        )
-        pageable = pageable_param.make_cpu_param().data
-
-        assert not pageable.qdata.is_pinned()
-        assert not pageable.scale.is_pinned()
-        assert pageable.qdata.data_ptr() == source.qdata.data_ptr()
-        assert pageable.scale.data_ptr() == source.scale.data_ptr()
-        assert pageable.group_size == source.group_size
-        assert pageable.dtype is source.dtype
-        assert torch.equal(pageable.qdata, source.qdata)
-        assert torch.equal(pageable.scale, source.scale)
 
     def test_tensor_id_tracks_storage_group_size_and_logical_dtype(self) -> None:
         qdata = torch.randint(-127, 128, (8, 64), dtype=torch.int8)
@@ -271,7 +254,7 @@ class TestPiperConvRotInt8Adapter:
             ),
         )
 
-        store = PinnedModuleStore.from_module(module)
+        store = HostModuleStore.from_module(module)
 
         assert store.params["first"] is store.params["second"]
         assert module.first is module.second
@@ -359,7 +342,6 @@ class TestPiperConvRotInt8Adapter:
         scale_ptr = convrot.scale.data_ptr()
         adapter = Adapter.from_state_dict(
             state_dict,
-            host_backing="adopt",
         )
 
         assert (
@@ -425,7 +407,6 @@ class TestPiperConvRotInt8Adapter:
         strength = -0.25
         adapter = Adapter.from_state_dict(
             {"weight": source},
-            host_backing="adopt",
             scale_parameter_values=scale_with_strength,
         )
         value = adapter.targets["weight"]
@@ -483,7 +464,6 @@ class TestPiperConvRotInt8Adapter:
         monkeypatch.setattr(convrot_cls, "add_", recording_add)
         adapter = Adapter.from_state_dict(
             {"weight": source},
-            host_backing="adopt",
             scale_parameter_values=True,
         )
         model = nn.Module()
@@ -636,14 +616,14 @@ class TestPiperConvRotInt8Adapter:
         assert isinstance(adapter, DenseMergeTargetValidationTensorAdapter)
         assert not isinstance(adapter, ParameterDataSwapTensorAdapter)
 
-        pinned_param = PinnedParam(
+        host_param = HostParam(
             nn.Parameter(_make_convrot(), requires_grad=True),
         )
-        state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
+        state = host_param.allocate_gpu_storage(torch.device("cpu"))
         with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            pinned_param.copy_to_cpu(state)
+            host_param.copy_to_cpu(state)
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            pinned_param.validate_parameter_data_swap_target()
+            host_param.validate_parameter_data_swap_target()
 
     def test_dense_merge_fails_clearly_when_kernel_add_is_unavailable(
         self,
@@ -660,11 +640,11 @@ class TestPiperConvRotInt8Adapter:
     def test_allocate_copy_and_reconstruct_gpu_wrapper(self) -> None:
         convrot_cls = _convrot_cls()
         source = _make_convrot(dtype=torch.float32)
-        pinned_param = PinnedParam(nn.Parameter(source, requires_grad=False))
+        host_param = HostParam(nn.Parameter(source, requires_grad=False))
 
-        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
-        gpu_param = pinned_param.make_gpu_param(gpu_state)
-        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
+        gpu_param = host_param.make_gpu_param(gpu_state)
+        host_param.copy_to_gpu(gpu_state, non_blocking=True)
         torch.cuda.synchronize()
 
         assert isinstance(gpu_param.data, convrot_cls)
@@ -722,12 +702,10 @@ class TestPiperConvRotInt8Adapter:
         model.requires_grad_(False)
         value = Adapter.from_state_dict(
             {"weight": source},
-            host_backing="adopt",
             scale_parameter_values=True,
         )
         offloader = ModelOffloader.from_module(
             model,
-            host_backing="adopt",
         )
 
         with activated_model(
@@ -755,9 +733,8 @@ class TestPiperConvRotInt8Adapter:
         source = _make_convrot()
         adapter = Adapter.from_state_dict(
             {"left.weight": source},
-            host_backing="adopt",
         )
-        offloader = ModelOffloader.from_module(model, host_backing="adopt")
+        offloader = ModelOffloader.from_module(model)
 
         with activated_model(offloader, "cuda", adapters=[adapter]):
             assert model.left.weight is model.right.weight
@@ -780,9 +757,8 @@ class TestPiperConvRotInt8Adapter:
                 "left.weight": source,
                 "right.weight": source,
             },
-            host_backing="adopt",
         )
-        offloader = ModelOffloader.from_module(model, host_backing="adopt")
+        offloader = ModelOffloader.from_module(model)
 
         with activated_model(offloader, "cuda", adapters=[adapter]):
             assert model.left.weight is not model.right.weight
@@ -813,7 +789,6 @@ class TestPiperConvRotInt8Adapter:
         source = _make_convrot()
         adapter = Adapter.from_state_dict(
             {"blocks.1.weight": source},
-            host_backing="adopt",
         )
         model = M()
         offloader = ModelOffloader.from_module(
@@ -821,7 +796,6 @@ class TestPiperConvRotInt8Adapter:
             block_paths=("blocks",),
             block_mode="rolling",
             block_compile=BlockCompileConfig(dynamic=False, fullgraph=True),
-            host_backing="adopt",
         )
         inputs = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
         expected = torch.nn.functional.linear(inputs, source.clone().cuda())
@@ -871,7 +845,6 @@ class TestPiperConvRotInt8Adapter:
                 f"blocks.{idx}.weight": source
                 for idx, source in enumerate(sources)
             },
-            host_backing="adopt",
             scale_parameter_values=True,
         )
         model = M()
@@ -885,7 +858,6 @@ class TestPiperConvRotInt8Adapter:
             block_paths=("blocks",),
             block_mode=block_mode,  # type: ignore[arg-type]
             block_compile=compile_config,
-            host_backing="adopt",
         )
         inputs = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
         expected = inputs

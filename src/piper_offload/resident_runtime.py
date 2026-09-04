@@ -8,7 +8,7 @@ import torch
 
 from .block_compile import CompileBackend
 from .block_runtime import validate_load_plans
-from .pinned_module import PinnedModuleInstance, PinnedModuleLoadPlan
+from .host_module import HostModuleInstance, HostModuleLoadPlan
 from .target_lease import CudaTargetLease
 
 logger = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ class ResidentBlockRuntime:
 
     def __init__(
         self,
-        instances: Sequence[PinnedModuleInstance],
+        instances: Sequence[HostModuleInstance],
     ) -> None:
         self._instances = tuple(instances)
         self._device: torch.device | None = None
@@ -38,7 +38,7 @@ class ResidentBlockRuntime:
     def acquire(
         self,
         device: torch.device,
-        load_plans: Sequence[PinnedModuleLoadPlan],
+        load_plans: Sequence[HostModuleLoadPlan],
     ) -> None:
         if self.acquired:
             raise RuntimeError("resident block runtime is already acquired")
@@ -82,7 +82,7 @@ class ResidentBlockRuntime:
 
         for instance in self._instances:
             try:
-                instance.install_pinned()
+                instance.install_host()
                 instance.move_trainable_grads_to(torch.device("cpu"))
             except BaseException as exc:
                 if first_error is None:

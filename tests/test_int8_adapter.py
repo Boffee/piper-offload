@@ -15,7 +15,7 @@ from piper_offload import (
     merge_adapter,
 )
 from piper_offload.int8_adapter import Int8Adapter
-from piper_offload.pinned_param import PinnedParam
+from piper_offload.host_param import HostParam
 from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from tests.conftest import activated_model
@@ -211,26 +211,26 @@ class TestInt8Adapter:
         # from the other TorchAO structured adapters in the dispatch order).
         assert isinstance(select_adapter(qt), Int8Adapter)
 
-    def test_pin_preserves_storage_and_metadata(self) -> None:
+    def test_capture_preserves_storage_and_metadata(self) -> None:
         int8_cls = _int8_tensor_cls()
         qt = _make_int8()
-        pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
+        host_param = HostParam(nn.Parameter(qt, requires_grad=False))
 
-        pinned = pinned_param.make_cpu_param().data
-        assert isinstance(pinned, int8_cls)
-        assert pinned.qdata.is_pinned()
-        assert pinned.scale.is_pinned()
-        assert pinned.qdata.data_ptr() == pinned_param.pinned_state.storage[0].data_ptr()
-        assert pinned.scale.data_ptr() == pinned_param.pinned_state.storage[1].data_ptr()
+        host = host_param.make_cpu_param().data
+        assert isinstance(host, int8_cls)
+        assert not host.qdata.is_pinned()
+        assert not host.scale.is_pinned()
+        assert host.qdata.data_ptr() == host_param.host_state.storage[0].data_ptr()
+        assert host.scale.data_ptr() == host_param.host_state.storage[1].data_ptr()
         if qt.zero_point is not None:
-            assert pinned.zero_point is not None
-            assert pinned.zero_point.is_pinned()
-            assert pinned.zero_point.data_ptr() == pinned_param.pinned_state.storage[2].data_ptr()
-        assert pinned.block_size == qt.block_size
-        assert pinned.dtype == qt.dtype
-        assert pinned.reduce_range == qt.reduce_range
-        assert pinned_param.compute_dtype is torch.bfloat16
-        assert torch.equal(pinned.dequantize(), qt.dequantize())
+            assert host.zero_point is not None
+            assert not host.zero_point.is_pinned()
+            assert host.zero_point.data_ptr() == host_param.host_state.storage[2].data_ptr()
+        assert host.block_size == qt.block_size
+        assert host.dtype == qt.dtype
+        assert host.reduce_range == qt.reduce_range
+        assert host_param.compute_dtype is torch.bfloat16
+        assert torch.equal(host.dequantize(), qt.dequantize())
 
     def test_tensor_id_tracks_buffers(self) -> None:
         qt = _make_int8()
@@ -276,25 +276,25 @@ class TestInt8Adapter:
         assert again.qdata.min().item() >= -64
         assert again.qdata.max().item() <= 63
 
-        pinned = (
-            PinnedParam(
+        host = (
+            HostParam(
                 nn.Parameter(reduced_range, requires_grad=False),
             )
             .make_cpu_param()
             .data
         )
-        assert pinned.reduce_range is True
+        assert host.reduce_range is True
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
-        pinned_param = PinnedParam(
+        host_param = HostParam(
             nn.Parameter(_make_int8(), requires_grad=True),
         )
-        state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
+        state = host_param.allocate_gpu_storage(torch.device("cpu"))
 
         with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            pinned_param.copy_to_cpu(state)
+            host_param.copy_to_cpu(state)
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            pinned_param.validate_parameter_data_swap_target()
+            host_param.validate_parameter_data_swap_target()
 
     @pytest.mark.parametrize("dynamic_activation", [False, True])
     def test_dequantize_requantize_preserves_representation(self, dynamic_activation: bool) -> None:
@@ -1180,8 +1180,8 @@ class TestInt8Adapter:
         x = torch.randn(4, 16, dtype=torch.bfloat16)
         ref = torch.nn.functional.linear(x, qt)
 
-        pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
-        reconstructed = pinned_param.make_cpu_param().data
+        host_param = HostParam(nn.Parameter(qt, requires_grad=False))
+        reconstructed = host_param.make_cpu_param().data
         assert isinstance(reconstructed, int8_cls)
         out = torch.nn.functional.linear(x, reconstructed)
         torch.testing.assert_close(out, ref)
@@ -1190,24 +1190,24 @@ class TestInt8Adapter:
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:
         int8_cls = _int8_tensor_cls()
         qt = _make_int8()
-        pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
+        host_param = HostParam(nn.Parameter(qt, requires_grad=False))
 
-        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
-        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
-        gpu_param = pinned_param.make_gpu_param(gpu_state)
+        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
+        host_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu_param = host_param.make_gpu_param(gpu_state)
         torch.cuda.synchronize()
-        pinned = pinned_param.make_cpu_param().data
+        host = host_param.make_cpu_param().data
 
         assert isinstance(gpu_param.data, int8_cls)
         assert gpu_param.data.qdata.is_cuda
         assert gpu_param.data.scale.is_cuda
-        assert gpu_param.data.block_size == pinned.block_size
-        assert gpu_param.data.dtype == pinned.dtype
-        assert torch.equal(gpu_param.data.qdata.cpu(), pinned.qdata)
-        assert torch.equal(gpu_param.data.scale.cpu(), pinned.scale)
-        if pinned.zero_point is not None:
+        assert gpu_param.data.block_size == host.block_size
+        assert gpu_param.data.dtype == host.dtype
+        assert torch.equal(gpu_param.data.qdata.cpu(), host.qdata)
+        assert torch.equal(gpu_param.data.scale.cpu(), host.scale)
+        if host.zero_point is not None:
             assert gpu_param.data.zero_point is not None
-            assert torch.equal(gpu_param.data.zero_point.cpu(), pinned.zero_point)
+            assert torch.equal(gpu_param.data.zero_point.cpu(), host.zero_point)
 
     @CUDA
     @pytest.mark.parametrize("dynamic_activation", [False, True])

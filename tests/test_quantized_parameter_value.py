@@ -119,7 +119,6 @@ def test_quantized_parameter_value_uses_dense_merge_support(
 
     adapter = Adapter.from_state_dict(
         {"weight": source},
-        host_backing="adopt",
         scale_parameter_values=True,
     )
     value = adapter.targets["weight"]
@@ -129,7 +128,7 @@ def test_quantized_parameter_value_uses_dense_merge_support(
         torch.empty(value.backing.logical_shape, device="meta"),
         requires_grad=False,
     )
-    offloader = ModelOffloader.from_module(model, host_backing="adopt")
+    offloader = ModelOffloader.from_module(model)
 
     with activated_model(
         offloader,
@@ -162,7 +161,6 @@ def test_quantized_parameter_value_permanent_scaling(kind: str) -> None:
     dense_source = source_adapter.dequantize(source).cpu()
     adapter = Adapter.from_state_dict(
         {"weight": source},
-        host_backing="adopt",
         scale_parameter_values=True,
     )
     value = adapter.targets["weight"]
@@ -196,23 +194,20 @@ def test_structured_parameter_value_dtype_is_representation_owned() -> None:
     value = ParameterValue.from_tensor(
         source,
         dtype=source.dtype,
-        pin_memory=False,
     )
 
     assert value.backing.compute_dtype is source.dtype
-    adopted = Adapter.from_state_dict(
+    adapter = Adapter.from_state_dict(
         {"weight": source},
         dtype=source.dtype,
-        host_backing="adopt",
     )
-    adopted_value = adopted.targets["weight"]
-    assert isinstance(adopted_value, ParameterValue)
-    assert adopted_value.backing.compute_dtype is source.dtype
+    captured_value = adapter.targets["weight"]
+    assert isinstance(captured_value, ParameterValue)
+    assert captured_value.backing.compute_dtype is source.dtype
     with pytest.raises(ValueError, match="Prequantize"):
         ParameterValue.from_tensor(
             source,
             dtype=torch.float16,
-            pin_memory=False,
         )
 
 
@@ -232,7 +227,6 @@ def test_auto_mode_falls_back_for_incompatible_value_adapter() -> None:
         block_paths=("blocks",),
         block_mode="auto",
         block_compile=BlockCompileConfig(fullgraph=True),
-        host_backing="adopt",
     )
     component = block_components(offloader)[0]
     assert component.block_mode == "rolling"
@@ -250,7 +244,6 @@ def test_auto_mode_falls_back_for_incompatible_value_adapter() -> None:
                 )
                 for idx in range(2)
             },
-            host_backing="adopt",
         )
         offloader.activate("cuda", adapters=[incompatible])
         assert component._active_runtime is component._eager_runtime

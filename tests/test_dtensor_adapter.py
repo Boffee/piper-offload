@@ -24,7 +24,7 @@ from piper_offload import (
 )
 from piper_offload.dtensor_adapter import DTensorAdapter
 from piper_offload.int8_adapter import Int8Adapter
-from piper_offload.pinned_param import PinnedParam
+from piper_offload.host_param import HostParam
 from piper_offload.tensor_adapters import (
     CpuRoundTripTensorAdapter,
     DenseMergeTargetValidationTensorAdapter,
@@ -107,28 +107,38 @@ class TestDTensorAdapter:
 
     def test_delegates_local_shard_to_inner_adapter(self, tp_mesh: Any) -> None:
         dt, _ = _dtensor_weight(tp_mesh)
-        pinned_param = PinnedParam(nn.Parameter(dt, requires_grad=False))
+        host_param = HostParam(nn.Parameter(dt, requires_grad=False))
         # A plain local shard is moved by the registry's RegularAdapter — the
         # DTensorAdapter only adds the distributed wrapper on top.
-        assert isinstance(pinned_param.pinned_state.inner, RegularAdapter)
-        assert isinstance(pinned_param.pinned_state.inner, LoRAMergeTensorAdapter)
+        assert isinstance(host_param.host_state.inner, RegularAdapter)
+        assert isinstance(host_param.host_state.inner, LoRAMergeTensorAdapter)
 
-    def test_host_adoption_rejects_cuda_local_shard(self, tp_mesh: Any) -> None:
-        dt, _ = _dtensor_weight(tp_mesh)
-
-        with pytest.raises(NotImplementedError, match="host adoption"):
-            PinnedParam(
-                nn.Parameter(dt, requires_grad=False),
-                pin_memory=False,
-            )
-
-    def test_pinned_param_roundtrip_reconstructs_dtensor(self, tp_mesh: Any) -> None:
+    def test_storage_enumeration_reads_local_backing_without_rebuilding_dtensor(
+        self,
+        tp_mesh: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         dt, full = _dtensor_weight(tp_mesh)
-        pinned_param = PinnedParam(nn.Parameter(dt, requires_grad=False))
+        host = HostParam(nn.Parameter(dt, requires_grad=False))
+
+        def unexpected_rebuild(*args: object, **kwargs: object) -> None:
+            raise AssertionError("storage enumeration must not rebuild DTensor")
+
+        monkeypatch.setattr(dtensor_adapter_module, "rebuild_dtensor", unexpected_rebuild)
+        (local,) = host.storage_tensors()
+
+        assert type(local) is torch.Tensor
+        assert local.device.type == "cpu"
+        assert local is host.host_state.inner_state.data
+        torch.testing.assert_close(local, full.cpu())
+
+    def test_host_param_roundtrip_reconstructs_dtensor(self, tp_mesh: Any) -> None:
+        dt, full = _dtensor_weight(tp_mesh)
+        host_param = HostParam(nn.Parameter(dt, requires_grad=False))
 
         # Resting state: still a DTensor (type-stable), but on a CPU mesh so
         # the local shard stays on the host (no GPU memory held).
-        cpu = pinned_param.make_cpu_param()
+        cpu = host_param.make_cpu_param()
         assert _is_dtensor(cpu.data)
         assert cpu.data.device_mesh.device_type == "cpu"
         assert cpu.data.to_local().device.type == "cpu"
@@ -136,9 +146,9 @@ class TestDTensorAdapter:
         assert torch.equal(cpu.data.to_local(), dt.to_local().cpu())
 
         # Resident state: the DTensor is reconstructed on the GPU.
-        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
-        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
-        gpu_param = pinned_param.make_gpu_param(gpu_state)
+        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
+        host_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu_param = host_param.make_gpu_param(gpu_state)
         torch.cuda.synchronize()
 
         assert _is_dtensor(gpu_param.data)
@@ -149,10 +159,10 @@ class TestDTensorAdapter:
 
     def test_one_shot_materialize_reconstructs_cuda_mesh(self, tp_mesh: Any) -> None:
         dt, full = _dtensor_weight(tp_mesh)
-        pinned_param = PinnedParam(nn.Parameter(dt, requires_grad=False))
-        assert pinned_param.shape == dt.shape
+        host_param = HostParam(nn.Parameter(dt, requires_grad=False))
+        assert host_param.shape == dt.shape
 
-        materialized = pinned_param.materialize(
+        materialized = host_param.materialize(
             torch.device("cuda"),
             non_blocking=True,
         )
@@ -170,10 +180,10 @@ class TestDTensorAdapter:
         # its buffers in place. from_local must alias the inner GPU storage
         # (not copy) so refills are visible through the wrapper.
         dt, _ = _dtensor_weight(tp_mesh)
-        pinned_param = PinnedParam(nn.Parameter(dt, requires_grad=False))
-        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
-        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
-        gpu_param = pinned_param.make_gpu_param(gpu_state)
+        host_param = HostParam(nn.Parameter(dt, requires_grad=False))
+        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
+        host_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu_param = host_param.make_gpu_param(gpu_state)
         torch.cuda.synchronize()
 
         assert gpu_param.data.to_local().data_ptr() == gpu_state.inner_gpu.data.data_ptr()
@@ -199,7 +209,7 @@ class TestDTensorAdapter:
         assert DTensorAdapter.layout_signature(bf16) != DTensorAdapter.layout_signature(fp32)
         assert DTensorAdapter.bind_layout_signature(bf16) == DTensorAdapter.bind_layout_signature(fp32)
         # Both keys carry the GLOBAL shape (gpu_param replays it; uneven shards
-        # are not pinned by the local shape alone).
+        # are not host by the local shape alone).
         assert tuple(bf16.shape) in DTensorAdapter.layout_signature(bf16)
         assert tuple(bf16.shape) in DTensorAdapter.bind_layout_signature(bf16)
 
@@ -212,28 +222,28 @@ class TestDTensorAdapter:
         assert tensor_id(dt) != tensor_id(other)
         assert tensor_id(dt) == tensor_id(dt)
         # The global shape is in the identity key so aliased local shards with
-        # different global views are not deduped onto one PinnedParam.
+        # different global views are not deduped onto one HostParam.
         assert tuple(dt.shape) in tensor_id(dt)
 
     def test_cache_bytes_counts_local_shard(self, tp_mesh: Any) -> None:
         dt, _ = _dtensor_weight(tp_mesh, rows=16, cols=8)
-        pinned_param = PinnedParam(nn.Parameter(dt, requires_grad=False))
+        host_param = HostParam(nn.Parameter(dt, requires_grad=False))
         local = dt.to_local()
         # Local-shard bytes (== global only because world_size==1; on N ranks
         # this is the ~1/N local footprint, not the global numel).
-        assert DTensorAdapter.cache_bytes(pinned_param.pinned_state) == (local.numel() * local.element_size())
+        assert DTensorAdapter.cache_bytes(host_param.host_state) == (local.numel() * local.element_size())
 
     def test_compute_dtype_delegates_to_local(self, tp_mesh: Any) -> None:
         dt, _ = _dtensor_weight(tp_mesh, dtype=torch.bfloat16)
         assert DTensorAdapter.compute_dtype(dt) is torch.bfloat16
 
-    def test_compute_dtype_via_pinned_param_property(self, tp_mesh: Any) -> None:
-        # Regression: PinnedParam.compute_dtype feeds the bare local shard
+    def test_compute_dtype_via_host_param_property(self, tp_mesh: Any) -> None:
+        # Regression: HostParam.compute_dtype feeds the bare local shard
         # (what cpu_param yields, not a DTensor) into the adapter; it must not
         # require a live DTensor. Every other adapter asserts this property.
         dt, _ = _dtensor_weight(tp_mesh, dtype=torch.bfloat16)
-        pinned_param = PinnedParam(nn.Parameter(dt, requires_grad=False))
-        assert pinned_param.compute_dtype is torch.bfloat16
+        host_param = HostParam(nn.Parameter(dt, requires_grad=False))
+        assert host_param.compute_dtype is torch.bfloat16
 
     def test_direct_validation_localizes_global_factors_like_merge(
         self,
@@ -658,12 +668,19 @@ class TestDTensorAdapter:
         assert isinstance(select_adapter(dt), DTensorAdapter)
         assert isinstance(select_adapter(dt.to_local()), Float8Adapter)
 
-        pinned_param = PinnedParam(nn.Parameter(dt, requires_grad=False))
-        assert isinstance(pinned_param.pinned_state.inner, Float8Adapter)
+        host_param = HostParam(nn.Parameter(dt, requires_grad=False))
+        assert isinstance(host_param.host_state.inner, Float8Adapter)
 
-        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
-        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
-        gpu_param = pinned_param.make_gpu_param(gpu_state)
+        qdata, scale = host_param.storage_tensors()
+        assert type(qdata) is torch.Tensor and type(scale) is torch.Tensor
+        assert qdata is host_param.host_state.inner_state.storage[0]
+        assert scale is host_param.host_state.inner_state.storage[1]
+        assert qdata.dtype == f8.qdata.dtype
+        assert qdata.nbytes + scale.nbytes == host_param.cache_bytes
+
+        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
+        host_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu_param = host_param.make_gpu_param(gpu_state)
         torch.cuda.synchronize()
 
         assert _is_dtensor(gpu_param.data)

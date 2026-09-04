@@ -4,7 +4,7 @@ Covers ``ModelOffloader`` (the public composite),
 and ``BlockComponent`` (the per-block-list primitive).
 
 CUDA-only tests gate on availability. CPU activation is pass-through
-over the host-backed pinned state.
+over the host-backed state.
 """
 
 import copy
@@ -23,17 +23,18 @@ from piper_offload import (
     BlockComponentStore,
     BlockMode,
     ModelOffloader,
-    PinnedComponent,
+    HostComponent,
     ResourceBinding,
     ResourceStore,
 )
 from piper_offload.composite_component import CompositeComponent
-from piper_offload.pinned_module import ParameterOverride
+from piper_offload.host_module import ParameterOverride
 from piper_offload.streaming_runtime import _plan_target_signature
 
 from tests.conftest import (
+    CallbackParameterTransform,
     activated_model,
-    pinned_component,
+    host_component,
     block_components,
     transient_components,
 )
@@ -191,161 +192,22 @@ class TestResourceBindingConformance:
 
 
 class TestConstructorPins:
-    def test_constructor_pins_blocks(self) -> None:
+    def test_constructor_captures_blocks(self) -> None:
         m = _make_block_model()
         strategy = ModelOffloader.from_module(
             m,
             block_paths=["transformer_blocks"],
         )
         try:
-            # Block weights are pinned via registry replacement.
+            # Block weights are host via registry replacement.
             for block in m.transformer_blocks:
-                assert block.weight.is_pinned()
-            # Non-block (embed/head) also pinned via composed PinnedComponent.
-            assert m.embed.weight.is_pinned()
-            assert m.head.weight.is_pinned()
+                assert not block.weight.is_pinned()
+            # Non-block (embed/head) also host via composed HostComponent.
+            assert not m.embed.weight.is_pinned()
+            assert not m.head.weight.is_pinned()
             assert strategy.cache_bytes > 0
         finally:
             strategy.deactivate()
-
-    def test_constructor_supports_adopted_host_backing(self) -> None:
-        m = _make_block_model()
-        original_ptrs = {name: param.data_ptr() for name, param in m.named_parameters()}
-        strategy = ModelOffloader.from_module(
-            m,
-            block_paths=["transformer_blocks"],
-            host_backing="adopt",
-        )
-        try:
-            assert all(not param.is_pinned() for param in m.parameters())
-            assert {name: param.data_ptr() for name, param in m.named_parameters()} == original_ptrs
-            assert strategy.cache_bytes > 0
-        finally:
-            strategy.deactivate()
-
-    def test_adoption_rejects_trainables_before_mutating_model(self) -> None:
-        m = nn.Linear(8, 8, bias=False)
-        original_ptr = m.weight.data_ptr()
-
-        with pytest.raises(ValueError, match="inference-only"):
-            ModelOffloader.from_module(m, host_backing="adopt")
-
-        assert m.weight.data_ptr() == original_ptr
-
-    def test_late_adoption_failure_does_not_mutate_model(self) -> None:
-        class Block(nn.Module):
-            def __init__(self, weight: torch.Tensor) -> None:
-                super().__init__()
-                self.weight = nn.Parameter(weight, requires_grad=False)
-                self.register_buffer("state", torch.randn(2))
-
-            def forward(self, value: torch.Tensor) -> torch.Tensor:
-                return nn.functional.linear(value, self.weight)
-
-        class Model(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.blocks = nn.ModuleList(
-                    [
-                        Block(torch.randn(2, 3)),
-                        Block(torch.randn(3, 2).t()),
-                    ]
-                )
-
-        model = Model()
-        original_params = [block.weight for block in model.blocks]
-        original_buffers = [block.state for block in model.blocks]
-
-        with pytest.raises(ValueError, match="non-contiguous"):
-            ModelOffloader.from_module(
-                model,
-                block_paths=("blocks",),
-                host_backing="adopt",
-            )
-
-        assert all(
-            block.weight is original
-            for block, original in zip(
-                model.blocks,
-                original_params,
-                strict=True,
-            )
-        )
-        assert all(
-            block.state is original
-            for block, original in zip(
-                model.blocks,
-                original_buffers,
-                strict=True,
-            )
-        )
-
-    def test_adopted_backing_preserves_mmap(self, tmp_path: Path) -> None:
-        rows, cols = 8, 16
-        path = tmp_path / "weight.bin"
-        path.write_bytes(bytes(rows * cols * 4))
-        mapped = torch.from_file(
-            str(path),
-            shared=False,
-            size=rows * cols,
-            dtype=torch.float32,
-        ).view(rows, cols)
-        mapped.copy_(torch.arange(rows * cols).view(rows, cols))
-        model = nn.Linear(cols, rows, bias=False)
-        model.weight = nn.Parameter(mapped, requires_grad=False)
-        mapped_ptr = mapped.data_ptr()
-
-        strategy = ModelOffloader.from_module(
-            model,
-            host_backing="adopt",
-        )
-        try:
-            assert model.weight.data_ptr() == mapped_ptr
-            torch.testing.assert_close(model.weight, mapped)
-        finally:
-            strategy.deactivate()
-
-    def test_adopted_cache_bytes_uses_logical_component_sizes(
-        self,
-    ) -> None:
-        class Block(nn.Module):
-            def __init__(self, weight: torch.Tensor) -> None:
-                super().__init__()
-                self.weight = nn.Parameter(weight, requires_grad=False)
-
-        class Model(nn.Module):
-            def __init__(self, backing: torch.Tensor) -> None:
-                super().__init__()
-                self.remainder = nn.Parameter(
-                    backing[:4].view(2, 2),
-                    requires_grad=False,
-                )
-                self.blocks = nn.ModuleList([Block(backing[16:20].view(2, 2))])
-
-        backing = torch.empty(1024, dtype=torch.float32)
-        model = Model(backing)
-        strategy = ModelOffloader.from_module(
-            model,
-            block_paths=("blocks",),
-            host_backing="adopt",
-        )
-        try:
-            assert strategy.cache_bytes == model.remainder.nbytes + model.blocks[0].weight.nbytes
-        finally:
-            strategy.deactivate()
-
-    def test_invalid_host_backing_fails_before_mutating_model(self) -> None:
-        m = _make_block_model()
-        original = [param.data_ptr() for param in m.parameters()]
-
-        with pytest.raises(ValueError, match="host_backing"):
-            ModelOffloader.from_module(
-                m,
-                block_paths=["transformer_blocks"],
-                host_backing="invalid",
-            )
-
-        assert [param.data_ptr() for param in m.parameters()] == original
 
 
 # ---------------------------------------------------------------------------
@@ -411,16 +273,16 @@ class TestLifecycle:
             block_paths=["transformer_blocks"],
         )
         try:
-            pinned_block_params = [block.weight for block in m_off.transformer_blocks]
+            host_block_params = [block.weight for block in m_off.transformer_blocks]
             with activated_model(strategy, "cpu") as cpu_model:
                 assert strategy._active_device == torch.device("cpu")
                 assert all(s._active_device == torch.device("cpu") for s in block_components(strategy))
                 assert all(not s._runtime.acquired for s in block_components(strategy))
                 assert all(
-                    block.weight is pinned
-                    for block, pinned in zip(
+                    block.weight is host
+                    for block, host in zip(
                         m_off.transformer_blocks,
-                        pinned_block_params,
+                        host_block_params,
                         strict=True,
                     )
                 )
@@ -430,7 +292,7 @@ class TestLifecycle:
             torch.testing.assert_close(got, expected)
             for p in m_off.parameters():
                 assert p.device == torch.device("cpu")
-                assert p.is_pinned()
+                assert not p.is_pinned()
         finally:
             strategy.deactivate()
 
@@ -450,33 +312,7 @@ class TestLifecycle:
             strategy.deactivate()
 
     @CUDA
-    def test_adopted_streaming_matches_eager_model(self) -> None:
-        torch.manual_seed(42)
-        eager = _make_block_model(num_blocks=4, width=32)
-        offloaded = _make_block_model(num_blocks=4, width=32)
-        offloaded.load_state_dict(eager.state_dict())
-        x = torch.randn(2, 32)
-        with torch.no_grad():
-            expected = eager(x).cuda()
-
-        strategy = ModelOffloader.from_module(
-            offloaded,
-            block_paths=["transformer_blocks"],
-            host_backing="adopt",
-        )
-        try:
-            with activated_model(strategy, "cuda") as active:
-                with torch.no_grad():
-                    actual = active(x.cuda())
-                torch.cuda.synchronize()
-
-            torch.testing.assert_close(actual, expected)
-            assert all(not param.is_pinned() for param in offloaded.parameters())
-        finally:
-            strategy.deactivate()
-
-    @CUDA
-    def test_deactivate_returns_non_block_to_pinned(self) -> None:
+    def test_deactivate_returns_non_block_to_host(self) -> None:
         m = _make_block_model()
         target = torch.device("cuda")
         strategy = _make_model_offloader(
@@ -488,8 +324,8 @@ class TestLifecycle:
             assert m.embed.weight.is_cuda
             strategy.deactivate()
             assert m.embed.weight.device != target
-            assert m.embed.weight.is_pinned()
-            assert m.head.weight.is_pinned()
+            assert not m.embed.weight.is_pinned()
+            assert not m.head.weight.is_pinned()
         finally:
             strategy.deactivate()
 
@@ -537,9 +373,9 @@ class TestLifecycle:
                 del device
                 raise AssertionError("component activation should not run")
 
-            assert pinned_component(strategy) is not None
+            assert host_component(strategy) is not None
             monkeypatch.setattr(
-                pinned_component(strategy),
+                host_component(strategy),
                 "activate",
                 fail_activate,
             )
@@ -564,17 +400,17 @@ class TestBlockComponentBackendActivation:
             blocks=list(m.transformer_blocks),
         )
         try:
-            pinned_params = [block.weight for block in m.transformer_blocks]
+            host_params = [block.weight for block in m.transformer_blocks]
             with streamer.use("cpu"):
                 assert streamer._active_device == torch.device("cpu")
                 assert not streamer._runtime.acquired
                 streamer.release()
                 streamer.acquire()
                 assert all(
-                    block.weight is pinned
-                    for block, pinned in zip(
+                    block.weight is host
+                    for block, host in zip(
                         m.transformer_blocks,
-                        pinned_params,
+                        host_params,
                         strict=True,
                     )
                 )
@@ -585,7 +421,7 @@ class TestBlockComponentBackendActivation:
             torch.testing.assert_close(got, expected)
             for block in m.transformer_blocks:
                 assert block.weight.device == torch.device("cpu")
-                assert block.weight.is_pinned()
+                assert not block.weight.is_pinned()
         finally:
             streamer.deactivate()
 
@@ -686,9 +522,9 @@ class TestBlockComponentBackendActivation:
             blocks=list(blocks),
         )
         try:
-            pinned_data_ptrs = {i: block.weight.data_ptr() for i, block in enumerate(blocks)}
+            host_data_ptrs = {i: block.weight.data_ptr() for i, block in enumerate(blocks)}
             with streamer.use("cpu"):
-                assert pinned_data_ptrs == {i: block.weight.data_ptr() for i, block in enumerate(blocks)}
+                assert host_data_ptrs == {i: block.weight.data_ptr() for i, block in enumerate(blocks)}
                 x = torch.randn(2, 4)
                 target = torch.randn(2, 4)
                 out = x
@@ -704,7 +540,7 @@ class TestBlockComponentBackendActivation:
             for i, block in enumerate(blocks):
                 torch.testing.assert_close(block.weight, active_after[i])
                 assert block.weight.device == torch.device("cpu")
-                assert block.weight.is_pinned()
+                assert not block.weight.is_pinned()
         finally:
             streamer.deactivate()
 
@@ -736,7 +572,7 @@ class TestCleanup:
         )
         strategy.activate("cuda")
         strategy.deactivate()
-        # Model is back in CPU/pinned state — usable, just without the
+        # Model is back in CPU/host state — usable, just without the
         # strategy's GPU streaming.
         for p in m.parameters():
             assert not p.is_cuda
@@ -798,7 +634,7 @@ class TestCleanup:
         # When the strategy is dropped without deactivate, the hooks
         # remain installed on the model but the weakref inside is
         # dead. The hook must no-op cleanly so the model still works
-        # for forward. (Slow path: blocks may be on GPU or pinned-CPU
+        # for forward. (Slow path: blocks may be on GPU or CPU
         # depending on eviction state at drop-time.)
         torch.manual_seed(0)
         m = _make_block_model(num_blocks=4, width=8)
@@ -811,12 +647,12 @@ class TestCleanup:
         del strategy
 
         # Forward through the model — orphaned hooks should no-op.
-        # (Some blocks resident on GPU, some pinned-CPU. PyTorch will
+        # (Some blocks resident on GPU, some CPU. PyTorch will
         # auto-promote inputs to match param device for each block.)
         x = torch.randn(2, 8, device="cpu")
         with torch.no_grad():
             # Should not raise. We don't assert correctness of the
-            # output (params are in a mixed GPU/pinned-CPU state) —
+            # output (params are in a mixed GPU/CPU state) —
             # just that the hooks don't crash.
             try:
                 _ = m(x)
@@ -921,7 +757,7 @@ class TestTransientResidency:
             assert components["embed"].param_names == {"embed.weight"}
             assert components["embed"].buffer_names == {"embed.table"}
             assert components["head"].param_names == {"head.weight"}
-            assert pinned_component(offloader) is None
+            assert host_component(offloader) is None
         finally:
             offloader.deactivate()
 
@@ -1482,26 +1318,6 @@ class TestResourceCacheIntegration:
         finally:
             offloader.deactivate()
 
-    def test_model_spec_propagates_adopted_host_backing(self) -> None:
-        from piper_offload import ModelSpec
-
-        spec = ModelSpec(
-            key="adopted",
-            estimated_cache_bytes=1024,
-            factory=_make_block_model,
-            block_paths=("transformer_blocks",),
-            host_backing="adopt",
-        )
-
-        offloader = spec.build_store()
-        try:
-            assert all(not param.is_pinned() for param in offloader.value.parameters())
-            resident = pinned_component(offloader)
-            assert resident is not None
-            assert resident.param_names == {"embed.weight", "head.weight"}
-        finally:
-            offloader.deactivate()
-
     def test_model_spec_reuses_single_model(self) -> None:
         from piper_offload import ModelCache, ModelSpec
 
@@ -1513,7 +1329,7 @@ class TestResourceCacheIntegration:
             factory_calls += 1
             return _make_block_model(num_blocks=4, width=8)
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ModelCache()
         spec = ModelSpec(
             key="xformer",
             estimated_cache_bytes=1024,
@@ -1579,7 +1395,7 @@ class TestResourceCacheIntegration:
     def test_model_spec_rejects_nested_use(self) -> None:
         from piper_offload import ModelCache, ModelRuntimeInUseError, ModelSpec
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ModelCache()
         spec = ModelSpec(
             key="xformer",
             estimated_cache_bytes=1024,
@@ -1598,7 +1414,7 @@ class TestResourceCacheIntegration:
     def test_model_cache_deactivates_after_body_error(self) -> None:
         from piper_offload import ModelCache, ModelSpec
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ModelCache()
         spec = ModelSpec(
             key="xformer",
             estimated_cache_bytes=1024,
@@ -1618,13 +1434,62 @@ class TestResourceCacheIntegration:
 
         cache.clear()
 
-    def test_model_cache_is_a_resource_cache(self) -> None:
+    def test_model_cache_is_an_unbounded_resource_cache(self) -> None:
         from piper_offload import ModelCache, ResourceCache
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ModelCache()
 
         assert isinstance(cache, ResourceCache)
-        assert cache.max_cache_bytes == 10_000_000
+        assert cache.max_cache_bytes is None
+
+        with pytest.raises(TypeError):
+            ModelCache(max_cache_bytes=10_000_000)
+
+    def test_model_cache_preserves_factory_split_file_mapping(self, tmp_path: Path) -> None:
+        from piper_offload import ModelCache, ModelSpec
+
+        path = tmp_path / "weight.bin"
+        path.touch()
+        seed = torch.from_file(str(path), shared=True, size=24, dtype=torch.float32)
+        seed.copy_(torch.arange(24, dtype=torch.float32))
+        del seed
+        captured_storage_pointer = 0
+
+        def factory() -> nn.Module:
+            nonlocal captured_storage_pointer
+            fused = torch.from_file(
+                str(path),
+                shared=False,
+                size=24,
+                dtype=torch.float32,
+            ).reshape(3, 2, 4)
+            captured_storage_pointer = fused.untyped_storage().data_ptr()
+            model = nn.Module()
+            model.q = nn.Parameter(fused[0], requires_grad=False)
+            model.k = nn.Parameter(fused[1], requires_grad=False)
+            model.v = nn.Parameter(fused[2], requires_grad=False)
+            return model
+
+        cache = ModelCache()
+        spec = ModelSpec(key="mapped", factory=factory)
+
+        with cache.use(spec, device="cpu") as model:
+            params = (model.q, model.k, model.v)
+            storage_pointers = {
+                param.untyped_storage().data_ptr() for param in params
+            }
+            assert storage_pointers == {captured_storage_pointer}
+            assert tuple(param.storage_offset() for param in params) == (0, 8, 16)
+            assert all(not param.untyped_storage().resizable() for param in params)
+            torch.testing.assert_close(
+                torch.stack(params),
+                torch.arange(24, dtype=torch.float32).reshape(3, 2, 4),
+            )
+
+        assert cache.info("mapped").cached
+        assert cache.info("mapped").estimated_cache_bytes == 0
+        assert cache.info("mapped").cache_bytes == 24 * torch.float32.itemsize
+        cache.clear()
 
     def test_model_spec_trainable_reuses_primary_model(self) -> None:
         from piper_offload import ModelCache, ModelSpec
@@ -1637,7 +1502,7 @@ class TestResourceCacheIntegration:
             factory_calls += 1
             return nn.Linear(8, 8, bias=False)
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ModelCache()
         spec = ModelSpec(
             key="trainable",
             estimated_cache_bytes=1024,
@@ -1657,7 +1522,7 @@ class TestResourceCacheIntegration:
     def test_model_spec_trainable_rejects_nested_binding(self) -> None:
         from piper_offload import ModelCache, ModelRuntimeInUseError, ModelSpec
 
-        cache = ModelCache(max_cache_bytes=10_000_000)
+        cache = ModelCache()
         spec = ModelSpec(
             key="trainable",
             estimated_cache_bytes=1024,
@@ -1827,9 +1692,9 @@ class TestConstructedStateIsInactive:
         finally:
             strategy.deactivate()
 
-    def test_block_only_model_has_no_non_block_pinned(self) -> None:
+    def test_block_only_model_has_no_non_block_host(self) -> None:
         # Edge case: model whose only top-level child IS the block list.
-        # No non-block PinnedComponent in components; store bytes come from blocks only.
+        # No non-block HostComponent in components; store bytes come from blocks only.
         class BlockOnly(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1843,8 +1708,8 @@ class TestConstructedStateIsInactive:
             block_paths=["transformer_blocks"],
         )
         try:
-            # No PinnedComponent component, just BlockComponent.
-            assert pinned_component(strategy) is None
+            # No HostComponent component, just BlockComponent.
+            assert host_component(strategy) is None
             assert strategy.cache_bytes > 0  # block bytes only
         finally:
             strategy.deactivate()
@@ -1878,11 +1743,11 @@ class TestBufferOnlyNonBlock:
             block_paths=["transformer_blocks"],
         )
         try:
-            assert m.rope.table.is_pinned()
+            assert not m.rope.table.is_pinned()
             strategy.activate("cuda")
             assert m.rope.table.is_cuda
             strategy.deactivate()
-            assert m.rope.table.is_pinned()
+            assert not m.rope.table.is_pinned()
         finally:
             strategy.deactivate()
 
@@ -1968,7 +1833,7 @@ class TestSharedStorageLocalBehavior:
         try:
             for block in m.transformer_blocks:
                 assert block.buf_a is block.buf_b
-                assert block.buf_a.is_pinned()
+                assert not block.buf_a.is_pinned()
         finally:
             strategy.deactivate()
 
@@ -1996,12 +1861,12 @@ class TestSharedStorageLocalBehavior:
         try:
             for block in m.transformer_blocks:
                 assert block.buf_a is block.buf_b
-                assert block.buf_a.is_pinned()
+                assert not block.buf_a.is_pinned()
         finally:
             strategy.deactivate()
 
     def test_non_block_internal_tied_works(self) -> None:
-        # Tied embed↔head WITHIN PinnedComponent: PinnedComponent handles
+        # Tied embed↔head WITHIN HostComponent: HostComponent handles
         # this via tensor-id dedup. Should not raise.
         embed = nn.Embedding(16, 8)
         head = nn.Linear(8, 16, bias=False)
@@ -2023,7 +1888,7 @@ class TestSharedStorageLocalBehavior:
         )
         try:
             assert m.embed.weight is m.head.weight
-            non_block = pinned_component(strategy)
+            non_block = host_component(strategy)
             assert non_block is not None
             assert non_block.param_names == {"embed.weight", "head.weight"}
             assert len({id(non_block._instance.params[name]) for name in non_block.param_names}) == 1
@@ -2037,7 +1902,7 @@ class TestSharedStorageLocalBehavior:
 
 
 class TestDirectParentStateHandled:
-    def test_direct_frozen_param_on_root_is_pinned(self) -> None:
+    def test_direct_frozen_param_on_root_is_host(self) -> None:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -2052,7 +1917,7 @@ class TestDirectParentStateHandled:
             block_paths=["transformer_blocks"],
         )
         try:
-            assert m.scale_shift.is_pinned()
+            assert not m.scale_shift.is_pinned()
         finally:
             strategy.deactivate()
 
@@ -2072,11 +1937,11 @@ class TestDirectParentStateHandled:
             block_paths=["encoder.blocks"],
         )
         try:
-            assert m.root_param.is_pinned()
+            assert not m.root_param.is_pinned()
         finally:
             strategy.deactivate()
 
-    def test_direct_buffer_on_root_is_pinned(self) -> None:
+    def test_direct_buffer_on_root_is_host(self) -> None:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -2091,7 +1956,7 @@ class TestDirectParentStateHandled:
             block_paths=["transformer_blocks"],
         )
         try:
-            assert m.table.is_pinned()
+            assert not m.table.is_pinned()
         finally:
             strategy.deactivate()
 
@@ -2101,7 +1966,7 @@ class TestDirectParentStateHandled:
 # ---------------------------------------------------------------------------
 
 
-class TestBlockBuffersPinned:
+class TestBlockBuffersHost:
     @staticmethod
     def _make_tied_buffer_model(
         num_blocks: int = 2,
@@ -2126,7 +1991,7 @@ class TestBlockBuffersPinned:
 
         return M()
 
-    def test_block_buffer_clone_is_pinned(self) -> None:
+    def test_block_buffer_clone_is_host(self) -> None:
         class BlockWithBuffer(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -2147,8 +2012,8 @@ class TestBlockBuffersPinned:
         )
         try:
             for block in m.transformer_blocks:
-                assert block.table.is_pinned(), (
-                    "block buffer must be pinned for honest cache_bytes and to avoid silently-synchronous H2D copies"
+                assert not block.table.is_pinned(), (
+                    "block buffer must be host for honest cache_bytes and to avoid silently-synchronous H2D copies"
                 )
         finally:
             strategy.deactivate()
@@ -2161,7 +2026,7 @@ class TestBlockBuffersPinned:
                 self.register_buffer("table", torch.randn(2))
 
             def to(self, *args, **kwargs):
-                raise AssertionError("constructor must pin directly")
+                raise AssertionError("constructor must capture directly")
 
         class M(nn.Module):
             def __init__(self):
@@ -2169,7 +2034,7 @@ class TestBlockBuffersPinned:
                 self.transformer_blocks = nn.ModuleList([Block(), Block()])
 
             def to(self, *args, **kwargs):
-                raise AssertionError("constructor must pin directly")
+                raise AssertionError("constructor must capture directly")
 
         m = M()
         strategy = _make_model_offloader(
@@ -2178,8 +2043,8 @@ class TestBlockBuffersPinned:
         )
         try:
             for block in m.transformer_blocks:
-                assert block.weight.is_pinned()
-                assert block.table.is_pinned()
+                assert not block.weight.is_pinned()
+                assert not block.table.is_pinned()
         finally:
             strategy.deactivate()
 
@@ -2193,7 +2058,7 @@ class TestBlockBuffersPinned:
         try:
             for block in m.transformer_blocks:
                 assert block.buf_a is block.buf_b
-                assert block.buf_a.is_pinned()
+                assert not block.buf_a.is_pinned()
 
             strategy.activate("cuda")
             resident = m.transformer_blocks[0]
@@ -2203,7 +2068,7 @@ class TestBlockBuffersPinned:
             strategy.deactivate()
             for block in m.transformer_blocks:
                 assert block.buf_a is block.buf_b
-                assert block.buf_a.is_pinned()
+                assert not block.buf_a.is_pinned()
         finally:
             strategy.deactivate()
 
@@ -2325,7 +2190,7 @@ class TestBlockLayoutCompatibility:
         assert contiguous.shape == non_contiguous.shape
         assert contiguous.stride() != non_contiguous.stride()
 
-        # No reject. Pinning clones buffers contiguous, so the two
+        # No reject. Capture clones buffers contiguous, so the two
         # collapse to one signature — what matters is the old hard layout
         # check no longer rejects the group.
         component = _make_block_component(
@@ -2385,10 +2250,10 @@ class TestBlockLayoutCompatibility:
                 blocks=[A(), B()],
             )
 
-    def test_failure_leaves_model_unpinned_and_unmutated(self) -> None:
+    def test_validation_failure_leaves_model_unmutated(self) -> None:
         # Strong-exception-safety: structural validation runs before any
-        # pinning, so on a reject the user's Parameter objects keep their
-        # identities and are not pinned.
+        # capture, so on a reject the user's Parameter objects keep their
+        # identities and are not host.
         class A(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -2401,7 +2266,7 @@ class TestBlockLayoutCompatibility:
 
         blocks = [A(), B()]
         original_params = [blocks[0].foo, blocks[1].bar]
-        original_pinned = [p.is_pinned() for p in original_params]
+        original_host = [p.is_pinned() for p in original_params]
 
         with pytest.raises(ValueError, match="parameter names differ"):
             _make_block_component(
@@ -2412,10 +2277,10 @@ class TestBlockLayoutCompatibility:
         assert blocks[1].bar is original_params[1]
         for param, orig_pin in zip(
             original_params,
-            original_pinned,
+            original_host,
             strict=True,
         ):
-            assert param.is_pinned() == orig_pin, "param was pinned despite pre-pin validation failure"
+            assert param.is_pinned() == orig_pin, "parameter pin status changed despite validation failure"
 
 
 # ---------------------------------------------------------------------------
@@ -2425,12 +2290,12 @@ class TestBlockLayoutCompatibility:
 
 class TestMultiComponentCleanup:
     @CUDA
-    def test_pinned_deactivate_failure_still_runs_streamer_deactivate(
+    def test_host_deactivate_failure_still_runs_streamer_deactivate(
         self,
         monkeypatch,
     ) -> None:
         # ExitStack continues unwinding callbacks even when one raises.
-        # If non-block PinnedComponent raises during deactivate, streamers
+        # If non-block HostComponent raises during deactivate, streamers
         # earlier in unwind order have still been deactivated.
 
         m = _make_block_model()
@@ -2438,23 +2303,23 @@ class TestMultiComponentCleanup:
             m,
             block_paths=["transformer_blocks"],
         )
-        original_deactivate = PinnedComponent.deactivate
+        original_deactivate = HostComponent.deactivate
 
-        def broken_deactivate(component: PinnedComponent) -> None:
+        def broken_deactivate(component: HostComponent) -> None:
             original_deactivate(component)
-            raise RuntimeError("simulated pinned deactivate failure")
+            raise RuntimeError("simulated host deactivate failure")
 
-        monkeypatch.setattr(PinnedComponent, "deactivate", broken_deactivate)
+        monkeypatch.setattr(HostComponent, "deactivate", broken_deactivate)
         try:
             strategy.activate("cuda")
             assert m.embed.weight.is_cuda  # type: ignore[union-attr]
 
-            with pytest.raises(RuntimeError, match="simulated pinned deactivate failure"):
+            with pytest.raises(RuntimeError, match="simulated host deactivate failure"):
                 strategy.deactivate()
 
-            # PinnedComponent restored registry entries before raising, and streamers
+            # HostComponent restored registry entries before raising, and streamers
             # were already unwound in LIFO order.
-            assert m.embed.weight.is_pinned()  # type: ignore[union-attr]
+            assert not m.embed.weight.is_pinned()  # type: ignore[union-attr]
             assert not block_components(strategy)[0]._runtime._hooks
             assert strategy._composite._teardown_stack is None
         finally:
@@ -2509,7 +2374,7 @@ class TestBlockNameSelection:
                 target.transformer_blocks,
                 strict=True,
             ):
-                assert target_block.weight.is_pinned()
+                assert not target_block.weight.is_pinned()
                 torch.testing.assert_close(target_block.weight, prototype_block.weight)
             torch.testing.assert_close(target.embed.weight, target_embed)
             assert not target.embed.weight.is_pinned()
@@ -2577,15 +2442,17 @@ class TestBlockNameSelection:
         def update(_param: nn.Parameter) -> None:
             pass
 
+        transform = CallbackParameterTransform(update)
+
         try:
             plans = streamer._resolve_load_plans(
                 {
                     "transformer_blocks.1.weight": ParameterOverride(
-                        update=update
+                        update=transform
                     )
                 }
             )
-            assert plans[1].loads["weight"].update is update
+            assert plans[1].loads["weight"].update is transform
             assert plans[0].loads["weight"].update is None
         finally:
             streamer.deactivate()
@@ -2601,14 +2468,14 @@ class TestBlockNameSelection:
                 streamer._resolve_load_plans(
                     {
                         "transformer_blocks.10.weight": ParameterOverride(
-                            update=lambda _param: None
+                            update=CallbackParameterTransform(lambda _param: None)
                         )
                     }
                 )
         finally:
             streamer.deactivate()
 
-    def test_model_offloader_partitions_streamed_and_pinned_names(
+    def test_model_offloader_partitions_streamed_and_host_names(
         self,
     ) -> None:
         m = _make_block_model()
@@ -2618,7 +2485,7 @@ class TestBlockNameSelection:
         )
         try:
             streamer = block_components(strategy)[0]
-            non_block = pinned_component(strategy)
+            non_block = host_component(strategy)
             assert non_block is not None
 
             assert streamer.managed_param_names_by_block == [["weight"]] * len(m.transformer_blocks)
@@ -2637,7 +2504,7 @@ class TestBlockComponentContractGuard:
     """BlockComponent now handles in-block trainables natively via
     ``.data`` swap (preserves user Parameter identity for autograd /
     optimizer state). The composer routes any non-streamed trainables to
-    ``PinnedComponent``."""
+    ``HostComponent``."""
 
     def test_direct_unskipped_trainable_constructs(self) -> None:
         block_0 = nn.Linear(4, 4, bias=False)  # default requires_grad=True
@@ -2646,8 +2513,8 @@ class TestBlockComponentContractGuard:
             blocks=[block_0, block_1],
         )
         assert streamer.managed_param_names_by_block == [["weight"], ["weight"]]
-        # The user's Parameter object survives pinning — .data has been
-        # repointed at the pinned clone, but the wrapper is unchanged
+        # The user's Parameter object survives capture — .data has been
+        # repointed at the host clone, but the wrapper is unchanged
         # so optimizer state attached to it would still apply.
         assert isinstance(block_0.weight, nn.Parameter)
         assert block_0.weight.requires_grad
@@ -2658,7 +2525,7 @@ class TestMixedGradTieDetection:
 
     def test_intra_non_block_mixed_grad_tie_raises(self) -> None:
         # Two distinct Parameter objects sharing storage, both in the
-        # PinnedComponent store, with mixed grad.
+        # HostComponent store, with mixed grad.
         shared = torch.randn(4, 4)
         a = nn.Parameter(shared, requires_grad=True)
         b = nn.Parameter(shared, requires_grad=False)
@@ -2683,7 +2550,7 @@ class TestMixedGradTieDetection:
 
     def test_all_trainable_distinct_parameter_tie_constructs(self) -> None:
         # Two distinct Parameter objects sharing storage, both trainable.
-        # Default mode skips trainables in BlockComponent, so PinnedComponent
+        # Default mode skips trainables in BlockComponent, so HostComponent
         # owns and deduplicates the shared storage.
         shared = torch.randn(4, 4)
         a = nn.Parameter(shared, requires_grad=True)
@@ -2754,8 +2621,8 @@ class TestMixedGradTieDetection:
                     torch.testing.assert_close(b.detach().cpu(), expected)
                 optimizer.zero_grad(set_to_none=True)
 
-            assert a.is_pinned()
-            assert b.is_pinned()
+            assert not a.is_pinned()
+            assert not b.is_pinned()
             assert a.data_ptr() == b.data_ptr()
             torch.testing.assert_close(a.detach(), expected)
             torch.testing.assert_close(b.detach(), expected)
@@ -2769,7 +2636,7 @@ class TestMixedGradTieDetection:
 
     def test_all_trainable_same_parameter_default_mode_constructs(self) -> None:
         # Default mode skips all trainables in BlockComponent and manages
-        # them through PinnedComponent, so all-trainable shared storage
+        # them through HostComponent, so all-trainable shared storage
         # remain valid.
         shared = nn.Parameter(torch.randn(4, 4), requires_grad=True)
 
@@ -2854,7 +2721,7 @@ class TestMixedGradTieDetection:
         try:
             for block in m.transformer_blocks:
                 assert block.weight.device.type == "cpu"
-                assert block.weight.is_pinned()
+                assert not block.weight.is_pinned()
                 assert block.weight.grad is not None
                 assert block.weight.grad.device.type == "cpu"
         finally:
@@ -2864,7 +2731,7 @@ class TestMixedGradTieDetection:
 class TestLoRAInBlockRouting:
     """LoRA-shaped models: blocks contain frozen base layers plus
     trainable adapter layers. The composer must route the base to
-    BlockComponent and, in default mode, the adapters to PinnedComponent; neither
+    BlockComponent and, in default mode, the adapters to HostComponent; neither
     strategy's contract guard should fire on a well-formed LoRA model.
     """
 
@@ -2910,9 +2777,9 @@ class TestLoRAInBlockRouting:
         finally:
             strat.deactivate()
 
-    def test_default_routes_in_block_lora_to_pinned_component(self) -> None:
+    def test_default_routes_in_block_lora_to_host_component(self) -> None:
         # Default mode skips in-block trainables in BlockComponent and
-        # keeps them GPU-resident through PinnedComponent while active.
+        # keeps them GPU-resident through HostComponent while active.
         class M(nn.Module):
             def __init__(self, blocks):
                 super().__init__()
@@ -2931,9 +2798,9 @@ class TestLoRAInBlockRouting:
                 ["base.weight"],
                 ["base.weight"],
             ]
-            pinned = pinned_component(strat)
-            assert pinned is not None
-            assert pinned.param_names == {
+            host = host_component(strat)
+            assert host is not None
+            assert host.param_names == {
                 "transformer_blocks.0.lora_a.weight",
                 "transformer_blocks.0.lora_b.weight",
                 "transformer_blocks.1.lora_a.weight",
@@ -2944,7 +2811,7 @@ class TestLoRAInBlockRouting:
 
     def test_composer_partitions_names_correctly(self) -> None:
         # Through-test: the composer subtracts streamed full names from
-        # model names to form PinnedComponent include-name sets. Verify that
+        # model names to form HostComponent include-name sets. Verify that
         # streamed block names are excluded and non-streamed trainables are
         # included.
         class M(nn.Module):
@@ -2966,17 +2833,17 @@ class TestLoRAInBlockRouting:
             block_paths=["transformer_blocks"],
         )
         try:
-            pinned = pinned_component(strat)
-            assert pinned is not None
-            # PinnedComponent manages every non-streamed parameter, including
+            host = host_component(strat)
+            assert host is not None
+            # HostComponent manages every non-streamed parameter, including
             # trainable_bias.
-            assert pinned.param_names == {"frozen_head.weight", "trainable_bias"}
+            assert host.param_names == {"frozen_head.weight", "trainable_bias"}
             for name, param in m.named_parameters(remove_duplicate=False):
                 if name in {"frozen_head.weight", "trainable_bias"}:
-                    assert name in pinned.param_names
+                    assert name in host.param_names
                 else:
-                    assert name not in pinned.param_names, (
-                        f"param {name} (requires_grad={param.requires_grad}) leaked into PinnedComponent"
+                    assert name not in host.param_names, (
+                        f"param {name} (requires_grad={param.requires_grad}) leaked into HostComponent"
                     )
         finally:
             strat.deactivate()
@@ -3055,12 +2922,12 @@ class TestTrainingWithCheckpointing:
     @CUDA
     def test_streamed_trainable_cpu_optimizer_step_without_context(self) -> None:
         """A plain ``optimizer.step()`` while deactivated (and outside
-        ``optimizer_step()``) runs the optimizer on CPU over the pinned
+        ``optimizer_step()``) runs the optimizer on CPU over the host
         trainable weights: states allocate on the host, and the in-place
         update writes through to what the next forward streams.
 
         This pins the context-free CPU-optimizer pattern — the offloader
-        leaves the trainable ``.data`` (pinned CPU) and ``.grad`` (CPU) ready
+        leaves the trainable ``.data`` (CPU) and ``.grad`` (CPU) ready
         for a host-side step, so ``optimizer_step()`` is only needed when you
         want the step on GPU for speed. fp32 trainables make the in-place
         update a correct master-weight update.
@@ -3101,7 +2968,7 @@ class TestTrainingWithCheckpointing:
                     gpu_model(x).sum().backward()
 
                 # Deactivated: trainable data + grad are host-resident.
-                assert weight.device.type == "cpu" and weight.is_pinned()
+                assert weight.device.type == "cpu" and not weight.is_pinned()
                 assert weight.grad is not None
                 assert weight.grad.device.type == "cpu"
 
@@ -3240,7 +3107,7 @@ class TestInBlockTrainableStreamingEndToEnd:
     - ``param.grad`` lives on GPU through backward via native
       ``AccumulateGrad`` (no custom hooks).
     - ``gather_for_step`` brings ``.data`` to GPU around the step;
-      after exit, ``.data`` is back on pinned CPU.
+      after exit, ``.data`` is back on CPU.
     - User's ``Parameter`` object identity is preserved across the
       whole cycle so optimizer state is correct.
     """
@@ -3296,7 +3163,7 @@ class TestInBlockTrainableStreamingEndToEnd:
     @CUDA
     def test_default_optimizer_step_updates_match_baseline(self) -> None:
         # Default mode keeps in-block LoRA trainables out of the streamer;
-        # ModelOffloader.optimizer_step must still sync their PinnedComponent
+        # ModelOffloader.optimizer_step must still sync their HostComponent
         # CPU cache after the optimizer mutates CUDA data.
         torch.manual_seed(0)
         m_baseline = _make_lora_in_block_model(num_blocks=4, width=8, rank=2)
@@ -3400,8 +3267,8 @@ class TestInBlockTrainableStreamingEndToEnd:
         finally:
             offloader.deactivate()
 
-        # After deactivate, all params live on pinned CPU. Compare the
-        # source-of-truth (pinned host clones).
+        # After deactivate, all params live on CPU. Compare the
+        # source-of-truth (host clones).
         streamed_after = {n: p.detach().clone().cpu() for n, p in m_streamed.named_parameters() if p.requires_grad}
 
         assert set(baseline_after) == set(streamed_after)
@@ -3487,7 +3354,7 @@ class TestInBlockTrainableStreamingEndToEnd:
                 torch.testing.assert_close(after_deactivate[name], active_value)
             for p in m.parameters():
                 assert p.device == torch.device("cpu")
-                assert p.is_pinned()
+                assert not p.is_pinned()
         finally:
             offloader.deactivate()
 
@@ -3626,7 +3493,7 @@ class TestRevisedDataOnlyDesign:
         self,
     ) -> None:
         # Exception inside the gather body must NOT roll back to stale
-        # pinned bytes — the optimizer may have partially mutated
+        # host bytes — the optimizer may have partially mutated
         # params before raising. Scatter on body exit (clean OR
         # exception); the user's exception handler sees the actual
         # failure rather than a silent revert.
@@ -3661,7 +3528,7 @@ class TestRevisedDataOnlyDesign:
         finally:
             offloader.deactivate()
 
-        # The +1 mutation must have made it back to pinned despite
+        # The +1 mutation must have made it back to host despite
         # the exception inside the gather body.
         for n, post in ((n, p.data.detach().clone()) for n, p in m.named_parameters() if p.requires_grad):
             torch.testing.assert_close(

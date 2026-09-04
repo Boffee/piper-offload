@@ -16,7 +16,7 @@ from piper_offload import (
     merge_adapter,
 )
 from piper_offload.bnb8bit_adapter import Bnb8bitAdapter
-from piper_offload.pinned_param import PinnedParam
+from piper_offload.host_param import HostParam
 from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import tensor_id
 from tests.conftest import activated_model
@@ -91,54 +91,38 @@ class TestBnb8bitAdapter:
         # An Int8Params with CB/SCB None (an unquantized meta-skeleton
         # placeholder) is a legitimate bind target. matches is pure type
         # recognition, so it accepts it; the "must be pre-forward / quantized"
-        # guard moves to the pin/read path (test_pin_rejects_post_forward).
+        # guard moves to the capture/read path (test_capture_rejects_post_forward).
         assert Bnb8bitAdapter.matches(_unquantized_int8params())
 
-    def test_pin_rejects_post_forward(self) -> None:
+    def test_capture_rejects_post_forward(self) -> None:
         # After the first forward bitsandbytes nulls CB/SCB on the weight
-        # (state migrates to the module). Pinning decomposes CB/SCB, so such a
+        # (state migrates to the module). Capture decomposes CB/SCB, so such a
         # weight still fails loudly — at the read path now, not at matches.
         p = _make_int8()
         p.CB = None
         p.SCB = None
         with pytest.raises(RuntimeError, match="before the first forward"):
-            PinnedParam(p)
+            HostParam(p)
 
-    def test_pin_preserves_storage_and_metadata(self) -> None:
+    def test_capture_preserves_storage_and_metadata(self) -> None:
         pytest.importorskip("bitsandbytes")
         from bitsandbytes.nn import Int8Params
 
         p = _make_int8()
-        pinned_param = PinnedParam(p)
+        host_param = HostParam(p)
 
         # make_cpu_param() returns the Int8Params itself (a Parameter); CB is
         # the int8 weight, SCB the per-row scale.
-        pinned = pinned_param.make_cpu_param()
-        assert isinstance(pinned, Int8Params)
-        assert pinned.CB.is_pinned()
-        assert pinned.SCB.is_pinned()
-        assert pinned.CB.data_ptr() == pinned_param.pinned_state.data.data_ptr()
-        assert pinned.SCB.data_ptr() == pinned_param.pinned_state.scb.data_ptr()
-        assert pinned.CB.dtype == torch.int8
-        assert pinned_param.compute_dtype is torch.float16
+        host = host_param.make_cpu_param()
+        assert isinstance(host, Int8Params)
+        assert not host.CB.is_pinned()
+        assert not host.SCB.is_pinned()
+        assert host.CB.data_ptr() == host_param.host_state.data.data_ptr()
+        assert host.SCB.data_ptr() == host_param.host_state.scb.data_ptr()
+        assert host.CB.dtype == torch.int8
+        assert host_param.compute_dtype is torch.float16
         assert torch.equal(
-            Bnb8bitAdapter.dequantize(pinned), Bnb8bitAdapter.dequantize(p)
-        )
-
-    def test_adopted_backing_retains_storage_and_metadata(self) -> None:
-        p = _make_int8()
-        cb_ptr = p.CB.data_ptr()
-        scb_ptr = p.SCB.data_ptr()
-        pageable_param = PinnedParam(p, pin_memory=False)
-        pageable = pageable_param.make_cpu_param()
-
-        assert not pageable.CB.is_pinned()
-        assert not pageable.SCB.is_pinned()
-        assert pageable_param.pinned_state.data.data_ptr() == cb_ptr
-        assert pageable_param.pinned_state.scb.data_ptr() == scb_ptr
-        assert torch.equal(
-            Bnb8bitAdapter.dequantize(pageable),
-            Bnb8bitAdapter.dequantize(p),
+            Bnb8bitAdapter.dequantize(host), Bnb8bitAdapter.dequantize(p)
         )
 
     def test_tensor_id_tracks_cb_and_scb(self) -> None:
@@ -157,7 +141,7 @@ class TestBnb8bitAdapter:
         assert _param_target_layout(p1) == _param_target_layout(p2)
 
     def test_bind_layout_matches_real_and_placeholder(self) -> None:
-        # A config-built placeholder (CB None) must bind against a store pinned
+        # A config-built placeholder (CB None) must bind against a store host
         # from a real quantized param. int8 isn't packed, so both sides' bind
         # layout is simply the logical [out, in] shape (no quant_state branch,
         # unlike 4-bit).
@@ -169,13 +153,13 @@ class TestBnb8bitAdapter:
         ) == Bnb8bitAdapter.bind_layout_signature(real)
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
-        pinned_param = PinnedParam(_make_int8())
-        state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
+        host_param = HostParam(_make_int8())
+        state = host_param.allocate_gpu_storage(torch.device("cpu"))
 
         with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            pinned_param.copy_to_cpu(state)
+            host_param.copy_to_cpu(state)
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            pinned_param.validate_parameter_data_swap_target()
+            host_param.validate_parameter_data_swap_target()
 
     def test_dequantize_requantize_preserves_representation(self) -> None:
         p = _make_int8()
@@ -519,7 +503,7 @@ class TestBnb8bitAdapter:
 
     def test_tied_int8_weights_rejected(self) -> None:
         # int8 quant state migrates onto the module on first forward, so a
-        # single shared wrapper cannot serve two tied modules; reject at pin.
+        # single shared wrapper cannot serve two tied modules; reject at capture.
         shared = _make_int8(rows=64, cols=64)
 
         class M(nn.Module):
@@ -540,20 +524,20 @@ class TestBnb8bitAdapter:
         pytest.importorskip("bitsandbytes")
         from bitsandbytes.nn import Int8Params
 
-        pinned_param = PinnedParam(_make_int8(device="cuda"))
+        host_param = HostParam(_make_int8(device="cuda"))
 
-        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
-        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
-        gpu_param = pinned_param.make_gpu_param(gpu_state)
+        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
+        host_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu_param = host_param.make_gpu_param(gpu_state)
         torch.cuda.synchronize()
-        pinned = pinned_param.make_cpu_param()
+        host = host_param.make_cpu_param()
 
         assert isinstance(gpu_param, Int8Params)
         assert gpu_param.CB.is_cuda
         assert gpu_param.SCB.is_cuda
         assert gpu_param.CB.dtype == torch.int8
-        assert torch.equal(gpu_param.CB.cpu(), pinned.CB)
-        assert torch.equal(gpu_param.SCB.cpu(), pinned.SCB)
+        assert torch.equal(gpu_param.CB.cpu(), host.CB)
+        assert torch.equal(gpu_param.SCB.cpu(), host.SCB)
 
     @CUDA
     def test_model_offloader_cuda_forward_int8_multi_cycle(self) -> None:

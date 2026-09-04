@@ -1,7 +1,7 @@
 """Internal optional-import module for TorchAO NVFP4 support.
 
 Single source of truth for the private-ish TorchAO NVFP4 layout this
-repo needs to move packed weights through :class:`PinnedParam` and to
+repo needs to move packed weights through :class:`HostParam` and to
 expose the dequantize/requantize adapter capability. TorchAO's public
 workflow creates ``NVFP4Tensor`` weights via
 ``quantize_(..., NVFP4WeightOnlyConfig/NVFP4DynamicActivation...)``;
@@ -102,7 +102,7 @@ def validate_layout(t: torch.Tensor) -> None:
         return
     raise RuntimeError(
         f"NVFP4Tensor is missing expected attributes {missing!r}; "
-        f"this repo is pinned to a layout that exposes {LAYOUT_ATTRS}. "
+        f"this repo requires a layout that exposes {LAYOUT_ATTRS}. "
         "TorchAO likely refactored the wrapper class — upgrade "
         "piper-offload to match."
     )

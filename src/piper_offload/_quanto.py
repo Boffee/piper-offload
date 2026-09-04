@@ -12,11 +12,11 @@ optimum-quanto:
   :class:`~piper_offload.quanto_adapter.QuantoAdapter` to expose a
   dequantize/requantize adapter capability.
 
-Both pin/move/wrap and dequantize/requantize support consume from here
+Both capture/move/wrap and dequantize/requantize support consume from here
 through :mod:`quanto_adapter`, so the layout assumption only has to be
 updated once when optimum-quanto refactors.
 
-Pinned to optimum-quanto's internal layout. Not part of the public API.
+Host to optimum-quanto's internal layout. Not part of the public API.
 """
 
 from typing import Any
@@ -210,7 +210,7 @@ def validate_layout(qt: torch.Tensor) -> None:
         return
     raise RuntimeError(
         f"WeightQBytesTensor is missing expected attributes {missing!r}; "
-        f"this repo is pinned to a layout that exposes {LAYOUT_ATTRS}. "
+        f"this repo requires a layout that exposes {LAYOUT_ATTRS}. "
         "optimum-quanto likely refactored the wrapper class — upgrade "
         "piper-offload to match."
     )

@@ -11,10 +11,9 @@ from torch import nn
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent, BlockComponentStore
 from .block_mode import BlockMode
-from .host_backing import HostBacking
+from .host_component import HostComponent, HostComponentStore
+from .host_module import ParameterOverride
 from .module_names import buffer_names, parameter_names
-from .pinned_component import PinnedComponent, PinnedComponentStore
-from .pinned_module import ParameterOverride
 
 
 class CompositeComponent:
@@ -23,9 +22,9 @@ class CompositeComponent:
     def __init__(
         self,
         *,
-        resident: PinnedComponent | None,
+        resident: HostComponent | None,
         blocks: Sequence[BlockComponent],
-        transient: Sequence[tuple[str, PinnedComponent]] = (),
+        transient: Sequence[tuple[str, HostComponent]] = (),
         transient_blocks: Sequence[BlockComponent] = (),
     ) -> None:
         self._resident = resident
@@ -35,7 +34,7 @@ class CompositeComponent:
         self._teardown_stack: contextlib.ExitStack | None = None
 
     @property
-    def resident(self) -> PinnedComponent | None:
+    def resident(self) -> HostComponent | None:
         return self._resident
 
     @property
@@ -43,14 +42,14 @@ class CompositeComponent:
         return self._blocks
 
     @property
-    def transient(self) -> tuple[tuple[str, PinnedComponent], ...]:
+    def transient(self) -> tuple[tuple[str, HostComponent], ...]:
         return self._transient
 
     @property
     def transient_blocks(self) -> tuple[BlockComponent, ...]:
         return self._transient_blocks
 
-    def _components(self) -> Iterator[PinnedComponent | BlockComponent]:
+    def _components(self) -> Iterator[HostComponent | BlockComponent]:
         if self._resident is not None:
             yield self._resident
         for _path, component in self._transient:
@@ -119,10 +118,10 @@ class CompositeComponent:
 class CompositeComponentStore:
     """Reusable stores for resident, transient, and block model state."""
 
-    resident_store: PinnedComponentStore | None
+    resident_store: HostComponentStore | None
     block_stores: tuple[BlockComponentStore, ...]
     transient_block_stores: tuple[BlockComponentStore, ...] = ()
-    transient_stores: tuple[tuple[str, PinnedComponentStore], ...] = ()
+    transient_stores: tuple[tuple[str, HostComponentStore], ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -135,7 +134,7 @@ class CompositeComponentStore:
 
     def _stores(
         self,
-    ) -> Iterator[PinnedComponentStore | BlockComponentStore]:
+    ) -> Iterator[HostComponentStore | BlockComponentStore]:
         if self.resident_store is not None:
             yield self.resident_store
         for _path, store in self.transient_stores:
@@ -152,7 +151,6 @@ class CompositeComponentStore:
         transient_block_paths: Sequence[str] = (),
         transient_paths: Sequence[str] = (),
         include_block_trainables: bool = False,
-        host_backing: HostBacking = "pinned",
     ) -> Self:
         persistent_paths = tuple(block_paths)
         transient_paths_with_blocks = tuple(transient_block_paths)
@@ -174,7 +172,6 @@ class CompositeComponentStore:
                 model,
                 blocks_path=blocks_path,
                 include_block_trainables=include_block_trainables,
-                host_backing=host_backing,
             )
 
         block_stores = tuple(make_block_store(blocks_path) for blocks_path in persistent_paths)
@@ -184,7 +181,7 @@ class CompositeComponentStore:
         block_buffers = {name for store in all_block_stores for name in store.buffer_names}
         resident_params = parameter_names(model) - block_params
         resident_buffers = buffer_names(model) - block_buffers
-        transient_stores: list[tuple[str, PinnedComponentStore]] = []
+        transient_stores: list[tuple[str, HostComponentStore]] = []
         for path in transient_paths:
             module = model.get_submodule(path)
             prefix = f"{path}." if path else ""
@@ -195,22 +192,20 @@ class CompositeComponentStore:
             transient_stores.append(
                 (
                     path,
-                    PinnedComponentStore.from_module(
+                    HostComponentStore.from_module(
                         model,
                         include_param_names=selected_params,
                         include_buffer_names=selected_buffers,
-                        host_backing=host_backing,
                     ),
                 )
             )
             resident_params -= selected_params
             resident_buffers -= selected_buffers
         resident_store = (
-            PinnedComponentStore.from_module(
+            HostComponentStore.from_module(
                 model,
                 include_param_names=resident_params,
                 include_buffer_names=resident_buffers,
-                host_backing=host_backing,
             )
             if resident_params or resident_buffers
             else None

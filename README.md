@@ -1,8 +1,8 @@
 # Piper Offload
 
 A model-agnostic GPU/CPU memory manager for PyTorch. It caches reusable
-model and adapter resources, and swaps independent models in and out of
-GPU memory under a policy-driven cache.
+model and adapter resources, preserves compatible file-backed CPU mappings,
+and swaps independent models in and out of GPU memory.
 
 Piper Offload is self-contained and library-friendly: it has no required
 dependency beyond `torch`. Optional integrations support `bitsandbytes`,
@@ -41,12 +41,13 @@ is not required.
 | Module | Role |
 |---|---|
 | `resource_cache.py` | `ResourceCache`, eviction policy, cache metadata, and cache errors |
+| `pin_manager.py` | `PinManager`, `PinLease`, `PinStats`, and the process-wide `host_pin_manager` for budgeted host registration |
 | `model_cache.py` | `ModelCache` — model-aware `ResourceCache` with activation and adapter coordination |
 | `resource_specs.py` | `ModelSpec`, `AdapterSpec`, `ObjectSpec` — standard frozen resource specifications |
 | `protocols.py` | `ResourceSpec`, `ResourceStore`, `ResourceBinding` plug-in contracts |
 | `block_compile.py` | `BlockCompileConfig` — opt-in Inductor policy for declared block forwards |
-| `model_offloader.py` | `ModelOffloader` — cached single-model runtime for whole-model bulk pinned-CPU↔GPU or streamed block offload |
-| `pinned_component.py` | `PinnedComponentStore`, `PinnedComponent` — lower-level reusable pinned backing storage plus lifecycle-only pinned component used by `ModelOffloader` |
+| `model_offloader.py` | `ModelOffloader` — cached single-model runtime for whole-model bulk CPU↔GPU or streamed block offload |
+| `host_component.py` | `HostComponentStore`, `HostComponent` — lower-level reusable host backing storage plus lifecycle-only host component used by `ModelOffloader` |
 | `block_component.py` | `BlockComponentStore`, `BlockComponent` — lower-level streamed backing storage plus per-block-list streaming component |
 | `adapter.py` | `Adapter`, `AdapterTarget` — cached resources and their delta-or-value target union |
 | `lora.py` | `LoRAFactor`, `ScaledLoRAFactor`, `LoRATransform` — low-rank data, merge, and routed execution |
@@ -55,10 +56,10 @@ is not required.
 | `parameter_transform.py` | `ParameterTransform` — shared parameter-update protocol |
 | `merge.py` | `merge_adapter()` — permanent in-place adapter application to base weights |
 | `seeding.py` | `derive_seed()` — canonical stable unsigned 64-bit seed derivation from typed identity parts |
-| `pinned_param.py` | `PinnedParam` — per-parameter pinning primitive (handles plain tensors, quanto, GGUF, bitsandbytes, Piper ConvRot INT8 / NVFP4, DTensor, and TorchAO dynamic/static scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
-| `pinned_module.py` | Internal name-keyed pinned module storage plus concrete module bindings |
+| `host_param.py` | `HostParam` — per-parameter capture primitive (handles plain tensors, quanto, GGUF, bitsandbytes, Piper ConvRot INT8 / NVFP4, DTensor, and TorchAO dynamic/static scaled-FP8 / INT8 / MX (MXFP8, MXFP4) / NVFP4 / INT4 tile-packed via adapters; see [Quantized weight support](#quantized-weight-support)) |
+| `host_module.py` | Internal name-keyed host module storage plus concrete module bindings |
 | `tensor_adapters.py`, `quanto_adapter.py`, `gguf_adapter.py`, `piper_convrot_int8_adapter.py`, `piper_convrot_nvfp4_adapter.py`, `nvfp4_adapter.py`, `mx_adapter.py`, `float8_adapter.py`, `static_float8_adapter.py`, `int8_adapter.py`, `int4_tile_adapter.py`, `dtensor_adapter.py` | Tensor adapter contracts/implementations and optional optimum-quanto / GGUF / Piper ConvRot / torchao / DTensor support |
-| `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (scaled-FP8 / INT8 / MX / NVFP4 / INT4 tile-packed) — common pin/move/identity mechanics + per-format hooks; capabilities beyond inference movement (CPU round-trip, dequant/requant conversion, copy, and staged factorized/dense merge) are opted into per subclass |
+| `torchao_structured_adapter.py` | Internal: shared `TorchaoStructuredAdapter` base for the TorchAO subclass adapters (scaled-FP8 / INT8 / MX / NVFP4 / INT4 tile-packed) — common capture/move/identity mechanics + per-format hooks; capabilities beyond inference movement (CPU round-trip, dequant/requant conversion, copy, and staged factorized/dense merge) are opted into per subclass |
 | `dtensor_adapter.py` | Internal: `DTensorAdapter` for tensor-parallel `DTensor` weights — composes with other adapters by delegating local-shard movement and factorized/dense merge to the registry, then replaying the `(mesh, placements)` wrapper; frozen-inference scope (see `_dtensor.py`) |
 | `tensor_adapter_registry.py` | Public external-adapter registration plus adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
@@ -80,19 +81,17 @@ simultaneously, and you want to swap them in and out efficiently
 across many calls. Re-loading from disk every call is too slow
 (seconds per gigabyte). Keeping all models resident on GPU is too
 expensive. `torch.cuda.empty_cache()` plus `.to("meta")` gets you the
-basics but leaves significant performance on the table — pinned host
-memory does CPU↔GPU DMA at full PCIe bandwidth (~30 GB/s vs.
-~3 GB/s from disk), and a shared cache lets multiple models use the
-same host-memory budget.
+basics; a shared cache adds reusable host storage, managed activation, and
+block streaming.
 
 This library gives you:
 
-1. **Cached resources** that pin reusable model or adapter state to host RAM.
+1. **Cached resources** that retain reusable model or adapter state to host RAM.
 2. **Activation lifecycles** that move one cached model onto a compute device.
-3. **A resource cache** that evicts least-recently-used unleased entries and
-   protects leased stores from eviction.
-4. **A model-aware cache** that leases model and adapter resources and owns their
-   device lifecycle.
+3. **A resource cache** with reference-counted leases and optional byte-based
+   eviction.
+4. **An unbounded model cache** that leases model and adapter resources, owns
+   their device lifecycle, and leaves mapped-page residency to the OS.
 
 ## When to use what
 
@@ -110,10 +109,9 @@ This library gives you:
 import torch
 from piper_offload import ModelCache, ModelSpec
 
-cache = ModelCache(max_cache_bytes=24 * 1024**3)
+cache = ModelCache()
 model_spec = ModelSpec(
     key="main",
-    estimated_cache_bytes=12 * 1024**3,
     factory=build_my_model,  # returns a fresh nn.Module
 )
 device = torch.device("cuda")
@@ -126,71 +124,105 @@ with cache.use(model_spec, device=device) as gpu_model:
     output = gpu_model(input_tensor_2)
 ```
 
-`ModelCache` inherits the complete `ResourceCache` API, adding model activation
-and adapter coordination to the same registry and memory budget. `ModelSpec`
-factories should build fresh modules. One model cache entry contains one
+`ModelCache` uses an unbounded `ResourceCache`, adding model activation and
+adapter coordination to its registry and lease API. `ModelSpec` factories
+should build fresh modules. One model cache entry contains one
 `ModelOffloader` and one model instance. Uses are sequential:
 an overlapping activation raises `ModelRuntimeInUseError`. Applications that
 need concurrent replicas must register separately constructed models under
-distinct cache keys, which intentionally duplicates their pinned host storage.
-To release pinned host memory, evict or clear inactive cache entries and drop
+distinct cache keys. Their file mappings can still share physical OS pages.
+To release host memory, evict or clear inactive cache entries and drop
 any escaped model references.
 
-### Pinned copies versus adopted model backing
+### Host backing
 
-Model weights use owned pinned host copies by default for maximum CPU-to-GPU
-transfer bandwidth. Systems with a tight pinned-memory limit can instead
-adopt existing CPU backing without copying it:
+Model and adapter factories transfer ownership of compatible complete pageable
+CPU allocations and non-empty views into non-resizable storage to the cached
+resource. This preserves checkpoint mmap backing when loaders assign mapped
+tensors or splits of mapped tensors directly into the model. Callers must not
+mutate factory-produced tensors after construction. Device tensors, pinned CPU
+tensors, partial views into ordinary resizable allocations, and incompatible
+layouts are copied into pageable CPU allocations. Tensor adapters preserve
+packed quantized data, scales, and reconstruction metadata.
+
+Host storage is shared by bound wrappers and counted once per stored object.
+Capture does not register memory for accelerated transfers. The old
+construction-time backing modes have been removed.
+
+`HostParam.storage_tensors()` and `HostBuffer.storage_tensors()` expose the
+existing physical CPU tensors, including packed quantized data, scales, and
+tensor-valued metadata. Enumeration makes no copies and preserves views;
+DTensor delegates to its local shard, and meta parameters return an empty
+tuple. Consumers must deduplicate underlying allocations themselves. Use
+`tensor.untyped_storage()` for allocation addresses and sizes; a tensor's
+`data_ptr()` and `nbytes` describe its view. Enumeration does not register or
+pin memory.
+
+### Optional host registration
+
+`host_pin_manager` registers existing CPU storage in place under a separate
+`max_pinned_bytes` budget. Its default budget is zero, so registration is opt-in,
+and construction and configuration do not initialize CUDA. Set a finite byte
+limit, or set `max_pinned_bytes = None` to register opportunistically up to the
+capacity currently available from CUDA/HIP. Ordinary streaming and compiled
+rolling acquire leases automatically with their CUDA working sets. CPU
+execution, resident blocks, and non-block components do not acquire pin leases.
+
+Deactivation releases the lease after transfers finish and leaves registrations
+in the idle LRU. Reactivating the same backing reuses its retained registrations
+without native register/unregister calls. `BlockComponent.release()` also
+releases pin protection during a temporary working-set release; `acquire()`
+reuses or registers backing again. This lets transient components share the
+budget. Resolved replacement sources, quantized payloads and metadata, buffers,
+and trainable optimizer backing all participate in the same lease.
+
+Explicit leases are also available for custom transfers:
 
 ```python
-model_spec = ModelSpec(
-    key="main-adopted",
-    estimated_cache_bytes=12 * 1024**3,
-    factory=build_my_model,
-    block_paths=("transformer_blocks",),
-    host_backing="adopt",
-)
+import torch
+from piper_offload import host_pin_manager
 
-# The same option exists on the low-level API.
-offload = ModelOffloader.from_module(
-    model,
-    block_paths=("transformer_blocks",),
-    host_backing="adopt",
-)
+host_pin_manager.max_pinned_bytes = 4 * 1024**3
+source = torch.randn(1024, 1024)
+target = torch.empty_like(source, device="cuda")
+copy_stream = torch.cuda.Stream()
+
+with host_pin_manager.acquire([source]):
+    with torch.cuda.stream(copy_stream):
+        target.copy_(source, non_blocking=True)
+    copy_stream.synchronize()  # finish every host read before closing the lease
+# The source may remain registered in the idle LRU after the lease closes.
 ```
 
-Adopt mode is a strict zero-copy path for frozen model state that
-already lives on CPU. The offloader retains the existing tensors rather than
-cloning them, so anonymous pageable allocations and file-backed/mmap storage
-use the same implementation and preserve their original backing. Copies go
-directly into the existing GPU target pool; CUDA owns any implicit staging.
-Trainable parameters, non-CPU tensors, incompatible layouts, and adapters that
-cannot preserve the source representation raise instead of silently
-materializing a copy. The policy applies to both streamed blocks and the
-non-streamed model remainder. Adapter resources choose their host storage
-independently (pinned by default), and `cache_bytes` accounts for model bytes
-the same way in either mode using each tensor adapter's logical byte count.
-For mmap backing, this is the size of the retained model tensors, not the
-checkpoint file size or the mmap pages currently resident in RAM.
+For model backing, pass tensors from `HostParam.storage_tensors()` and
+`HostBuffer.storage_tensors()`. Acquiring a lease protects existing
+registrations and registers additional whole allocations when capacity allows.
+Budget or supported runtime-capacity failures leave complete allocations
+pageable. They remain pageable until all their active leases close, even if
+another request arrives after capacity becomes available. A lease reports
+`registered_bytes` and `pageable_bytes` for unique
+requested allocations. `host_pin_manager.stats.pinned_bytes` instead counts
+the union of covered OS pages, including shared boundary pages only once.
 
-Because adopted model backing aliases its source allocations, callers must
-not mutate retained parameter or buffer references—or writable mmap contents—
-for the offloader's lifetime. `requires_grad=False` disables autograd tracking;
-it does not make the underlying bytes immutable.
+Released registrations enter an idle LRU. Budget pressure evicts idle entries;
+active leases remain protected. A native capacity failure evicts unrelated idle
+registrations in LRU order and retries the current allocation. If capacity
+remains unavailable, the rest of that acquisition stays pageable without
+repeated registration attempts. Discarding a source tensor retires its
+registration once active users finish. Storage remains alive until successful
+unregistration, including after cleanup errors; `clear()` retries failed cleanup
+and evicts idle entries. `ModelCache` retains host stores until explicit
+eviction; unpinned mapped pages remain reclaimable by the OS.
+Do not resize storage or register/unregister it outside the manager while it is
+managed. Use views of one storage for aliases; distinct overlapping byte ranges
+are rejected before mutation.
 
-Adopted capture retains every selected tensor before changing any module
-registry. Only after the complete composite store succeeds does binding install
-the adopted wrappers. An adoption failure therefore leaves the supplied model's
-original parameter and buffer objects untouched.
-
-Pinned backing remains faster for transfer-bound streaming, while adopted
-backing has near-zero construction-copy cost and can be competitive
-when computation hides weight movement. Compare the complete offloader path on
-a target system with:
-
-```bash
-python benchmarks/benchmark_offloader_host_backing.py
-```
+The backend binds the CUDA or HIP runtime already loaded by PyTorch. It clears
+errors from handled registration failures and reports unexpected errors through
+`HostRegistrationError`, including conflicting foreign registrations. CUDA
+registration semantics follow the [CUDA memory API](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html);
+the corresponding HIP calls are documented in the
+[HIP runtime API](https://rocm.docs.amd.com/projects/HIP/en/latest/doxygen/html/hip__runtime__api_8h.html).
 
 ## Manual offloader lifecycle
 
@@ -211,20 +243,20 @@ try:
 finally:
     offload.deactivate()
 
-del offload, model  # drop refs to free pinned host memory
+del offload, model  # drop refs to free host memory
 ```
 
-`ModelOffloader.from_module()` mutates the source model while
-pinning: frozen `nn.Parameter` registry entries get repointed at
-Parameters wrapping pinned CPU storage, trainable Parameter objects keep
-their identity and point their `.data` at pinned CPU storage, and buffers
-are replaced with pinned copies. After construction, only access the bound
+`ModelOffloader.from_module()` mutates the source model during
+capture: frozen `nn.Parameter` registry entries get repointed at
+Parameters wrapping CPU storage, trainable Parameter objects keep
+their identity and point their `.data` at CPU storage, and buffers
+are replaced with host copies. After construction, only access the bound
 model while the offloader is active: call `activate(device)`, use
 `offload.value`, and guarantee a matching `deactivate()` with `try`/`finally`.
 For CUDA training, wrap `optimizer.step()` in
 `offload.optimizer_step()` so trainable GPU updates are copied back to
-the pinned CPU cache before deactivation.
-**Drop the offloader and model references to release pinned host
+the CPU cache before deactivation.
+**Drop the offloader and model references to release host
 memory** — there's no `close()`; resource cleanup is reference-drop + GC.
 
 ## Manual block streaming
@@ -237,7 +269,7 @@ and a CUDA-stream-based async prefetcher.
 import torch
 from piper_offload import ModelOffloader
 
-# Construction pins and binds once; cache_bytes is final immediately.
+# Construction captures and binds once; cache_bytes is final immediately.
 # block_paths selects block groups; block_mode selects their residency strategy.
 offload = ModelOffloader.from_module(
     model,
@@ -251,7 +283,7 @@ try:
 finally:
     offload.deactivate()
 
-del offload, model  # drop refs to free pinned host memory
+del offload, model  # drop refs to free host memory
 ```
 
 Ordinary streaming owns one active block and one asynchronous lookahead target.
@@ -263,14 +295,14 @@ selected by `block_paths` and `transient_block_paths`.
 block target resident, while `block_mode="rolling"` uses one compiled target
 refilled parameter-by-parameter. `block_mode="auto"` selects rolling for each
 supported block group when full-graph compilation is configured and otherwise
-uses streaming. With both path lists empty, the whole model is one bulk-pinned
+uses streaming. With both path lists empty, the whole model is one bulk-host
 component that activation copies to the GPU.
 For heterogeneous block lists, execution still limits concurrency to the active
 and lookahead blocks, while the morphing pool may park one reusable target per
 distinct tensor-layout signature.
 
 `ModelOffloader` only streams on CUDA. Activating the binding on
-`cpu` is a pass-through over the already-installed pinned CPU storage:
+`cpu` is a pass-through over the already-installed CPU storage:
 no target pool, no streaming hooks, no weight copies.
 `adapter_mode="merge"` is CUDA-only; use routed LoRA mode for
 CPU activation. Routed LoRA installs target-Linear hooks: a forward-PRE
@@ -451,11 +483,11 @@ mutations. Dynamo's native graph-break and recompilation-limit behavior still
 applies.
 
 By default, trainable parameters (e.g. LoRA adapters) are managed by
-the composed `PinnedComponent`: they move to GPU on CUDA activation and
-back to pinned CPU storage on deactivate. On CPU activation they stay in
+the composed `HostComponent`: they move to GPU on CUDA activation and
+back to CPU storage on deactivate. On CPU activation they stay in
 the host-backed module state. Wrap CUDA optimizer updates in
 `offload.optimizer_step()` so updated trainable bytes are copied back
-to pinned CPU storage before deactivation.
+to CPU storage before deactivation.
 
 To let the selected block residency strategy own in-block trainable weights,
 opt them into the block component:
@@ -488,7 +520,7 @@ shape and capability validation. Adapter target keys must
 match the model's parameter names exactly; any remapping — stripping a
 `diffusion_model.` prefix, inserting a PEFT `.base_layer.` segment — is
 the caller's job when building the adapter state dict. Each planned update runs
-immediately after the owning component copies its effective source from pinned
+immediately after the owning component copies its effective source from host
 CPU storage to GPU, so both
 block-streamed and non-block weights use the same merge path. Merge
 compatibility is tensor-format-owned: physical plain floating-point tensors
@@ -501,7 +533,7 @@ unsupported. Frozen plain floating-point meta tensors can instead be populated
 by dense or registered structured parameter values.
 Routed mode remains factor-only and requires a compatible logical `nn.Linear`
 shape and compute dtype.
-`PinnedParam` remains a storage primitive; transforms ask the selected tensor
+`HostParam` remains a storage primitive; transforms ask the selected tensor
 adapter for their required capabilities.
 
 `Adapter.from_state_dict()` reserves the exact suffixes `.lora_A.weight` and
@@ -677,33 +709,19 @@ from piper_offload import derive_seed
 local_seed = derive_seed(parent_seed, shard_offset)
 ```
 
-Adapter delta and parameter-value tensors use pinned storage by default. To
-retain existing anonymous pageable or mmap/file-backed CPU tensors without
-copying them, use strict adoption:
+Adapter delta and parameter-value tensors own pageable CPU backing. Compatible
+allocations and mmap-backed split views transfer without a copy. `dtype=`
+converts dense sources during capture; prequantized values retain their encoded
+representation and must already have the requested compute dtype.
 
-```python
-lora = Adapter.from_state_dict(
-    state_dict=load_file("lora.safetensors"),
-    host_backing="adopt",
-)
-```
-
-The loader must return tensors that still reference the desired backing.
-Adopted adapter backing requires contiguous CPU tensors and raises rather than
-moving or normalizing them. A `dtype=` conversion is also rejected because it
-would allocate new storage; pre-convert the checkpoint or use pinned backing.
-Because the resource aliases adopted tensors, callers must not mutate those
-storages during the adapter's lifetime. Pinned factors generally transfer faster,
-especially in routed mode where the matched factors move on every invocation.
-
-Block reload from pristine pinned CPU storage automatically clears
+Block reload from pristine CPU storage automatically clears
 the previous merge — no explicit unmerge step needed.
 
 Pass `adapter_mode="routed"` as an alternative to the default merge mode.
 Routed mode installs a forward hook pair on each matched
 `nn.Linear` parent — `y = base(x) + alpha * (B * A * x + bias)` when a legacy
 bias is present — instead of merging into the base weight. Its PRE hook
-copies only that target's factor tensors from pinned CPU storage to the
+copies only that target's factor tensors from CPU storage to the
 invocation's input device; its POST hook applies the residual and releases
 those device tensors. Multiple LoRAs on one target are grouped into one hook
 pair and summed independently. **Routed mode is
@@ -860,7 +878,7 @@ training block is checkpointed (HF `gradient_checkpointing_enable()` or
 manual `torch.utils.checkpoint.checkpoint` wrapping).
 
 Wrap CUDA optimizer updates so managed trainable weights are synced back
-to pinned CPU storage. With `include_block_trainables=True`, this also
+to CPU storage. With `include_block_trainables=True`, this also
 materializes streamed trainable weights on GPU while a normal PyTorch
 optimizer mutates them:
 
@@ -881,14 +899,14 @@ finally:
 ```
 
 This boundary is not optimizer-specific. It runs whatever
-`optimizer.step()` does, copies updated trainable data back to pinned
+`optimizer.step()` does, copies updated trainable data back to host
 CPU storage, and leaves gradients on GPU.
 
 ## Cached model details
 
-`ResourceCache` owns only reusable-resource admission, accounting, leases, and
-eviction. `ModelCache` inherits that API and adds dependency leasing, adapter
-attachment, and device activation for model uses.
+`ResourceCache` owns reusable-resource registration, accounting, leases, and
+eviction. `ModelCache` uses it without a byte limit and adds dependency
+leasing, adapter attachment, and device activation for model uses.
 
 ```python
 from piper_offload import (
@@ -898,23 +916,20 @@ from piper_offload import (
 )
 from safetensors.torch import load_file
 
-cache = ModelCache(max_cache_bytes=80 * 1024**3)
+cache = ModelCache()
 device = "cuda:0"
 
 text_encoder = ModelSpec(
     key="text_encoder",
-    estimated_cache_bytes=12 * 1024**3,
     factory=build_text_encoder,
 )
 diffusion_model = ModelSpec(
     key="diffusion_model",
-    estimated_cache_bytes=24 * 1024**3,
     factory=build_diffusion_model,
     block_paths=("transformer_blocks",),
 )
 style_lora = AdapterSpec(
     key="style-lora",
-    estimated_cache_bytes=512 * 1024**2,
     factory=lambda: load_file("style.safetensors"),
     dtype=torch.bfloat16,
 )
@@ -938,15 +953,13 @@ exact-name mapping and activate it with `adapter_mode="merge"`:
 ```python
 feature_adapter = AdapterSpec(
     key="feature-adapter",
-    estimated_cache_bytes=512 * 1024**2,
     factory=load_parameter_values,
     dtype=torch.bfloat16,
 )
 ```
 
-The model cache leases adapter resources before admitting the model resource. An
-adapter selected for a use therefore cannot be evicted by that same model admission.
-All leases unwind in reverse order if construction or activation
+The model cache leases adapter resources before the model resource. All leases
+unwind in reverse order if construction or activation
 fails. `adapter_strengths` defaults to `1.0` per adapter; when supplied, it must
 have the same length as `adapter_specs`. Exact `0.0` and `-0.0` strengths are
 inactive: they are filtered before target grouping or hook installation, and
@@ -968,9 +981,9 @@ with cache.lease(style_lora) as lora:  # auto-registers on first lease
 > my_kept_model` the cache is no longer the sole owner of the model.
 > Always have the factory build the model itself.
 
-`ResourceCache` accepts custom `EvictionPolicy` implementations. The
-default is `LRUEvictionPolicy` for unleased host-cache eviction. The
-cache builds the eviction candidate set and byte context, then asks the
+For a finite `ResourceCache`, custom `EvictionPolicy` implementations control
+automatic eviction. The default is `LRUEvictionPolicy` for unleased stores.
+The cache builds the eviction candidate set and byte context, then asks the
 eviction policy to choose victims; `ResourceCache` still owns validation,
 accounting, admission, and release. Policies are called under
 the cache lock. `choose_victims()` must return unique keys from
@@ -989,28 +1002,26 @@ registration / cache admission
         |
         v
   +-------------+
-  | ModelCache  |  extends ResourceCache with model-aware use
+  | ModelCache  |  unbounded ResourceCache with model-aware use
   +-------------+
         |
-        +-- builds/admit --> ModelOffloader (one model, one runtime)
+        +-- builds/retains -> ModelOffloader (one model, one runtime)
         |                    |
-        |                    +-- PinnedComponent
+        |                    +-- HostComponent
         |                    |       |  resident non-block state
-        |                    |       +-- PinnedParam(s)
+        |                    |       +-- HostParam(s)
         |                    |
-        |                    +-- PinnedComponent(s)
+        |                    +-- HostComponent(s)
         |                    |       |  transient path state
-        |                    |       +-- PinnedParam(s)
+        |                    |       +-- HostParam(s)
         |                    |
         |                    +-- BlockComponent(s)
         |                            |
-        |                            +-- PinnedParam(s)
+        |                            +-- HostParam(s)
         |
-        +-- builds/admit --> Adapter (pinned or adopted LoRA/parameter values)
+        +-- builds/retains -> Adapter (CPU-backed LoRA/parameter values)
         |
-        +-- builds/admit --> custom ResourceStore
-        |
-        +-- chooses inactive victims via EvictionPolicy
+        +-- builds/retains -> custom ResourceStore
 
 ModelCache.use(...)
 -------------------
@@ -1032,7 +1043,7 @@ eviction but does not create or activate a runtime.
 `activate(device=None, **kwargs)`, and `deactivate()`.
 `ModelOffloader` is both a cached `ResourceStore` and a `ResourceBinding`;
 `Adapter` is an immutable cached `ResourceStore`. It exposes neither an active
-lifecycle nor a model-like `value`; merge and routed hooks read its pinned
+lifecycle nor a model-like `value`; merge and routed hooks read its host
 adapter backing directly.
 
 A custom cached resource needs only one spec and one store:
@@ -1069,7 +1080,7 @@ with cache.lease(spec) as store:
     ...
 ```
 
-`BlockComponent` and `PinnedComponent` are composable
+`BlockComponent` and `HostComponent` are composable
 `activate`/`deactivate` lifecycle pieces (no `value` or `model`) that live
 inside a top-level model runtime rather than acting as one themselves. Either
 active component may `release()` and later `acquire()` its CUDA working set
@@ -1080,15 +1091,12 @@ This lets higher-level runtimes coordinate component lifetimes at model
 execution boundaries without adding policy to component internals.
 
 `TensorAdapter` is the per-parameter extension point. Its base contract
-only covers inference movement: clone/pin, H2D copy, GPU wrapper rebuild,
+only covers inference movement: host capture, storage enumeration, H2D copy, GPU wrapper rebuild,
 cache bytes, logical compute dtype, and block-layout signatures. Extra
 behaviors are explicit capabilities: CPU round-trip for optimizer-step
 sync, `Parameter.data` swap for trainable streaming, shape-preserving
 dequantize/requantize conversion, representation-preserving `copy_into`, and
-adapter-owned staged factorized and dense merge. Zero-copy host adoption is another optional
-capability: `adopt_host()` returns adapter-specific state that aliases the
-existing CPU storage. The existing `cache_bytes()` method accounts for either
-pinned or adopted state. Plain bases implement these capabilities with native
+adapter-owned staged factorized and dense merge. Plain bases implement these capabilities with native
 `addmm_` and `add_`; structured bases own the representation-preserving
 implementation. Conversion and copy capabilities do not implicitly advertise
 merge support. Factorized merges with layout or value constraints can implement
@@ -1107,11 +1115,16 @@ or passing `None` preserves deterministic behavior. An adapter that needs a
 reproducible substream can derive one with the public `derive_seed()` utility.
 
 Downstream tensor subclasses can provide their adapter without adding a
-format-specific dependency to piper-offload:
+format-specific dependency to piper-offload.
+
+Every adapter must implement `storage_tensors(state)` alongside
+`capture_host()`. Return the captured state's existing plain CPU storage
+tensors, including tensor-valued metadata that stays on the CPU. Omit absent
+optional tensors, preserve shared allocations and views, and delegate through
+composing wrappers instead of reconstructing them.
 
 ```python
 from piper_offload import (
-    AdoptableTensorAdapter,
     TensorAdapter,
     register_adapter,
 )
@@ -1119,8 +1132,6 @@ from piper_offload import (
 
 class MyTensorAdapter:
     # Implement the stateless TensorAdapter protocol.
-    # To support host_backing="adopt", also implement the
-    # AdoptableTensorAdapter protocol and return adopted adapter state.
     ...
 
 
@@ -1128,7 +1139,7 @@ remove_adapter = register_adapter(MyTensorAdapter)
 ```
 
 Register adapters during application startup, before constructing models or
-pinned resources. `DTensorAdapter` remains the outermost wrapper; registered
+host resources. `DTensorAdapter` remains the outermost wrapper; registered
 adapters are then checked newest-first before the remaining built-ins. This
 lets a downstream adapter override a built-in `isinstance` match for a more
 specific subclass, and also lets DTensor delegate a custom local shard through
@@ -1138,8 +1149,8 @@ for tests and scoped integrations.
 ## Cached resource lifecycle
 
 Cached resources own cache accounting. Host capture happens during construction
-so `cache_bytes` is final at admission time; leases protect resources while
-they are used. `ModelOffloader` owns one exclusive activation lifecycle.
+so `cache_bytes` is final once the store is built; leases protect resources
+while they are used. `ModelOffloader` owns one exclusive activation lifecycle.
 `Adapter` remains immutable host backing throughout its lease:
 
 ```
@@ -1151,30 +1162,29 @@ Adapter:       construct -> lease -> read host updates -> release lease
 requested device. Merge updates stage factors when their base weight is loaded;
 routed PRE hooks copy factors for one Linear invocation and routed POST hooks
 release them after enqueueing the residual.
-`ModelOffloader`, `MpsWeights`, `PinnedComponent`, and
+`ModelOffloader`, `MpsWeights`, `HostComponent`, and
 `BlockComponent` require an explicit device. CUDA activation uses the
 streaming/DMA path where applicable; CPU activation is pass-through over
-pinned host-backed storage.
+host storage.
 `deactivate()` releases transient device resources. Host backing remains cached
 until its resource is evicted or otherwise released.
 
-Construction optimizes peak host memory. Pinning clones managed tensors
-into pinned CPU storage. For plain `torch.Tensor` parameters, the source
-`Parameter.data` may be immediately repointed at the pinned clone as soon
-as that pinned parameter is created. This releases the original source
-storage early, avoiding temporarily holding both pageable and pinned
-copies for CPU-origin models and promptly freeing GPU storage for
-CUDA-origin models. It is a clone-to-pinned plus storage swap, not true
-in-place pinning. Tensor subclasses such as quanto, GGUF, and NVFP4 do
-not use this `.data` swap when it would lose wrapper state.
+Construction transfers compatible complete pageable CPU allocations and
+non-empty views into non-resizable storage, preserving checkpoint file mappings
+through split parameters. Other sources are copied into pageable CPU storage.
+For plain `torch.Tensor` parameters, the source `Parameter.data` may be
+immediately repointed at the captured backing as soon as that host parameter is
+created. This releases replaced source storage early and promptly frees GPU
+storage for CUDA-origin models. Tensor subclasses such as quanto, GGUF, and
+NVFP4 do not use this `.data` swap when it would lose wrapper state.
 
-**There is no `close()`.** To release pinned host memory, first let all
+**There is no `close()`.** To release host memory, first let all
 leases end, then evict or clear the cache entry. Python's refcount-based
-GC frees pinned tensors once the cache and any escaped resource, binding, or
+GC frees host tensors once the cache and any escaped resource, binding, or
 model references are gone.
 
-**Failure semantics.** If construction raises after pinning has started,
-the model may already be partially repointed to pinned storage. Treat the
+**Failure semantics.** If construction raises after capture has started,
+the model may already be partially repointed to host storage. Treat the
 partially constructed resource/model as unrecoverable: drop those references
 and rebuild from a fresh model instance. If `activate()` raises, the offloader
 rolls back its active components and releases its activation claim, so a later
@@ -1203,7 +1213,7 @@ This is a low-level library; we don't guard against caller misuse.
   construction and lease accounting, then releases its lock while a lease is
   held. Each cached `ModelOffloader` owns one model and rejects overlapping
   activation, including calls from different runners. Concurrent replicas
-  require distinct `ModelSpec` keys and therefore distinct pinned storage.
+  require distinct `ModelSpec` keys and therefore distinct host storage.
 - **Buffer mutations during CUDA activation are discarded** on
   `deactivate()`. CPU activation is pass-through over host-backed
   buffers, so CPU buffer mutations behave like ordinary module
@@ -1226,16 +1236,16 @@ distinct quanto wrappers around shared inner `_data` storage.
 
 `ModelOffloader` is intended for ordinary transformer block lists where
 the streamed block weights are independent. Shared storage is preserved
-within one streamed block and within pinned state, including the standard
+within one streamed block and within host state, including the standard
 tied input-embedding/output-head pattern. It is unsupported across offload
-ownership boundaries: between streamed and pinned state, or between distinct
+ownership boundaries: between streamed and host state, or between distinct
 streamed blocks or block groups. `ModelOffloader` does not prevalidate these
 unusual layouts; omit `block_paths` and use whole-model offloading if that
 sharing must be preserved.
 
 ## Quantized weight support
 
-Every supported weight type can be offloaded (pinned host ↔ GPU
+Every supported weight type can be offloaded (host ↔ GPU
 movement). Additive-update support differs by type: factor-only LoRA and
 full-rank dense deltas have separate adapter capabilities. **Routed** LoRA
 (`adapter_mode="routed"` — a forward hook) is available for any of them
@@ -1303,13 +1313,13 @@ Notes:
 ## Quanto support
 
 Quanto-quantized models (`optimum.quanto.WeightQBytesTensor`) are
-handled correctly by both `ModelOffloader` modes. `PinnedParam` decomposes
+handled correctly by both `ModelOffloader` modes. `HostParam` decomposes
 the wrapper into its inner `_data` (int8/fp8) and `_scale` (fp16/fp32)
-tensors, pins each, and reconstructs the quanto wrapper around the GPU
+tensors, captures each, and reconstructs the quanto wrapper around the GPU
 storage on activation.
 
 Optimized `MarlinF8QBytesTensor` weights are first canonicalized to the
-ordinary unpacked `WeightQBytesTensor` representation for pinned streaming,
+ordinary unpacked `WeightQBytesTensor` representation for host streaming,
 so streamed execution is correct but does not use Marlin's packed matmul.
 Direct merges into an existing Marlin weight use the reference
 dequantize/addmm/requantize path and repack the result into that weight's
@@ -1363,7 +1373,7 @@ Piper ConvRot weights
 (`piper_kernels.linear.convrot.ConvRotInt8Tensor`) are handled when the
 `convrot` optional extra is installed. `piper-kernels` owns the tensor semantics
 plus reference and optimized execution backends; Piper Offload owns only the
-built-in `PiperConvRotInt8Adapter`. `PinnedParam` pins the INT8 `qdata` and
+built-in `PiperConvRotInt8Adapter`. `HostParam` captures the INT8 `qdata` and
 float32 per-output `scale`, preserves `group_size` and the logical floating
 `dtype`, and reconstructs the same wrapper around CUDA storage on activation.
 
@@ -1386,7 +1396,7 @@ optional suite.
 
 Piper ConvRot NVFP4 weights
 (`piper_kernels.linear.convrot.nvfp4.ConvRotNVFP4Tensor`) use a dedicated
-adapter selected before the broader TorchAO NVFP4 adapter. It pins the same
+adapter selected before the broader TorchAO NVFP4 adapter. It captures the same
 packed E2M1 data, FP8 block scales, and optional global scales as ordinary
 NVFP4 while additionally preserving the rotation group through identity,
 pool-layout, host, device, and rolling reconstruction.
@@ -1410,7 +1420,7 @@ optional integration, including exact-SM120 forward coverage when available.
 TorchAO NVFP4 weights
 (`torchao.prototype.mx_formats.nvfp4_tensor.NVFP4Tensor`) are handled
 when the `torchao` optional extra is installed.
-`PinnedParam` pins the packed FP4 `qdata`, FP8 block `scale`,
+`HostParam` captures the packed FP4 `qdata`, FP8 block `scale`,
 optional per-tensor scales, and the TorchAO dispatch metadata, then
 rebuilds the same concrete `NVFP4Tensor` subclass around GPU storage on
 activation. Subclass identity also survives requantization and merge-mode LoRA.
@@ -1449,7 +1459,7 @@ TorchAO MX (OCP microscaling) weights
 installed. A single adapter covers both
 MXFP8 (`float8_e4m3fn` / `float8_e5m2`) and MXFP4
 (`float4_e2m1fn_x2`), since TorchAO models them as the same `MXTensor`
-subclass parameterized by `elem_dtype`. `PinnedParam` pins the packed
+subclass parameterized by `elem_dtype`. `HostParam` captures the packed
 `qdata`, the E8M0 block `scale`, and the TorchAO dispatch metadata
 (`elem_dtype`, `block_size`, `kernel_preference`, `act_quant_kwargs`,
 `is_swizzled_scales`), then rebuilds the `MXTensor` wrapper around GPU
@@ -1476,8 +1486,8 @@ frozen. Routed LoRA remains the non-destructive alternative.
 
 TorchAO scaled-fp8 weights (`torchao.quantization.Float8Tensor`, created
 by `quantize_(..., Float8WeightOnlyConfig/Float8DynamicActivationFloat8WeightConfig)`)
-are handled when the `torchao` optional extra is installed. `PinnedParam`
-pins the fp8 `qdata` and fp32 `scale` tensors plus the TorchAO dispatch
+are handled when the `torchao` optional extra is installed. `HostParam`
+captures the fp8 `qdata` and fp32 `scale` tensors plus the TorchAO dispatch
 metadata (`block_size`, `mm_config`, `kernel_preference`,
 `act_quant_kwargs`), then rebuilds the `Float8Tensor` wrapper around GPU
 storage on activation. Per-group, per-row, and per-tensor scale granularities are
@@ -1493,7 +1503,7 @@ Trainable `Parameter.data` swap is not — scaled-FP8 weights stay frozen.
 TorchAO's calibrated static-activation representation is handled separately
 by `StaticFloat8Adapter`. It targets only
 `torchao.prototype.quantization.float8_static_quant.prototype_float8_tensor.PrototypeFloat8Tensor`
-weights with per-tensor weight and activation quantization, and pins the FP8
+weights with per-tensor weight and activation quantization, and captures the FP8
 `qdata`, weight `scale`, and checkpoint-provided `act_quant_scale`. All three
 are included in identity, block-pool layout compatibility, cache accounting,
 H2D/D2H movement, and wrapper reconstruction; the ordinary `Float8Tensor`
@@ -1532,11 +1542,12 @@ than silent corruption.
 
 ## State Inspection
 
-Use `cache.used_cache_bytes` and `cache.available_cache_bytes` for
-current cache accounting. Use `cache.info(key)` for per-key state when
-needed.
+Use `cache.used_cache_bytes` for logical backing accounting and
+`cache.info(key)` for per-key state. `ModelCache.available_cache_bytes` is
+`None` because it has no byte limit; release its inactive stores explicitly
+with `evict()` or `clear()`.
 
-The budget can be changed while the cache is running:
+An explicitly finite `ResourceCache` can change its budget while running:
 
 ```python
 cache.resize(40 * 1024**3)

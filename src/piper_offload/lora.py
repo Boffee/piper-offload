@@ -12,7 +12,7 @@ from typing import Any, Protocol, Self, runtime_checkable
 import torch
 from torch import nn
 
-from .pinned_param import PinnedParam
+from .host_param import HostParam
 from .seeding import derive_seed
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
@@ -53,12 +53,10 @@ def _capture_factor_tensor(
     source: torch.Tensor,
     *,
     dtype: torch.dtype | None,
-    pin_memory: bool,
-) -> PinnedParam:
+) -> HostParam:
     tensor = source if dtype is None or source.dtype is dtype else source.to(dtype=dtype)
-    return PinnedParam(
+    return HostParam(
         nn.Parameter(tensor, requires_grad=False),
-        pin_memory=pin_memory,
     )
 
 
@@ -67,20 +65,20 @@ class LoRAFactor:
     """A LoRA's host-backed tensors for one target weight.
 
     ``a`` is the ``(rank, in_dim)`` down-projection and ``b`` the
-    ``(out_dim, rank)`` up-projection, each held as a :class:`PinnedParam`.
+    ``(out_dim, rank)`` up-projection, each held as a :class:`HostParam`.
     Strength is *not* part of the pair — it is extrinsic and supplied when the
     adapter is bound to a target. :meth:`from_tensors` validates the stored
     pair before capture; direct construction enforces the same invariant. The
     match against a concrete target shape is checked separately, where the
     target is known.
 
-    :meth:`scaled` binds the extrinsic strength without discarding the pinned
+    :meth:`scaled` binds the extrinsic strength without discarding the host
     representation, so each application path can materialize the factors
     through their tensor adapters.
     """
 
-    a: PinnedParam
-    b: PinnedParam
+    a: HostParam
+    b: HostParam
 
     def __post_init__(self) -> None:
         """Keep direct construction subject to the same data invariants."""
@@ -96,13 +94,12 @@ class LoRAFactor:
         b: torch.Tensor,
         *,
         dtype: torch.dtype | None = None,
-        pin_memory: bool = True,
     ) -> Self:
         """Validate and capture one unscaled factor pair."""
         _validate_factor_tensors(a, b)
         return cls(
-            _capture_factor_tensor(a, dtype=dtype, pin_memory=pin_memory),
-            _capture_factor_tensor(b, dtype=dtype, pin_memory=pin_memory),
+            _capture_factor_tensor(a, dtype=dtype),
+            _capture_factor_tensor(b, dtype=dtype),
         )
 
     @property
@@ -120,13 +117,13 @@ class ScaledLoRAFactor:
     """Host-backed LoRA tensors bound to an application ``strength``.
 
     The application-side carrier used by :class:`LoRATransform` and routed
-    hooks. Keeping :class:`PinnedParam` rather than CPU tensor views preserves
+    hooks. Keeping :class:`HostParam` rather than CPU tensor views preserves
     adapter-specific reconstruction metadata such as a ``DTensor``'s original
     device mesh. The contribution to the base weight is
     ``strength * (b @ a)``.
 
     Use :meth:`from_tensors` when constructing a standalone transform from
-    unpinned tensors. Adapter resources normally create this through
+    source tensors. Adapter resources normally create this through
     :meth:`LoRAFactor.scaled` and reuse their existing host backing.
     """
 
@@ -144,15 +141,15 @@ class ScaledLoRAFactor:
         b: torch.Tensor,
         strength: float,
     ) -> Self:
-        """Pin unbound adapter tensors and bind them to ``strength``."""
+        """Capture unbound adapter tensors and bind them to ``strength``."""
         return cls(LoRAFactor.from_tensors(a, b), strength)
 
     @property
-    def a(self) -> PinnedParam:
+    def a(self) -> HostParam:
         return self.factor.a
 
     @property
-    def b(self) -> PinnedParam:
+    def b(self) -> HostParam:
         return self.factor.b
 
     @property
@@ -330,7 +327,7 @@ class _LoRAWeightPlan:
 class LoRATransform:
     """Apply low-rank factors to one weight.
 
-    Holds references to Adapter-owned host tensors — no cloning or pinning
+    Holds references to Adapter-owned host tensors — no cloning or capture
     happens here. Multiple ordinary factors are packed into transient buffers
     and applied as one update. Validation builds a reusable execution plan,
     keeping validation-only work out of repeated offload copy hooks.
@@ -460,6 +457,15 @@ class LoRATransform:
     def apply_parameter(self, param: nn.Parameter) -> None:
         """Implement the shared parameter-transform application protocol."""
         self.apply_weight(param)
+
+    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return the physical host tensors used to stage all factors."""
+        return tuple(
+            tensor
+            for factor in self._factors
+            for backing in (factor.a, factor.b)
+            for tensor in backing.storage_tensors()
+        )
 
     def _materialize_weight_factors(
         self,

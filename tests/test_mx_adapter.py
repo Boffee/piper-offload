@@ -14,7 +14,7 @@ from piper_offload import (
 )
 from piper_offload._torchao_mx import is_supported_mx_elem_dtype
 from piper_offload.mx_adapter import MxAdapter
-from piper_offload.pinned_param import PinnedParam
+from piper_offload.host_param import HostParam
 from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from tests.conftest import activated_model
@@ -194,32 +194,32 @@ class TestMxAdapter:
             select_adapter(f6)
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_pin_preserves_storage_and_metadata(self, elem_dtype: torch.dtype) -> None:
+    def test_capture_preserves_storage_and_metadata(self, elem_dtype: torch.dtype) -> None:
         mx_cls = _mx_tensor_cls()
         qt = _make_mx(elem_dtype=elem_dtype)
-        pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
+        host_param = HostParam(nn.Parameter(qt, requires_grad=False))
 
-        pinned = pinned_param.make_cpu_param().data
-        assert isinstance(pinned, mx_cls)
-        assert pinned.qdata.is_pinned()
-        assert pinned.scale.is_pinned()
-        assert pinned.qdata.data_ptr() == pinned_param.pinned_state.storage[0].data_ptr()
-        assert pinned.scale.data_ptr() == pinned_param.pinned_state.storage[1].data_ptr()
-        assert pinned.elem_dtype == qt.elem_dtype
-        assert pinned.block_size == qt.block_size
-        assert pinned.orig_dtype == qt.orig_dtype
-        assert pinned.is_swizzled_scales == qt.is_swizzled_scales
-        assert pinned_param.compute_dtype is torch.bfloat16
+        host = host_param.make_cpu_param().data
+        assert isinstance(host, mx_cls)
+        assert not host.qdata.is_pinned()
+        assert not host.scale.is_pinned()
+        assert host.qdata.data_ptr() == host_param.host_state.storage[0].data_ptr()
+        assert host.scale.data_ptr() == host_param.host_state.storage[1].data_ptr()
+        assert host.elem_dtype == qt.elem_dtype
+        assert host.block_size == qt.block_size
+        assert host.orig_dtype == qt.orig_dtype
+        assert host.is_swizzled_scales == qt.is_swizzled_scales
+        assert host_param.compute_dtype is torch.bfloat16
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
     def test_transposed_storage_stride_is_preserved(self, elem_dtype: torch.dtype) -> None:
         qt = _make_mx(elem_dtype=elem_dtype, rows=16, cols=64).t()
-        pinned_param = PinnedParam(nn.Parameter(qt, requires_grad=False))
-        pinned = pinned_param.make_cpu_param().data
+        host_param = HostParam(nn.Parameter(qt, requires_grad=False))
+        host = host_param.make_cpu_param().data
 
-        assert pinned.shape == qt.shape
-        assert pinned.qdata.stride() == qt.qdata.stride()
-        assert pinned.scale.stride() == qt.scale.stride()
+        assert host.shape == qt.shape
+        assert host.qdata.stride() == qt.qdata.stride()
+        assert host.scale.stride() == qt.scale.stride()
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
     def test_tensor_id_is_stable_and_keyed(self, elem_dtype: torch.dtype) -> None:
@@ -269,15 +269,15 @@ class TestMxAdapter:
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
     def test_no_cpu_round_trip_or_trainable_swap_capability(self, elem_dtype: torch.dtype) -> None:
-        pinned_param = PinnedParam(
+        host_param = HostParam(
             nn.Parameter(_make_mx(elem_dtype=elem_dtype), requires_grad=True),
         )
-        state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
+        state = host_param.allocate_gpu_storage(torch.device("cpu"))
 
         with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            pinned_param.copy_to_cpu(state)
+            host_param.copy_to_cpu(state)
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            pinned_param.validate_parameter_data_swap_target()
+            host_param.validate_parameter_data_swap_target()
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
     def test_dequantize_requantize_preserves_representation(self, elem_dtype: torch.dtype) -> None:
@@ -791,31 +791,31 @@ class TestMxAdapter:
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self, elem_dtype: torch.dtype) -> None:
         mx_cls = _mx_tensor_cls()
-        pinned_param = PinnedParam(
+        host_param = HostParam(
             nn.Parameter(_make_mx(elem_dtype=elem_dtype), requires_grad=False),
         )
 
-        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
-        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
-        gpu_param = pinned_param.make_gpu_param(gpu_state)
+        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
+        host_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu_param = host_param.make_gpu_param(gpu_state)
         torch.cuda.synchronize()
-        pinned = pinned_param.make_cpu_param().data
+        host = host_param.make_cpu_param().data
 
         assert isinstance(gpu_param.data, mx_cls)
         assert gpu_param.data.qdata.is_cuda
         assert gpu_param.data.scale.is_cuda
-        assert gpu_param.data.elem_dtype == pinned.elem_dtype
-        assert gpu_param.data.block_size == pinned.block_size
-        assert gpu_param.data.orig_dtype == pinned.orig_dtype
+        assert gpu_param.data.elem_dtype == host.elem_dtype
+        assert gpu_param.data.block_size == host.block_size
+        assert gpu_param.data.orig_dtype == host.orig_dtype
         # Compare the raw bytes: fp8 / e8m0 dtypes carry NaN encodings that
         # break value equality, so view as uint8 for a bitwise check.
         assert torch.equal(
             gpu_param.data.qdata.view(torch.uint8).cpu(),
-            pinned.qdata.view(torch.uint8),
+            host.qdata.view(torch.uint8),
         )
         assert torch.equal(
             gpu_param.data.scale.view(torch.uint8).cpu(),
-            pinned.scale.view(torch.uint8),
+            host.scale.view(torch.uint8),
         )
 
     @CUDA

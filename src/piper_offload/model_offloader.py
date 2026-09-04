@@ -1,6 +1,6 @@
 """Unified CUDA offload binding with optional adapter application.
 
-Supports whole-model pinned bulk offload or block streaming, with optional
+Supports whole-model host bulk offload or block streaming, with optional
 per-parameter adapter application.
 """
 
@@ -19,17 +19,16 @@ from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent
 from .block_mode import BlockMode
 from .composite_component import CompositeComponent, CompositeComponentStore
-from .host_backing import HostBacking
+from .host_component import HostComponent
+from .host_module import ParameterOverride
 from .lora import install_routed_residual_hook
 from .module_names import resolve_parent_leaf
 from .parameter_delta import ParameterDeltaTransform
 from .parameter_transform import ParameterTransform
 from .parameter_value import ParameterValueTransform
-from .pinned_component import PinnedComponent
-from .pinned_module import ParameterOverride
 
 type _ParameterUpdateMap = dict[str, AdapterTargetUpdates]
-type _TransientComponent = PinnedComponent | BlockComponent
+type _TransientComponent = HostComponent | BlockComponent
 type _ForwardHook = Callable[
     [nn.Module, tuple[object, ...], object],
     object | None,
@@ -51,7 +50,7 @@ def _release_after_forward_hook(
         component = component_ref()
         if component is not None:
             if record_device is not None:
-                assert isinstance(component, PinnedComponent)
+                assert isinstance(component, HostComponent)
                 component.record_stream(
                     torch.cuda.current_stream(record_device),
                 )
@@ -87,7 +86,7 @@ class ModelOffloader:
     inference. CPU activation is pass-through over the host-backed module state
     and remains eager.
 
-    Composes resident and transient :class:`PinnedComponent`\\ s with one or
+    Composes resident and transient :class:`HostComponent`\\ s with one or
     more :class:`BlockComponent`\\ s internally. Adapter requests are supplied
     directly to :meth:`activate`; merge mode builds activation-scoped
     parameter overrides so each update runs immediately after its source is
@@ -117,10 +116,10 @@ class ModelOffloader:
     responsibility — there is no auto-detection or guard.
 
     By default, trainable params are not streamed through the block
-    residency pool. They are managed by :class:`PinnedComponent`, stay
+    residency pool. They are managed by :class:`HostComponent`, stay
     GPU-resident while the offloader binding is active on CUDA, and must be
     updated inside :meth:`optimizer_step` so CUDA updates are copied
-    back to the pinned CPU cache. CPU activation leaves them in the
+    back to the CPU cache. CPU activation leaves them in the
     host-backed module state.
 
     Configure ``include_block_trainables=True`` on :meth:`from_module` to
@@ -128,7 +127,7 @@ class ModelOffloader:
     pool. In that mode,
     :meth:`optimizer_step` is the optimizer boundary: it materializes
     streamed trainable ``.data`` on GPU while an arbitrary PyTorch
-    optimizer updates it, then copies the updated data back to pinned
+    optimizer updates it, then copies the updated data back to host
     CPU. CPU activation makes :meth:`optimizer_step` a guarded no-op.
     Gradients are not streamed; PyTorch owns ``param.grad`` normally.
 
@@ -137,7 +136,7 @@ class ModelOffloader:
     model:
         The concrete model bound to the supplied composite.
     composite:
-        Bound :class:`CompositeComponent` owning the model's pinned
+        Bound :class:`CompositeComponent` owning the model's host
         and block offload components.
     cache_bytes:
         Stable host-cache bytes owned by the bound components.
@@ -168,7 +167,6 @@ class ModelOffloader:
         include_block_trainables: bool = False,
         block_mode: BlockMode = "streaming",
         block_compile: BlockCompileConfig | None = None,
-        host_backing: HostBacking = "pinned",
         transient_paths: Sequence[str] = (),
     ) -> Self:
         """Clone and bind ``model`` as one reusable cached runtime.
@@ -190,13 +188,10 @@ class ModelOffloader:
         cannot distinguish occurrences of an aliased block.
         Each module named by ``transient_paths`` similarly owns a separate
         CUDA working set that releases after that module's forward.
-        ``host_backing`` defaults to a pinned copy; ``"adopt"`` strictly
-        retains frozen state already in CPU RAM and uses direct CUDA copies
-        without an application-owned staging pool. It never silently
-        materializes an incompatible source, and adoption failures occur
-        before binding mutates model registries. Retained source tensors and
-        writable mmap contents must remain immutable for the offloader's
-        lifetime.
+        Takes ownership of compatible pageable CPU backing for every managed
+        parameter and buffer, including non-resizable checkpoint views, while
+        preserving mappings and each adapter's physical representation. Other
+        devices and incompatible views are normalized into CPU storage.
         """
         composite_store = CompositeComponentStore.from_module(
             model,
@@ -204,7 +199,6 @@ class ModelOffloader:
             transient_block_paths=transient_block_paths,
             transient_paths=transient_paths,
             include_block_trainables=include_block_trainables,
-            host_backing=host_backing,
         )
         cache_bytes = composite_store.cache_bytes
         composite = composite_store.bind(
@@ -311,14 +305,14 @@ class ModelOffloader:
                 overrides[param_name] = ParameterOverride(
                     source=transform.backing,
                     update=(
-                        transform.apply_parameter
+                        transform
                         if transform.requires_update
                         else None
                     ),
                 )
             else:
                 overrides[param_name] = ParameterOverride(
-                    update=transform.apply_parameter,
+                    update=transform,
                 )
         return overrides
 
@@ -329,7 +323,7 @@ class ModelOffloader:
         """Install one staged PRE/POST routed hook per target Linear.
 
         The PRE hook copies all LoRA factors for that target from immutable
-        pinned backing to the invocation's input device. The POST hook applies
+        host backing to the invocation's input device. The POST hook applies
         their additive residual and releases the staged device tensors.
         """
         value_names = sorted(
@@ -568,9 +562,9 @@ class ModelOffloader:
         managed trainable weights.
 
         On CUDA activation, non-streamed trainables are already active
-        through :class:`PinnedComponent`, while block-component trainables
+        through :class:`HostComponent`, while block-component trainables
         are materialized on enter after force-evicting loaded blocks.
-        On exit, updated trainable bytes are copied back to their pinned
+        On exit, updated trainable bytes are copied back to their host
         CPU storage. On CPU activation, this is a guarded no-op.
 
         ``param.grad`` is unaffected throughout. On CUDA, it lives on
@@ -591,8 +585,8 @@ class ModelOffloader:
         *CPU* instead — keeping its state on the host — call
         ``optimizer.step()`` after :meth:`deactivate` without this context. On
         ``deactivate()`` every managed trainable has its ``.data``
-        restored to pinned CPU storage *and* its ``.grad`` moved to CPU
-        (:class:`PinnedComponent` and :class:`BlockComponent` alike), so
+        restored to CPU storage *and* its ``.grad`` moved to CPU
+        (:class:`HostComponent` and :class:`BlockComponent` alike), so
         the step runs on CPU and the in-place update is streamed to GPU on the
         next forward. Keep such trainables in fp32 so the update is a correct
         master-weight update::

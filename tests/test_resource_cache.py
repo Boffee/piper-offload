@@ -139,6 +139,20 @@ class TestConstruction:
         assert cache.used_cache_bytes == 0
         assert cache.available_cache_bytes == 0
 
+    def test_unbounded_cache_retains_all_stores(self) -> None:
+        cache = ResourceCache(None)
+
+        with cache.lease(_spec("a", 75)):
+            pass
+        with cache.lease(_spec("b", 125)):
+            pass
+
+        assert cache.max_cache_bytes is None
+        assert cache.available_cache_bytes is None
+        assert cache.used_cache_bytes == 200
+        assert _is_cached(cache, "a")
+        assert _is_cached(cache, "b")
+
 
 class TestResize:
     def test_grow_preserves_cached_entries(self) -> None:
@@ -550,29 +564,6 @@ class TestObservabilityAndRelease:
     def test_unknown_info_rejected(self) -> None:
         with pytest.raises(ResourceNotRegisteredError):
             ResourceCache(100).info("missing")
-
-    def test_host_cache_callback_runs_after_positive_size_eviction(self) -> None:
-        calls = 0
-
-        def callback() -> None:
-            nonlocal calls
-            calls += 1
-
-        cache = ResourceCache(100, empty_host_cache=callback)
-        with cache.lease(_spec("a", 50)):
-            pass
-        assert calls == 0
-        cache.evict("a")
-        assert calls == 1
-
-    def test_host_cache_callback_failure_is_ignored(self) -> None:
-        def callback() -> None:
-            raise RuntimeError("flush failed")
-
-        cache = ResourceCache(100, empty_host_cache=callback)
-        with cache.lease(_spec("a", 50)):
-            pass
-        cache.evict("a")
 
 
 class FakeTokenizer:

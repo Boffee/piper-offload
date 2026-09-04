@@ -8,12 +8,12 @@ from torch import nn
 
 from piper_offload import (
     ModelOffloader,
-    PinnedComponentStore,
+    HostComponentStore,
     ResourceBinding,
 )
-from piper_offload.pinned_module import ParameterOverride
+from piper_offload.host_module import ParameterOverride
 
-from tests.conftest import activated_model, pinned_component
+from tests.conftest import CallbackParameterTransform, activated_model, host_component
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -39,12 +39,12 @@ def _make_simple_model() -> nn.Module:
     return m
 
 
-def _unique_pinned_param_count(pw: ModelOffloader) -> int:
-    return len({id(pinned) for pinned in pinned_component(pw)._instance.params.values()})
+def _unique_host_param_count(pw: ModelOffloader) -> int:
+    return len({id(host) for host in host_component(pw)._instance.params.values()})
 
 
-def _unique_pinned_buffer_count(pw: ModelOffloader) -> int:
-    return len({id(pinned) for pinned in pinned_component(pw)._instance.buffers.values()})
+def _unique_host_buffer_count(pw: ModelOffloader) -> int:
+    return len({id(host) for host in host_component(pw)._instance.buffers.values()})
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +62,7 @@ class TestResourceBindingConformance:
 
     def test_component_is_not_top_level_binding(self) -> None:
         model = _make_simple_model()
-        component = PinnedComponentStore.from_module(model).bind(model)
+        component = HostComponentStore.from_module(model).bind(model)
         try:
             assert not isinstance(component, ResourceBinding)
         finally:
@@ -81,13 +81,13 @@ class TestResourceBindingConformance:
             pw.deactivate()
 
 
-class TestPinnedComponentStoreBind:
+class TestHostComponentStoreBind:
     def test_bind_allows_empty_noop_component(self) -> None:
         module = nn.Module()
         module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         module.register_buffer("running", torch.randn(2))
 
-        store = PinnedComponentStore.from_module(
+        store = HostComponentStore.from_module(
             module,
             include_param_names=set(),
             include_buffer_names=set(),
@@ -117,7 +117,7 @@ class TestPinnedComponentStoreBind:
                 self.used.append(stream)
 
         model = _make_simple_model()
-        component = PinnedComponentStore.from_module(model).bind(model)
+        component = HostComponentStore.from_module(model).bind(model)
         lease = Lease()
         forward_stream = object()
         component._lease = cast(Any, lease)
@@ -137,35 +137,11 @@ class TestPinnedComponentStoreBind:
             component._active_device = None
             component.deactivate()
 
-    def test_adopted_store_defers_registry_install_until_bind(self) -> None:
-        module = nn.Module()
-        module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
-        module.register_buffer("running", torch.randn(2))
-        original_weight = module.weight
-        original_buffer = module.running
-
-        store = PinnedComponentStore.from_module(
-            module,
-            host_backing="adopt",
-        )
-
-        assert module.weight is original_weight
-        assert module.running is original_buffer
-
-        component = store.bind(module)
-        try:
-            assert module.weight is not original_weight
-            assert module.weight.data_ptr() == original_weight.data_ptr()
-            assert module.running is not original_buffer
-            assert module.running.data_ptr() == original_buffer.data_ptr()
-        finally:
-            component.deactivate()
-
     def test_binds_existing_store_to_multiple_components(self) -> None:
         prototype = nn.Module()
         prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         prototype.register_buffer("running", torch.randn(2))
-        store = PinnedComponentStore.from_module(prototype)
+        store = HostComponentStore.from_module(prototype)
 
         first = store.bind(prototype)
         second_model = nn.Module()
@@ -194,7 +170,7 @@ class TestPinnedComponentStoreBind:
     def test_bind_propagates_module_mismatch_errors(self) -> None:
         prototype = nn.Module()
         prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
-        store = PinnedComponentStore.from_module(prototype)
+        store = HostComponentStore.from_module(prototype)
 
         target = nn.Module()
         target.weight = nn.Parameter(torch.randn(3, 2), requires_grad=False)
@@ -204,7 +180,7 @@ class TestPinnedComponentStoreBind:
 
     def test_cpu_acquire_and_release_are_noops(self) -> None:
         model = _make_simple_model()
-        component = PinnedComponentStore.from_module(model).bind(model)
+        component = HostComponentStore.from_module(model).bind(model)
         try:
             component.activate(torch.device("cpu"))
             component.release()
@@ -212,13 +188,13 @@ class TestPinnedComponentStoreBind:
 
             assert component._active_device == torch.device("cpu")
             assert component._lease is None
-            assert all(param.is_pinned() for param in model.parameters())
+            assert all(not param.is_pinned() for param in model.parameters())
         finally:
             component.deactivate()
 
     def test_acquire_requires_active_session(self) -> None:
         model = _make_simple_model()
-        component = PinnedComponentStore.from_module(model).bind(model)
+        component = HostComponentStore.from_module(model).bind(model)
         try:
             component.release()
             with pytest.raises(RuntimeError, match="active session"):
@@ -236,14 +212,16 @@ class TestPinnedComponentStoreBind:
         with torch.inference_mode():
             expected = eager(value)
 
-        component = PinnedComponentStore.from_module(model).bind(model)
+        component = HostComponentStore.from_module(model).bind(model)
         copied: list[torch.device] = []
         try:
             component.activate(
                 torch.device("cuda"),
                 parameter_overrides={
                     "0.weight": ParameterOverride(
-                        update=lambda param: copied.append(param.device)
+                        update=CallbackParameterTransform(
+                            lambda param: copied.append(param.device)
+                        )
                     )
                 },
             )
@@ -258,7 +236,7 @@ class TestPinnedComponentStoreBind:
             assert component._active_device.type == "cuda"
             assert component._lease is None
             assert not model._forward_pre_hooks
-            assert all(param.is_pinned() for param in model.parameters())
+            assert all(not param.is_pinned() for param in model.parameters())
 
             component.acquire()
             component.acquire()
@@ -274,7 +252,7 @@ class TestPinnedComponentStoreBind:
 
         assert component._active_device is None
         assert component._lease is None
-        assert all(param.is_pinned() for param in model.parameters())
+        assert all(not param.is_pinned() for param in model.parameters())
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +270,7 @@ class TestTrainableParams:
         try:
             assert m.weight is param
             assert m.weight.requires_grad
-            assert m.weight.is_pinned()
+            assert not m.weight.is_pinned()
 
             before = m.weight.detach().clone()
             with activated_model(pw, "cpu"):
@@ -303,7 +281,7 @@ class TestTrainableParams:
                 opt.zero_grad(set_to_none=True)
 
             assert m.weight is param
-            assert m.weight.is_pinned()
+            assert not m.weight.is_pinned()
             assert not torch.equal(m.weight.detach(), before)
         finally:
             pw.deactivate()
@@ -341,12 +319,12 @@ class TestTrainableParams:
                 assert m.weight.is_cuda
                 assert m.weight.requires_grad
             assert m.weight is param
-            assert m.weight.is_pinned()
+            assert not m.weight.is_pinned()
         finally:
             pw.deactivate()
 
     @CUDA
-    def test_cuda_optimizer_step_copies_updates_back_to_pinned(self) -> None:
+    def test_cuda_optimizer_step_copies_updates_back_to_host(self) -> None:
         m = nn.Linear(4, 1, bias=False)
         param = m.weight
         opt = torch.optim.SGD(m.parameters(), lr=0.25)
@@ -362,7 +340,7 @@ class TestTrainableParams:
                 updated = m.weight.detach().cpu().clone()
 
             assert m.weight is param
-            assert m.weight.is_pinned()
+            assert not m.weight.is_pinned()
             assert torch.equal(m.weight.detach(), updated)
 
             with activated_model(pw, "cuda"):
@@ -388,9 +366,9 @@ class TestTrainableParams:
 
     @CUDA
     def test_cuda_deactivate_moves_trainable_grad_to_cpu(self) -> None:
-        # A pinned trainable's grad must follow its data to CPU on
+        # A host trainable's grad must follow its data to CPU on
         # deactivate, mirroring the streamed component. Otherwise grads
-        # linger on the GPU (pinning device memory and stranding the
+        # linger on the GPU (capture device memory and stranding the
         # gradient off-host), which breaks the context-free CPU step.
         torch.manual_seed(0)
         m = nn.Linear(4, 2, bias=False)
@@ -405,7 +383,7 @@ class TestTrainableParams:
 
             # Deactivated: data and grad are both host-resident, and the
             # grad is preserved (moved, not cleared).
-            assert m.weight.data.device.type == "cpu" and m.weight.is_pinned()
+            assert m.weight.data.device.type == "cpu" and not m.weight.is_pinned()
             assert m.weight.grad is not None
             assert m.weight.grad.device.type == "cpu"
         finally:
@@ -414,10 +392,10 @@ class TestTrainableParams:
     @CUDA
     def test_cuda_context_free_cpu_optimizer_step(self) -> None:
         """A plain ``optimizer.step()`` while deactivated (and outside
-        ``optimizer_step()``) runs the optimizer on CPU over the pinned
+        ``optimizer_step()``) runs the optimizer on CPU over the host
         trainable: Adam state allocates on the host and the in-place update
         writes through to what the next forward loads. Pins the context-free
-        CPU-optimizer pattern for the pinned (whole-model) path; fp32
+        CPU-optimizer pattern for the host (whole-model) path; fp32
         trainables make the update a correct master-weight update."""
         torch.manual_seed(0)
         m = nn.Linear(8, 8, bias=False)
@@ -430,7 +408,7 @@ class TestTrainableParams:
                     gpu_model(x).sum().backward()
 
                 # Deactivated: trainable data + grad are host-resident.
-                assert m.weight.device.type == "cpu" and m.weight.is_pinned()
+                assert m.weight.device.type == "cpu" and not m.weight.is_pinned()
                 assert m.weight.grad is not None
                 assert m.weight.grad.device.type == "cpu"
 
@@ -473,33 +451,7 @@ class TestLifecycle:
             pw.deactivate()
             for p in m.parameters():
                 assert not p.is_cuda
-                assert p.is_pinned()
-        finally:
-            pw.deactivate()
-
-    @CUDA
-    def test_adopted_bulk_activation_matches_eager_model(self) -> None:
-        torch.manual_seed(42)
-        eager = _make_simple_model()
-        offloaded = _make_simple_model()
-        offloaded.load_state_dict(eager.state_dict())
-        x = torch.randn(4, 8)
-        with torch.no_grad():
-            expected = eager(x).cuda()
-
-        pw = ModelOffloader.from_module(
-            offloaded,
-            host_backing="adopt",
-        )
-        try:
-            assert all(not param.is_pinned() for param in offloaded.parameters())
-            with activated_model(pw, "cuda") as active:
-                with torch.no_grad():
-                    actual = active(x.cuda())
-                torch.cuda.synchronize()
-
-            torch.testing.assert_close(actual, expected)
-            assert all(not param.is_pinned() for param in offloaded.parameters())
+                assert not p.is_pinned()
         finally:
             pw.deactivate()
 
@@ -508,16 +460,16 @@ class TestLifecycle:
         pw = _make_model_offloader(m)
         try:
             # CPU activate restores frozen params to fresh wrappers over the
-            # same pinned storage (the materialized CPU wrapper is built on
-            # demand, not cached), so compare stable pinned-storage pointers.
-            pinned_ptrs = [p.data_ptr() for p in m.parameters()]
+            # same host storage (the materialized CPU wrapper is built on
+            # demand, not cached), so compare stable host-storage pointers.
+            host_ptrs = [p.data_ptr() for p in m.parameters()]
             with activated_model(pw, "cpu") as model:
                 assert model is m
-                assert [p.data_ptr() for p in m.parameters()] == pinned_ptrs
+                assert [p.data_ptr() for p in m.parameters()] == host_ptrs
                 for p in m.parameters():
-                    assert p.is_pinned()
+                    assert not p.is_pinned()
             for p in m.parameters():
-                assert p.is_pinned()
+                assert not p.is_pinned()
         finally:
             pw.deactivate()
 
@@ -568,14 +520,14 @@ class TestLifecycle:
 
 
 # ---------------------------------------------------------------------------
-# Cleanup: drop the strategy + model refs to free pinned
+# Cleanup: drop the strategy + model refs to free host
 # ---------------------------------------------------------------------------
 
 
 class TestCleanup:
-    def test_drop_strategy_and_model_frees_pinned(self) -> None:
-        # The "drop refs to free pinned" contract. Strategies don't have
-        # a destructive close(); pinned tensors live in module state
+    def test_drop_strategy_and_model_frees_host(self) -> None:
+        # The "drop refs to free host" contract. Strategies don't have
+        # a destructive close(); host tensors live in module state
         # and are freed when the caller drops the model reference (and
         # the strategy reference, which is the only other holder).
         import gc
@@ -608,7 +560,7 @@ class TestConstruction:
     def test_accepts_buffer_only_module(self) -> None:
         # A module with only registered buffers (no frozen params) is a
         # legitimate target — common for things like RoPE position tables
-        # or sinusoidal embeddings. ModelOffloader should pin the buffers
+        # or sinusoidal embeddings. ModelOffloader should capture the buffers
         # and behave as a no-op for params.
         class BufferOnly(nn.Module):
             def __init__(self):
@@ -619,7 +571,7 @@ class TestConstruction:
         pw = ModelOffloader.from_module(m)
         try:
             assert pw.cache_bytes == 8 * 4 * 4  # float32
-            assert m.table.is_pinned()
+            assert not m.table.is_pinned()
         finally:
             pw.deactivate()
 
@@ -630,12 +582,12 @@ class TestConstruction:
                 self.weight = nn.Parameter(torch.randn(4), requires_grad=False)
 
             def to(self, *args, **kwargs):
-                raise AssertionError("constructor must pin directly")
+                raise AssertionError("constructor must capture directly")
 
         m = Guarded()
         pw = _make_model_offloader(m)
         try:
-            assert m.weight.is_pinned()
+            assert not m.weight.is_pinned()
         finally:
             pw.deactivate()
 
@@ -677,18 +629,18 @@ class TestTiedWeightDedup:
         m, embed, head = self._make_tied_model()
         pw = _make_model_offloader(m)
         try:
-            # Exactly one unique pinned parameter for the tied weight.
-            assert _unique_pinned_param_count(pw) == 1
+            # Exactly one unique host parameter for the tied weight.
+            assert _unique_host_param_count(pw) == 1
             assert pw.param_names == {"embed.weight", "head.weight"}
             # After construction, both names reference the same Parameter
             # object, preserving tying at the strongest level.
             assert m.embed._parameters["weight"] is m.head._parameters["weight"]
-            pinned = pinned_component(pw)._instance.params["embed.weight"]
+            host = host_component(pw)._instance.params["embed.weight"]
             # The materialized CPU wrapper is installed onto the module (the
             # instance no longer caches it); both tied leaves share it.
             cpu_param = m.embed.weight
             assert m.head.weight is cpu_param
-            assert cpu_param.data_ptr() == pinned.make_cpu_param().data_ptr()
+            assert cpu_param.data_ptr() == host.make_cpu_param().data_ptr()
         finally:
             pw.deactivate()
 
@@ -696,7 +648,7 @@ class TestTiedWeightDedup:
         m, _, _ = self._make_distinct_param_tied_model()
         pw = _make_model_offloader(m)
         try:
-            assert _unique_pinned_param_count(pw) == 1
+            assert _unique_host_param_count(pw) == 1
             assert pw.param_names == {"a", "b"}
             # Both module entries now reference the same Parameter object.
             assert m._parameters["a"] is m._parameters["b"]
@@ -711,7 +663,7 @@ class TestTiedWeightDedup:
 
         pw = _make_model_offloader(m)
         try:
-            assert _unique_pinned_param_count(pw) == 1
+            assert _unique_host_param_count(pw) == 1
             assert m._parameters["a"] is m._parameters["b"]
         finally:
             pw.deactivate()
@@ -720,7 +672,7 @@ class TestTiedWeightDedup:
         m, _, _ = self._make_tied_model()
         pw = ModelOffloader.from_module(m)
         try:
-            # 32 * 16 * 4 (float32 default) = 2048 bytes for one pinned param.
+            # 32 * 16 * 4 (float32 default) = 2048 bytes for one host param.
             # If the dedup were broken this would double.
             assert pw.cache_bytes == 32 * 16 * 4
         finally:
@@ -764,9 +716,9 @@ class TestTiedWeightDedup:
 
         pw = _make_model_offloader(m)
         try:
-            assert _unique_pinned_param_count(pw) == 1
+            assert _unique_host_param_count(pw) == 1
             assert m._parameters["a"] is m._parameters["b"]
-            assert m.a.is_pinned()
+            assert not m.a.is_pinned()
         finally:
             pw.deactivate()
 
@@ -790,7 +742,7 @@ class TestSharedSubmoduleAlias:
         m.b = shared
         pw = _make_model_offloader(m)
         try:
-            assert _unique_pinned_param_count(pw) == 1
+            assert _unique_host_param_count(pw) == 1
             assert pw.param_names == {"a.weight", "b.weight"}
             assert m.a._parameters["weight"] is m.b._parameters["weight"]
         finally:
@@ -800,7 +752,7 @@ class TestSharedSubmoduleAlias:
         # Two distinct submodules sharing the same buffer tensor. The
         # default named_buffers() walks only one path; using
         # remove_duplicate=False plus tensor-id dedup ensures both
-        # paths get pinned consistently.
+        # paths get host consistently.
         shared_buf = torch.randn(4)
 
         class Inner(nn.Module):
@@ -814,14 +766,14 @@ class TestSharedSubmoduleAlias:
         m.b = Inner(shared_buf)
         pw = _make_model_offloader(m)
         try:
-            # One pinned buffer backing covers both alias paths.
-            assert _unique_pinned_buffer_count(pw) == 1
+            # One host buffer backing covers both alias paths.
+            assert _unique_host_buffer_count(pw) == 1
             assert pw.buffer_names == {"a.buf", "b.buf"}
-            pinned_buffer = pinned_component(pw)._instance.buffers["a.buf"]
-            assert pinned_buffer.tensor.is_pinned()
-            # Both module entries reference the SAME pinned tensor.
-            assert m.a.buf is pinned_buffer.tensor
-            assert m.b.buf is pinned_buffer.tensor
+            host_buffer = host_component(pw)._instance.buffers["a.buf"]
+            assert not host_buffer.tensor.is_pinned()
+            # Both module entries reference the SAME host tensor.
+            assert m.a.buf is host_buffer.tensor
+            assert m.b.buf is host_buffer.tensor
         finally:
             pw.deactivate()
 
@@ -839,10 +791,10 @@ class TestSharedSubmoduleAlias:
         m.b = Inner(shared_buf)
         pw = _make_model_offloader(m)
         try:
-            assert _unique_pinned_buffer_count(pw) == 1
-            pinned_buffer = pinned_component(pw)._instance.buffers["a.buf"]
-            assert m.a.buf is pinned_buffer.tensor
-            assert m.b.buf is pinned_buffer.tensor
+            assert _unique_host_buffer_count(pw) == 1
+            host_buffer = host_component(pw)._instance.buffers["a.buf"]
+            assert m.a.buf is host_buffer.tensor
+            assert m.b.buf is host_buffer.tensor
         finally:
             pw.deactivate()
 
@@ -865,11 +817,11 @@ class TestSharedSubmoduleAlias:
 
         pw = _make_model_offloader(m)
         try:
-            assert _unique_pinned_buffer_count(pw) == 1
-            pinned_buffer = pinned_component(pw)._instance.buffers["a.buf"]
-            assert m.a.buf is pinned_buffer.tensor
-            assert m.b.buf is pinned_buffer.tensor
-            assert m.a.buf.is_pinned()
+            assert _unique_host_buffer_count(pw) == 1
+            host_buffer = host_component(pw)._instance.buffers["a.buf"]
+            assert m.a.buf is host_buffer.tensor
+            assert m.b.buf is host_buffer.tensor
+            assert not m.a.buf.is_pinned()
         finally:
             pw.deactivate()
 
@@ -877,7 +829,7 @@ class TestSharedSubmoduleAlias:
 class TestMixedTrainableFrozenTied:
     def test_raises_when_tied_group_has_mixed_grad(self) -> None:
         # Two distinct Parameter objects sharing storage, one trainable
-        # and one frozen. One pinned backing cannot preserve both
+        # and one frozen. One host backing cannot preserve both
         # requires_grad values, so the store rejects the storage group.
         shared = torch.randn(8, dtype=torch.bfloat16)
         a = nn.Parameter(shared, requires_grad=True)
@@ -891,7 +843,7 @@ class TestMixedTrainableFrozenTied:
 class TestZeroSizedParams:
     def test_zero_sized_params_do_not_collapse(self) -> None:
         # Empty tensors all share data_ptr()==0; they must not dedupe
-        # into one pinned param binding.
+        # into one host param binding.
         m = nn.Module()
         m.a = nn.Parameter(torch.empty(0), requires_grad=False)
         m.b = nn.Parameter(torch.empty(0), requires_grad=False)
@@ -901,7 +853,7 @@ class TestZeroSizedParams:
         pw = _make_model_offloader(m)
         try:
             # 3 entries: a, b, c — empties did not collapse.
-            assert _unique_pinned_param_count(pw) == 3
+            assert _unique_host_param_count(pw) == 3
         finally:
             pw.deactivate()
 
@@ -930,19 +882,16 @@ class TestQuanto:
         m.weight = nn.Parameter(qt, requires_grad=False)
         return m
 
-    def test_quanto_constructor_repoints_to_pinned(self) -> None:
-        # The bug Codex found: the original ModelOffloader did
-        # `p.data = binding.cpu_param.data` which is a no-op for quanto.
-        # The fix: swap module._parameters[leaf] = binding.cpu_param.
-        # Verify the model now references pinned _data storage.
+    def test_quanto_constructor_rebuilds_from_transferred_host_storage(self) -> None:
+        # Structured parameters still require registry replacement even when
+        # their compatible CPU inner storage is transferred without copying.
         m = self._make_quanto_model()
         original_data_ptr = m.weight._data.data_ptr()
         pw = _make_model_offloader(m)
         try:
-            # Inner _data must now point at pinned storage, not the original.
-            assert m.weight._data.data_ptr() != original_data_ptr
-            assert m.weight._data.is_pinned()
-            assert m.weight._scale.is_pinned()
+            assert m.weight._data.data_ptr() == original_data_ptr
+            assert not m.weight._data.is_pinned()
+            assert not m.weight._scale.is_pinned()
         finally:
             pw.deactivate()
 
@@ -954,22 +903,22 @@ class TestQuanto:
             with activated_model(pw, "cuda"):
                 assert m.weight._data.is_cuda
                 assert m.weight._scale.is_cuda
-            # Back to pinned after deactivate
-            assert m.weight._data.is_pinned()
-            assert m.weight._scale.is_pinned()
+            # Back to host after deactivate
+            assert not m.weight._data.is_pinned()
+            assert not m.weight._scale.is_pinned()
         finally:
             pw.deactivate()
 
     def test_quanto_close_releases_internal_state(self) -> None:
         # deactivate is idempotent; the model.s quanto
-        # parameter still references its pinned-CPU storage. Pinned
+        # parameter still references its CPU storage. Host
         # memory is freed when the caller drops the model reference.
         m = self._make_quanto_model()
         pw = _make_model_offloader(m)
         pw.deactivate()
         # Quanto wrapper still on CPU after deactivate.
-        assert m.weight._data.is_pinned()
-        assert m.weight._scale.is_pinned()
+        assert not m.weight._data.is_pinned()
+        assert not m.weight._scale.is_pinned()
 
 
 # ---------------------------------------------------------------------------

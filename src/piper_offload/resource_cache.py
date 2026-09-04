@@ -1,14 +1,14 @@
 """Policy-driven cache for reusable resource stores.
 
-Manages cached pinned-CPU (or other resource-owned) backing storage for
-multiple independent resources (models, LoRA adapters, etc.). When a new
-store needs more cache than is free, inactive entries are evicted
-according to the configured :class:`EvictionPolicy` until room is
-available. Leased entries are never evicted.
+Manages cached CPU (or other resource-owned) backing storage for
+multiple independent resources (models, adapters, etc.). A finite cache
+budget evicts inactive entries according to the configured
+:class:`EvictionPolicy` until room is available. An unbounded cache retains
+built stores until explicit eviction. Leased entries are never evicted.
 
 Design highlights
 -----------------
-- **Store-only.** The cache builds, budgets, leases, and evicts
+- **Store-only.** The cache builds, accounts for, leases, and evicts
   :class:`ResourceStore` instances. It does not create runtime bindings,
   choose devices, or know how one resource is applied to another.
 - **Structural specs.** Cache entries implement :class:`ResourceSpec`; concrete
@@ -16,18 +16,18 @@ Design highlights
 - **Reference-counted leases.** A lease protects its store from eviction.
   Multiple callers may lease the same cached store concurrently; whether its
   value supports overlapping use is a separate policy owned by that resource.
-- **Transactional admission, with one caveat.** Eviction is just a
-  reference drop (no failure path) — pinned memory is freed when GC runs
+- **Transactional budgeted admission, with one caveat.** Eviction is just a
+  reference drop (no failure path) — host memory is freed when GC runs
   on the dropped store. **Store factory failure**
   preserves the registration but leaves any pre-eviction *committed*
   — the cache evicts inactive entries to give the factory a
-  predictable host-memory budget for pinning, and those evictions
+  predictable host-memory budget for capture, and those evictions
   are not rolled back if the factory raises (rolling back would
-  mean re-pinning the just-released weights, which can OOM the host
+  mean recapturing the just-released weights, which can OOM the host
   allocator). The cache stays internally consistent; the cost is
   some warm cached entries disappearing.
-- **No runtime or GPU lifecycle.** The cache only enforces logical
-  ``max_cache_bytes`` for cached host backing. Activation and GPU
+- **No runtime or GPU lifecycle.** A configured ``max_cache_bytes`` limit
+  applies only to logical cached backing. Activation and GPU
   residency belong to resources and consumers such as
   :class:`~piper_offload.ModelOffloader` and
   :class:`~piper_offload.ModelCache`.
@@ -41,18 +41,13 @@ Instance-owned (not global) so it's library-friendly and embeddable.
 """
 
 import contextlib
-import logging
 import threading
 from collections import OrderedDict
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Generator, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
-
-import torch
+from typing import Any, Protocol
 
 from .protocols import ResourceSpec, ResourceStore
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Public dataclasses and policy interfaces
@@ -246,16 +241,8 @@ class ResourceCache:
     Parameters
     ----------
     max_cache_bytes:
-        Total budget for cached resource backing storage (typically
-        pinned host memory). Must be ≥ 0.
-    empty_host_cache:
-        Optional callback invoked after any path that releases a
-        cache-held store reference — eviction and admission rejection
-        (negative or oversized post-build ``cache_bytes``).
-        Flushes PyTorch's ``CachingHostAllocator`` so freed pinned
-        pages return to the OS. If ``None`` and CUDA is available,
-        defaults to ``torch._C._host_emptyCache`` when present. Pass
-        a no-op callable to disable.
+        Optional total budget for cached resource backing storage. ``None``
+        keeps every built store until explicit eviction or unregistration.
     eviction_policy:
         Optional inactive-entry eviction policy. Defaults to
         :class:`LRUEvictionPolicy`. The cache owns the policy instance
@@ -264,37 +251,25 @@ class ResourceCache:
 
     def __init__(
         self,
-        max_cache_bytes: int,
+        max_cache_bytes: int | None,
         *,
-        empty_host_cache: Callable[[], None] | None = None,
         eviction_policy: EvictionPolicy | None = None,
     ) -> None:
-        if max_cache_bytes < 0:
+        if max_cache_bytes is not None and max_cache_bytes < 0:
             raise ValueError(f"max_cache_bytes must be >= 0, got {max_cache_bytes}")
         self._max_cache_bytes = max_cache_bytes
-        self._empty_host_cache = self._resolve_host_cache_cb(empty_host_cache)
         self._entries: dict[str, _Entry] = {}
         self._eviction = eviction_policy if eviction_policy is not None else LRUEvictionPolicy()
         self._lock = threading.RLock()
         self._used_bytes = 0
 
-    @staticmethod
-    def _resolve_host_cache_cb(cb: Callable[[], None] | None) -> Callable[[], None] | None:
-        if cb is not None:
-            return cb
-        # Best-effort default: PyTorch's CachingHostAllocator flush is
-        # only present when CUDA is available and only on torch >= 2.x.
-        host_empty: object = getattr(torch._C, "_host_emptyCache", None)
-        if callable(host_empty) and torch.cuda.is_available():
-            return cast(Callable[[], None], host_empty)
-        return None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     @property
-    def max_cache_bytes(self) -> int:
+    def max_cache_bytes(self) -> int | None:
         with self._lock:
             return self._max_cache_bytes
 
@@ -308,13 +283,15 @@ class ResourceCache:
             return self._used_bytes
 
     @property
-    def available_cache_bytes(self) -> int:
+    def available_cache_bytes(self) -> int | None:
         """Current cache-budget headroom."""
         with self._lock:
             return self._available_cache_bytes
 
     @property
-    def _available_cache_bytes(self) -> int:
+    def _available_cache_bytes(self) -> int | None:
+        if self._max_cache_bytes is None:
+            return None
         return self._max_cache_bytes - self._used_bytes
 
     def resize(self, max_cache_bytes: int) -> None:
@@ -509,14 +486,12 @@ class ResourceCache:
         Pre-build eviction trusts the estimate. After construction,
         a negative ``cache_bytes`` is rejected and an over-estimate
         triggers further eviction (which can fail with
-        :class:`ResourceTooLargeError`). All post-factory failure paths
-        drop the local store ref BEFORE the host-cache flush so
-        refcount-GC frees pinned tensors in time for the flush to
-        actually reclaim them.
+        :class:`ResourceTooLargeError`). Failed admission releases the local
+        store reference before propagating the error.
         """
         estimate = entry.spec.estimated_cache_bytes
         self._evict_to_fit(estimate)
-        store: ResourceStore | None = entry.spec.build_store()
+        store = entry.spec.build_store()
 
         try:
             actual = store.cache_bytes
@@ -527,11 +502,9 @@ class ResourceCache:
             if actual > estimate:
                 self._evict_to_fit(actual)
         except BaseException:
-            store = None
-            self._after_release()
+            del store
             raise
 
-        assert store is not None
         entry.store = store
         entry.cache_bytes = actual
         self._used_bytes += actual
@@ -556,6 +529,7 @@ class ResourceCache:
         return tuple(candidates)
 
     def _build_eviction_context(self, required_cache_bytes: int) -> EvictionContext:
+        assert self._max_cache_bytes is not None
         return EvictionContext(
             required_cache_bytes=required_cache_bytes,
             used_cache_bytes=self._used_bytes,
@@ -567,7 +541,8 @@ class ResourceCache:
         """Evict inactive entries so ``required_cache_bytes`` fits.
         Raises :class:`ResourceTooLargeError` when leased entries block
         sufficient eviction."""
-        if required_cache_bytes <= self._available_cache_bytes:
+        available = self._available_cache_bytes
+        if available is None or required_cache_bytes <= available:
             return
 
         context = self._build_eviction_context(required_cache_bytes)
@@ -577,7 +552,7 @@ class ResourceCache:
             raise ResourceTooLargeError(
                 required=required_cache_bytes,
                 used=self._used_bytes,
-                limit=self._max_cache_bytes,
+                limit=context.max_cache_bytes,
             )
 
         victims = self._eviction.choose_victims(context)
@@ -591,7 +566,9 @@ class ResourceCache:
             )
 
         for victim in victims:
-            if required_cache_bytes <= self._available_cache_bytes:
+            available = self._available_cache_bytes
+            assert available is not None
+            if required_cache_bytes <= available:
                 break
             self._evict_inactive(victim)
 
@@ -606,26 +583,11 @@ class ResourceCache:
     def _release_store(self, entry: _Entry) -> None:
         """Drop the store reference and update accounting.
 
-        Used for policy eviction and store admission rejection. Dropping
-        ``entry.store`` triggers refcount-GC of pinned tensors when the
-        cache was the sole owner; the host-cache flush runs after so
-        freed pages return to the OS.
+        Used for policy eviction and store admission rejection. Storage is
+        released when the cache was its last owner.
         """
         bytes_freed = entry.cache_bytes
-        # Drop store ref BEFORE the host-cache flush so refcount-GC
-        # frees pinned tensors in time for empty_host_cache to reclaim
-        # them.
         entry.store = None
         entry.cache_bytes = 0
         self._eviction.discard(entry.spec.key)
         self._used_bytes -= bytes_freed
-        if bytes_freed > 0:
-            self._after_release()
-
-    def _after_release(self) -> None:
-        if self._empty_host_cache is None:
-            return
-        try:
-            self._empty_host_cache()
-        except Exception:
-            logger.warning("empty_host_cache callback raised; ignoring", exc_info=True)

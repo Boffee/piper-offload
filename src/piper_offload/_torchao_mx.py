@@ -1,7 +1,7 @@
 """Internal optional-import module for TorchAO MX (microscaling) support.
 
 Single source of truth for the TorchAO ``MXTensor`` layout this repo
-needs to move OCP-microscaling weights through :class:`PinnedParam` and
+needs to move OCP-microscaling weights through :class:`HostParam` and
 to expose the dequantize/requantize adapter capability. TorchAO's public
 workflow creates ``MXTensor`` weights via ``quantize_(...)`` with an MX
 inference config (or directly through ``MXTensor.to_mx``); the adapter
@@ -134,7 +134,7 @@ def validate_layout(t: torch.Tensor) -> None:
         return
     raise RuntimeError(
         f"MXTensor is missing expected attributes {missing!r}; "
-        f"this repo is pinned to a layout that exposes {LAYOUT_ATTRS}. "
+        f"this repo requires a layout that exposes {LAYOUT_ATTRS}. "
         "TorchAO likely refactored the wrapper class — upgrade "
         "piper-offload to match."
     )

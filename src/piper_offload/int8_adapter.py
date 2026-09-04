@@ -7,7 +7,7 @@ bytes (``qdata``), per-row/per-tensor ``scale``, an optional
 metadata controlling the matmul dispatch (``block_size``, ``dtype``,
 ``act_quant_kwargs``, ``reduce_range``). The shared
 :class:`~piper_offload.torchao_structured_adapter.TorchaoStructuredAdapter`
-base preserves that representation across pinned CPU and GPU storage;
+base preserves that representation across CPU and GPU storage;
 this module supplies the INT8-specific hooks. One adapter covers both
 ``Int8WeightOnlyConfig`` and ``Int8DynamicActivationInt8WeightConfig``
 because TorchAO models them as the same ``Int8Tensor`` parameterized by

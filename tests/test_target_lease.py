@@ -7,14 +7,54 @@ import pytest
 import torch
 from torch import nn
 
-from piper_offload.pinned_module import (
-    PinnedModuleLoadPlan,
-    PinnedModuleStore,
-    PinnedModuleTarget,
+from piper_offload import PinManager
+from piper_offload.host_module import (
+    HostModuleLoadPlan,
+    HostModuleStore,
+    HostModuleTarget,
 )
 from piper_offload.target_lease import CudaTargetLease
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+@CUDA
+def test_first_pinned_upload_waits_for_prior_work_on_reused_allocation() -> None:
+    module = nn.Linear(64, 64, bias=False).requires_grad_(False)
+    module.weight.fill_(7)
+    plan = HostModuleStore.from_module(module).bind(module).resolve_load_plan()
+    manager = PinManager(1024**2)
+    device = torch.device("cuda")
+    copy_stream = torch.cuda.Stream(device=device)
+    allocation_stream = torch.cuda.current_stream(device)
+    lease = None
+    try:
+        with manager.acquire(plan.sources["weight"].storage_tensors()) as pins:
+            assert pins.registered_bytes > 0
+            # Warm allocation and fill/copy kernels before enqueueing delayed
+            # work, so lazy CUDA module loading cannot serialize the probe.
+            warm = CudaTargetLease.allocate(plan, device, allocation_stream=allocation_stream)
+            warm.stage(plan, copy_stream)
+            warm.close()
+            stale = torch.empty((64, 64), device=device).fill_(0)
+            pointer = stale.data_ptr()
+            torch.cuda._sleep(1)
+            torch.cuda.synchronize(device)
+            torch.cuda._sleep(500_000_000)
+            stale.fill_(123)
+            del stale
+
+            lease = CudaTargetLease.allocate(plan, device, allocation_stream=allocation_stream)
+            assert lease.target.param_targets["weight"].param.data_ptr() == pointer
+            assert not allocation_stream.query()
+            lease.stage(plan, copy_stream, non_blocking=True)
+            actual = lease.acquire(allocation_stream).param_targets["weight"].param.cpu()
+            copy_stream.synchronize()
+            torch.testing.assert_close(actual, torch.full((64, 64), 7.0))
+    finally:
+        if lease is not None:
+            lease.close()
+        manager.clear()
 
 
 @CUDA
@@ -27,8 +67,8 @@ def test_stage_is_registry_pure_and_reuse_waits_for_consumer() -> None:
     value = torch.randn(4, 32)
     expected_first = first(value).cuda()
     expected_second = second(value).cuda()
-    first_instance = PinnedModuleStore.from_module(first).bind(first)
-    second_instance = PinnedModuleStore.from_module(second).bind(second)
+    first_instance = HostModuleStore.from_module(first).bind(first)
+    second_instance = HostModuleStore.from_module(second).bind(second)
     device = torch.device("cuda")
     copy_stream = torch.cuda.Stream(device=device)
     compute_stream = torch.cuda.Stream(device=device)
@@ -41,7 +81,7 @@ def test_stage_is_registry_pure_and_reuse_waits_for_consumer() -> None:
     with torch.cuda.stream(compute_stream):
         first_instance.install_target(lease.acquire(compute_stream))
         actual_first = first(value.cuda())
-    first_instance.install_pinned()
+    first_instance.install_host()
     lease.release()
 
     lease.stage(second_plan, copy_stream)
@@ -49,7 +89,7 @@ def test_stage_is_registry_pure_and_reuse_waits_for_consumer() -> None:
     with torch.cuda.stream(compute_stream):
         second_instance.install_target(lease.acquire(compute_stream))
         actual_second = second(value.cuda())
-    second_instance.install_pinned()
+    second_instance.install_host()
     lease.release()
     lease.close()
 
@@ -78,7 +118,7 @@ def test_close_synchronizes_target_work_before_drop() -> None:
     consumer_stream = Stream()
     ready = Event()
     lease = CudaTargetLease(
-        cast(PinnedModuleTarget, object()),
+        cast(HostModuleTarget, object()),
         cast(torch.cuda.Stream, allocation_stream),
     )
     lease._ready_event = cast(torch.cuda.Event, ready)
@@ -128,7 +168,7 @@ def test_restage_waits_for_every_actual_use_stream(
     ready = object()
     plan = Plan()
     lease = CudaTargetLease(
-        cast(PinnedModuleTarget, object()),
+        cast(HostModuleTarget, object()),
         cast(torch.cuda.Stream, allocation_stream),
     )
     lease._ready_event = cast(torch.cuda.Event, ready)
@@ -143,7 +183,7 @@ def test_restage_waits_for_every_actual_use_stream(
     )
 
     lease.stage(
-        cast(PinnedModuleLoadPlan, plan),
+        cast(HostModuleLoadPlan, plan),
         cast(torch.cuda.Stream, copy_stream),
     )
 

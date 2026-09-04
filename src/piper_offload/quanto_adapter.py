@@ -7,7 +7,7 @@ support ``p.data = ...`` storage swap — its quant state is part of the
 Parameter's wrapped object, not its bytes. So this adapter:
 
 - Decomposes ``WeightQBytesTensor`` into ``_data`` and ``_scale``,
-  pins each separately.
+  captures each separately.
 - Reconstructs a fresh ``WeightQBytesTensor`` (and thus a fresh
   :class:`nn.Parameter`) on each activate via registry replacement.
   PyTorch optimizers keyed by the user's pre-wrap Parameter id are
@@ -18,13 +18,13 @@ optimum-quanto 0.2.7's ``MarlinF8QBytesTensor`` stores packed INT32 data
 and permuted scales, and its wrapper-level ``copy_`` unpacks instead of
 updating the packed leaf. The adapter therefore canonicalizes Marlin
 inputs to the kernel-agnostic ``WeightQBytesTensor`` representation when
-pinning and keeps that raw representation throughout streaming. Direct
+capture and keeps that raw representation throughout streaming. Direct
 updates to an existing Marlin wrapper are repacked into its physical
 ``_data._data`` buffer so wrapper, workspace, and storage identity remain
 stable.
 
 Reaches into quanto's private attributes (``_data``, ``_scale``,
-``qtype``, ``axis``, ``activation_qtype``). Pinned to the
+``qtype``, ``axis``, ``activation_qtype``). Host to the
 ``WeightQBytesTensor`` layout in optimum-quanto as of the version this
 repo depends on. If quanto refactors the wrapper class, the
 :class:`QuantoAdapter` will fail with a clear validation error at
@@ -39,7 +39,6 @@ Selected by :mod:`tensor_adapter_registry`. Importing fails silently if
 optimum-quanto is not installed — quanto support is optional.
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -61,7 +60,7 @@ from ._quanto import (
     require_qbytes_tensor,
     validate_layout,
 )
-from .tensor_adapters import adopt_cpu_storage, clone_to_pinned_cpu
+from .tensor_adapters import capture_host_tensor
 
 try:
     from ._triton_quanto_lora import (
@@ -86,12 +85,12 @@ except ModuleNotFoundError as exc:
 
 
 @dataclass(slots=True)
-class _QuantoPinned:
-    """Pinned-CPU state for a quanto tensor: two pinned tensors
+class _QuantoHost:
+    """CPU state for a quanto tensor: two host tensors
     plus the quant metadata needed to reconstruct the wrapper."""
 
-    data: torch.Tensor   # pinned int8/fp8
-    scale: torch.Tensor  # pinned fp16/fp32
+    data: torch.Tensor   # host int8/fp8
+    scale: torch.Tensor  # host fp16/fp32
     qtype: object
     axis: int | None
     size: torch.Size
@@ -102,7 +101,7 @@ class _QuantoPinned:
 @dataclass(slots=True)
 class _QuantoGpu:
     """GPU state for a quanto tensor: the two GPU tensors. Quant
-    metadata lives in the originating :class:`_QuantoPinned`; only
+    metadata lives in the originating :class:`_QuantoHost`; only
     storage moves to GPU."""
 
     data: torch.Tensor
@@ -110,7 +109,7 @@ class _QuantoGpu:
 
 
 def _build_qbytes(
-    state: _QuantoPinned, data: torch.Tensor, scale: torch.Tensor
+    state: _QuantoHost, data: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
     """Reconstruct a :class:`WeightQBytesTensor` from raw pieces +
     cached quant metadata."""
@@ -217,7 +216,7 @@ def _has_triton_compatible_dense_layout(
 class QuantoAdapter:
     """Adapter for ``optimum.quanto.WeightQBytesTensor``.
 
-    Decompose-on-pin, reconstruct-on-move. Each activate creates a
+    Decompose-on-capture, reconstruct-on-move. Each activate creates a
     fresh ``WeightQBytesTensor`` and a fresh :class:`nn.Parameter`,
     installed via registry replacement. This breaks PyTorch optimizer
     references — quanto-quantized weights are inference-only.
@@ -227,7 +226,7 @@ class QuantoAdapter:
     def matches(t: torch.Tensor) -> bool:
         if not is_weight_qbytes_tensor(t):
             return False
-        # Validate the private layout we read in clone_pin/_build_qbytes.
+        # Validate the private layout we read in capture_host/_build_qbytes.
         # Cheap (four hasattr calls) and runs on every dispatch.
         validate_layout(t)
         return True
@@ -279,39 +278,20 @@ class QuantoAdapter:
         )
 
     @staticmethod
-    def clone_pin(t: torch.Tensor) -> _QuantoPinned:
-        return QuantoAdapter._host_state(t, clone_to_pinned_cpu)
-
-    @staticmethod
-    def adopt_host(t: torch.Tensor) -> _QuantoPinned:
-        qt = require_qbytes_tensor(t)
-        canonical = canonicalize_qbytes_tensor(t)
-        if canonical is not qt:
-            raise ValueError(
-                "adopted host backing cannot retain an optimized Quanto "
-                "representation that requires canonicalization. Convert it "
-                "to WeightQBytesTensor before constructing the offloader."
-            )
-        return QuantoAdapter._host_state(canonical, adopt_cpu_storage)
-
-    @staticmethod
-    def _host_state(
+    def capture_host(
         t: torch.Tensor,
-        clone: Callable[..., torch.Tensor],
-    ) -> _QuantoPinned:
+    ) -> _QuantoHost:
         qt = canonicalize_qbytes_tensor(t)
-        # contiguous_format clone: fp8-quanto leaves some _data buffers
-        # strided via internal transposes; the default preserve_format
-        # would carry that through pin_memory(), breaking downstream
-        # assumptions of a contiguous pinned buffer. The original quant
+        # fp8-quanto leaves some _data buffers strided via internal transposes;
+        # capture contiguous bytes for the shared transfer path. The original quant
         # stride is captured separately and reapplied when rebuilding the
         # canonical WeightQBytesTensor wrapper.
-        return _QuantoPinned(
-            data=clone(
+        return _QuantoHost(
+            data=capture_host_tensor(
                 qt._data,
                 memory_format=torch.contiguous_format,
             ),
-            scale=clone(
+            scale=capture_host_tensor(
                 qt._scale,
                 memory_format=torch.contiguous_format,
             ),
@@ -323,14 +303,18 @@ class QuantoAdapter:
         )
 
     @staticmethod
+    def storage_tensors(state: _QuantoHost) -> tuple[torch.Tensor, ...]:
+        return (state.data, state.scale)
+
+    @staticmethod
     def cpu_param(
-        state: _QuantoPinned, *, requires_grad: bool = False
+        state: _QuantoHost, *, requires_grad: bool = False
     ) -> nn.Parameter:
         qt = _build_qbytes(state, state.data, state.scale)
         return nn.Parameter(qt, requires_grad=requires_grad)
 
     @staticmethod
-    def alloc_gpu(state: _QuantoPinned, device: torch.device) -> _QuantoGpu:
+    def alloc_gpu(state: _QuantoHost, device: torch.device) -> _QuantoGpu:
         return _QuantoGpu(
             data=torch.empty_like(state.data, device=device),
             scale=torch.empty_like(state.scale, device=device),
@@ -338,29 +322,29 @@ class QuantoAdapter:
 
     @staticmethod
     def gpu_param(
-        pinned: _QuantoPinned,
+        host: _QuantoHost,
         gpu_state: _QuantoGpu,
         *,
         requires_grad: bool = False,
     ) -> nn.Parameter:
-        # Quant metadata comes from the pinned state; only the storage
+        # Quant metadata comes from the host state; only the storage
         # tensors come from the GPU side.
-        qt = _build_qbytes(pinned, gpu_state.data, gpu_state.scale)
+        qt = _build_qbytes(host, gpu_state.data, gpu_state.scale)
         return nn.Parameter(qt, requires_grad=requires_grad)
 
     @staticmethod
     def copy_to_gpu(
-        src: _QuantoPinned, dst: _QuantoGpu, *, non_blocking: bool = False
+        src: _QuantoHost, dst: _QuantoGpu, *, non_blocking: bool = False
     ) -> None:
         dst.data.copy_(src.data, non_blocking=non_blocking)
         dst.scale.copy_(src.scale, non_blocking=non_blocking)
 
     @staticmethod
     def copy_to_cpu(
-        src: _QuantoGpu, dst: _QuantoPinned, *, non_blocking: bool = False
+        src: _QuantoGpu, dst: _QuantoHost, *, non_blocking: bool = False
     ) -> None:
         # Symmetric D2H of both packed tensors. Quant metadata lives on
-        # the pinned state already and is unaffected by GPU operations,
+        # the host state already and is unaffected by GPU operations,
         # so only the int8/fp8 _data and the fp16/fp32 _scale need to
         # round-trip back to host.
         dst.data.copy_(src.data, non_blocking=non_blocking)
@@ -549,7 +533,7 @@ class QuantoAdapter:
         copy_qbytes_tensor_(src, target)
 
     @staticmethod
-    def cache_bytes(state: _QuantoPinned) -> int:
+    def cache_bytes(state: _QuantoHost) -> int:
         return (
             state.data.numel() * state.data.element_size()
             + state.scale.numel() * state.scale.element_size()

@@ -1,25 +1,24 @@
-"""Per-buffer pinned-CPU storage primitive."""
+"""Per-buffer CPU storage primitive."""
 
 from dataclasses import dataclass
 from typing import Self
 
 import torch
 
-from .tensor_adapters import adopt_cpu_storage, clone_to_pinned_cpu
+from .tensor_adapters import capture_host_tensor
 
 
 @dataclass(slots=True, eq=False)
-class PinnedBuffer:
-    """Pinned host storage for one registered buffer."""
+class HostBuffer:
+    """Host storage for one registered buffer."""
 
     tensor: torch.Tensor
     target_layout: tuple[object, ...]
 
     @classmethod
-    def clone(cls, buffer: torch.Tensor, *, pin_memory: bool = True) -> Self:
-        """Clone into pinned RAM or adopt existing CPU storage."""
-        materialize = clone_to_pinned_cpu if pin_memory else adopt_cpu_storage
-        tensor = materialize(
+    def capture(cls, buffer: torch.Tensor) -> Self:
+        """Capture contiguous pageable CPU backing, retaining compatible storage."""
+        tensor = capture_host_tensor(
             buffer,
             memory_format=torch.contiguous_format,
         )
@@ -43,8 +42,8 @@ class PinnedBuffer:
         """Opaque bind-compatibility layout for ``buffer``.
 
         dtype excluded: binding replaces the module's buffer with the
-        pinned tensor, so a placeholder's dtype carries no information
-        past validation (mirrors :meth:`PinnedParam.bind_layout_for`).
+        host tensor, so a placeholder's dtype carries no information
+        past validation (mirrors :meth:`HostParam.bind_layout_for`).
         """
         return (
             tuple(buffer.shape),
@@ -56,5 +55,9 @@ class PinnedBuffer:
     def cache_bytes(self) -> int:
         return self.tensor.nbytes
 
+    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return the existing backing tensor, preserving its storage and view."""
+        return (self.tensor,)
 
-__all__ = ["PinnedBuffer"]
+
+__all__ = ["HostBuffer"]

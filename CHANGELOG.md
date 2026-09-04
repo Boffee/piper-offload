@@ -7,6 +7,32 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Wire ordinary streaming and compiled rolling to host pin leases for their
+  acquired CUDA working sets. Leases cover resolved replacement sources,
+  quantized metadata, buffers, and optimizer backing; release waits for copies
+  and leaves registrations in the idle LRU for reactivation. CPU and resident
+  execution do not acquire pins. The default pin budget remains zero.
+  Initial uploads on a separate stream wait for prior work on reused CUDA
+  allocations before writing the target. Pin ownership now lives uniformly in
+  the block component; CUDA runtimes own transfer completion and remain
+  independent of registration policy.
+
+- Add `PinManager`, `PinLease`, `PinStats`, and the process-wide
+  `host_pin_manager` for in-place CUDA/HIP host registration. Whole allocations
+  share reference-counted leases and an idle LRU under a finite page-rounded
+  budget or opportunistically up to native capacity. Capacity failures reclaim
+  unrelated idle registrations before leaving the rest of an acquisition
+  pageable without repeated native calls. Source disposal retires registrations,
+  and failed cleanup retains storage and accounting for retry. The native
+  backend clears handled runtime errors without hiding prior GPU failures.
+  Registration has a zero-byte default budget.
+
+- Add required `TensorAdapter.storage_tensors(state)` enumeration and expose
+  it through `HostParam.storage_tensors()` and `HostBuffer.storage_tensors()`.
+  Enumeration returns existing physical CPU tensors, including quantized
+  payloads and tensor-valued metadata, without copying or materialization.
+  DTensor delegates to local shard storage; meta parameters return no tensors.
+
 - Add direct GGUF-to-ConvRot INT8 offload for existing Diffusers
   `GGUFParameter` objects. Packed GGUF bytes remain in host backing and in a
   reusable GPU staging buffer; Piper Kernels decodes, rotates, and requantizes
@@ -18,7 +44,35 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   packed GGUF sources during preflight, while exact parameter-value replacement
   remains supported.
 
+### Changed
+
+- Make `ModelCache` unbounded: its constructor no longer accepts a host-byte
+  limit, and built model and adapter stores remain cached until explicit
+  eviction. Compatible complete pageable CPU allocations and non-empty views
+  into non-resizable storage now transfer from resource factories into host
+  backing, preserving checkpoint file mappings through split parameters. The
+  OS controls their pageable residency while `host_pin_manager` separately
+  bounds registered pages. `ModelSpec` and `AdapterSpec` byte estimates now
+  default to zero because model-cache admission no longer uses them.
+
+- Replace the synthetic pageable-versus-staging benchmark with a benchmark of
+  actual streaming and rolling runtimes across pin budgets, cold registration,
+  retained registrations, and component switching. Report native registration
+  timing, raw session samples, and output checks for dense and ConvRot INT8 backing.
+
+- Unify model and adapter backing as owned pageable CPU storage. Rename the
+  `Pinned*` storage primitives and modules to `Host*`, and replace the tensor
+  adapter's `clone_pin()` contract with `capture_host()`. Packed quantized
+  representations and their movement and merge capabilities are preserved.
+  Host capture no longer allocates pinned memory; streaming runtimes register
+  backing through the separate global pin budget.
+
 ### Removed
+
+- Remove `HostBacking`, construction-time `host_backing` / `pin_memory`
+  switches, and the `AdoptableTensorAdapter.adopt_host()` contract. Remove
+  `ResourceCache.empty_host_cache` and its PyTorch host-allocator flush path.
+  The old APIs have no compatibility aliases.
 
 - Remove the vendored pure-PyTorch GGUF-to-dense dequantization path in favor
   of the direct Piper Kernels conversion contract.

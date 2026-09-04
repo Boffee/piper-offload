@@ -9,7 +9,7 @@ storage swap: its quant state is part of the wrapped object, not its
 bytes. So this adapter, like :class:`~piper_offload.quanto_adapter.QuantoAdapter`:
 
 - Decomposes ``Params4bit`` into the packed weight + the quant-state
-  tensors (via ``QuantState.as_dict(packed=True)``), pinning each.
+  tensors (via ``QuantState.as_dict(packed=True)``), capture each.
 - Reconstructs a fresh ``Params4bit`` (and thus a fresh
   :class:`nn.Parameter`) on each activate via registry replacement.
   PyTorch optimizers keyed by the user's pre-wrap Parameter id are
@@ -29,7 +29,7 @@ uint8/fp16/bf16/fp32 quant storage. Other layouts keep the precise generic
 dequantize/addmm/requantize path.
 
 Reaches into bitsandbytes' 4-bit layout through :mod:`._bnb`; if
-bitsandbytes refactors, the pin/read paths fail with a clear validation
+bitsandbytes refactors, the capture/read paths fail with a clear validation
 error (``require_params_4bit`` checks the expected attributes before reading
 the quant state). :meth:`Bnb4bitAdapter.matches` stays pure type recognition
 so an unquantized placeholder can still serve as a bind target.
@@ -38,7 +38,6 @@ Selected by :mod:`tensor_adapter_registry`. Importing fails silently if
 bitsandbytes is not installed — 4-bit support is optional.
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,8 +55,7 @@ from ._bnb import (
 )
 from ._dense_merge import merge_dense_requantize_
 from .tensor_adapters import (
-    adopt_cpu_storage,
-    clone_to_pinned_cpu,
+    capture_host_tensor,
     empty_like_strided,
     optional_tensor_id,
     tensor_layout,
@@ -192,13 +190,13 @@ def _can_use_triton_dense_merge(
 
 
 @dataclass(slots=True)
-class _Bnb4bitPinned:
-    """Pinned-CPU state for a 4-bit tensor: the packed weight, the
+class _Bnb4bitHost:
+    """CPU state for a 4-bit tensor: the packed weight, the
     per-block scale tensors (keyed as bitsandbytes serializes them), and
     the small host-resident metadata blob needed to rebuild the wrapper."""
 
-    data: torch.Tensor                    # pinned uint8 packed weight
-    buffers: dict[str, torch.Tensor]      # pinned absmax / quant_map / nested_*
+    data: torch.Tensor                    # host uint8 packed weight
+    buffers: dict[str, torch.Tensor]      # host absmax / quant_map / nested_*
     blob_key: str                         # key of the packed metadata blob
     blob: torch.Tensor                    # uint8 scalar-metadata (host-resident)
     offset: torch.Tensor | None           # nested double-quant offset (data-dependent)
@@ -207,7 +205,7 @@ class _Bnb4bitPinned:
 @dataclass(slots=True)
 class _Bnb4bitGpu:
     """GPU state for a 4-bit tensor: the packed weight + per-block scale
-    tensors. Scalar metadata stays in the originating :class:`_Bnb4bitPinned`;
+    tensors. Scalar metadata stays in the originating :class:`_Bnb4bitHost`;
     only storage moves to GPU."""
 
     data: torch.Tensor
@@ -216,17 +214,17 @@ class _Bnb4bitGpu:
 
 
 def _gpu_stats(
-    pinned: _Bnb4bitPinned, buffers: dict[str, torch.Tensor]
+    host: _Bnb4bitHost, buffers: dict[str, torch.Tensor]
 ) -> dict[str, torch.Tensor]:
     """Assemble the packed stats dict ``from_prequantized`` expects:
-    the (GPU or pinned) scale buffers plus the host-resident blob."""
-    return {**buffers, pinned.blob_key: pinned.blob}
+    the (GPU or host) scale buffers plus the host-resident blob."""
+    return {**buffers, host.blob_key: host.blob}
 
 
 class Bnb4bitAdapter:
     """Adapter for ``bitsandbytes.nn.Params4bit`` (NF4 / FP4).
 
-    Decompose-on-pin, reconstruct-on-move. Each activate creates a fresh
+    Decompose-on-capture, reconstruct-on-move. Each activate creates a fresh
     ``Params4bit`` and a fresh :class:`nn.Parameter`, installed via
     registry replacement. This breaks PyTorch optimizer references —
     4-bit weights are inference-only.
@@ -239,9 +237,9 @@ class Bnb4bitAdapter:
         # meta skeleton carries one, and binding replaces it wholesale with a
         # store-reconstructed Params4bit. The layout validation that *reading*
         # the quant state needs lives in require_params_4bit, so it still fires
-        # on every pin/read path (clone_pin, layout_signature, tensor_id, …) —
+        # on every capture/read path (capture_host, layout_signature, tensor_id, …) —
         # where a real tensor must be fully quantized — without rejecting a
-        # placeholder that is only ever bound, never pinned.
+        # placeholder that is only ever bound, never host.
         return is_params_4bit(t)
 
     @staticmethod
@@ -306,45 +304,36 @@ class Bnb4bitAdapter:
         return (shape,)
 
     @staticmethod
-    def clone_pin(t: torch.Tensor) -> _Bnb4bitPinned:
-        return Bnb4bitAdapter._host_state(t, clone_to_pinned_cpu)
-
-    @staticmethod
-    def adopt_host(t: torch.Tensor) -> _Bnb4bitPinned:
-        return Bnb4bitAdapter._host_state(t, adopt_cpu_storage)
-
-    @staticmethod
-    def _host_state(
+    def capture_host(
         t: torch.Tensor,
-        clone: Callable[..., torch.Tensor],
-    ) -> _Bnb4bitPinned:
+    ) -> _Bnb4bitHost:
         qt = require_params_4bit(t)
         quant_state = qt.quant_state
         stats = quant_stats(qt)
         blob_key = metadata_blob_key(stats)
-        return _Bnb4bitPinned(
-            data=clone(
+        return _Bnb4bitHost(
+            data=capture_host_tensor(
                 qt.data, memory_format=torch.contiguous_format
             ),
             buffers={
-                key: clone(
+                key: capture_host_tensor(
                     value, memory_format=torch.contiguous_format
                 )
                 for key, value in stats.items()
                 if key != blob_key
             },
             blob_key=blob_key,
-            # Metadata blob is tiny, constant, and host-resident — pin it
+            # Metadata blob is tiny, constant, and host-resident — capture it
             # once and inject it at reconstruction; it never DMAs.
-            blob=clone(
+            blob=capture_host_tensor(
                 stats[blob_key], memory_format=torch.contiguous_format
             ),
             # The nested double-quant offset is data-dependent but lives in
             # the (host-resident, template-block) blob, so a wrapper reused
-            # across pooled streamed blocks would keep the wrong offset. Pin
+            # across pooled streamed blocks would keep the wrong offset. Capture
             # it separately and alias it per load like the other scales.
             offset=(
-                clone(
+                capture_host_tensor(
                     quant_state.offset, memory_format=torch.contiguous_format
                 )
                 if quant_state.nested
@@ -353,8 +342,13 @@ class Bnb4bitAdapter:
         )
 
     @staticmethod
+    def storage_tensors(state: _Bnb4bitHost) -> tuple[torch.Tensor, ...]:
+        tensors = (state.data, *state.buffers.values(), state.blob)
+        return tensors if state.offset is None else (*tensors, state.offset)
+
+    @staticmethod
     def cpu_param(
-        state: _Bnb4bitPinned, *, requires_grad: bool = False
+        state: _Bnb4bitHost, *, requires_grad: bool = False
     ) -> nn.Parameter:
         # Params4bit is itself an nn.Parameter subclass.
         return build_params_4bit(
@@ -365,7 +359,7 @@ class Bnb4bitAdapter:
         )
 
     @staticmethod
-    def alloc_gpu(state: _Bnb4bitPinned, device: torch.device) -> _Bnb4bitGpu:
+    def alloc_gpu(state: _Bnb4bitHost, device: torch.device) -> _Bnb4bitGpu:
         return _Bnb4bitGpu(
             data=empty_like_strided(state.data, device),
             buffers={
@@ -381,17 +375,17 @@ class Bnb4bitAdapter:
 
     @staticmethod
     def gpu_param(
-        pinned: _Bnb4bitPinned,
+        host: _Bnb4bitHost,
         gpu_state: _Bnb4bitGpu,
         *,
         requires_grad: bool = False,
     ) -> nn.Parameter:
-        # Scalar metadata comes from the pinned blob; the packed weight and
+        # Scalar metadata comes from the host blob; the packed weight and
         # scale tensors come from the (pre-allocated) GPU side. Reconstruction
         # aliases those buffers, so the later copy_to_gpu DMA is visible here.
         param = build_params_4bit(
             gpu_state.data,
-            _gpu_stats(pinned, gpu_state.buffers),
+            _gpu_stats(host, gpu_state.buffers),
             device=gpu_state.data.device,
             requires_grad=requires_grad,
         )
@@ -405,7 +399,7 @@ class Bnb4bitAdapter:
 
     @staticmethod
     def copy_to_gpu(
-        src: _Bnb4bitPinned, dst: _Bnb4bitGpu, *, non_blocking: bool = False
+        src: _Bnb4bitHost, dst: _Bnb4bitGpu, *, non_blocking: bool = False
     ) -> None:
         dst.data.copy_(src.data, non_blocking=non_blocking)
         for key, value in src.buffers.items():
@@ -547,7 +541,7 @@ class Bnb4bitAdapter:
             target_qt.quant_state.offset.copy_(src_qt.quant_state.offset)
 
     @staticmethod
-    def cache_bytes(state: _Bnb4bitPinned) -> int:
+    def cache_bytes(state: _Bnb4bitHost) -> int:
         total = state.data.numel() * state.data.element_size()
         total += state.blob.numel() * state.blob.element_size()
         for value in state.buffers.values():

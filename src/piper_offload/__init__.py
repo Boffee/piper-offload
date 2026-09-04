@@ -3,8 +3,9 @@
 High-level API:
 
 - :class:`ResourceCache` accepts structural :class:`ResourceSpec` implementations
-  and leases reusable model, adapter, and object stores under a host-memory
-  budget. :class:`ModelCache` specializes it with model-aware use: it composes
+  and leases reusable model, adapter, and object stores with optional byte
+  budgeting. :class:`ModelCache` uses its unbounded mode for model-aware use:
+  it composes
   a leased :class:`ModelSpec` with optional :class:`AdapterSpec` resources and
   activates the cached :class:`ModelOffloader`.
   :class:`ObjectSpec` caches general Python objects (tokenizers,
@@ -23,7 +24,7 @@ Lower-level resource bindings:
   activation checkpointing through autograd backward when block compilation
   is disabled. By default,
   trainable params are managed by
-  :class:`PinnedComponent` and stay GPU-resident while active; set
+  :class:`HostComponent` and stay GPU-resident while active; set
   ``include_block_trainables=True`` to stream in-block trainable weights
   and materialize them only around ``optimizer.step()``. That step runs on
   the GPU via the ``optimizer_step()`` context; calling ``optimizer.step()``
@@ -41,7 +42,7 @@ Lower-level resource bindings:
 
 The CUDA-oriented :class:`ModelOffloader` shares the underlying
 per-parameter host storage from
-:class:`~piper_offload.pinned_param.PinnedParam` (clone + pin
+:class:`~piper_offload.host_param.HostParam` (host capture
 + optional quanto ``WeightQBytesTensor`` decomposition, bitsandbytes
 4-bit ``Params4bit`` (NF4/FP4) and 8-bit ``Int8Params`` (LLM.int8)
 decomposition, GGUF packed weights, Piper ConvRot INT8 / NVFP4, TorchAO NVFP4 / MX
@@ -53,37 +54,31 @@ tensor-parallel ``DTensor`` weights wrapping any of the above).
 implement the :class:`ResourceBinding` Protocol. Each owns exactly one model
 runtime and is reused sequentially.
 
-``ModelOffloader.from_module(..., host_backing="adopt")`` adopts frozen
-model state already in CPU RAM without copying it. Anonymous pageable and
-file-backed/mmap tensors therefore share one path and retain their original
-storage. Copies go directly into the same GPU targets; CUDA performs any
-implicit staging. Unsupported adoption raises rather than materializing a
-hidden copy. Capture completes for the entire adopted store before binding
-changes any module registry, so adoption failures leave the supplied model
-untouched. Adopted tensors and writable mmap contents must remain immutable for
-the offloader's lifetime. The default ``"pinned"`` policy preserves the
-full-bandwidth asynchronous path. Package resources make ``cache_bytes`` final
-during construction.
+Host capture takes ownership of compatible complete pageable CPU allocations
+and non-empty views into non-resizable storage, preserving checkpoint file
+mappings and each tensor adapter's physical representation. Device, pinned,
+ordinary resizable partial-view, and incompatible-layout sources are copied
+into pageable CPU allocations. Package resources make
+``cache_bytes`` final during construction.
 ``activate(device)`` then makes the resource usable on the requested device. For
 :class:`ModelOffloader`, ``deactivate()`` returns managed tensors to
-their configured host backing. For :class:`MpsWeights`,
+their host backing. For :class:`MpsWeights`,
 construction has already materialized the model on MPS, so
 ``activate('mps')`` and ``deactivate()`` are lifecycle-only.
 
-Pinned host-store construction intentionally optimizes peak host memory. For
+Host-store construction intentionally optimizes peak host memory. For
 plain ``torch.Tensor`` parameters, it may immediately repoint the source
-``Parameter.data`` at each pinned clone so the original source storage can be
+``Parameter.data`` at captured host backing so the original source storage can be
 freed before all buffers finish. This avoids a temporary 2x host-memory peak
 for CPU-origin models and promptly frees GPU storage for CUDA-origin models.
-Adopted inference instead retains the existing CPU allocation. If pinned
-construction raises after pinning has started, recovery of the partially
+If host construction raises after capture has started, recovery of the partially
 constructed resource/model is unsupported; drop those references and rebuild
 from a fresh model instance.
 
 :class:`ModelOffloader` composes:
-  1. A resident :class:`PinnedComponent` for non-streamed state, including
+  1. A resident :class:`HostComponent` for non-streamed state, including
      trainables skipped by block streaming.
-  2. One :class:`PinnedComponent` per stateful path in ``transient_paths``.
+  2. One :class:`HostComponent` per stateful path in ``transient_paths``.
   3. One :class:`BlockComponent` per path in ``block_paths`` or
      ``transient_block_paths`` when block residency is configured.
      ``block_mode`` selects resident, whole-block streaming, rolling, or
@@ -112,22 +107,37 @@ non-LoRA entry as the complete value for an exact-name parameter. Parameter
 values are merge-only and populate storage-free frozen plain floating-point
 meta parameters; parameter deltas require existing physical parameters.
 
-:class:`Adapter` owns immutable parameter-delta and parameter-value storage,
-pinned by default or strictly adopted from existing CPU backing. Compatible
-consumers read that backing directly and may overlap; routed hooks stage their
-own per-forward device copies.
+:class:`Adapter` owns immutable parameter-delta and parameter-value storage.
+Compatible complete CPU allocations and non-empty views into non-resizable
+storage supplied to its factory transfer to that backing, so callers must not
+mutate them after construction. Compatible consumers read the backing directly
+and may overlap; routed hooks stage their own per-forward device copies.
 
-Downstream tensor subclasses can participate in pinning and movement without
+Downstream tensor subclasses can participate in capture and movement without
 adding format-specific dependencies here: implement the public
 :class:`TensorAdapter` contract and register it during application startup with
 :func:`register_adapter`. Registered adapters are used for both movement and
-tied-storage identity. To additionally support ``host_backing="adopt"``,
-implement :class:`AdoptableTensorAdapter`; its ``adopt_host()`` method returns
-adapter state that aliases the retained source storage.
+tied-storage identity. ``capture_host()`` returns owned pageable CPU state,
+retaining compatible complete allocations and non-empty views into
+non-resizable storage where supported, that the adapter can copy and
+reconstruct without changing its encoding.
+``storage_tensors(state)`` exposes that state's physical CPU tensors directly,
+including tensor-valued metadata, without copying or rebuilding wrappers.
 
-:class:`ResourceCache` manages cached backing stores with policy-driven
-eviction, reference-counted leases, and transactional admission.
-:class:`ModelCache` owns dependency leasing, adapter attachment, and device
+The process-wide :data:`host_pin_manager` can register that storage in place
+under a finite page-rounded budget or opportunistically up to native CUDA/HIP
+capacity. :class:`PinLease` protects backing until its owner explicitly closes
+it; released registrations enter an idle LRU. The default budget is zero.
+Block components acquire leases for ordinary streaming and compiled rolling,
+then close them only after their runtime has completed pending transfers. CUDA
+runtimes own stream ordering and remain independent of pin-budget policy. CPU
+and resident execution do not acquire pins. Host-data caching remains
+independent of this registration budget.
+
+:class:`ResourceCache` manages cached backing stores with optional
+policy-driven byte eviction, reference-counted leases, and transactional
+finite-budget admission. :class:`ModelCache` keeps stores until explicit
+eviction and owns dependency leasing, adapter attachment, and device
 activation. Each model offloader rejects overlapping use. Custom
 :class:`EvictionPolicy`
 implementations can replace the default LRU behavior. See its docstring
@@ -151,11 +161,12 @@ Compatibility
   backing may be shared.
 """
 
+from ._host_registration import HostRegistrationError
 from .adapter import Adapter, AdapterMode, AdapterTarget
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent, BlockComponentStore
 from .block_mode import BlockMode
-from .host_backing import HostBacking
+from .host_component import HostComponent, HostComponentStore
 from .lora import LoRAFactor, LoRATransform, ScaledLoRAFactor
 from .merge import merge_adapter
 from .model_cache import ModelCache
@@ -168,7 +179,7 @@ from .parameter_value import (
     ParameterValueTransform,
     ScaledParameterValue,
 )
-from .pinned_component import PinnedComponent, PinnedComponentStore
+from .pin_manager import PinLease, PinManager, PinStats, host_pin_manager
 from .protocols import (
     ResourceBinding,
     ResourceSpec,
@@ -193,7 +204,6 @@ from .resource_specs import AdapterSpec, ModelSpec, ObjectSpec
 from .seeding import derive_seed
 from .tensor_adapter_registry import register_adapter
 from .tensor_adapters import (
-    AdoptableTensorAdapter,
     TensorAdapter,
 )
 
@@ -202,7 +212,6 @@ __all__ = [
     "AdapterMode",
     "AdapterSpec",
     "AdapterTarget",
-    "AdoptableTensorAdapter",
     "BlockCompileConfig",
     "BlockComponent",
     "BlockComponentStore",
@@ -213,7 +222,9 @@ __all__ = [
     "EvictionContext",
     "EvictionPolicy",
     "EvictionPolicyError",
-    "HostBacking",
+    "HostComponent",
+    "HostComponentStore",
+    "HostRegistrationError",
     "LRUEvictionPolicy",
     "LoRAFactor",
     "LoRATransform",
@@ -228,8 +239,9 @@ __all__ = [
     "ParameterTransform",
     "ParameterValue",
     "ParameterValueTransform",
-    "PinnedComponent",
-    "PinnedComponentStore",
+    "PinLease",
+    "PinManager",
+    "PinStats",
     "ResourceBinding",
     "ResourceCache",
     "ResourceCachedError",
@@ -244,6 +256,7 @@ __all__ = [
     "ScaledParameterValue",
     "TensorAdapter",
     "derive_seed",
+    "host_pin_manager",
     "merge_adapter",
     "register_adapter",
 ]

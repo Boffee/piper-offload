@@ -13,7 +13,7 @@ from piper_offload import (
     merge_adapter,
 )
 from piper_offload.float8_adapter import Float8Adapter
-from piper_offload.pinned_param import PinnedParam
+from piper_offload.host_param import HostParam
 from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import tensor_id
 from tests.conftest import activated_model
@@ -114,25 +114,25 @@ class TestFloat8Adapter:
         assert Float8Adapter.matches(f8)
         assert not Float8Adapter.matches(torch.zeros(16, 16, dtype=torch.bfloat16))
 
-    def test_pin_preserves_storage_and_metadata(self) -> None:
+    def test_capture_preserves_storage_and_metadata(self) -> None:
         float8_tensor_cls, _, _, _, _ = _float8_modules()
         f8 = _make_float8()
         p = nn.Parameter(f8, requires_grad=False)
-        pinned_param = PinnedParam(p)
+        host_param = HostParam(p)
 
-        pinned = pinned_param.make_cpu_param().data
-        assert isinstance(pinned, float8_tensor_cls)
-        assert pinned.qdata.is_pinned()
-        assert pinned.scale.is_pinned()
-        assert pinned.qdata.data_ptr() == pinned_param.pinned_state.storage[0].data_ptr()
-        assert pinned.scale.data_ptr() == pinned_param.pinned_state.storage[1].data_ptr()
-        assert pinned.block_size == f8.block_size
-        assert pinned.mm_config == f8.mm_config
-        assert pinned.kernel_preference == f8.kernel_preference
-        assert pinned.act_quant_kwargs == f8.act_quant_kwargs
-        assert pinned.dtype == f8.dtype
-        assert pinned_param.compute_dtype is torch.bfloat16
-        assert torch.equal(pinned.dequantize(), f8.dequantize())
+        host = host_param.make_cpu_param().data
+        assert isinstance(host, float8_tensor_cls)
+        assert not host.qdata.is_pinned()
+        assert not host.scale.is_pinned()
+        assert host.qdata.data_ptr() == host_param.host_state.storage[0].data_ptr()
+        assert host.scale.data_ptr() == host_param.host_state.storage[1].data_ptr()
+        assert host.block_size == f8.block_size
+        assert host.mm_config == f8.mm_config
+        assert host.kernel_preference == f8.kernel_preference
+        assert host.act_quant_kwargs == f8.act_quant_kwargs
+        assert host.dtype == f8.dtype
+        assert host_param.compute_dtype is torch.bfloat16
+        assert torch.equal(host.dequantize(), f8.dequantize())
 
     def test_tensor_id_tracks_both_buffers(self) -> None:
         f8 = _make_float8()
@@ -161,29 +161,29 @@ class TestFloat8Adapter:
 
         assert _param_target_layout(with_activation) != _param_target_layout(weight_only)
 
-    def test_cpu_round_trip_restores_pinned_bytes(self) -> None:
-        pinned_param = PinnedParam(
+    def test_cpu_round_trip_restores_host_bytes(self) -> None:
+        host_param = HostParam(
             nn.Parameter(_make_float8(), requires_grad=False),
         )
-        state = pinned_param.allocate_gpu_storage(torch.device("cpu"))
-        pinned_param.copy_to_gpu(state)
+        state = host_param.allocate_gpu_storage(torch.device("cpu"))
+        host_param.copy_to_gpu(state)
 
-        original_qdata = pinned_param.pinned_state.storage[0].view(torch.uint8).clone()
-        original_scale = pinned_param.pinned_state.storage[1].clone()
-        pinned_param.pinned_state.storage[0].view(torch.uint8).zero_()
-        pinned_param.pinned_state.storage[1].zero_()
-        pinned_param.copy_to_cpu(state)
+        original_qdata = host_param.host_state.storage[0].view(torch.uint8).clone()
+        original_scale = host_param.host_state.storage[1].clone()
+        host_param.host_state.storage[0].view(torch.uint8).zero_()
+        host_param.host_state.storage[1].zero_()
+        host_param.copy_to_cpu(state)
 
-        assert torch.equal(pinned_param.pinned_state.storage[0].view(torch.uint8), original_qdata)
-        assert torch.equal(pinned_param.pinned_state.storage[1], original_scale)
+        assert torch.equal(host_param.host_state.storage[0].view(torch.uint8), original_qdata)
+        assert torch.equal(host_param.host_state.storage[1], original_scale)
 
     def test_no_trainable_swap_capability(self) -> None:
-        pinned_param = PinnedParam(
+        host_param = HostParam(
             nn.Parameter(_make_float8(), requires_grad=True),
         )
 
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            pinned_param.validate_parameter_data_swap_target()
+            host_param.validate_parameter_data_swap_target()
 
     @pytest.mark.parametrize("per_tensor", [False, True])
     def test_dequantize_requantize_preserves_representation(self, per_tensor: bool) -> None:
@@ -893,28 +893,28 @@ class TestFloat8Adapter:
     @CUDA
     def test_allocate_copy_make_gpu_param_preserves_wrapper(self) -> None:
         float8_tensor_cls, _, _, _, _ = _float8_modules()
-        pinned_param = PinnedParam(
+        host_param = HostParam(
             nn.Parameter(_make_float8(), requires_grad=False),
         )
 
-        gpu_state = pinned_param.allocate_gpu_storage(torch.device("cuda"))
-        pinned_param.copy_to_gpu(gpu_state, non_blocking=True)
-        gpu_param = pinned_param.make_gpu_param(gpu_state)
+        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
+        host_param.copy_to_gpu(gpu_state, non_blocking=True)
+        gpu_param = host_param.make_gpu_param(gpu_state)
         torch.cuda.synchronize()
-        pinned = pinned_param.make_cpu_param().data
+        host = host_param.make_cpu_param().data
 
         assert isinstance(gpu_param.data, float8_tensor_cls)
         assert gpu_param.data.qdata.is_cuda
         assert gpu_param.data.scale.is_cuda
-        assert gpu_param.data.block_size == pinned.block_size
-        assert gpu_param.data.kernel_preference == pinned.kernel_preference
-        assert gpu_param.data.act_quant_kwargs == pinned.act_quant_kwargs
-        assert gpu_param.data.dtype == pinned.dtype
+        assert gpu_param.data.block_size == host.block_size
+        assert gpu_param.data.kernel_preference == host.kernel_preference
+        assert gpu_param.data.act_quant_kwargs == host.act_quant_kwargs
+        assert gpu_param.data.dtype == host.dtype
         assert torch.equal(
             gpu_param.data.qdata.view(torch.uint8).cpu(),
-            pinned.qdata.view(torch.uint8),
+            host.qdata.view(torch.uint8),
         )
-        assert torch.equal(gpu_param.data.scale.cpu(), pinned.scale)
+        assert torch.equal(gpu_param.data.scale.cpu(), host.scale)
 
     @CUDA
     def test_model_offloader_cuda_forward_dynamic_float8(self) -> None:

@@ -6,8 +6,8 @@ These Protocols form the contract:
   resource, estimates its backing bytes, builds its store, and projects a
   leased store to the value exposed to its caller.
 
-- :class:`ResourceStore` -- cached backing state. A store owns the
-  budgeted cache bytes and defines whether active uses may overlap.
+- :class:`ResourceStore` -- cached backing state. A store reports its logical
+  bytes and defines whether active uses may overlap.
 
 - :class:`ResourceBinding` -- active-resource lifecycle. A binding exposes a
   typed :attr:`value` accessor plus activate/deactivate methods. A cached
@@ -19,11 +19,11 @@ Top-level :class:`ResourceBinding` implementations in this package:
 block offload) and :class:`~piper_offload.MpsWeights` (whole-model
 CPU->MPS materialization without a second CPU cache). An
 :class:`~piper_offload.Adapter` is itself the cached adapter resource. Merge
-and routed consumers read its immutable pinned backing directly; routed
+and routed consumers read its immutable host backing directly; routed
 device copies belong to activation-scoped model hooks.
 
 Composable lifecycle pieces inside a model runtime include
-:class:`~piper_offload.PinnedComponent` and
+:class:`~piper_offload.HostComponent` and
 :class:`~piper_offload.BlockComponent`.
 
 Lifecycle
@@ -33,27 +33,30 @@ is final immediately. Tensor-backed stores report logical representation bytes
 through their adapters; this is not a measurement of allocation capacity,
 checkpoint file size, or mmap pages currently resident in RAM.
 :class:`~piper_offload.ResourceCache` keeps stores cached and protects them
-with reference-counted leases. A store may itself implement the active
+with reference-counted leases. A finite cache uses the logical byte count for
+admission; an unbounded cache retains stores until explicit eviction. A store
+may itself implement the active
 lifecycle. That lifecycle is
 ``activate(device=...)`` (make the value usable, on the caller-selected
 device when device-aware) ->
 ``deactivate()`` (release transient compute resources while store
 ``cache_bytes`` remains resident).
 
-Package model resources optimize construction peak memory: plain
-``torch.Tensor`` parameters may be repointed to pinned storage while
-pinning is still in progress. If construction raises after pinning has
-started, recovery of the partially constructed model/resource is
-unsupported; drop those references and rebuild from a fresh model
-instance.
+Package model resources transfer compatible complete pageable CPU storage and
+non-empty views into non-resizable storage, which preserves checkpoint file
+mappings through split parameters. Plain ``torch.Tensor`` parameters may be
+repointed to captured host storage while construction is still in progress. If
+construction raises after capture has started, recovery of the partially
+constructed model/resource is unsupported; drop those references and rebuild
+from a fresh model instance.
 
 ``activate()/deactivate()`` may be repeated as many times as you want.
 :class:`~piper_offload.ModelCache` combines cache leases with an
 exception-safe model activation scope.
 
 There is no ``close()``. To release store ``cache_bytes`` (typically
-pinned host memory), drop the store reference. Python's refcount-based
-GC frees pinned tensors immediately. Bindings release what they own on
+host memory), drop the store reference. Python's refcount-based
+GC frees host tensors immediately. Bindings release what they own on
 deactivate; ownership of any user-held model references is the user's
 concern.
 """
@@ -69,7 +72,7 @@ class ResourceStore(Protocol):
 
     @property
     def cache_bytes(self) -> int:
-        """Bytes charged against the cache budget."""
+        """Logical bytes reported for accounting and optional budgeting."""
         ...
 
 
@@ -77,9 +80,9 @@ class ResourceSpec[T](Protocol):
     """Structural contract for one lazily built cache entry.
 
     ``key`` is the cache identity and must include every construction input
-    that affects the resulting resource. ``estimated_cache_bytes`` is used
-    for pre-build admission; the cache reconciles it with the built store's
-    actual :attr:`ResourceStore.cache_bytes`.
+    that affects the resulting resource. A finite cache uses
+    ``estimated_cache_bytes`` for pre-build admission; the cache reconciles it
+    with the built store's actual :attr:`ResourceStore.cache_bytes`.
     """
 
     @property
@@ -89,7 +92,7 @@ class ResourceSpec[T](Protocol):
 
     @property
     def estimated_cache_bytes(self) -> int:
-        """Pre-build estimate used for admission planning."""
+        """Pre-build estimate used by finite cache admission."""
         ...
 
     def build_store(self) -> ResourceStore:

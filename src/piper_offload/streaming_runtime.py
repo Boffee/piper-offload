@@ -12,21 +12,21 @@ from torch import nn
 
 from .block_compile import CompileBackend
 from .block_runtime import validate_load_plans
-from .module_names import group_names
-from .pinned_module import (
-    PinnedModuleInstance,
-    PinnedModuleLoadPlan,
-    PinnedModuleTarget,
+from .host_module import (
+    HostModuleInstance,
+    HostModuleLoadPlan,
+    HostModuleTarget,
 )
+from .module_names import group_names
 from .target_lease import CudaTargetLease
 
 logger = logging.getLogger(__name__)
 
 type BlockSignature = tuple[object, ...]
-type _LoadedTrainableBlock = tuple[PinnedModuleInstance, PinnedModuleTarget]
+type _LoadedTrainableBlock = tuple[HostModuleInstance, HostModuleTarget]
 
 
-def _plan_target_signature(plan: PinnedModuleLoadPlan) -> BlockSignature:
+def _plan_target_signature(plan: HostModuleLoadPlan) -> BlockSignature:
     """Return the layout-equivalence key for one block's GPU targets."""
     instance = plan.instance
     params = plan.sources
@@ -59,7 +59,7 @@ class _MorphingTargetPool:
     def acquire(
         self,
         signature: BlockSignature,
-        plan: PinnedModuleLoadPlan,
+        plan: HostModuleLoadPlan,
         stream: torch.cuda.Stream,
     ) -> CudaTargetLease:
         free = self._free.get(signature)
@@ -90,14 +90,14 @@ class StreamingBlockRuntime:
 
     def __init__(
         self,
-        instances: Sequence[PinnedModuleInstance],
+        instances: Sequence[HostModuleInstance],
         *,
         wraparound: bool = True,
     ) -> None:
         self._instances = tuple(instances)
         self._wraparound = wraparound
         self._device: torch.device | None = None
-        self._load_plans: tuple[PinnedModuleLoadPlan, ...] = ()
+        self._load_plans: tuple[HostModuleLoadPlan, ...] = ()
         self._pool: _MorphingTargetPool | None = None
         self._block_to_lease: dict[int, CudaTargetLease] = {}
         self._active_idx: int | None = None
@@ -120,7 +120,7 @@ class StreamingBlockRuntime:
     def acquire(
         self,
         device: torch.device,
-        load_plans: Sequence[PinnedModuleLoadPlan],
+        load_plans: Sequence[HostModuleLoadPlan],
     ) -> None:
         if self.acquired:
             raise RuntimeError("streaming block runtime is already acquired")
@@ -185,7 +185,7 @@ class StreamingBlockRuntime:
             raise RuntimeError(
                 "BlockComponent.optimizer_step() does not support "
                 "reentrant entry. A nested optimizer-step boundary would "
-                "scatter the outer step's stale pinned bytes on top of "
+                "scatter the outer step's stale host bytes on top of "
                 "the inner update."
             )
         if not any(instance.has_trainables for instance in self._instances):
@@ -228,7 +228,7 @@ class StreamingBlockRuntime:
             for instance in self._instances:
                 if not instance.has_trainables:
                     continue
-                stack.callback(instance.install_pinned)
+                stack.callback(instance.install_host)
                 plan = instance.resolve_load_plan().select_parameters(
                     instance.trainable_param_names,
                 )
@@ -296,7 +296,7 @@ class StreamingBlockRuntime:
         block_idx: int,
     ) -> None:
         plan = self._load_plans[block_idx]
-        plan.instance.install_pinned()
+        plan.instance.install_host()
         assert self._pool is not None, "runtime is not acquired"
         lease = self._block_to_lease.pop(block_idx, None)
         if lease is not None:

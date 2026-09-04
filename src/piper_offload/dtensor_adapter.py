@@ -15,14 +15,14 @@ for the local shard, a ``DTensor`` wrapping a plain tensor reuses
 It does NOT compose with adapters whose local shard is itself an
 ``nn.Parameter`` subclass carrying quant state on the object rather than
 ``.data`` (bitsandbytes ``Params4bit`` / ``Int8Params``): reconstruction
-reads ``.data`` off the inner wrapper, which strips that state. ``clone_pin``
+reads ``.data`` off the inner wrapper, which strips that state. ``capture_host``
 rejects such a local shard with ``NotImplementedError`` rather than silently
 corrupting it. (bitsandbytes + tensor parallelism is not a supported
 combination upstream regardless.)
 
 Scope: **movement plus shard-local additive merge, for frozen-inference tensor
 parallelism.** Merge mode supports ordinary ``Replicate`` and contiguous
-``Shard`` placements. It selects the pinned dense regions and, for rank-two
+``Shard`` placements. It selects the host dense regions and, for rank-two
 weights, LoRA factor regions needed by each rank before device staging, then
 delegates the actual update to the local shard's adapter. This keeps
 tensor-parallel concerns out of format-specific quant adapters.
@@ -85,8 +85,8 @@ from .tensor_adapters import (
 
 
 @dataclass(slots=True)
-class _DTensorPinned:
-    """Pinned state for a DTensor: the inner adapter's pinned local-shard
+class _DTensorHost:
+    """Host state for a DTensor: the inner adapter's host local-shard
     state plus the distributed wrapper to replay on reconstruction. ``mesh`` is
     the original (CUDA) mesh — used as-is by :meth:`gpu_param` for the resident
     weight (which computes, so it must reuse the model's canonical mesh), and
@@ -371,7 +371,7 @@ class DTensorAdapter:
     def tensor_id(t: torch.Tensor) -> tuple:
         # Include the GLOBAL shape/stride (matching layout_signature): two
         # DTensors can alias the same local shard yet carry different global
-        # views, and tied-weight dedup reuses the first param's pinned state —
+        # views, and tied-weight dedup reuses the first param's host state —
         # so without these, the second would rebuild with the wrong global
         # metadata.
         dt = require_dtensor(t)
@@ -403,7 +403,7 @@ class DTensorAdapter:
 
     @staticmethod
     def bind_layout_signature(t: torch.Tensor) -> tuple:
-        # Bind validation compares the store (pinned from the CUDA-mesh weight)
+        # Bind validation compares the store (captured from the CUDA-mesh weight)
         # against the bound module, whose resting weight cpu_param rebuilt on a
         # CPU mesh. Drop the mesh device type so the two compare equal. Delegate
         # the local shard to the inner adapter's *bind* signature (not the
@@ -425,7 +425,7 @@ class DTensorAdapter:
         )
 
     @staticmethod
-    def clone_pin(t: torch.Tensor) -> _DTensorPinned:
+    def capture_host(t: torch.Tensor) -> _DTensorHost:
         dt = require_dtensor(t)
         local = dt.to_local()
         if issubclass(type(local), nn.Parameter):
@@ -442,9 +442,9 @@ class DTensorAdapter:
                 f"shards are supported."
             )
         inner = _select(local)
-        return _DTensorPinned(
+        return _DTensorHost(
             inner=inner,
-            inner_state=inner.clone_pin(local),
+            inner_state=inner.capture_host(local),
             mesh=dt.device_mesh,
             placements=tuple(dt.placements),
             shape=dt.shape,
@@ -452,13 +452,17 @@ class DTensorAdapter:
         )
 
     @staticmethod
-    def cpu_param(state: _DTensorPinned, *, requires_grad: bool = False) -> nn.Parameter:
+    def storage_tensors(state: _DTensorHost) -> tuple[torch.Tensor, ...]:
+        return state.inner.storage_tensors(state.inner_state)
+
+    @staticmethod
+    def cpu_param(state: _DTensorHost, *, requires_grad: bool = False) -> nn.Parameter:
         # The resting weight stays a DTensor (so its adapter/layout matches the
         # store and a deactivated block is still a DTensor), but on a CPU mesh
         # so the local shard stays on the host — a CUDA mesh would move the
         # local onto the device, re-allocating GPU memory for the offloaded
         # state. The resting form never computes, so a freshly-derived CPU mesh
-        # is fine. The local aliases the inner adapter's pinned host storage.
+        # is fine. The local aliases the inner adapter's host storage.
         local = state.inner.cpu_param(state.inner_state, requires_grad=False).data
         dt = rebuild_dtensor(
             local,
@@ -470,12 +474,12 @@ class DTensorAdapter:
         return nn.Parameter(dt, requires_grad=requires_grad)
 
     @staticmethod
-    def alloc_gpu(state: _DTensorPinned, device: torch.device) -> _DTensorGpu:
+    def alloc_gpu(state: _DTensorHost, device: torch.device) -> _DTensorGpu:
         return _DTensorGpu(inner_gpu=state.inner.alloc_gpu(state.inner_state, device))
 
     @staticmethod
     def gpu_param(
-        pinned: _DTensorPinned,
+        host: _DTensorHost,
         gpu_state: _DTensorGpu,
         *,
         requires_grad: bool = False,
@@ -484,12 +488,12 @@ class DTensorAdapter:
         # replay the distributed wrapper. run_check=False: pure local rebuild,
         # never a collective. The local already lives on the mesh device, so
         # from_local aliases it (no copy) — the reused wrapper sees refills.
-        local = pinned.inner.gpu_param(pinned.inner_state, gpu_state.inner_gpu, requires_grad=False).data
-        dt = rebuild_dtensor(local, pinned.mesh, pinned.placements, pinned.shape, pinned.stride)
+        local = host.inner.gpu_param(host.inner_state, gpu_state.inner_gpu, requires_grad=False).data
+        dt = rebuild_dtensor(local, host.mesh, host.placements, host.shape, host.stride)
         return nn.Parameter(dt, requires_grad=requires_grad)
 
     @staticmethod
-    def copy_to_gpu(src: _DTensorPinned, dst: _DTensorGpu, *, non_blocking: bool = False) -> None:
+    def copy_to_gpu(src: _DTensorHost, dst: _DTensorGpu, *, non_blocking: bool = False) -> None:
         # Pure local-shard DMA; never a collective.
         src.inner.copy_to_gpu(src.inner_state, dst.inner_gpu, non_blocking=non_blocking)
 
@@ -738,14 +742,14 @@ class DTensorAdapter:
     @staticmethod
     def compute_dtype(t: torch.Tensor) -> torch.dtype:
         # Accept either the live DTensor or the bare local shard: the
-        # PinnedParam.compute_dtype property feeds the local shard that
+        # HostParam.compute_dtype property feeds the local shard that
         # cpu_param produced (a DTensor weight's resting representation is not
         # a DTensor), and the routed-LoRA path feeds the live DTensor.
         local = local_shard(t)
         return _select(local).compute_dtype(local)
 
     @staticmethod
-    def cache_bytes(state: _DTensorPinned) -> int:
+    def cache_bytes(state: _DTensorHost) -> int:
         # Local shard bytes only — the DTensor's global numel would
         # over-account host memory by the world size.
         return state.inner.cache_bytes(state.inner_state)

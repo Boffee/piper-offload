@@ -2,6 +2,7 @@
 
 from typing import Protocol
 
+import torch
 from torch import nn
 
 
@@ -14,6 +15,10 @@ class ParameterTransform(Protocol):
 
     def apply_parameter(self, param: nn.Parameter) -> None:
         """Apply the prepared update to ``param`` in place."""
+        ...
+
+    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return physical CPU tensors read while applying the update."""
         ...
 
 

@@ -21,11 +21,11 @@ module.
   to expose a dequantize/requantize conversion capability and implement its
   LoRA merge fallback.
 
-Both pin/move/wrap and dequantize/requantize support consume from here
+Both capture/move/wrap and dequantize/requantize support consume from here
 through :mod:`bnb4bit_adapter`, so the layout assumption only has to be
 updated once when bitsandbytes refactors.
 
-Pinned to bitsandbytes' internal layout (validated against 0.49.x). Not
+Host to bitsandbytes' internal layout (validated against 0.49.x). Not
 part of the public API.
 """
 
@@ -102,7 +102,7 @@ def validate_layout(t: torch.Tensor) -> None:
         return
     raise RuntimeError(
         f"Params4bit is missing expected attributes {missing!r}; this repo "
-        f"is pinned to a layout that exposes {LAYOUT_ATTRS} and "
+        f"requires a layout that exposes {LAYOUT_ATTRS} and "
         f"quant_state.{QUANT_STATE_ATTRS}. bitsandbytes likely refactored "
         "the 4-bit wrapper — upgrade piper-offload to match, or the weight "
         "was never quantized (move the model to CUDA before offloading)."
@@ -307,7 +307,7 @@ INT8_LAYOUT_ATTRS = ("CB", "SCB")
 per-output-row float32 scale. Both live on the parameter only *before* the
 owning ``Linear8bitLt`` runs its first forward — after that bitsandbytes
 migrates them onto the module's ``MatmulLtState`` and nulls them here. The
-adapter therefore pins a not-yet-forwarded weight; a post-forward (or
+adapter therefore captures a not-yet-forwarded weight; a post-forward (or
 unquantized) weight is reported by :func:`validate_int8_layout`.
 """
 
@@ -334,7 +334,7 @@ def validate_int8_layout(t: torch.Tensor) -> None:
     parameter only until the owning ``Linear8bitLt`` runs its first
     forward, which migrates it onto the module (``MatmulLtState``) and nulls
     ``CB``/``SCB`` here. A tensor-scoped adapter cannot reach the module, so
-    it can only pin a pre-forward weight — this validates that and otherwise
+    it can only capture a pre-forward weight — this validates that and otherwise
     raises a framed error rather than silently capturing ``None``.
     """
     missing = [
@@ -348,7 +348,7 @@ def validate_int8_layout(t: torch.Tensor) -> None:
         f"Int8Params is missing {missing!r}; this repo reads {INT8_LAYOUT_ATTRS}. "
         "Either bitsandbytes refactored the int8 wrapper, or — most likely — "
         "the owning Linear8bitLt already ran a forward, which migrates CB/SCB "
-        "onto the module and nulls them on the weight. Pin int8 weights before "
+        "onto the module and nulls them on the weight. Capture int8 weights before "
         "the first forward (e.g. build the offload store at load time)."
     )
 

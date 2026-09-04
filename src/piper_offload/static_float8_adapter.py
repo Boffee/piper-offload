@@ -6,7 +6,7 @@ The prototype static FP8 representation is deliberately separate from
 ``PrototypeFloat8Tensor`` additionally owns a checkpoint-calibrated
 ``act_quant_scale``.  This adapter keeps all three storage tensors
 (``qdata``, weight ``scale``, and ``act_quant_scale``) quantized and intact
-through pinning, block streaming, cache reuse, and lossless CPU round trips.
+through capture, block streaming, cache reuse, and lossless CPU round trips.
 
 CUDA LoRA updates use a format-specific Triton merge when available, with a
 pure-Torch dequantize/GEMM/requantize fallback. Both recompute only the weight
@@ -33,7 +33,7 @@ from ._torchao_static_float8 import (
 from .tensor_adapters import metadata_key
 from .torchao_structured_adapter import (
     TorchaoGpu,
-    TorchaoPinned,
+    TorchaoHost,
     TorchaoStructuredAdapter,
     copy_storage,
 )
@@ -196,7 +196,7 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
     @staticmethod
     def copy_to_cpu(
         src: TorchaoGpu,
-        dst: TorchaoPinned[_StaticFloat8Meta],
+        dst: TorchaoHost[_StaticFloat8Meta],
         *,
         non_blocking: bool = False,
     ) -> None:
