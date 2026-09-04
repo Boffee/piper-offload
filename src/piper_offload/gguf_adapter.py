@@ -122,6 +122,7 @@ class GgufAdapter:
             tuple(data.shape),
             data.stride(),
             _quant_type(t),
+            _logical_shape(t),
         )
 
     @staticmethod

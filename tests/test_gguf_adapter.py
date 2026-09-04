@@ -96,9 +96,16 @@ class TestGGUFSource:
             requires_grad=False,
             quant_type=w.quant_type,
         )
+        conflicting_shape = GGUFParameter(
+            w.as_tensor(),
+            requires_grad=False,
+            quant_type=w.quant_type,
+        )
+        conflicting_shape.quant_shape = torch.Size((2, 128))
 
         assert GgufAdapter.tensor_id(w) == GgufAdapter.tensor_id(alias)
         assert GgufAdapter.tensor_id(w) != GgufAdapter.tensor_id(clone)
+        assert GgufAdapter.tensor_id(w) != GgufAdapter.tensor_id(conflicting_shape)
 
     @pytest.mark.parametrize(
         ("features", "expected_group_size"),
