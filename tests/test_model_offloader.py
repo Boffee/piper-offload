@@ -32,6 +32,7 @@ from piper_offload.host_module import ParameterOverride
 from piper_offload.streaming_runtime import _plan_target_signature
 
 from tests.conftest import (
+    CallbackParameterTransform,
     activated_model,
     host_component,
     block_components,
@@ -2441,15 +2442,17 @@ class TestBlockNameSelection:
         def update(_param: nn.Parameter) -> None:
             pass
 
+        transform = CallbackParameterTransform(update)
+
         try:
             plans = streamer._resolve_load_plans(
                 {
                     "transformer_blocks.1.weight": ParameterOverride(
-                        update=update
+                        update=transform
                     )
                 }
             )
-            assert plans[1].loads["weight"].update is update
+            assert plans[1].loads["weight"].update is transform
             assert plans[0].loads["weight"].update is None
         finally:
             streamer.deactivate()
@@ -2465,7 +2468,7 @@ class TestBlockNameSelection:
                 streamer._resolve_load_plans(
                     {
                         "transformer_blocks.10.weight": ParameterOverride(
-                            update=lambda _param: None
+                            update=CallbackParameterTransform(lambda _param: None)
                         )
                     }
                 )

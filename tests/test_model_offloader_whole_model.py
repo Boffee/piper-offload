@@ -13,7 +13,7 @@ from piper_offload import (
 )
 from piper_offload.host_module import ParameterOverride
 
-from tests.conftest import activated_model, host_component
+from tests.conftest import CallbackParameterTransform, activated_model, host_component
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -219,7 +219,9 @@ class TestHostComponentStoreBind:
                 torch.device("cuda"),
                 parameter_overrides={
                     "0.weight": ParameterOverride(
-                        update=lambda param: copied.append(param.device)
+                        update=CallbackParameterTransform(
+                            lambda param: copied.append(param.device)
+                        )
                     )
                 },
             )

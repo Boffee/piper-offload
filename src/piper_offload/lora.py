@@ -458,6 +458,15 @@ class LoRATransform:
         """Implement the shared parameter-transform application protocol."""
         self.apply_weight(param)
 
+    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return the physical host tensors used to stage all factors."""
+        return tuple(
+            tensor
+            for factor in self._factors
+            for backing in (factor.a, factor.b)
+            for tensor in backing.storage_tensors()
+        )
+
     def _materialize_weight_factors(
         self,
     ) -> list[_MaterializedWeightFactor]:

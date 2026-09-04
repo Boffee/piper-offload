@@ -17,6 +17,7 @@ from piper_offload.host_module import (
     HostParamTarget,
 )
 from piper_offload.host_param import HostParam
+from tests.conftest import CallbackParameterTransform
 
 
 class _FakeHostParam:
@@ -376,7 +377,11 @@ class TestHostModuleInstance:
         assert instance.resolve_load_plan().loads == {}
         with pytest.raises(ValueError, match="physical replacement source"):
             instance.resolve_load_plan(
-                {"weight": ParameterOverride(update=lambda _param: None)}
+                {
+                    "weight": ParameterOverride(
+                        update=CallbackParameterTransform(lambda _param: None)
+                    )
+                }
             )
 
         plan = instance.resolve_load_plan(
@@ -423,8 +428,9 @@ class TestHostModuleInstance:
             update_calls.append(param)
             param.data.add_(1)
 
+        transform = CallbackParameterTransform(update)
         plan = instance.resolve_load_plan(
-            {"left.weight": ParameterOverride(update=update)}
+            {"left.weight": ParameterOverride(update=transform)}
         )
         target = plan.allocate_target(torch.device("cuda"))
         plan.load_to_target(target)
@@ -448,7 +454,11 @@ class TestHostModuleInstance:
         )
         update_calls: list[nn.Parameter] = []
         plan = instance.resolve_load_plan(
-            {"weight": ParameterOverride(update=update_calls.append)}
+            {
+                "weight": ParameterOverride(
+                    update=CallbackParameterTransform(update_calls.append)
+                )
+            }
         )
         target = plan.allocate_target(torch.device("cuda"))
 

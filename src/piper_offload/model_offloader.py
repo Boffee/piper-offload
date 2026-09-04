@@ -305,14 +305,14 @@ class ModelOffloader:
                 overrides[param_name] = ParameterOverride(
                     source=transform.backing,
                     update=(
-                        transform.apply_parameter
+                        transform
                         if transform.requires_update
                         else None
                     ),
                 )
             else:
                 overrides[param_name] = ParameterOverride(
-                    update=transform.apply_parameter,
+                    update=transform,
                 )
         return overrides
 

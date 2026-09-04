@@ -6,7 +6,6 @@ store and an instance.
 """
 
 from collections.abc import (
-    Callable,
     Iterable,
     Iterator,
     Mapping,
@@ -22,13 +21,12 @@ from torch import nn
 from .host_buffer import HostBuffer
 from .host_param import HostParam
 from .module_names import group_names, resolve_parent_leaf
+from .parameter_transform import ParameterTransform
 from .tensor_adapter_registry import (
     buffer_tensor_id,
     param_representation,
     param_tensor_id,
 )
-
-type ParameterUpdate = Callable[[nn.Parameter], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,7 +34,7 @@ class ParameterOverride:
     """Activation-scoped replacement source and/or in-place update."""
 
     source: HostParam | None = None
-    update: ParameterUpdate | None = None
+    update: ParameterTransform | None = None
 
     def __post_init__(self) -> None:
         if self.source is None and self.update is None:
@@ -51,7 +49,7 @@ class ParameterLoad:
     """Resolved source and optional update for one active parameter."""
 
     source: HostParam
-    update: ParameterUpdate | None = None
+    update: ParameterTransform | None = None
 
 
 @dataclass(slots=True)
@@ -796,7 +794,7 @@ def _load_param_target(
     # the adapter migrates state off the wrapper, e.g. bitsandbytes int8).
     source.rearm_after_load(target.param, target._state)
     if load.update is not None:
-        load.update(target.param)
+        load.update.apply_parameter(target.param)
 
 
 def _copy_buffers_to_target(
@@ -947,5 +945,4 @@ __all__ = [
     "HostParamTarget",
     "ParameterLoad",
     "ParameterOverride",
-    "ParameterUpdate",
 ]

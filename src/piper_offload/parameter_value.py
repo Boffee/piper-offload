@@ -269,6 +269,10 @@ class ParameterValueTransform:
             )
         self._scale_parameter(target)
 
+    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return update-only storage; the load plan already owns the value."""
+        return ()
+
     def _scale_parameter(self, target: torch.Tensor) -> None:
         """Scale one trusted physical replacement representation in place."""
         plan = self._require_plan()

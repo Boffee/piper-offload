@@ -312,6 +312,18 @@ class ParameterDeltaTransform:
         )
         self._merge_index += 1
 
+    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return all physical host tensors read while staging the delta."""
+        tensors: list[torch.Tensor] = []
+        for scaled in self._deltas:
+            delta = scaled.delta
+            if delta.lora is not None:
+                tensors.extend(delta.lora.a.storage_tensors())
+                tensors.extend(delta.lora.b.storage_tensors())
+            if delta.dense is not None:
+                tensors.extend(delta.dense.storage_tensors())
+        return tuple(tensors)
+
     def _materialize_dense_sources(self) -> list[tuple[torch.Tensor, float]]:
         sources: list[tuple[torch.Tensor, float]] = []
         for bound in self._deltas:

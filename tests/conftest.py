@@ -14,7 +14,7 @@ assert a CUDA error catch it themselves, so they are unaffected.
 
 import contextlib
 import sys
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 
 import pytest
 import torch
@@ -23,6 +23,25 @@ from torch import nn
 from piper_offload import ModelOffloader
 
 _CUDA_UNAVAILABLE_ERROR_FRAGMENTS = ("CUDA", "NVIDIA driver")
+
+
+class CallbackParameterTransform:
+    """Small transform implementation for low-level load-plan tests."""
+
+    def __init__(
+        self,
+        callback: Callable[[nn.Parameter], None],
+    ) -> None:
+        self._callback = callback
+
+    def validate_parameter(self, _param: nn.Parameter) -> None:
+        pass
+
+    def apply_parameter(self, param: nn.Parameter) -> None:
+        self._callback(param)
+
+    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+        return ()
 
 
 def _windows_cuda_current_device_unavailable() -> int:

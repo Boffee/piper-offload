@@ -7,7 +7,17 @@ import torch
 from torch import nn
 
 import piper_offload.block_component as block_component_module
-from piper_offload import BlockCompileConfig, BlockComponentStore, ModelOffloader, ParameterValue, PinManager
+from piper_offload import (
+    BlockCompileConfig,
+    BlockComponentStore,
+    LoRATransform,
+    ModelOffloader,
+    ParameterDelta,
+    ParameterDeltaTransform,
+    ParameterValue,
+    PinManager,
+    ScaledLoRAFactor,
+)
 from piper_offload._host_registration import RuntimeHostRegistration
 from piper_offload.block_component import _host_transfer_tensors
 from piper_offload.host_module import HostModuleStore, ParameterOverride
@@ -15,7 +25,7 @@ from piper_offload.host_param import HostParam
 from piper_offload.target_lease import CudaTargetLease
 from piper_offload.tensor_adapter_registry import param_representation, select_adapter
 from tests._block_compile_helpers import _BlockModel, _make_offloader
-from tests.conftest import activated_model, block_components
+from tests.conftest import CallbackParameterTransform, activated_model, block_components
 from tests.test_quantized_parameter_value import _QUANT_KINDS, _make_quantized
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device required")
@@ -181,6 +191,43 @@ def test_transfer_sources_include_buffers_and_optimizer_backing() -> None:
         assert all(id(tensor) in identities for tensor in host.storage_tensors())
 
 
+def test_transfer_sources_include_parameter_transform_backing() -> None:
+    module = nn.Linear(8, 4, bias=False)
+    module.requires_grad_(False)
+    instance = HostModuleStore.from_module(module).bind(module)
+    factor = ScaledLoRAFactor.from_tensors(
+        torch.randn(2, 8),
+        torch.randn(4, 2),
+        0.5,
+    )
+    delta = ParameterDelta.from_tensors(
+        a=torch.randn(2, 8),
+        b=torch.randn(4, 2),
+        dense=torch.randn(4, 8),
+    )
+    cases = (
+        (
+            LoRATransform([factor]),
+            (*factor.a.storage_tensors(), *factor.b.storage_tensors()),
+        ),
+        (
+            ParameterDeltaTransform([delta.scaled(0.25)]),
+            (
+                *delta.lora.a.storage_tensors(),
+                *delta.lora.b.storage_tensors(),
+                *delta.dense.storage_tensors(),
+            ),
+        ),
+    )
+
+    for transform, expected in cases:
+        plan = instance.resolve_load_plan(
+            {"weight": ParameterOverride(update=transform)}
+        )
+        identities = {id(tensor) for tensor in _host_transfer_tensors([plan])}
+        assert all(id(tensor) in identities for tensor in expected)
+
+
 @CUDA
 @pytest.mark.parametrize("kind", _QUANT_KINDS)
 def test_quantized_replacements_pin_payload_and_metadata_without_conversion(kind: str, pins) -> None:
@@ -301,7 +348,9 @@ def test_prefetch_update_failure_waits_before_releasing_pins(pins) -> None:
         raise RuntimeError("injected update failure after upload")
 
     component.activate(torch.device("cuda"), parameter_overrides={
-        "blocks.1.proj.weight": ParameterOverride(update=fail_update),
+        "blocks.1.proj.weight": ParameterOverride(
+            update=CallbackParameterTransform(fail_update)
+        ),
     })
     stream = component._runtime._stream
     try:

@@ -86,6 +86,8 @@ def _host_transfer_tensors(
     for plan in load_plans:
         for load in plan.loads.values():
             yield from load.source.storage_tensors()
+            if load.update is not None:
+                yield from load.update.storage_tensors()
         for buffer in plan.instance.buffers.values():
             yield from buffer.storage_tensors()
         for host in plan.instance.params.values():
