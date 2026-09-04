@@ -42,6 +42,11 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
+- Replace the synthetic pageable-versus-staging benchmark with a benchmark of
+  actual streaming and rolling runtimes across pin budgets, cold registration,
+  retained registrations, and component switching. Report native registration
+  timing, raw session samples, and output checks for dense and ConvRot INT8 backing.
+
 - Unify model and adapter backing as owned pageable CPU storage. Rename the
   `Pinned*` storage primitives and modules to `Host*`, and replace the tensor
   adapter's `clone_pin()` contract with `capture_host()`. Packed quantized
