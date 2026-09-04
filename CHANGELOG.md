@@ -14,7 +14,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   rolling refill without materializing a dense source weight. The adapter
   derives the largest compatible ConvRot group size from 256, 64, and 16.
   Active targets use the existing ConvRot LoRA, dense/mixed merge, and compiled
-  block paths without a target-policy API.
+  block paths without a target-policy API. Permanent merge rejects updates to
+  packed GGUF sources during preflight, while exact parameter-value replacement
+  remains supported.
 
 ### Removed
 

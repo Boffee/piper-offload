@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from piper_offload import Adapter, ModelOffloader
+from piper_offload import Adapter, ModelOffloader, merge_adapter
 from piper_offload.gguf_adapter import GgufAdapter
 from piper_offload.lora import LoRATransform, ScaledLoRAFactor
 from piper_offload.parameter_delta import ParameterDelta, ParameterDeltaTransform
@@ -128,6 +128,73 @@ class TestGGUFSource:
 
         with pytest.raises(ValueError, match="in_features divisible by 16"):
             GgufAdapter.adopt_host(weight)
+
+
+class TestPermanentMerge:
+    def test_rejects_before_mutating_another_parameter(self) -> None:
+        class Model(nn.Module):
+            def __init__(self, gguf_weight: nn.Parameter) -> None:
+                super().__init__()
+                self.first = nn.Linear(64, 64, bias=False)
+                self.second = nn.Linear(64, 64, bias=False)
+                self.second.weight = gguf_weight
+
+        weight, _packed, _quant_type = _quantized_weight(8)
+        assert isinstance(weight, nn.Parameter)
+        model = Model(weight)
+        model.requires_grad_(False)
+        first_before = model.first.weight.detach().clone()
+        adapter = Adapter.from_state_dict(
+            {
+                "first.lora_A.weight": torch.randn(4, 64),
+                "first.lora_B.weight": torch.randn(64, 4),
+                "second.lora_A.weight": torch.randn(4, 64),
+                "second.lora_B.weight": torch.randn(64, 4),
+            }
+        )
+
+        with pytest.raises(ValueError, match="Permanent updates to packed GGUF"):
+            merge_adapter(model, [(adapter, 1.0)])
+
+        torch.testing.assert_close(model.first.weight, first_before)
+
+    def test_rejects_scaled_parameter_value(self) -> None:
+        weight, _packed, _quant_type = _quantized_weight(9)
+        model = nn.Linear(
+            64,
+            64,
+            bias=False,
+            device="meta",
+            dtype=torch.bfloat16,
+        )
+        model.weight.requires_grad_(False)
+        adapter = Adapter.from_state_dict(
+            {"weight": weight},
+            scale_parameter_values=True,
+        )
+
+        with pytest.raises(ValueError, match="Permanent updates to packed GGUF"):
+            merge_adapter(model, [(adapter, 0.5)])
+
+        assert model.weight.is_meta
+
+    def test_allows_exact_parameter_value(self) -> None:
+        weight, packed, quant_type = _quantized_weight(10)
+        model = nn.Linear(
+            64,
+            64,
+            bias=False,
+            device="meta",
+            dtype=torch.bfloat16,
+        )
+        model.weight.requires_grad_(False)
+        adapter = Adapter.from_state_dict({"weight": weight})
+
+        assert merge_adapter(model, [(adapter, 0.5)]) == 1
+
+        assert isinstance(model.weight, GGUFParameter)
+        assert model.weight.quant_type == quant_type
+        torch.testing.assert_close(model.weight.as_tensor(), packed)
 
 
 class TestDirectConversion:

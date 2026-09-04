@@ -51,6 +51,7 @@ __all__ = [
     "LogicalShapeTensorAdapter",
     "MergeLocalityTensorAdapter",
     "ParameterDataSwapTensorAdapter",
+    "PermanentUpdateValidationTensorAdapter",
     "PostLoadRearmTensorAdapter",
     "TensorAdapter",
     "TensorCopyIntoAdapter",
@@ -231,6 +232,21 @@ class LogicalShapeTensorAdapter[PinnedStateT, GpuStateT](
     @staticmethod
     def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
         """Return the dense logical shape represented by ``t``."""
+        ...
+
+
+@runtime_checkable
+class PermanentUpdateValidationTensorAdapter(Protocol):
+    """Optional preflight for permanent in-place parameter updates.
+
+    Source adapters whose active device representation supports updates while
+    their resting representation does not can reject permanent mutation here.
+    Activation loading does not consult this capability.
+    """
+
+    @staticmethod
+    def validate_permanent_update() -> None:
+        """Raise when the resting representation cannot be updated in place."""
         ...
 
 

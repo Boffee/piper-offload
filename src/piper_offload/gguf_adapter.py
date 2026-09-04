@@ -229,6 +229,13 @@ class GgufAdapter:
         return _logical_shape(t)
 
     @staticmethod
+    def validate_permanent_update() -> None:
+        raise ValueError(
+            "Permanent updates to packed GGUF parameters are unsupported; "
+            "use activation-time adapter merge instead."
+        )
+
+    @staticmethod
     def dequantize(t: torch.Tensor) -> torch.Tensor:
         """Delegate active-value dequantization to ConvRot INT8."""
         return PiperConvRotInt8Adapter.dequantize(t)
