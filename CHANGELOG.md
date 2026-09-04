@@ -27,9 +27,11 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
-- Treat `ParameterValue` payload numerical validity as the caller's
-  responsibility. Construction, activation, and permanent merge no longer
-  scan complete values for NaN or infinity.
+- Treat tensor payload numerical validity as the caller's responsibility.
+  Construction, validation, activation, and permanent merge no longer perform
+  finiteness preflight scans over parameter values, additive deltas,
+  transformed LoRA factors, or model quantization metadata. Scalar adapter
+  strengths remain finite-checked.
 
 ## [0.9.0rc1] - 2026-09-02
 

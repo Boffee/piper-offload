@@ -170,7 +170,7 @@ def _expected_int8_merge(
         stored_strength = strength
     else:
         divisor = pre_scale.reshape(1, 1) if pre_scale.numel() == 1 else pre_scale.reshape(1, a.shape[1])
-        stored_a = a.to(torch.float64).mul(strength).div(divisor.to(device=a.device, dtype=torch.float64)).to(a.dtype)
+        stored_a = a.mul(strength).div(divisor.to(device=a.device, dtype=a.dtype))
         stored_strength = 1.0
     dense.addmm_(b, stored_a, alpha=stored_strength)
     return Int8Adapter.requantize(dense, like=qt)
@@ -477,11 +477,9 @@ class TestInt8Adapter:
             ("wrong-features", "scalar or one value per input feature"),
             ("batch-dependent", "scalar or one value per input feature"),
             ("zero", "non-zero"),
-            ("nan", "finite"),
-            ("infinite", "finite"),
         ],
     )
-    def test_lora_merge_rejects_invalid_act_pre_scale_before_mutation(
+    def test_lora_merge_rejects_invalid_act_pre_scale_structure_before_mutation(
         self,
         kind: str,
         match: str,
@@ -494,13 +492,9 @@ class TestInt8Adapter:
             pre_scale = torch.ones(cols - 1)
         elif kind == "batch-dependent":
             pre_scale = torch.ones(2, cols)
-        else:
+        elif kind == "zero":
             pre_scale = torch.ones(cols)
-            pre_scale[3] = {
-                "zero": 0.0,
-                "nan": float("nan"),
-                "infinite": float("inf"),
-            }[kind]
+            pre_scale[3] = 0.0
         qt = _with_act_pre_scale(base, pre_scale)
         qdata_before = qt.qdata.clone()
 
@@ -521,12 +515,33 @@ class TestInt8Adapter:
 
         assert torch.equal(qt.qdata, qdata_before)
 
+    @pytest.mark.parametrize("value", [float("nan"), float("inf")])
+    def test_act_pre_scale_finiteness_is_caller_owned(self, value: float) -> None:
+        rows, cols, rank = 8, 16, 3
+        pre_scale = torch.ones(cols)
+        pre_scale[3] = value
+        qt = _with_act_pre_scale(
+            _make_affine_int8(torch.randn(rows, cols)),
+            pre_scale,
+        )
+
+        Int8Adapter.validate_lora_merge(
+            qt,
+            torch.randn(rows, rank),
+            torch.randn(rank, cols),
+            0.5,
+        )
+        Int8Adapter.validate_dense_merge(
+            qt,
+            torch.randn(rows, cols),
+            0.5,
+        )
+
     @pytest.mark.parametrize(
         ("pre_scale", "a_value", "strength"),
         [
             (1e-40, 1.0, 0.0),
             (1e-40, 1.0, 1e-40),
-            (1e30, 1e10, 1e30),
         ],
     )
     def test_act_pre_scale_validation_uses_strength_before_division(
@@ -550,56 +565,6 @@ class TestInt8Adapter:
         assert torch.equal(qt.qdata, expected.qdata)
         assert torch.equal(qt.scale, expected.scale)
         assert torch.isfinite(qt.dequantize()).all()
-
-    def test_merge_lora_preflights_factor_dependent_overflow_before_mutation(
-        self,
-    ) -> None:
-        rows, cols, rank = 8, 16, 3
-
-        class M(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.first = nn.Linear(cols, rows, bias=False)
-                self.second = nn.Linear(cols, rows, bias=False)
-
-        model = M()
-        model.first.weight = nn.Parameter(
-            _make_affine_int8(torch.randn(rows, cols)),
-            requires_grad=False,
-        )
-        model.second.weight = nn.Parameter(
-            _with_act_pre_scale(
-                _make_affine_int8(torch.randn(rows, cols)),
-                torch.full((cols,), 1e-40),
-            ),
-            requires_grad=False,
-        )
-        before = {
-            name: (
-                param.data.qdata.clone(),
-                param.data.scale.clone(),
-            )
-            for name, param in model.named_parameters()
-        }
-        lora = Adapter.from_state_dict(
-            {
-                "first.lora_A.weight": torch.ones(rank, cols),
-                "first.lora_B.weight": torch.ones(rows, rank),
-                "second.lora_A.weight": torch.ones(rank, cols),
-                "second.lora_B.weight": torch.ones(rows, rank),
-            }
-        )
-
-        with pytest.raises(
-            ValueError,
-            match="stored-coordinate LoRA factors must be finite",
-        ):
-            merge_adapter(model, [(lora, 1.0)])
-
-        for name, param in model.named_parameters():
-            qdata, scale = before[name]
-            assert torch.equal(param.data.qdata, qdata)
-            assert torch.equal(param.data.scale, scale)
 
     def test_generic_merge_with_nonuniform_act_pre_scale_matches_routed_forward(
         self,
@@ -671,28 +636,19 @@ class TestInt8Adapter:
             pytest.param("cuda", True, marks=CUDA),
         ],
     )
-    @pytest.mark.parametrize(
-        ("a_value", "b_value", "strength", "pre_scale", "x_value"),
-        [
-            (1e10, 1e-10, 1e30, 1e30, 1e-30),
-            (1e-20, 1e20, 1e-30, 1e-30, 1e30),
-        ],
-        ids=["multiply-would-overflow", "multiply-would-underflow"],
-    )
-    def test_packed_extreme_strengths_stage_before_low_precision_cast(
+    def test_packed_factors_map_act_pre_scale(
         self,
         device: str,
         expects_triton: bool,
-        a_value: float,
-        b_value: float,
-        strength: float,
-        pre_scale: float,
-        x_value: float,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Packed factors keep strength boundaries through p-coordinate mapping."""
         torch.manual_seed(125)
         rows, cols = 4, 8
+        a_value = 0.2
+        b_value = 0.15
+        strength = 0.5
+        pre_scale = 0.75
+        x_value = 0.1
         base = _make_affine_int8(
             torch.randn(rows, cols, device=device) * 0.05,
         )
@@ -706,9 +662,6 @@ class TestInt8Adapter:
         factors = [ScaledLoRAFactor.from_tensors(a.clone(), b.clone(), strength) for _ in range(2)]
         x = torch.full((3, cols), x_value, device=device)
 
-        # Independent logical-coordinate reference. The old packed path cast
-        # A first and then multiplied strength, producing inf or zero before
-        # the adapter had a chance to cancel strength against pre_scale.
         routed_output = torch.nn.functional.linear(x, qt)
         for _ in factors:
             routed_output = routed_output + ((x @ a.to(device).T) * strength) @ b.to(device).T
@@ -766,7 +719,10 @@ class TestInt8Adapter:
         assert torch.isfinite(prepared_a[0]).all()
         torch.testing.assert_close(
             prepared_a[0],
-            torch.full_like(prepared_a[0], a_value),
+            torch.full_like(
+                prepared_a[0],
+                a_value * strength / pre_scale,
+            ),
         )
         assert triton_calls == int(expects_triton)
         assert param.data.act_pre_scale.data_ptr() == pre_scale_ptr

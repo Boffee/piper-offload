@@ -68,7 +68,8 @@ class ParameterDelta:
     optional full-rank contribution. At least one representation must be
     present. Strength is deliberately extrinsic: binding this resource to an
     activation produces ``strength * (lora.B @ lora.A + dense)`` without
-    mutating or copying its host backing.
+    mutating or copying its host backing. Tensor payload numerical validity is
+    the caller's responsibility.
     """
 
     lora: LoRAFactor | None = None
@@ -239,8 +240,6 @@ class ParameterDeltaTransform:
                     "Dense parameter delta shape mismatch: "
                     f"source shape is {tuple(source.shape)}, target shape is {shape}."
                 )
-            if source.numel() and not bool(torch.isfinite(source).all()):
-                raise ValueError("Dense parameter deltas must contain only finite values.")
 
         rounding_seed = self._rounding_seed()
         requires_update_validation = isinstance(
