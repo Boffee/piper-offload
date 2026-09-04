@@ -227,6 +227,7 @@ def _session(
     backend: _TimedRegistration,
 ) -> dict[str, Any]:
     torch.cuda.synchronize(value.device)
+    torch.cuda.reset_peak_memory_stats(value.device)
     before_failures = host_pin_manager.stats.registration_failures
     memory_before = torch.cuda.memory_stats(value.device)
     output: torch.Tensor | None = None
@@ -327,7 +328,6 @@ def _run_case(
 ) -> dict[str, Any]:
     host_pin_manager.clear()
     before_gpu = _gpu_sample()
-    torch.cuda.reset_peak_memory_stats(value.device)
     priming = (subjects[0], subjects[1], subjects[0]) if scenario == "alternating" else (subjects[0],)
     if scenario != "cold":
         for subject in priming:
