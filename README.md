@@ -705,9 +705,10 @@ from piper_offload import derive_seed
 local_seed = derive_seed(parent_seed, shard_offset)
 ```
 
-Adapter delta and parameter-value tensors own pageable CPU copies. `dtype=`
-converts dense sources during capture; prequantized values retain their
-encoded representation and must already have the requested compute dtype.
+Adapter delta and parameter-value tensors own pageable CPU backing. Compatible
+allocations and mmap-backed split views transfer without a copy. `dtype=`
+converts dense sources during capture; prequantized values retain their encoded
+representation and must already have the requested compute dtype.
 
 Block reload from pristine CPU storage automatically clears
 the previous merge — no explicit unmerge step needed.
