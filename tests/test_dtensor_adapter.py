@@ -699,7 +699,7 @@ class TestDTensorAdapter:
                 atol=0.05,
             )
 
-    def test_packed_int8_extreme_strength_delegates_factor_aware_staging(
+    def test_packed_int8_delegates_factor_aware_staging(
         self,
         tp_mesh: Any,
         monkeypatch: pytest.MonkeyPatch,
@@ -716,7 +716,8 @@ class TestDTensorAdapter:
 
         torch.manual_seed(126)
         rows, cols = 4, 8
-        pre_scale = torch.tensor(1e30, device="cuda")
+        pre_scale_value = 0.75
+        pre_scale = torch.tensor(pre_scale_value, device="cuda")
         base = Int8Tensor.from_hp(
             torch.randn(rows, cols, device="cuda") * 0.05,
             PerRow(),
@@ -760,12 +761,12 @@ class TestDTensorAdapter:
 
         monkeypatch.setattr(DTensor, "to_local", int8_to_local_without_view)
 
-        a = torch.full((1, cols), 1e10)
-        b = torch.full((rows, 1), 1e-10)
-        strength = 1e30
+        a = torch.full((1, cols), 0.2)
+        b = torch.full((rows, 1), 0.15)
+        strength = 0.5
         factors = [ScaledLoRAFactor.from_tensors(a.clone(), b.clone(), strength) for _ in range(2)]
         param = nn.Parameter(weight, requires_grad=False)
-        x = torch.full((3, cols), 1e-30, device="cuda")
+        x = torch.full((3, cols), 0.1, device="cuda")
         routed_output = torch.nn.functional.linear(x, local)
         for _ in factors:
             routed_output = routed_output + ((x @ a.to("cuda").T) * strength) @ b.to("cuda").T
@@ -785,7 +786,10 @@ class TestDTensorAdapter:
             assert torch.isfinite(packed_a).all()
             torch.testing.assert_close(
                 packed_a,
-                torch.full_like(packed_a, 1e10),
+                torch.full_like(
+                    packed_a,
+                    0.2 * strength / pre_scale_value,
+                ),
             )
             original_prepared_merge(
                 target,

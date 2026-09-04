@@ -99,11 +99,6 @@ def _normalized_act_pre_scale(qt: Any) -> torch.Tensor | None:  # noqa: ANN401
             "input features."
         )
 
-    if not bool(torch.isfinite(normalized).all()):
-        raise ValueError(
-            "TorchAO INT8 act_pre_scale must contain only finite values for "
-            "additive merge."
-        )
     if bool((normalized == 0).any()):
         raise ValueError(
             "TorchAO INT8 act_pre_scale must contain only non-zero values for "
@@ -124,17 +119,11 @@ def _lora_a_in_stored_weight_coordinates(
 
     # Base execution is (x * p) @ W_stored.T, while routed LoRA is
     # strength * x @ (B @ A).T. Thus delta(W_stored) is
-    # B @ ((strength * A) / p). Fold strength into A before division so a
-    # tiny/zero strength can keep the actual update finite even when A / p
-    # alone would overflow. Both backends then receive unit strength.
-    # Float64 avoids choosing between multiply-first overflow for large
-    # strengths and divide-first overflow for tiny pre-scales. Only tensors
-    # carrying act_pre_scale take this one-time merge/preflight path.
-    stored_a = (
-        a.to(torch.float64).mul(strength).div(pre_scale.to(device=a.device, dtype=torch.float64)).to(dtype=a.dtype)
+    # B @ ((strength * A) / p). Fold strength into A before division so both
+    # backends receive unit strength. Numerical validity is caller-owned.
+    stored_a = a.mul(strength).div(
+        pre_scale.to(device=a.device, dtype=a.dtype)
     )
-    if not bool(torch.isfinite(stored_a).all()):
-        raise ValueError("TorchAO INT8 act_pre_scale produces non-finite stored-coordinate LoRA factors.")
     return stored_a.contiguous(), 1.0
 
 
@@ -164,14 +153,9 @@ def _prepare_dense_merge(
     if pre_scale is None:
         return qt, update, strength
 
-    stored_update = (
-        update.to(torch.float64)
-        .mul(strength)
-        .div(pre_scale.to(device=update.device, dtype=torch.float64))
-        .to(dtype=update.dtype)
+    stored_update = update.mul(strength).div(
+        pre_scale.to(device=update.device, dtype=update.dtype)
     )
-    if not bool(torch.isfinite(stored_update).all()):
-        raise ValueError("TorchAO INT8 act_pre_scale produces a non-finite stored-coordinate dense update.")
     return qt, stored_update, 1.0
 
 
@@ -402,22 +386,18 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
             device=qt.device,
             dtype=compute_dtype,
         )
-        pre_scale_f64 = pre_scale.to(device=qt.device, dtype=torch.float64)
+        stored_pre_scale = pre_scale.to(device=qt.device, dtype=compute_dtype)
 
         rank_offset = 0
         for strength, a, b in factors:
             next_offset = rank_offset + a.shape[0]
-            stored_a_f64 = (
-                a.to(
-                    device=qt.device,
-                    dtype=torch.float64,
-                    non_blocking=True,
-                )
-                .mul(strength)
-                .div(pre_scale_f64)
+            stored_a = a_packed[rank_offset:next_offset]
+            stored_a.copy_(a, non_blocking=True)
+            stored_a.mul_(strength).div_(stored_pre_scale)
+            b_packed[:, rank_offset:next_offset].copy_(
+                b,
+                non_blocking=True,
             )
-            a_packed[rank_offset:next_offset].copy_(stored_a_f64)
-            b_packed[:, rank_offset:next_offset].copy_(b, non_blocking=True)
             rank_offset = next_offset
 
         return b_packed, a_packed, 1.0
@@ -448,13 +428,13 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
     @staticmethod
     def validate_dense_merge(
         target: torch.Tensor,
-        update: torch.Tensor,
-        strength: float,
+        _update: torch.Tensor,
+        _strength: float,
         *,
         rounding_seed: int | None = None,
     ) -> None:
         del rounding_seed
-        _prepare_dense_merge(target, update, strength)
+        _normalized_act_pre_scale(require_int8_tensor(target))
 
     @staticmethod
     def merge_dense_(
@@ -541,24 +521,20 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
     def validate_lora_merge(
         target: torch.Tensor,
         _b: torch.Tensor,
-        a: torch.Tensor,
-        strength: float,
+        _a: torch.Tensor,
+        _strength: float,
         *,
         rounding_seed: int | None = None,
     ) -> None:
-        """Validate activation pre-scale and transformed factor range."""
+        """Validate activation pre-scale structure."""
         del rounding_seed
-        _prepare_lora_merge(
-            target,
-            a,
-            strength,
-        )
+        _normalized_act_pre_scale(require_int8_tensor(target))
 
     @staticmethod
     def validate_prepared_lora_merge(
         target: torch.Tensor,
         _b: torch.Tensor,
-        a: torch.Tensor,
+        _a: torch.Tensor,
         strength: float,
         *,
         rounding_seed: int | None = None,
@@ -569,8 +545,6 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
         _normalized_act_pre_scale(qt)
         if strength != 1.0:
             raise ValueError(f"TorchAO INT8 prepared LoRA merge requires unit strength, got {strength}.")
-        if not bool(torch.isfinite(a).all()):
-            raise ValueError("TorchAO INT8 prepared stored-coordinate LoRA factors must be finite.")
 
     @staticmethod
     def merge_prepared_lora_(

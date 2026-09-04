@@ -849,6 +849,17 @@ class TestLoRAConstruction:
         assert isinstance(infinite_value, ParameterValue)
         assert torch.isinf(infinite_value.backing.make_cpu_param()).all()
 
+    def test_dense_delta_payload_finiteness_is_caller_owned(self) -> None:
+        model = nn.Module()
+        model.target = nn.Linear(2, 2, bias=False)
+        model.requires_grad_(False)
+        delta = Adapter.from_state_dict(
+            {"target.delta.weight": torch.full((2, 2), float("nan"))},
+        )
+
+        assert merge_adapter(model, [(delta, 1.0)]) == 1
+        assert torch.isnan(model.target.weight).all()
+
 
 # ---------------------------------------------------------------------------
 # Parameter delta semantics

@@ -555,9 +555,12 @@ composition. The placeholder supplies only the target name, logical shape, and
 alias group. Supplying `dtype=` while constructing an adapter can cast a dense
 value, but cannot convert a structured value; it must either match the
 representation's compute dtype or the caller must prequantize the value again.
-The caller is responsible for payload numerical validity: parameter values are
-not scanned for NaN or infinity during construction, activation, or permanent
-merge.
+The caller is responsible for tensor payload numerical validity. Piper
+validates representation structure, shape, layout, dtype, and capabilities,
+but does not perform finiteness preflight scans over parameter values,
+additive deltas, or model quantization metadata during construction,
+activation, or permanent merge. Scalar adapter strengths remain
+finite-checked.
 
 Exact replacement supports offload-capable physical representations with a
 registered tensor adapter, floating compute dtype, and compatible logical-shape
