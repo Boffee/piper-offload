@@ -161,11 +161,12 @@ pin memory.
 ### Optional host registration
 
 `host_pin_manager` registers existing CPU storage in place under a separate
-`max_pinned_bytes` budget. Its default budget is zero, and construction and
-configuration do not initialize CUDA. Ordinary streaming and compiled rolling
-acquire leases automatically with their CUDA working sets. Set the budget
-before activation to enable pinning. CPU execution, resident blocks, and
-non-block components do not acquire pin leases.
+`max_pinned_bytes` budget. Its default budget is zero, so registration is opt-in,
+and construction and configuration do not initialize CUDA. Set a finite byte
+limit, or set `max_pinned_bytes = None` to register opportunistically up to the
+capacity currently available from CUDA/HIP. Ordinary streaming and compiled
+rolling acquire leases automatically with their CUDA working sets. CPU
+execution, resident blocks, and non-block components do not acquire pin leases.
 
 Deactivation releases the lease after transfers finish and leaves registrations
 in the idle LRU. Reactivating the same backing reuses its retained registrations
@@ -204,7 +205,10 @@ requested allocations. `host_pin_manager.stats.pinned_bytes` instead counts
 the union of covered OS pages, including shared boundary pages only once.
 
 Released registrations enter an idle LRU. Budget pressure evicts idle entries;
-active leases remain protected. Discarding a source tensor retires its
+active leases remain protected. A native capacity failure evicts unrelated idle
+registrations in LRU order and retries the current allocation. If capacity
+remains unavailable, the rest of that acquisition stays pageable without
+repeated registration attempts. Discarding a source tensor retires its
 registration once active users finish. Storage remains alive until successful
 unregistration, including after cleanup errors; `clear()` retries failed cleanup
 and evicts idle entries. `ModelCache` retains host stores until explicit

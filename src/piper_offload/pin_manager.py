@@ -1,7 +1,8 @@
 """Budgeted host registrations with active leases and an idle LRU.
 
-Use the process-wide ``host_pin_manager`` for application registrations. Its budget
-starts at zero; configuring it performs no CUDA initialization. Isolated
+Use the process-wide ``host_pin_manager`` for application registrations. Its
+budget starts at zero; ``None`` enables opportunistic registration up to native
+CUDA/HIP capacity. Configuring it performs no CUDA initialization. Isolated
 ``PinManager`` instances can use an injected backend for testing.
 
 Native registration uses whole storage byte ranges. Budget accounting counts
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 class PinStats:
     """Registration counts and the union of charged OS pages."""
 
-    max_pinned_bytes: int
+    max_pinned_bytes: int | None
     pinned_bytes: int
     registrations: int
     idle_registrations: int
@@ -124,6 +125,10 @@ class PinLease:
 class PinManager:
     """Own registrations under a page-rounded budget.
 
+    A finite ``max_pinned_bytes`` bounds registered pages in this process.
+    ``None`` instead treats native CUDA/HIP capacity as the limit, reclaiming
+    unrelated idle registrations when the runtime refuses a new allocation.
+
     Acquire accepts the plain CPU tensors returned by ``storage_tensors()``.
     Tensor views share one whole-storage registration. Separate allocations
     may share OS pages, which are charged once. Distinct overlapping byte
@@ -140,11 +145,11 @@ class PinManager:
 
     def __init__(
         self,
-        max_pinned_bytes: int = 0,
+        max_pinned_bytes: int | None = 0,
         *,
         backend: HostRegistrationBackend | None = None,
     ) -> None:
-        if max_pinned_bytes < 0:
+        if max_pinned_bytes is not None and max_pinned_bytes < 0:
             raise ValueError("max_pinned_bytes must be >= 0")
         self._max_pinned_bytes = max_pinned_bytes
         self._backend = backend if backend is not None else RuntimeHostRegistration()
@@ -164,19 +169,21 @@ class PinManager:
         self._next_lease = 0
 
     @property
-    def max_pinned_bytes(self) -> int:
+    def max_pinned_bytes(self) -> int | None:
         with self._lock:
             return self._max_pinned_bytes
 
     @max_pinned_bytes.setter
-    def max_pinned_bytes(self, value: int) -> None:
-        """Set the budget and evict idle entries; active leases stay protected.
+    def max_pinned_bytes(self, value: int | None) -> None:
+        """Set the budget or enable opportunistic native-capacity discovery.
 
-        If active registrations exceed the new limit, releases trim them back
+        ``None`` removes the application byte limit. Native capacity failures
+        still reclaim unrelated idle registrations before falling back to
+        pageable storage. For a finite limit, releases trim active excess back
         to budget. Failed unregistrations stay charged and can be retried with
         ``clear()`` or later admission pressure.
         """
-        if value < 0:
+        if value is not None and value < 0:
             raise ValueError("max_pinned_bytes must be >= 0")
         with self._lock:
             self._max_pinned_bytes = value
@@ -200,7 +207,10 @@ class PinManager:
 
         All input validation happens before registration or eviction. Existing
         registrations anywhere in the request are protected before admitting
-        new ones, avoiding eviction of backing this same lease will use.
+        new ones, avoiding eviction of backing this same lease will use. A
+        native capacity failure reclaims unrelated idle registrations and
+        retries; if capacity remains unavailable, later allocations in this
+        acquisition skip registration.
         """
         requests = self._requests(tensors)
         held: dict[int, _Registration] = {}
@@ -218,14 +228,17 @@ class PinManager:
                     size = request.storage.nbytes()
                     if not self._make_room(pointer, size):
                         continue
-                    try:
-                        registered = self._backend.register(pointer, size)
-                    except Exception:
-                        self._registration_failures += 1
-                        raise
+                    registered = self._try_register(pointer, size)
+                    while not registered and self._reclaim_idle_for_native_retry(
+                        pointer,
+                        size,
+                    ):
+                        registered = self._try_register(pointer, size)
                     if not registered:
-                        self._registration_failures += 1
-                        continue
+                        # Native capacity is still unavailable after reclaiming
+                        # every lower-priority idle registration that can help.
+                        # Avoid one failed runtime call per remaining tensor.
+                        break
                     entry = _Registration(pointer, size, request.storage)
                     _live_managers.add(self)
                     self._entries[pointer] = entry
@@ -331,18 +344,43 @@ class PinManager:
         shared = sum(page in self._boundary_pages for page in self._boundaries(pointer, size))
         return (pages - shared) * mmap.PAGESIZE
 
+    def _try_register(self, pointer: int, size: int) -> bool:
+        try:
+            registered = self._backend.register(pointer, size)
+        except Exception:
+            self._registration_failures += 1
+            raise
+        if not registered:
+            self._registration_failures += 1
+        return registered
+
+    def _reclaim_idle_for_native_retry(self, pointer: int, size: int) -> bool:
+        """Evict an LRU batch before retrying a native-capacity failure."""
+        target = max(mmap.PAGESIZE, self._page_charge(pointer, size))
+        before = self._pinned_bytes
+        for candidate in tuple(self._idle):
+            entry = self._entries.get(candidate)
+            if entry is not None:
+                self._unregister(entry)
+            if before - self._pinned_bytes >= target:
+                break
+        return self._pinned_bytes < before
+
     def _make_room(self, pointer: int, size: int) -> bool:
+        limit = self._max_pinned_bytes
+        if limit is None:
+            return True
         if size:
             pages = (pointer + size - 1) // mmap.PAGESIZE - pointer // mmap.PAGESIZE + 1
-            if pages * mmap.PAGESIZE > self._max_pinned_bytes:
+            if pages * mmap.PAGESIZE > limit:
                 return False
-        if self._pinned_bytes + self._page_charge(pointer, size) <= self._max_pinned_bytes:
+        if self._pinned_bytes + self._page_charge(pointer, size) <= limit:
             return True
         for candidate in tuple(self._idle):
             entry = self._entries.get(candidate)
             if entry is not None:
                 self._unregister(entry)
-            if self._pinned_bytes + self._page_charge(pointer, size) <= self._max_pinned_bytes:
+            if self._pinned_bytes + self._page_charge(pointer, size) <= limit:
                 return True
         return False
 

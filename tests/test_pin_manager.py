@@ -33,12 +33,15 @@ class FakeBackend:
         self.refuse: set[int] = set()
         self.register_errors: set[int] = set()
         self.unregister_errors: set[int] = set()
+        self.capacity: int | None = None
 
     def register(self, pointer: int, size: int) -> bool:
         self.register_calls.append((pointer, size))
         if pointer in self.register_errors:
             raise HostRegistrationError("registration", 700)
         if pointer in self.refuse:
+            return False
+        if self.capacity is not None and sum(self.registered.values()) + size > self.capacity:
             return False
         assert pointer not in self.registered
         self.registered[pointer] = size
@@ -192,13 +195,67 @@ def test_budget_reduction_waits_for_active_leases(manager: PinManager, backend: 
     assert manager.stats.pinned_bytes == 0
 
 
-def test_capacity_failure_leaves_whole_allocation_pageable(manager: PinManager, backend: FakeBackend) -> None:
-    a, b = _tensors((0, PAGE), (2 * PAGE, PAGE))
+def test_capacity_failure_stops_later_registration_attempts(manager: PinManager, backend: FakeBackend) -> None:
+    a, b, c = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
     backend.refuse.add(a.data_ptr())
-    with manager.acquire([a, b]) as lease:
-        assert lease.registered_bytes == lease.pageable_bytes == PAGE
+    with manager.acquire([a, b, c]) as lease:
+        assert lease.registered_bytes == 0
+        assert lease.pageable_bytes == 3 * PAGE
         assert manager.stats.registration_failures == 1
-        assert set(backend.registered) == {b.data_ptr()}
+        assert backend.register_calls == [(a.data_ptr(), PAGE)]
+
+
+def test_opportunistic_mode_reclaims_idle_lru_and_retries(backend: FakeBackend) -> None:
+    manager = PinManager(None, backend=backend)
+    a, b, c = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
+    backend.capacity = 2 * PAGE
+    for tensor in (a, b):
+        with manager.acquire([tensor]):
+            pass
+
+    with manager.acquire([c]) as lease:
+        assert lease.registered_bytes == PAGE
+        assert lease.pageable_bytes == 0
+        assert backend.unregister_calls == [a.data_ptr()]
+        assert set(backend.registered) == {b.data_ptr(), c.data_ptr()}
+        assert manager.stats.max_pinned_bytes is None
+        assert manager.stats.registration_failures == 1
+    manager.clear()
+
+
+def test_opportunistic_reclaim_protects_requested_idle_registration(backend: FakeBackend) -> None:
+    manager = PinManager(None, backend=backend)
+    requested, unrelated, new = _tensors(
+        (0, PAGE),
+        (2 * PAGE, PAGE),
+        (4 * PAGE, PAGE),
+    )
+    backend.capacity = 2 * PAGE
+    for tensor in (requested, unrelated):
+        with manager.acquire([tensor]):
+            pass
+
+    with manager.acquire([requested, new]) as lease:
+        assert lease.registered_bytes == 2 * PAGE
+        assert backend.unregister_calls == [unrelated.data_ptr()]
+        assert set(backend.registered) == {requested.data_ptr(), new.data_ptr()}
+    manager.clear()
+
+
+def test_budget_can_switch_between_finite_and_opportunistic(backend: FakeBackend) -> None:
+    manager = PinManager(PAGE, backend=backend)
+    a, b = _tensors((0, PAGE), (2 * PAGE, PAGE))
+    with manager.acquire([a]):
+        pass
+
+    manager.max_pinned_bytes = None
+    with manager.acquire([b]):
+        assert manager.stats.pinned_bytes == 2 * PAGE
+    assert manager.max_pinned_bytes is None
+
+    manager.max_pinned_bytes = PAGE
+    assert manager.stats.pinned_bytes == PAGE
+    manager.clear()
 
 
 def test_pageable_storage_waits_for_all_active_leases_before_registration(backend: FakeBackend) -> None:

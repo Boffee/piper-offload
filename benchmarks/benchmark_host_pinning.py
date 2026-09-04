@@ -258,7 +258,11 @@ def _session(
     torch.testing.assert_close(output.cpu(), subject.reference, rtol=0, atol=0)
     after = host_pin_manager.stats
     memory_after = torch.cuda.memory_stats(value.device)
-    if after.active_leases or after.pinned_bytes > after.max_pinned_bytes:
+    exceeded_budget = (
+        after.max_pinned_bytes is not None
+        and after.pinned_bytes > after.max_pinned_bytes
+    )
+    if after.active_leases or exceeded_budget:
         raise RuntimeError("session leaked an active lease or exceeded the pin budget")
     return {
         "subject": subject.name,
