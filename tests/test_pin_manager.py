@@ -67,18 +67,31 @@ def manager(backend: FakeBackend):
     result.clear()
 
 
-def test_global_manager_starts_disabled_without_initializing_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_default_budget_is_unlimited_without_initializing_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_runtime():
+        raise AssertionError("construction and configuration must not initialize CUDA/HIP")
+
+    monkeypatch.setattr(registration_module, "_load_runtime", unexpected_runtime)
+    manager = PinManager()
+    assert manager.max_pinned_bytes is None
+    assert host_pin_manager.max_pinned_bytes is None
+    manager.max_pinned_bytes = PAGE
+    manager.max_pinned_bytes = None
+    assert manager.stats.max_pinned_bytes is None
+    assert manager.stats.pinned_bytes == 0
+
+
+def test_zero_budget_disables_registration_without_initializing_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     def unexpected_runtime():
         raise AssertionError("zero budget must not initialize CUDA/HIP")
 
     monkeypatch.setattr(registration_module, "_load_runtime", unexpected_runtime)
-    manager = PinManager()
+    manager = PinManager(0)
     tensor = torch.ones(8)
     with manager.acquire([tensor]) as lease:
         assert lease.registered_bytes == 0
         assert lease.pageable_bytes == tensor.nbytes
     assert manager.stats.pinned_bytes == 0
-    assert host_pin_manager.max_pinned_bytes == 0
 
 
 def test_aliases_share_whole_allocation_and_reference_counts(manager: PinManager, backend: FakeBackend) -> None:
@@ -194,8 +207,8 @@ def test_capacity_failure_stops_later_registration_attempts(manager: PinManager,
         assert backend.register_calls == [(a.data_ptr(), PAGE)]
 
 
-def test_opportunistic_mode_reclaims_idle_lru_and_retries(backend: FakeBackend) -> None:
-    manager = PinManager(None, backend=backend)
+def test_default_budget_reclaims_idle_lru_and_retries(backend: FakeBackend) -> None:
+    manager = PinManager(backend=backend)
     a, b, c = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
     backend.capacity = 2 * PAGE
     for tensor in (a, b):

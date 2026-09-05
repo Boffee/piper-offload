@@ -1,9 +1,10 @@
 """Budgeted host registrations with active leases and an idle LRU.
 
 Use the process-wide ``host_pin_manager`` for application registrations. Its
-budget starts at zero; ``None`` enables opportunistic registration up to native
-CUDA/HIP capacity. Configuring it performs no CUDA initialization. Isolated
-``PinManager`` instances can use an injected backend for testing.
+budget defaults to ``None``, enabling opportunistic registration up to native
+CUDA/HIP capacity. Set it to zero to disable registration. Construction and
+configuration perform no CUDA initialization. Isolated ``PinManager`` instances
+can use an injected backend for testing.
 
 Native registration uses whole storage byte ranges. Budget accounting counts
 the union of their OS pages, including pages shared by separate allocations.
@@ -115,7 +116,7 @@ class PinManager:
     """Own registrations under a page-rounded budget.
 
     A finite ``max_pinned_bytes`` bounds registered pages in this process.
-    ``None`` instead treats native CUDA/HIP capacity as the limit, reclaiming
+    The default, ``None``, treats native CUDA/HIP capacity as the limit, reclaiming
     unrelated idle registrations when the runtime refuses a new allocation.
 
     Acquire accepts the plain CPU tensors returned by ``storage_tensors()``.
@@ -134,7 +135,7 @@ class PinManager:
 
     def __init__(
         self,
-        max_pinned_bytes: int | None = 0,
+        max_pinned_bytes: int | None = None,
         *,
         backend: HostRegistrationBackend | None = None,
     ) -> None:
