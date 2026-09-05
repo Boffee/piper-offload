@@ -5,6 +5,11 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-05
+
+Promote the 0.9.0 release candidates to stable, including the changes documented
+under 0.9.0rc1, 0.9.0rc2, and 0.9.0rc3 below.
+
 ### Changed
 
 - Default `PinManager.max_pinned_bytes` and the process-wide `host_pin_manager`
