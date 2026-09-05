@@ -2068,7 +2068,8 @@ class TestBlockBuffersHost:
             strategy.deactivate()
             for block in m.transformer_blocks:
                 assert block.buf_a is block.buf_b
-                assert not block.buf_a.is_pinned()
+                # Released backing stays on CPU and may retain an idle pin.
+                assert block.buf_a.device.type == "cpu"
         finally:
             strategy.deactivate()
 
@@ -2968,7 +2969,8 @@ class TestTrainingWithCheckpointing:
                     gpu_model(x).sum().backward()
 
                 # Deactivated: trainable data + grad are host-resident.
-                assert weight.device.type == "cpu" and not weight.is_pinned()
+                # Data may remain registered in the idle pin cache.
+                assert weight.device.type == "cpu"
                 assert weight.grad is not None
                 assert weight.grad.device.type == "cpu"
 

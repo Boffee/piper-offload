@@ -659,7 +659,7 @@ triton = [
 
 [[package]]
 name = "piper-offload"
-version = "0.9.0rc3"
+version = "0.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
