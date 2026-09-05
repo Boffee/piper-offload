@@ -5,6 +5,14 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Default `PinManager.max_pinned_bytes` and the process-wide `host_pin_manager`
+  budget to `None` (no application byte limit). Streaming and rolling register
+  host backing opportunistically up to CUDA/HIP capacity, reclaiming idle pins
+  and falling back to pageable storage when capacity is exhausted. Set the
+  budget to `0` to disable registration or to a finite byte count to cap it.
+
 ## [0.9.0rc3] - 2026-09-04
 
 ### Added

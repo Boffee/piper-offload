@@ -158,15 +158,16 @@ tuple. Consumers must deduplicate underlying allocations themselves. Use
 `data_ptr()` and `nbytes` describe its view. Enumeration does not register or
 pin memory.
 
-### Optional host registration
+### Host registration
 
 `host_pin_manager` registers existing CPU storage in place under a separate
-`max_pinned_bytes` budget. Its default budget is zero, so registration is opt-in,
-and construction and configuration do not initialize CUDA. Set a finite byte
-limit, or set `max_pinned_bytes = None` to register opportunistically up to the
-capacity currently available from CUDA/HIP. Ordinary streaming and compiled
-rolling acquire leases automatically with their CUDA working sets. CPU
-execution, resident blocks, and non-block components do not acquire pin leases.
+`max_pinned_bytes` budget. Its default is `None` (no application byte limit), so
+registration proceeds opportunistically up to the capacity currently available
+from CUDA/HIP. Set a finite byte limit to cap registration, or set
+`max_pinned_bytes = 0` to disable it. Construction and configuration do not
+initialize CUDA. Ordinary streaming and compiled rolling acquire leases
+automatically with their CUDA working sets. CPU execution, resident blocks,
+and non-block components do not acquire pin leases.
 
 Deactivation releases the lease after transfers finish and leaves registrations
 in the idle LRU. Reactivating the same backing reuses its retained registrations
@@ -182,7 +183,7 @@ Explicit leases are also available for custom transfers:
 import torch
 from piper_offload import host_pin_manager
 
-host_pin_manager.max_pinned_bytes = 4 * 1024**3
+host_pin_manager.max_pinned_bytes = 4 * 1024**3  # optional cap; default is None
 source = torch.randn(1024, 1024)
 target = torch.empty_like(source, device="cuda")
 copy_stream = torch.cuda.Stream()
