@@ -77,7 +77,7 @@ class PinLease:
 
     ``registered_bytes`` and ``pageable_bytes`` count unique requested storage
     bytes, without page rounding. The owner must keep the lease open until no
-    asynchronous operation can read its host tensors. CUDA ordering belongs to
+    asynchronous operation can read or write its host tensors. CUDA ordering belongs to
     the runtime that enqueues those operations; the pin manager does not track
     or synchronize accelerator streams. Dropping the token also releases its
     protection, so asynchronous owners must retain it through completion.

@@ -5,6 +5,18 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add opt-in `register_relay_backend()` in `piper_offload.communication`.
+  The experimental `piper_relay` process group implements blocking SUM
+  all-reduce for FP32, FP16 and BF16, plus broadcast, scatter and all-gather
+  through CPU Gloo. Supports normal DTensor initialization, uneven/empty
+  shards, functional coalesced collectives, and tested Inductor redistribution
+  forwards with CUDA graphs disabled. Low-precision reductions accumulate in
+  FP32 on the CPU; copy collectives preserve payload bits. Accelerator
+  transfers use temporary CPU staging under the existing pin budget. Includes
+  a two-rank example and CPU, shared-GPU, and two-physical-GPU correctness tests.
+
 ## [0.10.0rc1] - 2026-09-11
 
 ### Added
