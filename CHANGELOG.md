@@ -15,7 +15,27 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   forwards with CUDA graphs disabled. Low-precision reductions accumulate in
   FP32 on the CPU; copy collectives preserve payload bits. Accelerator
   transfers use temporary CPU staging under the existing pin budget. Includes
-  a two-rank example and CPU, shared-GPU, and two-physical-GPU correctness tests.
+  CPU, shared-GPU, and two-physical-GPU correctness tests.
+- Add opt-in `RelayOptions(transport="shared")` for same-machine copy collectives.
+  Two outgoing shared host slots per rank provide simultaneous peer exchange
+  without Gloo payload copies. Large slots use 4 KiB alignment for DMA.
+  Ready/free signals guard DMA completion and slot
+  reuse. Local contributions stay on the device. Peer rounds reuse one bounded
+  arena, including each rank's existing Gloo reduction workspace. Shared exchange
+  failures require group recreation; the original Gloo transport remains available.
+
+### Changed
+
+- Share pin-lease handling between staging modes and reuse validated all-gather
+  output views.
+- Stream relay collectives through one reusable CPU buffer per process group.
+  Add `RelayOptions(staging_bytes=...)`, defaulting to 8 MiB, with rank agreement
+  checks and shutdown cleanup. The bound includes FP32 reduction accumulators;
+  idle pin registrations remain reusable and evictable. Reject unsafe all-gather
+  aliases before chunking. Failed collectives may leave completed chunks updated.
+- Add opt-in double/triple buffering with `RelayOptions(pipeline_buffers=2|3)`
+  inside the same staging allocation. Overlap pinned downloads/uploads with
+  CPU communication while preserving blocking completion and pageable fallback.
 
 ## [0.10.0rc1] - 2026-09-11
 

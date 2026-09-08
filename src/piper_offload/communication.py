@@ -2,25 +2,31 @@
 
 Call ``register_relay_backend()`` in each worker before initializing a
 ``piper_relay`` process group. It supports SUM all-reduce in FP32, FP16 and
-BF16, plus broadcast, scatter and all-gather of contiguous tensors. CPU Gloo
-performs communication; Gloo never receives an accelerator tensor.
+BF16, plus broadcast, scatter and all-gather of contiguous tensors. Select
+``transport="shared"`` for same-machine copy collectives through shared host
+slots; Gloo then carries only control messages and CPU reductions. The default
+``transport="gloo"`` carries payloads through CPU Gloo as well. Gloo never
+receives an accelerator tensor.
 
-This first implementation stages the entire tensor and completes both device
-copies before returning, including when ``async_op=True``. It establishes the
-DTensor integration boundary; chunked staging and asynchronous progress are
-separate follow-up work. No offloader, NCCL, or compiled extension is required.
+Collectives stream through a reusable, bounded CPU buffer and complete all
+device copies before returning, including when ``async_op=True``. No offloader,
+NCCL, or compiled extension is required. Internal pipelining is opt-in; public
+calls remain blocking.
 """
 
 import threading
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager
+from contextlib import closing, contextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import timedelta
 from itertools import pairwise
 
 import torch
 import torch.distributed as dist
-from torch._C._distributed_c10d import AllgatherOptions
+from torch._C._distributed_c10d import AllgatherOptions, _DistributedBackendOptions
 
+from ._relay_shared import COPY_BUFFERS, SharedRelay, shared_slot_bytes
+from ._relay_staging import HostChunk, TransferPipeline, chunk_ranges, make_host_chunk
 from .pin_manager import host_pin_manager
 
 _BACKEND_NAME = "piper_relay"
@@ -31,6 +37,50 @@ _COPY_DTYPES = (
     torch.float64, torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
     torch.complex64, torch.complex128,
 )
+
+
+@dataclass(frozen=True)
+class RelayOptions:
+    """Pass as ``pg_options`` to ``init_process_group`` or ``new_group``.
+
+    ``staging_bytes`` bounds this group's reusable CPU allocation, including
+    reduction accumulators, but excludes Gloo workspace and caller tensors.
+    All ranks must agree. Gloo staging is allocated lazily; shared staging is
+    mapped at group initialization. Both are released on group shutdown.
+    Pinning remains subject to ``host_pin_manager``'s separate page-rounded budget.
+    For Gloo transfers, ``pipeline_buffers=2`` or ``3`` divides the same allocation
+    into chunk sets to overlap pinned CUDA/HIP copies with CPU communication.
+    The default, 1, is serial. CPU and pageable copies keep the same chunk size
+    and run serially.
+
+    ``transport="shared"`` instead maps one ``staging_bytes`` arena across all
+    ranks on the same machine. Copy collectives always use two outgoing slots
+    per rank, reused across peer rounds. Every process registers its full
+    mapping under its own pin budget; physical payload storage is shared once.
+    Gloo reductions borrow this rank's region, with ``pipeline_buffers`` still
+    controlling their copy pipeline. The default transport remains ``"gloo"``.
+    """
+
+    staging_bytes: int = 8 * 1024 * 1024
+    pipeline_buffers: int = 1
+    transport: str = "gloo"
+
+    def __post_init__(self) -> None:
+        if type(self.staging_bytes) is not int or self.staging_bytes <= 0 or self.staging_bytes % 16:
+            raise ValueError("piper_relay staging_bytes must be a positive integer multiple of 16")
+        if type(self.pipeline_buffers) is not int or self.pipeline_buffers not in (1, 2, 3):
+            raise ValueError("piper_relay pipeline_buffers must be 1, 2, or 3")
+        if self.transport not in ("gloo", "shared"):
+            raise ValueError("piper_relay transport must be 'gloo' or 'shared'")
+
+    def _validate_group_size(self, size: int) -> None:
+        minimum = 16 * max(3, size + 1) * self.pipeline_buffers
+        if self.staging_bytes < minimum:
+            raise ValueError("piper_relay staging_bytes must allow 16 bytes per staging slot")
+        if self.transport == "shared" and shared_slot_bytes(self.staging_bytes, size) * COPY_BUFFERS < minimum:
+            raise ValueError(
+                "piper_relay shared staging_bytes must allow 16 bytes per staging slot in each rank region",
+            )
 
 
 def register_relay_backend() -> None:
@@ -47,22 +97,45 @@ def register_relay_backend() -> None:
     with _registration_lock:
         plugin = dist.Backend._plugins.get(_BACKEND_NAME.upper())
         if plugin is not None:
-            if plugin.creator_fn is not _RelayProcessGroup:
+            if plugin.creator_fn is not _create_relay_group:
                 raise RuntimeError("A different backend is already registered as piper_relay")
             return
         dist.Backend.register_backend(
             _BACKEND_NAME,
-            _RelayProcessGroup,
+            _create_relay_group,
+            extended_api=True,
             devices=["cpu", "cuda"],
         )
 
 
+def _create_relay_group(backend: _DistributedBackendOptions, options: RelayOptions | None) -> dist.ProcessGroup:
+    if options is None:
+        options = RelayOptions()
+    if not isinstance(options, RelayOptions):
+        raise TypeError("piper_relay pg_options must be RelayOptions")
+    return _RelayProcessGroup(backend.store, backend.group_rank, backend.group_size, backend.timeout, options)
+
+
 class _RelayProcessGroup(dist.ProcessGroup):
-    def __init__(self, store: dist.Store, rank: int, size: int, timeout: timedelta) -> None:
+    def __init__(self, store: dist.Store, rank: int, size: int, timeout: timedelta, options: RelayOptions) -> None:
         # The rank/size overload constructs the Python trampoline. The
         # store/rank/size overload in PyTorch 2.13 cannot construct subclasses.
         super().__init__(rank, size)  # type: ignore[call-arg]
         self._collective_lock = threading.Lock()
+        self._staging_bytes = options.staging_bytes
+        self._pipeline_buffers = options.pipeline_buffers
+        self._staging_buffer: torch.Tensor | None = None
+        self._pipeline: TransferPipeline | None = None
+        self._shared: SharedRelay | None = None
+        self._closed = False
+        options._validate_group_size(size)
+        # Different chunk sizes would issue incompatible Gloo collectives.
+        settings = dist.PrefixStore("piper_relay_options", store)
+        settings.set(str(rank), f"{self._staging_bytes}:{self._pipeline_buffers}:{options.transport}")
+        keys = [str(r) for r in range(size)]
+        settings.wait(keys, timeout)
+        if len({settings.get(key) for key in keys}) != 1:
+            raise ValueError("piper_relay staging_bytes, pipeline_buffers and transport must match across all ranks")
         self._cpu_group = dist.ProcessGroupGloo(store, rank, size, timeout)
         # Give the base process group ownership of Gloo for shutdown and CPU
         # control operations. Deliberately do not register Gloo for CUDA.
@@ -71,9 +144,59 @@ class _RelayProcessGroup(dist.ProcessGroup):
             dist.ProcessGroup.BackendType.GLOO,
             self._cpu_group,
         )
+        if options.transport == "shared":
+            self._shared = SharedRelay(
+                store, self._cpu_group, rank, size, self._staging_bytes, timeout,
+            )
 
     def getBackendName(self) -> str:  # noqa: N802 -- PyTorch trampoline name
         return _BACKEND_NAME
+
+    def shutdown(self) -> None:
+        with self._collective_lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                super().shutdown()
+            finally:
+                self._staging_buffer = None
+                self._pipeline = None
+                self._shared = None
+
+    @contextmanager
+    def _collective(self, tensor: torch.Tensor) -> Generator[None]:
+        device = tensor.device
+        with self._collective_lock, torch.no_grad(), (
+            torch.cuda.device(device) if device.type == "cuda" else nullcontext()
+        ):
+            if self._closed:
+                raise RuntimeError("piper_relay process group is shut down")
+            if self._shared is not None and self._shared.broken:
+                raise RuntimeError("shared relay failed previously; destroy and recreate the process group")
+            if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("piper_relay blocking transfers do not support CUDA graph capture")
+            yield
+
+    @contextmanager
+    def _buffer(self, device: torch.device) -> Generator[tuple[torch.Tensor, bool]]:
+        if self._shared is not None:
+            # Reductions keep their existing Gloo implementation, using only
+            # this rank's region. No second payload allocation is necessary.
+            owner = self._shared.buffer
+            region = self._shared.local_buffer()
+        else:
+            if self._staging_buffer is None:
+                self._staging_buffer = torch.empty(self._staging_bytes, dtype=torch.uint8, device="cpu")
+            owner = region = self._staging_buffer
+        # Lease the persistent owner, never temporary views: view destruction
+        # must not retire the reusable registration. Idle pins remain evictable.
+        with host_pin_manager.acquire([owner]) if device.type == "cuda" else nullcontext() as lease:
+            yield region, lease is not None and lease.pageable_bytes == 0
+
+    def _slot_bytes(self, slots: int) -> int:
+        size = self._staging_bytes if self._shared is None else self._shared.capacity * self._shared.buffer_count
+        return size // (16 * slots * self._pipeline_buffers) * 16
 
     def allreduce(
         self,
@@ -83,7 +206,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
         options = opts if opts is not None else dist.AllreduceOptions()
         tensor = _single_tensor(tensors)
         _validate_reduction([tensor], options)
-        with self._collective_lock, torch.no_grad():
+        with self._collective(tensor):
             self._reduce(tensor, options)
         return _CompletedWork([tensor])
 
@@ -101,20 +224,27 @@ class _RelayProcessGroup(dist.ProcessGroup):
         single_options.reduceOp = options.reduceOp
         single_options.timeout = options.timeout
         single_options.asyncOp = options.asyncOp
-        with self._collective_lock, torch.no_grad():
+        with self._collective(tensors[0]):
             for tensor in tensors:
                 self._reduce(tensor, single_options)
         return _CompletedWork(tensors)
 
     def _reduce(self, tensor: torch.Tensor, options: dist.AllreduceOptions) -> None:
-        with _host_staging([tensor], [tensor]) as (inputs, _outputs):
-            host = inputs[0]
-            # Promote on the CPU after download, so low-precision reduction
-            # needs neither a full FP32 GPU temporary nor FP32 device copies.
-            accumulator = host.float()
-            self._cpu_group.allreduce([accumulator], options).wait()
-            if accumulator is not host:
-                host.copy_(accumulator)
+        low_precision = tensor.dtype != torch.float32
+        with closing(self._copy_chunks(
+            [tensor], [tensor], slots=3 if low_precision else 1, inplace=True, stage_cpu=low_precision,
+        )) as chunks:
+            for chunk in chunks:
+                host = chunk.inputs[0].view(tensor.dtype)
+                if low_precision:
+                    assert chunk.scratch is not None
+                    accumulator = chunk.scratch[:host.numel() * 4].view(torch.float32)
+                    accumulator.copy_(host)
+                else:
+                    accumulator = host
+                self._cpu_group.allreduce([accumulator], options).wait()
+                if low_precision:
+                    host.copy_(accumulator)
 
     def broadcast(
         self,
@@ -128,8 +258,15 @@ class _RelayProcessGroup(dist.ProcessGroup):
         if options.rootTensor != 0:
             raise ValueError("piper_relay broadcast requires rootTensor=0")
         sources = [tensor] if self.rank() == options.rootRank else []
-        with self._collective_lock, torch.no_grad(), _host_staging(sources, [tensor]) as (_inputs, outputs):
-            self._cpu_group.broadcast([_bytes(outputs[0])], options).wait()
+        with self._collective(tensor):
+            if self._shared is not None:
+                self._shared.copy("broadcast", sources, [tensor], options.rootRank, host_pin_manager)
+            else:
+                with closing(self._copy_chunks(sources, [tensor], slots=2)) as chunks:
+                    for chunk in chunks:
+                        if chunk.inputs:
+                            chunk.outputs[0].copy_(chunk.inputs[0])
+                        self._cpu_group.broadcast(chunk.outputs, options).wait()
         return _CompletedWork([tensor])
 
     def scatter(
@@ -158,9 +295,13 @@ class _RelayProcessGroup(dist.ProcessGroup):
                 source_rank != options.rootRank or output.data_ptr() != tensor.data_ptr()
             ):
                 raise ValueError("piper_relay scatter output must not overlap inputs except its exact root slice")
-        with self._collective_lock, torch.no_grad(), _host_staging(sources, [output]) as (inputs, outputs):
-            cpu_inputs = [[_bytes(tensor) for tensor in inputs]] if sources else []
-            self._cpu_group.scatter([_bytes(outputs[0])], cpu_inputs, options).wait()
+        with self._collective(output):
+            if self._shared is not None:
+                self._shared.copy("scatter", sources, [output], options.rootRank, host_pin_manager)
+            else:
+                with closing(self._copy_chunks(sources, [output], slots=self.size() + 1)) as chunks:
+                    for chunk in chunks:
+                        self._cpu_group.scatter(chunk.outputs, [chunk.inputs] if sources else [], options).wait()
         return _CompletedWork([output])
 
     def allgather(
@@ -178,8 +319,9 @@ class _RelayProcessGroup(dist.ProcessGroup):
         _validate_disjoint(destinations)
         for output in destinations:
             _validate_pair(output, source, source.numel(), same_shape=True)
-        with self._collective_lock, torch.no_grad(), _host_staging([source], destinations) as (inputs, outputs):
-            self._cpu_group.allgather([[_bytes(tensor) for tensor in outputs]], [_bytes(inputs[0])], options).wait()
+        self._validate_gather_aliases(source, destinations)
+        with self._collective(source):
+            self._gather(source, destinations, options)
         return _CompletedWork(destinations, nested=True)
 
     def all_gather_single(
@@ -214,14 +356,62 @@ class _RelayProcessGroup(dist.ProcessGroup):
                 if i != j and _overlap(output, source):
                     raise ValueError("piper_relay batched outputs must not overlap another input")
         # Validate the whole batch before starting communication or mutation.
+        destinations: list[list[torch.Tensor]] = []
         for output, source in zip(output_tensors, input_tensors, strict=True):
             _validate_pair(output, source, source.numel() * self.size())
-        with self._collective_lock, torch.no_grad():
-            for output, source in zip(output_tensors, input_tensors, strict=True):
-                with _host_staging([source], [output]) as (inputs, outputs):
-                    rows = _bytes(outputs[0]).reshape(self.size(), source.nbytes)
-                    self._cpu_group.allgather([list(rows.unbind(0))], [_bytes(inputs[0])], options).wait()
+            views = list(output.view(self.size(), source.numel()).unbind(0))
+            self._validate_gather_aliases(source, views)
+            destinations.append(views)
+        with self._collective(input_tensors[0]):
+            for source, outputs in zip(input_tensors, destinations, strict=True):
+                self._gather(source, outputs, options)
         return _CompletedWork(output_tensors)
+
+    def _validate_gather_aliases(self, source: torch.Tensor, outputs: list[torch.Tensor]) -> None:
+        for rank, output in enumerate(outputs):
+            if _overlap(output, source) and (rank != self.rank() or output.data_ptr() != source.data_ptr()):
+                raise ValueError("piper_relay all-gather input may overlap only its exact local output slice")
+
+    def _gather(self, source: torch.Tensor, outputs: list[torch.Tensor], options: AllgatherOptions) -> None:
+        if self._shared is not None:
+            self._shared.copy("allgather", [source], outputs, -1, host_pin_manager)
+            return
+        with closing(self._copy_chunks([source], outputs)) as chunks:
+            for chunk in chunks:
+                self._cpu_group.allgather([chunk.outputs], chunk.inputs, options).wait()
+
+    def _copy_chunks(
+        self, inputs: list[torch.Tensor], outputs: list[torch.Tensor], *, slots: int | None = None,
+        inplace: bool = False, stage_cpu: bool = False,
+    ) -> Generator[HostChunk]:
+        sources, destinations = [_bytes(t) for t in inputs], [_bytes(t) for t in outputs]
+        # The root/non-root scatter plans must use identical chunk sizes.
+        slots = slots if slots is not None else len(inputs) + len(outputs)
+        capacity = self._slot_bytes(slots)
+        device = outputs[0].device
+        if device.type == "cpu" and not stage_cpu:
+            for start, end in chunk_ranges(destinations[0].numel(), capacity):
+                yield HostChunk([t[start:end] for t in sources], [t[start:end] for t in destinations])
+            return
+        with self._buffer(device) as (buffer, pinned):
+            if pinned and self._pipeline_buffers > 1 and destinations[0].numel() > capacity:
+                if self._pipeline is None or self._pipeline.device != device:
+                    self._pipeline = TransferPipeline(device, self._pipeline_buffers)
+                # Closing the inner generator drains DMA before _buffer releases
+                # its lease, including when the caller's CPU collective raises.
+                with closing(self._pipeline.chunks(sources, destinations, buffer, capacity, slots, inplace)) as chunks:
+                    yield from chunks
+                return
+            # CPU and pageable fallback retain the configured chunk size so
+            # ranks with different registration outcomes issue matching calls.
+            region = buffer[:slots * capacity]
+            for start, end in chunk_ranges(destinations[0].numel(), capacity):
+                chunk = make_host_chunk(region, capacity, end - start, len(inputs), len(outputs), inplace)
+                for source, host in zip(sources, chunk.inputs, strict=True):
+                    host.copy_(source[start:end], non_blocking=False)
+                yield chunk
+                for destination, host in zip(destinations, chunk.outputs, strict=True):
+                    destination[start:end].copy_(host, non_blocking=False)
 
     def _validate_root(self, root: int) -> None:
         if not 0 <= root < self.size():
@@ -323,33 +513,4 @@ def _bytes(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.reshape(-1).view(torch.uint8)
 
 
-@contextmanager
-def _host_staging(
-    inputs: list[torch.Tensor], outputs: list[torch.Tensor],
-) -> Generator[tuple[list[torch.Tensor], list[torch.Tensor]]]:
-    # Callers validate devices and always supply at least one output.
-    device = outputs[0].device
-    if device.type == "cpu":
-        yield inputs, outputs
-        return
-
-    tensors = {id(tensor): tensor for tensor in [*inputs, *outputs]}
-    with torch.cuda.device(device):
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("piper_relay blocking transfers do not support CUDA graph capture")
-        hosts = {
-            key: torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
-            for key, tensor in tensors.items()
-        }
-        # Pageable fallback is safe because every device copy is synchronous.
-        # Keep all sources and destinations leased through communication and
-        # final uploads; an exception exits without uploading partial results.
-        with host_pin_manager.acquire(hosts.values()):
-            for tensor in inputs:
-                hosts[id(tensor)].copy_(tensor, non_blocking=False)
-            yield [hosts[id(tensor)] for tensor in inputs], [hosts[id(tensor)] for tensor in outputs]
-            for tensor in outputs:
-                tensor.copy_(hosts[id(tensor)], non_blocking=False)
-
-
-__all__ = ["register_relay_backend"]
+__all__ = ["RelayOptions", "register_relay_backend"]

@@ -42,7 +42,7 @@ is not required.
 |---|---|
 | `resource_cache.py` | `ResourceCache`, eviction policy, cache metadata, and cache errors |
 | `pin_manager.py` | `PinManager`, `PinLease`, `PinStats`, and the process-wide `host_pin_manager` for budgeted host registration |
-| `communication.py` | Experimental `piper_relay` process group: blocking SUM all-reduce, all-gather, broadcast and scatter through CPU Gloo, independently usable with DTensor |
+| `communication.py` | Experimental `piper_relay` process group: blocking collectives through CPU Gloo or shared host memory, independently usable with DTensor |
 | `model_cache.py` | `ModelCache` — model-aware `ResourceCache` with activation and adapter coordination |
 | `resource_specs.py` | `ModelSpec`, `AdapterSpec`, `ObjectSpec` — standard frozen resource specifications |
 | `protocols.py` | `ResourceSpec`, `ResourceStore`, `ResourceBinding` plug-in contracts |
@@ -229,8 +229,11 @@ the corresponding HIP calls are documented in the
 ## Experimental DTensor host relay
 
 `piper_relay` is an experimental communication backend for DTensor inference.
-It stages accelerator tensors through host memory and uses CPU Gloo for
-SUM all-reduce, all-gather, broadcast and scatter.
+It stages accelerator tensors through host memory for SUM all-reduce,
+all-gather, broadcast and scatter. The default `transport="gloo"` uses CPU
+Gloo for payload communication. `transport="shared"` uses shared host slots
+for same-machine copy collectives, with Gloo carrying small control messages
+and CPU reductions.
 It uses PyTorch's Python process-group extension support and requires no
 NCCL, compiled extension, or active offloader.
 
@@ -239,11 +242,14 @@ Register the backend in every worker before initializing the process group:
 ```python
 import torch
 import torch.distributed as dist
-from piper_offload.communication import register_relay_backend
+from piper_offload.communication import RelayOptions, register_relay_backend
 
 torch.cuda.set_device(local_rank)
 register_relay_backend()
-dist.init_process_group("piper_relay")  # rank/rendezvous supplied by the launcher
+dist.init_process_group(
+    "piper_relay",  # rank/rendezvous supplied by the launcher
+    pg_options=RelayOptions(staging_bytes=8 * 1024 * 1024, pipeline_buffers=1),  # defaults
+)
 ```
 
 Select the device explicitly and omit `device_id` from `init_process_group`;
@@ -260,8 +266,9 @@ Copy collectives preserve payload bits and support the reduction dtypes plus
 FP64, bool, uint8, signed integers and complex64/complex128. Inputs and outputs
 must be contiguous plain tensors on one local device; output buffers must
 not overlap. Coalesced all-gather outputs must not overwrite another input in
-the batch. Scatter's root output may exactly alias its own source slice;
-other input/output overlap is rejected before communication.
+the batch. Within an all-gather, the input may exactly alias its own rank's
+output slice. Scatter's root output may exactly alias its own source slice.
+Other input/output overlap for these collectives is rejected before communication.
 FP16/BF16 reductions accumulate in FP32 on the CPU and cast back before upload,
 retaining the original dtype for GPU/host transfers.
 
@@ -275,28 +282,36 @@ the Python override and are unsupported for accelerator tensors.
 Reduce-scatter, all-to-all, point-to-point accelerator transfers
 and non-SUM reductions remain unsupported.
 
-The backend is **blocking**, including calls with `async_op=True`: a returned
-work handle represents a result whose upload has already completed. Full-size
-CPU staging is allocated for each collective's accelerator inputs/outputs,
-in addition to Gloo's transport workspace and the FP32 accumulator for
-low-precision reductions. Coalesced calls process tensors sequentially.
-It uses `host_pin_manager` for
-opportunistic registration under the existing process-wide budget;
-registration failure falls back to synchronous pageable copies. Chunked
-buffer pools, asynchronous overlap, and prefetch coordination are follow-up
-work. CUDA graph capture is unsupported.
+`RelayOptions.staging_bytes` defaults to 8 MiB and bounds reusable CPU staging,
+including reduction accumulators: per rank with Gloo, or once for the entire
+group with shared transport. Gloo workspace, caller tensors and allocator
+overhead are excluded. All ranks must agree on options; supply them separately
+when creating subgroups with `new_group()`.
 
-The [runnable example](examples/dtensor_relay.py) uses two spawned workers and
-a file store, with CPU, shared-GPU, and two-GPU modes:
+`pipeline_buffers` defaults to 1 (serial). Setting it to 2 or 3 overlaps pinned
+copies with Gloo communication within the same staging budget. Shared copy
+collectives always use two buffers per sender; in shared mode this option
+controls only Gloo reductions.
 
-```bash
-python examples/dtensor_relay.py --device cpu
-python examples/dtensor_relay.py --shared-gpu --dtype bfloat16
-python examples/dtensor_relay.py
+For ranks on the same machine, select shared transport:
+
+```python
+RelayOptions(transport="shared", staging_bytes=8 * 1024 * 1024)
 ```
 
-`--shared-gpu` exercises two real ranks on `cuda:0`; it is a correctness test
-and does not reduce single-GPU VRAM use. CUDA/HIP transfers use PyTorch's
+All ranks must be able to attach the same host allocation; use Gloo for separate
+machines. Staging registration uses `host_pin_manager`'s process-wide budget.
+Each process registers the full shared allocation under its own budget.
+Insufficient pin capacity falls back to synchronous pageable copies.
+
+The backend remains **blocking**, including `async_op=True`: returned work
+handles represent completed uploads. Coalesced calls process tensors sequentially.
+Failures may leave outputs partially updated; after a shared-exchange failure,
+destroy and recreate the group. Offloader prefetch coordination and CUDA graph
+capture remain unsupported.
+
+The automated tests exercise two real ranks on `cuda:0` for correctness;
+this does not reduce single-GPU VRAM use. CUDA/HIP transfers use PyTorch's
 device API, but Windows GPU, ROCm, and distinct-GPU behavior need validation
 on their respective hardware. The test suite includes a two-physical-GPU
 case that skips when fewer than two devices are available.
