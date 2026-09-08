@@ -32,6 +32,7 @@ class _PiperConvRotNVFP4Meta:
     is_swizzled_scales: bool
     use_triton_kernel: bool
     act_quant_kwargs: object | None
+    high_first: bool
 
 
 class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta]):
@@ -71,6 +72,7 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
             is_swizzled_scales=t.is_swizzled_scales,
             use_triton_kernel=t.use_triton_kernel,
             act_quant_kwargs=t.act_quant_kwargs,
+            high_first=t.high_first,
         )
 
     @staticmethod
@@ -92,6 +94,7 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
             meta.is_swizzled_scales,
             meta.use_triton_kernel,
             meta.act_quant_kwargs,
+            meta.high_first,
             wrapper_type=meta.wrapper_type,
         )
 
@@ -105,6 +108,7 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
             t.is_swizzled_scales,
             t.use_triton_kernel,
             metadata_key(t.act_quant_kwargs),
+            t.high_first,
         )
 
     @staticmethod

@@ -37,6 +37,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   inside the same staging allocation. Overlap pinned downloads/uploads with
   CPU communication while preserving blocking completion and pageable fallback.
 
+### Fixed
+
+- Preserve Piper NVFP4 `high_first` packing order through host/device movement,
+  DTensor reconstruction and requantization. High-first merges use the reference
+  path when the raw Triton merge only supports low-first packing.
+
 ## [0.10.0rc1] - 2026-09-11
 
 ### Added

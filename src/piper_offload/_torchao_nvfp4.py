@@ -63,7 +63,12 @@ def require_nvfp4_tensor(t: torch.Tensor) -> Any:  # noqa: ANN401
     return t
 
 
-def create_nvfp4_tensor(
+def _swap_packed_pairs(qdata: torch.Tensor) -> torch.Tensor:
+    """Exchange the two E2M1 values stored in every packed byte."""
+    return ((qdata & 0x0F) << 4) | (qdata >> 4)
+
+
+def create_nvfp4_tensor(  # noqa: PLR0913
     qdata: torch.Tensor,
     scale: torch.Tensor,
     block_size: int,
@@ -75,6 +80,7 @@ def create_nvfp4_tensor(
     act_quant_kwargs: object | None,
     *,
     wrapper_type: type[torch.Tensor] | None = None,
+    high_first: bool | None = None,
 ) -> torch.Tensor:
     """Rebuild a compatible NVFP4 wrapper from raw storage + metadata."""
     if not TORCHAO_NVFP4_AVAILABLE:
@@ -82,6 +88,9 @@ def create_nvfp4_tensor(
     constructor = cast(Any, NVFP4Tensor if wrapper_type is None else wrapper_type)
     if not issubclass(constructor, NVFP4Tensor):
         raise TypeError(f"NVFP4 wrapper type must subclass TorchAO NVFP4Tensor, got {constructor.__name__}")
+    kwargs = {}
+    if high_first is not None:
+        kwargs["high_first"] = high_first
     return constructor(
         qdata=qdata,
         scale=scale,
@@ -92,6 +101,7 @@ def create_nvfp4_tensor(
         is_swizzled_scales=is_swizzled_scales,
         use_triton_kernel=use_triton_kernel,
         act_quant_kwargs=act_quant_kwargs,
+        **kwargs,
     )
 
 
@@ -194,8 +204,14 @@ def requantize_nvfp4_tensor(
         use_triton_kernel=False,
         act_quant_kwargs=nv.act_quant_kwargs,
     )
-    out = create_nvfp4_tensor(
-        out.qdata,
+    if rounding_seed is not None:
+        _stochastic_recode_nvfp4_(out, t, rounding_seed=rounding_seed)
+    high_first = getattr(nv, "high_first", None)
+    qdata = out.qdata
+    if high_first:
+        qdata = _swap_packed_pairs(qdata)
+    return create_nvfp4_tensor(
+        qdata,
         out.scale,
         out.block_size,
         out.orig_dtype,
@@ -205,10 +221,8 @@ def requantize_nvfp4_tensor(
         out.use_triton_kernel,
         out.act_quant_kwargs,
         wrapper_type=type(nv),
+        high_first=high_first,
     )
-    if rounding_seed is not None:
-        _stochastic_recode_nvfp4_(out, t, rounding_seed=rounding_seed)
-    return out
 
 
 def _stochastic_recode_nvfp4_(

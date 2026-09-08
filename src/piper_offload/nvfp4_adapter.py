@@ -204,6 +204,7 @@ class _Nvfp4Meta:
     is_swizzled_scales: bool
     use_triton_kernel: bool
     act_quant_kwargs: object | None
+    high_first: bool | None
 
 
 class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
@@ -237,6 +238,7 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
             is_swizzled_scales=t.is_swizzled_scales,
             use_triton_kernel=t.use_triton_kernel,
             act_quant_kwargs=t.act_quant_kwargs,
+            high_first=getattr(t, "high_first", None),
         )
 
     @staticmethod
@@ -255,6 +257,7 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
             meta.use_triton_kernel,
             meta.act_quant_kwargs,
             wrapper_type=meta.wrapper_type,
+            high_first=meta.high_first,
         )
 
     @staticmethod
@@ -266,6 +269,7 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
             t.is_swizzled_scales,
             t.use_triton_kernel,
             metadata_key(t.act_quant_kwargs),
+            getattr(t, "high_first", None),
         )
 
     @staticmethod
@@ -339,7 +343,7 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
     ) -> None:
         """Merge a validated staged update while preserving target storage."""
         nv = require_nvfp4_tensor(target)
-        if _is_triton_nvfp4_layout(nv, b, a):
+        if not getattr(nv, "high_first", False) and _is_triton_nvfp4_layout(nv, b, a):
             assert _triton_merge_nvfp4_lora is not None
             qdata, scale, per_tensor_scale = _triton_merge_nvfp4_lora(
                 nv.qdata,
@@ -386,7 +390,7 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
     ) -> None:
         """Merge a full-rank update while preserving target storage."""
         nv = require_nvfp4_tensor(target)
-        if _is_triton_nvfp4_dense_layout(nv, update):
+        if not getattr(nv, "high_first", False) and _is_triton_nvfp4_dense_layout(nv, update):
             assert _triton_merge_nvfp4_dense is not None
             qdata, scale, per_tensor_scale = _triton_merge_nvfp4_dense(
                 nv.qdata,
