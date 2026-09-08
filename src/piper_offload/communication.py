@@ -3,15 +3,15 @@
 Call ``register_relay_backend()`` in each worker before initializing a
 ``piper_relay`` process group. It supports SUM all-reduce in FP32, FP16 and
 BF16, plus broadcast, scatter and all-gather of contiguous tensors. Select
-``transport="shared"`` for same-machine copy collectives through shared host
-slots; Gloo then carries only control messages and CPU reductions. The default
-``transport="gloo"`` carries payloads through CPU Gloo as well. Gloo never
-receives an accelerator tensor.
+``transport="shared"`` for same-machine transfers through shared host slots
+and GPU-local summation; Gloo then carries only control messages and reductions
+of CPU tensors. The default ``transport="gloo"`` carries payloads through CPU
+Gloo as well. Gloo never receives an accelerator tensor.
 
 Collectives stream through a reusable, bounded CPU buffer and complete all
 device copies before returning, including when ``async_op=True``. No offloader,
-NCCL, or compiled extension is required. Internal pipelining is opt-in; public
-calls remain blocking.
+NCCL, or compiled extension is required. Gloo pipelining is opt-in; shared
+transfers use two outgoing slots per rank. Public calls remain blocking.
 """
 
 import threading
@@ -25,15 +25,14 @@ import torch
 import torch.distributed as dist
 from torch._C._distributed_c10d import AllgatherOptions, _DistributedBackendOptions
 
-from ._relay_shared import COPY_BUFFERS, SharedRelay, shared_slot_bytes
+from ._relay_shared import BUFFERS_PER_RANK, REDUCTION_DTYPES, SharedRelay, shared_slot_bytes
 from ._relay_staging import HostChunk, TransferPipeline, chunk_ranges, make_host_chunk
 from .pin_manager import host_pin_manager
 
 _BACKEND_NAME = "piper_relay"
 _registration_lock = threading.Lock()
-_REDUCTION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 _COPY_DTYPES = (
-    *_REDUCTION_DTYPES,
+    *REDUCTION_DTYPES,
     torch.float64, torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
     torch.complex64, torch.complex128,
 )
@@ -57,8 +56,11 @@ class RelayOptions:
     ranks on the same machine. Copy collectives always use two outgoing slots
     per rank, reused across peer rounds. Every process registers its full
     mapping under its own pin budget; physical payload storage is shared once.
-    Gloo reductions borrow this rank's region, with ``pipeline_buffers`` still
-    controlling their copy pipeline. The default transport remains ``"gloo"``.
+    GPU reductions use the same two slots plus at most three slot sizes of
+    reusable device scratch per rank, independent of tensor size. FP16/BF16
+    accumulate in FP32. CPU tensor reductions use Gloo and borrow this rank's
+    region. ``pipeline_buffers`` only affects the Gloo path. The default
+    transport remains ``"gloo"``.
     """
 
     staging_bytes: int = 8 * 1024 * 1024
@@ -77,7 +79,7 @@ class RelayOptions:
         minimum = 16 * max(3, size + 1) * self.pipeline_buffers
         if self.staging_bytes < minimum:
             raise ValueError("piper_relay staging_bytes must allow 16 bytes per staging slot")
-        if self.transport == "shared" and shared_slot_bytes(self.staging_bytes, size) * COPY_BUFFERS < minimum:
+        if self.transport == "shared" and shared_slot_bytes(self.staging_bytes, size) * BUFFERS_PER_RANK < minimum:
             raise ValueError(
                 "piper_relay shared staging_bytes must allow 16 bytes per staging slot in each rank region",
             )
@@ -181,8 +183,8 @@ class _RelayProcessGroup(dist.ProcessGroup):
     @contextmanager
     def _buffer(self, device: torch.device) -> Generator[tuple[torch.Tensor, bool]]:
         if self._shared is not None:
-            # Reductions keep their existing Gloo implementation, using only
-            # this rank's region. No second payload allocation is necessary.
+            # CPU reductions use only this rank's region. No second host
+            # payload allocation is necessary.
             owner = self._shared.buffer
             region = self._shared.local_buffer()
         else:
@@ -230,6 +232,9 @@ class _RelayProcessGroup(dist.ProcessGroup):
         return _CompletedWork(tensors)
 
     def _reduce(self, tensor: torch.Tensor, options: dist.AllreduceOptions) -> None:
+        if self._shared is not None and tensor.device.type == "cuda":
+            self._shared.reduce(tensor, host_pin_manager)
+            return
         low_precision = tensor.dtype != torch.float32
         with closing(self._copy_chunks(
             [tensor], [tensor], slots=3 if low_precision else 1, inplace=True, stage_cpu=low_precision,
@@ -455,7 +460,7 @@ def _validate_reduction(tensors: list[torch.Tensor], options: dist.AllreduceOpti
         raise NotImplementedError("piper_relay currently supports only SUM all-reduce")
     _validate_tensors(tensors)
     for tensor in tensors:
-        if tensor.dtype not in _REDUCTION_DTYPES:
+        if tensor.dtype not in REDUCTION_DTYPES:
             raise NotImplementedError("piper_relay SUM all-reduce supports FP32, FP16 and BF16")
 
 

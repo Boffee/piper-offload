@@ -3,8 +3,9 @@
 Each rank owns two outgoing slots in one shared mapping. Slots are reused
 across peer rounds, bounding storage independently of the number of pairs.
 All-gather exchanges peers in cyclic rounds; broadcast and scatter visit each
-receiver in turn. Gloo carries 8-byte ready/free signals per chunk and a 24-byte
-metadata all-gather per copy collective. No CPU polling,
+receiver in turn. SUM publishes each original chunk once for all peers, then
+accumulates in rank order on the GPU. Gloo carries 8-byte ready/free signals
+per chunk and a 24-byte metadata all-gather per collective. No CPU polling,
 GPU IPC, cross-process CUDA events, or payload socket transfers are needed.
 """
 
@@ -14,7 +15,8 @@ import os
 import socket
 import tempfile
 import uuid
-from contextlib import nullcontext
+from collections.abc import Generator, Sequence
+from contextlib import closing, contextmanager, nullcontext
 from datetime import timedelta
 from pathlib import Path
 
@@ -23,12 +25,13 @@ import torch.distributed as dist
 
 from .pin_manager import PinManager
 
-COPY_BUFFERS = 2
+BUFFERS_PER_RANK = 2
+REDUCTION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
 def shared_slot_bytes(nbytes: int, world_size: int) -> int:
     """Keep large DMA slots 4 KiB aligned while allowing tiny staging budgets."""
-    capacity = nbytes // (world_size * COPY_BUFFERS)
+    capacity = nbytes // (world_size * BUFFERS_PER_RANK)
     alignment = 4096 if capacity >= 4096 else 16
     return capacity // alignment * alignment
 
@@ -105,7 +108,7 @@ def create_shared_buffer(
 
 
 class SharedRelay:
-    buffer_count = COPY_BUFFERS
+    buffer_count = BUFFERS_PER_RANK
 
     def __init__(
         self, store: dist.Store, group: dist.ProcessGroupGloo, rank: int, world_size: int,
@@ -114,6 +117,10 @@ class SharedRelay:
         self.buffer = create_shared_buffer(store, rank, world_size, nbytes, timeout)
         self.rank = rank
         self.world_size = world_size
+        self._peers = tuple(
+            ((rank + step) % world_size, (rank - step) % world_size)
+            for step in range(1, world_size)
+        )
         self.capacity = shared_slot_bytes(nbytes, world_size)
         self.group = group
         self.timeout = timeout
@@ -123,6 +130,7 @@ class SharedRelay:
         self.upload: torch.cuda.Stream | None = None
         self.ready: list[torch.cuda.Event] = []
         self.uploaded: list[torch.cuda.Event] = []
+        self._reduction_buffer: torch.Tensor | None = None
         self._send_signal = torch.empty(1, dtype=torch.int64)
         self._recv_signal = torch.empty(1, dtype=torch.int64)
         self._pending: list[dist.Work] = []
@@ -170,8 +178,21 @@ class SharedRelay:
             return
         tensor = source if source is not None else destination
         assert tensor is not None
-        length = tensor.numel()
+        with closing(self._chunks(source, tensor.numel(), [(send, receive)], asynchronous)) as chunks:
+            for index, start, width in chunks:
+                if destination is not None:
+                    assert receive is not None
+                    destination[start:start + width].copy_(
+                        self._slot(receive, index % self.buffer_count, width), non_blocking=asynchronous,
+                    )
+
+    def _chunks(
+        self, source: torch.Tensor | None, length: int,
+        peers: Sequence[tuple[int | None, int | None]], asynchronous: bool,
+    ) -> Generator[tuple[int, int, int]]:
+        """Yield published chunks on the upload stream; acknowledge every reader."""
         count = max(1, (length + self.capacity - 1) // self.capacity)
+        receiving = any(receive is not None for _, receive in peers)
 
         def download(index: int) -> None:
             if source is None:
@@ -186,11 +207,12 @@ class SharedRelay:
                     self.ready[index % self.buffer_count].record(self.download)
 
         def release(index: int) -> None:
-            if destination is not None and asynchronous:
+            if receiving and asynchronous:
                 self.uploaded[index % self.buffer_count].synchronize()
             # The receiver acknowledges only after its GPU stops reading the
             # shared slot. This is the producer's permission to overwrite it.
-            self._signal(receive, send, 1, index)
+            for send, receive in peers:
+                self._signal(receive, send, 1, index)
 
         for index in range(min(self.buffer_count, count)):
             download(index)
@@ -200,17 +222,14 @@ class SharedRelay:
                 download(index)
             if source is not None and asynchronous:
                 self.ready[index % self.buffer_count].synchronize()
-            self._signal(send, receive, 0, index)
-            if destination is not None:
-                assert receive is not None
-                start = index * self.capacity
-                width = min(self.capacity, length - start)
-                with torch.cuda.stream(self.upload) if asynchronous else nullcontext():
-                    destination[start:start + width].copy_(
-                        self._slot(receive, index % self.buffer_count, width), non_blocking=asynchronous,
-                    )
-                    if asynchronous:
-                        self.uploaded[index % self.buffer_count].record(self.upload)
+            for send, receive in peers:
+                self._signal(send, receive, 0, index)
+            start = index * self.capacity
+            width = min(self.capacity, length - start)
+            with torch.cuda.stream(self.upload) if asynchronous else nullcontext():
+                yield index, start, width
+                if receiving and asynchronous:
+                    self.uploaded[index % self.buffer_count].record(self.upload)
         for index in range(max(0, count - self.buffer_count), count):
             release(index)
 
@@ -218,26 +237,68 @@ class SharedRelay:
         self, operation: str, sources: list[torch.Tensor], outputs: list[torch.Tensor],
         root: int, manager: PinManager,
     ) -> None:
+        with self._collective(operation, outputs[0], root, manager) as asynchronous:
+            sources = [t.reshape(-1).view(torch.uint8) for t in sources]
+            outputs = [t.reshape(-1).view(torch.uint8) for t in outputs]
+            self._rounds(operation, sources, outputs, root, asynchronous)
+
+    def reduce(self, tensor: torch.Tensor, manager: PinManager) -> None:
+        dtype_index = REDUCTION_DTYPES.index(tensor.dtype)
+        with self._collective("allreduce", tensor, dtype_index, manager) as asynchronous:
+            if self.world_size == 1 or tensor.numel() == 0:
+                return
+            if self._reduction_buffer is None or self._reduction_buffer.device != tensor.device:
+                # One native-dtype receive chunk and one FP32 accumulator.
+                # Both are reused on the upload stream, including across calls.
+                self._reduction_buffer = torch.empty(3 * self.capacity, dtype=torch.uint8, device=tensor.device)
+            buffer = self._reduction_buffer
+            assert buffer is not None
+            source = tensor.reshape(-1).view(torch.uint8)
+            with closing(self._chunks(source, source.numel(), self._peers, asynchronous)) as chunks:
+                for index, start, width in chunks:
+                    output = source[start:start + width].view(tensor.dtype)
+                    incoming = buffer[:width].view(tensor.dtype)
+                    accumulator = buffer[
+                        self.capacity:self.capacity + output.numel() * 4
+                    ].view(torch.float32)
+                    # All peers have published the original chunk. Accumulate
+                    # in the same order everywhere, casting back only once.
+                    for peer in range(self.world_size):
+                        value = output
+                        if peer != self.rank:
+                            incoming.copy_(
+                                self._slot(peer, index % self.buffer_count, width).view(tensor.dtype),
+                                non_blocking=asynchronous,
+                            )
+                            value = incoming
+                        if peer == 0:
+                            accumulator.copy_(value)
+                        else:
+                            accumulator.add_(value)
+                    output.copy_(accumulator)
+
+    @contextmanager
+    def _collective(
+        self, operation: str, tensor: torch.Tensor, detail: int, manager: PinManager,
+    ) -> Generator[bool]:
         if self.broken:
             raise RuntimeError("shared relay failed previously; destroy and recreate the process group")
-        device = outputs[0].device
+        device = tensor.device
         # Check rank agreement before any shared-slot writes. This also keeps
         # each collective separate from earlier peer rounds.
         metadata = torch.tensor([
-            ("broadcast", "scatter", "allgather").index(operation), outputs[0].nbytes, root,
+            ("broadcast", "scatter", "allgather", "allreduce").index(operation), tensor.nbytes, detail,
         ], dtype=torch.int64)
         gathered = [torch.empty_like(metadata) for _ in range(self.world_size)]
         self.group.allgather([gathered], [metadata]).wait(self.timeout)
         if any(not torch.equal(metadata, other) for other in gathered):
-            raise ValueError("shared relay collective operation, payload bytes and root must match across ranks")
-        sources = [t.reshape(-1).view(torch.uint8) for t in sources]
-        outputs = [t.reshape(-1).view(torch.uint8) for t in outputs]
+            raise ValueError("shared relay collective operation, payload bytes and root/dtype must match across ranks")
         with manager.acquire([self.buffer]) if device.type == "cuda" else nullcontext() as lease:
             asynchronous = lease is not None and lease.pageable_bytes == 0
             try:
                 if asynchronous:
                     self._prepare_streams(device)
-                self._rounds(operation, sources, outputs, root, asynchronous)
+                yield asynchronous
             except BaseException:
                 # A failed exchange can leave unread ready/free messages. Do
                 # not reuse its slots or control tensors in a later operation.
@@ -264,8 +325,7 @@ class SharedRelay:
     ) -> None:
         if operation == "allgather":
             self._local_copy(outputs[self.rank], sources[0])
-            for step in range(1, self.world_size):
-                send, receive = (self.rank + step) % self.world_size, (self.rank - step) % self.world_size
+            for send, receive in self._peers:
                 self._exchange(sources[0], outputs[receive], send, receive, asynchronous)
         else:
             if self.rank == root and operation == "scatter":

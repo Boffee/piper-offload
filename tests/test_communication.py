@@ -275,8 +275,7 @@ def test_two_rank_cpu_dtensor(tmp_path, transport):
 
 
 @CUDA
-@pytest.mark.parametrize("buffers", [1, 3])
-@pytest.mark.parametrize("transport", ["gloo", "shared"])
+@pytest.mark.parametrize(("transport", "buffers"), [("gloo", 1), ("gloo", 3), ("shared", 1)])
 def test_two_rank_dtensor_on_one_gpu(tmp_path, buffers, transport):
     mp.spawn(_run_relay, args=(str(tmp_path / "shared-gpu-store"), (0, 0), buffers, transport), nprocs=2)
 
@@ -755,6 +754,9 @@ class _ControlOnly:
         self.inner = inner
         self.messages = 0
 
+    def allreduce(self, *args):
+        pytest.fail("shared GPU reduction forwarded its payload to CPU Gloo")
+
     def allgather(self, outputs, inputs):
         assert inputs[0].dtype == torch.int64
         assert inputs[0].nbytes == 24
@@ -808,6 +810,8 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(communication, "host_pin_manager", manager)
         patch.setattr(shared, "_slot", slot)
+        if device_type == "cuda":
+            patch.setattr(group, "_cpu_group", control)
         # Exercise slot reuse and a partial last chunk at either alignment.
         local = torch.arange(shared.capacity + 1, dtype=torch.float32, device=device) + rank
         output = torch.empty((size, local.numel()), device=device)
@@ -825,6 +829,12 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
         dist.barrier()
         for dtype in DTYPES:
             _check_chunked_values(rank, size, device, dtype)
+        if device_type == "cuda":
+            scratch = shared._reduction_buffer
+            assert scratch.device == local.device
+            assert scratch.nbytes == 3 * shared.capacity
+            _check_shared_reduction_precision(rank, size, device, shared.capacity)
+            assert shared._reduction_buffer is scratch
         assert control.messages > 20
         assert group._staging_buffer is None
         assert shared.buffer.data_ptr() == pointer
@@ -837,6 +847,7 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
             manager.max_pinned_bytes = pin_budget
             _check_chunked_values(rank, size, device, torch.float16)
             assert registration.register_calls == initial + 1
+            assert shared._reduction_buffer is scratch
         # Drop test-owned references so shutdown can retire the arena owner.
         del shared
         dist.destroy_process_group()
@@ -847,6 +858,27 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
     assert manager.stats.pinned_bytes == 0
 
 
+def _check_shared_reduction_precision(rank, size, device, capacity):
+    # Three ranks expose premature low-precision rounding and rank-dependent
+    # FP32 addition order. Both buffers wrap, including a partial last chunk.
+    values = {
+        torch.float16: (65504, 65504, -65504),
+        torch.bfloat16: (256, 1, -256),
+        torch.float32: (2**24, 1, -(2**24)),
+    }
+    for dtype, contributions in values.items():
+        count = capacity * 3 // dtype.itemsize + 1
+        backing = torch.full((count + 2,), contributions[rank], dtype=dtype, device=device)
+        local = backing[1:-1]
+        expected = torch.tensor(contributions[:size], dtype=dtype).float()
+        total = expected[0]
+        for value in expected[1:]:
+            total = total + value
+        dist.all_reduce(local)
+        torch.testing.assert_close(local, torch.full_like(local, total.to(dtype).item()), rtol=0, atol=0)
+        torch.testing.assert_close(backing[[0, -1]], torch.full_like(backing[:2], contributions[rank]))
+
+
 @pytest.mark.parametrize(("size", "staging_bytes"), [(2, 1024), (3, 1024), (3, 65536)])
 @pytest.mark.parametrize("pipeline_buffers", [1, 3])
 def test_shared_chunks_on_cpu(tmp_path, size, pipeline_buffers, staging_bytes):
@@ -855,10 +887,11 @@ def test_shared_chunks_on_cpu(tmp_path, size, pipeline_buffers, staging_bytes):
 
 
 @CUDA
-@pytest.mark.parametrize(("size", "mixed_pinning", "staging_bytes"), [
-    (2, False, 1024), (2, True, 1024), (3, False, 1024), (3, True, 65536),
+@pytest.mark.parametrize(("size", "mixed_pinning", "staging_bytes", "pipeline_buffers"), [
+    (2, False, 1024, 1), (2, True, 1024, 1), (3, False, 1024, 1), (3, True, 65536, 1),
+    # A nondefault Gloo pipeline option still uses two shared outgoing slots.
+    (2, False, 1024, 3),
 ])
-@pytest.mark.parametrize("pipeline_buffers", [1, 3])
 def test_shared_chunks_on_gpu(tmp_path, size, mixed_pinning, pipeline_buffers, staging_bytes):
     mp.spawn(
         _run_shared_chunks,
@@ -866,7 +899,7 @@ def test_shared_chunks_on_gpu(tmp_path, size, mixed_pinning, pipeline_buffers, s
     )
 
 
-def _run_shared_failure(rank, path):
+def _run_shared_failure(rank, path, operation):
     torch.set_num_threads(1)
     torch.cuda.set_device(0)
     register_relay_backend()
@@ -905,7 +938,10 @@ def _run_shared_failure(rank, path):
         local = torch.full((257,), rank + 1, device="cuda", dtype=torch.bfloat16)
         output = torch.empty((2, 257), device="cuda", dtype=torch.bfloat16)
         with pytest.raises(RuntimeError, match="acknowledgement failure"):
-            dist.all_gather_single(output, local)
+            if operation == "allreduce":
+                dist.all_reduce(local)
+            else:
+                dist.all_gather_single(output, local)
         assert shared.broken
         assert manager.stats.active_leases == 0
         assert manager.stats.pinned_bytes == 0
@@ -916,8 +952,9 @@ def _run_shared_failure(rank, path):
 
 
 @CUDA
-def test_shared_failure_drains_copies_before_unpinning(tmp_path):
-    mp.spawn(_run_shared_failure, args=(str(tmp_path / "shared-failure"),), nprocs=2)
+@pytest.mark.parametrize("operation", ["allgather", "allreduce"])
+def test_shared_failure_drains_copies_before_unpinning(tmp_path, operation):
+    mp.spawn(_run_shared_failure, args=(str(tmp_path / "shared-failure"), operation), nprocs=2)
 
 
 @pytest.mark.parametrize("transport", [None, "auto", "nccl", True])
@@ -1020,22 +1057,42 @@ def test_shared_peer_failure_times_out_without_reusing_slots(tmp_path):
     mp.spawn(_run_shared_peer_failure, args=(str(tmp_path / "peer-failure"),), nprocs=2)
 
 
-def _run_shared_metadata_mismatch(rank, path):
+def _run_shared_metadata_mismatch(rank, path, device_type):
+    if device_type == "cuda":
+        torch.cuda.set_device(0)
     register_relay_backend()
     dist.init_process_group(
         "piper_relay", store=dist.FileStore(path, 2), rank=rank, world_size=2,
         timeout=timedelta(seconds=5), pg_options=RelayOptions(transport="shared", staging_bytes=512),
     )
-    local = torch.full((rank + 1,), rank, dtype=torch.int64)
-    output = torch.full((2, rank + 1), -1, dtype=torch.int64)
+    local = torch.full((rank + 1,), rank, dtype=torch.int64, device=device_type)
+    output = torch.full((2, rank + 1), -1, dtype=torch.int64, device=device_type)
     with pytest.raises(ValueError, match="payload bytes"):
         dist.all_gather_single(output, local)
     assert torch.all(output == -1)
-    received = torch.empty((2, 1), dtype=torch.int64)
+    received = torch.empty((2, 1), dtype=torch.int64, device=device_type)
     dist.all_gather_single(received, local[:1])
-    assert torch.equal(received.flatten(), torch.arange(2))
+    assert torch.equal(received.flatten().cpu(), torch.arange(2))
+    if device_type == "cuda":
+        # Equal byte counts can still disagree on reduction dtype or operation.
+        value = torch.full((257,), rank + 1, dtype=DTYPES[rank + 1], device=device_type)
+        with pytest.raises(ValueError, match="root/dtype"):
+            dist.all_reduce(value)
+        torch.testing.assert_close(value, torch.full_like(value, rank + 1))
+        value = value.float()
+        output = torch.full((2, value.numel()), -1, dtype=value.dtype, device=device_type)
+        with pytest.raises(ValueError, match="collective operation"):
+            if rank == 0:
+                dist.all_reduce(value)
+            else:
+                dist.all_gather_single(output, value)
+        torch.testing.assert_close(value, torch.full_like(value, rank + 1))
+        assert torch.all(output == -1)
+        dist.all_reduce(value)
+        torch.testing.assert_close(value, torch.full_like(value, 3))
     dist.destroy_process_group()
 
 
-def test_shared_metadata_mismatch_fails_before_writes(tmp_path):
-    mp.spawn(_run_shared_metadata_mismatch, args=(str(tmp_path / "bad-metadata"),), nprocs=2)
+@pytest.mark.parametrize("device_type", ["cpu", pytest.param("cuda", marks=CUDA)])
+def test_shared_metadata_mismatch_fails_before_writes(tmp_path, device_type):
+    mp.spawn(_run_shared_metadata_mismatch, args=(str(tmp_path / "bad-metadata"), device_type), nprocs=2)

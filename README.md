@@ -232,8 +232,8 @@ the corresponding HIP calls are documented in the
 It stages accelerator tensors through host memory for SUM all-reduce,
 all-gather, broadcast and scatter. The default `transport="gloo"` uses CPU
 Gloo for payload communication. `transport="shared"` uses shared host slots
-for same-machine copy collectives, with Gloo carrying small control messages
-and CPU reductions.
+for same-machine transfers and sums contributions on each GPU. Gloo carries
+small control messages and reductions of CPU tensors.
 It uses PyTorch's Python process-group extension support and requires no
 NCCL, compiled extension, or active offloader.
 
@@ -269,8 +269,8 @@ not overlap. Coalesced all-gather outputs must not overwrite another input in
 the batch. Within an all-gather, the input may exactly alias its own rank's
 output slice. Scatter's root output may exactly alias its own source slice.
 Other input/output overlap for these collectives is rejected before communication.
-FP16/BF16 reductions accumulate in FP32 on the CPU and cast back before upload,
-retaining the original dtype for GPU/host transfers.
+FP16/BF16 reductions accumulate in FP32 (on the GPU with shared transport),
+retaining the original dtype for GPU/host transfers and casting back once.
 
 Normal `distribute_tensor()` initialization uses broadcast/scatter;
 `Shard -> Replicate` redistribution and `full_tensor()` use all-gather, while
@@ -285,13 +285,13 @@ and non-SUM reductions remain unsupported.
 `RelayOptions.staging_bytes` defaults to 8 MiB and bounds reusable CPU staging,
 including reduction accumulators: per rank with Gloo, or once for the entire
 group with shared transport. Gloo workspace, caller tensors and allocator
-overhead are excluded. All ranks must agree on options; supply them separately
-when creating subgroups with `new_group()`.
+overhead are excluded. Shared GPU reductions also reuse device scratch of at
+most `3 * staging_bytes / (2 * world_size)` bytes per rank. All ranks must agree
+on options; supply them separately when creating subgroups with `new_group()`.
 
 `pipeline_buffers` defaults to 1 (serial). Setting it to 2 or 3 overlaps pinned
-copies with Gloo communication within the same staging budget. Shared copy
-collectives always use two buffers per sender; in shared mode this option
-controls only Gloo reductions.
+copies with Gloo communication within the same staging budget. Shared GPU
+collectives always use two buffers per sender; this option only affects Gloo.
 
 For ranks on the same machine, select shared transport:
 
