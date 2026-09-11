@@ -43,7 +43,7 @@ def _nvfp4_modules():
 
 
 def _piper_nvfp4(tensor: torch.Tensor) -> torch.Tensor:
-    mod = pytest.importorskip("piper_kernels.linear.nvfp4")
+    mod = pytest.importorskip("piper_kernels.weights.nvfp4")
     return mod.PiperNVFP4Tensor.from_torchao(tensor)
 
 

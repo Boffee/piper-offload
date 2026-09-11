@@ -14,8 +14,6 @@ import torch
 from ._piper_convrot_nvfp4 import (
     create_convrot_nvfp4_tensor,
     is_convrot_nvfp4_tensor,
-    require_convrot_nvfp4_add,
-    require_convrot_nvfp4_addmm,
     require_convrot_nvfp4_tensor,
     validate_layout,
 )
@@ -128,7 +126,7 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
         rounding_seed: int | None = None,
     ) -> None:
         """Delegate a validated staged update to Piper Kernels."""
-        require_convrot_nvfp4_addmm(target).addmm_(
+        require_convrot_nvfp4_tensor(target).addmm_(
             b,
             a,
             alpha=strength,
@@ -145,7 +143,7 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
         rounding_seed: int | None = None,
     ) -> None:
         del rounding_seed
-        require_convrot_nvfp4_addmm(target)
+        require_convrot_nvfp4_tensor(target)
 
     @staticmethod
     def validate_dense_merge_target(
@@ -155,7 +153,7 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
     ) -> bool:
         """Validate kernel support without staging the dense update."""
         del rounding_seed
-        require_convrot_nvfp4_add(target)
+        require_convrot_nvfp4_tensor(target)
         return False
 
     @staticmethod
@@ -167,7 +165,7 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
         rounding_seed: int | None = None,
     ) -> None:
         """Delegate a validated dense update to Piper Kernels."""
-        require_convrot_nvfp4_add(target).add_(
+        require_convrot_nvfp4_tensor(target).add_(
             update,
             alpha=strength,
             rounding_seed=rounding_seed,

@@ -25,7 +25,6 @@ import torch
 from ._piper_convrot_int8 import (
     create_convrot_int8_tensor,
     is_convrot_int8_tensor,
-    require_convrot_int8_add,
     require_convrot_int8_tensor,
     validate_layout,
 )
@@ -41,7 +40,7 @@ class _PiperConvRotInt8Meta:
 
 
 class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
-    """Adapter for ``piper_kernels.linear.convrot.ConvRotInt8Tensor`` weights."""
+    """Adapter for ``piper_kernels.weights.convrot.int8.ConvRotInt8Tensor`` weights."""
 
     _TAG = "piper-kernels-convrot-int8"
     _STORAGE_NAMES = ("qdata", "scale")
@@ -134,7 +133,7 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
     ) -> bool:
         """Validate kernel support without staging the dense update."""
         del rounding_seed
-        require_convrot_int8_add(target)
+        require_convrot_int8_tensor(target)
         return False
 
     @staticmethod
@@ -146,7 +145,7 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
         rounding_seed: int | None = None,
     ) -> None:
         """Delegate a validated dense update to Piper Kernels."""
-        require_convrot_int8_add(target).add_(
+        require_convrot_int8_tensor(target).add_(
             update,
             alpha=strength,
             rounding_seed=rounding_seed,

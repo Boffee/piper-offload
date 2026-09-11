@@ -45,7 +45,7 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def _convrot_cls() -> type:
-    module = pytest.importorskip("piper_kernels.linear.convrot")
+    module = pytest.importorskip("piper_kernels.weights.convrot.int8")
     return module.ConvRotInt8Tensor
 
 
@@ -624,17 +624,6 @@ class TestPiperConvRotInt8Adapter:
             host_param.copy_to_cpu(state)
         with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
             host_param.validate_parameter_data_swap_target()
-
-    def test_dense_merge_fails_clearly_when_kernel_add_is_unavailable(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        convrot_cls = _convrot_cls()
-        convrot = _make_convrot()
-        monkeypatch.delattr(convrot_cls, "add_")
-
-        with pytest.raises(RuntimeError, match=r"piper-kernels>=0\.7\.0rc1"):
-            PiperConvRotInt8Adapter.validate_dense_merge_target(convrot)
 
     @CUDA
     def test_allocate_copy_and_reconstruct_gpu_wrapper(self) -> None:

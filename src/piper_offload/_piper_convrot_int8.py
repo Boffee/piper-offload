@@ -24,7 +24,7 @@ LAYOUT_ATTRS = (
 
 
 try:
-    from piper_kernels.linear.convrot import ConvRotInt8Tensor
+    from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
     PIPER_CONVROT_AVAILABLE = True
 except ImportError:
@@ -40,17 +40,9 @@ def is_convrot_int8_tensor(t: object) -> bool:
 def require_convrot_int8_tensor(t: torch.Tensor) -> Any:  # noqa: ANN401
     """Return ``t`` as a validated ConvRot tensor, or raise."""
     if not is_convrot_int8_tensor(t):
-        raise TypeError(f"expected piper_kernels.linear.convrot.ConvRotInt8Tensor, got {type(t).__name__}")
+        raise TypeError(f"expected piper_kernels.weights.convrot.int8.ConvRotInt8Tensor, got {type(t).__name__}")
     validate_layout(t)
     return t
-
-
-def require_convrot_int8_add(t: torch.Tensor) -> Any:  # noqa: ANN401
-    """Require the kernel-owned ConvRot INT8 dense-update API."""
-    tensor = require_convrot_int8_tensor(t)
-    if ConvRotInt8Tensor.add_ is torch.Tensor.add_:
-        raise RuntimeError("ConvRot INT8 dense merge requires piper-kernels>=0.7.0rc1; upgrade piper-kernels")
-    return tensor
 
 
 def create_convrot_int8_tensor(

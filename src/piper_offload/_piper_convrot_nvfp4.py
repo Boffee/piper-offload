@@ -20,7 +20,7 @@ LAYOUT_ATTRS = (*NVFP4_LAYOUT_ATTRS, "group_size")
 
 
 try:
-    from piper_kernels.linear.convrot.nvfp4 import ConvRotNVFP4Tensor
+    from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 
     PIPER_CONVROT_NVFP4_AVAILABLE = True
 except ImportError:
@@ -36,27 +36,9 @@ def is_convrot_nvfp4_tensor(t: object) -> bool:
 def require_convrot_nvfp4_tensor(t: torch.Tensor) -> Any:  # noqa: ANN401
     """Return ``t`` as a validated ConvRot NVFP4 tensor, or raise."""
     if not is_convrot_nvfp4_tensor(t):
-        raise TypeError(f"expected piper_kernels.linear.convrot.nvfp4.ConvRotNVFP4Tensor, got {type(t).__name__}")
+        raise TypeError(f"expected piper_kernels.weights.convrot.nvfp4.ConvRotNVFP4Tensor, got {type(t).__name__}")
     validate_layout(t)
     return t
-
-
-def require_convrot_nvfp4_addmm(t: torch.Tensor) -> Any:  # noqa: ANN401
-    """Require the kernel-owned ConvRot NVFP4 in-place update API."""
-    tensor = require_convrot_nvfp4_tensor(t)
-    if ConvRotNVFP4Tensor.addmm_ is torch.Tensor.addmm_:
-        raise RuntimeError(
-            "ConvRot NVFP4 LoRA merge requires piper-kernels>=0.6.1; upgrade piper-kernels or use routed LoRA"
-        )
-    return tensor
-
-
-def require_convrot_nvfp4_add(t: torch.Tensor) -> Any:  # noqa: ANN401
-    """Require the kernel-owned ConvRot NVFP4 dense-update API."""
-    tensor = require_convrot_nvfp4_tensor(t)
-    if ConvRotNVFP4Tensor.add_ is torch.Tensor.add_:
-        raise RuntimeError("ConvRot NVFP4 dense merge requires piper-kernels>=0.7.0rc1; upgrade piper-kernels")
-    return tensor
 
 
 def create_convrot_nvfp4_tensor(  # noqa: PLR0913

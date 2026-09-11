@@ -1370,8 +1370,11 @@ direct conversion requires
 
 ## Piper ConvRot INT8 support
 
+The Piper adapters require a matching Piper Kernels build that exports its tensors
+from `piper_kernels.weights`. Earlier tensor import paths are no longer supported.
+
 Piper ConvRot weights
-(`piper_kernels.linear.convrot.ConvRotInt8Tensor`) are handled when the
+(`piper_kernels.weights.convrot.int8.ConvRotInt8Tensor`) are handled when the
 `convrot` optional extra is installed. `piper-kernels` owns the tensor semantics
 plus reference and optimized execution backends; Piper Offload owns only the
 built-in `PiperConvRotInt8Adapter`. `HostParam` captures the INT8 `qdata` and
@@ -1396,7 +1399,7 @@ optional suite.
 ## Piper ConvRot NVFP4 support
 
 Piper ConvRot NVFP4 weights
-(`piper_kernels.linear.convrot.nvfp4.ConvRotNVFP4Tensor`) use a dedicated
+(`piper_kernels.weights.convrot.nvfp4.ConvRotNVFP4Tensor`) use a dedicated
 adapter selected before the broader TorchAO NVFP4 adapter. It captures the same
 packed E2M1 data, FP8 block scales, and optional global scales as ordinary
 NVFP4 while additionally preserving the rotation group through identity,

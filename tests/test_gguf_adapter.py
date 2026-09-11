@@ -216,7 +216,7 @@ class TestPermanentMerge:
 class TestDirectConversion:
     @CUDA
     def test_external_parameter_activates_as_convrot(self) -> None:
-        from piper_kernels.linear.convrot import ConvRotInt8Tensor
+        from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
         weight, packed, quant_type = _quantized_weight(1)
         model = nn.Linear(64, 64, bias=False)
@@ -241,7 +241,7 @@ class TestDirectConversion:
 
     @CUDA
     def test_parameter_value_activates_as_convrot(self) -> None:
-        from piper_kernels.linear.convrot import ConvRotInt8Tensor
+        from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
         weight, packed, quant_type = _quantized_weight(2)
         model = nn.Linear(
@@ -279,7 +279,7 @@ class TestDirectConversion:
 
     @CUDA
     def test_scaled_parameter_value_uses_convrot_dense_merge(self) -> None:
-        from piper_kernels.linear.convrot import ConvRotInt8Tensor
+        from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
         weight, packed, quant_type = _quantized_weight(3)
         model = nn.Linear(
@@ -318,7 +318,7 @@ class TestDirectConversion:
 
     @CUDA
     def test_conversion_reuses_storage(self) -> None:
-        from piper_kernels.linear.convrot import ConvRotInt8Tensor
+        from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
         first, first_packed, first_quant_type = _quantized_weight(4)
         second, second_packed, second_quant_type = _quantized_weight(5)
@@ -354,7 +354,7 @@ class TestDirectConversion:
 
     @CUDA
     def test_lora_merges_into_converted_target(self) -> None:
-        from piper_kernels.linear.convrot import ConvRotInt8Tensor
+        from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
         weight, packed, quant_type = _quantized_weight(6)
         assert isinstance(weight, nn.Parameter)
@@ -390,7 +390,7 @@ class TestDirectConversion:
 
     @CUDA
     def test_dense_delta_merges_into_converted_target(self) -> None:
-        from piper_kernels.linear.convrot import ConvRotInt8Tensor
+        from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
         weight, packed, quant_type = _quantized_weight(7)
         assert isinstance(weight, nn.Parameter)
