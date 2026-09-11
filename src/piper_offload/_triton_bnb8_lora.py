@@ -142,8 +142,8 @@ def _quantize_kernel(
             quantized,
             rounding_seed,
             offsets,
-            -127,
-            127,
+            QMIN=tl.constexpr(-127),
+            QMAX=tl.constexpr(127),
         )
     quantized = tl.minimum(tl.maximum(quantized, -127.0), 127.0)
     tl.store(output_cb_ptr + offsets, quantized, mask=mask)

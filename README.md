@@ -8,7 +8,7 @@ Piper Offload is self-contained and library-friendly: it has no required
 dependency beyond `torch`. Optional integrations support `bitsandbytes`,
 `optimum.quanto`, `gguf`, `piper-kernels`, and `torchao` quantized models.
 
-Requires Python 3.14 or newer and PyTorch 2.13.
+Requires Python 3.14 or newer and PyTorch 2.14.
 
 ## Installation
 

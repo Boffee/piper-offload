@@ -190,7 +190,8 @@ def _merge_group_kernel(
         merged = merged.to(tl.bfloat16)
 
     absolute = tl.where(mask, tl.abs(merged.to(tl.float32)), 0.0)
-    output_scale = tl.max(absolute, axis=1) / FP8_LIMIT
+    max_abs: tl.tensor = tl.max(absolute, axis=1)  # pyright: ignore[reportAssignmentType]
+    output_scale = max_abs / FP8_LIMIT
     if COMPUTE_DTYPE == 0:
         output_scale = output_scale.to(tl.float16).to(tl.float32)
     elif COMPUTE_DTYPE == 1:
@@ -250,7 +251,7 @@ def _reduce_tensor_scale_kernel(
         mask=offsets < NUM_VALUES,
         other=0.0,
     )
-    max_abs = tl.max(values, axis=0)
+    max_abs: tl.tensor = tl.max(values, axis=0)  # pyright: ignore[reportAssignmentType]
     scale = max_abs / FP8_LIMIT
     if COMPUTE_DTYPE == 0:
         scale = scale.to(tl.float16).to(tl.float32)
@@ -276,7 +277,7 @@ def _reduce_row_scale_kernel(
         mask=offsets < NUM_TILES_N,
         other=0.0,
     )
-    max_abs = tl.max(values, axis=0)
+    max_abs: tl.tensor = tl.max(values, axis=0)  # pyright: ignore[reportAssignmentType]
     scale = max_abs / FP8_LIMIT
     if COMPUTE_DTYPE == 0:
         scale = scale.to(tl.float16).to(tl.float32)

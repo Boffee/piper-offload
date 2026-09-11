@@ -274,7 +274,7 @@ def _global_scale_kernel(
         mask=offsets < NUM_VALUES,
         other=0.0,
     )
-    max_abs = tl.max(values, axis=0)
+    max_abs: tl.tensor = tl.max(values, axis=0)  # pyright: ignore[reportAssignmentType]
     global_scale = max_abs / 2688.0
     global_scale = tl.maximum(global_scale, 1.1920928955078125e-07)
     tl.store(output_global_scale_ptr, global_scale)
@@ -327,7 +327,7 @@ def _quantize_kernel(
         BLOCK_R,
     )
     merged_f32 = merged.to(tl.float32)
-    max_abs = tl.max(
+    max_abs: tl.tensor = tl.max(  # pyright: ignore[reportAssignmentType]
         tl.where(row_mask[:, None], tl.abs(merged_f32), 0.0),
         axis=1,
     )
