@@ -1,7 +1,7 @@
 """Internal optional-import boundary for Piper ConvRot INT8 support.
 
 ``piper-kernels`` owns the :class:`ConvRotInt8Tensor` representation and its
-linear, in-place ``addmm_``, and in-place ``add_`` execution backends. Piper
+linear, convolution, and matrix-update execution backends. Piper
 Offload uses the public wrapper constructor and storage fields to preserve the
 representation during movement; its adapter delegates LoRA and dense merges,
 including optional stochastic rounding, to those public operations.
@@ -17,14 +17,16 @@ import torch
 LAYOUT_ATTRS = (
     "qdata",
     "scale",
+    "act_per_tensor_scale",
     "group_size",
     "dtype",
+    "transposed",
 )
 """Public ``ConvRotInt8Tensor`` fields preserved by Piper Offload."""
 
 
 try:
-    from piper_kernels.linear.convrot import ConvRotInt8Tensor
+    from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
     PIPER_CONVROT_AVAILABLE = True
 except ImportError:
@@ -40,16 +42,16 @@ def is_convrot_int8_tensor(t: object) -> bool:
 def require_convrot_int8_tensor(t: torch.Tensor) -> Any:  # noqa: ANN401
     """Return ``t`` as a validated ConvRot tensor, or raise."""
     if not is_convrot_int8_tensor(t):
-        raise TypeError(f"expected piper_kernels.linear.convrot.ConvRotInt8Tensor, got {type(t).__name__}")
+        raise TypeError(f"expected piper_kernels.weights.convrot.int8.ConvRotInt8Tensor, got {type(t).__name__}")
     validate_layout(t)
     return t
 
 
-def require_convrot_int8_add(t: torch.Tensor) -> Any:  # noqa: ANN401
-    """Require the kernel-owned ConvRot INT8 dense-update API."""
+def require_convrot_int8_matrix(t: torch.Tensor) -> Any:  # noqa: ANN401
+    """Require a canonical matrix weight before staging a weight update."""
     tensor = require_convrot_int8_tensor(t)
-    if ConvRotInt8Tensor.add_ is torch.Tensor.add_:
-        raise RuntimeError("ConvRot INT8 dense merge requires piper-kernels>=0.7.0rc1; upgrade piper-kernels")
+    if tensor.ndim != 2:
+        raise NotImplementedError("ConvRot INT8 weight updates require a 2-D weight")
     return tensor
 
 
@@ -58,15 +60,17 @@ def create_convrot_int8_tensor(
     scale: torch.Tensor,
     group_size: int,
     dtype: torch.dtype,
+    act_per_tensor_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Rebuild a ConvRot wrapper from its public storage and metadata."""
+    """Rebuild a ConvRot wrapper from canonical storage without copying or repacking."""
     if not PIPER_CONVROT_AVAILABLE:
         raise RuntimeError("piper-kernels[convrot] is required to create a ConvRotInt8Tensor")
-    return ConvRotInt8Tensor.from_quantized(
+    return ConvRotInt8Tensor(
         qdata,
         scale,
         group_size=group_size,
-        logical_dtype=dtype,
+        dtype=dtype,
+        act_per_tensor_scale=act_per_tensor_scale,
     )
 
 
@@ -81,13 +85,14 @@ def validate_layout(t: torch.Tensor) -> None:
             "piper-offload to match."
         )
 
-    # The public constructor is also piper-kernels' storage validator. Rebuild
-    # a cheap wrapper so mutations to public fields cannot enter the offload
-    # path with invalid qdata/scale/group metadata.
+    # Use the same strict, storage-preserving constructor as reconstruction.
     wrapped: Any = t
+    if wrapped.transposed:
+        raise NotImplementedError("ConvRot INT8 offload requires an untransposed weight")
     create_convrot_int8_tensor(
         wrapped.qdata,
         wrapped.scale,
         wrapped.group_size,
         wrapped.dtype,
+        wrapped.act_per_tensor_scale,
     )

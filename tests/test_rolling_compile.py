@@ -295,7 +295,7 @@ class TestRollingCompile:
 
     @CUDA
     def test_piper_convrot_structured_slots_match_compiled(self) -> None:
-        convrot = pytest.importorskip("piper_kernels.linear.convrot")
+        convrot = pytest.importorskip("piper_kernels.weights.convrot.int8")
         torch.manual_seed(10)
 
         blocks: list[nn.Module] = []
@@ -318,7 +318,8 @@ class TestRollingCompile:
         rolling_model = copy.deepcopy(baseline_model)
         lora = _lora(3, 64)
         x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
-        compile_options = convrot.convrot_int8_compile_options()
+        compiler = pytest.importorskip("piper_kernels.linear.convrot")
+        compile_options = compiler.convrot_int8_compile_options()
 
         expected = _compiled_output(
             baseline_model,

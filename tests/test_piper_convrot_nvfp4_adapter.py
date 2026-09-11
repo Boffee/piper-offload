@@ -47,8 +47,8 @@ SM120 = pytest.mark.skipif(
 
 def _modules() -> tuple[Any, Any, Any, Any, Any]:
     nvfp4 = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
-    convrot = pytest.importorskip("piper_kernels.linear.convrot.nvfp4")
-    rotation = pytest.importorskip("piper_kernels.linear.convrot._rotation")
+    convrot = pytest.importorskip("piper_kernels.weights.convrot.nvfp4")
+    rotation = pytest.importorskip("piper_kernels.weights.convrot._rotation")
     return (
         nvfp4.NVFP4Tensor,
         nvfp4.QuantizeTensorToNVFP4Kwargs,
@@ -361,33 +361,6 @@ class TestPiperConvRotNVFP4Adapter:
 
         with pytest.raises(ValueError, match="group size"):
             PiperConvRotNVFP4Adapter.matches(mutated)
-
-    def test_merge_fails_clearly_when_kernel_addmm_is_unavailable(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        convrot_cls = _modules()[3]
-        convrot, _dense = _make_convrot_nvfp4()
-        monkeypatch.delattr(convrot_cls, "addmm_")
-
-        with pytest.raises(RuntimeError, match=r"piper-kernels>=0\.6\.1"):
-            PiperConvRotNVFP4Adapter.validate_lora_merge(
-                convrot,
-                torch.empty(16, 4, dtype=torch.bfloat16),
-                torch.empty(4, 64, dtype=torch.bfloat16),
-                1.0,
-            )
-
-    def test_dense_merge_fails_clearly_when_kernel_add_is_unavailable(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        convrot_cls = _modules()[3]
-        convrot, _dense = _make_convrot_nvfp4()
-        monkeypatch.delattr(convrot_cls, "add_")
-
-        with pytest.raises(RuntimeError, match=r"piper-kernels>=0\.7\.0rc1"):
-            PiperConvRotNVFP4Adapter.validate_dense_merge_target(convrot)
 
     @SM120
     def test_model_offloader_cuda_forward_preserves_convrot_nvfp4(self) -> None:

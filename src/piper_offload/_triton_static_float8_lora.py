@@ -123,7 +123,7 @@ def _reduce_scale_kernel(
         mask=offsets < NUM_TILES,
         other=0.0,
     )
-    max_abs = tl.max(values, axis=0)
+    max_abs: tl.tensor = tl.max(values, axis=0)  # pyright: ignore[reportAssignmentType]
     scale = max_abs / FP8_LIMIT
     if COMPUTE_DTYPE == 0:
         scale = scale.to(tl.float16).to(tl.float32)

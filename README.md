@@ -8,7 +8,7 @@ Piper Offload is self-contained and library-friendly: it has no required
 dependency beyond `torch`. Optional integrations support `bitsandbytes`,
 `optimum.quanto`, `gguf`, `piper-kernels`, and `torchao` quantized models.
 
-Requires Python 3.14 or newer and PyTorch 2.13.
+Requires Python 3.14 or newer and PyTorch 2.14.
 
 ## Installation
 
@@ -1370,8 +1370,11 @@ direct conversion requires
 
 ## Piper ConvRot INT8 support
 
+The Piper adapters require a matching Piper Kernels build that exports its tensors
+from `piper_kernels.weights`. Earlier tensor import paths are no longer supported.
+
 Piper ConvRot weights
-(`piper_kernels.linear.convrot.ConvRotInt8Tensor`) are handled when the
+(`piper_kernels.weights.convrot.int8.ConvRotInt8Tensor`) are handled when the
 `convrot` optional extra is installed. `piper-kernels` owns the tensor semantics
 plus reference and optimized execution backends; Piper Offload owns only the
 built-in `PiperConvRotInt8Adapter`. `HostParam` captures the INT8 `qdata` and
@@ -1386,17 +1389,27 @@ dense + LoRA updates are combined once and delegated to
 stochastic-rounding seed and preserve the wrapper and its storage identities.
 Piper uses its optimized Triton backend on supported CUDA devices and its
 portable reference backend elsewhere. Use routed LoRA when the base must
-remain untouched. This integration requires Piper Kernels 0.7.0rc1 or newer.
+remain untouched.
 The base package remains
 importable without `piper-kernels`; use
 `uv sync --extra convrot --group dev` and then
 `pytest tests/test_piper_convrot_int8_adapter.py -q -rs` to exercise the
 optional suite.
 
+Static-scale Conv3D weights use the same `ConvRotInt8Tensor` adapter. It preserves
+`qdata`, `scale`, and optional FP32 `act_per_tensor_scale` through mmap host
+capture, device allocation, copying, reconstruction, identity, and cache-byte
+accounting. The logical weight shape is `[out, in, 3, 3, 3]`; the kernel package
+owns its packed layout and convolution execution. Offload requires contiguous
+storage and an untransposed logical weight; validation never repacks storage.
+Dense and LoRA updates remain 2-D operations and are rejected for convolution
+weights before staging. This requires a matching Piper Kernels build exposing the
+`act_per_tensor_scale` field and Conv3D weight support.
+
 ## Piper ConvRot NVFP4 support
 
 Piper ConvRot NVFP4 weights
-(`piper_kernels.linear.convrot.nvfp4.ConvRotNVFP4Tensor`) use a dedicated
+(`piper_kernels.weights.convrot.nvfp4.ConvRotNVFP4Tensor`) use a dedicated
 adapter selected before the broader TorchAO NVFP4 adapter. It captures the same
 packed E2M1 data, FP8 block scales, and optional global scales as ordinary
 NVFP4 while additionally preserving the rotation group through identity,

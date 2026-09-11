@@ -278,8 +278,8 @@ def _merge_quantize_kernel(
         output_codes = _nearest_sorted_code(
             normalized,
             code_ptr,
-            15,
-            4,
+            MAX_INDEX=tl.constexpr(15),
+            STEPS=tl.constexpr(4),
         )
         if STOCHASTIC:
             logical_offsets = offsets_m[:, None] * N + offsets_n[None, :]
@@ -289,8 +289,8 @@ def _merge_quantize_kernel(
                 code_ptr,
                 rounding_seed,
                 logical_offsets,
-                15,
-                4,
+                MAX_INDEX=tl.constexpr(15),
+                STEPS=tl.constexpr(4),
             )
     else:
         output_codes = _nearest_fp4_code(normalized)
@@ -380,7 +380,7 @@ def _quantize_nested_scales_kernel(
         tl.maximum(centered / safe_absmax, -1.0),
         1.0,
     )
-    quantized = _nearest_sorted_code(scaled, code_ptr, 255, 8)
+    quantized = _nearest_sorted_code(scaled, code_ptr, MAX_INDEX=tl.constexpr(255), STEPS=tl.constexpr(8))
     tl.store(output_qabsmax_ptr + indices, quantized, mask=mask)
     tl.store(output_nested_absmax_ptr + block, nested_absmax)
 

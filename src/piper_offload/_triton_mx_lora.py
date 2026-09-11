@@ -284,7 +284,7 @@ def _merge_mx_kernel(
         low, high = tl.split(codes.reshape(BLOCK_M, 16, 2))
         packed = low | (high << 4)
         tl.store(
-            qdata_ptr + packed_offsets,
+            qdata_ptr + packed_offsets,  # pyright: ignore[reportPossiblyUnboundVariable]
             packed,
             mask=row_mask[:, None],
         )
@@ -299,7 +299,7 @@ def _merge_mx_kernel(
                 MAX_POS,
             )
         tl.store(
-            qdata_ptr + qdata_offsets,
+            qdata_ptr + qdata_offsets,  # pyright: ignore[reportPossiblyUnboundVariable]
             normalized,
             mask=row_mask[:, None],
         )

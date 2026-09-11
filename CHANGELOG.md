@@ -5,6 +5,19 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Preserve static ConvRot INT8 convolution activation scales through host capture,
+  mmap reconstruction, storage accounting, identity, and GPU transfer. Convolution
+  weights use the shared adapter and reject unsupported matrix-only updates.
+
+### Changed
+
+- Import Piper tensor representations from `piper_kernels.weights` and require
+  Piper Kernels 0.7.0rc6 for optional Piper backends.
+- Move the supported PyTorch line to 2.14 and Triton to 3.8, including Windows.
+  Update Triton helper annotations for the new type declarations.
+
 ## [0.9.0] - 2026-09-05
 
 Promote the 0.9.0 release candidates to stable, including the changes documented

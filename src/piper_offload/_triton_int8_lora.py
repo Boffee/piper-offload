@@ -120,8 +120,8 @@ def _block_stats_kernel(
         mask=block_offsets < BLOCK_NUMEL,
         other=0.0,
     ).to(tl.float32)
-    min_value = tl.min(tl.minimum(values, 0.0), axis=0)
-    max_value = tl.max(tl.maximum(values, 0.0), axis=0)
+    min_value: tl.tensor = tl.min(tl.minimum(values, 0.0), axis=0)  # pyright: ignore[reportAssignmentType]
+    max_value: tl.tensor = tl.max(tl.maximum(values, 0.0), axis=0)  # pyright: ignore[reportAssignmentType]
     tl.store(partial_min_ptr + pid, min_value)
     tl.store(partial_max_ptr + pid, max_value)
 
@@ -143,11 +143,11 @@ def _choose_qparams_kernel(
     chunk_offsets = tl.arange(0, BLOCK_SIZE)
     partial_offsets = qparam_id * CHUNKS_PER_BLOCK + chunk_offsets
     mask = chunk_offsets < CHUNKS_PER_BLOCK
-    min_value = tl.min(
+    min_value: tl.tensor = tl.min(  # pyright: ignore[reportAssignmentType]
         tl.load(partial_min_ptr + partial_offsets, mask=mask, other=0.0),
         axis=0,
     )
-    max_value = tl.max(
+    max_value: tl.tensor = tl.max(  # pyright: ignore[reportAssignmentType]
         tl.load(partial_max_ptr + partial_offsets, mask=mask, other=0.0),
         axis=0,
     )

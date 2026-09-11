@@ -115,7 +115,7 @@ def _weight(rows: int, cols: int, representation: str, dtype: torch.dtype) -> nn
         bound = 1 / math.sqrt(cols)
         data = torch.empty(rows, cols, dtype=dtype).uniform_(-bound, bound)
     else:
-        from piper_kernels.linear.convrot import ConvRotInt8Tensor  # noqa: PLC0415
+        from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor  # noqa: PLC0415
 
         # Construct valid synthetic packed weights directly, avoiding a dense
         # quantization scratch model. Scale metadata is part of the pin budget.
