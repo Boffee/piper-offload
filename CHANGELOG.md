@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.10.0rc1] - 2026-09-11
+
 ### Added
 
 - Preserve static ConvRot INT8 convolution activation scales through host capture,
