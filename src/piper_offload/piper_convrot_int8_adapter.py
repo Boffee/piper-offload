@@ -25,6 +25,7 @@ import torch
 from ._piper_convrot_int8 import (
     create_convrot_int8_tensor,
     is_convrot_int8_tensor,
+    require_convrot_int8_matrix,
     require_convrot_int8_tensor,
     validate_layout,
 )
@@ -43,7 +44,7 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
     """Adapter for ``piper_kernels.weights.convrot.int8.ConvRotInt8Tensor`` weights."""
 
     _TAG = "piper-kernels-convrot-int8"
-    _STORAGE_NAMES = ("qdata", "scale")
+    _STORAGE_NAMES = ("qdata", "scale", "act_per_tensor_scale")
 
     @staticmethod
     def _is_tensor(t: torch.Tensor) -> bool:
@@ -59,7 +60,7 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
 
     @staticmethod
     def _storage_of(t: Any) -> tuple[torch.Tensor | None, ...]:  # noqa: ANN401
-        return (t.qdata, t.scale)
+        return (t.qdata, t.scale, t.act_per_tensor_scale)
 
     @staticmethod
     def _meta_of(t: Any) -> _PiperConvRotInt8Meta:  # noqa: ANN401
@@ -73,7 +74,7 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
         storage: tuple[torch.Tensor | None, ...],
         meta: _PiperConvRotInt8Meta,
     ) -> torch.Tensor:
-        qdata, scale = storage
+        qdata, scale, act_per_tensor_scale = storage
         assert qdata is not None
         assert scale is not None
         return create_convrot_int8_tensor(
@@ -81,6 +82,7 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
             scale,
             meta.group_size,
             meta.dtype,
+            act_per_tensor_scale,
         )
 
     @staticmethod
@@ -106,7 +108,7 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a validated staged update into ConvRot INT8 storage."""
-        require_convrot_int8_tensor(target).addmm_(
+        require_convrot_int8_matrix(target).addmm_(
             b,
             a,
             alpha=strength,
@@ -123,7 +125,7 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
         rounding_seed: int | None = None,
     ) -> None:
         del rounding_seed
-        require_convrot_int8_tensor(target)
+        require_convrot_int8_matrix(target)
 
     @staticmethod
     def validate_dense_merge_target(
@@ -133,7 +135,7 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
     ) -> bool:
         """Validate kernel support without staging the dense update."""
         del rounding_seed
-        require_convrot_int8_tensor(target)
+        require_convrot_int8_matrix(target)
         return False
 
     @staticmethod
@@ -145,7 +147,7 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
         rounding_seed: int | None = None,
     ) -> None:
         """Delegate a validated dense update to Piper Kernels."""
-        require_convrot_int8_tensor(target).add_(
+        require_convrot_int8_matrix(target).add_(
             update,
             alpha=strength,
             rounding_seed=rounding_seed,

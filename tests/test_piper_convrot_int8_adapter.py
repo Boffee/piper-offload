@@ -132,14 +132,15 @@ class TestPiperConvRotInt8Adapter:
         assert convrot.device.type == "meta"
         assert signature[0] == (8, 64)
         assert signature[1] is torch.bfloat16
-        assert signature[-2] == (
+        assert signature[-3] == (
             "qdata",
             ((8, 64), torch.int8, (64, 1)),
         )
-        assert signature[-1] == (
+        assert signature[-2] == (
             "scale",
             ((8, 1), torch.float32, (1, 1)),
         )
+        assert signature[-1] == ("act_per_tensor_scale", None)
 
     def test_capture_preserves_storage_metadata_shape_and_cache_bytes(self) -> None:
         convrot_cls = _convrot_cls()

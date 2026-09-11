@@ -1389,12 +1389,22 @@ dense + LoRA updates are combined once and delegated to
 stochastic-rounding seed and preserve the wrapper and its storage identities.
 Piper uses its optimized Triton backend on supported CUDA devices and its
 portable reference backend elsewhere. Use routed LoRA when the base must
-remain untouched. This integration requires Piper Kernels 0.7.0rc1 or newer.
+remain untouched.
 The base package remains
 importable without `piper-kernels`; use
 `uv sync --extra convrot --group dev` and then
 `pytest tests/test_piper_convrot_int8_adapter.py -q -rs` to exercise the
 optional suite.
+
+Static-scale Conv3D weights use the same `ConvRotInt8Tensor` adapter. It preserves
+`qdata`, `scale`, and optional FP32 `act_per_tensor_scale` through mmap host
+capture, device allocation, copying, reconstruction, identity, and cache-byte
+accounting. The logical weight shape is `[out, in, 3, 3, 3]`; the kernel package
+owns its packed layout and convolution execution. Offload requires contiguous
+storage and an untransposed logical weight; validation never repacks storage.
+Dense and LoRA updates remain 2-D operations and are rejected for convolution
+weights before staging. This requires a matching Piper Kernels build exposing the
+`act_per_tensor_scale` field and Conv3D weight support.
 
 ## Piper ConvRot NVFP4 support
 
