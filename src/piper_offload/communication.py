@@ -119,9 +119,11 @@ def _create_relay_group(backend: _DistributedBackendOptions, options: RelayOptio
 
 
 class _RelayProcessGroup(dist.ProcessGroup):
+    # Implement c10d's tensor-list/options virtual methods. Its Python
+    # convenience overloads (tensor/root/timeout) are not backend entry points.
     def __init__(self, store: dist.Store, rank: int, size: int, timeout: timedelta, options: RelayOptions) -> None:
         # The rank/size overload constructs the Python trampoline. The
-        # store/rank/size overload in PyTorch 2.13 cannot construct subclasses.
+        # store/rank/size overload cannot construct subclasses.
         super().__init__(rank, size)  # type: ignore[call-arg]
         self._collective_lock = threading.Lock()
         self._staging_bytes = options.staging_bytes
@@ -200,7 +202,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
         size = self._staging_bytes if self._shared is None else self._shared.capacity * self._shared.buffer_count
         return size // (16 * slots * self._pipeline_buffers) * 16
 
-    def allreduce(
+    def allreduce(  # type: ignore[override]
         self,
         tensors: list[torch.Tensor],
         opts: dist.AllreduceOptions | None = None,
@@ -247,11 +249,12 @@ class _RelayProcessGroup(dist.ProcessGroup):
                     accumulator.copy_(host)
                 else:
                     accumulator = host
-                self._cpu_group.allreduce([accumulator], options).wait()
+                # PyTorch's Gloo stubs omit the collective bindings.
+                self._cpu_group.allreduce([accumulator], options).wait()  # type: ignore[attr-defined]
                 if low_precision:
                     host.copy_(accumulator)
 
-    def broadcast(
+    def broadcast(  # type: ignore[override]
         self,
         tensors: list[torch.Tensor],
         opts: dist.BroadcastOptions | None = None,
@@ -271,10 +274,10 @@ class _RelayProcessGroup(dist.ProcessGroup):
                     for chunk in chunks:
                         if chunk.inputs:
                             chunk.outputs[0].copy_(chunk.inputs[0])
-                        self._cpu_group.broadcast(chunk.outputs, options).wait()
+                        self._cpu_group.broadcast(chunk.outputs, options).wait()  # type: ignore[attr-defined]
         return _CompletedWork([tensor])
 
-    def scatter(
+    def scatter(  # type: ignore[override]
         self,
         output_tensors: list[torch.Tensor],
         input_tensors: list[list[torch.Tensor]],
@@ -306,10 +309,12 @@ class _RelayProcessGroup(dist.ProcessGroup):
             else:
                 with closing(self._copy_chunks(sources, [output], slots=self.size() + 1)) as chunks:
                     for chunk in chunks:
-                        self._cpu_group.scatter(chunk.outputs, [chunk.inputs] if sources else [], options).wait()
+                        self._cpu_group.scatter(  # type: ignore[attr-defined]
+                            chunk.outputs, [chunk.inputs] if sources else [], options,
+                        ).wait()
         return _CompletedWork([output])
 
-    def allgather(
+    def allgather(  # type: ignore[override]
         self,
         output_tensors: list[list[torch.Tensor]],
         input_tensors: list[torch.Tensor],
@@ -347,30 +352,30 @@ class _RelayProcessGroup(dist.ProcessGroup):
 
     def all_gather_single_coalesced(
         self,
-        output_tensors: list[torch.Tensor],
-        input_tensors: list[torch.Tensor],
+        output_lists: list[torch.Tensor],
+        input_list: list[torch.Tensor],
         opts: AllgatherOptions | None = None,
     ) -> dist.Work:
         options = opts if opts is not None else AllgatherOptions()
-        if len(output_tensors) != len(input_tensors) or not input_tensors:
+        if len(output_lists) != len(input_list) or not input_list:
             raise ValueError("piper_relay all-gather requires matching nonempty input/output lists")
-        _validate_tensors([*input_tensors, *output_tensors])
-        _validate_disjoint(output_tensors)
-        for i, output in enumerate(output_tensors):
-            for j, source in enumerate(input_tensors):
+        _validate_tensors([*input_list, *output_lists])
+        _validate_disjoint(output_lists)
+        for i, output in enumerate(output_lists):
+            for j, source in enumerate(input_list):
                 if i != j and _overlap(output, source):
                     raise ValueError("piper_relay batched outputs must not overlap another input")
         # Validate the whole batch before starting communication or mutation.
         destinations: list[list[torch.Tensor]] = []
-        for output, source in zip(output_tensors, input_tensors, strict=True):
+        for output, source in zip(output_lists, input_list, strict=True):
             _validate_pair(output, source, source.numel() * self.size())
             views = list(output.view(self.size(), source.numel()).unbind(0))
             self._validate_gather_aliases(source, views)
             destinations.append(views)
-        with self._collective(input_tensors[0]):
-            for source, outputs in zip(input_tensors, destinations, strict=True):
+        with self._collective(input_list[0]):
+            for source, outputs in zip(input_list, destinations, strict=True):
                 self._gather(source, outputs, options)
-        return _CompletedWork(output_tensors)
+        return _CompletedWork(output_lists)
 
     def _validate_gather_aliases(self, source: torch.Tensor, outputs: list[torch.Tensor]) -> None:
         for rank, output in enumerate(outputs):
@@ -383,7 +388,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
             return
         with closing(self._copy_chunks([source], outputs)) as chunks:
             for chunk in chunks:
-                self._cpu_group.allgather([chunk.outputs], chunk.inputs, options).wait()
+                self._cpu_group.allgather([chunk.outputs], chunk.inputs, options).wait()  # type: ignore[attr-defined]
 
     def _copy_chunks(
         self, inputs: list[torch.Tensor], outputs: list[torch.Tensor], *, slots: int | None = None,

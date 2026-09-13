@@ -156,13 +156,14 @@ def _local_shape_and_offsets(
                 f"{placement!r}."
             )
 
-        tensor_dim = placement.dim
+        shard = cast(Any, placement)
+        tensor_dim = shard.dim
         if tensor_dim < 0:
             tensor_dim += len(global_shape)
         if not 0 <= tensor_dim < len(global_shape):
             raise ValueError(
                 f"DTensor merge placement {placement!r} refers to tensor "
-                f"dimension {placement.dim}, but the target shape is "
+                f"dimension {shard.dim}, but the target shape is "
                 f"{global_shape}."
             )
 

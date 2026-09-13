@@ -791,8 +791,9 @@ def install_routed_residual_hook(
         staged = staged_factors.pop() if staged_factors else None
         if staged is None or not isinstance(output, torch.Tensor):
             return output
+        output_tensor: Any = output
         x = _linear_input(inputs, kwargs)
-        return output + _routed_residual(x, staged, output.dtype)
+        return output_tensor + _routed_residual(x, staged, output_tensor.dtype)
 
     pre_handle = parent.register_forward_pre_hook(
         pre_hook,

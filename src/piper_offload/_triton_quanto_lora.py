@@ -3,7 +3,7 @@
 # Triton JIT kernel signatures intentionally use untyped pointer parameters
 # and upper-case constexpr names.
 # ruff: noqa: ANN001, ANN202, N803, PLR0913
-# pyright: reportCallIssue=false
+# pyright: reportCallIssue=false, reportIndexIssue=false
 
 import torch
 import triton

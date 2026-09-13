@@ -159,11 +159,12 @@ class SharedRelay:
     def _signal(self, send: int | None, receive: int | None, tag: int, sequence: int) -> None:
         # Post sends before waiting for receives, including cyclic peer rounds.
         # Completion precedes reusing these persistent control tensors.
+        # PyTorch's Gloo stubs omit its send/recv and collective bindings.
         self._send_signal[0] = sequence
         if send is not None:
-            self._pending.append(self.group.send([self._send_signal], send, tag))
+            self._pending.append(self.group.send([self._send_signal], send, tag))  # type: ignore[attr-defined]
         if receive is not None:
-            self._pending.append(self.group.recv([self._recv_signal], receive, tag))
+            self._pending.append(self.group.recv([self._recv_signal], receive, tag))  # type: ignore[attr-defined]
         for work in reversed(self._pending):
             work.wait(self.timeout)
         self._pending.clear()
@@ -290,7 +291,7 @@ class SharedRelay:
             ("broadcast", "scatter", "allgather", "allreduce").index(operation), tensor.nbytes, detail,
         ], dtype=torch.int64)
         gathered = [torch.empty_like(metadata) for _ in range(self.world_size)]
-        self.group.allgather([gathered], [metadata]).wait(self.timeout)
+        self.group.allgather([gathered], [metadata]).wait(self.timeout)  # type: ignore[attr-defined]
         if any(not torch.equal(metadata, other) for other in gathered):
             raise ValueError("shared relay collective operation, payload bytes and root/dtype must match across ranks")
         with manager.acquire([self.buffer]) if device.type == "cuda" else nullcontext() as lease:
