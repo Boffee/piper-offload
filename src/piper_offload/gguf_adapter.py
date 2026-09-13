@@ -18,6 +18,7 @@ from typing import Any, cast
 import torch
 from torch import nn
 
+from ._host_staging import copy_host_to_device
 from ._piper_convrot_int8 import create_convrot_int8_tensor
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from .tensor_adapters import capture_host_tensor
@@ -207,7 +208,11 @@ class GgufAdapter:
         *,
         non_blocking: bool = False,
     ) -> None:
-        dst.staging.copy_(src.data, non_blocking=non_blocking)
+        copy_host_to_device(
+            dst.staging,
+            src.data,
+            non_blocking=non_blocking,
+        )
         cast(Any, dst.target).copy_from_gguf_(
             dst.staging,
             quant_type=src.quant_type,

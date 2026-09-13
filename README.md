@@ -170,6 +170,15 @@ initialize CUDA. Ordinary streaming and compiled rolling acquire leases
 automatically with their CUDA working sets. CPU execution, resident blocks,
 and non-block components do not acquire pin leases.
 
+On Linux, private file mappings are never registered in place. CUDA and HIP
+can request writable page pins for these mappings even during a host-to-device
+copy, materializing private copy-on-write pages across an otherwise reclaimable
+checkpoint. Piper leaves those allocations pageable and routes their uploads
+through a process-wide two-slot, 8 MiB-per-slot pinned staging window. The same
+bounded fallback is used for other contiguous sources that could not be
+registered. Anonymous and shared allocations remain eligible for direct
+registration, and Windows retains its existing registration behavior.
+
 Deactivation releases the lease after transfers finish and leaves registrations
 in the idle LRU. Reactivating the same backing reuses its retained registrations
 without native register/unregister calls. `BlockComponent.release()` also
@@ -200,8 +209,9 @@ For model backing, pass tensors from `HostParam.storage_tensors()` and
 `HostBuffer.storage_tensors()`. Acquiring a lease protects existing
 registrations and registers additional whole allocations when capacity allows.
 Budget or supported runtime-capacity failures leave complete allocations
-pageable. They remain pageable until all their active leases close, even if
-another request arrives after capacity becomes available. A lease reports
+pageable, as do Linux private file mappings. They remain pageable until all
+their active leases close, even if another request arrives after capacity
+becomes available. A lease reports
 `registered_bytes` and `pageable_bytes` for unique
 requested allocations. `host_pin_manager.stats.pinned_bytes` instead counts
 the union of covered OS pages, including shared boundary pages only once.

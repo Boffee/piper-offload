@@ -55,6 +55,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
+from ._host_staging import reserve_linux_host_staging
 from .block_compile import BlockCompileConfig, _BlockCompileState
 from .block_mode import BlockMode
 from .block_runtime import BlockRuntime
@@ -1009,6 +1010,9 @@ class BlockComponent:
                 "BlockComponent cannot acquire while prior pin cleanup is incomplete."
             )
         if self._block_mode != "resident":
+            # Reserve the small pageable fallback before opportunistic direct
+            # registrations are allowed to consume native host-pin capacity.
+            reserve_linux_host_staging()
             self._pin_lease = host_pin_manager.acquire(
                 _host_transfer_tensors(self._load_plans)
             )

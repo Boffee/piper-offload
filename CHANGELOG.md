@@ -39,6 +39,10 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Fixed
 
+- Avoid retaining checkpoint-sized anonymous COW pages on Linux when CUDA/HIP
+  host registration encounters private file mappings. Such mappings now stay
+  pageable and H2D transfers use a reusable 16 MiB ping-pong pinned staging
+  window; anonymous and shared storage keep the direct-registration fast path.
 - Preserve Piper NVFP4 `high_first` packing order through host/device movement,
   DTensor reconstruction and requantization. High-first merges use the reference
   path when the raw Triton merge only supports low-first packing.

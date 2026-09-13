@@ -2,6 +2,7 @@
 
 import gc
 import mmap
+import sys
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,7 @@ import pytest
 import torch
 
 import piper_offload._host_registration as registration_module
+import piper_offload.pin_manager as pin_manager_module
 from piper_offload._host_registration import HostRegistrationError, RuntimeHostRegistration
 from piper_offload import PinManager, host_pin_manager
 
@@ -92,6 +94,49 @@ def test_zero_budget_disables_registration_without_initializing_runtime(monkeypa
         assert lease.registered_bytes == 0
         assert lease.pageable_bytes == tensor.nbytes
     assert manager.stats.pinned_bytes == 0
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="private file VMA detection uses /proc/self/maps",
+)
+def test_private_file_mapping_stays_pageable(
+    tmp_path,
+    backend: FakeBackend,
+) -> None:
+    path = tmp_path / "weights.bin"
+    path.write_bytes(bytes(2 * PAGE))
+    with path.open("r+b") as file:
+        mapped = mmap.mmap(file.fileno(), 2 * PAGE, access=mmap.ACCESS_COPY)
+    tensor = torch.frombuffer(mapped, dtype=torch.uint8)
+    manager = PinManager(2 * PAGE, backend=backend)
+    with manager.acquire([tensor]) as lease:
+        assert lease.registered_bytes == 0
+        assert lease.pageable_bytes == tensor.nbytes
+        assert backend.register_calls == []
+    del tensor
+    mapped.close()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Linux-only conservative VMA fallback",
+)
+def test_unavailable_vma_metadata_leaves_nonresizable_storage_pageable(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: FakeBackend,
+) -> None:
+    monkeypatch.setattr(
+        pin_manager_module,
+        "_linux_private_file_mappings",
+        lambda: None,
+    )
+    (tensor,) = _tensors((0, PAGE))
+    manager = PinManager(PAGE, backend=backend)
+    with manager.acquire([tensor]) as lease:
+        assert lease.registered_bytes == 0
+        assert lease.pageable_bytes == tensor.nbytes
+    assert backend.register_calls == []
 
 
 def test_aliases_share_whole_allocation_and_reference_counts(manager: PinManager, backend: FakeBackend) -> None:
