@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.10.0rc2] - 2026-09-13
+
 ### Added
 
 - Add `ResourceCache.evict_bytes()` for one-shot, policy-driven release of an
