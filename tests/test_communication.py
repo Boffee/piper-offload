@@ -963,7 +963,7 @@ def test_reject_invalid_relay_transport(transport):
         RelayOptions(transport=transport)
 
 
-def test_shared_mapping_survives_failed_unregistration(monkeypatch):
+def test_shared_mapping_survives_failed_unregistration(monkeypatch, tmp_path):
     import weakref
     from piper_offload import _relay_shared
 
@@ -986,7 +986,8 @@ def test_shared_mapping_survives_failed_unregistration(monkeypatch):
                 raise RuntimeError("injected unregister failure")
 
     monkeypatch.setattr(_relay_shared, "_create_mapping", capture)
-    tensor = _relay_shared.create_shared_buffer(dist.HashStore(), 0, 1, 4096, timedelta(seconds=2))
+    store = dist.FileStore(str(tmp_path / "mapping-lifetime"), 1)
+    tensor = _relay_shared.create_shared_buffer(store, 0, 1, 4096, timedelta(seconds=2))
     backend = Registration()
     manager = PinManager(backend=backend)
     manager.acquire([tensor]).close()
