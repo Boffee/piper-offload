@@ -25,17 +25,12 @@ import torch
 import torch.distributed as dist
 from torch._C._distributed_c10d import AllgatherOptions, _DistributedBackendOptions
 
-from ._relay_shared import BUFFERS_PER_RANK, REDUCTION_DTYPES, SharedRelay, shared_slot_bytes
+from ._relay_shared import BUFFERS_PER_RANK, COPY_DTYPES, REDUCTION_DTYPES, SharedRelay, shared_slot_bytes
 from ._relay_staging import HostChunk, TransferPipeline, chunk_ranges, make_host_chunk
 from .pin_manager import host_pin_manager
 
 _BACKEND_NAME = "piper_relay"
 _registration_lock = threading.Lock()
-_COPY_DTYPES = (
-    *REDUCTION_DTYPES,
-    torch.float64, torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
-    torch.complex64, torch.complex128,
-)
 
 
 @dataclass(frozen=True)
@@ -489,7 +484,7 @@ def _validate_tensor(tensor: torch.Tensor) -> None:
         raise TypeError("piper_relay expects a plain local tensor, not a tensor subclass")
     if tensor.device.type not in ("cpu", "cuda"):
         raise NotImplementedError("piper_relay supports only CPU and CUDA/HIP tensors")
-    if tensor.dtype not in _COPY_DTYPES:
+    if tensor.dtype not in COPY_DTYPES:
         raise NotImplementedError(f"piper_relay does not support dtype {tensor.dtype}")
     if tensor.layout != torch.strided or not tensor.is_contiguous():
         raise NotImplementedError("piper_relay requires a contiguous strided tensor")

@@ -5,7 +5,7 @@ across peer rounds, bounding storage independently of the number of pairs.
 All-gather exchanges peers in cyclic rounds; broadcast and scatter visit each
 receiver in turn. SUM publishes each original chunk once for all peers, then
 accumulates in rank order on the GPU. Gloo carries 8-byte ready/free signals
-per chunk and a 24-byte metadata all-gather per collective. No CPU polling,
+per chunk and a 32-byte metadata all-gather per collective. No CPU polling,
 GPU IPC, cross-process CUDA events, or payload socket transfers are needed.
 """
 
@@ -27,6 +27,18 @@ from .pin_manager import PinManager
 
 BUFFERS_PER_RANK = 2
 REDUCTION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+COPY_DTYPES = (
+    *REDUCTION_DTYPES,
+    torch.float64,
+    torch.bool,
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.complex64,
+    torch.complex128,
+)
 
 
 def shared_slot_bytes(nbytes: int, world_size: int) -> int:
@@ -244,8 +256,7 @@ class SharedRelay:
             self._rounds(operation, sources, outputs, root, asynchronous)
 
     def reduce(self, tensor: torch.Tensor, manager: PinManager) -> None:
-        dtype_index = REDUCTION_DTYPES.index(tensor.dtype)
-        with self._collective("allreduce", tensor, dtype_index, manager) as asynchronous:
+        with self._collective("allreduce", tensor, -1, manager) as asynchronous:
             if self.world_size == 1 or tensor.numel() == 0:
                 return
             if self._reduction_buffer is None or self._reduction_buffer.device != tensor.device:
@@ -288,7 +299,10 @@ class SharedRelay:
         # Check rank agreement before any shared-slot writes. This also keeps
         # each collective separate from earlier peer rounds.
         metadata = torch.tensor([
-            ("broadcast", "scatter", "allgather", "allreduce").index(operation), tensor.nbytes, detail,
+            ("broadcast", "scatter", "allgather", "allreduce").index(operation),
+            tensor.nbytes,
+            COPY_DTYPES.index(tensor.dtype),
+            detail,
         ], dtype=torch.int64)
         gathered = [torch.empty_like(metadata) for _ in range(self.world_size)]
         self.group.allgather([gathered], [metadata]).wait(self.timeout)  # type: ignore[attr-defined]

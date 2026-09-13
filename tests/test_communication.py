@@ -759,7 +759,7 @@ class _ControlOnly:
 
     def allgather(self, outputs, inputs):
         assert inputs[0].dtype == torch.int64
-        assert inputs[0].nbytes == 24
+        assert inputs[0].nbytes == 32
         self.messages += 1
         return self.inner.allgather(outputs, inputs)
 
@@ -1070,6 +1070,12 @@ def _run_shared_metadata_mismatch(rank, path, device_type):
     with pytest.raises(ValueError, match="payload bytes"):
         dist.all_gather_single(output, local)
     assert torch.all(output == -1)
+    copy_dtype = torch.float32 if rank == 0 else torch.int32
+    copy_value = torch.full((1,), rank, dtype=copy_dtype, device=device_type)
+    copy_output = torch.full((2, 1), -1, dtype=copy_dtype, device=device_type)
+    with pytest.raises(ValueError, match="root/dtype"):
+        dist.all_gather_single(copy_output, copy_value)
+    assert torch.all(copy_output == -1)
     received = torch.empty((2, 1), dtype=torch.int64, device=device_type)
     dist.all_gather_single(received, local[:1])
     assert torch.equal(received.flatten().cpu(), torch.arange(2))
