@@ -15,7 +15,7 @@ import torch
 
 from ._torchao_nvfp4 import LAYOUT_ATTRS as NVFP4_LAYOUT_ATTRS
 
-LAYOUT_ATTRS = (*NVFP4_LAYOUT_ATTRS, "group_size")
+LAYOUT_ATTRS = (*NVFP4_LAYOUT_ATTRS, "group_size", "high_first")
 """Public ``ConvRotNVFP4Tensor`` fields preserved by Piper Offload."""
 
 
@@ -41,7 +41,7 @@ def require_convrot_nvfp4_tensor(t: torch.Tensor) -> Any:  # noqa: ANN401
     return t
 
 
-def create_convrot_nvfp4_tensor(  # noqa: PLR0913
+def create_convrot_nvfp4_tensor(  # noqa: PLR0913, PLR0917
     qdata: torch.Tensor,
     scale: torch.Tensor,
     block_size: int,
@@ -52,6 +52,7 @@ def create_convrot_nvfp4_tensor(  # noqa: PLR0913
     is_swizzled_scales: bool,
     use_triton_kernel: bool,
     act_quant_kwargs: object | None,
+    high_first: bool,
     *,
     wrapper_type: type[torch.Tensor] | None = None,
 ) -> torch.Tensor:
@@ -75,6 +76,7 @@ def create_convrot_nvfp4_tensor(  # noqa: PLR0913
         is_swizzled_scales=is_swizzled_scales,
         use_triton_kernel=use_triton_kernel,
         act_quant_kwargs=act_quant_kwargs,
+        high_first=high_first,
     )
 
 
@@ -100,5 +102,6 @@ def validate_layout(t: torch.Tensor) -> None:
         wrapped.is_swizzled_scales,
         wrapped.use_triton_kernel,
         wrapped.act_quant_kwargs,
+        wrapped.high_first,
         wrapper_type=type(wrapped),
     )

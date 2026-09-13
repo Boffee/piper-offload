@@ -18,7 +18,7 @@ original TorchAO handlers.
 """
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -97,7 +97,7 @@ def _run_rank_agnostic_linear(
         or not isinstance(weight_tensor, PrototypeFloat8Tensor)
         or act_quant_scale is None
         or act_quant_scale.numel() != 1
-        or input_tensor.ndim == 0
+        or getattr(input_tensor, "ndim", 0) == 0
         # Output-static quantization is a separate Prototype feature and is
         # not part of this adapter's qdata/scale/act_quant_scale contract.
         or output_scale is not None
@@ -105,6 +105,7 @@ def _run_rank_agnostic_linear(
     ):
         return original(func, types, args, kwargs)
 
+    input_tensor = cast(Any, input_tensor)
     input_shape = tuple(input_tensor.shape)
     flattened = input_tensor.reshape(-1, input_shape[-1])
     weight_rank2 = _rank2_static_weight(weight_tensor)

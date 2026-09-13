@@ -66,6 +66,7 @@ def _make_convrot_nvfp4(
     dtype: torch.dtype = torch.bfloat16,
     device: torch.device | str = "cpu",
     dense: torch.Tensor | None = None,
+    high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     nvfp4_cls, kwargs_cls, amax_to_scale, convrot_cls, rotate_groups = _modules()
     if dense is None:
@@ -86,7 +87,23 @@ def _make_convrot_nvfp4(
             use_dynamic_per_tensor_scale=True,
         ),
     )
-    return convrot_cls.from_torchao(packed, group_size=group_size), dense
+    convrot = convrot_cls.from_torchao(packed, group_size=group_size)
+    if high_first:
+        qdata = (((convrot.qdata & 0x0F) << 4) | (convrot.qdata >> 4)).to(torch.uint8)
+        convrot = convrot_cls(
+            qdata,
+            convrot.scale,
+            convrot.block_size,
+            convrot.orig_dtype,
+            convrot.group_size,
+            convrot.per_tensor_scale,
+            convrot.act_per_tensor_scale,
+            convrot.is_swizzled_scales,
+            convrot.use_triton_kernel,
+            convrot.act_quant_kwargs,
+            high_first=True,
+        )
+    return convrot, dense
 
 
 class TestPiperConvRotNVFP4Adapter:
@@ -140,6 +157,18 @@ class TestPiperConvRotNVFP4Adapter:
             reconstructed.scale.view(torch.uint8),
             convrot.scale.view(torch.uint8),
         )
+
+    def test_high_first_metadata_survives_movement(self) -> None:
+        convrot, _dense = _make_convrot_nvfp4(high_first=True)
+        host_param = HostParam(nn.Parameter(convrot, requires_grad=False))
+        state = host_param.allocate_gpu_storage(torch.device("cpu"))
+
+        host_param.copy_to_gpu(state)
+        reconstructed = host_param.make_gpu_param(state).data
+
+        assert reconstructed.high_first is True
+        assert torch.equal(reconstructed.qdata, convrot.qdata)
+        torch.testing.assert_close(reconstructed.dequantize(), convrot.dequantize())
 
     def test_identity_and_pool_layout_track_rotation_group(self) -> None:
         convrot_cls = _modules()[3]

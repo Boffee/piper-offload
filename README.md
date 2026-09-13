@@ -42,6 +42,8 @@ is not required.
 |---|---|
 | `resource_cache.py` | `ResourceCache`, eviction policy, cache metadata, and cache errors |
 | `pin_manager.py` | `PinManager`, `PinLease`, `PinStats`, and the process-wide `host_pin_manager` for budgeted host registration |
+| `communication.py` | Experimental `piper_relay` process group: blocking collectives through CPU Gloo or shared host memory, independently usable with DTensor |
+| `sequential.py` | Experimental `SequentialExecutor`: two DTensor ranks sharing one process, GPU and compute stream |
 | `model_cache.py` | `ModelCache` — model-aware `ResourceCache` with activation and adapter coordination |
 | `resource_specs.py` | `ModelSpec`, `AdapterSpec`, `ObjectSpec` — standard frozen resource specifications |
 | `protocols.py` | `ResourceSpec`, `ResourceStore`, `ResourceBinding` plug-in contracts |
@@ -169,6 +171,15 @@ initialize CUDA. Ordinary streaming and compiled rolling acquire leases
 automatically with their CUDA working sets. CPU execution, resident blocks,
 and non-block components do not acquire pin leases.
 
+On Linux, private file mappings are never registered in place. CUDA and HIP
+can request writable page pins for these mappings even during a host-to-device
+copy, materializing private copy-on-write pages across an otherwise reclaimable
+checkpoint. Piper leaves those allocations pageable and routes their uploads
+through a process-wide two-slot, 8 MiB-per-slot pinned staging window. The same
+bounded fallback is used for other contiguous sources that could not be
+registered. Anonymous and shared allocations remain eligible for direct
+registration, and Windows retains its existing registration behavior.
+
 Deactivation releases the lease after transfers finish and leaves registrations
 in the idle LRU. Reactivating the same backing reuses its retained registrations
 without native register/unregister calls. `BlockComponent.release()` also
@@ -199,8 +210,9 @@ For model backing, pass tensors from `HostParam.storage_tensors()` and
 `HostBuffer.storage_tensors()`. Acquiring a lease protects existing
 registrations and registers additional whole allocations when capacity allows.
 Budget or supported runtime-capacity failures leave complete allocations
-pageable. They remain pageable until all their active leases close, even if
-another request arrives after capacity becomes available. A lease reports
+pageable, as do Linux private file mappings. They remain pageable until all
+their active leases close, even if another request arrives after capacity
+becomes available. A lease reports
 `registered_bytes` and `pageable_bytes` for unique
 requested allocations. `host_pin_manager.stats.pinned_bytes` instead counts
 the union of covered OS pages, including shared boundary pages only once.
@@ -224,6 +236,129 @@ errors from handled registration failures and reports unexpected errors through
 registration semantics follow the [CUDA memory API](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html);
 the corresponding HIP calls are documented in the
 [HIP runtime API](https://rocm.docs.amd.com/projects/HIP/en/latest/doxygen/html/hip__runtime__api_8h.html).
+
+## Experimental DTensor host relay
+
+`piper_relay` is an experimental communication backend for DTensor inference.
+It stages accelerator tensors through host memory for SUM all-reduce,
+all-gather, broadcast and scatter. The default `transport="gloo"` uses CPU
+Gloo for payload communication. `transport="shared"` uses shared host slots
+for same-machine transfers and sums contributions on each GPU. Gloo carries
+small control messages and reductions of CPU tensors.
+It uses PyTorch's Python process-group extension support and requires no
+NCCL, compiled extension, or active offloader.
+
+Register the backend in every worker before initializing the process group:
+
+```python
+import torch
+import torch.distributed as dist
+from piper_offload.communication import RelayOptions, register_relay_backend
+
+torch.cuda.set_device(local_rank)
+register_relay_backend()
+dist.init_process_group(
+    "piper_relay",  # rank/rendezvous supplied by the launcher
+    pg_options=RelayOptions(staging_bytes=8 * 1024 * 1024, pipeline_buffers=1),  # defaults
+)
+```
+
+Select the device explicitly and omit `device_id` from `init_process_group`;
+this Python backend does not implement eager accelerator connection. The
+caller still creates the device mesh and model sharding.
+
+| Operation | Supported behavior |
+|---|---|
+| SUM all-reduce | FP32, FP16 and BF16; single tensor and coalesced tensor lists |
+| All-gather | Equal-sized inputs; list outputs, concatenated/stacked tensor outputs, and functional coalesced calls |
+| Broadcast / scatter | One local tensor per rank; source rank is relative to the process group |
+
+Copy collectives preserve payload bits and support the reduction dtypes plus
+FP64, bool, uint8, signed integers and complex64/complex128. Inputs and outputs
+must be contiguous plain tensors on one local device; output buffers must
+not overlap. Coalesced all-gather outputs must not overwrite another input in
+the batch. Within an all-gather, the input may exactly alias its own rank's
+output slice. Scatter's root output may exactly alias its own source slice.
+Other input/output overlap for these collectives is rejected before communication.
+FP16/BF16 reductions accumulate in FP32 (on the GPU with shared transport),
+retaining the original dtype for GPU/host transfers and casting back once.
+
+Normal `distribute_tensor()` initialization uses broadcast/scatter;
+`Shard -> Replicate` redistribution and `full_tensor()` use all-gather, while
+`Partial -> Replicate` uses all-reduce. DTensor handles padding for uneven and
+empty shards before these collectives. Tests cover those paths, metadata
+checks, and an Inductor-compiled redistribution forward with CUDA graphs
+disabled. Direct C++ calls to the functional all-gather `out` variant bypass
+the Python override and are unsupported for accelerator tensors.
+Reduce-scatter, all-to-all, point-to-point accelerator transfers
+and non-SUM reductions remain unsupported.
+
+`RelayOptions.staging_bytes` defaults to 8 MiB and bounds reusable CPU staging,
+including reduction accumulators: per rank with Gloo, or once for the entire
+group with shared transport. Gloo workspace, caller tensors and allocator
+overhead are excluded. Shared GPU reductions also reuse device scratch of at
+most `3 * staging_bytes / (2 * world_size)` bytes per rank. All ranks must agree
+on options; supply them separately when creating subgroups with `new_group()`.
+
+`pipeline_buffers` defaults to 1 (serial). Setting it to 2 or 3 overlaps pinned
+copies with Gloo communication within the same staging budget. Shared GPU
+collectives always use two buffers per sender; this option only affects Gloo.
+
+For ranks on the same machine, select shared transport:
+
+```python
+RelayOptions(transport="shared", staging_bytes=8 * 1024 * 1024)
+```
+
+All ranks must be able to attach the same host allocation; use Gloo for separate
+machines. Staging registration uses `host_pin_manager`'s process-wide budget.
+Each process registers the full shared allocation under its own budget.
+Insufficient pin capacity falls back to synchronous pageable copies.
+
+The backend remains **blocking**, including `async_op=True`: returned work
+handles represent completed uploads. Coalesced calls process tensors sequentially.
+Failures may leave outputs partially updated; after a shared-exchange failure,
+destroy and recreate the group. Offloader prefetch coordination and CUDA graph
+capture remain unsupported.
+
+The automated tests exercise two real ranks on `cuda:0` for correctness;
+this does not reduce single-GPU VRAM use. CUDA/HIP transfers use PyTorch's
+device API, but Windows GPU, ROCm, and distinct-GPU behavior need validation
+on their respective hardware. The test suite includes a two-physical-GPU
+case that skips when fewer than two devices are available.
+
+## Experimental sequential DTensor execution
+
+`SequentialExecutor` runs two ordinary DTensor ranks on one GPU and one compute
+stream, alternating at collectives so temporary buffers can be reused. Its
+collectives use direct local operations without NCCL or Gloo. SUM writes both
+results without tensor-sized scratch; all-gather, broadcast and scatter use
+local copies. Requires PyTorch 2.14 and the `triton` extra.
+Piper NVFP4 and ConvRot DTensors require Piper Kernels 0.7.0rc6 or newer.
+
+```python
+from piper_offload.sequential import SequentialExecutor
+
+with SequentialExecutor("cuda:0") as executor:
+    states = executor.run(setup_rank, sequential=False)  # callback(rank): mesh, model, optional offloader
+    try:
+        executor.run(lambda rank: forward(states[rank]), sequential=False)  # compilation warmup
+        outputs = executor.run(lambda rank: forward(states[rank]))
+    finally:
+        executor.run(lambda rank: cleanup(states[rank]), sequential=False)
+```
+
+The executor initializes one process group per rank. Use a separate model and
+offloader for each rank, and keep DTensor operations inside callbacks. Both ranks
+must reach matching collectives. Only one executor may be open, with no other
+distributed activity.
+After an error, `sequential=False` permits local cleanup once previous callbacks
+have exited; further distributed execution requires a new executor.
+
+Supports FP32/FP16/BF16 SUM and CPU tensors for offloaded state. Inference only;
+disable CUDA graphs when compiling. Reduce-scatter, all-to-all and non-SUM
+reductions are unsupported. Windows/ROCm and full-model inference still need
+validation.
 
 ## Manual offloader lifecycle
 

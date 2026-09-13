@@ -5,6 +5,53 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add experimental `SequentialExecutor` in `piper_offload.sequential` for two
+  ordinary DTensor ranks sharing one process, GPU and compute stream. Supports
+  compiled inference and streamed weights with local SUM, all-gather, broadcast
+  and scatter. SUM accumulates in FP32 without tensor-sized scratch. Requires
+  Triton and disabled CUDA graphs; local cleanup remains available after errors.
+- Add opt-in `register_relay_backend()` in `piper_offload.communication`.
+  The experimental `piper_relay` process group implements blocking SUM
+  all-reduce for FP32, FP16 and BF16, plus broadcast, scatter and all-gather
+  through CPU Gloo. Supports normal DTensor initialization, uneven/empty
+  shards, functional coalesced collectives, and tested Inductor redistribution
+  forwards with CUDA graphs disabled. Low-precision reductions accumulate in
+  FP32 on the CPU; copy collectives preserve payload bits. Accelerator
+  transfers use temporary CPU staging under the existing pin budget. Includes
+  CPU, shared-GPU, and two-physical-GPU correctness tests.
+- Add opt-in `RelayOptions(transport="shared")` for same-machine copy collectives.
+  Two outgoing shared host slots per rank provide simultaneous peer exchange
+  without Gloo payload copies. Large slots use 4 KiB alignment for DMA.
+  Ready/free signals guard DMA completion and slot
+  reuse. Local contributions stay on the device. Peer rounds reuse one bounded
+  arena, including each rank's existing Gloo reduction workspace. Shared exchange
+  failures require group recreation; the original Gloo transport remains available.
+
+### Changed
+
+- Share pin-lease handling between staging modes and reuse validated all-gather
+  output views.
+- Stream relay collectives through one reusable CPU buffer per process group.
+  Add `RelayOptions(staging_bytes=...)`, defaulting to 8 MiB, with rank agreement
+  checks and shutdown cleanup. The bound includes FP32 reduction accumulators;
+  idle pin registrations remain reusable and evictable. Reject unsafe all-gather
+  aliases before chunking. Failed collectives may leave completed chunks updated.
+- Add opt-in double/triple buffering with `RelayOptions(pipeline_buffers=2|3)`
+  inside the same staging allocation. Overlap pinned downloads/uploads with
+  CPU communication while preserving blocking completion and pageable fallback.
+
+### Fixed
+
+- Avoid retaining checkpoint-sized anonymous COW pages on Linux when CUDA/HIP
+  host registration encounters private file mappings. Such mappings now stay
+  pageable and H2D transfers use a reusable 16 MiB ping-pong pinned staging
+  window; anonymous and shared storage keep the direct-registration fast path.
+- Preserve Piper NVFP4 `high_first` packing order through host/device movement,
+  DTensor reconstruction and requantization. High-first merges use the reference
+  path when the raw Triton merge only supports low-first packing.
+
 ## [0.10.0rc1] - 2026-09-11
 
 ### Added

@@ -42,9 +42,28 @@ def _nvfp4_modules():
     return mod.NVFP4Tensor, mod.QuantizeTensorToNVFP4Kwargs
 
 
-def _piper_nvfp4(tensor: torch.Tensor) -> torch.Tensor:
+def _piper_nvfp4(
+    tensor: torch.Tensor,
+    *,
+    high_first: bool = False,
+) -> torch.Tensor:
     mod = pytest.importorskip("piper_kernels.weights.nvfp4")
-    return mod.PiperNVFP4Tensor.from_torchao(tensor)
+    piper = mod.PiperNVFP4Tensor.from_torchao(tensor)
+    if not high_first:
+        return piper
+    qdata = (((piper.qdata & 0x0F) << 4) | (piper.qdata >> 4)).to(torch.uint8)
+    return mod.PiperNVFP4Tensor(
+        qdata,
+        piper.scale,
+        piper.block_size,
+        piper.orig_dtype,
+        piper.per_tensor_scale,
+        piper.act_per_tensor_scale,
+        piper.is_swizzled_scales,
+        piper.use_triton_kernel,
+        piper.act_quant_kwargs,
+        high_first=True,
+    )
 
 
 def _make_nvfp4(
@@ -244,6 +263,70 @@ class TestNvfp4Adapter:
         assert type(host) is source_type
         assert type(reconstructed) is source_type
         assert type(requantized) is source_type
+
+    def test_high_first_survives_movement_and_requantization(self) -> None:
+        low_first = _make_nvfp4_amax()
+        source = _piper_nvfp4(low_first, high_first=True)
+        stored_qdata = source.qdata
+        host_param = HostParam(nn.Parameter(source, requires_grad=False))
+
+        host = host_param.make_cpu_param().data
+        device_state = host_param.allocate_gpu_storage(torch.device("cpu"))
+        host_param.copy_to_gpu(device_state)
+        reconstructed = host_param.make_gpu_param(device_state).data
+        requantized = Nvfp4Adapter.requantize(
+            Nvfp4Adapter.dequantize(reconstructed),
+            like=reconstructed,
+        )
+
+        assert source.high_first is True
+        assert host.high_first is True
+        assert reconstructed.high_first is True
+        assert requantized.high_first is True
+        assert host.qdata.data_ptr() == host_param.host_state.storage[0].data_ptr()
+        assert torch.equal(host.qdata, stored_qdata)
+        assert torch.equal(requantized.qdata, stored_qdata)
+        torch.testing.assert_close(source.dequantize(), low_first.dequantize())
+        torch.testing.assert_close(requantized.dequantize(), low_first.dequantize())
+
+    @pytest.mark.parametrize("kind", ["lora", "dense"])
+    @pytest.mark.parametrize("rounding_seed", [None, 123])
+    def test_high_first_merge_bypasses_low_first_triton_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        kind: str,
+        rounding_seed: int | None,
+    ) -> None:
+        low_first = _piper_nvfp4(_make_nvfp4_amax())
+        target = _piper_nvfp4(low_first.clone(), high_first=True)
+        assert Nvfp4Adapter.layout_signature(target) != Nvfp4Adapter.layout_signature(low_first)
+        b = torch.randn(16, 2, dtype=target.orig_dtype)
+        a = torch.randn(2, 64, dtype=target.orig_dtype)
+
+        def merge(value):
+            if kind == "lora":
+                Nvfp4Adapter.merge_lora_(value, b, a, 0.125, rounding_seed=rounding_seed)
+            else:
+                Nvfp4Adapter.merge_dense_(value, b @ a, 0.125, rounding_seed=rounding_seed)
+
+        merge(low_first)
+        raw_merge = Mock()
+        monkeypatch.setattr(
+            nvfp4_adapter_module,
+            f"_triton_merge_nvfp4_{kind}",
+            raw_merge,
+        )
+        monkeypatch.setattr(
+            nvfp4_adapter_module,
+            "_is_triton_nvfp4_layout" if kind == "lora" else "_is_triton_nvfp4_dense_layout",
+            lambda *_args: True,
+        )
+
+        merge(target)
+
+        assert target.high_first is True
+        raw_merge.assert_not_called()
+        torch.testing.assert_close(target.dequantize(), low_first.dequantize(), rtol=0, atol=0)
 
     def test_target_layout_ignores_tensor_id(self) -> None:
         p1 = nn.Parameter(_make_nvfp4(), requires_grad=False)

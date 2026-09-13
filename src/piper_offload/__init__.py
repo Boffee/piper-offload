@@ -128,7 +128,9 @@ The process-wide :data:`host_pin_manager` can register that storage in place
 under a finite page-rounded budget or opportunistically up to native CUDA/HIP
 capacity. :class:`PinLease` protects backing until its owner explicitly closes
 it; released registrations enter an idle LRU. The default budget is ``None``
-(no application byte limit); zero disables registration.
+(no application byte limit); zero disables registration. Linux private file
+mappings remain pageable to avoid materializing copy-on-write pages, and Piper's
+model upload paths move those sources through a bounded 16 MiB pinned window.
 Block components acquire leases for ordinary streaming and compiled rolling,
 then close them only after their runtime has completed pending transfers. CUDA
 runtimes own stream ordering and remain independent of pin-budget policy. CPU
