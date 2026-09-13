@@ -7,6 +7,11 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Add experimental `SequentialExecutor` in `piper_offload.sequential` for two
+  ordinary DTensor ranks sharing one process, GPU and compute stream. Supports
+  compiled inference and streamed weights with local SUM, all-gather, broadcast
+  and scatter. SUM accumulates in FP32 without tensor-sized scratch. Requires
+  Triton and disabled CUDA graphs; local cleanup remains available after errors.
 - Add opt-in `register_relay_backend()` in `piper_offload.communication`.
   The experimental `piper_relay` process group implements blocking SUM
   all-reduce for FP32, FP16 and BF16, plus broadcast, scatter and all-gather

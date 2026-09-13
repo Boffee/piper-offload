@@ -43,6 +43,7 @@ is not required.
 | `resource_cache.py` | `ResourceCache`, eviction policy, cache metadata, and cache errors |
 | `pin_manager.py` | `PinManager`, `PinLease`, `PinStats`, and the process-wide `host_pin_manager` for budgeted host registration |
 | `communication.py` | Experimental `piper_relay` process group: blocking collectives through CPU Gloo or shared host memory, independently usable with DTensor |
+| `sequential.py` | Experimental `SequentialExecutor`: two DTensor ranks sharing one process, GPU and compute stream |
 | `model_cache.py` | `ModelCache` — model-aware `ResourceCache` with activation and adapter coordination |
 | `resource_specs.py` | `ModelSpec`, `AdapterSpec`, `ObjectSpec` — standard frozen resource specifications |
 | `protocols.py` | `ResourceSpec`, `ResourceStore`, `ResourceBinding` plug-in contracts |
@@ -325,6 +326,39 @@ this does not reduce single-GPU VRAM use. CUDA/HIP transfers use PyTorch's
 device API, but Windows GPU, ROCm, and distinct-GPU behavior need validation
 on their respective hardware. The test suite includes a two-physical-GPU
 case that skips when fewer than two devices are available.
+
+## Experimental sequential DTensor execution
+
+`SequentialExecutor` runs two ordinary DTensor ranks on one GPU and one compute
+stream, alternating at collectives so temporary buffers can be reused. Its
+collectives use direct local operations without NCCL or Gloo. SUM writes both
+results without tensor-sized scratch; all-gather, broadcast and scatter use
+local copies. Requires PyTorch 2.14 and the `triton` extra.
+Piper NVFP4 and ConvRot DTensors require Piper Kernels 0.7.0rc6 or newer.
+
+```python
+from piper_offload.sequential import SequentialExecutor
+
+with SequentialExecutor("cuda:0") as executor:
+    states = executor.run(setup_rank, sequential=False)  # callback(rank): mesh, model, optional offloader
+    try:
+        executor.run(lambda rank: forward(states[rank]), sequential=False)  # compilation warmup
+        outputs = executor.run(lambda rank: forward(states[rank]))
+    finally:
+        executor.run(lambda rank: cleanup(states[rank]), sequential=False)
+```
+
+The executor initializes one process group per rank. Use a separate model and
+offloader for each rank, and keep DTensor operations inside callbacks. Both ranks
+must reach matching collectives. Only one executor may be open, with no other
+distributed activity.
+After an error, `sequential=False` permits local cleanup once previous callbacks
+have exited; further distributed execution requires a new executor.
+
+Supports FP32/FP16/BF16 SUM and CPU tensors for offloaded state. Inference only;
+disable CUDA graphs when compiling. Reduce-scatter, all-to-all and non-SUM
+reductions are unsupported. Windows/ROCm and full-model inference still need
+validation.
 
 ## Manual offloader lifecycle
 
