@@ -140,11 +140,10 @@ independent of this registration budget.
 :class:`ResourceCache` manages cached backing stores with optional
 policy-driven byte eviction, reference-counted leases, and transactional
 finite-budget admission. :class:`ModelCache` keeps stores until explicit
-eviction and owns dependency leasing, adapter attachment, and device
-activation. Each model offloader rejects overlapping use. Custom
-:class:`EvictionPolicy`
-implementations can replace the default LRU behavior. See its docstring
-for design notes.
+eviction, including best-effort policy-driven byte targets, and owns dependency
+leasing, adapter attachment, and device activation. Each model offloader rejects
+overlapping use. Custom :class:`EvictionPolicy` implementations can replace the
+default LRU behavior. See its docstring for design notes.
 
 Compatibility
 -------------

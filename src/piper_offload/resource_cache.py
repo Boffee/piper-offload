@@ -420,6 +420,45 @@ class ResourceCache:
                 raise ResourceLeasedError(f"cannot evict leased resource {key!r}")
             self._evict_inactive(key)
 
+    def evict_bytes(self, bytes_to_free: int) -> int:
+        """Evict inactive entries totaling at least ``bytes_to_free``.
+
+        Victims are selected by the configured eviction policy and whole
+        entries are released, so the returned byte count can exceed the
+        request. If leased entries prevent satisfying the request, all
+        available inactive bytes are evicted and the smaller actual count is
+        returned. The configured cache budget is unchanged.
+        """
+        if bytes_to_free < 0:
+            raise ValueError(f"bytes_to_free must be >= 0, got {bytes_to_free}")
+        if bytes_to_free == 0:
+            return 0
+
+        with self._lock:
+            candidates = self._eviction_candidates()
+            candidate_bytes = {candidate.key: candidate.cache_bytes for candidate in candidates}
+            target = min(bytes_to_free, sum(candidate_bytes.values()))
+            if target == 0:
+                return 0
+
+            # Present the one-shot target through the existing policy context
+            # without changing the cache's persistent byte limit.
+            context = EvictionContext(
+                required_cache_bytes=0,
+                used_cache_bytes=self._used_bytes,
+                max_cache_bytes=self._used_bytes - target,
+                candidates=candidates,
+            )
+            victims = self._validated_victims(context)
+
+            freed = 0
+            for victim in victims:
+                if freed >= target:
+                    break
+                freed += candidate_bytes[victim]
+                self._evict_inactive(victim)
+            return freed
+
     def clear(self) -> None:
         """Evict all unleased entries. Registrations are preserved.
         Raises :class:`ResourceLeasedError` if any entry is leased."""
@@ -555,15 +594,7 @@ class ResourceCache:
                 limit=context.max_cache_bytes,
             )
 
-        victims = self._eviction.choose_victims(context)
-        if len(victims) != len(set(victims)) or not set(victims) <= candidate_bytes.keys():
-            raise EvictionPolicyError("eviction policy chose invalid victims")
-
-        selected_bytes = sum(candidate_bytes[victim] for victim in victims)
-        if selected_bytes < bytes_to_free:
-            raise EvictionPolicyError(
-                f"eviction policy chose insufficient victims selected {selected_bytes} bytes, need {bytes_to_free}",
-            )
+        victims = self._validated_victims(context)
 
         for victim in victims:
             available = self._available_cache_bytes
@@ -571,6 +602,24 @@ class ResourceCache:
             if required_cache_bytes <= available:
                 break
             self._evict_inactive(victim)
+
+    def _validated_victims(
+        self,
+        context: EvictionContext,
+    ) -> tuple[str, ...]:
+        """Select and validate policy victims without evicting them."""
+        candidate_bytes = {candidate.key: candidate.cache_bytes for candidate in context.candidates}
+        victims = self._eviction.choose_victims(context)
+        if len(victims) != len(set(victims)) or not set(victims) <= candidate_bytes.keys():
+            raise EvictionPolicyError("eviction policy chose invalid victims")
+
+        selected_bytes = sum(candidate_bytes[victim] for victim in victims)
+        if selected_bytes < context.bytes_to_free:
+            raise EvictionPolicyError(
+                "eviction policy chose insufficient victims "
+                f"selected {selected_bytes} bytes, need {context.bytes_to_free}",
+            )
+        return victims
 
     def _evict_inactive(self, key: str) -> None:
         """Release a cached, inactive entry as an eviction. Asserts the

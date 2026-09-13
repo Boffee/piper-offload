@@ -1693,8 +1693,18 @@ than silent corruption.
 
 Use `cache.used_cache_bytes` for logical backing accounting and
 `cache.info(key)` for per-key state. `ModelCache.available_cache_bytes` is
-`None` because it has no byte limit; release its inactive stores explicitly
-with `evict()` or `clear()`.
+`None` because it has no byte limit. Release inactive stores by key with
+`evict()`, release at least a requested number of bytes according to the
+configured eviction policy with `evict_bytes()`, or release everything with
+`clear()`:
+
+```python
+freed = cache.evict_bytes(20 * 1024**3)
+```
+
+Entries are released whole, so `freed` can exceed the request. If active leases
+prevent the requested amount from being released, every inactive candidate is
+evicted and `freed` reports the smaller amount. The cache remains unbounded.
 
 An explicitly finite `ResourceCache` can change its budget while running:
 

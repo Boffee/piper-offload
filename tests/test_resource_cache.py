@@ -12,6 +12,7 @@ from piper_offload import (
     DuplicateResourceKeyError,
     EvictionContext,
     EvictionPolicyError,
+    ModelCache,
     ResourceCache,
     ObjectSpec,
     ResourceCachedError,
@@ -387,6 +388,83 @@ class TestLeaseMany:
 
 
 class TestEviction:
+    def test_model_cache_inherits_evict_bytes(self) -> None:
+        cache = ModelCache()
+        with cache.lease(_spec("model", 50)):
+            pass
+
+        assert cache.evict_bytes(25) == 50
+        assert cache.max_cache_bytes is None
+        assert cache.used_cache_bytes == 0
+        assert not _is_cached(cache, "model")
+
+    def test_evict_bytes_uses_lru_without_bounding_cache(self) -> None:
+        cache = ResourceCache(None)
+        for key, size in (("a", 40), ("b", 30), ("c", 50)):
+            with cache.lease(_spec(key, size)):
+                pass
+
+        assert cache.evict_bytes(50) == 70
+
+        assert cache.max_cache_bytes is None
+        assert cache.used_cache_bytes == 50
+        assert not _is_cached(cache, "a")
+        assert not _is_cached(cache, "b")
+        assert _is_cached(cache, "c")
+
+    def test_evict_bytes_uses_configured_policy(self) -> None:
+        cache = ResourceCache(100, eviction_policy=MRUEvictionPolicy())
+        for key, size in (("a", 40), ("b", 60)):
+            with cache.lease(_spec(key, size)):
+                pass
+
+        assert cache.evict_bytes(30) == 60
+        assert cache.max_cache_bytes == 100
+        assert _is_cached(cache, "a")
+        assert not _is_cached(cache, "b")
+
+    def test_evict_bytes_returns_partial_count_when_entries_are_leased(
+        self,
+    ) -> None:
+        cache = ResourceCache(None)
+        with cache.lease(_spec("inactive", 40)):
+            pass
+
+        with cache.lease(_spec("leased", 60)):
+            assert cache.evict_bytes(80) == 40
+            assert cache.used_cache_bytes == 60
+            assert not _is_cached(cache, "inactive")
+            assert _is_cached(cache, "leased")
+
+    def test_evict_bytes_rejects_negative_request(self) -> None:
+        cache = ResourceCache(None)
+        with cache.lease(_spec("a", 50)):
+            pass
+
+        with pytest.raises(ValueError, match="bytes_to_free"):
+            cache.evict_bytes(-1)
+
+        assert cache.used_cache_bytes == 50
+        assert _is_cached(cache, "a")
+
+    def test_evict_bytes_validates_policy_before_eviction(self) -> None:
+        class EmptyPolicy(MRUEvictionPolicy):
+            def choose_victims(
+                self,
+                context: EvictionContext,
+            ) -> tuple[str, ...]:
+                return ()
+
+        cache = ResourceCache(None, eviction_policy=EmptyPolicy())
+        with cache.lease(_spec("a", 50)):
+            pass
+
+        with pytest.raises(EvictionPolicyError, match="insufficient"):
+            cache.evict_bytes(25)
+
+        assert cache.used_cache_bytes == 50
+        assert _is_cached(cache, "a")
+
     def test_lru_evicts_oldest_released_store(self) -> None:
         cache = ResourceCache(100)
         for key in ("a", "b"):
