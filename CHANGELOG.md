@@ -7,6 +7,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Add `ResourceCache.evict_bytes()` for one-shot, policy-driven release of an
+  approximate number of inactive cache bytes without changing the persistent
+  cache budget. `ModelCache` inherits the same public operation.
 - Add experimental `SequentialExecutor` in `piper_offload.sequential` for two
   ordinary DTensor ranks sharing one process, GPU and compute stream. Supports
   compiled inference and streamed weights with local SUM, all-gather, broadcast
