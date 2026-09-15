@@ -15,11 +15,12 @@ such as D2H round-trip, trainable ``.data`` swap, and in-place updates
 are exposed through adapter capability methods.
 """
 
-from typing import Any, cast
+from typing import Any, Self, cast
 
 import torch
 from torch import nn
 
+from .dtensor_adapter import DTensorAdapter
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
     BindLayoutTensorAdapter,
@@ -95,8 +96,7 @@ class HostParam:
         # Parameter subclass whose ``.data`` is lossy (bitsandbytes
         # Params4bit). See ``param_representation``.
         representation = param_representation(param)
-        self._shape = torch.Size(representation.shape)
-        self.requires_grad: bool = param.requires_grad
+        requires_grad = param.requires_grad
         is_meta = representation.is_meta
         if is_meta:
             if type(representation) is not torch.Tensor:
@@ -114,35 +114,23 @@ class HostParam:
                     "Meta parameters must be floating-point; "
                     f"got {representation.dtype}."
                 )
-            if self.requires_grad:
+            if requires_grad:
                 raise ValueError(
                     "Meta parameters are inference-only and must have "
                     "requires_grad=False."
                 )
-        self.adapter: TensorAdapter[Any, Any] = select_adapter(representation)
-        self._logical_shape = (
-            self.adapter.logical_shape(representation)
-            if isinstance(self.adapter, LogicalShapeTensorAdapter)
-            else tuple(representation.shape)
+        adapter: TensorAdapter[Any, Any] = select_adapter(representation)
+        # A meta tensor is the complete resting representation: it records
+        # shape, dtype, and stride without owning physical host bytes.
+        host_state = (
+            representation.detach() if is_meta else adapter.capture_host(representation)
         )
-        # Precompute the rearm capability once: the per-load check is a hot
-        # path (every param, every block rotation), and a runtime_checkable
-        # Protocol isinstance structurally probes every member each call.
-        self._needs_rearm: bool = isinstance(
-            self.adapter, PostLoadRearmTensorAdapter
+        self._init_from_host_state(
+            representation,
+            requires_grad=requires_grad,
+            adapter=adapter,
+            host_state=host_state,
         )
-        self._target_layout = self._target_layout_from_adapter(
-            self.adapter, representation,
-        )
-        self._bind_layout = self._bind_layout_from_adapter(
-            self.adapter, representation,
-        )
-        if is_meta:
-            # A meta tensor is the complete resting representation: it records
-            # shape, dtype, and stride without owning physical host bytes.
-            self.host_state = representation.detach()
-        else:
-            self.host_state = self.adapter.capture_host(representation)
         # Low-peak host construction optimization: release the original
         # source storage by repointing the source Parameter at the selected
         # host backing immediately. The assignment is an intentional
@@ -153,12 +141,91 @@ class HostParam:
         if not is_meta and type(representation) is torch.Tensor:
             param.data = self.make_cpu_param().data
 
+    @classmethod
+    def project_dtensor(cls, source: HostParam, target: nn.Parameter) -> Self:
+        """Project a full host source into a standard DTensor target layout.
+
+        The target contributes only its global shape, mesh, placements, and
+        rank-local layout. Its local storage is not retained. The physical
+        source remains the captured host allocation, including any file
+        mapping retained during capture.
+
+        The initial projection contract supports frozen plain tensors with one
+        ``Shard(0)`` placement. The local CPU shard is a view into the full
+        source allocation, so construction allocates no rank-local host tensor.
+        """
+        if source.is_meta:
+            raise ValueError("DTensor projection source must own physical host storage.")
+        if source.requires_grad or target.requires_grad:
+            raise ValueError(
+                "DTensor projection supports frozen inference parameters only."
+            )
+
+        representation = param_representation(target)
+        adapter = select_adapter(representation)
+        if not isinstance(adapter, DTensorAdapter):
+            raise TypeError(
+                "DTensor projection target must use a standard torch DTensor "
+                f"representation; got {type(representation).__name__}."
+            )
+        host_state = adapter.project_host(
+            source.adapter,
+            source.host_state,
+            representation,
+        )
+        projected = cls.__new__(cls)
+        projected._init_from_host_state(
+            representation,
+            requires_grad=False,
+            adapter=adapter,
+            host_state=host_state,
+        )
+        return projected
+
+    def _init_from_host_state(
+        self,
+        representation: torch.Tensor,
+        *,
+        requires_grad: bool,
+        adapter: TensorAdapter[Any, Any],
+        host_state: object,
+    ) -> None:
+        """Install representation metadata and an already-captured host state."""
+        self._shape = torch.Size(representation.shape)
+        self.requires_grad = requires_grad
+        self.adapter = adapter
+        self.host_state = host_state
+        self._logical_shape = (
+            adapter.logical_shape(representation)
+            if isinstance(adapter, LogicalShapeTensorAdapter)
+            else tuple(representation.shape)
+        )
+        # Precompute the rearm capability once: the per-load check is a hot
+        # path (every param, every block rotation), and a runtime_checkable
+        # Protocol isinstance structurally probes every member each call.
+        self._needs_rearm: bool = isinstance(
+            adapter, PostLoadRearmTensorAdapter
+        )
+        self._target_layout = self._target_layout_from_adapter(
+            adapter,
+            representation,
+            unresolved_meta=self.is_meta,
+        )
+        self._bind_layout = self._bind_layout_from_adapter(
+            adapter, representation,
+        )
+
     @staticmethod
     def _target_layout_from_adapter(
-        adapter: TensorAdapter[Any, Any], tensor: torch.Tensor,
+        adapter: TensorAdapter[Any, Any],
+        tensor: torch.Tensor,
+        *,
+        unresolved_meta: bool | None = None,
     ) -> tuple[object, object]:
         signature: object = adapter.layout_signature(tensor)
-        if tensor.is_meta:
+        if unresolved_meta is None:
+            unresolved_meta = tensor.is_meta
+        if unresolved_meta:
             # Physical regular tensors are normalized to contiguous backing,
             # but meta parameters retain their declared layout while resting.
             # Keep differing unresolved meta layouts out of the same

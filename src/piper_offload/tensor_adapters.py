@@ -756,6 +756,11 @@ class RegularAdapter:
         )
 
     @staticmethod
+    def capture_host_view(view: torch.Tensor) -> _RegularHost:
+        """Wrap an existing host view without normalizing or copying it."""
+        return _RegularHost(data=view.detach())
+
+    @staticmethod
     def storage_tensors(state: _RegularHost) -> tuple[torch.Tensor, ...]:
         return (state.data,)
 
