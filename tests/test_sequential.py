@@ -240,22 +240,34 @@ def test_model_forward(executor, compiled, streamed):
     assert executor.run(lambda rank: torch._C._distributed_c10d._get_work_registry_size()) == (0, 0)
 
 
-def test_mmap_shard0_projection_retains_full_host_mapping(executor, tmp_path: Path):
+@pytest.mark.parametrize("shard_dim", [0, 1])
+def test_mmap_projection_retains_full_host_mapping(
+    executor,
+    tmp_path: Path,
+    shard_dim: int,
+):
     path = tmp_path / "weight.bin"
     path.touch()
-    mapped = torch.from_file(str(path), shared=True, size=16 * 8, dtype=torch.float32)
+    mapped = torch.from_file(str(path), shared=True, size=17 * 9, dtype=torch.float32)
     mapped.copy_(torch.arange(mapped.numel(), dtype=torch.float32))
-    full = mapped.view(16, 8)
+    full = mapped.view(17, 9)
     source = HostParam(nn.Parameter(full, requires_grad=False))
     source_storage = source.storage_tensors()[0].untyped_storage()
 
     def setup(rank):
         mesh = DeviceMesh("cuda", [0, 1])
-        target_local = torch.empty((8, 8), device="meta")
+        local_shape = list(full.shape)
+        local_size, offset = Shard.local_shard_size_and_offset(
+            full.shape[shard_dim],
+            2,
+            rank,
+        )
+        local_shape[shard_dim] = int(local_size)
+        target_local = torch.empty(local_shape, device="meta")
         target_dtensor = DTensor.from_local(
             target_local,
             mesh,
-            [Shard(0)],
+            [Shard(shard_dim)],
             run_check=False,
             shape=full.shape,
             stride=full.stride(),
@@ -267,12 +279,11 @@ def test_mmap_shard0_projection_retains_full_host_mapping(executor, tmp_path: Pa
 
         host_local = module.weight.to_local()
         assert module.weight.device_mesh.device_type == "cpu"
-        assert module.weight.placements == (Shard(0),)
-        assert tuple(module.weight.shape) == tuple(full.shape)
+        assert module.weight.placements == (Shard(shard_dim),)
         assert host_local.untyped_storage().data_ptr() == source_storage.data_ptr()
         assert host_local.untyped_storage().nbytes() == source_storage.nbytes()
-        assert host_local.storage_offset() == rank * host_local.numel()
-        assert projected.storage_tensors()[0].data_ptr() == host_local.data_ptr()
+        assert host_local.storage_offset() == int(offset) * full.stride(shard_dim)
+        assert host_local.is_contiguous() is (shard_dim == 0)
         assert projected.cache_bytes == host_local.nbytes
         return {"module": module, "instance": instance, "target": None}
 
@@ -285,12 +296,22 @@ def test_mmap_shard0_projection_retains_full_host_mapping(executor, tmp_path: Pa
         plan.load_to_target(target)
         state["target"] = target
         weight = state["module"].weight
-        assert weight.device_mesh.device_type == "cuda"
-        assert weight.placements == (Shard(0),)
         assert state["instance"].params[
             "weight"
         ].target_layout == HostParam.target_layout_for(weight)
-        torch.testing.assert_close(weight.to_local().cpu(), full[rank * 8 : (rank + 1) * 8])
+        local = weight.to_local()
+        assert local.is_cuda and local.is_contiguous()
+        _, offset = Shard.local_shard_size_and_offset(
+            full.shape[shard_dim],
+            2,
+            rank,
+        )
+        expected = full.narrow(
+            shard_dim,
+            int(offset),
+            local.shape[shard_dim],
+        )
+        torch.testing.assert_close(local.cpu(), expected)
 
     executor.run(activate, sequential=False)
     for gathered in executor.run(lambda rank: states[rank]["module"].weight.full_tensor()):

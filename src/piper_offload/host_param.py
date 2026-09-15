@@ -150,9 +150,10 @@ class HostParam:
         source remains the captured host allocation, including any file
         mapping retained during capture.
 
-        The initial projection contract supports frozen plain tensors with one
-        ``Shard(0)`` placement. The local CPU shard is a view into the full
-        source allocation, so construction allocates no rank-local host tensor.
+        Projection supports frozen plain tensors with one ``Shard(0)``
+        placement, or rank-two tensors with ``Shard(1)``. The local CPU shard
+        is a view into the full source allocation, so construction allocates no
+        rank-local host tensor.
         """
         if source.is_meta:
             raise ValueError("DTensor projection source must own physical host storage.")

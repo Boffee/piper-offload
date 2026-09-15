@@ -687,7 +687,7 @@ def _make_hashable(value: object) -> object:
 
 @dataclass(slots=True)
 class _RegularHost:
-    """CPU state for a regular tensor: one contiguous host buffer."""
+    """CPU state for a regular tensor, possibly a projected noncontiguous view."""
 
     data: torch.Tensor
 

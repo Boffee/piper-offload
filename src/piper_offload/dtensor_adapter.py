@@ -27,10 +27,10 @@ weights, LoRA factor regions needed by each rank before device staging, then
 delegates the actual update to the local shard's adapter. This keeps
 tensor-parallel concerns out of format-specific quant adapters.
 
-Dense ``Shard(0)`` tensors can also be projected from a full plain host
-parameter. The target DTensor supplies only its distributed layout and may use
-a meta local tensor; the resting local shard remains a view of the original
-host allocation, including mmap-backed checkpoint storage.
+Dense ``Shard(0)`` and rank-two ``Shard(1)`` tensors can also be projected from
+a full plain host parameter. The target DTensor supplies only its distributed
+layout and may use a meta local tensor; the resting local shard remains a view
+of the original host allocation, including mmap-backed checkpoint storage.
 
 The adapter advertises no CPU round-trip, full dequantize/requantize,
 ``copy_into``, or trainable ``.data`` swap capability. It can expose a dense
@@ -463,7 +463,7 @@ class DTensorAdapter:
         source_state: object,
         target: torch.Tensor,
     ) -> _DTensorHost:
-        """Project a zero-copy dense ``Shard(0)`` view for ``target``."""
+        """Project a zero-copy dense ``Shard(0)`` or ``Shard(1)`` host view."""
         dt = require_dtensor(target)
         if not isinstance(source_adapter, RegularAdapter):
             raise NotImplementedError(
@@ -477,14 +477,15 @@ class DTensorAdapter:
         placements = tuple(dt.placements)
         if len(placements) != 1 or type(placements[0]) is not Shard:
             raise NotImplementedError(
-                "DTensor projection currently supports one Shard(0) placement only."
+                "DTensor projection requires one Shard(0) or Shard(1) placement."
             )
         shard_dim = cast(Any, placements[0]).dim
         if shard_dim < 0:
             shard_dim += source_tensor.ndim
-        if shard_dim != 0:
+        if shard_dim not in (0, 1) or (shard_dim == 1 and source_tensor.ndim != 2):
             raise NotImplementedError(
-                "DTensor projection currently supports one Shard(0) placement only."
+                "DTensor projection supports Shard(0) tensors and rank-two "
+                "Shard(1) tensors."
             )
         coordinate = dt.device_mesh.get_coordinate()
         if coordinate is None:
@@ -502,7 +503,11 @@ class DTensorAdapter:
             raise NotImplementedError(
                 "DTensor projection currently supports plain tensor local targets only."
             )
-        local = source_tensor.narrow(0, offsets[0], local_shape[0])
+        local = source_tensor.narrow(
+            shard_dim,
+            offsets[shard_dim],
+            local_shape[shard_dim],
+        )
         if (
             tuple(target_local.shape) != tuple(local.shape)
             or target_local.dtype is not local.dtype

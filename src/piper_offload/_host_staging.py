@@ -1,15 +1,17 @@
-"""Bounded Linux staging for pageable host-to-device copies.
+"""Bounded pinned staging for host-to-device copies.
 
 Private writable checkpoint mappings must not be registered in place on
 Linux: CUDA/HIP can request writable page pins even for a host-to-device copy,
 breaking copy-on-write for every mapped page.  A small pair of reusable pinned
 buffers preserves asynchronous DMA without retaining an anonymous copy of the
-checkpoint.
+checkpoint.  The same window packs row-strided projected shards on every
+platform.
 """
 
 import logging
 import sys
 import threading
+from collections.abc import Iterator
 
 import torch
 
@@ -19,13 +21,14 @@ _CHUNK_BYTES = 8 * 1024**2
 _SLOT_COUNT = 2
 
 
-class _LinuxHostStaging:
-    """Process-wide ping-pong buffers for contiguous pageable sources."""
+class _HostStaging:
+    """Process-wide ping-pong buffers for pageable and row-strided sources."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._slots: tuple[torch.Tensor, ...] | None = None
         self._events: list[torch.cuda.Event | None] = [None] * _SLOT_COUNT
+        self._event_devices: list[torch.device | None] = [None] * _SLOT_COUNT
         self._disabled = False
 
     def _allocate(self) -> tuple[torch.Tensor, ...] | None:
@@ -47,8 +50,8 @@ class _LinuxHostStaging:
                 # constrained process does not retry the allocation per tensor.
                 self._disabled = True
                 logger.warning(
-                    "Could not allocate the bounded Linux host staging window; "
-                    "using pageable host-to-device copies: %s",
+                    "Could not allocate the bounded host staging window; "
+                    "using direct host-to-device copies: %s",
                     str(error),
                 )
                 return None
@@ -59,6 +62,29 @@ class _LinuxHostStaging:
         with self._lock:
             return self._allocate() is not None
 
+    @staticmethod
+    def _iter_regions(
+        destination: torch.Tensor,
+        source: torch.Tensor,
+        elements_per_chunk: int,
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        """Yield matching regions that each fit one staging slot."""
+        if source.is_contiguous():
+            source_flat = source.reshape(-1)
+            destination_flat = destination.reshape(-1)
+            for start in range(0, source.numel(), elements_per_chunk):
+                end = min(start + elements_per_chunk, source.numel())
+                yield source_flat[start:end], destination_flat[start:end]
+            return
+
+        rows, columns = source.shape
+        if columns == 0:
+            return
+        rows_per_chunk = max(1, elements_per_chunk // columns)
+        for start in range(0, rows, rows_per_chunk):
+            end = min(start + rows_per_chunk, rows)
+            yield source[start:end], destination[start:end]
+
     def copy(
         self,
         destination: torch.Tensor,
@@ -67,6 +93,13 @@ class _LinuxHostStaging:
         non_blocking: bool,
     ) -> bool:
         """Stage one compatible copy, returning False for the direct fallback."""
+        source_is_contiguous = source.is_contiguous()
+        stageable_row_strided = (
+            source.ndim == 2
+            and source.stride(1) == 1
+            and source.stride(0) >= source.shape[1]
+            and source.shape[1] * source.element_size() <= _CHUNK_BYTES
+        )
         if (
             self._disabled
             or source.device.type != "cpu"
@@ -75,9 +108,9 @@ class _LinuxHostStaging:
             or destination.layout is not torch.strided
             or source.dtype != destination.dtype
             or source.shape != destination.shape
-            or not source.is_contiguous()
+            or not (source_is_contiguous or stageable_row_strided)
             or not destination.is_contiguous()
-            or source.is_pinned()
+            or (source.is_pinned() and source_is_contiguous)
         ):
             return False
 
@@ -86,28 +119,32 @@ class _LinuxHostStaging:
             if slots is None:
                 return False
             stream = torch.cuda.current_stream(destination.device)
-            source_flat = source.reshape(-1)
-            destination_flat = destination.reshape(-1)
             elements_per_chunk = _CHUNK_BYTES // source.element_size()
             last_event: torch.cuda.Event | None = None
             with torch.cuda.stream(stream):
-                for chunk_idx, start in enumerate(
-                    range(0, source.numel(), elements_per_chunk)
+                for chunk_idx, (source_region, destination_region) in enumerate(
+                    self._iter_regions(destination, source, elements_per_chunk)
                 ):
                     slot_idx = chunk_idx % _SLOT_COUNT
-                    prior = self._events[slot_idx]
-                    if prior is not None:
-                        prior.synchronize()
-                    end = min(start + elements_per_chunk, source.numel())
-                    staging = slots[slot_idx].view(source.dtype)[: end - start]
-                    staging.copy_(source_flat[start:end])
-                    destination_flat[start:end].copy_(
+                    event = self._events[slot_idx]
+                    if event is not None:
+                        event.synchronize()
+                    staging = slots[slot_idx].view(source.dtype)[
+                        : source_region.numel()
+                    ].view(source_region.shape)
+                    staging.copy_(source_region)
+                    destination_region.copy_(
                         staging,
                         non_blocking=True,
                     )
-                    event = torch.cuda.Event()
+                    if (
+                        event is None
+                        or self._event_devices[slot_idx] != destination.device
+                    ):
+                        event = torch.cuda.Event()
+                        self._events[slot_idx] = event
+                        self._event_devices[slot_idx] = destination.device
                     event.record(stream)
-                    self._events[slot_idx] = event
                     last_event = event
 
             if not non_blocking and last_event is not None:
@@ -115,12 +152,12 @@ class _LinuxHostStaging:
             return True
 
 
-_linux_host_staging = _LinuxHostStaging()
+_host_staging = _HostStaging()
 
 
-def reserve_linux_host_staging() -> bool:
-    """Reserve the Linux window, or report that pageable fallback is required."""
-    return sys.platform.startswith("linux") and _linux_host_staging.reserve()
+def reserve_host_staging() -> bool:
+    """Reserve the staging window, or report that direct fallback is required."""
+    return _host_staging.reserve()
 
 
 def copy_host_to_device(
@@ -129,8 +166,9 @@ def copy_host_to_device(
     *,
     non_blocking: bool,
 ) -> None:
-    """Copy host bytes, using bounded pinned staging when useful on Linux."""
-    if sys.platform.startswith("linux") and _linux_host_staging.copy(
+    """Copy host bytes through bounded pinned staging when useful."""
+    should_stage = sys.platform.startswith("linux") or not source.is_contiguous()
+    if should_stage and _host_staging.copy(
         destination,
         source,
         non_blocking=non_blocking,
@@ -139,4 +177,4 @@ def copy_host_to_device(
     destination.copy_(source, non_blocking=non_blocking)
 
 
-__all__ = ["copy_host_to_device", "reserve_linux_host_staging"]
+__all__ = ["copy_host_to_device", "reserve_host_staging"]
