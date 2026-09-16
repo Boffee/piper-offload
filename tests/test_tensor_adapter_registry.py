@@ -39,6 +39,32 @@ def test_package_import_does_not_require_triton() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+def test_package_import_does_not_require_dtensor() -> None:
+    script = """
+import sys
+# Model a minimal installation; quant libraries may themselves require DTensor.
+for package in ('torchao', 'bitsandbytes', 'optimum.quanto', 'piper_kernels'):
+    sys.modules[package] = None
+sys.modules['torch.distributed.tensor'] = None
+import torch
+import piper_offload
+from piper_offload._dtensor import DTENSOR_AVAILABLE
+from piper_offload.host_param import HostParam
+
+assert not DTENSOR_AVAILABLE
+weight = torch.nn.Parameter(torch.arange(6.0), requires_grad=False)
+host = HostParam(weight)
+assert torch.equal(host.make_cpu_param(), weight)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 class _ExternalTensor(torch.Tensor):
     pass
 

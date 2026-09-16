@@ -687,7 +687,7 @@ def _make_hashable(value: object) -> object:
 
 @dataclass(slots=True)
 class _RegularHost:
-    """CPU state for a regular tensor: one contiguous host buffer."""
+    """CPU state for a regular tensor, possibly a projected noncontiguous view."""
 
     data: torch.Tensor
 
@@ -754,6 +754,11 @@ class RegularAdapter:
                 memory_format=torch.contiguous_format,
             )
         )
+
+    @staticmethod
+    def capture_host_view(view: torch.Tensor) -> _RegularHost:
+        """Wrap an existing host view without normalizing or copying it."""
+        return _RegularHost(data=view.detach())
 
     @staticmethod
     def storage_tensors(state: _RegularHost) -> tuple[torch.Tensor, ...]:

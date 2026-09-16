@@ -6,6 +6,7 @@ import threading
 import weakref
 from contextlib import nullcontext
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 import torch
@@ -17,6 +18,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distrib
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
 
 from piper_offload import BlockCompileConfig, ModelOffloader
+from piper_offload.host_module import HostModuleStore
 from piper_offload.host_param import HostParam
 from piper_offload.sequential import SequentialExecutor
 from tests.conftest import activated_model
@@ -236,6 +238,94 @@ def test_model_forward(executor, compiled, streamed):
             assert type(actual) is torch.Tensor
             torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-4)
     assert executor.run(lambda rank: torch._C._distributed_c10d._get_work_registry_size()) == (0, 0)
+
+
+@pytest.mark.parametrize("shard_dim", [0, 1])
+def test_mmap_projection_retains_full_host_mapping(
+    executor,
+    tmp_path: Path,
+    shard_dim: int,
+):
+    path = tmp_path / "weight.bin"
+    path.touch()
+    mapped = torch.from_file(str(path), shared=True, size=17 * 9, dtype=torch.float32)
+    mapped.copy_(torch.arange(mapped.numel(), dtype=torch.float32))
+    full = mapped.view(17, 9)
+    source = HostParam(nn.Parameter(full, requires_grad=False))
+    source_storage = source.storage_tensors()[0].untyped_storage()
+
+    def setup(rank):
+        mesh = DeviceMesh("cuda", [0, 1])
+        local_shape = list(full.shape)
+        local_size, offset = Shard.local_shard_size_and_offset(
+            full.shape[shard_dim],
+            2,
+            rank,
+        )
+        local_shape[shard_dim] = int(local_size)
+        target_local = torch.empty(local_shape, device="meta")
+        target_dtensor = DTensor.from_local(
+            target_local,
+            mesh,
+            [Shard(shard_dim)],
+            run_check=False,
+            shape=full.shape,
+            stride=full.stride(),
+        )
+        module = nn.Module()
+        module.weight = nn.Parameter(target_dtensor, requires_grad=False)
+        projected = HostParam.project_dtensor(source, module.weight)
+        instance = HostModuleStore(params={"weight": projected}, buffers={}).bind(module)
+
+        host_local = module.weight.to_local()
+        assert module.weight.device_mesh.device_type == "cpu"
+        assert module.weight.placements == (Shard(shard_dim),)
+        assert host_local.untyped_storage().data_ptr() == source_storage.data_ptr()
+        assert host_local.untyped_storage().nbytes() == source_storage.nbytes()
+        assert host_local.storage_offset() == int(offset) * full.stride(shard_dim)
+        assert host_local.is_contiguous() is (shard_dim == 0)
+        assert projected.cache_bytes == host_local.nbytes
+        return {"module": module, "instance": instance, "target": None}
+
+    states = executor.run(setup, sequential=False)
+
+    def activate(rank):
+        state = states[rank]
+        plan = state["instance"].resolve_load_plan()
+        target = plan.allocate_target(torch.device("cuda"))
+        plan.load_to_target(target)
+        state["target"] = target
+        weight = state["module"].weight
+        assert state["instance"].params[
+            "weight"
+        ].target_layout == HostParam.target_layout_for(weight)
+        local = weight.to_local()
+        assert local.is_cuda and local.is_contiguous()
+        _, offset = Shard.local_shard_size_and_offset(
+            full.shape[shard_dim],
+            2,
+            rank,
+        )
+        expected = full.narrow(
+            shard_dim,
+            int(offset),
+            local.shape[shard_dim],
+        )
+        torch.testing.assert_close(local.cpu(), expected)
+
+    executor.run(activate, sequential=False)
+    for gathered in executor.run(lambda rank: states[rank]["module"].weight.full_tensor()):
+        torch.testing.assert_close(gathered.cpu(), full)
+
+    def deactivate(rank):
+        state = states[rank]
+        state["instance"].install_host()
+        state["target"] = None
+        local = state["module"].weight.to_local()
+        assert local.device.type == "cpu"
+        assert local.untyped_storage().data_ptr() == source_storage.data_ptr()
+
+    executor.run(deactivate, sequential=False)
 
 
 @pytest.mark.parametrize("backend", ["aot_eager", "inductor"])

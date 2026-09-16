@@ -1,4 +1,4 @@
-"""Bounded pageable host-to-device staging."""
+"""Bounded host-to-device staging."""
 
 import pytest
 import torch
@@ -6,7 +6,7 @@ import torch
 from piper_offload._host_staging import (
     _CHUNK_BYTES,
     _SLOT_COUNT,
-    _LinuxHostStaging,
+    _HostStaging,
 )
 
 CUDA = pytest.mark.skipif(
@@ -22,7 +22,7 @@ def test_staging_reuses_a_bounded_ping_pong_window() -> None:
         dtype=torch.uint8,
     )
     destination = torch.empty_like(source, device="cuda")
-    staging = _LinuxHostStaging()
+    staging = _HostStaging()
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         assert staging.copy(destination, source, non_blocking=True)
@@ -39,15 +39,35 @@ def test_staging_reuses_a_bounded_ping_pong_window() -> None:
 def test_staging_preserves_blocking_copy_semantics() -> None:
     source = torch.arange(_CHUNK_BYTES + 1, dtype=torch.uint8)
     destination = torch.empty_like(source, device="cuda")
-    staging = _LinuxHostStaging()
+    staging = _HostStaging()
 
     assert staging.copy(destination, source, non_blocking=False)
     torch.testing.assert_close(destination.cpu(), source)
 
 
 @CUDA
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize(("rows", "columns"), [(1025, 8192), (3, _CHUNK_BYTES + 17)])
+def test_staging_packs_row_strided_source(pinned: bool, rows: int, columns: int) -> None:
+    backing = torch.arange(rows * (columns + 2), dtype=torch.uint8).view(rows, columns + 2)
+    if pinned:
+        backing = backing.pin_memory()
+    source = backing[:, 1 : columns + 1]
+    destination = torch.empty(source.shape, dtype=source.dtype, device="cuda")
+    staging = _HostStaging()
+    stream = torch.cuda.Stream()
+
+    assert not source.is_contiguous()
+    assert source.nbytes > _CHUNK_BYTES
+    with torch.cuda.stream(stream):
+        assert staging.copy(destination, source, non_blocking=True)
+    stream.synchronize()
+    torch.testing.assert_close(destination.cpu(), source)
+
+
+@CUDA
 def test_staging_reservation_is_idempotent() -> None:
-    staging = _LinuxHostStaging()
+    staging = _HostStaging()
 
     assert staging.reserve()
     slots = staging._slots
@@ -61,7 +81,7 @@ def test_staging_leaves_pinned_sources_on_the_direct_path() -> None:
     source = torch.ones(16, pin_memory=True)
     destination = torch.empty_like(source, device="cuda")
 
-    assert not _LinuxHostStaging().copy(
+    assert not _HostStaging().copy(
         destination,
         source,
         non_blocking=True,

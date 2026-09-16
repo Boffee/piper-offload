@@ -27,6 +27,11 @@ weights, LoRA factor regions needed by each rank before device staging, then
 delegates the actual update to the local shard's adapter. This keeps
 tensor-parallel concerns out of format-specific quant adapters.
 
+Dense ``Shard(0)`` and rank-two ``Shard(1)`` tensors can also be projected from
+a full plain host parameter. The target DTensor supplies only its distributed
+layout and may use a meta local tensor; the resting local shard remains a view
+of the original host allocation, including mmap-backed checkpoint storage.
+
 The adapter advertises no CPU round-trip, full dequantize/requantize,
 ``copy_into``, or trainable ``.data`` swap capability. It can expose a dense
 local shard when the inner adapter can, which lets exact-name parameter values
@@ -61,6 +66,8 @@ import torch
 from torch import nn
 
 from ._dtensor import (
+    Replicate,
+    Shard,
     cpu_mesh_for,
     is_dtensor,
     local_shard,
@@ -79,6 +86,7 @@ from .tensor_adapters import (
     LogicalShapeTensorAdapter,
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
+    RegularAdapter,
     TensorAdapter,
     adapter_name,
 )
@@ -128,16 +136,14 @@ def _local_shape_and_offsets(
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Return this rank's contiguous shard shape and global offsets.
 
-    LoRA merge intentionally accepts only the common tensor-parallel placement
-    vocabulary: replication and contiguous sharding. Applying placements from
-    left to right mirrors DTensor's sharding semantics, including uneven and
-    repeated sharding of one tensor dimension.
+    Supports the common tensor-parallel placement vocabulary: replication and
+    contiguous sharding. Applying placements from left to right mirrors
+    DTensor's sharding semantics, including uneven and repeated sharding of one
+    tensor dimension.
     """
-    from torch.distributed.tensor import Replicate, Shard  # noqa: PLC0415
-
     if not (len(mesh_shape) == len(coordinate) == len(placements)):
         raise ValueError(
-            "DTensor merge requires one placement and coordinate per "
+            "DTensor layout requires one placement and coordinate per "
             f"mesh dimension; mesh shape is {mesh_shape}, coordinate is "
             f"{coordinate}, and placements are {placements}."
         )
@@ -151,7 +157,7 @@ def _local_shape_and_offsets(
             continue
         if type(placement) is not Shard:
             raise ValueError(
-                "DTensor merge supports only Replicate and contiguous "
+                "DTensor layout supports only Replicate and contiguous "
                 f"Shard placements; mesh dimension {mesh_dim} uses "
                 f"{placement!r}."
             )
@@ -448,6 +454,74 @@ class DTensorAdapter:
             inner_state=inner.capture_host(local),
             mesh=dt.device_mesh,
             placements=tuple(dt.placements),
+            shape=dt.shape,
+            stride=dt.stride(),
+        )
+
+    @staticmethod
+    def project_host(
+        source_adapter: TensorAdapter[Any, Any],
+        source_state: object,
+        target: torch.Tensor,
+    ) -> _DTensorHost:
+        """Project a zero-copy dense ``Shard(0)`` or ``Shard(1)`` host view."""
+        dt = require_dtensor(target)
+        if not isinstance(source_adapter, RegularAdapter):
+            raise NotImplementedError(
+                "DTensor projection currently supports plain tensor sources only."
+            )
+        (source_tensor,) = source_adapter.storage_tensors(cast(Any, source_state))
+        if tuple(source_tensor.shape) != tuple(dt.shape):
+            raise ValueError("DTensor projection source and target shapes must match.")
+        if dt.device_mesh.device_type != "cuda":
+            raise ValueError("DTensor projection target must use a CUDA/HIP device mesh.")
+        placements = tuple(dt.placements)
+        if len(placements) != 1 or type(placements[0]) is not Shard:
+            raise NotImplementedError(
+                "DTensor projection requires one Shard(0) or Shard(1) placement."
+            )
+        shard_dim = cast(Any, placements[0]).dim
+        if shard_dim < 0:
+            shard_dim += source_tensor.ndim
+        if shard_dim not in (0, 1) or (shard_dim == 1 and source_tensor.ndim != 2):
+            raise NotImplementedError(
+                "DTensor projection supports Shard(0) tensors and rank-two "
+                "Shard(1) tensors."
+            )
+        coordinate = dt.device_mesh.get_coordinate()
+        if coordinate is None:
+            raise ValueError(
+                "DTensor projection cannot run on a rank outside the target device mesh."
+            )
+        local_shape, offsets = _local_shape_and_offsets(
+            tuple(dt.shape),
+            tuple(dt.device_mesh.shape),
+            tuple(coordinate),
+            placements,
+        )
+        target_local = dt.to_local()
+        if type(target_local) is not torch.Tensor:
+            raise NotImplementedError(
+                "DTensor projection currently supports plain tensor local targets only."
+            )
+        local = source_tensor.narrow(
+            shard_dim,
+            offsets[shard_dim],
+            local_shape[shard_dim],
+        )
+        if (
+            tuple(target_local.shape) != tuple(local.shape)
+            or target_local.dtype is not local.dtype
+        ):
+            raise ValueError(
+                "DTensor projection local source and target must have matching "
+                "shapes and dtypes."
+            )
+        return _DTensorHost(
+            inner=source_adapter,
+            inner_state=source_adapter.capture_host_view(local),
+            mesh=dt.device_mesh,
+            placements=placements,
             shape=dt.shape,
             stride=dt.stride(),
         )
