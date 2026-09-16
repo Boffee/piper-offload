@@ -80,6 +80,12 @@ class _HostStaging:
         rows, columns = source.shape
         if columns == 0:
             return
+        if columns > elements_per_chunk:
+            for row in range(rows):
+                for start in range(0, columns, elements_per_chunk):
+                    end = min(start + elements_per_chunk, columns)
+                    yield source[row, start:end], destination[row, start:end]
+            return
         rows_per_chunk = max(1, elements_per_chunk // columns)
         for start in range(0, rows, rows_per_chunk):
             end = min(start + rows_per_chunk, rows)
@@ -98,7 +104,6 @@ class _HostStaging:
             source.ndim == 2
             and source.stride(1) == 1
             and source.stride(0) >= source.shape[1]
-            and source.shape[1] * source.element_size() <= _CHUNK_BYTES
         )
         if (
             self._disabled

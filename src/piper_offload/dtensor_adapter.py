@@ -64,9 +64,10 @@ from typing import Any, cast
 
 import torch
 from torch import nn
-from torch.distributed.tensor import Replicate, Shard
 
 from ._dtensor import (
+    Replicate,
+    Shard,
     cpu_mesh_for,
     is_dtensor,
     local_shard,

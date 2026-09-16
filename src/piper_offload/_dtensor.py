@@ -17,12 +17,14 @@ from typing import Any
 import torch
 
 try:
-    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor import DTensor, Replicate, Shard
 
     DTENSOR_AVAILABLE = True
 except ImportError:  # pragma: no cover - environment dependent
     DTENSOR_AVAILABLE = False
     DTensor: Any = None
+    Replicate: Any = None
+    Shard: Any = None
 
 
 def is_dtensor(t: object) -> bool:
