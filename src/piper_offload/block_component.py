@@ -55,7 +55,8 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from ._host_backing import HostBacking, HostLease
+from ._host_backing import HostBacking
+from ._host_lease import HostLease
 from .block_compile import BlockCompileConfig, _BlockCompileState
 from .block_mode import BlockMode
 from .block_runtime import BlockRuntime

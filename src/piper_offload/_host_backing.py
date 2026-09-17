@@ -17,8 +17,8 @@ the last owner waits for in-flight copies, unregisters, and frees the
 allocation.
 
 Parameters, buffers, and views sharing a storage share one backing. Backings
-do not reference their manager; the manager indexes them weakly and applies
-budget policy through the primitives below.
+do not reference their manager; the manager indexes them weakly and drives
+the transitions below.
 """
 
 import contextlib
@@ -27,9 +27,8 @@ import mmap
 import sys
 import threading
 import time
-import weakref
-from collections.abc import Callable, Generator
-from typing import Protocol, Self
+from collections.abc import Generator
+from typing import Protocol
 
 import torch
 
@@ -52,59 +51,6 @@ class EventStream(Protocol):
     def record_event(self) -> CopyEvent: ...
 
     def synchronize(self) -> None: ...
-
-
-def _close_lease(backings: tuple[HostBacking, ...], on_close: Callable[[], None] | None) -> None:
-    try:
-        for backing in backings:
-            backing.release()
-    finally:
-        if on_close is not None:
-            on_close()
-
-
-class HostLease:
-    """Protect a batch of backings until close.
-
-    Created by ``HostMemoryManager.acquire``. While open, the leased backings
-    are neither unpinned nor evicted. Dropping the lease closes it. Close is
-    idempotent, and a closed lease retains nothing.
-    """
-
-    def __init__(self, backings: tuple[HostBacking, ...], on_close: Callable[[], None] | None = None) -> None:
-        self._backings = backings
-        self._finalizer = weakref.finalize(self, _close_lease, backings, on_close)
-        self._finalizer.atexit = False
-
-    @property
-    def backings(self) -> tuple[HostBacking, ...]:
-        """The protected backings; unavailable once closed."""
-        if self.closed:
-            raise RuntimeError("Host lease is closed")
-        return self._backings
-
-    @property
-    def pinned(self) -> bool:
-        """Whether every leased backing is registered by its manager."""
-        return all(backing.pinned for backing in self.backings)
-
-    @property
-    def closed(self) -> bool:
-        return not self._finalizer.alive
-
-    def close(self) -> None:
-        try:
-            self._finalizer()
-        finally:
-            self._backings = ()
-
-    def __enter__(self) -> Self:
-        if self.closed:
-            raise RuntimeError("Host lease is closed")
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
 
 
 class HostBacking:
@@ -139,12 +85,12 @@ class HostBacking:
         pin_in_place: bool | None = None,
     ) -> None:
         self._lock = threading.RLock()
+        self._backend = backend
         self._source = storage
         # Memory PyTorch did not allocate is assumed to be a private file mapping.
         self._pin_in_place = storage.resizable() if pin_in_place is None else pin_in_place
         self._copy: torch.UntypedStorage | None = None
         self._pinned = False
-        self._backend = backend
         self._active = 0
         self._in_flight: list[CopyEvent] = []
         self._released_at = 0
@@ -165,7 +111,8 @@ class HostBacking:
             except Exception as error:
                 logger.warning("Host unregistration failed during cleanup: %s", str(error))
 
-    # Facts.
+    # ------------------------------------------------------------------
+    # Identity: fixed at capture.
 
     @property
     def storage(self) -> torch.UntypedStorage:
@@ -183,7 +130,8 @@ class HostBacking:
         """
         return self._pin_in_place
 
-    # State.
+    # ------------------------------------------------------------------
+    # State: what the transitions below have done so far.
 
     @property
     def pinned(self) -> bool:
@@ -202,6 +150,25 @@ class HostBacking:
         """Whether ``pin`` would have to allocate a copy: a private file mapping with none yet."""
         with self._lock:
             return not self._pin_in_place and self._copy is None
+
+    @property
+    def span(self) -> tuple[int, int]:
+        """Pointer and size of the storage reads use: the copy if any, else the source."""
+        with self._lock:
+            storage = self._selected()
+            return storage.data_ptr(), storage.nbytes()
+
+    @property
+    def page_bytes(self) -> int:
+        """Bytes of the OS pages ``pin`` locks: the selected storage's pages, or the aligned copy's."""
+        page = mmap.PAGESIZE
+        with self._lock:
+            pointer, size = self.span
+            if size == 0:
+                return 0
+            if self.needs_copy:
+                return -(-size // page) * page
+            return ((pointer + size - 1) // page - pointer // page + 1) * page
 
     @property
     def leases(self) -> int:
@@ -228,25 +195,7 @@ class HostBacking:
         """Monotonic time the last lease closed, ordering idle backings for eviction."""
         return self._released_at
 
-    @property
-    def span(self) -> tuple[int, int]:
-        """Pointer and size of the storage reads use: the copy if any, else the source."""
-        with self._lock:
-            storage = self._selected()
-            return storage.data_ptr(), storage.nbytes()
-
-    @property
-    def page_bytes(self) -> int:
-        """Bytes of the OS pages ``pin`` locks: the selected storage's pages, or the aligned copy's."""
-        page = mmap.PAGESIZE
-        with self._lock:
-            pointer, size = self.span
-            if size == 0:
-                return 0
-            if self.needs_copy:
-                return -(-size // page) * page
-            return ((pointer + size - 1) // page - pointer // page + 1) * page
-
+    # ------------------------------------------------------------------
     # Reads.
 
     def copy_to(self, destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool) -> None:
@@ -278,19 +227,9 @@ class HostBacking:
 
     @contextlib.contextmanager
     def _read(self, source: torch.Tensor, stream: EventStream | None = None) -> Generator[torch.Tensor]:
-        """Yield the source's view on the selected storage, busy until any marker on ``stream`` passes."""
-        if source.untyped_storage()._cdata != self._source._cdata:
-            raise ValueError("Source does not belong to this host backing")
+        """Bracket one read: hold the backing, yield the view, then record its completion on ``stream``."""
         with self._lock:
-            if self._copy is None:
-                view = source
-            else:
-                view = torch.empty(0, dtype=source.dtype, device="cpu").set_(
-                    self._copy,
-                    source.storage_offset(),
-                    source.shape,
-                    source.stride(),
-                )
+            view = self._view(source)
             self._active += 1
         event: CopyEvent | None = None
         try:
@@ -314,7 +253,21 @@ class HostBacking:
                         self._in_flight.append(event)
                 self.release()
 
-    # Primitives for the owning manager. They are budget-unaware: pin and
+    def _view(self, source: torch.Tensor) -> torch.Tensor:
+        """The source's view on the selected storage. Caller holds the lock."""
+        if source.untyped_storage()._cdata != self._source._cdata:
+            raise ValueError("Source does not belong to this host backing")
+        if self._copy is None:
+            return source
+        return torch.empty(0, dtype=source.dtype, device="cpu").set_(
+            self._copy,
+            source.storage_offset(),
+            source.shape,
+            source.stride(),
+        )
+
+    # ------------------------------------------------------------------
+    # Transitions, driven by the manager. They are budget-unaware: pin and
     # unpin through HostMemoryManager, which accounts for them.
 
     def hold(self) -> None:
@@ -340,17 +293,19 @@ class HostBacking:
             if self._pinned:
                 return True
             if self.needs_copy:
-                copy = _anonymous_storage(self._source.nbytes())
-                _bytes(copy).copy_(_bytes(self._source))
-                if not self._backend.register(copy.data_ptr(), copy.nbytes()):
-                    return False
-                self._copy = copy
-                self._pinned = True
-                return True
-            if not self._backend.register(*self.span):
-                return False
-            self._pinned = True
-            return True
+                return self._pin_copy()
+            self._pinned = self._backend.register(*self.span)
+            return self._pinned
+
+    def _pin_copy(self) -> bool:
+        """Copy the source into an owned aligned allocation and register that. Caller holds the lock."""
+        copy = _anonymous_storage(self._source.nbytes())
+        _bytes(copy).copy_(_bytes(self._source))
+        if not self._backend.register(copy.data_ptr(), copy.nbytes()):
+            return False
+        self._copy = copy
+        self._pinned = True
+        return True
 
     def unpin(self) -> bool:
         """Release the registration, keeping the copy. False while busy or when the runtime refuses.
@@ -381,6 +336,8 @@ class HostBacking:
             self._copy = None
             return True
 
+    # ------------------------------------------------------------------
+
     def _selected(self) -> torch.UntypedStorage:
         return self._copy if self._copy is not None else self._source
 
@@ -408,4 +365,4 @@ def _transfer(destination: torch.Tensor, view: torch.Tensor, *, non_blocking: bo
     destination.copy_(view, non_blocking=non_blocking)
 
 
-__all__ = ["CopyEvent", "EventStream", "HostBacking", "HostLease"]
+__all__ = ["CopyEvent", "EventStream", "HostBacking"]

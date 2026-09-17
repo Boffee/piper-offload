@@ -170,7 +170,8 @@ Compatibility
   backing may be shared.
 """
 
-from ._host_backing import HostBacking, HostLease
+from ._host_backing import HostBacking
+from ._host_lease import HostLease
 from ._host_registration import HostRegistrationError
 from .adapter import Adapter, AdapterMode, AdapterTarget
 from .block_compile import BlockCompileConfig

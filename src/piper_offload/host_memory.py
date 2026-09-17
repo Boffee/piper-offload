@@ -23,7 +23,8 @@ from dataclasses import dataclass
 
 import torch
 
-from ._host_backing import HostBacking, HostLease
+from ._host_backing import HostBacking
+from ._host_lease import HostLease
 from ._host_registration import HostRegistrationBackend, RuntimeHostRegistration
 
 
