@@ -147,9 +147,10 @@ Frozen parameters and buffers are not copied back from GPU execution, so
 stateful buffer updates that must persist are unsupported.
 
 Pinned copies rely on that immutability: a copy is only ever made of a
-private file mapping, and the mapping itself is never registered. Backing
-handles do not track trainability or detect mutation. Evicting a copy always
-preserves the original host source.
+private file mapping, and the mapping itself is never registered. Trainable
+parameters are captured to pin in place instead, since the optimizer writes
+them and a copy would go stale; `copy_to_cpu` refuses to write into a source
+that has a copy. Evicting a copy always preserves the original host source.
 
 Model and adapter factories transfer ownership of compatible complete pageable
 CPU allocations and non-empty views into non-resizable storage to the cached
@@ -227,12 +228,12 @@ allocation.
 Every read goes through `HostBacking.copy_to(destination, source, non_blocking=)`.
 It resolves the source's view onto the selected storage and copies it. Pinned
 storage copies through asynchronous DMA; pageable storage takes the driver's
-synchronous pageable copy. An asynchronous copy is issued only while a lease
-on the backing is open, because the lease is what keeps the backing from
-being evicted until its owner has synchronized; with no lease the copy is
-made synchronous. Adapters receive
-this as their `copy` callback. `HostLease` is the session-level protection
-returned by `HostMemoryManager.acquire()`; it has no per-copy form.
+synchronous pageable copy. Every asynchronous copy records a completion
+event on its stream, and the backing refuses to unpin or evict until every
+recorded event has passed, so any caller may copy asynchronously without
+holding a lease. Adapters receive this as their `copy` callback. `HostLease`
+is the session-level protection returned by `HostMemoryManager.acquire()`:
+while it is open the leased backings are neither unpinned nor evicted.
 
 `pin()` makes a backing's bytes DMA-ready: a source that may be pinned in
 place is registered where it is; a private file mapping is instead copied

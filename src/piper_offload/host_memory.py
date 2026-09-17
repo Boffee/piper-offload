@@ -58,7 +58,8 @@ class HostMemoryManager:
 
     Registration and backing metadata are read under one reentrant lock;
     budget state derives from the live handles rather than separate counters.
-    A backing stays pageable while any other lease may be reading it. Under
+    A backing stays pageable while another lease or an unfinished copy may be
+    reading it. Under
     pin pressure idle backings are unpinned least recently released first,
     keeping their copies; ``clear`` evicts idle copies as well.
     """
@@ -136,7 +137,7 @@ class HostMemoryManager:
                 sum(backing.copy_bytes for backing in live),
                 len(live),
                 len(pinned),
-                sum(backing.leases == 0 for backing in pinned),
+                sum(backing.idle for backing in pinned),
                 sum(backing.leases > 0 for backing in live),
             )
 
@@ -158,7 +159,7 @@ class HostMemoryManager:
             registered: list[HostBacking] = []
             try:
                 for backing in requested:
-                    if backing.pinned or backing.storage.nbytes() == 0 or backing.leases > 1:
+                    if backing.pinned or backing.storage.nbytes() == 0 or backing.leases > 1 or backing.in_flight:
                         continue
                     if backing.needs_copy and self._max_pinned_bytes is None:
                         # Copies duplicate the mapping into RAM; only a finite
@@ -195,7 +196,7 @@ class HostMemoryManager:
             failed = sum(
                 not backing.evict()
                 for backing in self._live()
-                if backing.leases == 0 and (backing.pinned or backing.copy_bytes)
+                if backing.idle and (backing.pinned or backing.copy_bytes)
             )
             if failed:
                 raise RuntimeError(f"Could not release {failed} host registration(s); storage remains retained")
@@ -210,7 +211,7 @@ class HostMemoryManager:
 
     def _idle_pinned(self) -> list[HostBacking]:
         """Idle registrations, least recently released first."""
-        candidates = [backing for backing in self._live() if backing.pinned and backing.leases == 0]
+        candidates = [backing for backing in self._live() if backing.pinned and backing.idle]
         candidates.sort(key=lambda backing: backing.released_at)
         return candidates
 

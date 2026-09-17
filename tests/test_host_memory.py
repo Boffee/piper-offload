@@ -388,6 +388,23 @@ def test_disposing_the_last_owner_unregisters_before_storage_dies(
     assert manager.stats.backings == 0
 
 
+def test_pending_copy_keeps_backing_pageable(backend: FakeBackend) -> None:
+    manager = HostMemoryManager(PAGE, backend=backend)
+    (tensor,) = _tensors((0, PAGE))
+    (backing,) = _backings(manager, tensor)
+    completion = SimpleNamespace(done=False, query=lambda: completion.done, synchronize=lambda: None)
+    stream = SimpleNamespace(record_event=lambda: completion, synchronize=lambda: None)
+    with backing._read(tensor, stream):
+        pass
+    with manager.acquire([backing]) as lease:
+        assert not lease.pinned
+        assert backend.register_calls == []
+    completion.done = True
+    with manager.acquire([backing]) as lease:
+        assert lease.pinned
+    manager.clear()
+
+
 def test_lease_retains_backing_until_close(manager: HostMemoryManager, backend: FakeBackend) -> None:
     (tensor,) = _tensors((0, PAGE))
     (backing,) = _backings(manager, tensor)

@@ -16,9 +16,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   `HostBacking` handles instead of tensors and returns a session `HostLease`.
   All reads go through the single `HostBacking.copy_to()` method, which
   resolves the selected storage and copies it; the separate copy module and
-  per-copy lease are gone. Asynchronous CUDA copies are issued only while a
-  session lease is open and are otherwise made synchronous, so a backing with
-  no lease is never being read. Overlap validation between distinct storages
+  per-copy lease are gone; the backing records a completion event for every
+  asynchronous CUDA copy and refuses to unpin or evict until they have
+  passed. Overlap validation between distinct storages
   is removed; the documented rule to use views of one storage stands.
   `PinLease`, `PinStats`, and
   `HostBacking.memory_manager` are removed; `HostMemoryStats` reports
@@ -37,7 +37,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   re-pin; `clear()` evicts idle copies. `HostMemoryStats.copy_bytes` reports
   retained copies. `try_set_anonymous_storage` is removed.
   `benchmarks/probe_host_registration.py` shows the copy-on-write cost of
-  registering a mapping on a given machine.
+  registering a mapping on a given machine. Trainable parameters always pin
+  in place, and `HostParam.copy_to_cpu` refuses to write into a source that
+  has a copy.
 - Remove the process-wide two-slot pinned staging window. Pageable sources,
   including Linux private file mappings and budget misses, now use the
   driver's synchronous pageable copy; retained anonymous copies (#112) are the

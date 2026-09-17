@@ -147,7 +147,12 @@ class HostParam:
         if memory_manager is None:
             memory_manager = HostMemoryManager()
         self._memory_manager = memory_manager
-        self._backings = memory_manager.capture(self.storage_tensors())
+        # A trainable weight is written by the optimizer, so copy-on-write on
+        # a mapped source is unavoidable and a retained copy would go stale;
+        # it is pinned where it is.
+        self._backings = memory_manager.capture(
+            self.storage_tensors(), pin_in_place=True if requires_grad else None,
+        )
         # Low-peak host construction optimization: release the original
         # source storage by repointing the source Parameter at the selected
         # host backing immediately. The assignment is an intentional
@@ -421,6 +426,11 @@ class HostParam:
                 f"{adapter_name(self.adapter)} does not support CPU round-trip: "
                 "its GPU representation cannot be copied back into the "
                 "host state without adapter-specific conversion."
+            )
+        if any(backing.copy_bytes for backing in self._backings.values()):
+            raise RuntimeError(
+                "Host state has a pinned copy that write-back would leave stale; "
+                "capture the parameter as trainable or evict the copy first."
             )
         self.adapter.copy_to_cpu(
             gpu_state, self.host_state, non_blocking=non_blocking

@@ -28,6 +28,30 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 BUDGET = 64 * 1024**2
 
 
+class _Completion:
+    def __init__(self):
+        self.done = False
+        self.waited = False
+
+    def query(self):
+        return self.done
+
+    def synchronize(self):
+        self.waited = True
+        self.done = True
+
+
+class _Stream:
+    def __init__(self, completion):
+        self.completion = completion
+
+    def record_event(self):
+        return self.completion
+
+    def synchronize(self):
+        self.completion.synchronize()
+
+
 def _bytes(tensor):
     storage = tensor.untyped_storage()
     return torch.empty(0, dtype=torch.uint8).set_(storage, 0, (storage.nbytes(),), (1,))
@@ -84,6 +108,58 @@ def test_pin_copies_a_private_file_mapping(tmp_path):
     assert backing.evict()
     assert backing.span == (source.data_ptr(), source.nbytes)
     assert backing.copy_bytes == 0
+
+
+def test_trainable_mapped_weight_pins_in_place_and_write_back_is_guarded(tmp_path):
+    manager = HostMemoryManager(BUDGET, backend=FakeBackend())
+    trainable = HostParam(nn.Parameter(_file_tensor(tmp_path, torch.arange(8.0), "train.bin")), memory_manager=manager)
+    frozen = HostParam(
+        nn.Parameter(_file_tensor(tmp_path, torch.arange(8.0), "frozen.bin"), requires_grad=False),
+        memory_manager=manager,
+    )
+    (trainable_backing,) = trainable.backing_handles()
+    (frozen_backing,) = frozen.backing_handles()
+    assert trainable_backing.pin_in_place and not frozen_backing.pin_in_place
+    with manager.acquire([trainable_backing, frozen_backing]) as lease:
+        assert lease.pinned
+        assert trainable_backing.copy_bytes == 0 and frozen_backing.copy_bytes == 8 * 4
+        target = trainable.allocate_gpu_storage(torch.device("cpu"))
+        trainable.copy_to_gpu(target)
+        trainable.copy_to_cpu(target)  # writes the source, which is what is pinned
+        frozen_target = frozen.allocate_gpu_storage(torch.device("cpu"))
+        frozen.copy_to_gpu(frozen_target)
+        with pytest.raises(RuntimeError, match="pinned copy"):
+            frozen.copy_to_cpu(frozen_target)
+    manager.clear()
+
+
+def test_in_flight_copy_blocks_unpin_and_evict_until_it_completes(tmp_path):
+    source = _file_tensor(tmp_path, torch.arange(7.0))
+    manager = HostMemoryManager(backend=FakeBackend())
+    (backing,) = manager.capture((source,)).values()
+    assert backing.pin()
+    completion = _Completion()
+    with backing._read(source, _Stream(completion)):
+        pass
+    assert backing.leases == 0 and backing.in_flight == 1 and not backing.idle
+    assert not backing.unpin()
+    assert not backing.evict()
+    with manager.acquire([backing]) as lease:
+        assert lease.pinned  # already pinned; nothing to admit
+    completion.done = True
+    assert backing.in_flight == 0 and backing.idle
+    assert backing.evict()
+
+
+def test_disposal_waits_for_in_flight_copies(tmp_path):
+    source = _file_tensor(tmp_path, torch.arange(7.0))
+    (backing,) = HostMemoryManager(backend=FakeBackend()).capture((source,)).values()
+    completion = _Completion()
+    with backing._read(source, _Stream(completion)):
+        pass
+    del backing
+    gc.collect()
+    assert completion.waited
 
 
 def test_refused_registration_after_copying_keeps_no_copy(tmp_path):
@@ -217,6 +293,7 @@ def test_unpin_and_evict_wait_for_every_reader_and_lease(tmp_path):
     (backing,) = manager.capture((source,)).values()
     assert backing.pin()
     with backing._read(source), backing._read(source):
+        assert backing.leases == 2
         assert not backing.unpin()
         assert not backing.evict()
     lease = manager.acquire([backing])
@@ -353,41 +430,66 @@ def test_quantized_copies_resolve_physical_storage_without_rewriting_state(kind,
 
 @CUDA
 @pytest.mark.parametrize("fail_after_copy", [False, True])
-def test_async_copy_under_a_lease_prevents_early_eviction(tmp_path, monkeypatch, fail_after_copy):
+def test_async_copy_prevents_eviction_until_it_completes(tmp_path, monkeypatch, fail_after_copy):
     source = _file_tensor(tmp_path, torch.arange(1024.0))
     manager = HostMemoryManager(BUDGET, backend=RecordingBackend())
     (backing,) = manager.capture((source,)).values()
+    with manager.acquire([backing]):
+        assert backing.copy_bytes == source.nbytes  # pinned through a copy; stays after the lease
     destination = torch.empty_like(source, device="cuda")
     stream = torch.cuda.Stream()
-    observed = []
     raw_copy = host_backing_module._transfer
 
-    def observe(destination, source, *, non_blocking):
-        observed.append(non_blocking)
+    def copy_then_fail(destination, source, *, non_blocking):
         raw_copy(destination, source, non_blocking=non_blocking)
-        if fail_after_copy and len(observed) > 1:
-            raise RuntimeError("after enqueue")
+        raise RuntimeError("after enqueue")
 
-    monkeypatch.setattr(host_backing_module, "_transfer", observe)
     # Warm the path before adding a delay, avoiding lazy initialization waits.
     with torch.cuda.stream(stream):
         backing.copy_to(destination, source, non_blocking=True)
         torch.cuda._sleep(1)
     stream.synchronize()
-    assert observed == [False]  # no lease: the copy was made synchronous
-    with manager.acquire([backing]) as lease:
-        assert lease.pinned and backing.copy_bytes == source.nbytes
-        with torch.cuda.stream(stream):
-            torch.cuda._sleep(500_000_000)
-            if fail_after_copy:
-                with pytest.raises(RuntimeError, match="after enqueue"):
-                    backing.copy_to(destination, source, non_blocking=True)
-            else:
+    if fail_after_copy:
+        monkeypatch.setattr(host_backing_module, "_transfer", copy_then_fail)
+    # No lease is held: the in-flight copy alone must keep the copy alive.
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(500_000_000)
+        if fail_after_copy:
+            with pytest.raises(RuntimeError, match="after enqueue"):
                 backing.copy_to(destination, source, non_blocking=True)
-        assert observed == [False, True]
-        assert not backing.evict()
-        stream.synchronize()
-    assert backing.evict()
+        else:
+            backing.copy_to(destination, source, non_blocking=True)
+    assert backing.in_flight and not backing.idle
+    assert not backing.evict()
+    manager.clear()
+    assert backing.copy_bytes == source.nbytes
+    stream.synchronize()
+    assert backing.idle
+    manager.clear()
+    assert backing.copy_bytes == 0
+    torch.testing.assert_close(destination.cpu(), source)
+
+
+@CUDA
+def test_copy_by_an_unleased_caller_survives_another_sessions_lease_closing(tmp_path):
+    source = _file_tensor(tmp_path, torch.arange(1024.0))
+    manager = HostMemoryManager(BUDGET, backend=RecordingBackend())
+    (backing,) = manager.capture((source,)).values()
+    destination = torch.empty_like(source, device="cuda")
+    stream = torch.cuda.Stream()
+    session = manager.acquire([backing])  # some other session's lease
+    with torch.cuda.stream(stream):
+        backing.copy_to(destination, source, non_blocking=True)
+    stream.synchronize()
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(500_000_000)
+        backing.copy_to(destination, source, non_blocking=True)  # this caller holds no lease
+    session.close()
+    manager.clear()  # the session is gone; the copy is not
+    assert backing.copy_bytes == source.nbytes
+    stream.synchronize()
+    manager.clear()
+    assert backing.copy_bytes == 0
     torch.testing.assert_close(destination.cpu(), source)
 
 

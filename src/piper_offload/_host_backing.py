@@ -9,11 +9,12 @@ anonymous allocation that is registered instead. ``unpin`` releases the
 registration and keeps the copy; ``evict`` frees the copy too. ``copy_to``
 reads the copy when there is one, else the source.
 
-A lease from the manager keeps the backing busy across a whole activation; an
-asynchronous CUDA copy is only issued while a lease is open, and the lease
-must close after the runtime has synchronized. Without a lease the copy runs
-synchronously, so nothing ever reads a backing that looks idle. Disposing the
-last owner unregisters and frees the allocation.
+The backing protects itself: every asynchronous CUDA copy records a
+completion event, and the backing refuses to unpin or evict until every
+recorded event has passed. A lease from the manager additionally keeps a
+backing from being unpinned or evicted across a whole activation. Disposing
+the last owner waits for in-flight copies, unregisters, and frees the
+allocation.
 
 Parameters, buffers, and views sharing a storage share one backing. Backings
 do not reference their manager; the manager indexes them weakly and applies
@@ -28,13 +29,29 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Generator
-from typing import Self
+from typing import Protocol, Self
 
 import torch
 
 from ._host_registration import HostRegistrationBackend
 
 logger = logging.getLogger(__name__)
+
+
+class CopyEvent(Protocol):
+    """The event recorded after an asynchronous copy, shaped like ``torch.cuda.Event``."""
+
+    def query(self) -> bool: ...
+
+    def synchronize(self) -> None: ...
+
+
+class EventStream(Protocol):
+    """Records an event for the work enqueued so far, shaped like ``torch.cuda.Stream``."""
+
+    def record_event(self) -> CopyEvent: ...
+
+    def synchronize(self) -> None: ...
 
 
 def _close_lease(backings: tuple[HostBacking, ...], on_close: Callable[[], None] | None) -> None:
@@ -49,10 +66,9 @@ def _close_lease(backings: tuple[HostBacking, ...], on_close: Callable[[], None]
 class HostLease:
     """Protect a batch of backings until close.
 
-    Created by ``HostMemoryManager.acquire``. Asynchronous copies are issued
-    only while a lease is open, so close it after the runtime has
-    synchronized. Dropping the lease closes it. Close is idempotent, and a
-    closed lease retains nothing.
+    Created by ``HostMemoryManager.acquire``. While open, the leased backings
+    are neither unpinned nor evicted. Dropping the lease closes it. Close is
+    idempotent, and a closed lease retains nothing.
     """
 
     def __init__(self, backings: tuple[HostBacking, ...], on_close: Callable[[], None] | None = None) -> None:
@@ -107,6 +123,7 @@ class HostBacking:
         "_active",
         "_backend",
         "_copy",
+        "_in_flight",
         "_lock",
         "_pin_in_place",
         "_pinned",
@@ -129,6 +146,7 @@ class HostBacking:
         self._pinned = False
         self._backend = backend
         self._active = 0
+        self._in_flight: list[CopyEvent] = []
         self._released_at = 0
 
     def __del__(self) -> None:
@@ -138,6 +156,8 @@ class HostBacking:
         # pages the driver could still touch, so the storage is freed anyway.
         if sys.is_finalizing():
             return
+        for event in getattr(self, "_in_flight", ()):
+            event.synchronize()
         if getattr(self, "_pinned", False):
             try:
                 self._backend.unregister(self._selected().data_ptr())
@@ -184,9 +204,23 @@ class HostBacking:
 
     @property
     def leases(self) -> int:
-        """Open leases; the backing is idle at zero."""
+        """Open leases."""
         with self._lock:
             return self._active
+
+    @property
+    def in_flight(self) -> int:
+        """Asynchronous copies enqueued but not yet complete."""
+        with self._lock:
+            self._discard_completed()
+            return len(self._in_flight)
+
+    @property
+    def idle(self) -> bool:
+        """No open lease and no unfinished copy, so nothing can be reading this backing."""
+        with self._lock:
+            self._discard_completed()
+            return self._active == 0 and not self._in_flight
 
     @property
     def released_at(self) -> int:
@@ -216,27 +250,31 @@ class HostBacking:
 
         A CUDA destination is written on its current stream: asynchronous DMA
         when the storage is pinned, otherwise the driver's synchronous pageable
-        copy. An asynchronous copy is issued only while a lease is open, since
-        the lease is what keeps the backing busy until the caller synchronizes;
-        with no lease the copy is made synchronous. CUDA graph capture is
-        rejected while a copy is selected, because a captured node reads the
-        pointer on every replay and the copy can be evicted. Other accelerators
-        cannot report completion, so their copies are always synchronous.
+        copy. A completion event recorded on that stream keeps the backing from
+        being unpinned or evicted until the copy has finished, so no caller
+        needs a lease to copy safely. CUDA graph capture is rejected while a
+        copy is selected, because a captured node reads the pointer on every
+        replay and the copy can be evicted. Other accelerators cannot report
+        completion, so their copies are made synchronous.
         """
         if source.device.type != "cpu":
             raise ValueError("Host copies require a CPU source")
-        cuda = destination.device.type == "cuda"
-        if cuda:
+        stream: EventStream | None = None
+        if destination.device.type == "cuda":
             with torch.cuda.device(destination.device):
-                if torch.cuda.is_current_stream_capturing() and self.copy_bytes:
-                    raise RuntimeError("Copies from an evictable host copy cannot be captured in CUDA graphs")
-        non_blocking = non_blocking and cuda and self.leases > 0
-        with self._read(source) as view:
+                if torch.cuda.is_current_stream_capturing():
+                    if self.copy_bytes:
+                        raise RuntimeError("Copies from an evictable host copy cannot be captured in CUDA graphs")
+                else:
+                    stream = torch.cuda.current_stream(destination.device)
+        elif destination.device.type != "cpu":
+            non_blocking = False
+        with self._read(source, stream) as view:
             _transfer(destination, view, non_blocking=non_blocking)
 
     @contextlib.contextmanager
-    def _read(self, source: torch.Tensor) -> Generator[torch.Tensor]:
-        """Yield the source's view on the selected storage, holding the backing busy meanwhile."""
+    def _read(self, source: torch.Tensor, stream: EventStream | None = None) -> Generator[torch.Tensor]:
+        """Yield the source's view on the selected storage, busy until any marker on ``stream`` passes."""
         if source.untyped_storage()._cdata != self._source._cdata:
             raise ValueError("Source does not belong to this host backing")
         with self._lock:
@@ -250,10 +288,24 @@ class HostBacking:
                     source.stride(),
                 )
             self._active += 1
+        event: CopyEvent | None = None
         try:
             yield view
         finally:
-            self.release()
+            try:
+                if stream is not None:
+                    try:
+                        event = stream.record_event()
+                    except BaseException:
+                        # Even a failing copy can have queued partial work.
+                        # Without a marker, wait for it before releasing.
+                        stream.synchronize()
+                        raise
+            finally:
+                with self._lock:
+                    if event is not None:
+                        self._in_flight.append(event)
+                self.release()
 
     # Primitives for the owning manager. They are budget-unaware: pin and
     # unpin through HostMemoryManager, which accounts for them.
@@ -294,13 +346,14 @@ class HostBacking:
             return True
 
     def unpin(self) -> bool:
-        """Release the registration, keeping the copy. False when leased or when the runtime refuses.
+        """Release the registration, keeping the copy. False while busy or when the runtime refuses.
 
+        Busy means a lease is open or an asynchronous copy has not completed.
         A refused unregistration keeps the storage and its budget charge so the
         registration can be retried; nothing registered is ever freed.
         """
         with self._lock:
-            if self._active:
+            if not self.idle:
                 return False
             if not self._pinned:
                 return True
@@ -324,6 +377,9 @@ class HostBacking:
     def _selected(self) -> torch.UntypedStorage:
         return self._copy if self._copy is not None else self._source
 
+    def _discard_completed(self) -> None:
+        self._in_flight[:] = [event for event in self._in_flight if not event.query()]
+
 
 def _anonymous_storage(nbytes: int) -> torch.UntypedStorage:
     """An owned, page-aligned anonymous allocation released with its last reference.
@@ -345,4 +401,4 @@ def _transfer(destination: torch.Tensor, view: torch.Tensor, *, non_blocking: bo
     destination.copy_(view, non_blocking=non_blocking)
 
 
-__all__ = ["HostBacking", "HostLease"]
+__all__ = ["CopyEvent", "EventStream", "HostBacking", "HostLease"]
