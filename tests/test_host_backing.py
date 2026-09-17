@@ -1,6 +1,7 @@
 """Pinned copies of file-backed weights preserve values and GPU scheduling."""
 
 import gc
+import logging
 import mmap
 import struct
 import threading
@@ -149,6 +150,57 @@ def test_in_flight_copy_blocks_unpin_and_evict_until_it_completes(tmp_path):
     completion.done = True
     assert backing.in_flight == 0 and backing.idle
     assert backing.evict()
+
+
+def test_lazy_conjugate_and_negation_views_resolve_onto_the_copy(tmp_path):
+    values = torch.arange(6, dtype=torch.float32).reshape(2, 3) * (1 + 2j)
+    source = _file_tensor(tmp_path, values.to(torch.complex64))
+    (backing,) = HostMemoryManager(backend=FakeBackend()).capture((source,)).values()
+    assert backing.pin()
+    for view in (source.conj(), torch._neg_view(source), torch._neg_view(source.conj())):
+        with backing._read(view) as resolved:
+            assert resolved.untyped_storage().data_ptr() == backing.span[0]
+            assert resolved.is_conj() == view.is_conj() and resolved.is_neg() == view.is_neg()
+            torch.testing.assert_close(resolved.resolve_conj().resolve_neg(), view.resolve_conj().resolve_neg())
+    assert backing.evict()
+
+
+def test_failed_event_query_still_records_the_marker_and_releases(tmp_path):
+    source = _file_tensor(tmp_path, torch.arange(7.0))
+    (backing,) = HostMemoryManager(backend=FakeBackend()).capture((source,)).values()
+
+    class Poisoned(_Completion):
+        def query(self):
+            raise RuntimeError("asynchronous CUDA error")
+
+    poisoned, fresh = Poisoned(), _Completion()
+    for event in (poisoned, fresh):
+        # Pruning surfaces the error, but only after the new marker is
+        # recorded and the read's lease released.
+        with pytest.raises(RuntimeError, match="asynchronous CUDA error"), backing._read(source, _Stream(event)):
+            pass
+        assert backing.leases == 0
+    assert backing._in_flight == [poisoned, fresh]
+
+
+def test_disposal_still_unregisters_when_waiting_for_a_copy_fails(tmp_path, caplog):
+    backend = FakeBackend()
+    source = _file_tensor(tmp_path, torch.arange(7.0))
+    (backing,) = HostMemoryManager(backend=backend).capture((source,)).values()
+    assert backing.pin()
+    copy_pointer = backing.span[0]
+
+    class Broken(_Completion):
+        def synchronize(self):
+            raise RuntimeError("context is dead")
+
+    with backing._read(source, _Stream(Broken())):
+        pass
+    with caplog.at_level(logging.WARNING, logger="piper_offload._host_backing"):
+        del backing
+        gc.collect()
+    assert backend.unregister_calls == [copy_pointer]
+    assert "context is dead" in caplog.text
 
 
 def test_completed_events_are_pruned_as_new_copies_are_recorded(tmp_path):
@@ -597,14 +649,17 @@ def test_runtime_reuses_then_evicts_copies_without_changing_weights(tmp_path, mo
 
 
 @CUDA
-def test_copy_from_an_evictable_copy_rejects_graph_capture(tmp_path):
-    source = _file_tensor(tmp_path, torch.ones(16))
+@pytest.mark.parametrize("pinned_in_place", [True, False])
+def test_host_copies_reject_graph_capture(tmp_path, pinned_in_place):
+    # Neither a registration nor a copy can be kept alive for a graph's
+    # replays, so capture is refused whichever storage would be read.
+    source = torch.ones(16) if pinned_in_place else _file_tensor(tmp_path, torch.ones(16))
     manager = HostMemoryManager(BUDGET, backend=RecordingBackend())
     (backing,) = manager.capture((source,)).values()
     destination = torch.empty_like(source, device="cuda")
     stream = torch.cuda.Stream()
     with manager.acquire([backing]):
-        assert backing.copy_bytes == source.nbytes
+        assert backing.pinned
         with torch.cuda.stream(stream):
             backing.copy_to(destination, source, non_blocking=True)
         stream.synchronize()

@@ -103,8 +103,13 @@ class HostBacking:
         # leaves pages the driver could still touch, so the storage is freed.
         if sys.is_finalizing():
             return
-        for event in getattr(self, "_in_flight", ()):
-            event.synchronize()
+        try:
+            for event in getattr(self, "_in_flight", ()):
+                event.synchronize()
+        except Exception as error:
+            # A failed wait means the context is dead and nothing can still
+            # be reading; the registration must still be released.
+            logger.warning("Waiting for in-flight host copies failed during cleanup: %s", str(error))
         if getattr(self, "_pinned", False):
             try:
                 self._backend.unregister(self._selected().data_ptr())
@@ -205,10 +210,11 @@ class HostBacking:
         when the storage is pinned, otherwise the driver's synchronous pageable
         copy. A completion event recorded on that stream keeps the backing from
         being unpinned or evicted until the copy has finished, so no caller
-        needs a lease to copy safely. CUDA graph capture is rejected while a
-        copy is selected, because a captured node reads the pointer on every
-        replay and the copy can be evicted. Other accelerators cannot report
-        completion, so their copies are made synchronous.
+        needs a lease to copy safely. CUDA graph capture is rejected: a
+        captured node reads the pointer on every replay, and nothing can keep
+        the registration or the copy alive for the graph's lifetime. Other
+        accelerators cannot report completion, so their copies are made
+        synchronous.
         """
         if source.device.type != "cpu":
             raise ValueError("Host copies require a CPU source")
@@ -216,10 +222,8 @@ class HostBacking:
         if destination.device.type == "cuda":
             with torch.cuda.device(destination.device):
                 if torch.cuda.is_current_stream_capturing():
-                    if self.copy_bytes:
-                        raise RuntimeError("Copies from an evictable host copy cannot be captured in CUDA graphs")
-                else:
-                    stream = torch.cuda.current_stream(destination.device)
+                    raise RuntimeError("Host copies cannot be captured in CUDA graphs")
+                stream = torch.cuda.current_stream(destination.device)
         elif destination.device.type != "cpu":
             non_blocking = False
         with self._read(source, stream) as view:
@@ -247,11 +251,13 @@ class HostBacking:
             finally:
                 with self._lock:
                     if event is not None:
-                        # Prune here too: steady-state reuse never queries
-                        # idle, so this is what keeps the list bounded.
-                        self._discard_completed()
                         self._in_flight.append(event)
-                self.release()
+                    self.release()
+                    # Prune last, so a query that surfaces an asynchronous
+                    # error leaves the marker recorded and the lease released.
+                    # Steady-state reuse never queries idle, so this is what
+                    # keeps the list bounded.
+                    self._discard_completed()
 
     def _view(self, source: torch.Tensor) -> torch.Tensor:
         """The source's view on the selected storage. Caller holds the lock."""
@@ -259,12 +265,19 @@ class HostBacking:
             raise ValueError("Source does not belong to this host backing")
         if self._copy is None:
             return source
-        return torch.empty(0, dtype=source.dtype, device="cpu").set_(
+        view = torch.empty(0, dtype=source.dtype, device="cpu").set_(
             self._copy,
             source.storage_offset(),
             source.shape,
             source.stride(),
         )
+        # set_ rebuilds geometry only; lazy conjugation and negation are
+        # view bits that must be carried over or the copy reads raw values.
+        if source.is_conj():
+            view = view.conj()
+        if source.is_neg():
+            view = torch._neg_view(view)
+        return view
 
     # ------------------------------------------------------------------
     # Transitions, driven by the manager. They are budget-unaware: pin and

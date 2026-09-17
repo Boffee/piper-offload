@@ -250,9 +250,9 @@ supplied by the parameter owner and carries its backing handles and non-blocking
 setting. Composing adapters forward it to their inner adapter. Sources must be
 included in `storage_tensors()`; unregistered sources raise an error. Buffer
 copies use their own handles directly. Leases cover CPU and CUDA/HIP copies.
-CUDA graph capture of copies from an owned copy is rejected because graph
-replays need the source to remain alive beyond one copy's completion, and a
-copy can be evicted.
+CUDA graph capture of host copies is rejected: a replay reads the pointer
+again later, and neither a registration nor an owned copy can be kept alive
+for the graph's lifetime.
 
 ### Host registration
 
