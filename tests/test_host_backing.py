@@ -151,6 +151,21 @@ def test_in_flight_copy_blocks_unpin_and_evict_until_it_completes(tmp_path):
     assert backing.evict()
 
 
+def test_completed_events_are_pruned_as_new_copies_are_recorded(tmp_path):
+    source = _file_tensor(tmp_path, torch.arange(7.0))
+    (backing,) = HostMemoryManager(backend=FakeBackend()).capture((source,)).values()
+    completions = []
+    for _ in range(50):
+        completion = _Completion()
+        completions.append(completion)
+        with backing._read(source, _Stream(completion)):
+            pass
+        completion.done = True
+    # Steady-state reuse never queries idle, so recording itself must prune.
+    assert len(backing._in_flight) <= 1
+    assert backing.idle
+
+
 def test_disposal_waits_for_in_flight_copies(tmp_path):
     source = _file_tensor(tmp_path, torch.arange(7.0))
     (backing,) = HostMemoryManager(backend=FakeBackend()).capture((source,)).values()

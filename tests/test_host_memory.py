@@ -595,6 +595,35 @@ def test_prior_runtime_error_is_reported_before_registering(monkeypatch: pytest.
     assert runtime.flags is None
 
 
+def test_prior_runtime_error_does_not_skip_unregistration(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime = FakeRuntime(0)
+    unregistered = []
+    runtime.unregister = lambda pointer: unregistered.append(pointer) or 0  # type: ignore[method-assign]
+    runtime.last_error = 700
+    monkeypatch.setattr(registration_module, "_load_runtime", lambda: runtime)
+    with caplog.at_level(logging.WARNING, logger="piper_offload._host_registration"):
+        RuntimeHostRegistration().unregister(PAGE)
+    assert unregistered == [PAGE]
+    assert runtime.last_error == 0
+    assert "700" in caplog.text
+
+
+def test_source_needing_a_copy_is_charged_for_the_aligned_copy(tmp_path, backend: FakeBackend) -> None:
+    # A one-page payload starting mid-page spans two source pages, but its
+    # page-aligned copy fits one, so a one-page budget admits it.
+    (unaligned,) = _tensors((PAGE - 100, PAGE))
+    manager = HostMemoryManager(PAGE, backend=backend)
+    (backing,) = manager.capture([unaligned]).values()
+    assert backing.needs_copy and backing.page_bytes == PAGE
+    with manager.acquire([backing]) as lease:
+        assert lease.pinned
+        assert backing.span[0] % PAGE == 0 and backing.page_bytes == PAGE
+        assert manager.stats.pinned_bytes == PAGE
+    manager.clear()
+
+
 @pytest.mark.parametrize(
     ("hip", "filename", "prefix"),
     [

@@ -326,8 +326,10 @@ the current allocation. If capacity remains unavailable, the rest of that
 acquisition stays pageable without repeated registration attempts. A
 registration lives as long as its handle: disposing the last owner unregisters
 before the storage is freed. A registration whose release fails while its
-handle is alive stays charged, and `clear()` retries it; a failure during
-disposal is logged and the storage is freed, since unregistration only fails
+handle is alive stays charged, and `clear()` retries it. The backend always
+issues the native unregister call, clearing and logging any error left by
+earlier runtime work rather than skipping the call; a failure during disposal
+is therefore logged and the storage freed, since the native call only fails
 for an unregistered pointer or a dead context. `ModelCache` retains host stores
 until explicit eviction; unpinned mapped pages remain reclaimable by the OS.
 Do not resize storage or register/unregister it outside the manager while it is

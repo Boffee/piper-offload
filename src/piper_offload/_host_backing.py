@@ -151,9 +151,10 @@ class HostBacking:
 
     def __del__(self) -> None:
         # Native registrations must never outlive their storage. Runtime
-        # calls are skipped during interpreter exit. Unregistration fails only
-        # for an unregistered pointer or a dead context, and neither leaves
-        # pages the driver could still touch, so the storage is freed anyway.
+        # calls are skipped during interpreter exit. The backend always issues
+        # the native unregister; it only raises when that call itself fails,
+        # which means an unregistered pointer or a dead context, and neither
+        # leaves pages the driver could still touch, so the storage is freed.
         if sys.is_finalizing():
             return
         for event in getattr(self, "_in_flight", ()):
@@ -236,12 +237,15 @@ class HostBacking:
 
     @property
     def page_bytes(self) -> int:
-        """Bytes of the OS pages a registration of the selected storage locks."""
-        pointer, size = self.span
-        if size == 0:
-            return 0
+        """Bytes of the OS pages ``pin`` locks: the selected storage's pages, or the aligned copy's."""
         page = mmap.PAGESIZE
-        return ((pointer + size - 1) // page - pointer // page + 1) * page
+        with self._lock:
+            pointer, size = self.span
+            if size == 0:
+                return 0
+            if self.needs_copy:
+                return -(-size // page) * page
+            return ((pointer + size - 1) // page - pointer // page + 1) * page
 
     # Reads.
 
@@ -304,6 +308,9 @@ class HostBacking:
             finally:
                 with self._lock:
                     if event is not None:
+                        # Prune here too: steady-state reuse never queries
+                        # idle, so this is what keeps the list bounded.
+                        self._discard_completed()
                         self._in_flight.append(event)
                 self.release()
 
