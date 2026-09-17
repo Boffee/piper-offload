@@ -76,6 +76,7 @@ from ._dtensor import (
     rebuild_dtensor,
     require_dtensor,
 )
+from ._host_copy import TensorCopy
 from .seeding import derive_seed
 from .tensor_adapters import (
     BindLayoutTensorAdapter,
@@ -568,9 +569,9 @@ class DTensorAdapter:
         return nn.Parameter(dt, requires_grad=requires_grad)
 
     @staticmethod
-    def copy_to_gpu(src: _DTensorHost, dst: _DTensorGpu, *, non_blocking: bool = False) -> None:
-        # Pure local-shard DMA; never a collective.
-        src.inner.copy_to_gpu(src.inner_state, dst.inner_gpu, non_blocking=non_blocking)
+    def copy_to_gpu(src: _DTensorHost, dst: _DTensorGpu, *, copy: TensorCopy) -> None:
+        # Copy the local shard; never a collective.
+        src.inner.copy_to_gpu(src.inner_state, dst.inner_gpu, copy=copy)
 
     @staticmethod
     def logical_shape(t: torch.Tensor) -> tuple[int, ...]:

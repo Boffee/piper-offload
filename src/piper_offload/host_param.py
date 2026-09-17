@@ -15,12 +15,16 @@ such as D2H round-trip, trainable ``.data`` swap, and in-place updates
 are exposed through adapter capability methods.
 """
 
+from functools import partial
 from typing import Any, Self, cast
 
 import torch
 from torch import nn
 
+from ._host_backing import HostBacking
+from ._host_copy import copy_host_to_device
 from .dtensor_adapter import DTensorAdapter
+from .host_memory import HostMemoryManager
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
     BindLayoutTensorAdapter,
@@ -72,6 +76,9 @@ class HostParam:
     references and rebuild from a fresh model instance. Tensor subclasses skip
     this optimization because ``.data =`` can drop wrapper state.
 
+    ``memory_manager`` shares allocation handles and a pin budget with other
+    host captures. If omitted, this parameter owns an independent manager.
+
     A frozen plain floating-point meta parameter retains its shape, dtype, and
     stride without host backing or cache charge. It remains meta unless a
     merge-mode parameter value allocates and fills active device storage.
@@ -79,8 +86,10 @@ class HostParam:
     """
 
     __slots__ = (
+        "_backings",
         "_bind_layout",
         "_logical_shape",
+        "_memory_manager",
         "_needs_rearm",
         "_shape",
         "_target_layout",
@@ -89,7 +98,7 @@ class HostParam:
         "requires_grad",
     )
 
-    def __init__(self, param: nn.Parameter) -> None:
+    def __init__(self, param: nn.Parameter, *, memory_manager: HostMemoryManager | None = None) -> None:
         # The adapter operates on the tensor that carries the parameter's
         # representation: ``param.data`` for plain Parameters (including ones
         # wrapping a quant subclass), but the param object itself for a
@@ -131,6 +140,10 @@ class HostParam:
             adapter=adapter,
             host_state=host_state,
         )
+        if memory_manager is None:
+            memory_manager = HostMemoryManager()
+        self._memory_manager = memory_manager
+        self._backings = memory_manager.capture(self.storage_tensors())
         # Low-peak host construction optimization: release the original
         # source storage by repointing the source Parameter at the selected
         # host backing immediately. The assignment is an intentional
@@ -181,6 +194,11 @@ class HostParam:
             adapter=adapter,
             host_state=host_state,
         )
+        projected._memory_manager = source.memory_manager
+        projected._backings = {
+            tensor.untyped_storage()._cdata: source._backings[tensor.untyped_storage()._cdata]
+            for tensor in projected.storage_tensors()
+        }
         return projected
 
     def _init_from_host_state(
@@ -299,6 +317,11 @@ class HostParam:
         """Whether the resting parameter representation is meta."""
         return type(self.host_state) is torch.Tensor and self.host_state.is_meta
 
+    @property
+    def memory_manager(self) -> HostMemoryManager:
+        """The manager chosen at capture; allocation ownership cannot change."""
+        return self._memory_manager
+
     def storage_tensors(self) -> tuple[torch.Tensor, ...]:
         """Enumerate existing CPU backing tensors without rebuilding wrappers.
 
@@ -309,6 +332,10 @@ class HostParam:
         if self.is_meta:
             return ()
         return self.adapter.storage_tensors(self.host_state)
+
+    def backing_handles(self) -> tuple[HostBacking, ...]:
+        """Shared allocation handles; CPU tensors keep their source storage."""
+        return tuple(self._backings.values())
 
     def make_cpu_param(self) -> nn.Parameter:
         """Build a CPU :class:`nn.Parameter` wrapper over this host state.
@@ -353,12 +380,16 @@ class HostParam:
         )
 
     def copy_to_gpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
-        """Bulk DMA host bytes into pre-allocated GPU storage."""
+        """Copy host bytes into pre-allocated GPU storage."""
         if self.is_meta:
             # The activation-scoped parameter-value hook populates this storage
             # directly. There are deliberately no zero bytes to transfer.
             return
-        self.adapter.copy_to_gpu(self.host_state, gpu_state, non_blocking=non_blocking)
+        self.adapter.copy_to_gpu(
+            self.host_state,
+            gpu_state,
+            copy=partial(copy_host_to_device, backings=self._backings, non_blocking=non_blocking),
+        )
 
     def copy_to_cpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk D2H GPU bytes back into the host state.

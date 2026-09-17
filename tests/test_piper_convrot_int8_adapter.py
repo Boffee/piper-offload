@@ -23,10 +23,7 @@ from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from piper_offload.dtensor_adapter import DTensorAdapter
 from piper_offload.host_module import HostModuleStore
 from piper_offload.host_param import HostParam
-from piper_offload.block_component import (
-    _param_target_layout,
-    _capture_block_module_stores,
-)
+from piper_offload.block_component import _capture_block_module_stores
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
     CpuRoundTripTensorAdapter,
@@ -233,8 +230,8 @@ class TestPiperConvRotInt8Adapter:
             requires_grad=False,
         )
 
-        assert _param_target_layout(first) == _param_target_layout(second)
-        assert _param_target_layout(first) != _param_target_layout(different_group)
+        assert HostParam.target_layout_for(first) == HostParam.target_layout_for(second)
+        assert HostParam.target_layout_for(first) != HostParam.target_layout_for(different_group)
 
     def test_tied_wrappers_sharing_storage_are_deduplicated(self) -> None:
         qdata = torch.randint(-127, 128, (8, 64), dtype=torch.int8)

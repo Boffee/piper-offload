@@ -2426,11 +2426,8 @@ class TestBlockNameSelection:
                 }
             )
             streamer = block_components(strategy)[0]
-            _instance, local_name = streamer._resolve_buffer_name("blocks.0.scale")
-            # The instance is module-agnostic now; block 0's scheduling module
-            # (== its from_module source) is model.blocks[0].
             assert streamer.blocks[0] is model.blocks[0]
-            assert local_name == "scale"
+            assert "scale" in streamer._block_instances[0].buffers
         finally:
             strategy.deactivate()
 
@@ -3108,7 +3105,7 @@ class TestInBlockTrainableStreamingEndToEnd:
       non-streamed baseline (grads identical, no version-counter trip).
     - ``param.grad`` lives on GPU through backward via native
       ``AccumulateGrad`` (no custom hooks).
-    - ``gather_for_step`` brings ``.data`` to GPU around the step;
+    - ``optimizer_step`` brings ``.data`` to GPU around the step;
       after exit, ``.data`` is back on CPU.
     - User's ``Parameter`` object identity is preserved across the
       whole cycle so optimizer state is correct.
@@ -3283,7 +3280,7 @@ class TestInBlockTrainableStreamingEndToEnd:
             )
 
     @CUDA
-    def test_gather_for_step_preserves_parameter_identity(self) -> None:
+    def test_optimizer_step_preserves_parameter_identity(self) -> None:
         # The user's Parameter object must survive the whole cycle —
         # otherwise optimizer state attached to it would be orphaned.
         torch.manual_seed(0)
@@ -3305,24 +3302,24 @@ class TestInBlockTrainableStreamingEndToEnd:
                 x = torch.randn(2, 8, device="cuda")
                 _ = gpu_model(x, use_checkpoint=True)
 
-                # Inside gather_for_step: trainable .data should be on GPU.
-                with offloader.gather_for_step():
+                # Inside optimizer_step: trainable .data should be on GPU.
+                with offloader.optimizer_step():
                     inside_ids = {n: id(p) for n, p in gpu_model.named_parameters() if p.requires_grad}
                     inside_devices = {n: p.data.device.type for n, p in gpu_model.named_parameters() if p.requires_grad}
 
-                # After gather_for_step exit: .data should be back on CPU.
+                # After optimizer_step exit: .data should be back on CPU.
                 after_ids = {n: id(p) for n, p in gpu_model.named_parameters() if p.requires_grad}
                 after_devices = {n: p.data.device.type for n, p in gpu_model.named_parameters() if p.requires_grad}
         finally:
             offloader.deactivate()
 
         assert initial_ids == inside_ids == after_ids, (
-            "Parameter object identity must be preserved across the gather_for_step boundary"
+            "Parameter object identity must be preserved across the optimizer_step boundary"
         )
         for n, dev in inside_devices.items():
-            assert dev == "cuda", f"{n} .data should be on cuda inside gather_for_step, got {dev}"
+            assert dev == "cuda", f"{n} .data should be on cuda inside optimizer_step, got {dev}"
         for n, dev in after_devices.items():
-            assert dev == "cpu", f"{n} .data should be back on cpu after gather_for_step, got {dev}"
+            assert dev == "cpu", f"{n} .data should be back on cpu after optimizer_step, got {dev}"
 
     def test_cpu_pass_through_trainable_step_preserves_updates(self) -> None:
         torch.manual_seed(0)
@@ -3469,7 +3466,7 @@ class TestRevisedDataOnlyDesign:
             )
 
     @CUDA
-    def test_reentrant_gather_for_step_rejected(self) -> None:
+    def test_reentrant_optimizer_step_rejected(self) -> None:
         m = _make_lora_in_block_model(num_blocks=2, width=8, rank=2)
         for block in m.transformer_blocks:
             block.gradient_checkpointing = True

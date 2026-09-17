@@ -77,7 +77,7 @@ class CudaTargetLease:
                 stream.wait_event(prior)
             elif stream != self._allocation_stream:
                 # A fresh target can reuse cached memory with pending work on
-                # its allocator stream. Order the first upload after that work.
+                # its allocator stream. Order the first copy after that work.
                 stream.wait_stream(self._allocation_stream)
             for recorded in self._recorded_streams:
                 if recorded != stream:

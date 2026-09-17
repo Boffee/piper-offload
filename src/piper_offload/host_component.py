@@ -60,6 +60,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
+from .host_memory import HostMemoryManager
 from .host_module import (
     HostModuleInstance,
     HostModuleLoadPlan,
@@ -87,6 +88,7 @@ class HostComponentStore:
         *,
         include_param_names: Iterable[str] | None = None,
         include_buffer_names: Iterable[str] | None = None,
+        memory_manager: HostMemoryManager | None = None,
     ) -> Self:
         """Create a reusable store that owns captured pageable CPU backing."""
         return cls(
@@ -94,6 +96,7 @@ class HostComponentStore:
                 model,
                 include_param_names=include_param_names,
                 include_buffer_names=include_buffer_names,
+                memory_manager=memory_manager,
             )
         )
 

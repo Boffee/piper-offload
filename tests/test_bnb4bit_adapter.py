@@ -17,7 +17,6 @@ from piper_offload import (
 )
 from piper_offload.bnb4bit_adapter import Bnb4bitAdapter
 from piper_offload.host_param import HostParam
-from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import tensor_id
 from tests.conftest import activated_model
 
@@ -180,19 +179,19 @@ class TestBnb4bitAdapter:
         p1 = _make_nf4()
         p2 = _make_nf4()
 
-        assert _param_target_layout(p1) == _param_target_layout(p2)
+        assert HostParam.target_layout_for(p1) == HostParam.target_layout_for(p2)
 
     def test_target_layout_tracks_quant_type(self) -> None:
         nf4 = _make_nf4(quant_type="nf4")
         fp4 = _make_nf4(quant_type="fp4")
 
-        assert _param_target_layout(nf4) != _param_target_layout(fp4)
+        assert HostParam.target_layout_for(nf4) != HostParam.target_layout_for(fp4)
 
     def test_target_layout_tracks_double_quant(self) -> None:
         single = _make_nf4(double_quant=False)
         nested = _make_nf4(double_quant=True)
 
-        assert _param_target_layout(single) != _param_target_layout(nested)
+        assert HostParam.target_layout_for(single) != HostParam.target_layout_for(nested)
 
     def test_bind_layout_matches_real_param_and_placeholder(self) -> None:
         # The enabling check: a config-built placeholder (quant_state is None,
@@ -211,7 +210,7 @@ class TestBnb4bitAdapter:
         # placeholders of equal shape are bind-compatible.
         nf4 = _make_nf4(quant_type="nf4")
         fp4 = _make_nf4(quant_type="fp4")
-        assert _param_target_layout(nf4) != _param_target_layout(fp4)
+        assert HostParam.target_layout_for(nf4) != HostParam.target_layout_for(fp4)
         assert Bnb4bitAdapter.bind_layout_signature(nf4) == Bnb4bitAdapter.bind_layout_signature(fp4)
 
     @pytest.mark.parametrize(

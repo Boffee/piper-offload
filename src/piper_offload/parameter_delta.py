@@ -8,6 +8,7 @@ from typing import Any, Self
 import torch
 from torch import nn
 
+from .host_memory import HostMemoryManager
 from .host_param import HostParam
 from .lora import (
     LoRAFactor,
@@ -51,11 +52,13 @@ def _capture_dense_tensor(
     source: torch.Tensor,
     *,
     dtype: torch.dtype | None,
+    memory_manager: HostMemoryManager,
 ) -> HostParam:
     _validate_dense_tensor(source)
     tensor = source if dtype is None or source.dtype is dtype else source.to(dtype=dtype)
     return HostParam(
         nn.Parameter(tensor, requires_grad=False),
+        memory_manager=memory_manager,
     )
 
 
@@ -92,10 +95,13 @@ class ParameterDelta:
         b: torch.Tensor | None = None,
         dense: torch.Tensor | None = None,
         dtype: torch.dtype | None = None,
+        memory_manager: HostMemoryManager | None = None,
     ) -> Self:
         """Validate and capture an optional LoRA pair and dense contribution."""
         if (a is None) != (b is None):
             raise ValueError("ParameterDelta requires both LoRA A and LoRA B when either factor is provided.")
+        if memory_manager is None:
+            memory_manager = HostMemoryManager()
         lora = (
             None
             if a is None or b is None
@@ -103,6 +109,7 @@ class ParameterDelta:
                 a,
                 b,
                 dtype=dtype,
+                memory_manager=memory_manager,
             )
         )
         dense_backing = (
@@ -111,6 +118,7 @@ class ParameterDelta:
             else _capture_dense_tensor(
                 dense,
                 dtype=dtype,
+                memory_manager=memory_manager,
             )
         )
         return cls(lora=lora, dense=dense_backing)
@@ -312,17 +320,16 @@ class ParameterDeltaTransform:
         )
         self._merge_index += 1
 
-    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
-        """Return all physical host tensors read while staging the delta."""
-        tensors: list[torch.Tensor] = []
+    def host_params(self) -> tuple[HostParam, ...]:
+        """Return the host owners read while staging the delta."""
+        params: list[HostParam] = []
         for scaled in self._deltas:
             delta = scaled.delta
             if delta.lora is not None:
-                tensors.extend(delta.lora.a.storage_tensors())
-                tensors.extend(delta.lora.b.storage_tensors())
+                params.extend((delta.lora.a, delta.lora.b))
             if delta.dense is not None:
-                tensors.extend(delta.dense.storage_tensors())
-        return tuple(tensors)
+                params.append(delta.dense)
+        return tuple(params)
 
     def _materialize_dense_sources(self) -> list[tuple[torch.Tensor, float]]:
         sources: list[tuple[torch.Tensor, float]] = []

@@ -15,7 +15,6 @@ from piper_offload import (
 from piper_offload.float8_adapter import Float8Adapter
 from piper_offload.host_param import HostParam
 from piper_offload.static_float8_adapter import StaticFloat8Adapter
-from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from tests.conftest import activated_model
 
@@ -195,7 +194,7 @@ class TestStaticFloat8Adapter:
             _make_static_float8(act_scale_value=0.04), requires_grad=False
         )
 
-        assert _param_target_layout(p1) == _param_target_layout(p2)
+        assert HostParam.target_layout_for(p1) == HostParam.target_layout_for(p2)
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_reports_logical_compute_dtype(self, dtype: torch.dtype) -> None:
@@ -211,7 +210,7 @@ class TestStaticFloat8Adapter:
             _make_static_float8(act_scale_shape=(1, 1)), requires_grad=False
         )
 
-        assert _param_target_layout(scalar) != _param_target_layout(rank_two)
+        assert HostParam.target_layout_for(scalar) != HostParam.target_layout_for(rank_two)
 
     def test_meta_layout_inspection_keeps_static_representation(self) -> None:
         f8 = _make_static_float8()

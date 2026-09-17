@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch import nn
 
-from piper_offload import PinManager
+from piper_offload import HostMemoryManager
 from piper_offload.host_module import (
     HostModuleLoadPlan,
     HostModuleStore,
@@ -19,11 +19,11 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 @CUDA
-def test_first_pinned_upload_waits_for_prior_work_on_reused_allocation() -> None:
+def test_first_pinned_copy_waits_for_prior_work_on_reused_allocation() -> None:
     module = nn.Linear(64, 64, bias=False).requires_grad_(False)
     module.weight.fill_(7)
     plan = HostModuleStore.from_module(module).bind(module).resolve_load_plan()
-    manager = PinManager(1024**2)
+    manager = HostMemoryManager(1024**2)
     device = torch.device("cuda")
     copy_stream = torch.cuda.Stream(device=device)
     allocation_stream = torch.cuda.current_stream(device)

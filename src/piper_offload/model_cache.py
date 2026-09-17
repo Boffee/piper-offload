@@ -1,21 +1,23 @@
 """Model-aware resource cache.
 
 :class:`ResourceCache` owns resource registration, accounting, leases, and
-explicit eviction. :class:`ModelCache` specializes its unbounded mode with
-activation-scoped model use, including adapter dependency leasing and device
-activation, while keeping the generic cache machinery unaware of models and
-adapters.
+explicit eviction. :class:`ModelCache` supplies shared host-memory policy at
+construction and activation-scoped model use, including adapter dependency
+leasing and device activation. The generic cache machinery remains unaware
+of models and adapters.
 """
 
 import contextlib
 from collections.abc import Generator, Sequence
-from typing import cast
+from typing import Any, cast, override
 
 import torch
 from torch import nn
 
 from .adapter import Adapter, AdapterMode
+from .host_memory import HostMemoryManager
 from .model_offloader import ModelOffloader
+from .protocols import ResourceSpec, ResourceStore
 from .resource_cache import ResourceCache
 from .resource_specs import AdapterSpec, ModelSpec
 
@@ -28,12 +30,27 @@ class ModelCache(ResourceCache):
     uses of the same entry fail regardless of which caller initiates them.
     Model and adapter stores are retained until explicit eviction. Their
     compatible CPU tensors preserve factory-supplied file mappings, so the OS
-    controls pageable residency while the independent host-pin budget controls
-    locked pages.
+    controls pageable residency. One :class:`HostMemoryManager` supplies the
+    shared pin budget and allocation handles for all models and adapters built
+    from :class:`ModelSpec` and :class:`AdapterSpec`, including direct leases.
+    Pass a manager to share that policy across caches or with manual captures;
+    otherwise the cache creates its own. Custom specs own their construction.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, memory_manager: HostMemoryManager | None = None) -> None:
         super().__init__(max_cache_bytes=None)
+        self._memory_manager = memory_manager if memory_manager is not None else HostMemoryManager()
+
+    @property
+    def memory_manager(self) -> HostMemoryManager:
+        """Shared host-memory policy; configure its budget or inspect its stats."""
+        return self._memory_manager
+
+    @override
+    def _build_store(self, spec: ResourceSpec[Any]) -> ResourceStore:
+        if isinstance(spec, (ModelSpec, AdapterSpec)):
+            return spec.build_store(memory_manager=self._memory_manager)
+        return super()._build_store(spec)
 
     @contextlib.contextmanager
     def use[M: nn.Module](

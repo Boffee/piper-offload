@@ -21,6 +21,7 @@ import torch
 from torch import nn
 
 from piper_offload import ModelOffloader
+from piper_offload.host_param import HostParam
 
 _CUDA_UNAVAILABLE_ERROR_FRAGMENTS = ("CUDA", "NVIDIA driver")
 
@@ -40,7 +41,7 @@ class CallbackParameterTransform:
     def apply_parameter(self, param: nn.Parameter) -> None:
         self._callback(param)
 
-    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+    def host_params(self) -> tuple[HostParam, ...]:
         return ()
 
 

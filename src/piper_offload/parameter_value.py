@@ -7,6 +7,7 @@ from typing import Any, cast
 import torch
 from torch import nn
 
+from .host_memory import HostMemoryManager
 from .host_param import HostParam
 from .seeding import derive_seed
 from .tensor_adapter_registry import param_representation, select_adapter
@@ -83,6 +84,7 @@ class ParameterValue:
         *,
         dtype: torch.dtype | None = None,
         scale_with_strength: bool = False,
+        memory_manager: HostMemoryManager | None = None,
     ) -> ParameterValue:
         """Validate and capture one physical replacement representation."""
         if not isinstance(source, torch.Tensor):
@@ -118,7 +120,7 @@ class ParameterValue:
             else nn.Parameter(tensor, requires_grad=False)
         )
         return cls(
-            HostParam(parameter),
+            HostParam(parameter, memory_manager=memory_manager),
             scale_with_strength=scale_with_strength,
         )
 
@@ -269,7 +271,7 @@ class ParameterValueTransform:
             )
         self._scale_parameter(target)
 
-    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+    def host_params(self) -> tuple[HostParam, ...]:
         """Return update-only storage; the load plan already owns the value."""
         return ()
 

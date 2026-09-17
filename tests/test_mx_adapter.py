@@ -15,7 +15,6 @@ from piper_offload import (
 from piper_offload._torchao_mx import is_supported_mx_elem_dtype
 from piper_offload.mx_adapter import MxAdapter
 from piper_offload.host_param import HostParam
-from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from tests.conftest import activated_model
 
@@ -235,7 +234,7 @@ class TestMxAdapter:
         p1 = nn.Parameter(_make_mx(elem_dtype=elem_dtype), requires_grad=False)
         p2 = nn.Parameter(_make_mx(elem_dtype=elem_dtype), requires_grad=False)
 
-        assert _param_target_layout(p1) == _param_target_layout(p2)
+        assert HostParam.target_layout_for(p1) == HostParam.target_layout_for(p2)
 
     def test_target_layout_distinguishes_mxfp8_and_mxfp4(self) -> None:
         if _FP4 is None:
@@ -243,7 +242,7 @@ class TestMxAdapter:
         p8 = nn.Parameter(_make_mx(elem_dtype=torch.float8_e4m3fn), requires_grad=False)
         p4 = nn.Parameter(_make_mx(elem_dtype=_FP4), requires_grad=False)
 
-        assert _param_target_layout(p8) != _param_target_layout(p4)
+        assert HostParam.target_layout_for(p8) != HostParam.target_layout_for(p4)
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
     def test_dynamic_activation_metadata_is_keyed(self, elem_dtype: torch.dtype) -> None:
@@ -265,7 +264,7 @@ class TestMxAdapter:
         assert key == tensor_id(dynamic.data)
         # Activation quantization changes the matmul dispatch, so the
         # block-pool layout must distinguish it from the weight-only base.
-        assert _param_target_layout(dynamic) != _param_target_layout(weight_only)
+        assert HostParam.target_layout_for(dynamic) != HostParam.target_layout_for(weight_only)
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
     def test_no_cpu_round_trip_or_trainable_swap_capability(self, elem_dtype: torch.dtype) -> None:
