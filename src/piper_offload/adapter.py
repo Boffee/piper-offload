@@ -14,6 +14,7 @@ from typing import Literal, Self
 
 import torch
 
+from .host_memory import HostMemoryManager
 from .lora import ScaledLoRAFactor
 from .parameter_delta import ParameterDelta, ScaledParameterDelta
 from .parameter_value import ParameterValue, ScaledParameterValue
@@ -149,6 +150,7 @@ class Adapter:
         dtype: torch.dtype | None = None,
         allow_partial_targets: bool = False,
         scale_parameter_values: bool = False,
+        memory_manager: HostMemoryManager | None = None,
     ) -> Self:
         """Validate and capture factor and/or parameter-value tensors.
 
@@ -174,6 +176,7 @@ class Adapter:
             sources,
             dtype=dtype,
             scale_parameter_values=scale_parameter_values,
+            memory_manager=memory_manager if memory_manager is not None else HostMemoryManager(),
         )
         return cls(targets, allow_partial_targets=allow_partial_targets)
 
@@ -250,6 +253,7 @@ def _build_adapter_targets(
     *,
     dtype: torch.dtype | None = None,
     scale_parameter_values: bool = False,
+    memory_manager: HostMemoryManager,
 ) -> dict[str, AdapterTarget]:
     """Capture parsed sources into one target value per parameter name."""
     targets: dict[str, AdapterTarget] = {}
@@ -262,6 +266,7 @@ def _build_adapter_targets(
             b=None if base is None else sources.b[base],
             dense=sources.deltas.get(target_key),
             dtype=dtype,
+            memory_manager=memory_manager,
         )
 
     for target_key, source in sources.values.items():
@@ -270,6 +275,7 @@ def _build_adapter_targets(
         targets[target_key] = ParameterValue.from_tensor(
             source,
             dtype=dtype,
+            memory_manager=memory_manager,
             scale_with_strength=scale_parameter_values,
         )
     return targets

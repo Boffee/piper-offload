@@ -48,7 +48,7 @@ from ._bnb import (
     require_int8_params,
 )
 from ._dense_merge import merge_dense_requantize_
-from ._host_staging import copy_host_to_device
+from ._host_copy import TensorCopy
 from .tensor_adapters import (
     capture_host_tensor,
     empty_like_strided,
@@ -270,10 +270,10 @@ class Bnb8bitAdapter:
 
     @staticmethod
     def copy_to_gpu(
-        src: _Bnb8bitHost, dst: _Bnb8bitGpu, *, non_blocking: bool = False
+        src: _Bnb8bitHost, dst: _Bnb8bitGpu, *, copy: TensorCopy
     ) -> None:
-        copy_host_to_device(dst.data, src.data, non_blocking=non_blocking)
-        copy_host_to_device(dst.scb, src.scb, non_blocking=non_blocking)
+        copy(dst.data, src.data)
+        copy(dst.scb, src.scb)
 
     @staticmethod
     def compute_dtype(t: torch.Tensor) -> torch.dtype:

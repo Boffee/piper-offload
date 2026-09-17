@@ -15,6 +15,7 @@ from torch import nn
 from .adapter import Adapter
 from .block_compile import BlockCompileConfig
 from .block_mode import BlockMode
+from .host_memory import HostMemoryManager
 from .model_offloader import ModelOffloader
 from .protocols import ResourceStore
 
@@ -34,6 +35,8 @@ class ModelSpec[M: nn.Module]:
     ``transient_paths`` gives named modules independent CUDA working sets
     scoped to their forwards. The factory transfers compatible pageable CPU
     storage to the cached runtime, preserving checkpoint-backed mappings.
+    :class:`ModelCache` supplies its shared memory manager when building the
+    store. Standalone builds create an independent manager unless given one.
     """
 
     key: str
@@ -46,10 +49,11 @@ class ModelSpec[M: nn.Module]:
     block_compile: BlockCompileConfig | None = None
     transient_paths: tuple[str, ...] = ()
 
-    def build_store(self) -> ModelOffloader:
-        """Build, capture, and bind the cached model runtime."""
+    def build_store(self, *, memory_manager: HostMemoryManager | None = None) -> ModelOffloader:
+        """Build the runtime using the manager supplied by its model cache."""
         return ModelOffloader.from_module(
             self.factory(),
+            memory_manager=memory_manager,
             block_paths=self.block_paths,
             transient_block_paths=self.transient_block_paths,
             include_block_trainables=self.include_block_trainables,
@@ -79,6 +83,8 @@ class AdapterSpec:
     intersection of its targets and a model's parameters.
     ``scale_parameter_values`` opts complete values into adapter-strength
     scaling; by default active parameter values remain unchanged.
+    :class:`ModelCache` supplies its shared memory manager when building the
+    store. Standalone builds create an independent manager unless given one.
     """
 
     key: str
@@ -88,10 +94,11 @@ class AdapterSpec:
     allow_partial_targets: bool = False
     scale_parameter_values: bool = False
 
-    def build_store(self) -> Adapter:
-        """Build and capture this reusable adapter resource."""
+    def build_store(self, *, memory_manager: HostMemoryManager | None = None) -> Adapter:
+        """Capture the adapter using the manager supplied by its model cache."""
         return Adapter.from_state_dict(
             self.factory(),
+            memory_manager=memory_manager,
             dtype=self.dtype,
             allow_partial_targets=self.allow_partial_targets,
             scale_parameter_values=self.scale_parameter_values,

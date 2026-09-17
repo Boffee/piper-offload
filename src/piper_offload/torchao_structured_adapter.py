@@ -34,7 +34,7 @@ from typing import Any, ClassVar
 import torch
 from torch import nn
 
-from ._host_staging import copy_host_to_device
+from ._host_copy import TensorCopy
 from .tensor_adapters import (
     capture_host_tensor,
     empty_like_strided,
@@ -79,7 +79,7 @@ def copy_storage(
     non_blocking: bool,
 ) -> None:
     """Per-tensor bulk copy of a parallel storage tuple, skipping absent
-    (``None``) entries. Used for both H2D and the Float8 D2H round-trip.
+    (``None``) entries. Used for the Float8 GPU-to-CPU round-trip.
 
     Movement keeps the same representation on both sides, so a ``None`` on
     one side is ``None`` on the other; skipping on ``src`` therefore also
@@ -88,10 +88,7 @@ def copy_storage(
         if s is None:
             continue
         assert d is not None
-        if s.device.type == "cpu" and d.device.type == "cuda":
-            copy_host_to_device(d, s, non_blocking=non_blocking)
-        else:
-            d.copy_(s, non_blocking=non_blocking)
+        d.copy_(s, non_blocking=non_blocking)
 
 
 def copy_storage_into(
@@ -288,9 +285,12 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         src: TorchaoHost[MetaT],
         dst: TorchaoGpu,
         *,
-        non_blocking: bool = False,
+        copy: TensorCopy,
     ) -> None:
-        copy_storage(src.storage, dst.storage, non_blocking=non_blocking)
+        for source, destination in zip(src.storage, dst.storage, strict=True):
+            if source is not None:
+                assert destination is not None
+                copy(destination, source)
 
     @classmethod
     def cache_bytes(cls, state: TorchaoHost[MetaT]) -> int:

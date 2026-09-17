@@ -20,6 +20,7 @@ from .block_component import BlockComponent
 from .block_mode import BlockMode
 from .composite_component import CompositeComponent, CompositeComponentStore
 from .host_component import HostComponent
+from .host_memory import HostMemoryManager
 from .host_module import ParameterOverride
 from .lora import install_routed_residual_hook
 from .module_names import resolve_parent_leaf
@@ -168,6 +169,7 @@ class ModelOffloader:
         block_mode: BlockMode = "streaming",
         block_compile: BlockCompileConfig | None = None,
         transient_paths: Sequence[str] = (),
+        memory_manager: HostMemoryManager | None = None,
     ) -> Self:
         """Clone and bind ``model`` as one reusable cached runtime.
 
@@ -192,10 +194,14 @@ class ModelOffloader:
         parameter and buffer, including non-resizable checkpoint views, while
         preserving mappings and each adapter's physical representation. Other
         devices and incompatible views are normalized into CPU storage.
+        ``memory_manager`` is passed to the captured host parameters and buffers.
+        Share it across factories for one aggregate pin budget; if omitted,
+        this capture uses an independent manager.
         """
         composite_store = CompositeComponentStore.from_module(
             model,
             block_paths=block_paths,
+            memory_manager=memory_manager,
             transient_block_paths=transient_block_paths,
             transient_paths=transient_paths,
             include_block_trainables=include_block_trainables,
@@ -600,12 +606,3 @@ class ModelOffloader:
             optimizer.zero_grad()
         """
         return self._composite.optimizer_step()
-
-    def gather_for_step(self) -> contextlib.AbstractContextManager[None]:
-        """Backward-compatible alias for :meth:`optimizer_step`.
-
-        The public API names the boundary after the operation that
-        requires all streamed trainable weight data to be materialized: the
-        optimizer step.
-        """
-        return self.optimizer_step()

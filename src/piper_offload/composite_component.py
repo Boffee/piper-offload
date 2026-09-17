@@ -12,6 +12,7 @@ from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent, BlockComponentStore
 from .block_mode import BlockMode
 from .host_component import HostComponent, HostComponentStore
+from .host_memory import HostMemoryManager
 from .host_module import ParameterOverride
 from .module_names import buffer_names, parameter_names
 
@@ -151,7 +152,10 @@ class CompositeComponentStore:
         transient_block_paths: Sequence[str] = (),
         transient_paths: Sequence[str] = (),
         include_block_trainables: bool = False,
+        memory_manager: HostMemoryManager | None = None,
     ) -> Self:
+        if memory_manager is None:
+            memory_manager = HostMemoryManager()
         persistent_paths = tuple(block_paths)
         transient_paths_with_blocks = tuple(transient_block_paths)
         overlap = set(persistent_paths) & set(transient_paths_with_blocks)
@@ -171,6 +175,7 @@ class CompositeComponentStore:
             return BlockComponentStore.from_module(
                 model,
                 blocks_path=blocks_path,
+                memory_manager=memory_manager,
                 include_block_trainables=include_block_trainables,
             )
 
@@ -194,6 +199,7 @@ class CompositeComponentStore:
                     path,
                     HostComponentStore.from_module(
                         model,
+                        memory_manager=memory_manager,
                         include_param_names=selected_params,
                         include_buffer_names=selected_buffers,
                     ),
@@ -204,6 +210,7 @@ class CompositeComponentStore:
         resident_store = (
             HostComponentStore.from_module(
                 model,
+                memory_manager=memory_manager,
                 include_param_names=resident_params,
                 include_buffer_names=resident_buffers,
             )

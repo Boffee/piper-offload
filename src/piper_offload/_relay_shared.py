@@ -23,7 +23,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from .pin_manager import PinManager
+from .host_memory import HostMemoryManager
 
 BUFFERS_PER_RANK = 2
 REDUCTION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
@@ -248,14 +248,14 @@ class SharedRelay:
 
     def copy(
         self, operation: str, sources: list[torch.Tensor], outputs: list[torch.Tensor],
-        root: int, manager: PinManager,
+        root: int, manager: HostMemoryManager,
     ) -> None:
         with self._collective(operation, outputs[0], root, manager) as asynchronous:
             sources = [t.reshape(-1).view(torch.uint8) for t in sources]
             outputs = [t.reshape(-1).view(torch.uint8) for t in outputs]
             self._rounds(operation, sources, outputs, root, asynchronous)
 
-    def reduce(self, tensor: torch.Tensor, manager: PinManager) -> None:
+    def reduce(self, tensor: torch.Tensor, manager: HostMemoryManager) -> None:
         with self._collective("allreduce", tensor, -1, manager) as asynchronous:
             if self.world_size == 1 or tensor.numel() == 0:
                 return
@@ -291,7 +291,7 @@ class SharedRelay:
 
     @contextmanager
     def _collective(
-        self, operation: str, tensor: torch.Tensor, detail: int, manager: PinManager,
+        self, operation: str, tensor: torch.Tensor, detail: int, manager: HostMemoryManager,
     ) -> Generator[bool]:
         if self.broken:
             raise RuntimeError("shared relay failed previously; destroy and recreate the process group")

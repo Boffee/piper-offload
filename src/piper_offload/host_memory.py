@@ -1,10 +1,11 @@
-"""Budgeted host registrations with active leases and an idle LRU.
+"""Explicit ownership of host backing handles and budgeted registrations.
 
-Use the process-wide ``host_pin_manager`` for application registrations. Its
-budget defaults to ``None``, enabling opportunistic registration up to native
-CUDA/HIP capacity. Set it to zero to disable registration. Construction and
-configuration perform no CUDA initialization. Isolated ``PinManager`` instances
-can use an injected backend for testing.
+Share one HostMemoryManager across captures to share allocation handles and a
+pin budget. Host parameters and buffers retain their manager; its weak handle
+index does not keep unused weights alive. Construction and configuration do
+not initialize CUDA. The default pin budget is None (native capacity); zero
+disables registration. Anonymous-copy allocation and RAM eviction are not yet
+implemented.
 
 Native registration uses whole storage byte ranges. Linux private file mappings
 stay pageable so registration cannot instantiate persistent copy-on-write
@@ -29,6 +30,7 @@ from typing import Self
 
 import torch
 
+from ._host_backing import HostBacking
 from ._host_registration import HostRegistrationBackend, RuntimeHostRegistration
 
 logger = logging.getLogger(__name__)
@@ -140,14 +142,14 @@ class PinLease:
     ``registered_bytes`` and ``pageable_bytes`` count unique requested storage
     bytes, without page rounding. The owner must keep the lease open until no
     asynchronous operation can read or write its host tensors. CUDA ordering belongs to
-    the runtime that enqueues those operations; the pin manager does not track
+    the runtime that enqueues those operations; the memory manager does not track
     or synchronize accelerator streams. Dropping the token also releases its
     protection, so asynchronous owners must retain it through completion.
     """
 
     def __init__(
         self,
-        manager: PinManager,
+        manager: HostMemoryManager,
         key: int,
         registered_bytes: int,
         pageable_bytes: int,
@@ -174,10 +176,10 @@ class PinLease:
         self.close()
 
 
-class PinManager:
-    """Own registrations under a page-rounded budget.
+class HostMemoryManager:
+    """Share host allocation handles and own registrations under one pin budget.
 
-    A finite ``max_pinned_bytes`` bounds registered pages in this process.
+    A finite ``max_pinned_bytes`` bounds pages registered by this manager.
     The default, ``None``, treats native CUDA/HIP capacity as the limit, reclaiming
     unrelated idle registrations when the runtime refuses a new allocation.
     Linux private file mappings are always left pageable because registering
@@ -190,7 +192,7 @@ class PinManager:
     rejected before registration; registering only part of a copy's range can
     make the CUDA/HIP copy invalid. Use views of one storage for such aliases.
 
-    All metadata and backend operations are serialized by a reentrant lock.
+    Registration metadata and backend operations share a reentrant lock.
     Active leases also retain pageable sources. Idle entries retain storage,
     but no model or tensor wrappers. Losing a source tensor retires its
     registration as soon as active leases have finished with it.
@@ -208,6 +210,7 @@ class PinManager:
         self._max_pinned_bytes = max_pinned_bytes
         self._backend = backend if backend is not None else RuntimeHostRegistration()
         self._lock = threading.RLock()
+        self._backings: weakref.WeakValueDictionary[int, HostBacking] = weakref.WeakValueDictionary()
         self._entries: dict[int, _Registration] = {}
         self._pageable: dict[int, _Pageable] = {}
         # All registered ranges and actively leased pageable ranges.
@@ -221,6 +224,26 @@ class PinManager:
         self._unregistration_failures = 0
         self._leases: dict[int, _LeaseState] = {}
         self._next_lease = 0
+
+    def capture(self, tensors: Iterable[torch.Tensor]) -> dict[int, HostBacking]:
+        """Share allocation handles within this manager without retaining owners.
+
+        Host parameters and buffers keep handles alive; each handle retains its
+        manager. Keeping a manager alive alone does not retain captured weights.
+        """
+        result: dict[int, HostBacking] = {}
+        with self._lock:
+            for tensor in tensors:
+                if tensor.device.type != "cpu" or tensor.layout is not torch.strided:
+                    raise ValueError("Host backings require strided CPU tensors")
+                storage = tensor.untyped_storage()
+                key = storage._cdata
+                backing = self._backings.get(key)
+                if backing is None:
+                    backing = HostBacking(storage, self)
+                    self._backings[key] = backing
+                result[key] = backing
+        return result
 
     @property
     def max_pinned_bytes(self) -> int | None:
@@ -366,9 +389,9 @@ class PinManager:
         seen: set[int] = set()
         for tensor in tensors:
             if type(tensor) is not torch.Tensor:
-                raise TypeError("PinManager requires plain CPU storage tensors")
+                raise TypeError("HostMemoryManager requires plain CPU storage tensors")
             if tensor.device.type != "cpu" or tensor.layout is not torch.strided:
-                raise ValueError("PinManager requires strided CPU storage tensors")
+                raise ValueError("HostMemoryManager requires strided CPU storage tensors")
             if id(tensor) in seen or tensor.numel() == 0:
                 continue
             seen.add(id(tensor))
@@ -524,8 +547,6 @@ class PinManager:
 # retains managers with live registrations/leases, but their idle tensor owners
 # remain weak. Discarding the last source retires its registration and releases
 # the root. Failed cleanup keeps storage alive rather than freeing pinned bytes.
-_live_managers: set[PinManager] = set()
+_live_managers: set[HostMemoryManager] = set()
 
-host_pin_manager = PinManager()
-
-__all__ = ["PinLease", "PinManager", "PinStats", "host_pin_manager"]
+__all__ = ["HostMemoryManager", "PinLease", "PinStats"]

@@ -47,7 +47,7 @@ when you need bespoke composition (e.g., multiple block lists like Flux's
 import contextlib
 import logging
 import weakref
-from collections.abc import Generator, Iterator, Mapping, Sequence
+from collections.abc import Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Self, cast
 
@@ -59,15 +59,14 @@ from ._host_staging import reserve_host_staging
 from .block_compile import BlockCompileConfig, _BlockCompileState
 from .block_mode import BlockMode
 from .block_runtime import BlockRuntime
+from .host_memory import HostMemoryManager, PinLease
 from .host_module import (
     HostModuleInstance,
     HostModuleLoadPlan,
     HostModuleStore,
     ParameterOverride,
 )
-from .host_param import HostParam
 from .module_names import walk_attr_path
-from .pin_manager import PinLease, host_pin_manager
 from .resident_runtime import ResidentBlockRuntime
 from .rolling_runtime import RollingBlockRuntime, create_rolling_block_runtime
 from .streaming_runtime import StreamingBlockRuntime
@@ -75,40 +74,9 @@ from .streaming_runtime import StreamingBlockRuntime
 logger = logging.getLogger(__name__)
 
 
-def _host_transfer_tensors(
-    load_plans: Sequence[HostModuleLoadPlan],
-) -> Iterator[torch.Tensor]:
-    """Enumerate host storage that a streamed activation may read.
-
-    Replacements supersede frozen model sources. Optimizer steps still gather
-    and scatter the instance's own trainable backing, so retain that too. The
-    pin manager deduplicates aliases and whole storage allocations.
-    """
-    for plan in load_plans:
-        for load in plan.loads.values():
-            yield from load.source.storage_tensors()
-            if load.update is not None:
-                yield from load.update.storage_tensors()
-        for buffer in plan.instance.buffers.values():
-            yield from buffer.storage_tensors()
-        for host in plan.instance.params.values():
-            if host.requires_grad:
-                yield from host.storage_tensors()
-
-
-def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
-    # Process-wide PyTorch CUDA allocator cache is the only state the
-    # refcount-based GC of a block component can't release on its own. Without
-    # this, freed GPU pages stay held by the allocator until the
-    # next allocation pressure event, which manifests as OOMs at
-    # workload boundaries (e.g. successive trainers in one process).
-    # ``empty_cache()`` is process-global (not per-device), so a single
-    # bool is the right abstraction — capturing the device object would
-    # imply per-device scoping that PyTorch doesn't actually provide.
-    if not is_cuda:
-        return
-    # Finalizers can run at interpreter shutdown when CUDA is already torn
-    # down, so suppress teardown-time noise.
+def _release_cuda_cache_on_drop() -> None:
+    # Release allocator-cached pages between workloads. Finalizers can also
+    # run during interpreter shutdown, after CUDA has already torn down.
     with contextlib.suppress(Exception):
         torch.cuda.empty_cache()
 
@@ -116,59 +84,6 @@ def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
 # ---------------------------------------------------------------------------
 # Block instances
 # ---------------------------------------------------------------------------
-
-
-def _param_target_layout(p: nn.Parameter) -> tuple[object, object]:
-    """Per-parameter target-compatibility layout, computed pre-capture.
-
-    Two params with equal values pool into structurally identical GPU
-    targets, so a refill is a plain ``Tensor.copy_``; unequal values must
-    never share a target, because ``copy_`` silently casts dtype and
-    silently broadcasts compatible shapes, and wrapper metadata (qtype,
-    axis, activation_qtype, quant_type) is similarly invisible to it.
-
-    This is the standalone form of the same value
-    :attr:`HostParam.target_layout` supplies the same value to the block
-    runtime's target-pool signature; this helper is not called on the
-    streaming path. Kept as the package's documented
-    way to compare two params' target compatibility directly (e.g. in
-    adapter tests) without capturing either.
-
-    :class:`HostParam` owns the tensor-adapter details because wrapper
-    metadata is type-specific. The returned value intentionally excludes
-    tensor identity so distinct blocks with the same layout share one
-    pooled target.
-    """
-    return HostParam.target_layout_for(p)
-
-
-def _collect_block_schemas(
-    blocks: list[nn.Module],
-    managed_param_names: set[str] | None,
-    managed_buffer_names: set[str] | None,
-) -> tuple[list[dict[str, bool]], list[set[str]]]:
-    """Snapshot the cross-block contract without retaining tensor objects.
-
-    Host construction replaces each completed block's source wrappers so
-    their pageable/file-backed storage can be released before the next block
-    is copied. Keeping ``Parameter`` or buffer objects in this pre-validation
-    snapshot would extend every source storage's lifetime until the complete
-    block list finished capture, producing an approximately 2x model-sized
-    peak for structured tensor adapters.
-    """
-    block_param_schemas: list[dict[str, bool]] = []
-    block_buffer_schemas: list[set[str]] = []
-
-    for block in blocks:
-        params, buffers = _select_block_schema(
-            block,
-            managed_param_names,
-            managed_buffer_names,
-        )
-        block_param_schemas.append(params)
-        block_buffer_schemas.append(buffers)
-
-    return block_param_schemas, block_buffer_schemas
 
 
 def _select_block_schema(
@@ -246,6 +161,7 @@ def _check_block_requires_grad_consistent(
 def _capture_block_module_stores(
     blocks: Sequence[nn.Module],
     *,
+    memory_manager: HostMemoryManager | None = None,
     managed_param_names: set[str] | None = None,
     managed_buffer_names: set[str] | None = None,
 ) -> list[HostModuleStore]:
@@ -256,87 +172,47 @@ def _capture_block_module_stores(
     low-peak ``Parameter.data`` repointing optimization; recovery from
     a capture-time failure is unsupported, matching :class:`HostComponent`.
     """
-    # Walk each block to snapshot selected names and requires_grad flags
-    # WITHOUT retaining the Parameter/buffer objects or capturing anything.
-    # Cross-block name consistency is enforced upstream
-    # (``_block_param_names_for_blocks`` / ``_block_buffer_names_for_blocks``);
-    # per-block tensor *layouts* may differ (heterogeneous quantization),
-    # since the component's morphing target pool keys reusable GPU targets
-    # by per-block layout signature so blocks of different formats never
-    # share a target.
-    block_param_schemas, block_buffer_schemas = _collect_block_schemas(
-        list(blocks),
-        managed_param_names,
-        managed_buffer_names,
-    )
-    _check_block_requires_grad_consistent(block_param_schemas)
+    # Snapshot names and trainability before capture mutates any block. Do not
+    # retain tensors: completed blocks must release replaced source allocations
+    # immediately, rather than keeping a second model-sized copy alive.
+    schemas = [
+        _select_block_schema(block, managed_param_names, managed_buffer_names)
+        for block in blocks
+    ]
+    _check_block_requires_grad_consistent([params for params, _buffers in schemas])
 
-    # Only lightweight name collections cross into capture. Capture and install
-    # each block before resolving the next block's live tensors so structured
-    # source wrappers from completed blocks can be reclaimed immediately.
-    param_names_by_block = [set(schema) for schema in block_param_schemas]
-    buffer_names_by_block = block_buffer_schemas
-    del block_param_schemas, block_buffer_schemas
-
-    stores: list[HostModuleStore] = []
-    for block, param_names, buffer_names in zip(
-        blocks,
-        param_names_by_block,
-        buffer_names_by_block,
-        strict=True,
-    ):
-        stores.append(
-            HostModuleStore.from_module(
-                block,
-                include_param_names=param_names,
-                include_buffer_names=buffer_names,
-            )
+    if memory_manager is None:
+        memory_manager = HostMemoryManager()
+    return [
+        HostModuleStore.from_module(
+            block,
+            memory_manager=memory_manager,
+            include_param_names=params,
+            include_buffer_names=buffers,
         )
-    return stores
+        for block, (params, buffers) in zip(blocks, schemas, strict=True)
+    ]
 
 
-def _build_param_name_index(
-    instances: Sequence[HostModuleInstance],
+def _index_block_names(
+    names_by_block: Iterable[Iterable[str]],
     prefix: str | None,
     block_indices: Sequence[int],
 ) -> dict[str, tuple[int, str]]:
-    # The external NAME uses the true block index so a sparse group's params
-    # are addressed at their real path; the stored VALUE keeps the compact
-    # position used to index ``_block_instances`` for the block runtime.
+    """Map model paths to compact block positions and local member names.
+
+    Paths retain original block indices even when empty blocks were skipped.
+    """
     index: dict[str, tuple[int, str]] = {}
-    for compact_idx, instance in enumerate(instances):
-        true_idx = block_indices[compact_idx]
-        for local_name in instance.params:
-            name = _block_param_name(prefix, true_idx, local_name)
+    for compact_idx, (true_idx, names) in enumerate(zip(block_indices, names_by_block, strict=True)):
+        for local_name in names:
+            name = f"{true_idx}.{local_name}"
+            if prefix is not None:
+                name = f"{prefix}.{name}"
             if name in index:
-                raise ValueError(f"duplicate block parameter name {name!r}")
+                raise ValueError(f"duplicate block member name {name!r}")
             index[name] = (compact_idx, local_name)
     return index
-
-
-def _build_buffer_name_index(
-    instances: Sequence[HostModuleInstance],
-    prefix: str | None,
-    block_indices: Sequence[int],
-) -> dict[str, tuple[int, str]]:
-    index: dict[str, tuple[int, str]] = {}
-    for compact_idx, instance in enumerate(instances):
-        true_idx = block_indices[compact_idx]
-        for local_name in instance.buffers:
-            name = _block_param_name(prefix, true_idx, local_name)
-            if name in index:
-                raise ValueError(f"duplicate block buffer name {name!r}")
-            index[name] = (compact_idx, local_name)
-    return index
-
-
-def _block_param_name(
-    prefix: str | None,
-    block_idx: int,
-    local_name: str,
-) -> str:
-    name = f"{block_idx}.{local_name}"
-    return name if prefix is None else f"{prefix}.{name}"
 
 
 def _resolve_blocks(module: nn.Module, blocks_path: str) -> list[nn.Module]:
@@ -431,6 +307,7 @@ class BlockComponentStore:
         *,
         blocks_path: str,
         include_block_trainables: bool = False,
+        memory_manager: HostMemoryManager | None = None,
     ) -> Self:
         """Resolve ``blocks_path`` on ``model`` and capture its managed blocks.
 
@@ -454,6 +331,7 @@ class BlockComponentStore:
         managed_buffer_names = _block_buffer_names_for_blocks(blocks)
         block_stores = _capture_block_module_stores(
             blocks,
+            memory_manager=memory_manager,
             managed_param_names=managed_param_names,
             managed_buffer_names=managed_buffer_names,
         )
@@ -482,30 +360,16 @@ class BlockComponentStore:
         real path (``blocks.2...``) and the host-remainder subtraction in
         :meth:`CompositeComponentStore.from_module` lines up correctly.
         """
-        names = {
-            _block_param_name(self.blocks_path, true_idx, local_name)
-            for true_idx, store in zip(
-                self.block_indices,
-                self._block_stores,
-                strict=True,
-            )
-            for local_name in store.params
-        }
-        return frozenset(names)
+        return frozenset(_index_block_names(
+            (store.params for store in self._block_stores), self.blocks_path, self.block_indices,
+        ))
 
     @property
     def buffer_names(self) -> frozenset[str]:
         """Externally addressable managed buffer names (true block indices)."""
-        names = {
-            _block_param_name(self.blocks_path, true_idx, local_name)
-            for true_idx, store in zip(
-                self.block_indices,
-                self._block_stores,
-                strict=True,
-            )
-            for local_name in store.buffers
-        }
-        return frozenset(names)
+        return frozenset(_index_block_names(
+            (store.buffers for store in self._block_stores), self.blocks_path, self.block_indices,
+        ))
 
     @property
     def cache_bytes(self) -> int:
@@ -739,32 +603,21 @@ class BlockComponent:
         self._active_device: torch.device | None = None
         self._active_runtime: BlockRuntime | None = None
         self._load_plans: tuple[HostModuleLoadPlan, ...] = ()
-        self._pin_lease: PinLease | None = None
-        self._param_name_to_block_param = _build_param_name_index(
-            self._block_instances,
+        self._pin_leases: list[PinLease] = []
+        self._param_index = _index_block_names(
+            (instance.params for instance in self._block_instances),
             name,
             block_indices,
         )
-        self._buffer_name_to_block_buffer = _build_buffer_name_index(
-            self._block_instances,
+        self._param_names = frozenset(self._param_index)
+        self._buffer_names = frozenset(_index_block_names(
+            (instance.buffers for instance in self._block_instances),
             name,
             block_indices,
-        )
-        self._param_names, self._buffer_names = (
-            frozenset(self._param_name_to_block_param),
-            frozenset(self._buffer_name_to_block_buffer),
-        )
+        ))
         self._cpu_optimizer_step_active = False
 
-        # Auto-flush the CUDA allocator cache when the component is GC'd,
-        # so callers don't need to remember an explicit empty_cache() at
-        # workload boundaries. Captures only a bool (no self ref) so it
-        # never blocks collection.
-        weakref.finalize(
-            self,
-            _release_cuda_cache_on_drop,
-            True,
-        )
+        weakref.finalize(self, _release_cuda_cache_on_drop)
 
     @property
     def blocks(self) -> tuple[nn.Module, ...]:
@@ -805,50 +658,6 @@ class BlockComponent:
     def has_trainables(self) -> bool:
         return any(instance.has_trainables for instance in self._block_instances)
 
-    def _resolve_param_name(
-        self,
-        name: str,
-    ) -> tuple[HostModuleInstance, str]:
-        ref = self._param_name_to_block_param.get(name)
-        if ref is None:
-            raise ValueError(f"param name {name!r} is not owned by this block component")
-        block_idx, local_name = ref
-        return self._resolve_block_param(block_idx, local_name)
-
-    def _resolve_buffer_name(
-        self,
-        name: str,
-    ) -> tuple[HostModuleInstance, str]:
-        ref = self._buffer_name_to_block_buffer.get(name)
-        if ref is None:
-            raise ValueError(f"buffer name {name!r} is not owned by this block component")
-        block_idx, local_name = ref
-        return self._resolve_block_buffer(block_idx, local_name)
-
-    def _resolve_block_param(
-        self,
-        block_idx: int,
-        name: str,
-    ) -> tuple[HostModuleInstance, str]:
-        if block_idx < 0 or block_idx >= len(self._block_instances):
-            raise ValueError(f"block index {block_idx} is out of range")
-        instance = self._block_instances[block_idx]
-        if name not in instance.params:
-            raise ValueError(f"param name {name!r} is not owned by block {block_idx}")
-        return instance, name
-
-    def _resolve_block_buffer(
-        self,
-        block_idx: int,
-        name: str,
-    ) -> tuple[HostModuleInstance, str]:
-        if block_idx < 0 or block_idx >= len(self._block_instances):
-            raise ValueError(f"block index {block_idx} is out of range")
-        instance = self._block_instances[block_idx]
-        if name not in instance.buffers:
-            raise ValueError(f"buffer name {name!r} is not owned by block {block_idx}")
-        return instance, name
-
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -887,10 +696,10 @@ class BlockComponent:
                 "active. Deactivate first, or check for a leaked "
                 "context manager."
             )
-        if self._pin_lease is not None:
+        if self._pin_leases:
             raise RuntimeError(
                 "BlockComponent cannot activate after its prior CUDA session "
-                "failed to finish host transfers. Recreate the CUDA worker."
+                "failed to finish host copies. Recreate the CUDA worker."
             )
         active_device = canonical_device(device)
         if active_device.type == "cpu":
@@ -917,7 +726,7 @@ class BlockComponent:
         ]
         if overrides is not None:
             for name, override in overrides.items():
-                ref = self._param_name_to_block_param.get(name)
+                ref = self._param_index.get(name)
                 if ref is None:
                     raise ValueError(
                         f"param name {name!r} is not owned by this block component"
@@ -992,8 +801,8 @@ class BlockComponent:
         set and therefore need no acquisition. The activation session and any
         installed compiled forwards remain intact across release/acquire
         cycles. The component leases streaming and rolling host storage under
-        the global pin budget before the selected runtime starts. Resident
-        mode does not use a host pin lease.
+        their owning managers' pin budgets before the selected runtime starts.
+        Resident mode does not use a host pin lease.
         """
         active_device = self._active_device
         if active_device is None:
@@ -1005,7 +814,7 @@ class BlockComponent:
             raise RuntimeError("BlockComponent CUDA session has no selected runtime.")
         if runtime.acquired:
             return
-        if self._pin_lease is not None:
+        if self._pin_leases:
             raise RuntimeError(
                 "BlockComponent cannot acquire while prior pin cleanup is incomplete."
             )
@@ -1013,9 +822,16 @@ class BlockComponent:
             # Reserve bounded staging before opportunistic direct registrations
             # are allowed to consume native host-pin capacity.
             reserve_host_staging()
-            self._pin_lease = host_pin_manager.acquire(
-                _host_transfer_tensors(self._load_plans)
-            )
+            sources: dict[HostMemoryManager, list[torch.Tensor]] = {}
+            for plan in self._load_plans:
+                for host in plan.host_sources():
+                    sources.setdefault(host.memory_manager, []).extend(host.storage_tensors())
+            with contextlib.ExitStack() as stack:
+                self._pin_leases = [
+                    stack.enter_context(manager.acquire(tensors))
+                    for manager, tensors in sources.items()
+                ]
+                stack.pop_all()
         runtime.acquire(active_device, self._load_plans)
 
     def release(self) -> None:
@@ -1027,8 +843,7 @@ class BlockComponent:
         the same session for another traversal. Target retirement completes
         recorded CUDA work, so release is safe immediately after a forward.
         Streaming host pin leases are released after the runtime confirms all
-        copies have completed. Their
-        registrations remain in the idle LRU for reuse until budget pressure,
+        copies have completed. Registrations remain in the idle LRU for reuse until budget pressure,
         explicit clearing, or source disposal unregisters them.
         """
         runtime = self._active_runtime
@@ -1038,16 +853,15 @@ class BlockComponent:
             runtime.release()
         finally:
             if not runtime.acquired:
-                lease = self._pin_lease
-                if lease is not None:
+                for lease in self._pin_leases:
                     lease.close()
-                    self._pin_lease = None
+                self._pin_leases.clear()
 
     def deactivate(self) -> None:
         """Tear down active resources idempotently — safe to call
         before activate or multiple times. The selected runtime owns cleanup
         of any partial acquisition state. A terminal CUDA synchronization
-        failure retains its pin lease but clears session metadata. Drop the
+        failure retains its pin leases but clears session metadata. Drop the
         binding reference after deactivate to release host memory."""
         self._block_compile.restore()
         if self._auto_fallback_compile is not None:
@@ -1099,10 +913,6 @@ class BlockComponent:
             )
         with runtime.optimizer_step():
             yield
-
-    def gather_for_step(self) -> contextlib.AbstractContextManager[None]:
-        """Backward-compatible alias for :meth:`optimizer_step`."""
-        return self.optimizer_step()
 
 
 __all__ = [

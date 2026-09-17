@@ -46,7 +46,7 @@ import torch
 from torch import nn
 
 from ._dense_merge import merge_dense_requantize_
-from ._host_staging import copy_host_to_device
+from ._host_copy import TensorCopy
 from ._quanto import (
     canonical_qbytes_storage_layout,
     canonicalize_qbytes_tensor,
@@ -335,10 +335,10 @@ class QuantoAdapter:
 
     @staticmethod
     def copy_to_gpu(
-        src: _QuantoHost, dst: _QuantoGpu, *, non_blocking: bool = False
+        src: _QuantoHost, dst: _QuantoGpu, *, copy: TensorCopy
     ) -> None:
-        copy_host_to_device(dst.data, src.data, non_blocking=non_blocking)
-        copy_host_to_device(dst.scale, src.scale, non_blocking=non_blocking)
+        copy(dst.data, src.data)
+        copy(dst.scale, src.scale)
 
     @staticmethod
     def copy_to_cpu(

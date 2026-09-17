@@ -38,7 +38,7 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 from torch import nn
 
-from ._host_staging import copy_host_to_device
+from ._host_copy import TensorCopy
 
 __all__ = [
     "BindLayoutTensorAdapter",
@@ -190,9 +190,15 @@ class TensorAdapter[HostStateT, GpuStateT](Protocol):
 
     @staticmethod
     def copy_to_gpu(
-        src: HostStateT, dst: GpuStateT, *, non_blocking: bool = False
+        src: HostStateT, dst: GpuStateT, *, copy: TensorCopy
     ) -> None:
-        """Bulk DMA the host state's bytes into pre-allocated GPU storage."""
+        """Copy host bytes into GPU storage using the supplied copy callback.
+
+        Call ``copy(destination, source)`` for every physical CPU tensor read.
+        The callback selects backing storage and protects it until completion;
+        it also carries the caller's non-blocking setting. Composing adapters
+        must forward the callback to their inner adapter.
+        """
         ...
 
     @staticmethod
@@ -789,9 +795,9 @@ class RegularAdapter:
 
     @staticmethod
     def copy_to_gpu(
-        src: _RegularHost, dst: _RegularGpu, *, non_blocking: bool = False
+        src: _RegularHost, dst: _RegularGpu, *, copy: TensorCopy
     ) -> None:
-        copy_host_to_device(dst.data, src.data, non_blocking=non_blocking)
+        copy(dst.data, src.data)
 
     @staticmethod
     def copy_to_cpu(

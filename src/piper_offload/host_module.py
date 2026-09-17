@@ -18,8 +18,8 @@ from typing import Self, cast
 import torch
 from torch import nn
 
-from ._host_staging import copy_host_to_device
 from .host_buffer import HostBuffer
+from .host_memory import HostMemoryManager
 from .host_param import HostParam
 from .module_names import group_names, resolve_parent_leaf
 from .parameter_transform import ParameterTransform
@@ -102,8 +102,11 @@ class HostModuleStore:
         *,
         include_param_names: Iterable[str] | None = None,
         include_buffer_names: Iterable[str] | None = None,
+        memory_manager: HostMemoryManager | None = None,
     ) -> Self:
-        """Capture and install owned CPU copies keyed by module names."""
+        """Capture CPU storage keyed by name, sharing allocation handles."""
+        if memory_manager is None:
+            memory_manager = HostMemoryManager()
         all_params = _named_parameters(module)
         params = _select_known_names(
             all_params,
@@ -117,8 +120,8 @@ class HostModuleStore:
         )
 
         store = cls(
-            params=_capture_params(params),
-            buffers=_capture_buffers(buffers),
+            params=_capture_params(params, memory_manager),
+            buffers=_capture_buffers(buffers, memory_manager),
         )
         _validate_trainable_param_data_swaps(store.params)
         _install_host_params(module, store.params)
@@ -341,6 +344,22 @@ class HostModuleLoadPlan:
         """Effective source backing for every parameter loaded by this plan."""
         return {name: load.source for name, load in self.loads.items()}
 
+    def host_sources(self) -> Iterator[HostParam | HostBuffer]:
+        """Host owners read by copies, parameter updates, and optimizer steps.
+
+        Replacements supersede frozen model sources. Optimizer steps still use
+        the instance's own trainable backing. Owning memory managers deduplicate
+        aliases and whole allocations when acquiring pins.
+        """
+        for load in self.loads.values():
+            yield load.source
+            if load.update is not None:
+                yield from load.update.host_params()
+        yield from self.instance.buffers.values()
+        for host in self.instance.params.values():
+            if host.requires_grad:
+                yield host
+
     def select_parameters(
         self,
         names: Iterable[str],
@@ -422,6 +441,7 @@ class HostModuleLoadPlan:
 
 def _capture_params(
     params: Mapping[str, nn.Parameter],
+    memory_manager: HostMemoryManager,
 ) -> dict[str, HostParam]:
     host_by_name: dict[str, HostParam] = {}
     for names in group_names(
@@ -429,7 +449,7 @@ def _capture_params(
         lambda name: param_tensor_id(params[name]),
     ):
         _validate_param_storage_group_requires_grad(names, params)
-        host = HostParam(params[names[0]])
+        host = HostParam(params[names[0]], memory_manager=memory_manager)
         _validate_param_storage_group_tieable(names, host)
         for name in names:
             host_by_name[name] = host
@@ -458,6 +478,7 @@ def _validate_param_storage_group_tieable(names: Sequence[str], host: HostParam)
 
 def _capture_buffers(
     buffers: Mapping[str, torch.Tensor],
+    memory_manager: HostMemoryManager,
 ) -> dict[str, HostBuffer]:
     host_by_name: dict[str, HostBuffer] = {}
     for names in group_names(
@@ -466,6 +487,7 @@ def _capture_buffers(
     ):
         host = HostBuffer.capture(
             buffers[names[0]],
+            memory_manager=memory_manager,
         )
         for name in names:
             host_by_name[name] = host
@@ -809,9 +831,8 @@ def _copy_buffers_to_target(
         key = id(host)
         if key in copied:
             continue
-        copy_host_to_device(
+        host.copy_to_gpu(
             targets[name].tensor,
-            host.tensor,
             non_blocking=non_blocking,
         )
         copied.add(key)
