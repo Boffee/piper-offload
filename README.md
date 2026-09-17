@@ -139,6 +139,20 @@ any escaped model references.
 
 ### Host backing
 
+Offload treats all non-trainable parameters and managed buffers as immutable
+for the lifetime of their host capture. Set parameter `requires_grad` before
+capture. Do not mutate frozen host bytes (including through aliases) or change
+trainability while captured; rebuild the capture when those values change.
+Frozen parameters and buffers are not copied back from GPU execution, so
+stateful buffer updates that must persist are unsupported.
+
+The caller admitting retained anonymous copies must exclude trainable parameters,
+including their physical payloads, metadata, and any shared storage aliases.
+Use the owning parameter's captured `requires_grad`, not the flag on detached
+storage tensors. Backing handles do not track trainability or detect mutation.
+Eviction of a copy always preserves the original host source, including for
+weights originally allocated in RAM.
+
 Model and adapter factories transfer ownership of compatible complete pageable
 CPU allocations and non-empty views into non-resizable storage to the cached
 resource. This preserves checkpoint mmap backing when loaders assign mapped

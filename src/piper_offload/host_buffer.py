@@ -13,7 +13,11 @@ from .tensor_adapters import capture_host_tensor
 
 @dataclass(frozen=True, slots=True, eq=False)
 class HostBuffer:
-    """Fixed storage and ownership for one buffer; contents may change in place."""
+    """Storage for a buffer whose host bytes remain immutable while captured.
+
+    Offload does not persist device-side buffer updates back to host storage.
+    Stateful buffers that require such updates are outside this contract.
+    """
 
     tensor: torch.Tensor
     target_layout: tuple[object, ...]

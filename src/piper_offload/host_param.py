@@ -65,6 +65,11 @@ class HostParam:
     trainable Parameter identity by ``.data``-swapping into the user's
     persistent Parameter — both are supported.
 
+    Non-trainable parameters promise immutable host bytes for the captured
+    lifetime. Set trainability before capture; changing it afterward or writing
+    frozen storage in place requires rebuilding the capture. Trainable physical
+    payloads and metadata cannot use retained anonymous copies.
+
     Low-peak host construction behavior: compatible complete CPU allocations
     and views into non-resizable storage are retained directly, preserving file
     mappings without a copy. For plain ``torch.Tensor`` parameters, construction

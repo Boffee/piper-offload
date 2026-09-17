@@ -160,8 +160,10 @@ class HostBacking:
         The caller must supply anonymous memory with equivalent immutable bytes
         and retain any pin until the anonymous storage is safely removed. This
         method does not copy bytes, pin, unpin, or verify equality or memory
-        provenance. A future cache must check whether weights are immutable and
-        recoverable before creating or discarding anonymous storage.
+        provenance or trainability. The caller must exclude trainable parameters
+        and their storage aliases using the owning parameter's captured
+        requires_grad, not detached tensor flags. Non-trainable captures promise
+        immutable bytes; a future cache must also check source recoverability.
         """
         state = self._state
         anonymous_storage = None
