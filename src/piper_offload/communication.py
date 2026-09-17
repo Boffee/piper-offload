@@ -25,6 +25,7 @@ import torch
 import torch.distributed as dist
 from torch._C._distributed_c10d import AllgatherOptions, _DistributedBackendOptions
 
+from ._host_backing import HostBacking
 from ._relay_shared import BUFFERS_PER_RANK, COPY_DTYPES, REDUCTION_DTYPES, SharedRelay, shared_slot_bytes
 from ._relay_staging import HostChunk, TransferPipeline, chunk_ranges, make_host_chunk
 from .host_memory import HostMemoryManager
@@ -127,6 +128,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
         self._staging_bytes = options.staging_bytes
         self._pipeline_buffers = options.pipeline_buffers
         self._staging_buffer: torch.Tensor | None = None
+        self._staging_backings: tuple[HostBacking, ...] = ()
         self._pipeline: TransferPipeline | None = None
         self._shared: SharedRelay | None = None
         self._closed = False
@@ -163,6 +165,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
                 super().shutdown()
             finally:
                 self._staging_buffer = None
+                self._staging_backings = ()
                 self._pipeline = None
                 self._shared = None
 
@@ -185,16 +188,20 @@ class _RelayProcessGroup(dist.ProcessGroup):
         if self._shared is not None:
             # CPU reductions use only this rank's region. No second host
             # payload allocation is necessary.
-            owner = self._shared.buffer
+            backings = self._shared.backings(self._memory_manager)
             region = self._shared.local_buffer()
         else:
             if self._staging_buffer is None:
                 self._staging_buffer = torch.empty(self._staging_bytes, dtype=torch.uint8, device="cpu")
-            owner = region = self._staging_buffer
-        # Lease the persistent owner, never temporary views: view destruction
-        # must not retire the reusable registration. Idle pins remain evictable.
-        with self._memory_manager.acquire([owner]) if device.type == "cuda" else nullcontext() as lease:
-            yield region, lease is not None and lease.pageable_bytes == 0
+                self._staging_backings = tuple(
+                    self._memory_manager.capture([self._staging_buffer]).values()
+                )
+            backings = self._staging_backings
+            region = self._staging_buffer
+        # Retain the backing with the buffer: dropping the handle would retire
+        # the reusable registration. Idle pins remain evictable.
+        with self._memory_manager.acquire(backings) if device.type == "cuda" else nullcontext() as lease:
+            yield region, lease is not None and lease.pinned
 
     def _slot_bytes(self, slots: int) -> int:
         size = self._staging_bytes if self._shared is None else self._shared.capacity * self._shared.buffer_count

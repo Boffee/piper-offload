@@ -249,7 +249,7 @@ def test_mmap_projection_retains_full_host_mapping(  # noqa: PLR0915
     use_anonymous_storage: bool,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    import piper_offload._host_copy as host_copy
+    import piper_offload._host_backing as host_backing_module
 
     path = tmp_path / "weight.bin"
     path.touch()
@@ -261,16 +261,16 @@ def test_mmap_projection_retains_full_host_mapping(  # noqa: PLR0915
     (backing,) = source.backing_handles()
     selected_pointer = file_storage.data_ptr()
     if use_anonymous_storage:
-        anonymous_storage = full.pin_memory()
-        assert backing.try_set_anonymous_storage(anonymous_storage)
-        selected_pointer = anonymous_storage.data_ptr()
-    raw_copy = host_copy._copy_host_to_device
+        # A private file mapping is pinned through an owned copy.
+        assert backing.pin()
+        selected_pointer = backing.span[0]
+    raw_copy = host_backing_module._transfer
 
     def copy_selected(destination, tensor, *, non_blocking):
         assert tensor.untyped_storage().data_ptr() == selected_pointer
         raw_copy(destination, tensor, non_blocking=non_blocking)
 
-    monkeypatch.setattr(host_copy, "_copy_host_to_device", copy_selected)
+    monkeypatch.setattr(host_backing_module, "_transfer", copy_selected)
 
     def setup(rank):
         mesh = DeviceMesh("cuda", [0, 1])

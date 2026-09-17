@@ -55,11 +55,11 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from ._host_staging import reserve_host_staging
+from ._host_backing import HostBacking, HostLease
 from .block_compile import BlockCompileConfig, _BlockCompileState
 from .block_mode import BlockMode
 from .block_runtime import BlockRuntime
-from .host_memory import HostMemoryManager, PinLease
+from .host_memory import HostMemoryManager
 from .host_module import (
     HostModuleInstance,
     HostModuleLoadPlan,
@@ -603,7 +603,7 @@ class BlockComponent:
         self._active_device: torch.device | None = None
         self._active_runtime: BlockRuntime | None = None
         self._load_plans: tuple[HostModuleLoadPlan, ...] = ()
-        self._pin_leases: list[PinLease] = []
+        self._pin_leases: list[HostLease] = []
         self._param_index = _index_block_names(
             (instance.params for instance in self._block_instances),
             name,
@@ -819,17 +819,14 @@ class BlockComponent:
                 "BlockComponent cannot acquire while prior pin cleanup is incomplete."
             )
         if self._block_mode != "resident":
-            # Reserve bounded staging before opportunistic direct registrations
-            # are allowed to consume native host-pin capacity.
-            reserve_host_staging()
-            sources: dict[HostMemoryManager, list[torch.Tensor]] = {}
+            sources: dict[HostMemoryManager, list[HostBacking]] = {}
             for plan in self._load_plans:
                 for host in plan.host_sources():
-                    sources.setdefault(host.memory_manager, []).extend(host.storage_tensors())
+                    sources.setdefault(host.memory_manager, []).extend(host.backing_handles())
             with contextlib.ExitStack() as stack:
                 self._pin_leases = [
-                    stack.enter_context(manager.acquire(tensors))
-                    for manager, tensors in sources.items()
+                    stack.enter_context(manager.acquire(backings))
+                    for manager, backings in sources.items()
                 ]
                 stack.pop_all()
         runtime.acquire(active_device, self._load_plans)

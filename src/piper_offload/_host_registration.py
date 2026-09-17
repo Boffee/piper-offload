@@ -29,6 +29,9 @@ class HostRegistrationBackend(Protocol):
         ...
 
 
+_PORTABLE = 0x01
+
+
 class HostRegistrationError(RuntimeError):
     """An unexpected runtime error during registration or unregistration."""
 
@@ -110,7 +113,7 @@ class RuntimeHostRegistration:
         if runtime is None:
             return False
         self._check_prior_error(runtime)
-        code = runtime.register(pointer, size, 1)
+        code = runtime.register(pointer, size, _PORTABLE)
         if code:
             self._clear_failed_call(runtime, code)
             if code in (2, 801):

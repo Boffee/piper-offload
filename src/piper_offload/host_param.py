@@ -22,7 +22,6 @@ import torch
 from torch import nn
 
 from ._host_backing import HostBacking
-from ._host_copy import copy_host_to_device
 from .dtensor_adapter import DTensorAdapter
 from .host_memory import HostMemoryManager
 from .tensor_adapter_registry import param_representation, select_adapter
@@ -393,8 +392,15 @@ class HostParam:
         self.adapter.copy_to_gpu(
             self.host_state,
             gpu_state,
-            copy=partial(copy_host_to_device, backings=self._backings, non_blocking=non_blocking),
+            copy=partial(self._copy_host, non_blocking=non_blocking),
         )
+
+    def _copy_host(self, destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool) -> None:
+        try:
+            backing = self._backings[source.untyped_storage()._cdata]
+        except KeyError:
+            raise ValueError("Copy source was not captured by this backing owner") from None
+        backing.copy_to(destination, source, non_blocking=non_blocking)
 
     def copy_to_cpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk D2H GPU bytes back into the host state.

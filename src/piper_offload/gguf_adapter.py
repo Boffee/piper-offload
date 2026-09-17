@@ -18,10 +18,9 @@ from typing import Any, cast
 import torch
 from torch import nn
 
-from ._host_copy import TensorCopy
 from ._piper_convrot_int8 import create_convrot_int8_tensor
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
-from .tensor_adapters import capture_host_tensor
+from .tensor_adapters import TensorCopy, capture_host_tensor
 
 __all__ = ["GgufAdapter"]
 

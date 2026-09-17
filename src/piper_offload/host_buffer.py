@@ -6,7 +6,6 @@ from typing import Self
 import torch
 
 from ._host_backing import HostBacking
-from ._host_copy import copy_host_to_device
 from .host_memory import HostMemoryManager
 from .tensor_adapters import capture_host_tensor
 
@@ -78,7 +77,8 @@ class HostBuffer:
 
     def copy_to_gpu(self, destination: torch.Tensor, *, non_blocking: bool = False) -> None:
         """Copy this buffer using its explicitly owned backing handles."""
-        copy_host_to_device(destination, self.tensor, backings=self._backings, non_blocking=non_blocking)
+        backing = self._backings[self.tensor.untyped_storage()._cdata]
+        backing.copy_to(destination, self.tensor, non_blocking=non_blocking)
 
 
 __all__ = ["HostBuffer"]
