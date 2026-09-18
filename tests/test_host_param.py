@@ -583,3 +583,27 @@ class TestCopyToCpu:
         gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
         with pytest.raises(NotImplementedError, match="CPU round-trip"):
             host_param.copy_to_cpu(gpu_state)
+
+
+class TestTrainableMappedCapture:
+    def test_trainable_view_into_a_mapping_is_copied_out(self, tmp_path: Path) -> None:
+        path = tmp_path / "weights.bin"
+        path.write_bytes(bytes(24 * 4))
+        mapped = torch.from_file(str(path), shared=False, size=24, dtype=torch.float32)
+        mapped.copy_(torch.arange(24, dtype=torch.float32))
+        frozen = nn.Parameter(mapped[:12].reshape(3, 4), requires_grad=False)
+        trainable = nn.Parameter(mapped[12:].reshape(3, 4), requires_grad=True)
+        expected = trainable.detach().clone()
+
+        (frozen_host,) = HostParam(frozen).storage_tensors()
+        (trainable_host,) = HostParam(trainable).storage_tensors()
+
+        # The frozen view keeps the mapping; the trainable one owns its bytes,
+        # so the pin manager may return the mapping's pages to the file.
+        assert frozen_host.untyped_storage().data_ptr() == mapped.untyped_storage().data_ptr()
+        assert not frozen_host.untyped_storage().resizable()
+        assert trainable_host.untyped_storage().data_ptr() != mapped.untyped_storage().data_ptr()
+        assert trainable_host.untyped_storage().resizable()
+        assert trainable.data_ptr() == trainable_host.data_ptr()
+        assert trainable.requires_grad
+        torch.testing.assert_close(trainable.detach(), expected)

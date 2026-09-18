@@ -5,6 +5,21 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- On Linux, unregistering a private file mapping discards its copied pages,
+  returning the mapping to file backing, and warms the page cache so the next
+  registration copies from RAM.
+- `HostParam` copies a trainable parameter out of non-resizable storage such
+  as a file mapping at capture, so optimizer updates live in memory the
+  process owns. Frozen parameters keep their mappings as before.
+
+### Removed
+
+- Remove the bounded staging window that copied Linux checkpoint mappings
+  through pinned buffers. Mapped checkpoints register in place on every
+  platform again.
+
 ## [0.10.0rc2] - 2026-09-13
 
 ### Added
