@@ -1,6 +1,7 @@
 """Registration ownership, page accounting, and explicit pin leases."""
 
 import gc
+import logging
 import mmap
 import sys
 import threading
@@ -470,6 +471,7 @@ class FakeRuntime:
         self.code = code
         self.flags: int | None = None
         self.last_error = 0
+        self.unregistered: list[int] = []
 
     def register(self, pointer: int, size: int, flags: int) -> int:
         self.flags = flags
@@ -477,6 +479,7 @@ class FakeRuntime:
         return self.code
 
     def unregister(self, pointer: int) -> int:
+        self.unregistered.append(pointer)
         self.last_error = self.code
         return self.code
 
@@ -526,6 +529,17 @@ def test_prior_runtime_error_is_reported_before_registering(monkeypatch: pytest.
         RuntimeHostRegistration().register(PAGE, PAGE)
     assert error.value.code == 700
     assert runtime.flags is None
+
+
+def test_stale_runtime_error_does_not_block_unregistration(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    runtime = FakeRuntime(0)
+    runtime.last_error = 700
+    monkeypatch.setattr(registration_module, "_load_runtime", lambda: runtime)
+    with caplog.at_level(logging.WARNING, logger="piper_offload._host_registration"):
+        RuntimeHostRegistration().unregister(PAGE)
+    assert runtime.unregistered == [PAGE]
+    assert runtime.last_error == 0
+    assert "700" in caplog.text
 
 
 @pytest.mark.parametrize(

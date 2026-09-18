@@ -5376,3 +5376,29 @@ class TestLoRAResource:
 
 
 # ---------------------------------------------------------------------------
+
+
+class TestMergeIntoMappedModel:
+    def test_mapped_target_is_copied_out_before_the_merge(self, tmp_path) -> None:
+        base = torch.randn(3, 4)
+        path = tmp_path / "weights.bin"
+        path.write_bytes(base.numpy().tobytes())
+        mapped = torch.from_file(str(path), shared=False, size=12, dtype=torch.float32).reshape(3, 4)
+        model = nn.Module()
+        model.target = nn.Linear(4, 3, bias=False)
+        model.tied = nn.Linear(4, 3, bias=False)
+        model.target.weight = nn.Parameter(mapped, requires_grad=False)
+        model.tied.weight = model.target.weight
+        dense = torch.randn(3, 4)
+        adapter = Adapter.from_state_dict({"target.delta.weight": dense})
+
+        assert merge_adapter(model, [(adapter, 0.5)]) == 1
+
+        weight = model.target.weight
+        assert model.tied.weight is weight
+        assert weight.untyped_storage().resizable()
+        assert weight.data_ptr() != mapped.data_ptr()
+        assert not weight.requires_grad
+        torch.testing.assert_close(weight, base + 0.5 * dense)
+        # The mapping itself was never written.
+        torch.testing.assert_close(mapped, base)

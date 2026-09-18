@@ -12,9 +12,10 @@ copy every page into private memory, and unregistering does not undo that. On
 Linux the manager discards those pages when it unregisters an immutable
 mapping (``MADV_DONTNEED``), so the mapping refaults from the file, then warms
 the page cache (``MADV_WILLNEED``) so the next registration copies from RAM.
-Every private file mapping is treated as immutable: ``HostParam`` copies
-trainable parameters out of mapped storage at capture, so a mapping's private
-pages never hold anything the file does not. Windows cannot discard the pages
+Piper never writes into a file mapping: ``HostParam`` copies trainable
+parameters out at capture and ``merge_adapter`` copies its targets out before
+merging, so a mapping's private pages never hold anything the file does not.
+Windows cannot discard the pages
 of a view it did not create, so private pages there stay until the mapping is
 released, within the budget.
 

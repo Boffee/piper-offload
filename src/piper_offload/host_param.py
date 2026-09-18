@@ -15,7 +15,6 @@ such as D2H round-trip, trainable ``.data`` swap, and in-place updates
 are exposed through adapter capability methods.
 """
 
-from contextlib import nullcontext
 from typing import Any, Self, cast
 
 import torch
@@ -31,13 +30,9 @@ from .tensor_adapters import (
     PostLoadRearmTensorAdapter,
     TensorAdapter,
     adapter_name,
+    host_state_is_owned,
     independent_host_capture,
 )
-
-
-def _in_non_resizable_cpu_storage(t: torch.Tensor) -> bool:
-    """Whether ``t`` lives in storage the process did not allocate, such as a file mapping."""
-    return t.device.type == "cpu" and t.layout is torch.strided and not t.untyped_storage().resizable()
 
 
 class HostParam:
@@ -69,10 +64,10 @@ class HostParam:
 
     Low-peak host construction behavior: compatible complete CPU allocations
     and views into non-resizable storage are retained directly, preserving file
-    mappings without a copy. A trainable parameter is the exception: it owns
-    its host bytes, because optimizer steps write them back and the pin
-    manager treats a file mapping as immutable. For plain ``torch.Tensor``
-    parameters, construction immediately repoints the source
+    mappings without a copy. A trainable parameter is the exception: optimizer
+    steps write its host bytes back, and Piper never writes into a file
+    mapping, so a trainable view into one is copied out at capture. For plain
+    ``torch.Tensor`` parameters, construction immediately repoints the source
     ``Parameter.data`` at the captured backing.
     This promptly releases replaced GPU or incompatible CPU storage before the
     owning store finishes. It also means host construction is not rollback-safe
@@ -131,14 +126,14 @@ class HostParam:
         adapter: TensorAdapter[Any, Any] = select_adapter(representation)
         # A meta tensor is the complete resting representation: it records
         # shape, dtype, and stride without owning physical host bytes.
-        # A trainable view into a file mapping is copied out of it: the
-        # optimizer writes the host bytes back, and the pin manager returns
-        # an idle mapping's pages to the file.
-        own_bytes = requires_grad and _in_non_resizable_cpu_storage(representation)
-        with independent_host_capture() if own_bytes else nullcontext():
-            host_state = (
-                representation.detach() if is_meta else adapter.capture_host(representation)
-            )
+        host_state = (
+            representation.detach() if is_meta else adapter.capture_host(representation)
+        )
+        if requires_grad and not is_meta and not host_state_is_owned(adapter, host_state):
+            # Optimizer steps write trainable host bytes back, and the pin
+            # manager may return a mapping's pages to the file.
+            with independent_host_capture():
+                host_state = adapter.capture_host(representation)
         self._init_from_host_state(
             representation,
             requires_grad=requires_grad,

@@ -10,9 +10,14 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - On Linux, unregistering a private file mapping discards its copied pages,
   returning the mapping to file backing, and warms the page cache so the next
   registration copies from RAM.
-- `HostParam` copies a trainable parameter out of non-resizable storage such
-  as a file mapping at capture, so optimizer updates live in memory the
-  process owns. Frozen parameters keep their mappings as before.
+- Piper never writes into a file mapping. `HostParam` copies a trainable
+  parameter out of storage the process does not own at capture, and
+  `merge_adapter()` replaces such a target by an independent parameter under
+  every tied name before merging. Frozen, unmerged parameters keep their
+  mappings as before.
+- `RuntimeHostRegistration.unregister()` issues the native call even when a
+  stale error from earlier runtime work is pending, logging that error
+  instead of leaving the registration and its budget charge behind.
 
 ### Removed
 

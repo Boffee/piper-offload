@@ -176,11 +176,16 @@ pages for writing, and the kernel answers by copying every page into private
 memory, so pinned mappings cost RAM. On Linux, when the manager
 unregisters an immutable mapping it discards those private pages, so the
 mapping refaults from the file, and asks the kernel to keep the file in the
-page cache so the next registration copies from RAM rather than disk. A
-mapping's private pages never hold anything the file does not, because a
-trainable parameter is copied out of mapped storage when its host parameter
-is captured. Windows cannot discard the pages of a view it did not create, so
-private pages there persist until the mapping is released.
+page cache so the next registration copies from RAM rather than disk.
+
+This relies on one contract: **Piper never writes into a file mapping.** Host
+storage it writes on your behalf is copied into memory the process owns
+first: a trainable parameter when its host parameter is captured, and a
+`merge_adapter()` target before the merge. Do not modify an mmap-backed
+parameter in place yourself before handing the model to Piper; on Linux those
+pages would revert to the file's bytes on the first eviction. Windows cannot
+discard the pages of a view it did not create, so private pages there persist
+until the mapping is released.
 
 Deactivation releases the lease after transfers finish and leaves registrations
 in the idle LRU. Reactivating the same backing reuses its retained registrations
@@ -894,7 +899,10 @@ merge_adapter(
 )
 ```
 
-This uses in-place arithmetic for plain fp/bf bases. Supported quantized
+This uses in-place arithmetic for plain fp/bf bases. A target that is a view
+into a file mapping is first replaced by an independent parameter under every
+tied name, so the mapping itself is never written (see Host registration).
+Supported quantized
 adapters use format-specific Triton kernels for factor-only and full-rank
 updates on CUDA and retain their dequantize/requantize reference path as a
 fallback. Formats without the required factorized merge capability need routed

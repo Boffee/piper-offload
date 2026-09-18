@@ -58,12 +58,26 @@ __all__ = [
     "adapter_name",
     "capture_host_tensor",
     "empty_like_strided",
+    "host_state_is_owned",
     "metadata_key",
     "optional_tensor_id",
     "tensor_layout",
 ]
 
 _force_host_copy: ContextVar[bool] = ContextVar("force_host_copy", default=False)
+
+
+def host_state_is_owned[HostStateT](
+    adapter: TensorAdapter[HostStateT, Any], state: HostStateT,
+) -> bool:
+    """Whether every physical tensor of ``state`` lives in storage this process allocated.
+
+    A view into a file mapping, or into a buffer the process did not
+    allocate, is not owned. Piper never writes into a file mapping: the pin
+    manager may return its pages to the file, so host state that Piper
+    writes, trainable parameters and merge targets, must be owned first.
+    """
+    return all(tensor.untyped_storage().resizable() for tensor in adapter.storage_tensors(state))
 
 
 @contextlib.contextmanager
