@@ -1,33 +1,22 @@
 """Per-buffer CPU storage primitive."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Self
 
 import torch
 
-from ._host_backing import HostBacking
-from .host_memory import HostMemoryManager
 from .tensor_adapters import capture_host_tensor
 
 
-@dataclass(frozen=True, slots=True, eq=False)
+@dataclass(slots=True, eq=False)
 class HostBuffer:
-    """Storage for a buffer whose host bytes remain immutable while captured.
-
-    Offload does not persist device-side buffer updates back to host storage.
-    Stateful buffers that require such updates are outside this contract.
-    """
+    """Host storage for one registered buffer."""
 
     tensor: torch.Tensor
     target_layout: tuple[object, ...]
-    memory_manager: HostMemoryManager = field(default_factory=HostMemoryManager, repr=False)
-    _backings: dict[int, HostBacking] = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "_backings", self.memory_manager.capture(self.storage_tensors()))
 
     @classmethod
-    def capture(cls, buffer: torch.Tensor, *, memory_manager: HostMemoryManager | None = None) -> Self:
+    def capture(cls, buffer: torch.Tensor) -> Self:
         """Capture contiguous pageable CPU backing, retaining compatible storage."""
         tensor = capture_host_tensor(
             buffer,
@@ -36,7 +25,6 @@ class HostBuffer:
         return cls(
             tensor=tensor,
             target_layout=cls.target_layout_for(tensor),
-            memory_manager=memory_manager if memory_manager is not None else HostMemoryManager(),
         )
 
     @staticmethod
@@ -70,15 +58,6 @@ class HostBuffer:
     def storage_tensors(self) -> tuple[torch.Tensor, ...]:
         """Return the existing backing tensor, preserving its storage and view."""
         return (self.tensor,)
-
-    def backing_handles(self) -> tuple[HostBacking, ...]:
-        """Shared allocation handles; the CPU buffer keeps its source storage."""
-        return tuple(self._backings.values())
-
-    def copy_to_gpu(self, destination: torch.Tensor, *, non_blocking: bool = False) -> None:
-        """Copy this buffer using its explicitly owned backing handles."""
-        backing = self._backings[self.tensor.untyped_storage()._cdata]
-        backing.copy_to(destination, self.tensor, non_blocking=non_blocking)
 
 
 __all__ = ["HostBuffer"]

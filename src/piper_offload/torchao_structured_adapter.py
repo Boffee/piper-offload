@@ -35,7 +35,6 @@ import torch
 from torch import nn
 
 from .tensor_adapters import (
-    TensorCopy,
     capture_host_tensor,
     empty_like_strided,
     optional_tensor_id,
@@ -79,7 +78,7 @@ def copy_storage(
     non_blocking: bool,
 ) -> None:
     """Per-tensor bulk copy of a parallel storage tuple, skipping absent
-    (``None``) entries. Used for the Float8 GPU-to-CPU round-trip.
+    (``None``) entries. Used for both H2D and the Float8 D2H round-trip.
 
     Movement keeps the same representation on both sides, so a ``None`` on
     one side is ``None`` on the other; skipping on ``src`` therefore also
@@ -285,12 +284,9 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         src: TorchaoHost[MetaT],
         dst: TorchaoGpu,
         *,
-        copy: TensorCopy,
+        non_blocking: bool = False,
     ) -> None:
-        for source, destination in zip(src.storage, dst.storage, strict=True):
-            if source is not None:
-                assert destination is not None
-                copy(destination, source)
+        copy_storage(src.storage, dst.storage, non_blocking=non_blocking)
 
     @classmethod
     def cache_bytes(cls, state: TorchaoHost[MetaT]) -> int:

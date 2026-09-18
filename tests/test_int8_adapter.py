@@ -16,6 +16,7 @@ from piper_offload import (
 )
 from piper_offload.int8_adapter import Int8Adapter
 from piper_offload.host_param import HostParam
+from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from tests.conftest import activated_model
 
@@ -244,13 +245,13 @@ class TestInt8Adapter:
         p1 = nn.Parameter(_make_int8(), requires_grad=False)
         p2 = nn.Parameter(_make_int8(), requires_grad=False)
 
-        assert HostParam.target_layout_for(p1) == HostParam.target_layout_for(p2)
+        assert _param_target_layout(p1) == _param_target_layout(p2)
 
     def test_target_layout_tracks_activation_quantization(self) -> None:
         with_activation = nn.Parameter(_make_int8(dynamic_activation=True), requires_grad=False)
         weight_only = nn.Parameter(_make_int8(dynamic_activation=False), requires_grad=False)
 
-        assert HostParam.target_layout_for(with_activation) != HostParam.target_layout_for(weight_only)
+        assert _param_target_layout(with_activation) != _param_target_layout(weight_only)
 
     def test_reduced_range_is_preserved_and_part_of_layout(self) -> None:
         weight = torch.randn(32, 16, dtype=torch.bfloat16)
@@ -261,9 +262,9 @@ class TestInt8Adapter:
         assert reduced_range.reduce_range is True
         assert reduced_range.qdata.min().item() >= -64
         assert reduced_range.qdata.max().item() <= 63
-        assert HostParam.target_layout_for(
+        assert _param_target_layout(
             nn.Parameter(full_range, requires_grad=False),
-        ) != HostParam.target_layout_for(
+        ) != _param_target_layout(
             nn.Parameter(reduced_range, requires_grad=False),
         )
 

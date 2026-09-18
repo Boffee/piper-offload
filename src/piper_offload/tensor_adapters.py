@@ -30,17 +30,13 @@ external adapter selection lives in :mod:`tensor_adapter_registry`.
 """
 
 import contextlib
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Generator, Mapping
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Protocol, runtime_checkable
 
 import torch
 from torch import nn
-
-# A copy of one physical host tensor into its pre-allocated device target.
-type TensorCopy = Callable[[torch.Tensor, torch.Tensor], None]
-
 
 __all__ = [
     "BindLayoutTensorAdapter",
@@ -58,17 +54,30 @@ __all__ = [
     "PermanentUpdateValidationTensorAdapter",
     "PostLoadRearmTensorAdapter",
     "TensorAdapter",
-    "TensorCopy",
     "TensorCopyIntoAdapter",
     "adapter_name",
     "capture_host_tensor",
     "empty_like_strided",
+    "host_state_is_owned",
     "metadata_key",
     "optional_tensor_id",
     "tensor_layout",
 ]
 
 _force_host_copy: ContextVar[bool] = ContextVar("force_host_copy", default=False)
+
+
+def host_state_is_owned[HostStateT](
+    adapter: TensorAdapter[HostStateT, Any], state: HostStateT,
+) -> bool:
+    """Whether every physical tensor of ``state`` lives in storage this process allocated.
+
+    A view into a file mapping, or into a buffer the process did not
+    allocate, is not owned. Piper never writes into a file mapping: the pin
+    manager may return its pages to the file, so host state that Piper
+    writes, trainable parameters and merge targets, must be owned first.
+    """
+    return all(tensor.untyped_storage().resizable() for tensor in adapter.storage_tensors(state))
 
 
 @contextlib.contextmanager
@@ -193,15 +202,9 @@ class TensorAdapter[HostStateT, GpuStateT](Protocol):
 
     @staticmethod
     def copy_to_gpu(
-        src: HostStateT, dst: GpuStateT, *, copy: TensorCopy
+        src: HostStateT, dst: GpuStateT, *, non_blocking: bool = False
     ) -> None:
-        """Copy host bytes into GPU storage using the supplied copy callback.
-
-        Call ``copy(destination, source)`` for every physical CPU tensor read.
-        The callback selects backing storage and protects it until completion;
-        it also carries the caller's non-blocking setting. Composing adapters
-        must forward the callback to their inner adapter.
-        """
+        """Bulk DMA the host state's bytes into pre-allocated GPU storage."""
         ...
 
     @staticmethod
@@ -798,9 +801,9 @@ class RegularAdapter:
 
     @staticmethod
     def copy_to_gpu(
-        src: _RegularHost, dst: _RegularGpu, *, copy: TensorCopy
+        src: _RegularHost, dst: _RegularGpu, *, non_blocking: bool = False
     ) -> None:
-        copy(dst.data, src.data)
+        dst.data.copy_(src.data, non_blocking=non_blocking)
 
     @staticmethod
     def copy_to_cpu(

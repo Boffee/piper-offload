@@ -15,15 +15,12 @@ such as D2H round-trip, trainable ``.data`` swap, and in-place updates
 are exposed through adapter capability methods.
 """
 
-from functools import partial
 from typing import Any, Self, cast
 
 import torch
 from torch import nn
 
-from ._host_backing import HostBacking
 from .dtensor_adapter import DTensorAdapter
-from .host_memory import HostMemoryManager
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
     BindLayoutTensorAdapter,
@@ -33,6 +30,7 @@ from .tensor_adapters import (
     PostLoadRearmTensorAdapter,
     TensorAdapter,
     adapter_name,
+    host_state_is_owned,
     independent_host_capture,
 )
 
@@ -64,24 +62,19 @@ class HostParam:
     trainable Parameter identity by ``.data``-swapping into the user's
     persistent Parameter — both are supported.
 
-    Non-trainable parameters promise immutable host bytes for the captured
-    lifetime. Set trainability before capture; changing it afterward or writing
-    frozen storage in place requires rebuilding the capture. Trainable physical
-    payloads and metadata cannot use retained anonymous copies.
-
     Low-peak host construction behavior: compatible complete CPU allocations
     and views into non-resizable storage are retained directly, preserving file
-    mappings without a copy. For plain ``torch.Tensor`` parameters, construction
-    immediately repoints the source ``Parameter.data`` at the captured backing.
+    mappings without a copy. A trainable parameter is the exception: optimizer
+    steps write its host bytes back, and Piper never writes into a file
+    mapping, so a trainable view into one is copied out at capture. For plain
+    ``torch.Tensor`` parameters, construction immediately repoints the source
+    ``Parameter.data`` at the captured backing.
     This promptly releases replaced GPU or incompatible CPU storage before the
     owning store finishes. It also means host construction is not rollback-safe
     after copying has started: if a later parameter fails to capture, recovery
     of the partially constructed store/model is unsupported. Drop those
     references and rebuild from a fresh model instance. Tensor subclasses skip
     this optimization because ``.data =`` can drop wrapper state.
-
-    ``memory_manager`` shares allocation handles and a pin budget with other
-    host captures. If omitted, this parameter owns an independent manager.
 
     A frozen plain floating-point meta parameter retains its shape, dtype, and
     stride without host backing or cache charge. It remains meta unless a
@@ -90,10 +83,8 @@ class HostParam:
     """
 
     __slots__ = (
-        "_backings",
         "_bind_layout",
         "_logical_shape",
-        "_memory_manager",
         "_needs_rearm",
         "_shape",
         "_target_layout",
@@ -102,7 +93,7 @@ class HostParam:
         "requires_grad",
     )
 
-    def __init__(self, param: nn.Parameter, *, memory_manager: HostMemoryManager | None = None) -> None:
+    def __init__(self, param: nn.Parameter) -> None:
         # The adapter operates on the tensor that carries the parameter's
         # representation: ``param.data`` for plain Parameters (including ones
         # wrapping a quant subclass), but the param object itself for a
@@ -138,20 +129,16 @@ class HostParam:
         host_state = (
             representation.detach() if is_meta else adapter.capture_host(representation)
         )
+        if requires_grad and not is_meta and not host_state_is_owned(adapter, host_state):
+            # Optimizer steps write trainable host bytes back, and the pin
+            # manager may return a mapping's pages to the file.
+            with independent_host_capture():
+                host_state = adapter.capture_host(representation)
         self._init_from_host_state(
             representation,
             requires_grad=requires_grad,
             adapter=adapter,
             host_state=host_state,
-        )
-        if memory_manager is None:
-            memory_manager = HostMemoryManager()
-        self._memory_manager = memory_manager
-        # A trainable weight is written by the optimizer, so copy-on-write on
-        # a mapped source is unavoidable and a retained copy would go stale;
-        # it is pinned where it is.
-        self._backings = memory_manager.capture(
-            self.storage_tensors(), pin_in_place=True if requires_grad else None,
         )
         # Low-peak host construction optimization: release the original
         # source storage by repointing the source Parameter at the selected
@@ -203,11 +190,6 @@ class HostParam:
             adapter=adapter,
             host_state=host_state,
         )
-        projected._memory_manager = source.memory_manager
-        projected._backings = {
-            tensor.untyped_storage()._cdata: source._backings[tensor.untyped_storage()._cdata]
-            for tensor in projected.storage_tensors()
-        }
         return projected
 
     def _init_from_host_state(
@@ -326,11 +308,6 @@ class HostParam:
         """Whether the resting parameter representation is meta."""
         return type(self.host_state) is torch.Tensor and self.host_state.is_meta
 
-    @property
-    def memory_manager(self) -> HostMemoryManager:
-        """The manager chosen at capture; allocation ownership cannot change."""
-        return self._memory_manager
-
     def storage_tensors(self) -> tuple[torch.Tensor, ...]:
         """Enumerate existing CPU backing tensors without rebuilding wrappers.
 
@@ -341,10 +318,6 @@ class HostParam:
         if self.is_meta:
             return ()
         return self.adapter.storage_tensors(self.host_state)
-
-    def backing_handles(self) -> tuple[HostBacking, ...]:
-        """Shared allocation handles; CPU tensors keep their source storage."""
-        return tuple(self._backings.values())
 
     def make_cpu_param(self) -> nn.Parameter:
         """Build a CPU :class:`nn.Parameter` wrapper over this host state.
@@ -389,23 +362,12 @@ class HostParam:
         )
 
     def copy_to_gpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
-        """Copy host bytes into pre-allocated GPU storage."""
+        """Bulk DMA host bytes into pre-allocated GPU storage."""
         if self.is_meta:
             # The activation-scoped parameter-value hook populates this storage
             # directly. There are deliberately no zero bytes to transfer.
             return
-        self.adapter.copy_to_gpu(
-            self.host_state,
-            gpu_state,
-            copy=partial(self._copy_host, non_blocking=non_blocking),
-        )
-
-    def _copy_host(self, destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool) -> None:
-        try:
-            backing = self._backings[source.untyped_storage()._cdata]
-        except KeyError:
-            raise ValueError("Copy source was not captured by this backing owner") from None
-        backing.copy_to(destination, source, non_blocking=non_blocking)
+        self.adapter.copy_to_gpu(self.host_state, gpu_state, non_blocking=non_blocking)
 
     def copy_to_cpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk D2H GPU bytes back into the host state.
@@ -426,11 +388,6 @@ class HostParam:
                 f"{adapter_name(self.adapter)} does not support CPU round-trip: "
                 "its GPU representation cannot be copied back into the "
                 "host state without adapter-specific conversion."
-            )
-        if any(backing.copy_bytes for backing in self._backings.values()):
-            raise RuntimeError(
-                "Host state has a pinned copy that write-back would leave stale; "
-                "capture the parameter as trainable or evict the copy first."
             )
         self.adapter.copy_to_cpu(
             gpu_state, self.host_state, non_blocking=non_blocking

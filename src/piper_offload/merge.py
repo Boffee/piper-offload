@@ -29,7 +29,11 @@ from .tensor_adapter_registry import (
     param_tensor_id,
     select_adapter,
 )
-from .tensor_adapters import PermanentUpdateValidationTensorAdapter
+from .tensor_adapters import (
+    PermanentUpdateValidationTensorAdapter,
+    host_state_is_owned,
+    independent_host_capture,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,14 +72,39 @@ class _MergeOp:
     def apply(self, model: nn.Module) -> None:
         """Apply this operation's parameter update."""
         if isinstance(self.transform, ParameterValueTransform):
-            materialized = self.transform.materialize()
-            for alias in self.aliases:
-                parent, leaf = resolve_parent_leaf(model, alias)
-                if leaf not in parent._parameters:
-                    raise RuntimeError(f"Parameter {alias!r} disappeared during permanent merge.")
-                parent._parameters[leaf] = materialized
+            self._install(model, self.transform.materialize())
             return
-        self.transform.apply_parameter(self.param)
+        param = self.param
+        owned = _owned_copy(param)
+        if owned is not None:
+            self._install(model, owned)
+            param = owned
+        self.transform.apply_parameter(param)
+
+    def _install(self, model: nn.Module, replacement: nn.Parameter) -> None:
+        for alias in self.aliases:
+            parent, leaf = resolve_parent_leaf(model, alias)
+            if leaf not in parent._parameters:
+                raise RuntimeError(f"Parameter {alias!r} disappeared during permanent merge.")
+            parent._parameters[leaf] = replacement
+
+
+def _owned_copy(param: nn.Parameter) -> nn.Parameter | None:
+    """An independent copy of ``param`` if it lives in storage Piper must not write, else None.
+
+    Merging writes the parameter in place. Piper never writes into a file
+    mapping, because the pin manager may return its pages to the file, so a
+    target that is a view into one is replaced by a copy the process owns.
+    """
+    if param.is_meta:
+        return None
+    representation = param_representation(param)
+    adapter = select_adapter(representation)
+    if host_state_is_owned(adapter, adapter.capture_host(representation)):
+        return None
+    with independent_host_capture():
+        state = adapter.capture_host(representation)
+    return adapter.cpu_param(state, requires_grad=param.requires_grad)
 
 
 def merge_adapter(
@@ -100,7 +129,10 @@ def merge_adapter(
     explicit non-unit scaling additionally requires dequantization and dense
     merge support. A populated meta target is replaced by one independent
     frozen CPU parameter, preserving any tied aliases of the original
-    parameter.
+    parameter. A target that is a view into a file mapping is likewise
+    replaced by an independent parameter under every tied name before it is
+    merged: Piper never writes into a file mapping, because the pin manager
+    may return a mapping's pages to the file.
     """
     # Filtering here avoids target lookup, staging, validation, and
     # requantization for work that cannot modify a parameter.
@@ -175,6 +207,17 @@ def _collect_params_by_target(model: nn.Module) -> dict[str, nn.Parameter]:
     return params_by_target
 
 
+def _tie_key(param: nn.Parameter) -> tuple[Any, ...]:
+    """Identity under which parameters sharing one backing are one merge target."""
+    try:
+        return param_tensor_id(param)
+    except NotImplementedError:
+        # Let transform validation produce the target-specific capability
+        # error. Unsupported wrappers cannot participate in tied-storage
+        # detection, so object identity is the conservative grouping key.
+        return ("__unsupported_param__", id(param))
+
+
 def _build_merge_ops(
     params_by_target: dict[str, nn.Parameter],
     adapters: Sequence[tuple[Adapter, float]],
@@ -188,13 +231,7 @@ def _build_merge_ops(
         param = params_by_target.get(target_key)
         if param is None:
             return None
-        try:
-            tensor_id = param_tensor_id(param)
-        except NotImplementedError:
-            # Let transform validation produce the target-specific capability
-            # error. Unsupported wrappers cannot participate in tied-storage
-            # detection, so object identity is the conservative grouping key.
-            tensor_id = ("__unsupported_param__", id(param))
+        tensor_id = _tie_key(param)
         group = groups_by_tensor_id.get(tensor_id)
         if group is None:
             group = _TargetGroup(target_key, param)
@@ -215,13 +252,18 @@ def _build_merge_ops(
                 continue
             group.updates.add(target, strength, target_key=target_key)
 
+    # A replacement parameter must reach every name sharing the target's
+    # backing, including distinct wrapper objects over the same storage.
+    names_by_tie: dict[tuple[Any, ...], list[str]] = {}
+    if groups_by_tensor_id:
+        for name, candidate in params_by_target.items():
+            names_by_tie.setdefault(_tie_key(candidate), []).append(name)
+
     merge_ops: list[_MergeOp] = []
-    for group in groups_by_tensor_id.values():
+    for tensor_id, group in groups_by_tensor_id.items():
         target_key = group.target_key
         param = group.param
-        aliases = (
-            tuple(name for name, param in params_by_target.items() if param is group.param) if param.is_meta else ()
-        )
+        aliases = tuple(names_by_tie[tensor_id])
         transform: ParameterTransform
         if group.updates.deltas:
             transform = ParameterDeltaTransform(

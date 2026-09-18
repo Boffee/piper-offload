@@ -55,7 +55,6 @@ from ._bnb import (
 )
 from ._dense_merge import merge_dense_requantize_
 from .tensor_adapters import (
-    TensorCopy,
     capture_host_tensor,
     empty_like_strided,
     optional_tensor_id,
@@ -400,13 +399,13 @@ class Bnb4bitAdapter:
 
     @staticmethod
     def copy_to_gpu(
-        src: _Bnb4bitHost, dst: _Bnb4bitGpu, *, copy: TensorCopy
+        src: _Bnb4bitHost, dst: _Bnb4bitGpu, *, non_blocking: bool = False
     ) -> None:
-        copy(dst.data, src.data)
+        dst.data.copy_(src.data, non_blocking=non_blocking)
         for key, value in src.buffers.items():
-            copy(dst.buffers[key], value)
+            dst.buffers[key].copy_(value, non_blocking=non_blocking)
         if src.offset is not None and dst.offset is not None:
-            copy(dst.offset, src.offset)
+            dst.offset.copy_(src.offset, non_blocking=non_blocking)
 
     @staticmethod
     def compute_dtype(t: torch.Tensor) -> torch.dtype:

@@ -7,7 +7,6 @@ from piper_offload import (
     BlockCompileConfig,
     BlockMode,
     ModelOffloader,
-    HostMemoryManager,
 )
 
 
@@ -47,7 +46,6 @@ def _make_offloader(
     transient_block_paths: tuple[str, ...] = (),
     block_compile: BlockCompileConfig | None = None,
     block_mode: BlockMode = "streaming",
-    memory_manager: HostMemoryManager | None = None,
 ) -> ModelOffloader:
     if block_paths is None:
         block_paths = [] if transient_block_paths else ["blocks"]
@@ -57,7 +55,6 @@ def _make_offloader(
         transient_block_paths=transient_block_paths,
         block_compile=block_compile,
         block_mode=block_mode,
-        memory_manager=memory_manager,
     )
 
 

@@ -60,7 +60,7 @@ from ._quanto import (
     require_qbytes_tensor,
     validate_layout,
 )
-from .tensor_adapters import TensorCopy, capture_host_tensor
+from .tensor_adapters import capture_host_tensor
 
 try:
     from ._triton_quanto_lora import (
@@ -334,10 +334,10 @@ class QuantoAdapter:
 
     @staticmethod
     def copy_to_gpu(
-        src: _QuantoHost, dst: _QuantoGpu, *, copy: TensorCopy
+        src: _QuantoHost, dst: _QuantoGpu, *, non_blocking: bool = False
     ) -> None:
-        copy(dst.data, src.data)
-        copy(dst.scale, src.scale)
+        dst.data.copy_(src.data, non_blocking=non_blocking)
+        dst.scale.copy_(src.scale, non_blocking=non_blocking)
 
     @staticmethod
     def copy_to_cpu(

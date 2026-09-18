@@ -13,6 +13,7 @@ from piper_offload import (
     ScaledLoRAFactor,
     merge_adapter,
 )
+from piper_offload.block_component import _param_target_layout
 from piper_offload.nvfp4_adapter import Nvfp4Adapter
 from piper_offload.host_param import HostParam
 from piper_offload.piper_convrot_nvfp4_adapter import (
@@ -187,7 +188,7 @@ class TestPiperConvRotNVFP4Adapter:
 
         assert tensor_id(group_64)[0] == "piper-kernels-convrot-nvfp4"
         assert tensor_id(group_64) != tensor_id(group_16)
-        assert HostParam.target_layout_for(nn.Parameter(group_64, requires_grad=False)) != HostParam.target_layout_for(
+        assert _param_target_layout(nn.Parameter(group_64, requires_grad=False)) != _param_target_layout(
             nn.Parameter(group_16, requires_grad=False)
         )
 

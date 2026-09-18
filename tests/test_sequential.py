@@ -241,36 +241,18 @@ def test_model_forward(executor, compiled, streamed):
 
 
 @pytest.mark.parametrize("shard_dim", [0, 1])
-@pytest.mark.parametrize("use_anonymous_storage", [False, True])
-def test_mmap_projection_retains_full_host_mapping(  # noqa: PLR0915
+def test_mmap_projection_retains_full_host_mapping(
     executor,
     tmp_path: Path,
     shard_dim: int,
-    use_anonymous_storage: bool,
-    monkeypatch: pytest.MonkeyPatch,
 ):
-    import piper_offload._host_backing as host_backing_module
-
     path = tmp_path / "weight.bin"
     path.touch()
     mapped = torch.from_file(str(path), shared=True, size=17 * 9, dtype=torch.float32)
     mapped.copy_(torch.arange(mapped.numel(), dtype=torch.float32))
     full = mapped.view(17, 9)
     source = HostParam(nn.Parameter(full, requires_grad=False))
-    file_storage = source.storage_tensors()[0].untyped_storage()
-    (backing,) = source.backing_handles()
-    selected_pointer = file_storage.data_ptr()
-    if use_anonymous_storage:
-        # A private file mapping is pinned through an owned copy.
-        assert backing.pin()
-        selected_pointer = backing.span[0]
-    raw_copy = host_backing_module._transfer
-
-    def copy_selected(destination, tensor, *, non_blocking):
-        assert tensor.untyped_storage().data_ptr() == selected_pointer
-        raw_copy(destination, tensor, non_blocking=non_blocking)
-
-    monkeypatch.setattr(host_backing_module, "_transfer", copy_selected)
+    source_storage = source.storage_tensors()[0].untyped_storage()
 
     def setup(rank):
         mesh = DeviceMesh("cuda", [0, 1])
@@ -293,14 +275,13 @@ def test_mmap_projection_retains_full_host_mapping(  # noqa: PLR0915
         module = nn.Module()
         module.weight = nn.Parameter(target_dtensor, requires_grad=False)
         projected = HostParam.project_dtensor(source, module.weight)
-        assert projected.backing_handles() == (backing,)
         instance = HostModuleStore(params={"weight": projected}, buffers={}).bind(module)
 
         host_local = module.weight.to_local()
         assert module.weight.device_mesh.device_type == "cpu"
         assert module.weight.placements == (Shard(shard_dim),)
-        assert host_local.untyped_storage().data_ptr() == file_storage.data_ptr()
-        assert host_local.untyped_storage().nbytes() == file_storage.nbytes()
+        assert host_local.untyped_storage().data_ptr() == source_storage.data_ptr()
+        assert host_local.untyped_storage().nbytes() == source_storage.nbytes()
         assert host_local.storage_offset() == int(offset) * full.stride(shard_dim)
         assert host_local.is_contiguous() is (shard_dim == 0)
         assert projected.cache_bytes == host_local.nbytes
@@ -315,7 +296,9 @@ def test_mmap_projection_retains_full_host_mapping(  # noqa: PLR0915
         plan.load_to_target(target)
         state["target"] = target
         weight = state["module"].weight
-        assert state["instance"].params["weight"].target_layout == HostParam.target_layout_for(weight)
+        assert state["instance"].params[
+            "weight"
+        ].target_layout == HostParam.target_layout_for(weight)
         local = weight.to_local()
         assert local.is_cuda and local.is_contiguous()
         _, offset = Shard.local_shard_size_and_offset(
@@ -340,7 +323,7 @@ def test_mmap_projection_retains_full_host_mapping(  # noqa: PLR0915
         state["target"] = None
         local = state["module"].weight.to_local()
         assert local.device.type == "cpu"
-        assert local.untyped_storage().data_ptr() == file_storage.data_ptr()
+        assert local.untyped_storage().data_ptr() == source_storage.data_ptr()
 
     executor.run(deactivate, sequential=False)
 

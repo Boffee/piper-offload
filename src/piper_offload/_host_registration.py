@@ -32,9 +32,6 @@ class HostRegistrationBackend(Protocol):
         ...
 
 
-_PORTABLE = 0x01
-
-
 class HostRegistrationError(RuntimeError):
     """An unexpected runtime error during registration or unregistration."""
 
@@ -116,7 +113,7 @@ class RuntimeHostRegistration:
         if runtime is None:
             return False
         self._check_prior_error(runtime)
-        code = runtime.register(pointer, size, _PORTABLE)
+        code = runtime.register(pointer, size, 1)
         if code:
             self._clear_failed_call(runtime, code)
             if code in (2, 801):
@@ -127,9 +124,10 @@ class RuntimeHostRegistration:
     def unregister(self, pointer: int) -> None:
         """Release a registration, raising only if the native call itself fails.
 
-        A leftover error from earlier runtime work must not stop the native
-        call: the registration would outlive its storage. It is cleared and
-        logged instead; a sticky error resurfaces on its owner's next call.
+        A stale error from earlier runtime work is consumed either way; if it
+        also stopped the native call, the registration, its storage, and its
+        budget charge would stay behind. It is logged instead, and a sticky
+        error resurfaces from the native call.
         """
         runtime = self._runtime
         if runtime is None:
@@ -140,4 +138,4 @@ class RuntimeHostRegistration:
             self._clear_failed_call(runtime, code)
             raise HostRegistrationError("unregistration", code)
         if prior:
-            logger.warning("Cleared CUDA/HIP error %d from prior runtime work before host unregistration", prior)
+            logger.warning("Cleared CUDA/HIP error %d from earlier work before unregistering host memory", prior)

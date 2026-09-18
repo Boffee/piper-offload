@@ -17,7 +17,7 @@ transfers use two outgoing slots per rank. Public calls remain blocking.
 import threading
 from collections.abc import Generator, Sequence
 from contextlib import closing, contextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import timedelta
 from itertools import pairwise
 
@@ -25,10 +25,9 @@ import torch
 import torch.distributed as dist
 from torch._C._distributed_c10d import AllgatherOptions, _DistributedBackendOptions
 
-from ._host_backing import HostBacking
 from ._relay_shared import BUFFERS_PER_RANK, COPY_DTYPES, REDUCTION_DTYPES, SharedRelay, shared_slot_bytes
 from ._relay_staging import HostChunk, TransferPipeline, chunk_ranges, make_host_chunk
-from .host_memory import HostMemoryManager
+from .pin_manager import host_pin_manager
 
 _BACKEND_NAME = "piper_relay"
 _registration_lock = threading.Lock()
@@ -42,8 +41,7 @@ class RelayOptions:
     reduction accumulators, but excludes Gloo workspace and caller tensors.
     All ranks must agree. Gloo staging is allocated lazily; shared staging is
     mapped at group initialization. Both are released on group shutdown.
-    ``memory_manager`` owns the page-rounded pin budget. Pass the same manager
-    used by host captures to share that budget; otherwise the group owns one.
+    Pinning remains subject to ``host_pin_manager``'s separate page-rounded budget.
     For Gloo transfers, ``pipeline_buffers=2`` or ``3`` divides the same allocation
     into chunk sets to overlap pinned CUDA/HIP copies with CPU communication.
     The default, 1, is serial. CPU and pageable copies keep the same chunk size
@@ -63,7 +61,6 @@ class RelayOptions:
     staging_bytes: int = 8 * 1024 * 1024
     pipeline_buffers: int = 1
     transport: str = "gloo"
-    memory_manager: HostMemoryManager = field(default_factory=HostMemoryManager, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if type(self.staging_bytes) is not int or self.staging_bytes <= 0 or self.staging_bytes % 16:
@@ -123,12 +120,10 @@ class _RelayProcessGroup(dist.ProcessGroup):
         # The rank/size overload constructs the Python trampoline. The
         # store/rank/size overload cannot construct subclasses.
         super().__init__(rank, size)  # type: ignore[call-arg]
-        self._memory_manager = options.memory_manager
         self._collective_lock = threading.Lock()
         self._staging_bytes = options.staging_bytes
         self._pipeline_buffers = options.pipeline_buffers
         self._staging_buffer: torch.Tensor | None = None
-        self._staging_backings: tuple[HostBacking, ...] = ()
         self._pipeline: TransferPipeline | None = None
         self._shared: SharedRelay | None = None
         self._closed = False
@@ -165,7 +160,6 @@ class _RelayProcessGroup(dist.ProcessGroup):
                 super().shutdown()
             finally:
                 self._staging_buffer = None
-                self._staging_backings = ()
                 self._pipeline = None
                 self._shared = None
 
@@ -188,20 +182,16 @@ class _RelayProcessGroup(dist.ProcessGroup):
         if self._shared is not None:
             # CPU reductions use only this rank's region. No second host
             # payload allocation is necessary.
-            backings = self._shared.backings(self._memory_manager)
+            owner = self._shared.buffer
             region = self._shared.local_buffer()
         else:
             if self._staging_buffer is None:
                 self._staging_buffer = torch.empty(self._staging_bytes, dtype=torch.uint8, device="cpu")
-                self._staging_backings = tuple(
-                    self._memory_manager.capture([self._staging_buffer]).values()
-                )
-            backings = self._staging_backings
-            region = self._staging_buffer
-        # Retain the backing with the buffer: dropping the handle would retire
-        # the reusable registration. Idle pins remain evictable.
-        with self._memory_manager.acquire(backings) if device.type == "cuda" else nullcontext() as lease:
-            yield region, lease is not None and lease.pinned
+            owner = region = self._staging_buffer
+        # Lease the persistent owner, never temporary views: view destruction
+        # must not retire the reusable registration. Idle pins remain evictable.
+        with host_pin_manager.acquire([owner]) if device.type == "cuda" else nullcontext() as lease:
+            yield region, lease is not None and lease.pageable_bytes == 0
 
     def _slot_bytes(self, slots: int) -> int:
         size = self._staging_bytes if self._shared is None else self._shared.capacity * self._shared.buffer_count
@@ -240,7 +230,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
 
     def _reduce(self, tensor: torch.Tensor, options: dist.AllreduceOptions) -> None:
         if self._shared is not None and tensor.device.type == "cuda":
-            self._shared.reduce(tensor, self._memory_manager)
+            self._shared.reduce(tensor, host_pin_manager)
             return
         low_precision = tensor.dtype != torch.float32
         with closing(self._copy_chunks(
@@ -273,7 +263,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
         sources = [tensor] if self.rank() == options.rootRank else []
         with self._collective(tensor):
             if self._shared is not None:
-                self._shared.copy("broadcast", sources, [tensor], options.rootRank, self._memory_manager)
+                self._shared.copy("broadcast", sources, [tensor], options.rootRank, host_pin_manager)
             else:
                 with closing(self._copy_chunks(sources, [tensor], slots=2)) as chunks:
                     for chunk in chunks:
@@ -310,7 +300,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
                 raise ValueError("piper_relay scatter output must not overlap inputs except its exact root slice")
         with self._collective(output):
             if self._shared is not None:
-                self._shared.copy("scatter", sources, [output], options.rootRank, self._memory_manager)
+                self._shared.copy("scatter", sources, [output], options.rootRank, host_pin_manager)
             else:
                 with closing(self._copy_chunks(sources, [output], slots=self.size() + 1)) as chunks:
                     for chunk in chunks:
@@ -389,7 +379,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
 
     def _gather(self, source: torch.Tensor, outputs: list[torch.Tensor], options: AllgatherOptions) -> None:
         if self._shared is not None:
-            self._shared.copy("allgather", [source], outputs, -1, self._memory_manager)
+            self._shared.copy("allgather", [source], outputs, -1, host_pin_manager)
             return
         with closing(self._copy_chunks([source], outputs)) as chunks:
             for chunk in chunks:

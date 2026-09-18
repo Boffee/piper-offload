@@ -41,10 +41,10 @@ is not required.
 | Module | Role |
 |---|---|
 | `resource_cache.py` | `ResourceCache`, eviction policy, cache metadata, and cache errors |
-| `host_memory.py` | `HostMemoryManager`: the weak registry of `HostBacking` handles, the pin budget, and batch `HostLease` acquisition reported through `HostMemoryStats` |
+| `pin_manager.py` | `PinManager`, `PinLease`, `PinStats`, and the process-wide `host_pin_manager` for budgeted host registration |
 | `communication.py` | Experimental `piper_relay` process group: blocking collectives through CPU Gloo or shared host memory, independently usable with DTensor |
 | `sequential.py` | Experimental `SequentialExecutor`: two DTensor ranks sharing one process, GPU and compute stream |
-| `model_cache.py` | `ModelCache` — shared host-memory policy, model activation, and adapter coordination |
+| `model_cache.py` | `ModelCache` — model-aware `ResourceCache` with activation and adapter coordination |
 | `resource_specs.py` | `ModelSpec`, `AdapterSpec`, `ObjectSpec` — standard frozen resource specifications |
 | `protocols.py` | `ResourceSpec`, `ResourceStore`, `ResourceBinding` plug-in contracts |
 | `block_compile.py` | `BlockCompileConfig` — opt-in Inductor policy for declared block forwards |
@@ -126,9 +126,8 @@ with cache.use(model_spec, device=device) as gpu_model:
     output = gpu_model(input_tensor_2)
 ```
 
-`ModelCache` uses an unbounded `ResourceCache`, adding a shared host-memory
-manager, model activation, and adapter coordination to its registry and lease
-API. `ModelSpec` factories
+`ModelCache` uses an unbounded `ResourceCache`, adding model activation and
+adapter coordination to its registry and lease API. `ModelSpec` factories
 should build fresh modules. One model cache entry contains one
 `ModelOffloader` and one model instance. Uses are sequential:
 an overlapping activation raises `ModelRuntimeInUseError`. Applications that
@@ -138,19 +137,6 @@ To release host memory, evict or clear inactive cache entries and drop
 any escaped model references.
 
 ### Host backing
-
-Offload treats all non-trainable parameters and managed buffers as immutable
-for the lifetime of their host capture. Set parameter `requires_grad` before
-capture. Do not mutate frozen host bytes (including through aliases) or change
-trainability while captured; rebuild the capture when those values change.
-Frozen parameters and buffers are not copied back from GPU execution, so
-stateful buffer updates that must persist are unsupported.
-
-Pinned copies rely on that immutability: a copy is only ever made of a
-private file mapping, and the mapping itself is never registered. Trainable
-parameters are captured to pin in place instead, since the optimizer writes
-them and a copy would go stale; `copy_to_cpu` refuses to write into a source
-that has a copy. Evicting a copy always preserves the original host source.
 
 Model and adapter factories transfer ownership of compatible complete pageable
 CPU allocations and non-empty views into non-resizable storage to the cached
@@ -162,7 +148,8 @@ layouts are copied into pageable CPU allocations. Tensor adapters preserve
 packed quantized data, scales, and reconstruction metadata.
 
 Host storage is shared by bound wrappers and counted once per stored object.
-Capture does not register memory for accelerated copies.
+Capture does not register memory for accelerated transfers. The old
+construction-time backing modes have been removed.
 
 `HostParam.storage_tensors()` and `HostBuffer.storage_tensors()` expose the
 existing physical CPU tensors, including packed quantized data, scales, and
@@ -173,92 +160,10 @@ tuple. Consumers must deduplicate underlying allocations themselves. Use
 `data_ptr()` and `nbytes` describe its view. Enumeration does not register or
 pin memory.
 
-`HostMemoryManager` shares allocation handles and owns the pin budget.
-`ModelCache` creates one manager for all models and adapters built through
-`ModelSpec` and `AdapterSpec`. Configure it at cache construction:
-
-```python
-from piper_offload import HostMemoryManager, ModelCache
-
-memory = HostMemoryManager(max_pinned_bytes=4 * 1024**3)
-cache = ModelCache(memory_manager=memory)
-
-# The same manager covers use(), lease(), and lease_many(), including rebuilds.
-cache.memory_manager.max_pinned_bytes = 8 * 1024**3
-stats = cache.memory_manager.stats
-```
-
-Each cache has an independent manager by default. Pass the same manager to
-multiple caches to share their budget. The manager cannot be replaced after
-construction; its budget remains configurable. Object and custom resource specs
-control their own construction and receive no automatic manager injection.
-
-For manual capture, pass `memory_manager=` to host capture factories to share
-one manager across models, adapters, parameters, and buffers. An omitted manager
-creates an independent owner for that capture. PyTorch models do not participate
-in memory management.
-Each `HostParam` or `HostBuffer` retains its manager and allocation handles;
-that ownership is fixed at capture. Projected views inherit their source's
-manager and handles. The manager indexes
-handles weakly, so keeping it alive does not keep unused weights alive.
-
-```python
-from piper_offload import Adapter, HostMemoryManager, ModelOffloader
-
-memory = HostMemoryManager(max_pinned_bytes=4 * 1024**3)
-first = ModelOffloader.from_module(model_a, block_paths=["blocks"], memory_manager=memory)
-second = ModelOffloader.from_module(model_b, block_paths=["blocks"], memory_manager=memory)
-adapter = Adapter.from_state_dict(adapter_weights, memory_manager=memory)
-```
-
-These captures share one aggregate pin budget and idle-registration LRU. Use
-the same manager for captures sharing physical allocations. There is no default
-process-wide manager or tensor-to-owner lookup.
-
-A `HostBacking` handle owns one allocation's state: its source storage, a
-private file mapping for mmap weights or anonymous memory for parameters
-constructed in RAM; an optional owned copy of the same bytes; the native
-registration covering
-the copy if there is one, else the source; and the leases protecting it. CPU
-tensors keep their source storage; copies to GPU read the owned copy when
-there is one and preserve tensor views. Handles do not reference their
-manager. Disposing a handle's last owner unregisters and frees the
-allocation.
-
-Every read goes through `HostBacking.copy_to(destination, source, non_blocking=)`.
-It resolves the source's view onto the selected storage and copies it. Pinned
-storage copies through asynchronous DMA; pageable storage takes the driver's
-synchronous pageable copy. Every asynchronous copy records a completion
-event on its stream, and the backing refuses to unpin or evict until every
-recorded event has passed, so any caller may copy asynchronously without
-holding a lease. Adapters receive this as their `copy` callback. `HostLease`
-is the session-level protection returned by `HostMemoryManager.acquire()`:
-while it is open the leased backings are neither unpinned nor evicted.
-
-`pin()` makes a backing's bytes DMA-ready: a source that may be pinned in
-place is registered where it is; a private file mapping is instead copied
-once into an owned page-aligned anonymous allocation that is registered.
-`unpin()` releases the registration and keeps the copy, so a later
-`pin()` re-registers it without another memcpy; `evict()` frees the copy too,
-and reads fall back to the source. Both refuse while a lease is open. These
-are budget-unaware primitives; `HostMemoryManager` decides when to call them.
-`pinned` and `copy_bytes` report the state.
-
-Every adapter implements `copy_to_gpu(src, dst, *, copy: TensorCopy)` and calls
-`copy(destination, source)` for each physical tensor. The required callback is
-supplied by the parameter owner and carries its backing handles and non-blocking
-setting. Composing adapters forward it to their inner adapter. Sources must be
-included in `storage_tensors()`; unregistered sources raise an error. Buffer
-copies use their own handles directly. Leases cover CPU and CUDA/HIP copies.
-CUDA graph capture of host copies is rejected: a replay reads the pointer
-again later, and neither a registration nor an owned copy can be kept alive
-for the graph's lifetime.
-
 ### Host registration
 
-`HostMemoryManager.acquire()` takes `HostBacking` handles from `capture()` or
-`backing_handles()` and pins them under its `max_pinned_bytes` budget. Its
-default is `None` (no application byte limit), so
+`host_pin_manager` registers existing CPU storage in place under a separate
+`max_pinned_bytes` budget. Its default is `None` (no application byte limit), so
 registration proceeds opportunistically up to the capacity currently available
 from CUDA/HIP. Set a finite byte limit to cap registration, or set
 `max_pinned_bytes = 0` to disable it. Construction and configuration do not
@@ -266,18 +171,21 @@ initialize CUDA. Ordinary streaming and compiled rolling acquire leases
 automatically with their CUDA working sets. CPU execution, resident blocks,
 and non-block components do not acquire pin leases.
 
-`capture()` records once per storage whether it may be pinned in place.
-Storage PyTorch allocated itself, which `storage.resizable()` reports, is
-anonymous memory and registers where it is; anything else is assumed to be a
-private file mapping. Locking such a mapping's pages materializes
-copy-on-write pages across an otherwise reclaimable checkpoint, so a mapped
-weight is never registered itself: it gets an owned pinned copy instead, and
-only under a finite budget, so the default unbounded budget never duplicates
-a checkpoint into RAM. Under the default budget mapped weights stay pageable
-and copy synchronously. An owner of a mapping with no copy-on-write, such as
-the relay's shared exchange buffer, passes `pin_in_place=True`. The rule is
-the same on every platform; `benchmarks/probe_host_registration.py` shows
-the copy-on-write cost on a given machine.
+Registering a private file mapping, such as a safetensors checkpoint, locks its
+pages for writing, and the kernel answers by copying every page into private
+memory, so pinned mappings cost RAM. On Linux, when the manager
+unregisters an immutable mapping it discards those private pages, so the
+mapping refaults from the file, and asks the kernel to keep the file in the
+page cache so the next registration copies from RAM rather than disk.
+
+This relies on one contract: **Piper never writes into a file mapping.** Host
+storage it writes on your behalf is copied into memory the process owns
+first: a trainable parameter when its host parameter is captured, and a
+`merge_adapter()` target before the merge. Do not modify an mmap-backed
+parameter in place yourself before handing the model to Piper; on Linux those
+pages would revert to the file's bytes on the first eviction. Windows cannot
+discard the pages of a view it did not create, so private pages there persist
+until the mapping is released.
 
 Deactivation releases the lease after transfers finish and leaves registrations
 in the idle LRU. Reactivating the same backing reuses its retained registrations
@@ -285,56 +193,51 @@ without native register/unregister calls. `BlockComponent.release()` also
 releases pin protection during a temporary working-set release; `acquire()`
 reuses or registers backing again. This lets transient components share the
 budget. Resolved replacement sources, quantized payloads and metadata, buffers,
-and trainable optimizer backing participate through their owning manager.
-A component groups sources by manager and holds one lease per manager until
-its copies finish. Parameter transforms expose `host_params()` so update sources
-retain their own memory ownership.
+and trainable optimizer backing all participate in the same lease.
 
 Explicit leases are also available for custom transfers:
 
 ```python
 import torch
-from piper_offload import HostMemoryManager
+from piper_offload import host_pin_manager
 
-memory = HostMemoryManager(max_pinned_bytes=4 * 1024**3)  # default is None
+host_pin_manager.max_pinned_bytes = 4 * 1024**3  # optional cap; default is None
 source = torch.randn(1024, 1024)
 target = torch.empty_like(source, device="cuda")
 copy_stream = torch.cuda.Stream()
-backings = memory.capture([source])  # keep the handles alive to keep the registration
 
-with memory.acquire(backings.values()) as lease:
+with host_pin_manager.acquire([source]):
     with torch.cuda.stream(copy_stream):
         target.copy_(source, non_blocking=True)
     copy_stream.synchronize()  # finish every host read before closing the lease
 # The source may remain registered in the idle LRU after the lease closes.
 ```
 
-For model backing, pass handles from `HostParam.backing_handles()` and
-`HostBuffer.backing_handles()`. Acquiring a lease protects every requested
-handle first, then registers unpinned whole allocations when capacity allows.
-Budget or supported runtime-capacity failures leave allocations pageable, as do
-Linux private file mappings and handles with another open lease or unfinished
-copy. `lease.pinned` reports whether every leased handle is registered, and
-`lease.backings` exposes them for per-handle inspection.
-`memory.stats.pinned_bytes` counts the OS pages of each registration, rounded
-per allocation.
+Do not write into a private file mapping while it is registered here: on
+Linux the manager returns its pages to the file when it unregisters them.
 
-Released registrations enter an idle LRU ordered by last release. Budget
-pressure evicts idle entries; leased handles remain protected. A native
-capacity failure evicts unrelated idle registrations in LRU order and retries
-the current allocation. If capacity remains unavailable, the rest of that
-acquisition stays pageable without repeated registration attempts. A
-registration lives as long as its handle: disposing the last owner unregisters
-before the storage is freed. A registration whose release fails while its
-handle is alive stays charged, and `clear()` retries it. The backend always
-issues the native unregister call, clearing and logging any error left by
-earlier runtime work rather than skipping the call; a failure during disposal
-is therefore logged and the storage freed, since the native call only fails
-for an unregistered pointer or a dead context. `ModelCache` retains host stores
-until explicit eviction; unpinned mapped pages remain reclaimable by the OS.
+For model backing, pass tensors from `HostParam.storage_tensors()` and
+`HostBuffer.storage_tensors()`. Acquiring a lease protects existing
+registrations and registers additional whole allocations when capacity allows.
+Budget or supported runtime-capacity failures leave complete allocations
+pageable. They remain pageable until all their active leases close, even if
+another request arrives after capacity becomes available. A lease reports
+`registered_bytes` and `pageable_bytes` for unique
+requested allocations. `host_pin_manager.stats.pinned_bytes` instead counts
+the union of covered OS pages, including shared boundary pages only once.
+
+Released registrations enter an idle LRU. Budget pressure evicts idle entries;
+active leases remain protected. A native capacity failure evicts unrelated idle
+registrations in LRU order and retries the current allocation. If capacity
+remains unavailable, the rest of that acquisition stays pageable without
+repeated registration attempts. Discarding a source tensor retires its
+registration once active users finish. Storage remains alive until successful
+unregistration, including after cleanup errors; `clear()` retries failed cleanup
+and evicts idle entries. `ModelCache` retains host stores until explicit
+eviction; unpinned mapped pages remain reclaimable by the OS.
 Do not resize storage or register/unregister it outside the manager while it is
-managed. Distinct storages must not overlap in memory; use views of one
-storage for aliases.
+managed. Use views of one storage for aliases; distinct overlapping byte ranges
+are rejected before mutation.
 
 The backend binds the CUDA or HIP runtime already loaded by PyTorch. It clears
 errors from handled registration failures and reports unexpected errors through
@@ -417,9 +320,7 @@ RelayOptions(transport="shared", staging_bytes=8 * 1024 * 1024)
 ```
 
 All ranks must be able to attach the same host allocation; use Gloo for separate
-machines. Relay staging registration uses `RelayOptions.memory_manager`.
-Pass the manager shared by host captures to charge both to the same budget;
-omitting it gives the relay group an independent manager.
+machines. Staging registration uses `host_pin_manager`'s process-wide budget.
 Each process registers the full shared allocation under its own budget.
 Insufficient pin capacity falls back to synchronous pageable copies.
 
@@ -998,7 +899,10 @@ merge_adapter(
 )
 ```
 
-This uses in-place arithmetic for plain fp/bf bases. Supported quantized
+This uses in-place arithmetic for plain fp/bf bases. A target that is a view
+into a file mapping is first replaced by an independent parameter under every
+tied name, so the mapping itself is never written (see Host registration).
+Supported quantized
 adapters use format-specific Triton kernels for factor-only and full-rank
 updates on CUDA and retain their dequantize/requantize reference path as a
 fallback. Formats without the required factorized merge capability need routed
@@ -1149,9 +1053,8 @@ CPU storage, and leaves gradients on GPU.
 ## Cached model details
 
 `ResourceCache` owns reusable-resource registration, accounting, leases, and
-eviction. `ModelCache` uses it without a byte limit and adds a shared
-`HostMemoryManager`, dependency leasing, adapter attachment, and device activation
-for model uses. The manager's pin budget is separate from logical cache bytes.
+eviction. `ModelCache` uses it without a byte limit and adds dependency
+leasing, adapter attachment, and device activation for model uses.
 
 ```python
 from piper_offload import (
@@ -1249,8 +1152,6 @@ registration / cache admission
   +-------------+
   | ModelCache  |  unbounded ResourceCache with model-aware use
   +-------------+
-        |
-        +-- owns -> HostMemoryManager (shared by captured parameters and buffers)
         |
         +-- builds/retains -> ModelOffloader (one model, one runtime)
         |                    |
@@ -1369,10 +1270,6 @@ Every adapter must implement `storage_tensors(state)` alongside
 tensors, including tensor-valued metadata that stays on the CPU. Omit absent
 optional tensors, preserve shared allocations and views, and delegate through
 composing wrappers instead of reconstructing them.
-`copy_to_gpu(src, dst, *, copy: TensorCopy)` must call the supplied
-`copy(destination, source)` callback for each physical tensor rather than
-copying directly. The callback already carries the backing handles and
-non-blocking setting. Composing adapters pass it to their inner adapter.
 
 ```python
 from piper_offload import (

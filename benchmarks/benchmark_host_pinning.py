@@ -31,11 +31,10 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from piper_offload import BlockCompileConfig, BlockMode, HostBacking, HostLease, HostMemoryManager, ModelOffloader
+from piper_offload import BlockCompileConfig, BlockMode, ModelOffloader, PinLease, host_pin_manager
 from piper_offload._host_registration import RuntimeHostRegistration
+from piper_offload.block_component import _host_transfer_tensors
 from piper_offload.streaming_runtime import StreamingBlockRuntime
-
-memory_manager = HostMemoryManager()
 
 GIB = 1024**3
 
@@ -80,35 +79,35 @@ class _TimedRegistration(RuntimeHostRegistration):
 def _instrument_registration() -> Generator[_TimedRegistration]:
     # Only this standalone benchmark replaces the manager's backend, to time
     # native calls without adding instrumentation to the production hot path.
-    if memory_manager.stats.active_backings or memory_manager.stats.registrations:
+    if host_pin_manager.stats.active_leases or host_pin_manager.stats.registrations:
         raise RuntimeError("run the benchmark in a fresh process without existing pin leases")
-    original_backend = memory_manager._backend
-    original_budget = memory_manager.max_pinned_bytes
+    original_backend = host_pin_manager._backend
+    original_budget = host_pin_manager.max_pinned_bytes
     backend = _TimedRegistration()
-    memory_manager._backend = backend
-    original_acquire = memory_manager.acquire
+    host_pin_manager._backend = backend
+    original_acquire = host_pin_manager.acquire
 
-    def measured_acquire(backings: Iterable[HostBacking]) -> HostLease:
+    def measured_acquire(tensors: Iterable[torch.Tensor]) -> PinLease:
         start = time.perf_counter()
         try:
-            return original_acquire(backings)
+            return original_acquire(tensors)
         finally:
             backend.totals.acquire_ms += (time.perf_counter() - start) * 1000
 
     try:
         # Exclude lazy runtime-library discovery from model registration cost.
-        memory_manager.max_pinned_bytes = 2 * mmap.PAGESIZE
+        host_pin_manager.max_pinned_bytes = 2 * mmap.PAGESIZE
         source = torch.zeros(1)
-        with memory_manager.acquire(memory_manager.capture([source]).values()):
+        with host_pin_manager.acquire([source]):
             pass
-        memory_manager.clear()
-        memory_manager.max_pinned_bytes = 0
-        with patch.object(memory_manager, "acquire", measured_acquire):
+        host_pin_manager.clear()
+        host_pin_manager.max_pinned_bytes = 0
+        with patch.object(host_pin_manager, "acquire", measured_acquire):
             yield backend
     finally:
-        memory_manager.clear()
-        memory_manager.max_pinned_bytes = original_budget
-        memory_manager._backend = original_backend
+        host_pin_manager.clear()
+        host_pin_manager.max_pinned_bytes = original_budget
+        host_pin_manager._backend = original_backend
 
 
 def _weight(rows: int, cols: int, representation: str, dtype: torch.dtype) -> nn.Parameter:
@@ -166,7 +165,7 @@ def _build_subject(name: str, mode: BlockMode, representation: str, args: argpar
     torch.manual_seed(args.seed + (name == "B"))
     model = _Model(args.blocks, args.width, representation, getattr(torch, args.dtype))
     offloader = ModelOffloader.from_module(
-        model, memory_manager=memory_manager,
+        model,
         block_paths=("blocks",),
         block_mode=mode,
         block_compile=BlockCompileConfig(fullgraph=True, dynamic=False),
@@ -175,12 +174,11 @@ def _build_subject(name: str, mode: BlockMode, representation: str, args: argpar
     # quant metadata. Merge page intervals without allocating a set per page.
     stores: dict[int, int] = {}
     for component in offloader._composite.blocks:
-        for instance in component._block_instances:
-            for host in instance.resolve_load_plan().host_sources():
-                for tensor in host.storage_tensors():
-                    if tensor.numel():
-                        storage = tensor.untyped_storage()
-                        stores[storage.data_ptr()] = storage.nbytes()
+        plans = [instance.resolve_load_plan() for instance in component._block_instances]
+        for tensor in _host_transfer_tensors(plans):
+            if tensor.numel():
+                storage = tensor.untyped_storage()
+                stores[storage.data_ptr()] = storage.nbytes()
     pages, prior_end = 0, 0
     for pointer, size in sorted(stores.items()):
         start, end = pointer // mmap.PAGESIZE, (pointer + size + mmap.PAGESIZE - 1) // mmap.PAGESIZE
@@ -230,6 +228,7 @@ def _session(
 ) -> dict[str, Any]:
     torch.cuda.synchronize(value.device)
     torch.cuda.reset_peak_memory_stats(value.device)
+    before_failures = host_pin_manager.stats.registration_failures
     memory_before = torch.cuda.memory_stats(value.device)
     output: torch.Tensor | None = None
 
@@ -244,14 +243,14 @@ def _session(
 
     try:
         activation = _phase(activate, backend)
-        active = memory_manager.stats
-        leases: list[HostLease] = []
+        active = host_pin_manager.stats
+        leases: list[PinLease] = []
         for component in subject.offloader._composite.blocks:
-            assert component._pin_leases
-            leases.extend(component._pin_leases)
-        backings = [backing for lease in leases for backing in lease.backings]
-        registered_bytes = sum(backing.storage.nbytes() for backing in backings if backing.pinned)
-        pageable_bytes = sum(backing.storage.nbytes() for backing in backings if not backing.pinned)
+            lease = component._pin_lease
+            assert lease is not None
+            leases.append(lease)
+        registered_bytes = sum(lease.registered_bytes for lease in leases)
+        pageable_bytes = sum(lease.pageable_bytes for lease in leases)
         with torch.inference_mode():
             passes = [_phase(forward, backend) for _ in range(forwards)]
         peak_gpu_bytes = torch.cuda.max_memory_allocated(value.device)
@@ -260,13 +259,13 @@ def _session(
     assert output is not None
     assert subject.reference is not None
     torch.testing.assert_close(output.cpu(), subject.reference, rtol=0, atol=0)
-    after = memory_manager.stats
+    after = host_pin_manager.stats
     memory_after = torch.cuda.memory_stats(value.device)
     exceeded_budget = (
         after.max_pinned_bytes is not None
         and after.pinned_bytes > after.max_pinned_bytes
     )
-    if after.active_backings or exceeded_budget:
+    if after.active_leases or exceeded_budget:
         raise RuntimeError("session leaked an active lease or exceeded the pin budget")
     return {
         "subject": subject.name,
@@ -277,6 +276,7 @@ def _session(
         "pageable_bytes": pageable_bytes,
         "active_pinned_page_bytes": active.pinned_bytes,
         "idle_pinned_page_bytes": after.pinned_bytes,
+        "registration_failures": after.registration_failures - before_failures,
         "peak_gpu_bytes": peak_gpu_bytes,
         "cuda_allocation_retries": memory_after["num_alloc_retries"] - memory_before["num_alloc_retries"],
         "cuda_ooms": memory_after["num_ooms"] - memory_before["num_ooms"],
@@ -315,6 +315,7 @@ def _summarize(samples: list[dict[str, Any]]) -> dict[str, float]:
         "forward_ms": median(passed["ms"] for sample in samples for passed in sample["forwards"]),
         "deactivation_ms": median(sample["deactivation"]["ms"] for sample in samples),
         "registered_gib": median(sample["registered_bytes"] / GIB for sample in samples),
+        "registration_failures": sum(sample["registration_failures"] for sample in samples),
     }
 
 
@@ -325,7 +326,7 @@ def _run_case(
     backend: _TimedRegistration,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    memory_manager.clear()
+    host_pin_manager.clear()
     before_gpu = _gpu_sample()
     priming = (subjects[0], subjects[1], subjects[0]) if scenario == "alternating" else (subjects[0],)
     if scenario != "cold":
@@ -335,14 +336,14 @@ def _run_case(
     clears = []
     for _ in range(args.repeats):
         if scenario == "cold":
-            clears.append(_phase(memory_manager.clear, backend))
+            clears.append(_phase(host_pin_manager.clear, backend))
         order = (subjects[1], subjects[0]) if scenario == "alternating" else (subjects[0],)
         for subject in order:
             samples.append(_session(subject, value, args.forwards, backend))
     summary = _summarize(samples)
     return {
         "scenario": scenario,
-        "budget_bytes": memory_manager.max_pinned_bytes,
+        "budget_bytes": host_pin_manager.max_pinned_bytes,
         "summary": summary,
         "samples": samples,
         "cold_reset_phases": clears,
@@ -401,7 +402,7 @@ def _run_models(
             f"Each model: {subjects[0].storage_bytes / GIB:.3f} GiB / {subjects[0].allocations} allocations",
             flush=True,
         )
-        memory_manager.max_pinned_bytes = 0
+        host_pin_manager.max_pinned_bytes = 0
         for subject in subjects:
             _warm_subject(subject, value, args.warmup)
         full_budget = max(subject.page_bytes for subject in subjects)
@@ -410,8 +411,8 @@ def _run_models(
             "    calls reg/unreg    forward ms  deactivate ms"
         )
         for fraction in args.budget_fractions:
-            memory_manager.clear()
-            memory_manager.max_pinned_bytes = math.ceil(full_budget * fraction / mmap.PAGESIZE) * mmap.PAGESIZE
+            host_pin_manager.clear()
+            host_pin_manager.max_pinned_bytes = math.ceil(full_budget * fraction / mmap.PAGESIZE) * mmap.PAGESIZE
             for scenario in args.scenarios:
                 result = _run_case(subjects, value, scenario, backend, args)
                 result.update(
@@ -436,7 +437,7 @@ def _run_models(
     finally:
         for subject in subjects:
             subject.offloader.deactivate()
-        memory_manager.clear()
+        host_pin_manager.clear()
 
 
 def _main() -> None:
@@ -478,7 +479,7 @@ def _main() -> None:
                 torch.cuda.empty_cache()
                 torch.compiler.reset()
     report["finished_utc"] = datetime.now(UTC).isoformat()
-    report["final_pin_stats"] = asdict(memory_manager.stats)
+    report["final_pin_stats"] = asdict(host_pin_manager.stats)
     _save(report, args.output)
     print("All outputs matched their zero-budget references; all registrations released.", flush=True)
 
