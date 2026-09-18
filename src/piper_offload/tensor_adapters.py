@@ -38,8 +38,6 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 from torch import nn
 
-from ._host_staging import copy_host_to_device
-
 __all__ = [
     "BindLayoutTensorAdapter",
     "CpuRoundTripTensorAdapter",
@@ -791,7 +789,7 @@ class RegularAdapter:
     def copy_to_gpu(
         src: _RegularHost, dst: _RegularGpu, *, non_blocking: bool = False
     ) -> None:
-        copy_host_to_device(dst.data, src.data, non_blocking=non_blocking)
+        dst.data.copy_(src.data, non_blocking=non_blocking)
 
     @staticmethod
     def copy_to_cpu(

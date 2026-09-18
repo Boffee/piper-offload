@@ -18,7 +18,6 @@ from typing import Self, cast
 import torch
 from torch import nn
 
-from ._host_staging import copy_host_to_device
 from .host_buffer import HostBuffer
 from .host_param import HostParam
 from .module_names import group_names, resolve_parent_leaf
@@ -809,11 +808,7 @@ def _copy_buffers_to_target(
         key = id(host)
         if key in copied:
             continue
-        copy_host_to_device(
-            targets[name].tensor,
-            host.tensor,
-            non_blocking=non_blocking,
-        )
+        targets[name].tensor.copy_(host.tensor, non_blocking=non_blocking)
         copied.add(key)
 
 

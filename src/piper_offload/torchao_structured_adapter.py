@@ -34,7 +34,6 @@ from typing import Any, ClassVar
 import torch
 from torch import nn
 
-from ._host_staging import copy_host_to_device
 from .tensor_adapters import (
     capture_host_tensor,
     empty_like_strided,
@@ -88,10 +87,7 @@ def copy_storage(
         if s is None:
             continue
         assert d is not None
-        if s.device.type == "cpu" and d.device.type == "cuda":
-            copy_host_to_device(d, s, non_blocking=non_blocking)
-        else:
-            d.copy_(s, non_blocking=non_blocking)
+        d.copy_(s, non_blocking=non_blocking)
 
 
 def copy_storage_into(

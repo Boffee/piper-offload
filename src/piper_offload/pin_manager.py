@@ -6,22 +6,18 @@ CUDA/HIP capacity. Set it to zero to disable registration. Construction and
 configuration perform no CUDA initialization. Isolated ``PinManager`` instances
 can use an injected backend for testing.
 
-Native registration uses whole storage byte ranges. Linux private file mappings
-stay pageable so registration cannot instantiate persistent copy-on-write
-pages; model H2D copies use bounded pinned staging for that fallback. Budget
-accounting counts the union of registered OS pages, including pages shared by
-separate allocations. Registrations retain storage until unregistration
-succeeds, but track their source tensors weakly while idle so discarded
-resources can release memory. Storage must not be resized or independently
-registered while managed here.
+Native registration uses whole storage byte ranges. Budget accounting counts
+the union of their OS pages, including pages shared by separate allocations.
+Registrations retain storage until unregistration succeeds, but track their
+source tensors weakly while idle so discarded resources can release memory.
+Storage must not be resized or independently registered while managed here.
 """
 
 import logging
 import mmap
-import sys
 import threading
 import weakref
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -76,64 +72,6 @@ class _LeaseState:
     tensors: tuple[torch.Tensor, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class _PrivateFileMapping:
-    start: int
-    end: int
-
-
-def _linux_private_file_mappings() -> tuple[_PrivateFileMapping, ...] | None:
-    """Return private file VMAs whose registration can break COW.
-
-    Linux exposes the provenance and sharing mode needed for this decision in
-    ``/proc/self/maps``.  Anonymous and shared mappings remain eligible for
-    direct registration.
-    """
-    if not sys.platform.startswith("linux"):
-        return ()
-    try:
-        with open("/proc/self/maps", encoding="utf-8") as maps:
-            lines = tuple(maps)
-    except OSError:
-        # A non-resizable-storage fallback is applied by acquire() when VMA
-        # provenance is unavailable.
-        return None
-
-    result: list[_PrivateFileMapping] = []
-    for line in lines:
-        fields = line.split(maxsplit=5)
-        if len(fields) < 5:
-            continue
-        address, permissions, _offset, _device, inode = fields[:5]
-        if len(permissions) < 4 or permissions[3] != "p" or inode == "0":
-            continue
-        start_text, end_text = address.split("-", maxsplit=1)
-        result.append(
-            _PrivateFileMapping(int(start_text, 16), int(end_text, 16))
-        )
-    return tuple(result)
-
-
-def _overlaps_private_file_mapping(
-    pointer: int,
-    size: int,
-    mappings: tuple[_PrivateFileMapping, ...] | None,
-) -> bool:
-    if not mappings or size == 0:
-        return False
-    index = max(
-        0,
-        bisect_right(mappings, pointer, key=lambda mapping: mapping.start) - 1,
-    )
-    end = pointer + size
-    for mapping in mappings[index:]:
-        if mapping.start >= end:
-            break
-        if pointer < mapping.end:
-            return True
-    return False
-
-
 class PinLease:
     """Protect registrations and source tensors until explicitly released.
 
@@ -180,8 +118,6 @@ class PinManager:
     A finite ``max_pinned_bytes`` bounds registered pages in this process.
     The default, ``None``, treats native CUDA/HIP capacity as the limit, reclaiming
     unrelated idle registrations when the runtime refuses a new allocation.
-    Linux private file mappings are always left pageable because registering
-    them can break copy-on-write across the complete mapped range.
 
     Acquire accepts the plain CPU tensors returned by ``storage_tensors()``.
     Tensor views share one whole-storage registration. Separate allocations
@@ -267,7 +203,6 @@ class PinManager:
         acquisition skip registration.
         """
         requests = self._requests(tensors)
-        private_file_mappings = _linux_private_file_mappings()
         held: dict[int, _Registration] = {}
         created: list[_Registration] = []
         with self._lock:
@@ -281,22 +216,7 @@ class PinManager:
                     if pointer in held or pointer in self._pageable:
                         continue
                     size = request.storage.nbytes()
-                    uncertain_nonresizable = (
-                        private_file_mappings is None
-                        and not request.storage.resizable()
-                    )
-                    if (
-                        uncertain_nonresizable
-                        or _overlaps_private_file_mapping(
-                            pointer, size, private_file_mappings
-                        )
-                        or not self._make_room(pointer, size)
-                    ):
-                        # Registering a MAP_PRIVATE file range can request
-                        # writable pins and instantiate every COW page.  Keep
-                        # checkpoint mappings pageable; H2D uses the bounded
-                        # staging path instead.  Ordinary budget misses take
-                        # the same pageable route.
+                    if not self._make_room(pointer, size):
                         continue
                     registered = self._try_register(pointer, size)
                     while not registered and self._reclaim_idle_for_native_retry(
