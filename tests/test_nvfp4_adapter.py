@@ -17,6 +17,7 @@ from piper_offload import (
 from piper_offload.nvfp4_adapter import Nvfp4Adapter
 from piper_offload.host_param import HostParam
 from piper_offload.tensor_adapter_registry import tensor_id
+from piper_offload.block_component import _param_target_layout
 from tests.conftest import activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -241,8 +242,8 @@ class TestNvfp4Adapter:
 
         assert type(piper) is not type(torchao)
         assert tensor_id(piper) != tensor_id(torchao)
-        assert HostParam.target_layout_for(nn.Parameter(piper, requires_grad=False)) != (
-            HostParam.target_layout_for(nn.Parameter(torchao, requires_grad=False))
+        assert _param_target_layout(nn.Parameter(piper, requires_grad=False)) != (
+            _param_target_layout(nn.Parameter(torchao, requires_grad=False))
         )
 
     def test_reconstruction_and_requantization_preserve_concrete_wrapper_type(self) -> None:
@@ -331,13 +332,13 @@ class TestNvfp4Adapter:
         p1 = nn.Parameter(_make_nvfp4(), requires_grad=False)
         p2 = nn.Parameter(_make_nvfp4(), requires_grad=False)
 
-        assert HostParam.target_layout_for(p1) == HostParam.target_layout_for(p2)
+        assert _param_target_layout(p1) == _param_target_layout(p2)
 
     def test_target_layout_tracks_activation_quantization(self) -> None:
         with_activation = nn.Parameter(_make_nvfp4(dynamic_activation=True), requires_grad=False)
         weight_only = nn.Parameter(_make_nvfp4(dynamic_activation=False), requires_grad=False)
 
-        assert HostParam.target_layout_for(with_activation) != HostParam.target_layout_for(weight_only)
+        assert _param_target_layout(with_activation) != _param_target_layout(weight_only)
 
     def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
         host_param = HostParam(

@@ -2,9 +2,8 @@
 
 from typing import Protocol
 
+import torch
 from torch import nn
-
-from .host_param import HostParam
 
 
 class ParameterTransform(Protocol):
@@ -18,8 +17,8 @@ class ParameterTransform(Protocol):
         """Apply the prepared update to ``param`` in place."""
         ...
 
-    def host_params(self) -> tuple[HostParam, ...]:
-        """Return host parameters read while applying the update, retaining their owners."""
+    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return physical CPU tensors read while applying the update."""
         ...
 
 

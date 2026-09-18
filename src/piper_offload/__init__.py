@@ -123,22 +123,16 @@ non-resizable storage where supported, that the adapter can copy and
 reconstruct without changing its encoding.
 ``storage_tensors(state)`` exposes that state's physical CPU tensors directly,
 including tensor-valued metadata, without copying or rebuilding wrappers.
-``copy_to_gpu(src, dst, *, copy)`` must use the supplied :class:`TensorCopy`
-callback for each physical tensor. It resolves storage through the parameter's
-explicit backing handles and protects pending copies. :class:`HostMemoryManager`
-shares allocation handles across a :class:`ModelCache` or explicitly shared
-manual captures; no global backing registry is used. Pass ``memory_manager=``
-to the cache to configure its aggregate pin budget or share one across caches.
 
-The same explicit :class:`HostMemoryManager` registers existing storage in place
+The process-wide :data:`host_pin_manager` can register that storage in place
 under a finite page-rounded budget or opportunistically up to native CUDA/HIP
 capacity. :class:`PinLease` protects backing until its owner explicitly closes
 it; released registrations enter an idle LRU. The default budget is ``None``
 (no application byte limit); zero disables registration. Linux private file
 mappings remain pageable to avoid materializing copy-on-write pages, and Piper's
-model copy paths move those sources through a bounded 16 MiB pinned window.
+model upload paths move those sources through a bounded 16 MiB pinned window.
 Block components acquire leases for ordinary streaming and compiled rolling,
-then close them only after their runtime has completed pending copies. CUDA
+then close them only after their runtime has completed pending transfers. CUDA
 runtimes own stream ordering and remain independent of pin-budget policy. CPU
 and resident execution do not acquire pins. Host-data caching remains
 independent of this registration budget.
@@ -169,14 +163,12 @@ Compatibility
   backing may be shared.
 """
 
-from ._host_copy import TensorCopy
 from ._host_registration import HostRegistrationError
 from .adapter import Adapter, AdapterMode, AdapterTarget
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent, BlockComponentStore
 from .block_mode import BlockMode
 from .host_component import HostComponent, HostComponentStore
-from .host_memory import HostMemoryManager, PinLease, PinStats
 from .lora import LoRAFactor, LoRATransform, ScaledLoRAFactor
 from .merge import merge_adapter
 from .model_cache import ModelCache
@@ -189,6 +181,7 @@ from .parameter_value import (
     ParameterValueTransform,
     ScaledParameterValue,
 )
+from .pin_manager import PinLease, PinManager, PinStats, host_pin_manager
 from .protocols import (
     ResourceBinding,
     ResourceSpec,
@@ -233,7 +226,6 @@ __all__ = [
     "EvictionPolicyError",
     "HostComponent",
     "HostComponentStore",
-    "HostMemoryManager",
     "HostRegistrationError",
     "LRUEvictionPolicy",
     "LoRAFactor",
@@ -250,6 +242,7 @@ __all__ = [
     "ParameterValue",
     "ParameterValueTransform",
     "PinLease",
+    "PinManager",
     "PinStats",
     "ResourceBinding",
     "ResourceCache",
@@ -264,8 +257,8 @@ __all__ = [
     "ScaledParameterDelta",
     "ScaledParameterValue",
     "TensorAdapter",
-    "TensorCopy",
     "derive_seed",
+    "host_pin_manager",
     "merge_adapter",
     "register_adapter",
 ]

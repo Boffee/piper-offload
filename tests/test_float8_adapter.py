@@ -14,6 +14,7 @@ from piper_offload import (
 )
 from piper_offload.float8_adapter import Float8Adapter
 from piper_offload.host_param import HostParam
+from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import tensor_id
 from tests.conftest import activated_model
 
@@ -146,19 +147,19 @@ class TestFloat8Adapter:
         p1 = nn.Parameter(_make_float8(), requires_grad=False)
         p2 = nn.Parameter(_make_float8(), requires_grad=False)
 
-        assert HostParam.target_layout_for(p1) == HostParam.target_layout_for(p2)
+        assert _param_target_layout(p1) == _param_target_layout(p2)
 
     def test_target_layout_tracks_granularity(self) -> None:
         per_row = nn.Parameter(_make_float8(per_tensor=False), requires_grad=False)
         per_tensor = nn.Parameter(_make_float8(per_tensor=True), requires_grad=False)
 
-        assert HostParam.target_layout_for(per_row) != HostParam.target_layout_for(per_tensor)
+        assert _param_target_layout(per_row) != _param_target_layout(per_tensor)
 
     def test_target_layout_tracks_activation_quantization(self) -> None:
         with_activation = nn.Parameter(_make_float8(dynamic_activation=True), requires_grad=False)
         weight_only = nn.Parameter(_make_float8(dynamic_activation=False), requires_grad=False)
 
-        assert HostParam.target_layout_for(with_activation) != HostParam.target_layout_for(weight_only)
+        assert _param_target_layout(with_activation) != _param_target_layout(weight_only)
 
     def test_cpu_round_trip_restores_host_bytes(self) -> None:
         host_param = HostParam(

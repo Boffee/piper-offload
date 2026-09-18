@@ -17,6 +17,7 @@ from piper_offload import (
 )
 from piper_offload.bnb8bit_adapter import Bnb8bitAdapter
 from piper_offload.host_param import HostParam
+from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import tensor_id
 from tests.conftest import activated_model
 
@@ -137,7 +138,7 @@ class TestBnb8bitAdapter:
         p1 = _make_int8()
         p2 = _make_int8()
 
-        assert HostParam.target_layout_for(p1) == HostParam.target_layout_for(p2)
+        assert _param_target_layout(p1) == _param_target_layout(p2)
 
     def test_bind_layout_matches_real_and_placeholder(self) -> None:
         # A config-built placeholder (CB None) must bind against a store host

@@ -366,9 +366,10 @@ def _has_parameter_update(strategy: ModelOffloader, target_key: str) -> bool:
             ).loads.get(target_key)
             return load is not None and load.update is not None
         if isinstance(component, BlockComponent):
-            block_idx, local = component._param_index[target_key]
+            instance, local = component._resolve_param_name(target_key)
             plans = component._resolve_load_plans(local_overrides)
-            load = plans[block_idx].loads.get(local)
+            plan = next(plan for plan in plans if plan.instance is instance)
+            load = plan.loads.get(local)
             return load is not None and load.update is not None
     return False
 

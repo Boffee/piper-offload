@@ -519,10 +519,6 @@ class ResourceCache:
     # Build & accounting
     # ------------------------------------------------------------------
 
-    def _build_store(self, spec: ResourceSpec[Any]) -> ResourceStore:
-        """Construct a store; specialized caches may supply construction policy."""
-        return spec.build_store()
-
     def _build_into_entry(self, entry: _Entry) -> None:
         """Cache miss: pre-evict, build, validate, commit accounting.
 
@@ -534,7 +530,7 @@ class ResourceCache:
         """
         estimate = entry.spec.estimated_cache_bytes
         self._evict_to_fit(estimate)
-        store = self._build_store(entry.spec)
+        store = entry.spec.build_store()
 
         try:
             actual = store.cache_bytes

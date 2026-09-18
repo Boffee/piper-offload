@@ -12,7 +12,6 @@ from typing import Any, Protocol, Self, runtime_checkable
 import torch
 from torch import nn
 
-from .host_memory import HostMemoryManager
 from .host_param import HostParam
 from .seeding import derive_seed
 from .tensor_adapter_registry import param_representation, select_adapter
@@ -54,12 +53,10 @@ def _capture_factor_tensor(
     source: torch.Tensor,
     *,
     dtype: torch.dtype | None,
-    memory_manager: HostMemoryManager,
 ) -> HostParam:
     tensor = source if dtype is None or source.dtype is dtype else source.to(dtype=dtype)
     return HostParam(
         nn.Parameter(tensor, requires_grad=False),
-        memory_manager=memory_manager,
     )
 
 
@@ -97,15 +94,12 @@ class LoRAFactor:
         b: torch.Tensor,
         *,
         dtype: torch.dtype | None = None,
-        memory_manager: HostMemoryManager | None = None,
     ) -> Self:
         """Validate and capture one unscaled factor pair."""
         _validate_factor_tensors(a, b)
-        if memory_manager is None:
-            memory_manager = HostMemoryManager()
         return cls(
-            _capture_factor_tensor(a, dtype=dtype, memory_manager=memory_manager),
-            _capture_factor_tensor(b, dtype=dtype, memory_manager=memory_manager),
+            _capture_factor_tensor(a, dtype=dtype),
+            _capture_factor_tensor(b, dtype=dtype),
         )
 
     @property
@@ -146,11 +140,9 @@ class ScaledLoRAFactor:
         a: torch.Tensor,
         b: torch.Tensor,
         strength: float,
-        *,
-        memory_manager: HostMemoryManager | None = None,
     ) -> Self:
         """Capture unbound adapter tensors and bind them to ``strength``."""
-        return cls(LoRAFactor.from_tensors(a, b, memory_manager=memory_manager), strength)
+        return cls(LoRAFactor.from_tensors(a, b), strength)
 
     @property
     def a(self) -> HostParam:
@@ -466,9 +458,14 @@ class LoRATransform:
         """Implement the shared parameter-transform application protocol."""
         self.apply_weight(param)
 
-    def host_params(self) -> tuple[HostParam, ...]:
-        """Return the host owners used to stage all factors."""
-        return tuple(backing for factor in self._factors for backing in (factor.a, factor.b))
+    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return the physical host tensors used to stage all factors."""
+        return tuple(
+            tensor
+            for factor in self._factors
+            for backing in (factor.a, factor.b)
+            for tensor in backing.storage_tensors()
+        )
 
     def _materialize_weight_factors(
         self,

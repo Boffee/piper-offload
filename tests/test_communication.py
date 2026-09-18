@@ -15,7 +15,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distrib
 from piper_offload import communication
 from piper_offload.communication import RelayOptions, register_relay_backend
 from piper_offload._host_registration import RuntimeHostRegistration
-from piper_offload.host_memory import HostMemoryManager
+from piper_offload.pin_manager import PinManager, host_pin_manager
 
 pytestmark = pytest.mark.skipif(not dist.is_gloo_available(), reason="CPU Gloo required")
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device required")
@@ -32,7 +32,6 @@ def _run_relay(
     else:
         device = torch.device("cuda", device_indices[rank])
         torch.cuda.set_device(device)
-    memory_manager = HostMemoryManager()
     register_relay_backend()
     register_relay_backend()
     dist.init_process_group(
@@ -41,7 +40,7 @@ def _run_relay(
         rank=rank,
         world_size=2,
         timeout=timedelta(seconds=20),
-        pg_options=RelayOptions(pipeline_buffers=pipeline_buffers, transport=transport, memory_manager=memory_manager),
+        pg_options=RelayOptions(pipeline_buffers=pipeline_buffers, transport=transport),
     )
     try:
         assert dist.get_backend() == "piper_relay"
@@ -50,12 +49,12 @@ def _run_relay(
         # Repeat with registration disabled and enabled. Both paths must
         # deliver completed GPU results and release their transient pin leases.
         for budget in (0, 16 * 1024 * 1024):
-            memory_manager.max_pinned_bytes = budget
+            host_pin_manager.max_pinned_bytes = budget
             for dtype in DTYPES:
                 _check_reduction(mesh, rank, device, dtype)
                 _check_copy_collectives(rank, device, dtype)
                 _check_dtensor_initialization(mesh, rank, device, dtype)
-                assert memory_manager.stats.active_leases == 0
+                assert host_pin_manager.stats.active_leases == 0
 
         for dtype in DTYPES:
             _check_mlp(mesh, rank, device, dtype)
@@ -80,9 +79,9 @@ def _run_relay(
     finally:
         dist.destroy_process_group()
         gc.collect()
-        memory_manager.clear()
-    assert memory_manager.stats.active_leases == 0
-    assert memory_manager.stats.pinned_bytes == 0
+        host_pin_manager.clear()
+    assert host_pin_manager.stats.active_leases == 0
+    assert host_pin_manager.stats.pinned_bytes == 0
 
 
 def _check_reduction(mesh, rank, device, dtype):
@@ -397,8 +396,8 @@ def test_broadcast_rejects_invalid_root(single_rank_group):
 
 @CUDA
 def test_failed_reduction_releases_staging(single_rank_group, monkeypatch):
-    manager = HostMemoryManager(1024 * 1024)
-    monkeypatch.setattr(single_rank_group, "_memory_manager", manager)
+    manager = PinManager(1024 * 1024)
+    monkeypatch.setattr(communication, "host_pin_manager", manager)
     expected = torch.arange(256, dtype=torch.float32)
 
     class FailingTransport:
@@ -503,10 +502,10 @@ def _run_chunked_relay(rank, store_path, device_type, world_size, buffers=1, mix
     assert group._staging_buffer is None
     registration = _CountingRegistration()
     initial_registrations = int(not mixed_pinning or rank != 0)
-    manager = HostMemoryManager(16 * 1024 if initial_registrations else 0, backend=registration)
+    manager = PinManager(16 * 1024 if initial_registrations else 0, backend=registration)
     measured = _MeasuredTransport(group._cpu_group, 512, device_type == "cuda")
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(group, "_memory_manager", manager)
+        patch.setattr(communication, "host_pin_manager", manager)
         patch.setattr(group, "_cpu_group", measured)
         pointer = None
         try:
@@ -668,8 +667,8 @@ def test_gather_rejects_partial_local_alias(single_rank_group):
 @pytest.mark.parametrize("operation", ["allreduce", "broadcast", "scatter", "allgather"])
 def test_late_chunk_failure_releases_lease(single_rank_group, monkeypatch, operation):
     registration = _CountingRegistration()
-    manager = HostMemoryManager(16 * 1024, backend=registration)
-    monkeypatch.setattr(single_rank_group, "_memory_manager", manager)
+    manager = PinManager(16 * 1024, backend=registration)
+    monkeypatch.setattr(communication, "host_pin_manager", manager)
     original_transport = single_rank_group._cpu_group
     original_unregister = registration.unregister
 
@@ -793,7 +792,7 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
     shared.group = control
     registration = _CountingRegistration()
     pin_budget = max(16384, staging_bytes * 2)
-    manager = HostMemoryManager(0 if mixed_pinning and rank == 0 else pin_budget, backend=registration)
+    manager = PinManager(0 if mixed_pinning and rank == 0 else pin_budget, backend=registration)
     initial = int(device_type == "cuda" and manager.max_pinned_bytes != 0)
     pointer = shared.buffer.data_ptr()
     counts = [0, 0]
@@ -809,7 +808,7 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
         return view
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(group, "_memory_manager", manager)
+        patch.setattr(communication, "host_pin_manager", manager)
         patch.setattr(shared, "_slot", slot)
         if device_type == "cuda":
             patch.setattr(group, "_cpu_group", control)
@@ -912,7 +911,7 @@ def _run_shared_failure(rank, path, operation):
     group = dist.group.WORLD
     shared = group._shared
     registration = _CountingRegistration()
-    manager = HostMemoryManager(16384, backend=registration)
+    manager = PinManager(16384, backend=registration)
     signal = shared._signal
     unregister = registration.unregister
 
@@ -933,7 +932,7 @@ def _run_shared_failure(rank, path, operation):
         unregister(pointer)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(group, "_memory_manager", manager)
+        patch.setattr(communication, "host_pin_manager", manager)
         patch.setattr(shared, "_signal", fail_release)
         patch.setattr(registration, "unregister", check_unregister)
         local = torch.full((257,), rank + 1, device="cuda", dtype=torch.bfloat16)
@@ -990,7 +989,7 @@ def test_shared_mapping_survives_failed_unregistration(monkeypatch, tmp_path):
     store = dist.FileStore(str(tmp_path / "mapping-lifetime"), 1)
     tensor = _relay_shared.create_shared_buffer(store, 0, 1, 4096, timedelta(seconds=2))
     backend = Registration()
-    manager = HostMemoryManager(backend=backend)
+    manager = PinManager(backend=backend)
     manager.acquire([tensor]).close()
     del tensor
     gc.collect()
