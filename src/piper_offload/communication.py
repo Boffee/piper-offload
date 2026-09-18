@@ -190,8 +190,12 @@ class _RelayProcessGroup(dist.ProcessGroup):
             owner = region = self._staging_buffer
         # Lease the persistent owner, never temporary views: view destruction
         # must not retire the reusable registration. Idle pins remain evictable.
+        # Chunk views are cut from a base-free alias: a view keeps its base
+        # tensor alive, and a completed collective can hold a chunk view a
+        # little longer than the group, which would keep the owner, and so
+        # its registration, alive past shutdown.
         with host_pin_manager.acquire([owner]) if device.type == "cuda" else nullcontext() as lease:
-            yield region, lease is not None and lease.pageable_bytes == 0
+            yield region.detach(), lease is not None and lease.pageable_bytes == 0
 
     def _slot_bytes(self, slots: int) -> int:
         size = self._staging_bytes if self._shared is None else self._shared.capacity * self._shared.buffer_count

@@ -5,6 +5,7 @@ import math
 from datetime import timedelta
 
 import pytest
+import weakref
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
@@ -652,6 +653,20 @@ def test_reject_insufficient_staging_slots(tmp_path, size, buffers, transport):
                 staging_bytes=size, pipeline_buffers=buffers, transport=transport,
             ),
         )
+
+
+def test_staging_buffer_dies_with_the_group_while_chunk_views_linger(single_rank_group):
+    group = single_rank_group
+    with group._buffer(torch.device("cpu")) as (region, _pinned):
+        view = region[:16]
+    buffer_ref = weakref.ref(group._staging_buffer)
+    group.shutdown()
+    assert group._staging_buffer is None
+    # A completed collective can hold a chunk view a little longer than the
+    # group. A view keeps its base alive, so chunks are cut from a base-free
+    # alias; otherwise the owner, and its registration, would outlive shutdown.
+    assert view.numel() == 16
+    assert buffer_ref() is None
 
 
 def test_gather_rejects_partial_local_alias(single_rank_group):
