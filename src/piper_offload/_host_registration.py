@@ -7,7 +7,6 @@ are cleared without swallowing errors from earlier GPU work.
 """
 
 import ctypes
-import logging
 from collections.abc import Callable
 from ctypes.util import dllist
 from dataclasses import dataclass
@@ -16,8 +15,6 @@ from pathlib import Path
 from typing import Protocol, cast
 
 import torch
-
-logger = logging.getLogger(__name__)
 
 
 class HostRegistrationBackend(Protocol):
@@ -30,9 +27,6 @@ class HostRegistrationBackend(Protocol):
     def unregister(self, pointer: int) -> None:
         """Release an owned registration, raising if it remains registered."""
         ...
-
-
-_PORTABLE = 0x01
 
 
 class HostRegistrationError(RuntimeError):
@@ -116,7 +110,7 @@ class RuntimeHostRegistration:
         if runtime is None:
             return False
         self._check_prior_error(runtime)
-        code = runtime.register(pointer, size, _PORTABLE)
+        code = runtime.register(pointer, size, 1)
         if code:
             self._clear_failed_call(runtime, code)
             if code in (2, 801):
@@ -125,19 +119,11 @@ class RuntimeHostRegistration:
         return True
 
     def unregister(self, pointer: int) -> None:
-        """Release a registration, raising only if the native call itself fails.
-
-        A leftover error from earlier runtime work must not stop the native
-        call: the registration would outlive its storage. It is cleared and
-        logged instead; a sticky error resurfaces on its owner's next call.
-        """
         runtime = self._runtime
         if runtime is None:
             raise RuntimeError("Cannot unregister without a CUDA/HIP runtime")
-        prior = runtime.get_last_error()
+        self._check_prior_error(runtime)
         code = runtime.unregister(pointer)
         if code:
             self._clear_failed_call(runtime, code)
             raise HostRegistrationError("unregistration", code)
-        if prior:
-            logger.warning("Cleared CUDA/HIP error %d from prior runtime work before host unregistration", prior)

@@ -30,7 +30,7 @@ external adapter selection lives in :mod:`tensor_adapter_registry`.
 """
 
 import contextlib
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Generator, Mapping
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -38,9 +38,7 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 from torch import nn
 
-# A copy of one physical host tensor into its pre-allocated device target.
-type TensorCopy = Callable[[torch.Tensor, torch.Tensor], None]
-
+from ._host_copy import TensorCopy
 
 __all__ = [
     "BindLayoutTensorAdapter",
@@ -58,7 +56,6 @@ __all__ = [
     "PermanentUpdateValidationTensorAdapter",
     "PostLoadRearmTensorAdapter",
     "TensorAdapter",
-    "TensorCopy",
     "TensorCopyIntoAdapter",
     "adapter_name",
     "capture_host_tensor",

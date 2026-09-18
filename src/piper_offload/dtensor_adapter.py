@@ -76,6 +76,7 @@ from ._dtensor import (
     rebuild_dtensor,
     require_dtensor,
 )
+from ._host_copy import TensorCopy
 from .seeding import derive_seed
 from .tensor_adapters import (
     BindLayoutTensorAdapter,
@@ -88,7 +89,6 @@ from .tensor_adapters import (
     LoRAMergeValidationTensorAdapter,
     RegularAdapter,
     TensorAdapter,
-    TensorCopy,
     adapter_name,
 )
 

@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from ._host_backing import HostBacking
+from ._host_copy import copy_host_to_device
 from .dtensor_adapter import DTensorAdapter
 from .host_memory import HostMemoryManager
 from .tensor_adapter_registry import param_representation, select_adapter
@@ -63,11 +64,6 @@ class HostParam:
     either replace frozen params with those wrappers or preserve
     trainable Parameter identity by ``.data``-swapping into the user's
     persistent Parameter — both are supported.
-
-    Non-trainable parameters promise immutable host bytes for the captured
-    lifetime. Set trainability before capture; changing it afterward or writing
-    frozen storage in place requires rebuilding the capture. Trainable physical
-    payloads and metadata cannot use retained anonymous copies.
 
     Low-peak host construction behavior: compatible complete CPU allocations
     and views into non-resizable storage are retained directly, preserving file
@@ -147,12 +143,7 @@ class HostParam:
         if memory_manager is None:
             memory_manager = HostMemoryManager()
         self._memory_manager = memory_manager
-        # A trainable weight is written by the optimizer, so copy-on-write on
-        # a mapped source is unavoidable and a retained copy would go stale;
-        # it is pinned where it is.
-        self._backings = memory_manager.capture(
-            self.storage_tensors(), pin_in_place=True if requires_grad else None,
-        )
+        self._backings = memory_manager.capture(self.storage_tensors())
         # Low-peak host construction optimization: release the original
         # source storage by repointing the source Parameter at the selected
         # host backing immediately. The assignment is an intentional
@@ -397,15 +388,8 @@ class HostParam:
         self.adapter.copy_to_gpu(
             self.host_state,
             gpu_state,
-            copy=partial(self._copy_host, non_blocking=non_blocking),
+            copy=partial(copy_host_to_device, backings=self._backings, non_blocking=non_blocking),
         )
-
-    def _copy_host(self, destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool) -> None:
-        try:
-            backing = self._backings[source.untyped_storage()._cdata]
-        except KeyError:
-            raise ValueError("Copy source was not captured by this backing owner") from None
-        backing.copy_to(destination, source, non_blocking=non_blocking)
 
     def copy_to_cpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk D2H GPU bytes back into the host state.
@@ -426,11 +410,6 @@ class HostParam:
                 f"{adapter_name(self.adapter)} does not support CPU round-trip: "
                 "its GPU representation cannot be copied back into the "
                 "host state without adapter-specific conversion."
-            )
-        if any(backing.copy_bytes for backing in self._backings.values()):
-            raise RuntimeError(
-                "Host state has a pinned copy that write-back would leave stale; "
-                "capture the parameter as trainable or evict the copy first."
             )
         self.adapter.copy_to_cpu(
             gpu_state, self.host_state, non_blocking=non_blocking

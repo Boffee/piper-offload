@@ -1,382 +1,189 @@
-"""One CPU allocation: its source, an optional pinned copy, and the reads on it.
+"""CPU source storage and optional anonymous storage of the same weight bytes.
 
-CPU tensors keep their source storage: a private file mapping for mmap
-weights, or anonymous memory for parameters constructed in RAM. ``pin`` makes
-the bytes DMA-ready: a source that may be pinned in place is registered where
-it is; a private file mapping never is, because a writable page lock forces
-copy-on-write across the checkpoint, so it is copied once into an owned
-anonymous allocation that is registered instead. ``unpin`` releases the
-registration and keeps the copy; ``evict`` frees the copy too. ``copy_to``
-reads the copy when there is one, else the source.
+CPU tensors retain their source storage: file-backed for mmap weights, or
+anonymous for parameters constructed in RAM. Copies to GPU prefer the optional
+anonymous storage when supplied. Allocation, pinning, and eviction are managed
+by the caller; this module protects storage while it is being read.
 
-The backing protects itself: every asynchronous CUDA copy records a
-completion event, and the backing refuses to unpin or evict until every
-recorded event has passed. A lease from the manager additionally keeps a
-backing from being unpinned or evicted across a whole activation. Disposing
-the last owner waits for in-flight copies, unregisters, and frees the
-allocation.
-
-Parameters, buffers, and views sharing a storage share one backing. Backings
-do not reference their manager; the manager indexes them weakly and drives
-the transitions below.
+Parameters, buffers, and views sharing a storage share one handle. Independent
+storages wrapping overlapping addresses are not deduplicated (the same
+restriction applies to HostMemoryManager).
 """
 
-import contextlib
-import logging
-import mmap
-import sys
 import threading
-import time
-from collections.abc import Generator
-from typing import Protocol
+import weakref
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Protocol, Self
 
 import torch
 
-from ._host_registration import HostRegistrationBackend
+if TYPE_CHECKING:
+    from .host_memory import HostMemoryManager
 
-logger = logging.getLogger(__name__)
 
-
-class CopyEvent(Protocol):
-    """The event recorded after an asynchronous copy, shaped like ``torch.cuda.Event``."""
+class CopyCompletion(Protocol):
+    """Completion marker supplied by the copy layer, usually a CUDA event."""
 
     def query(self) -> bool: ...
 
     def synchronize(self) -> None: ...
 
 
-class EventStream(Protocol):
-    """Records an event for the work enqueued so far, shaped like ``torch.cuda.Stream``."""
+@dataclass
+class _BackingState:
+    """Keep allocations alive through final cleanup without retaining the handle."""
 
-    def record_event(self) -> CopyEvent: ...
+    source_storage: torch.UntypedStorage
+    anonymous_storage: torch.UntypedStorage | None = None
+    active_leases: int = 0
+    pending_copies: list[CopyCompletion] = field(default_factory=list)
+    lock: threading.RLock = field(default_factory=threading.RLock)
 
-    def synchronize(self) -> None: ...
+    def discard_completed_copies(self) -> None:
+        """Drop completed markers while the caller holds the state lock."""
+        self.pending_copies[:] = [copy for copy in self.pending_copies if not copy.query()]
+
+    def wait_for_copies(self) -> None:
+        # Final cleanup runs after all leases release the handle.
+        for completion in self.pending_copies:
+            completion.synchronize()
+        self.pending_copies.clear()
+
+
+@dataclass
+class _LeaseState:
+    """Let the finalizer receive a completion marker without retaining the lease."""
+
+    completion: CopyCompletion | None = None
+
+
+class HostBackingLease:
+    """Protect one resolved view until close, then until its completion marker.
+
+    The tensor is borrowed: callers must not retain/use it after closing the
+    lease. Async callers must supply a marker covering every read, including
+    reads submitted before an exception. A live backing owner can defer reuse
+    without waiting; dropping the last owner waits for pending work.
+    """
+
+    def __init__(self, backing: HostBacking, tensor: torch.Tensor) -> None:
+        self._tensor: torch.Tensor | None = tensor
+        self._state = _LeaseState()
+        self._finalizer = weakref.finalize(self, backing._release, self._state)
+        self._finalizer.atexit = False
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        if self._tensor is None:
+            raise RuntimeError("Host backing lease is closed")
+        return self._tensor
+
+    def close(self, completion: CopyCompletion | None = None) -> None:
+        """Release protection immediately or after the supplied marker."""
+        if not self._finalizer.alive:
+            return
+        self._state.completion = completion
+        self._finalizer()
+        self._tensor = None
+
+    def __enter__(self) -> Self:
+        if not self._finalizer.alive:
+            raise RuntimeError("Host backing lease is closed")
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
 class HostBacking:
-    """A source storage, an optional owned copy of it, and the registration covering one of them.
+    """Track source storage and optional anonymous storage.
 
-    The registration, when present, always covers the copy if there is one,
-    else the source. Source tensor shape, stride, dtype and storage offset
-    determine each resolved view; the copy holds the entire source
-    allocation's bytes, including portions outside an individual tensor view.
-    Non-trainable captures promise immutable bytes, which is what makes a copy
-    valid.
+    Selection changes only when all acquired views and pending copies have
+    finished. Source tensor shape, stride, dtype and storage offset determine
+    each resolved view. Anonymous storage contains the entire source allocation's
+    bytes, including portions outside an individual tensor view.
     """
 
-    __slots__ = (
-        "__weakref__",
-        "_active",
-        "_backend",
-        "_copy",
-        "_in_flight",
-        "_lock",
-        "_pin_in_place",
-        "_pinned",
-        "_released_at",
-        "_source",
-    )
-
-    def __init__(
-        self,
-        storage: torch.UntypedStorage,
-        backend: HostRegistrationBackend,
-        *,
-        pin_in_place: bool | None = None,
-    ) -> None:
-        self._lock = threading.RLock()
-        self._backend = backend
-        self._source = storage
-        # Memory PyTorch did not allocate is assumed to be a private file mapping.
-        self._pin_in_place = storage.resizable() if pin_in_place is None else pin_in_place
-        self._copy: torch.UntypedStorage | None = None
-        self._pinned = False
-        self._active = 0
-        self._in_flight: list[CopyEvent] = []
-        self._released_at = 0
-
-    def __del__(self) -> None:
-        # Native registrations must never outlive their storage. Runtime
-        # calls are skipped during interpreter exit. The backend always issues
-        # the native unregister; it only raises when that call itself fails,
-        # which means an unregistered pointer or a dead context, and neither
-        # leaves pages the driver could still touch, so the storage is freed.
-        if sys.is_finalizing():
-            return
-        for event in getattr(self, "_in_flight", ()):
-            # Each event may belong to a different device or stream, so one
-            # failed wait says nothing about the others: wait for every one
-            # independently, then release the registration regardless.
-            try:
-                event.synchronize()
-            except Exception as error:
-                logger.warning("Waiting for an in-flight host copy failed during cleanup: %s", str(error))
-        if getattr(self, "_pinned", False):
-            try:
-                self._backend.unregister(self._selected().data_ptr())
-            except Exception as error:
-                logger.warning("Host unregistration failed during cleanup: %s", str(error))
-
-    # ------------------------------------------------------------------
-    # Identity: fixed at capture.
+    def __init__(self, storage: torch.UntypedStorage, memory_manager: HostMemoryManager) -> None:
+        self._memory_manager = memory_manager
+        self._state = _BackingState(storage)
+        self._finalizer = weakref.finalize(self, self._state.wait_for_copies)
+        self._finalizer.atexit = False
 
     @property
-    def storage(self) -> torch.UntypedStorage:
-        """The source storage this backing was captured from."""
-        return self._source
+    def memory_manager(self) -> HostMemoryManager:
+        """The manager that owns this allocation handle."""
+        return self._memory_manager
 
     @property
-    def pin_in_place(self) -> bool:
-        """Whether ``pin`` registers the source where it is, rather than a copy of it.
-
-        False for a private file mapping, whose pages the kernel would copy
-        into RAM the moment they were locked writable. Memory PyTorch did not
-        allocate is assumed to be one unless the owner said otherwise at
-        capture; a shared mapping, for example, has no copy-on-write.
-        """
-        return self._pin_in_place
-
-    # ------------------------------------------------------------------
-    # State: what the transitions below have done so far.
+    def nbytes(self) -> int:
+        """Physical bytes of this allocation, independent of view sizes."""
+        return self._state.source_storage.nbytes()
 
     @property
-    def pinned(self) -> bool:
-        """Whether the copy, or else the source, is registered."""
-        with self._lock:
-            return self._pinned
+    def has_anonymous_storage(self) -> bool:
+        """Whether an anonymous allocation is currently available for copies."""
+        with self._state.lock:
+            return self._state.anonymous_storage is not None
 
-    @property
-    def copy_bytes(self) -> int:
-        """Bytes held by the owned copy, or zero."""
-        with self._lock:
-            return 0 if self._copy is None else self._copy.nbytes()
-
-    @property
-    def needs_copy(self) -> bool:
-        """Whether ``pin`` would have to allocate a copy: a private file mapping with none yet."""
-        with self._lock:
-            return not self._pin_in_place and self._copy is None
-
-    @property
-    def span(self) -> tuple[int, int]:
-        """Pointer and size of the storage reads use: the copy if any, else the source."""
-        with self._lock:
-            storage = self._selected()
-            return storage.data_ptr(), storage.nbytes()
-
-    @property
-    def page_bytes(self) -> int:
-        """Bytes of the OS pages ``pin`` locks: the selected storage's pages, or the aligned copy's."""
-        page = mmap.PAGESIZE
-        with self._lock:
-            pointer, size = self.span
-            if size == 0:
-                return 0
-            if self.needs_copy:
-                return -(-size // page) * page
-            return ((pointer + size - 1) // page - pointer // page + 1) * page
-
-    @property
-    def leases(self) -> int:
-        """Open leases."""
-        with self._lock:
-            return self._active
-
-    @property
-    def in_flight(self) -> int:
-        """Asynchronous copies enqueued but not yet complete."""
-        with self._lock:
-            self._discard_completed()
-            return len(self._in_flight)
-
-    @property
-    def idle(self) -> bool:
-        """No open lease and no unfinished copy, so nothing can be reading this backing."""
-        with self._lock:
-            self._discard_completed()
-            return self._active == 0 and not self._in_flight
-
-    @property
-    def released_at(self) -> int:
-        """Monotonic time the last lease closed, ordering idle backings for eviction."""
-        return self._released_at
-
-    # ------------------------------------------------------------------
-    # Reads.
-
-    def copy_to(self, destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool) -> None:
-        """Copy the source view's bytes to ``destination`` from the copy if any, else the source.
-
-        A CUDA destination is written on its current stream: asynchronous DMA
-        when the storage is pinned, otherwise the driver's synchronous pageable
-        copy. A completion event recorded on that stream keeps the backing from
-        being unpinned or evicted until the copy has finished, so no caller
-        needs a lease to copy safely. CUDA graph capture is rejected: a
-        captured node reads the pointer on every replay, and nothing can keep
-        the registration or the copy alive for the graph's lifetime. Other
-        accelerators cannot report completion, so their copies are made
-        synchronous.
-        """
-        if source.device.type != "cpu":
-            raise ValueError("Host copies require a CPU source")
-        stream: EventStream | None = None
-        if destination.device.type == "cuda":
-            with torch.cuda.device(destination.device):
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError("Host copies cannot be captured in CUDA graphs")
-                stream = torch.cuda.current_stream(destination.device)
-        elif destination.device.type != "cpu":
-            non_blocking = False
-        with self._read(source, stream) as view:
-            _transfer(destination, view, non_blocking=non_blocking)
-
-    @contextlib.contextmanager
-    def _read(self, source: torch.Tensor, stream: EventStream | None = None) -> Generator[torch.Tensor]:
-        """Bracket one read: hold the backing, yield the view, then record its completion on ``stream``."""
-        with self._lock:
-            view = self._view(source)
-            self._active += 1
-        event: CopyEvent | None = None
-        try:
-            yield view
-        finally:
-            try:
-                if stream is not None:
-                    try:
-                        event = stream.record_event()
-                    except BaseException:
-                        # Even a failing copy can have queued partial work.
-                        # Without a marker, wait for it before releasing.
-                        stream.synchronize()
-                        raise
-            finally:
-                with self._lock:
-                    if event is not None:
-                        self._in_flight.append(event)
-                    self.release()
-                    # Prune last, so a query that surfaces an asynchronous
-                    # error leaves the marker recorded and the lease released.
-                    # Steady-state reuse never queries idle, so this is what
-                    # keeps the list bounded.
-                    self._discard_completed()
-
-    def _view(self, source: torch.Tensor) -> torch.Tensor:
-        """The source's view on the selected storage. Caller holds the lock."""
-        if source.untyped_storage()._cdata != self._source._cdata:
+    def acquire(self, source: torch.Tensor) -> HostBackingLease:
+        """Acquire the selected backing with the source's view."""
+        state = self._state
+        if source.untyped_storage()._cdata != state.source_storage._cdata:
             raise ValueError("Source does not belong to this host backing")
-        if self._copy is None:
-            return source
-        view = torch.empty(0, dtype=source.dtype, device="cpu").set_(
-            self._copy,
-            source.storage_offset(),
-            source.shape,
-            source.stride(),
-        )
-        # set_ rebuilds geometry only; lazy conjugation and negation are
-        # view bits that must be carried over or the copy reads raw values.
-        if source.is_conj():
-            view = view.conj()
-        if source.is_neg():
-            view = torch._neg_view(view)
-        return view
+        with state.lock:
+            state.discard_completed_copies()
+            if state.anonymous_storage is None:
+                tensor = source
+            else:
+                tensor = torch.empty(0, dtype=source.dtype, device="cpu").set_(
+                    state.anonymous_storage,
+                    source.storage_offset(),
+                    source.shape,
+                    source.stride(),
+                )
+            lease = HostBackingLease(self, tensor)
+            state.active_leases += 1
+            return lease
 
-    # ------------------------------------------------------------------
-    # Transitions, driven by the manager. They are budget-unaware: pin and
-    # unpin through HostMemoryManager, which accounts for them.
+    def _release(self, lease: _LeaseState) -> None:
+        state = self._state
+        with state.lock:
+            if lease.completion is not None:
+                state.pending_copies.append(lease.completion)
+            state.active_leases -= 1
 
-    def hold(self) -> None:
-        """Open a lease. Pair with ``release``; ``HostLease`` does this for a batch."""
-        with self._lock:
-            self._active += 1
+    def try_set_anonymous_storage(self, tensor: torch.Tensor | None) -> bool:
+        """Set anonymous storage, or clear it with None. Keep source storage intact.
 
-    def release(self) -> None:
-        with self._lock:
-            self._active -= 1
-            if self._active == 0:
-                self._released_at = time.monotonic_ns()
-
-    def pin(self) -> bool:
-        """Make the bytes DMA-ready, returning False when the runtime refuses capacity.
-
-        A source that may be pinned in place, or an existing copy, is
-        registered where it is. Otherwise the source bytes are copied once
-        into an owned page-aligned anonymous allocation that is registered
-        instead (see ``needs_copy``). Budget is the caller's concern.
+        Return False while a lease or unfinished copy prevents the change.
+        The caller must supply anonymous memory with equivalent immutable bytes
+        and retain any pin until the anonymous storage is safely removed. This
+        method does not copy bytes, pin, unpin, or verify equality or memory
+        provenance. A future cache must check whether weights are immutable and
+        recoverable before creating or discarding anonymous storage.
         """
-        with self._lock:
-            if self._pinned:
-                return True
-            if self.needs_copy:
-                return self._pin_copy()
-            self._pinned = self._backend.register(*self.span)
-            return self._pinned
-
-    def _pin_copy(self) -> bool:
-        """Copy the source into an owned aligned allocation and register that. Caller holds the lock."""
-        copy = _anonymous_storage(self._source.nbytes())
-        _bytes(copy).copy_(_bytes(self._source))
-        if not self._backend.register(copy.data_ptr(), copy.nbytes()):
-            return False
-        self._copy = copy
-        self._pinned = True
-        return True
-
-    def unpin(self) -> bool:
-        """Release the registration, keeping the copy. False while busy or when the runtime refuses.
-
-        Busy means a lease is open or an asynchronous copy has not completed.
-        A refused unregistration keeps the storage and its budget charge so the
-        registration can be retried; nothing registered is ever freed.
-        """
-        with self._lock:
-            if not self.idle:
+        state = self._state
+        anonymous_storage = None
+        if tensor is not None:
+            if (
+                type(tensor) is not torch.Tensor
+                or tensor.device.type != "cpu"
+                or tensor.layout is not torch.strided
+                or not tensor.is_contiguous()
+                or tensor.storage_offset() != 0
+                or tensor.nbytes != tensor.untyped_storage().nbytes()
+                or tensor.nbytes != self.nbytes
+            ):
+                raise ValueError("Anonymous storage must be a complete CPU allocation of equal byte size")
+            anonymous_storage = tensor.untyped_storage()
+            if anonymous_storage._cdata == state.source_storage._cdata:
+                raise ValueError("Use None to select source storage")
+        with state.lock:
+            if state.active_leases:
                 return False
-            if not self._pinned:
-                return True
-            try:
-                self._backend.unregister(self._selected().data_ptr())
-            except Exception as error:
-                # Tracebacks in buffered logs can retain storage after a later retry.
-                logger.warning("Host unregistration failed; retaining storage and budget charge: %s", str(error))
+            state.discard_completed_copies()
+            if state.pending_copies:
                 return False
-            self._pinned = False
+            state.anonymous_storage = anonymous_storage
             return True
-
-    def evict(self) -> bool:
-        """Unpin and free the copy, so reads fall back to the source. False when unpin fails."""
-        with self._lock:
-            if not self.unpin():
-                return False
-            self._copy = None
-            return True
-
-    # ------------------------------------------------------------------
-
-    def _selected(self) -> torch.UntypedStorage:
-        return self._copy if self._copy is not None else self._source
-
-    def _discard_completed(self) -> None:
-        self._in_flight[:] = [event for event in self._in_flight if not event.query()]
-
-
-def _anonymous_storage(nbytes: int) -> torch.UntypedStorage:
-    """An owned, page-aligned anonymous allocation released with its last reference.
-
-    Page alignment keeps two copies from sharing an OS page, which the
-    runtime would refuse to register twice.
-    """
-    if nbytes == 0:
-        return torch.UntypedStorage(0)
-    return torch.frombuffer(mmap.mmap(-1, nbytes), dtype=torch.uint8).untyped_storage()
-
-
-def _bytes(storage: torch.UntypedStorage) -> torch.Tensor:
-    return torch.empty(0, dtype=torch.uint8, device="cpu").set_(storage, 0, (storage.nbytes(),), (1,))
-
-
-def _transfer(destination: torch.Tensor, view: torch.Tensor, *, non_blocking: bool) -> None:
-    """The single copy primitive; tests observe the resolved view here."""
-    destination.copy_(view, non_blocking=non_blocking)
-
-
-__all__ = ["CopyEvent", "EventStream", "HostBacking"]

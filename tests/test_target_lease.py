@@ -22,15 +22,15 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_first_pinned_copy_waits_for_prior_work_on_reused_allocation() -> None:
     module = nn.Linear(64, 64, bias=False).requires_grad_(False)
     module.weight.fill_(7)
+    plan = HostModuleStore.from_module(module).bind(module).resolve_load_plan()
     manager = HostMemoryManager(1024**2)
-    plan = HostModuleStore.from_module(module, memory_manager=manager).bind(module).resolve_load_plan()
     device = torch.device("cuda")
     copy_stream = torch.cuda.Stream(device=device)
     allocation_stream = torch.cuda.current_stream(device)
     lease = None
     try:
-        with manager.acquire(plan.sources["weight"].backing_handles()) as pins:
-            assert pins.pinned
+        with manager.acquire(plan.sources["weight"].storage_tensors()) as pins:
+            assert pins.registered_bytes > 0
             # Warm allocation and fill/copy kernels before enqueueing delayed
             # work, so lazy CUDA module loading cannot serialize the probe.
             warm = CudaTargetLease.allocate(plan, device, allocation_stream=allocation_stream)

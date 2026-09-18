@@ -46,6 +46,7 @@ import torch
 from torch import nn
 
 from ._dense_merge import merge_dense_requantize_
+from ._host_copy import TensorCopy
 from ._quanto import (
     canonical_qbytes_storage_layout,
     canonicalize_qbytes_tensor,
@@ -60,7 +61,7 @@ from ._quanto import (
     require_qbytes_tensor,
     validate_layout,
 )
-from .tensor_adapters import TensorCopy, capture_host_tensor
+from .tensor_adapters import capture_host_tensor
 
 try:
     from ._triton_quanto_lora import (

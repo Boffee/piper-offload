@@ -55,7 +55,7 @@ def _run_relay(
                 _check_reduction(mesh, rank, device, dtype)
                 _check_copy_collectives(rank, device, dtype)
                 _check_dtensor_initialization(mesh, rank, device, dtype)
-                assert memory_manager.stats.active_backings == 0
+                assert memory_manager.stats.active_leases == 0
 
         for dtype in DTYPES:
             _check_mlp(mesh, rank, device, dtype)
@@ -81,7 +81,7 @@ def _run_relay(
         dist.destroy_process_group()
         gc.collect()
         memory_manager.clear()
-    assert memory_manager.stats.active_backings == 0
+    assert memory_manager.stats.active_leases == 0
     assert memory_manager.stats.pinned_bytes == 0
 
 
@@ -406,7 +406,7 @@ def test_failed_reduction_releases_staging(single_rank_group, monkeypatch):
             assert len(tensors) == 1
             assert tensors[0].device.type == "cpu"
             torch.testing.assert_close(tensors[0], expected)
-            assert manager.stats.active_backings == 1
+            assert manager.stats.active_leases == 1
             return self
 
         def wait(self):
@@ -417,7 +417,7 @@ def test_failed_reduction_releases_staging(single_rank_group, monkeypatch):
     try:
         with pytest.raises(RuntimeError, match="injected CPU transport failure"):
             dist.all_reduce(x)
-        assert manager.stats.active_backings == 0
+        assert manager.stats.active_leases == 0
         torch.testing.assert_close(x.cpu(), expected)
     finally:
         manager.clear()
@@ -519,7 +519,7 @@ def _run_chunked_relay(rank, store_path, device_type, world_size, buffers=1, mix
                     current = group._staging_buffer.data_ptr()
                     assert pointer in (None, current)
                     pointer = current
-                assert manager.stats.active_backings == 0
+                assert manager.stats.active_leases == 0
 
             assert all(count > 3 for count in measured.calls.values())
             if device_type == "cuda":
@@ -543,7 +543,7 @@ def _run_chunked_relay(rank, store_path, device_type, world_size, buffers=1, mix
         finally:
             dist.destroy_process_group()
         assert group._staging_buffer is None
-        assert manager.stats.active_backings == 0
+        assert manager.stats.active_leases == 0
         assert manager.stats.pinned_bytes == 0
         assert registration.unregister_calls == registration.register_calls
 
@@ -691,7 +691,7 @@ def test_late_chunk_failure_releases_lease(single_rank_group, monkeypatch, opera
             def call(tensors, *args):
                 output = tensors[0][0] if name == "allgather" else tensors[0]
                 output.fill_(9)
-                assert manager.stats.active_backings == 1
+                assert manager.stats.active_leases == 1
                 pipeline = single_rank_group._pipeline
                 if pipeline is not None and self.calls == 0:
                     # Keep the first upload pending until after the next CPU
@@ -721,7 +721,7 @@ def test_late_chunk_failure_releases_lease(single_rank_group, monkeypatch, opera
     with pytest.raises(RuntimeError, match="second-chunk failure"):
         calls[operation]()
     assert transport.calls == 2
-    assert manager.stats.active_backings == 0
+    assert manager.stats.active_leases == 0
     assert registration.unregister_calls == 1
     # Completed chunks stay committed; neither the failed chunk nor the tail
     # is uploaded. Bounded staging deliberately does not provide rollback.
@@ -839,7 +839,7 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
         assert control.messages > 20
         assert group._staging_buffer is None
         assert shared.buffer.data_ptr() == pointer
-        assert manager.stats.active_backings == 0
+        assert manager.stats.active_leases == 0
         assert registration.register_calls == initial
         if device_type == "cuda":
             manager.max_pinned_bytes = 0
@@ -855,7 +855,7 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
         assert group._shared is None
     gc.collect()
     manager.clear()
-    assert manager.stats.active_backings == 0
+    assert manager.stats.active_leases == 0
     assert manager.stats.pinned_bytes == 0
 
 
@@ -922,7 +922,7 @@ def _run_shared_failure(rank, path, operation):
                 torch.cuda._sleep(5_000_000)
         if tag == 1:
             manager.max_pinned_bytes = 0
-            assert manager.stats.active_backings == 1
+            assert manager.stats.active_leases == 1
             assert registration.unregister_calls == 0
             raise RuntimeError("injected shared acknowledgement failure")
         signal(send, receive, tag, sequence)
@@ -944,7 +944,7 @@ def _run_shared_failure(rank, path, operation):
             else:
                 dist.all_gather_single(output, local)
         assert shared.broken
-        assert manager.stats.active_backings == 0
+        assert manager.stats.active_leases == 0
         assert manager.stats.pinned_bytes == 0
         assert registration.unregister_calls == 1
         with pytest.raises(RuntimeError, match="failed previously"):
@@ -964,7 +964,7 @@ def test_reject_invalid_relay_transport(transport):
         RelayOptions(transport=transport)
 
 
-def test_shared_mapping_is_released_after_failed_unregistration(monkeypatch, tmp_path):
+def test_shared_mapping_survives_failed_unregistration(monkeypatch, tmp_path):
     import weakref
     from piper_offload import _relay_shared
 
@@ -991,13 +991,15 @@ def test_shared_mapping_is_released_after_failed_unregistration(monkeypatch, tmp
     tensor = _relay_shared.create_shared_buffer(store, 0, 1, 4096, timedelta(seconds=2))
     backend = Registration()
     manager = HostMemoryManager(backend=backend)
-    (backing,) = manager.capture([tensor], pin_in_place=True).values()
-    manager.acquire([backing]).close()
-    assert mappings[0]() is not None
-    del tensor, backing
+    manager.acquire([tensor]).close()
+    del tensor
     gc.collect()
-    # A failed unregistration at disposal is logged; nothing retains the mapping.
-    assert manager.stats.backings == 0
+    assert mappings[0]() is not None
+    assert not mappings[0]().closed
+    assert manager.stats.pinned_bytes == 4096
+    backend.fail = False
+    manager.clear()
+    gc.collect()
     assert mappings[0]() is None
 
 

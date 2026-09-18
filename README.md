@@ -41,7 +41,7 @@ is not required.
 | Module | Role |
 |---|---|
 | `resource_cache.py` | `ResourceCache`, eviction policy, cache metadata, and cache errors |
-| `host_memory.py` | `HostMemoryManager`: the weak registry of `HostBacking` handles, the pin budget, and batch `HostLease` acquisition reported through `HostMemoryStats` |
+| `host_memory.py` | `HostMemoryManager`, allocation handles, and budgeted host registration through `PinLease` and `PinStats` |
 | `communication.py` | Experimental `piper_relay` process group: blocking collectives through CPU Gloo or shared host memory, independently usable with DTensor |
 | `sequential.py` | Experimental `SequentialExecutor`: two DTensor ranks sharing one process, GPU and compute stream |
 | `model_cache.py` | `ModelCache` — shared host-memory policy, model activation, and adapter coordination |
@@ -139,19 +139,6 @@ any escaped model references.
 
 ### Host backing
 
-Offload treats all non-trainable parameters and managed buffers as immutable
-for the lifetime of their host capture. Set parameter `requires_grad` before
-capture. Do not mutate frozen host bytes (including through aliases) or change
-trainability while captured; rebuild the capture when those values change.
-Frozen parameters and buffers are not copied back from GPU execution, so
-stateful buffer updates that must persist are unsupported.
-
-Pinned copies rely on that immutability: a copy is only ever made of a
-private file mapping, and the mapping itself is never registered. Trainable
-parameters are captured to pin in place instead, since the optimizer writes
-them and a copy would go stale; `copy_to_cpu` refuses to write into a source
-that has a copy. Evicting a copy always preserves the original host source.
-
 Model and adapter factories transfer ownership of compatible complete pageable
 CPU allocations and non-empty views into non-resizable storage to the cached
 resource. This preserves checkpoint mmap backing when loaders assign mapped
@@ -215,34 +202,19 @@ These captures share one aggregate pin budget and idle-registration LRU. Use
 the same manager for captures sharing physical allocations. There is no default
 process-wide manager or tensor-to-owner lookup.
 
-A `HostBacking` handle owns one allocation's state: its source storage, a
-private file mapping for mmap weights or anonymous memory for parameters
-constructed in RAM; an optional owned copy of the same bytes; the native
-registration covering
-the copy if there is one, else the source; and the leases protecting it. CPU
-tensors keep their source storage; copies to GPU read the owned copy when
-there is one and preserve tensor views. Handles do not reference their
-manager. Disposing a handle's last owner unregisters and frees the
-allocation.
+A handle's `source_storage` is file-backed for mmap weights or anonymous for
+parameters constructed in RAM. The handle can retain separate `anonymous_storage`
+containing the same bytes. CPU tensors keep their source storage; copies to GPU
+prefer the separate anonymous storage and preserve tensor views. A lease keeps
+the selected allocation alive until the copy finishes.
 
-Every read goes through `HostBacking.copy_to(destination, source, non_blocking=)`.
-It resolves the source's view onto the selected storage and copies it. Pinned
-storage copies through asynchronous DMA; pageable storage takes the driver's
-synchronous pageable copy. Every asynchronous copy records a completion
-event on its stream, and the backing refuses to unpin or evict until every
-recorded event has passed, so any caller may copy asynchronously without
-holding a lease. Adapters receive this as their `copy` callback. `HostLease`
-is the session-level protection returned by `HostMemoryManager.acquire()`:
-while it is open the leased backings are neither unpinned nor evicted.
-
-`pin()` makes a backing's bytes DMA-ready: a source that may be pinned in
-place is registered where it is; a private file mapping is instead copied
-once into an owned page-aligned anonymous allocation that is registered.
-`unpin()` releases the registration and keeps the copy, so a later
-`pin()` re-registers it without another memcpy; `evict()` frees the copy too,
-and reads fall back to the source. Both refuse while a lease is open. These
-are budget-unaware primitives; `HostMemoryManager` decides when to call them.
-`pinned` and `copy_bytes` report the state.
+`try_set_anonymous_storage(tensor)` accepts anonymous memory containing identical
+immutable bytes. Passing `None` removes it while retaining source storage. Both
+operations return `False` while a lease or unfinished copy prevents the change.
+Pinning is a separate property of either allocation. The foundation does not
+allocate or evict anonymous copies. Existing registration, staging, and
+deactivation behavior is preserved. The future
+cache must manage those operations and verify that weights are recoverable.
 
 Every adapter implements `copy_to_gpu(src, dst, *, copy: TensorCopy)` and calls
 `copy(destination, source)` for each physical tensor. The required callback is
@@ -250,15 +222,13 @@ supplied by the parameter owner and carries its backing handles and non-blocking
 setting. Composing adapters forward it to their inner adapter. Sources must be
 included in `storage_tensors()`; unregistered sources raise an error. Buffer
 copies use their own handles directly. Leases cover CPU and CUDA/HIP copies.
-CUDA graph capture of host copies is rejected: a replay reads the pointer
-again later, and neither a registration nor an owned copy can be kept alive
-for the graph's lifetime.
+CUDA graph capture of copies from managed anonymous storage is rejected because
+graph replays need the source to remain alive beyond one copy's completion.
 
 ### Host registration
 
-`HostMemoryManager.acquire()` takes `HostBacking` handles from `capture()` or
-`backing_handles()` and pins them under its `max_pinned_bytes` budget. Its
-default is `None` (no application byte limit), so
+`HostMemoryManager.acquire()` registers existing CPU storage in place under its
+`max_pinned_bytes` budget. Its default is `None` (no application byte limit), so
 registration proceeds opportunistically up to the capacity currently available
 from CUDA/HIP. Set a finite byte limit to cap registration, or set
 `max_pinned_bytes = 0` to disable it. Construction and configuration do not
@@ -266,18 +236,15 @@ initialize CUDA. Ordinary streaming and compiled rolling acquire leases
 automatically with their CUDA working sets. CPU execution, resident blocks,
 and non-block components do not acquire pin leases.
 
-`capture()` records once per storage whether it may be pinned in place.
-Storage PyTorch allocated itself, which `storage.resizable()` reports, is
-anonymous memory and registers where it is; anything else is assumed to be a
-private file mapping. Locking such a mapping's pages materializes
-copy-on-write pages across an otherwise reclaimable checkpoint, so a mapped
-weight is never registered itself: it gets an owned pinned copy instead, and
-only under a finite budget, so the default unbounded budget never duplicates
-a checkpoint into RAM. Under the default budget mapped weights stay pageable
-and copy synchronously. An owner of a mapping with no copy-on-write, such as
-the relay's shared exchange buffer, passes `pin_in_place=True`. The rule is
-the same on every platform; `benchmarks/probe_host_registration.py` shows
-the copy-on-write cost on a given machine.
+On Linux, private file mappings are never registered in place. CUDA and HIP
+can request writable page pins for these mappings even during a host-to-device
+copy, materializing private copy-on-write pages across an otherwise reclaimable
+checkpoint. Piper leaves those allocations pageable and routes their copies
+through a process-wide two-slot, 8 MiB-per-slot pinned staging window. The same
+bounded fallback is used for other contiguous sources that could not be
+registered. This fixed window uses PyTorch's pinned allocator and is separate
+from the manager's registration budget. Anonymous and shared allocations remain eligible for direct
+registration, and Windows retains its existing registration behavior.
 
 Deactivation releases the lease after transfers finish and leaves registrations
 in the idle LRU. Reactivating the same backing reuses its retained registrations
@@ -300,41 +267,37 @@ memory = HostMemoryManager(max_pinned_bytes=4 * 1024**3)  # default is None
 source = torch.randn(1024, 1024)
 target = torch.empty_like(source, device="cuda")
 copy_stream = torch.cuda.Stream()
-backings = memory.capture([source])  # keep the handles alive to keep the registration
 
-with memory.acquire(backings.values()) as lease:
+with memory.acquire([source]):
     with torch.cuda.stream(copy_stream):
         target.copy_(source, non_blocking=True)
     copy_stream.synchronize()  # finish every host read before closing the lease
 # The source may remain registered in the idle LRU after the lease closes.
 ```
 
-For model backing, pass handles from `HostParam.backing_handles()` and
-`HostBuffer.backing_handles()`. Acquiring a lease protects every requested
-handle first, then registers unpinned whole allocations when capacity allows.
-Budget or supported runtime-capacity failures leave allocations pageable, as do
-Linux private file mappings and handles with another open lease or unfinished
-copy. `lease.pinned` reports whether every leased handle is registered, and
-`lease.backings` exposes them for per-handle inspection.
-`memory.stats.pinned_bytes` counts the OS pages of each registration, rounded
-per allocation.
+For model backing, pass tensors from `HostParam.storage_tensors()` and
+`HostBuffer.storage_tensors()`. Acquiring a lease protects existing
+registrations and registers additional whole allocations when capacity allows.
+Budget or supported runtime-capacity failures leave complete allocations
+pageable, as do Linux private file mappings. They remain pageable until all
+their active leases close, even if another request arrives after capacity
+becomes available. A lease reports
+`registered_bytes` and `pageable_bytes` for unique
+requested allocations. `memory.stats.pinned_bytes` instead counts
+the union of covered OS pages, including shared boundary pages only once.
 
-Released registrations enter an idle LRU ordered by last release. Budget
-pressure evicts idle entries; leased handles remain protected. A native
-capacity failure evicts unrelated idle registrations in LRU order and retries
-the current allocation. If capacity remains unavailable, the rest of that
-acquisition stays pageable without repeated registration attempts. A
-registration lives as long as its handle: disposing the last owner unregisters
-before the storage is freed. A registration whose release fails while its
-handle is alive stays charged, and `clear()` retries it. The backend always
-issues the native unregister call, clearing and logging any error left by
-earlier runtime work rather than skipping the call; a failure during disposal
-is therefore logged and the storage freed, since the native call only fails
-for an unregistered pointer or a dead context. `ModelCache` retains host stores
-until explicit eviction; unpinned mapped pages remain reclaimable by the OS.
+Released registrations enter an idle LRU. Budget pressure evicts idle entries;
+active leases remain protected. A native capacity failure evicts unrelated idle
+registrations in LRU order and retries the current allocation. If capacity
+remains unavailable, the rest of that acquisition stays pageable without
+repeated registration attempts. Discarding a source tensor retires its
+registration once active users finish. Storage remains alive until successful
+unregistration, including after cleanup errors; `clear()` retries failed cleanup
+and evicts idle entries. `ModelCache` retains host stores until explicit
+eviction; unpinned mapped pages remain reclaimable by the OS.
 Do not resize storage or register/unregister it outside the manager while it is
-managed. Distinct storages must not overlap in memory; use views of one
-storage for aliases.
+managed. Use views of one storage for aliases; distinct overlapping byte ranges
+are rejected before mutation.
 
 The backend binds the CUDA or HIP runtime already loaded by PyTorch. It clears
 errors from handled registration failures and reports unexpected errors through
