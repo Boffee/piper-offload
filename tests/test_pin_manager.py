@@ -4,6 +4,8 @@ import gc
 import logging
 import mmap
 import sys
+import tempfile
+from pathlib import Path
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -727,6 +729,21 @@ def test_budget_eviction_discards_the_evicted_mapping(backend, madvise, tmp_path
         assert lease.registered_bytes == second.nbytes
     assert [advice for _start, _length, advice in madvise] == [pin_module._MADV_DONTNEED, pin_module._MADV_WILLNEED]
     manager.clear()
+
+
+@LINUX
+@pytest.mark.skipif(not Path("/dev/shm").is_dir(), reason="tmpfs at /dev/shm required")
+def test_file_mapping_on_tmpfs_is_discarded(backend, madvise) -> None:
+    manager = PinManager(backend=backend)
+    with tempfile.NamedTemporaryFile(dir="/dev/shm", prefix="piper-test-") as file:
+        file.write(bytes(range(256)) * (4 * PAGE // 256))
+        file.flush()
+        tensor = torch.from_file(file.name, shared=False, size=4 * PAGE, dtype=torch.uint8)
+        with manager.acquire([tensor]):
+            pass
+        manager.clear()
+        span = (tensor.data_ptr(), 4 * PAGE)
+        assert madvise == [(*span, pin_module._MADV_DONTNEED), (*span, pin_module._MADV_WILLNEED)]
 
 
 def _anonymous_bytes(pointer: int) -> int:

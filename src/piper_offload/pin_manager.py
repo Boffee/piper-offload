@@ -89,8 +89,9 @@ def _private_file_mappings() -> tuple[_Mapping, ...]:
 
     Only the kernel knows whether storage is a private file mapping.
     ``storage.resizable()`` cannot tell one from ``frombuffer`` over anonymous
-    memory, which ``MADV_DONTNEED`` would zero. ``/dev`` mappings are skipped
-    because ``/dev/zero`` is anonymous memory with an inode.
+    memory, which ``MADV_DONTNEED`` would zero. ``/dev/zero`` is skipped for
+    the same reason: it is anonymous memory with an inode. Files on tmpfs,
+    such as a checkpoint under ``/dev/shm``, refault like any other file.
     """
     if not sys.platform.startswith("linux"):
         return ()
@@ -104,7 +105,7 @@ def _private_file_mappings() -> tuple[_Mapping, ...]:
         fields = line.split(maxsplit=5)
         if len(fields) < 5 or fields[1][3:4] != "p" or fields[4] == "0":
             continue
-        if len(fields) == 6 and fields[5].startswith("/dev/"):
+        if len(fields) == 6 and fields[5].rstrip() == "/dev/zero":
             continue
         start, end = fields[0].split("-", maxsplit=1)
         mappings.append(_Mapping(int(start, 16), int(end, 16)))

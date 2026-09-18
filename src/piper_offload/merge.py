@@ -207,6 +207,17 @@ def _collect_params_by_target(model: nn.Module) -> dict[str, nn.Parameter]:
     return params_by_target
 
 
+def _tie_key(param: nn.Parameter) -> tuple[Any, ...]:
+    """Identity under which parameters sharing one backing are one merge target."""
+    try:
+        return param_tensor_id(param)
+    except NotImplementedError:
+        # Let transform validation produce the target-specific capability
+        # error. Unsupported wrappers cannot participate in tied-storage
+        # detection, so object identity is the conservative grouping key.
+        return ("__unsupported_param__", id(param))
+
+
 def _build_merge_ops(
     params_by_target: dict[str, nn.Parameter],
     adapters: Sequence[tuple[Adapter, float]],
@@ -220,13 +231,7 @@ def _build_merge_ops(
         param = params_by_target.get(target_key)
         if param is None:
             return None
-        try:
-            tensor_id = param_tensor_id(param)
-        except NotImplementedError:
-            # Let transform validation produce the target-specific capability
-            # error. Unsupported wrappers cannot participate in tied-storage
-            # detection, so object identity is the conservative grouping key.
-            tensor_id = ("__unsupported_param__", id(param))
+        tensor_id = _tie_key(param)
         group = groups_by_tensor_id.get(tensor_id)
         if group is None:
             group = _TargetGroup(target_key, param)
@@ -247,11 +252,18 @@ def _build_merge_ops(
                 continue
             group.updates.add(target, strength, target_key=target_key)
 
+    # A replacement parameter must reach every name sharing the target's
+    # backing, including distinct wrapper objects over the same storage.
+    names_by_tie: dict[tuple[Any, ...], list[str]] = {}
+    if groups_by_tensor_id:
+        for name, candidate in params_by_target.items():
+            names_by_tie.setdefault(_tie_key(candidate), []).append(name)
+
     merge_ops: list[_MergeOp] = []
-    for group in groups_by_tensor_id.values():
+    for tensor_id, group in groups_by_tensor_id.items():
         target_key = group.target_key
         param = group.param
-        aliases = tuple(name for name, candidate in params_by_target.items() if candidate is group.param)
+        aliases = tuple(names_by_tie[tensor_id])
         transform: ParameterTransform
         if group.updates.deltas:
             transform = ParameterDeltaTransform(

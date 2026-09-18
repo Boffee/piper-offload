@@ -5402,3 +5402,24 @@ class TestMergeIntoMappedModel:
         torch.testing.assert_close(weight, base + 0.5 * dense)
         # The mapping itself was never written.
         torch.testing.assert_close(mapped, base)
+
+    def test_distinct_parameter_objects_over_one_mapped_view_stay_tied(self, tmp_path) -> None:
+        base = torch.randn(3, 4)
+        path = tmp_path / "weights.bin"
+        path.write_bytes(base.numpy().tobytes())
+        mapped = torch.from_file(str(path), shared=False, size=12, dtype=torch.float32).reshape(3, 4)
+        model = nn.Module()
+        model.target = nn.Linear(4, 3, bias=False)
+        model.tied = nn.Linear(4, 3, bias=False)
+        model.target.weight = nn.Parameter(mapped, requires_grad=False)
+        model.tied.weight = nn.Parameter(mapped, requires_grad=False)
+        assert model.tied.weight is not model.target.weight
+        dense = torch.randn(3, 4)
+        adapter = Adapter.from_state_dict({"target.delta.weight": dense})
+
+        assert merge_adapter(model, [(adapter, 0.5)]) == 1
+
+        assert model.tied.weight is model.target.weight
+        assert model.target.weight.untyped_storage().resizable()
+        torch.testing.assert_close(model.target.weight, base + 0.5 * dense)
+        torch.testing.assert_close(mapped, base)
