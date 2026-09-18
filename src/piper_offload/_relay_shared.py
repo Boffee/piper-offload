@@ -23,6 +23,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+from ._host_backing import HostBacking
 from .host_memory import HostMemoryManager
 
 BUFFERS_PER_RANK = 2
@@ -127,6 +128,7 @@ class SharedRelay:
         nbytes: int, timeout: timedelta,
     ) -> None:
         self.buffer = create_shared_buffer(store, rank, world_size, nbytes, timeout)
+        self._backings: tuple[HostBacking, ...] | None = None
         self.rank = rank
         self.world_size = world_size
         self._peers = tuple(
@@ -246,6 +248,15 @@ class SharedRelay:
         for index in range(max(0, count - self.buffer_count), count):
             release(index)
 
+    def backings(self, manager: HostMemoryManager) -> tuple[HostBacking, ...]:
+        """The shared buffer's handle, retained so idle pins survive between collectives."""
+        if self._backings is None:
+            # A MAP_SHARED mapping (tmpfs on Linux, anonymous on Windows) has
+            # no copy-on-write, so a writable pin in place is safe; peers
+            # write into it, so it must never be copied.
+            self._backings = tuple(manager.capture([self.buffer], pin_in_place=True).values())
+        return self._backings
+
     def copy(
         self, operation: str, sources: list[torch.Tensor], outputs: list[torch.Tensor],
         root: int, manager: HostMemoryManager,
@@ -308,8 +319,8 @@ class SharedRelay:
         self.group.allgather([gathered], [metadata]).wait(self.timeout)  # type: ignore[attr-defined]
         if any(not torch.equal(metadata, other) for other in gathered):
             raise ValueError("shared relay collective operation, payload bytes and root/dtype must match across ranks")
-        with manager.acquire([self.buffer]) if device.type == "cuda" else nullcontext() as lease:
-            asynchronous = lease is not None and lease.pageable_bytes == 0
+        with manager.acquire(self.backings(manager)) if device.type == "cuda" else nullcontext() as lease:
+            asynchronous = lease is not None and lease.pinned
             try:
                 if asynchronous:
                     self._prepare_streams(device)

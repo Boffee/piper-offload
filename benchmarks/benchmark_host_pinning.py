@@ -31,7 +31,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from piper_offload import BlockCompileConfig, BlockMode, HostMemoryManager, ModelOffloader, PinLease
+from piper_offload import BlockCompileConfig, BlockMode, HostBacking, HostLease, HostMemoryManager, ModelOffloader
 from piper_offload._host_registration import RuntimeHostRegistration
 from piper_offload.streaming_runtime import StreamingBlockRuntime
 
@@ -80,7 +80,7 @@ class _TimedRegistration(RuntimeHostRegistration):
 def _instrument_registration() -> Generator[_TimedRegistration]:
     # Only this standalone benchmark replaces the manager's backend, to time
     # native calls without adding instrumentation to the production hot path.
-    if memory_manager.stats.active_leases or memory_manager.stats.registrations:
+    if memory_manager.stats.active_backings or memory_manager.stats.registrations:
         raise RuntimeError("run the benchmark in a fresh process without existing pin leases")
     original_backend = memory_manager._backend
     original_budget = memory_manager.max_pinned_bytes
@@ -88,10 +88,10 @@ def _instrument_registration() -> Generator[_TimedRegistration]:
     memory_manager._backend = backend
     original_acquire = memory_manager.acquire
 
-    def measured_acquire(tensors: Iterable[torch.Tensor]) -> PinLease:
+    def measured_acquire(backings: Iterable[HostBacking]) -> HostLease:
         start = time.perf_counter()
         try:
-            return original_acquire(tensors)
+            return original_acquire(backings)
         finally:
             backend.totals.acquire_ms += (time.perf_counter() - start) * 1000
 
@@ -99,7 +99,7 @@ def _instrument_registration() -> Generator[_TimedRegistration]:
         # Exclude lazy runtime-library discovery from model registration cost.
         memory_manager.max_pinned_bytes = 2 * mmap.PAGESIZE
         source = torch.zeros(1)
-        with memory_manager.acquire([source]):
+        with memory_manager.acquire(memory_manager.capture([source]).values()):
             pass
         memory_manager.clear()
         memory_manager.max_pinned_bytes = 0
@@ -230,7 +230,6 @@ def _session(
 ) -> dict[str, Any]:
     torch.cuda.synchronize(value.device)
     torch.cuda.reset_peak_memory_stats(value.device)
-    before_failures = memory_manager.stats.registration_failures
     memory_before = torch.cuda.memory_stats(value.device)
     output: torch.Tensor | None = None
 
@@ -246,12 +245,13 @@ def _session(
     try:
         activation = _phase(activate, backend)
         active = memory_manager.stats
-        leases: list[PinLease] = []
+        leases: list[HostLease] = []
         for component in subject.offloader._composite.blocks:
             assert component._pin_leases
             leases.extend(component._pin_leases)
-        registered_bytes = sum(lease.registered_bytes for lease in leases)
-        pageable_bytes = sum(lease.pageable_bytes for lease in leases)
+        backings = [backing for lease in leases for backing in lease.backings]
+        registered_bytes = sum(backing.storage.nbytes() for backing in backings if backing.pinned)
+        pageable_bytes = sum(backing.storage.nbytes() for backing in backings if not backing.pinned)
         with torch.inference_mode():
             passes = [_phase(forward, backend) for _ in range(forwards)]
         peak_gpu_bytes = torch.cuda.max_memory_allocated(value.device)
@@ -266,7 +266,7 @@ def _session(
         after.max_pinned_bytes is not None
         and after.pinned_bytes > after.max_pinned_bytes
     )
-    if after.active_leases or exceeded_budget:
+    if after.active_backings or exceeded_budget:
         raise RuntimeError("session leaked an active lease or exceeded the pin budget")
     return {
         "subject": subject.name,
@@ -277,7 +277,6 @@ def _session(
         "pageable_bytes": pageable_bytes,
         "active_pinned_page_bytes": active.pinned_bytes,
         "idle_pinned_page_bytes": after.pinned_bytes,
-        "registration_failures": after.registration_failures - before_failures,
         "peak_gpu_bytes": peak_gpu_bytes,
         "cuda_allocation_retries": memory_after["num_alloc_retries"] - memory_before["num_alloc_retries"],
         "cuda_ooms": memory_after["num_ooms"] - memory_before["num_ooms"],
@@ -316,7 +315,6 @@ def _summarize(samples: list[dict[str, Any]]) -> dict[str, float]:
         "forward_ms": median(passed["ms"] for sample in samples for passed in sample["forwards"]),
         "deactivation_ms": median(sample["deactivation"]["ms"] for sample in samples),
         "registered_gib": median(sample["registered_bytes"] / GIB for sample in samples),
-        "registration_failures": sum(sample["registration_failures"] for sample in samples),
     }
 
 

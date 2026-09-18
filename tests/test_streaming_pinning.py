@@ -35,7 +35,7 @@ def pins():
     manager = HostMemoryManager(64 * 1024**2, backend=backend)
     yield manager, backend
     manager.clear()
-    assert manager.stats.active_leases == 0
+    assert manager.stats.active_backings == 0
     assert manager.stats.pinned_bytes == 0
 
 
@@ -54,11 +54,11 @@ def test_reactivation_reuses_pins_and_preserves_results(mode: str, pins) -> None
     try:
         for _ in range(2):
             with activated_model(offloader, "cuda"), torch.inference_mode():
-                assert manager.stats.active_leases == 1
+                assert manager.stats.active_backings == 3
                 assert manager.stats.idle_registrations == 0
                 assert len(backend.registrations) == 3
                 actual = model(value.cuda()).cpu()
-            assert manager.stats.active_leases == 0
+            assert manager.stats.active_backings == 0
             assert manager.stats.idle_registrations == 3
             assert not backend.unregistrations
             torch.testing.assert_close(actual, expected)
@@ -75,11 +75,11 @@ def test_working_set_release_also_returns_pins_to_idle_lru(pins) -> None:
     component = block_components(offloader)[0]
     with activated_model(offloader, "cuda"):
         component.release()
-        assert manager.stats.active_leases == 0
+        assert manager.stats.active_backings == 0
         assert manager.stats.idle_registrations == 2
         count = len(backend.registrations)
         component.acquire()
-        assert manager.stats.active_leases == 1
+        assert manager.stats.active_backings == 2
         assert len(backend.registrations) == count
         assert not backend.unregistrations
 
@@ -95,9 +95,8 @@ def test_budget_fallback_keeps_streamed_results_correct(budget: int, pins) -> No
     offloader = _make_offloader(model, memory_manager=manager)
     with activated_model(offloader, "cuda"), torch.inference_mode():
         lease = block_components(offloader)[0]._pin_leases[0]
-        assert lease is not None
-        assert lease.pageable_bytes > 0
-        assert (lease.registered_bytes > 0) == (budget > 0)
+        assert not lease.pinned
+        assert any(backing.pinned for backing in lease.backings) == (budget > 0)
         assert manager.stats.pinned_bytes <= budget
         actual = model(value.cuda()).cpu()
     torch.testing.assert_close(actual, expected)
@@ -116,13 +115,13 @@ def test_another_component_evicts_only_released_registrations(pins) -> None:
         second.activate("cuda")
         assert not backend.unregistrations
         lease = block_components(second)[0]._pin_leases[0]
-        assert lease is not None and lease.pageable_bytes > 0
+        assert not lease.pinned
         second.deactivate()
         first.deactivate()
         second.activate("cuda")
         assert backend.unregistrations
         lease = block_components(second)[0]._pin_leases[0]
-        assert lease is not None and lease.registered_bytes > 0
+        assert lease.pinned
     finally:
         second.deactivate()
         first.deactivate()
@@ -149,7 +148,7 @@ def test_cpu_and_resident_execution_do_not_acquire_pins(device: str, mode: str, 
         block_mode="resident" if mode == "resident" else "streaming",
     )
     with activated_model(offloader, device):
-        assert manager.stats.active_leases == 0
+        assert manager.stats.active_backings == 0
 
 
 def test_host_sources_include_buffers_and_optimizer_backing() -> None:
@@ -263,7 +262,7 @@ def test_partial_activation_failure_releases_host_lease(mode: str, pins, monkeyp
         patch.setattr(runtime, "_register_hooks", fail_hooks)
         with pytest.raises(RuntimeError, match="injected hook failure"):
             offloader.activate("cuda")
-    assert manager.stats.active_leases == 0
+    assert manager.stats.active_backings == 0
     assert manager.stats.idle_registrations == 2
     count = len(backend.registrations)
     with activated_model(offloader, "cuda"):
@@ -306,7 +305,7 @@ def test_failed_runtime_quiescence_does_not_release_host_lease(
         assert component._active_device is None
         assert component._active_runtime is None
         assert component._pin_leases[0] is not None
-        assert manager.stats.active_leases == 1
+        assert manager.stats.active_backings > 0
         with pytest.raises(RuntimeError, match="Recreate the CUDA worker"):
             component.activate(torch.device("cuda"))
 
@@ -342,7 +341,7 @@ def test_prefetch_update_failure_waits_before_releasing_pins(pins) -> None:
         with pytest.raises(RuntimeError, match="injected update failure"):
             component.deactivate()
         assert stream.query()
-        assert manager.stats.active_leases == 0
+        assert manager.stats.active_backings == 0
         assert manager.stats.pinned_bytes == 0
     finally:
         component.deactivate()
@@ -362,7 +361,7 @@ def test_trainable_copy_back_preserves_registered_host_storage(pins) -> None:
         with component.optimizer_step(), torch.no_grad():
             for parameter in model.parameters():
                 parameter.add_(1)
-        assert manager.stats.active_leases == 1
+        assert manager.stats.active_backings > 0
         assert len(backend.registrations) == count
     finally:
         component.deactivate()
@@ -399,7 +398,8 @@ def test_replacement_and_transform_use_their_own_manager(pins) -> None:
         })
         assert model_manager.stats.registrations == 1  # only the model's buffer
         assert update_manager.stats.registrations == 3
-        assert model_manager.stats.active_leases == update_manager.stats.active_leases == 1
+        assert model_manager.stats.active_backings == 1
+        assert update_manager.stats.active_backings == 3
         torch.testing.assert_close(model.blocks[0].proj.weight.cpu(), expected)
         update_manager.max_pinned_bytes = 0
         assert update_manager.stats.registrations == 3
@@ -433,7 +433,7 @@ def test_failed_acquisition_of_second_manager_releases_first(pins) -> None:
                 "blocks.0.proj.weight": ParameterOverride(update=LoRATransform([factor])),
             })
         assert not component._pin_leases
-        assert first.stats.active_leases == second.stats.active_leases == 0
+        assert first.stats.active_backings == second.stats.active_backings == 0
         assert first.stats.idle_registrations == 1
     finally:
         component.deactivate()

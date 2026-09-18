@@ -1,6 +1,8 @@
-"""Copies from anonymous CPU storage preserve weight values and GPU scheduling."""
+"""Pinned copies of file-backed weights preserve values and GPU scheduling."""
 
 import gc
+import logging
+import mmap
 import struct
 import threading
 import weakref
@@ -9,7 +11,7 @@ import pytest
 import torch
 from torch import nn
 
-import piper_offload._host_copy as host_copy
+import piper_offload._host_backing as host_backing_module
 from piper_offload import BlockCompileConfig
 from piper_offload.host_memory import HostMemoryManager
 from piper_offload.composite_component import CompositeComponentStore
@@ -18,13 +20,16 @@ from piper_offload.host_module import HostModuleStore
 from piper_offload.host_param import HostParam
 from piper_offload.target_lease import CudaTargetLease
 from tests._block_compile_helpers import _BlockModel, _make_offloader
+from tests._host_memory_helpers import RecordingBackend
 from tests.conftest import activated_model, block_components
+from tests.test_host_memory import FakeBackend
 from tests.test_quantized_parameter_value import _QUANT_KINDS, _make_quantized
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+BUDGET = 64 * 1024**2
 
 
-class Completion:
+class _Completion:
     def __init__(self):
         self.done = False
         self.waited = False
@@ -37,79 +42,269 @@ class Completion:
         self.done = True
 
 
+class _Stream:
+    def __init__(self, completion):
+        self.completion = completion
+
+    def record_event(self):
+        return self.completion
+
+    def synchronize(self):
+        self.completion.synchronize()
+
+
 def _bytes(tensor):
     storage = tensor.untyped_storage()
     return torch.empty(0, dtype=torch.uint8).set_(storage, 0, (storage.nbytes(),), (1,))
 
 
-def test_handles_deduplicate_allocations_and_preserve_mixed_views():
-    source = torch.arange(24, dtype=torch.int32).reshape(4, 6)
+def _file_tensor(tmp_path, tensor, name="weights.bin"):
+    """A private file mapping holding ``tensor``'s bytes, as a checkpoint loader would produce."""
+    path = tmp_path / name
+    path.write_bytes(_bytes(tensor.contiguous()).numpy().tobytes())
+    return torch.from_file(str(path), shared=False, size=tensor.numel(), dtype=tensor.dtype).view(tensor.shape)
+
+
+def _observe_transfers(monkeypatch):
+    observed = []
+    raw_copy = host_backing_module._transfer
+
+    def observe(destination, source, *, non_blocking):
+        observed.append(source.untyped_storage().data_ptr())
+        raw_copy(destination, source, non_blocking=non_blocking)
+
+    monkeypatch.setattr(host_backing_module, "_transfer", observe)
+    return observed
+
+
+def test_pin_registers_anonymous_memory_in_place():
+    backend = FakeBackend()
+    source = torch.arange(24.0)
+    (backing,) = HostMemoryManager(backend=backend).capture((source,)).values()
+    assert backing.pin_in_place and not backing.needs_copy
+    assert backing.pin()
+    assert backing.pinned and backing.copy_bytes == 0
+    assert backend.register_calls == [(source.data_ptr(), source.nbytes)]
+    assert backing.evict()
+    assert backend.unregister_calls == [source.data_ptr()]
+
+
+def test_pin_copies_a_private_file_mapping(tmp_path):
+    backend = FakeBackend()
+    source = _file_tensor(tmp_path, torch.arange(24.0))
+    (backing,) = HostMemoryManager(backend=backend).capture((source,)).values()
+    assert not backing.pin_in_place and backing.needs_copy
+    assert backing.pin()
+    pointer, size = backing.span
+    assert pointer != source.data_ptr() and size == source.nbytes
+    assert pointer % mmap.PAGESIZE == 0
+    assert backing.copy_bytes == source.nbytes
+    assert backend.register_calls == [(pointer, size)]
+    # Unpin keeps the copy; a later pin reuses it without another memcpy.
+    assert backing.unpin()
+    assert not backing.pinned and backing.copy_bytes == source.nbytes
+    assert not backing.needs_copy
+    assert backing.pin()
+    assert backing.span == (pointer, size)
+    assert backing.evict()
+    assert backing.span == (source.data_ptr(), source.nbytes)
+    assert backing.copy_bytes == 0
+
+
+def test_trainable_mapped_weight_pins_in_place_and_write_back_is_guarded(tmp_path):
+    manager = HostMemoryManager(BUDGET, backend=FakeBackend())
+    trainable = HostParam(nn.Parameter(_file_tensor(tmp_path, torch.arange(8.0), "train.bin")), memory_manager=manager)
+    frozen = HostParam(
+        nn.Parameter(_file_tensor(tmp_path, torch.arange(8.0), "frozen.bin"), requires_grad=False),
+        memory_manager=manager,
+    )
+    (trainable_backing,) = trainable.backing_handles()
+    (frozen_backing,) = frozen.backing_handles()
+    assert trainable_backing.pin_in_place and not frozen_backing.pin_in_place
+    with manager.acquire([trainable_backing, frozen_backing]) as lease:
+        assert lease.pinned
+        assert trainable_backing.copy_bytes == 0 and frozen_backing.copy_bytes == 8 * 4
+        target = trainable.allocate_gpu_storage(torch.device("cpu"))
+        trainable.copy_to_gpu(target)
+        trainable.copy_to_cpu(target)  # writes the source, which is what is pinned
+        frozen_target = frozen.allocate_gpu_storage(torch.device("cpu"))
+        frozen.copy_to_gpu(frozen_target)
+        with pytest.raises(RuntimeError, match="pinned copy"):
+            frozen.copy_to_cpu(frozen_target)
+    manager.clear()
+
+
+def test_in_flight_copy_blocks_unpin_and_evict_until_it_completes(tmp_path):
+    source = _file_tensor(tmp_path, torch.arange(7.0))
+    manager = HostMemoryManager(backend=FakeBackend())
+    (backing,) = manager.capture((source,)).values()
+    assert backing.pin()
+    completion = _Completion()
+    with backing._read(source, _Stream(completion)):
+        pass
+    assert backing.leases == 0 and backing.in_flight == 1 and not backing.idle
+    assert not backing.unpin()
+    assert not backing.evict()
+    with manager.acquire([backing]) as lease:
+        assert lease.pinned  # already pinned; nothing to admit
+    completion.done = True
+    assert backing.in_flight == 0 and backing.idle
+    assert backing.evict()
+
+
+def test_lazy_conjugate_and_negation_views_resolve_onto_the_copy(tmp_path):
+    values = torch.arange(6, dtype=torch.float32).reshape(2, 3) * (1 + 2j)
+    source = _file_tensor(tmp_path, values.to(torch.complex64))
+    (backing,) = HostMemoryManager(backend=FakeBackend()).capture((source,)).values()
+    assert backing.pin()
+    for view in (source.conj(), torch._neg_view(source), torch._neg_view(source.conj())):
+        with backing._read(view) as resolved:
+            assert resolved.untyped_storage().data_ptr() == backing.span[0]
+            assert resolved.is_conj() == view.is_conj() and resolved.is_neg() == view.is_neg()
+            torch.testing.assert_close(resolved.resolve_conj().resolve_neg(), view.resolve_conj().resolve_neg())
+    assert backing.evict()
+
+
+def test_failed_event_query_still_records_the_marker_and_releases(tmp_path):
+    source = _file_tensor(tmp_path, torch.arange(7.0))
+    (backing,) = HostMemoryManager(backend=FakeBackend()).capture((source,)).values()
+
+    class Poisoned(_Completion):
+        def query(self):
+            raise RuntimeError("asynchronous CUDA error")
+
+    poisoned, fresh = Poisoned(), _Completion()
+    for event in (poisoned, fresh):
+        # Pruning surfaces the error, but only after the new marker is
+        # recorded and the read's lease released.
+        with pytest.raises(RuntimeError, match="asynchronous CUDA error"), backing._read(source, _Stream(event)):
+            pass
+        assert backing.leases == 0
+    assert backing._in_flight == [poisoned, fresh]
+
+
+def test_disposal_still_unregisters_when_waiting_for_a_copy_fails(tmp_path, caplog):
+    backend = FakeBackend()
+    source = _file_tensor(tmp_path, torch.arange(7.0))
+    (backing,) = HostMemoryManager(backend=backend).capture((source,)).values()
+    assert backing.pin()
+    copy_pointer = backing.span[0]
+
+    class Broken(_Completion):
+        def synchronize(self):
+            raise RuntimeError("context is dead")
+
+    # Events from different streams or devices: a failed wait on the first
+    # must not skip the wait on the second, nor the unregistration.
+    later = _Completion()
+    with backing._read(source, _Stream(Broken())):
+        pass
+    with backing._read(source, _Stream(later)):
+        pass
+    with caplog.at_level(logging.WARNING, logger="piper_offload._host_backing"):
+        del backing
+        gc.collect()
+    assert later.waited
+    assert backend.unregister_calls == [copy_pointer]
+    assert "context is dead" in caplog.text
+
+
+def test_completed_events_are_pruned_as_new_copies_are_recorded(tmp_path):
+    source = _file_tensor(tmp_path, torch.arange(7.0))
+    (backing,) = HostMemoryManager(backend=FakeBackend()).capture((source,)).values()
+    completions = []
+    for _ in range(50):
+        completion = _Completion()
+        completions.append(completion)
+        with backing._read(source, _Stream(completion)):
+            pass
+        completion.done = True
+    # Steady-state reuse never queries idle, so recording itself must prune.
+    assert len(backing._in_flight) <= 1
+    assert backing.idle
+
+
+def test_disposal_waits_for_in_flight_copies(tmp_path):
+    source = _file_tensor(tmp_path, torch.arange(7.0))
+    (backing,) = HostMemoryManager(backend=FakeBackend()).capture((source,)).values()
+    completion = _Completion()
+    with backing._read(source, _Stream(completion)):
+        pass
+    del backing
+    gc.collect()
+    assert completion.waited
+
+
+def test_refused_registration_after_copying_keeps_no_copy(tmp_path):
+    backend = FakeBackend()
+    backend.capacity = 0
+    source = _file_tensor(tmp_path, torch.arange(24.0))
+    (backing,) = HostMemoryManager(backend=backend).capture((source,)).values()
+    assert not backing.pin()
+    assert not backing.pinned and backing.copy_bytes == 0
+    assert len(backend.register_calls) == 1
+
+
+def test_reads_resolve_mixed_views_onto_the_copy(tmp_path):
+    source = _file_tensor(tmp_path, torch.arange(24, dtype=torch.int32).reshape(4, 6))
     view = source[1:, 1::2]
     as_bytes = _bytes(source)[3:17]
-    memory_manager = HostMemoryManager()
+    memory_manager = HostMemoryManager(backend=FakeBackend())
     backings = memory_manager.capture((source, view, as_bytes))
     (backing,) = backings.values()
     assert tuple(memory_manager.capture((view,)).values()) == (backing,)
-    assert backing.nbytes == source.untyped_storage().nbytes()
-    anonymous_storage = _bytes(source).clone()
-    assert backing.try_set_anonymous_storage(anonymous_storage)
+    assert backing.storage.nbytes() == source.untyped_storage().nbytes()
+    assert backing.pin()
+    copy_pointer = backing.span[0]
 
     for tensor in (source, view, as_bytes, source[:0]):
-        with backing.acquire(tensor) as lease:
-            resolved = lease.tensor
-            assert resolved.untyped_storage().data_ptr() == anonymous_storage.data_ptr()
+        with backing._read(tensor) as resolved:
+            assert resolved.untyped_storage().data_ptr() == copy_pointer
             assert resolved.dtype == tensor.dtype
             assert resolved.shape == tensor.shape
             assert resolved.stride() == tensor.stride()
             assert resolved.storage_offset() == tensor.storage_offset()
             torch.testing.assert_close(resolved, tensor)
 
-    assert backing.try_set_anonymous_storage(None)
-    with backing.acquire(view) as lease:
-        assert lease.tensor is view
+    assert backing.evict()
+    with backing._read(view) as resolved:
+        assert resolved is view
 
 
 def test_mmap_parameter_and_buffer_share_handle_and_keep_file_backed_wrappers(tmp_path):
     path = tmp_path / "weights.bin"
     path.write_bytes(struct.pack("24f", *range(24)))
     source = torch.from_file(str(path), shared=False, size=24, dtype=torch.float32).reshape(4, 6)
-    memory_manager = HostMemoryManager()
+    memory_manager = HostMemoryManager(backend=FakeBackend())
     host = HostParam(nn.Parameter(source, requires_grad=False), memory_manager=memory_manager)
     view = HostBuffer(source[:, 1::2], HostBuffer.target_layout_for(source[:, 1::2]), memory_manager=memory_manager)
     (backing,) = host.backing_handles()
     assert view.backing_handles() == (backing,)
     resting = host.make_cpu_param()
-    anonymous_storage = _bytes(source).clone()
-    assert backing.try_set_anonymous_storage(anonymous_storage)
+    assert backing.pin()
     assert resting.data_ptr() == source.data_ptr()
     assert host.make_cpu_param().data_ptr() == source.data_ptr()
     assert host.storage_tensors()[0].data_ptr() == source.data_ptr()
     assert view.tensor.untyped_storage().data_ptr() == source.data_ptr()
-    assert backing.try_set_anonymous_storage(None)
+    assert backing.evict()
     torch.testing.assert_close(host.make_cpu_param(), source)
 
 
-def test_independent_captures_do_not_share_anonymous_storage(monkeypatch):
-    source = nn.Parameter(torch.arange(7.0), requires_grad=False)
-    first, second = HostParam(source), HostParam(source)
+def test_independent_captures_do_not_share_copies(tmp_path, monkeypatch):
+    source = nn.Parameter(_file_tensor(tmp_path, torch.arange(7.0)), requires_grad=False)
+    first = HostParam(source, memory_manager=HostMemoryManager(backend=FakeBackend()))
+    second = HostParam(source, memory_manager=HostMemoryManager(backend=FakeBackend()))
     (first_backing,) = first.backing_handles()
     (second_backing,) = second.backing_handles()
     assert first_backing is not second_backing
-    anonymous = source.detach().clone()
-    assert first_backing.try_set_anonymous_storage(anonymous)
-    observed = []
-    raw_copy = host_copy._copy_host_to_device
-
-    def observe(destination, source, *, non_blocking):
-        observed.append(source.data_ptr())
-        raw_copy(destination, source, non_blocking=non_blocking)
-
-    monkeypatch.setattr(host_copy, "_copy_host_to_device", observe)
+    assert first_backing.pin()
+    observed = _observe_transfers(monkeypatch)
     for host in (first, second):
         target = host.allocate_gpu_storage(torch.device("cpu"))
         host.copy_to_gpu(target)
         torch.testing.assert_close(host.make_gpu_param(target), source)
-    assert observed == [anonymous.data_ptr(), source.data_ptr()]
+    assert observed == [first_backing.span[0], source.data_ptr()]
+    assert observed[0] != observed[1]
 
 
 def test_shared_manager_does_not_keep_unrelated_parameters_alive():
@@ -140,13 +335,17 @@ def test_model_capture_shares_backing_across_components_and_buffers():
 
 def test_copy_rejects_sources_outside_its_owner():
     source = torch.arange(7.0)
-    backings = HostMemoryManager().capture((source,))
+    host = HostParam(nn.Parameter(source, requires_grad=False))
+    (backing,) = host.backing_handles()
     with pytest.raises(ValueError, match="not captured"):
-        host_copy.copy_host_to_device(torch.empty_like(source), source.clone(), backings=backings, non_blocking=False)
+        host._copy_host(torch.empty_like(source), source.clone(), non_blocking=False)
+    with pytest.raises(ValueError, match="does not belong"):
+        backing.copy_to(torch.empty_like(source), source.clone(), non_blocking=False)
 
 
-def test_source_acquisition_does_not_materialize_or_initialize_cuda(monkeypatch):
+def test_source_reads_do_not_materialize_or_initialize_cuda(monkeypatch):
     source = torch.arange(7)
+    destination = torch.zeros_like(source)
     backings = HostMemoryManager().capture((source,))
     (backing,) = backings.values()
 
@@ -155,40 +354,37 @@ def test_source_acquisition_does_not_materialize_or_initialize_cuda(monkeypatch)
 
     monkeypatch.setattr(torch, "empty", unexpected)
     monkeypatch.setattr(torch.cuda, "current_stream", unexpected)
-    with backing.acquire(source) as lease:
-        assert lease.tensor is source
+    with backing._read(source) as view:
+        assert view is source
+    backing.copy_to(destination, source, non_blocking=False)
+    assert torch.equal(destination, source)
 
 
-def test_setting_anonymous_storage_waits_for_leases_and_all_pending_copies():
-    source = torch.arange(7)
-    backings = HostMemoryManager().capture((source,))
-    (backing,) = backings.values()
-    first = backing.acquire(source)
-    second = backing.acquire(source)
-    anonymous_storage = source.clone()
-    assert not backing.try_set_anonymous_storage(anonymous_storage)
-    first_done, second_done = Completion(), Completion()
-    first.close(first_done)
-    first.close()
-    assert not backing.try_set_anonymous_storage(anonymous_storage)
-    second.close(second_done)
-    first_done.done = True
-    assert not backing.try_set_anonymous_storage(anonymous_storage)
-    second_done.done = True
-    assert backing.try_set_anonymous_storage(anonymous_storage)
-    with pytest.raises(RuntimeError, match="closed"):
-        _ = first.tensor
+def test_unpin_and_evict_wait_for_every_reader_and_lease(tmp_path):
+    source = _file_tensor(tmp_path, torch.arange(7.0))
+    manager = HostMemoryManager(backend=FakeBackend())
+    (backing,) = manager.capture((source,)).values()
+    assert backing.pin()
+    with backing._read(source), backing._read(source):
+        assert backing.leases == 2
+        assert not backing.unpin()
+        assert not backing.evict()
+    lease = manager.acquire([backing])
+    assert not backing.evict()
+    lease.close()
+    assert backing.evict()
+    assert not backing.pinned and backing.copy_bytes == 0
 
 
-def test_active_reader_on_another_thread_prevents_setting_anonymous_storage():
-    source = torch.arange(7)
-    backings = HostMemoryManager().capture((source,))
-    (backing,) = backings.values()
+def test_active_reader_on_another_thread_prevents_unpinning(tmp_path):
+    source = _file_tensor(tmp_path, torch.arange(7.0))
+    (backing,) = HostMemoryManager(backend=FakeBackend()).capture((source,)).values()
+    assert backing.pin()
     acquired = threading.Event()
     release = threading.Event()
 
     def read():
-        with backing.acquire(source):
+        with backing._read(source):
             acquired.set()
             assert release.wait(5)
 
@@ -196,112 +392,66 @@ def test_active_reader_on_another_thread_prevents_setting_anonymous_storage():
     reader.start()
     try:
         assert acquired.wait(5)
-        assert not backing.try_set_anonymous_storage(source.clone())
+        assert not backing.unpin()
     finally:
         release.set()
         reader.join(5)
     assert not reader.is_alive()
-    assert backing.try_set_anonymous_storage(source.clone())
+    assert backing.evict()
 
 
-def test_last_owner_waits_for_copy_before_releasing_storage():
-    source = torch.arange(7)
-    backings = HostMemoryManager().capture((source,))
-    (backing,) = backings.values()
-    anonymous_storage = source.clone()
-    assert backing.try_set_anonymous_storage(anonymous_storage)
-    storage_ref = weakref.ref(anonymous_storage.untyped_storage())
-    backing_ref = weakref.ref(backing)
-    lease = backing.acquire(source)
-    completion = Completion()
-    lease.close(completion)
-    del anonymous_storage, backing, backings
-    gc.collect()
-    assert completion.waited
-    assert backing_ref() is None
-    assert storage_ref() is None
-
-
-def test_eviction_releases_anonymous_storage_even_while_store_and_cpu_wrapper_live():
-    host = HostParam(nn.Parameter(torch.arange(7.0), requires_grad=False))
+def test_eviction_releases_the_copy_while_store_and_cpu_wrapper_live(tmp_path):
+    manager = HostMemoryManager(backend=FakeBackend())
+    parameter = nn.Parameter(_file_tensor(tmp_path, torch.arange(7.0)), requires_grad=False)
+    host = HostParam(parameter, memory_manager=manager)
     (backing,) = host.backing_handles()
     resting = host.make_cpu_param()
-    anonymous_storage = resting.detach().clone()
-    storage_ref = weakref.ref(anonymous_storage.untyped_storage())
-    assert backing.try_set_anonymous_storage(anonymous_storage)
-    del anonymous_storage
-    assert storage_ref() is not None
-    assert backing.try_set_anonymous_storage(None)
-    gc.collect()
-    assert storage_ref() is None
+    assert backing.pin()
+    assert manager.stats.copy_bytes == backing.storage.nbytes()
+    assert backing.evict()
+    assert manager.stats.copy_bytes == 0
     torch.testing.assert_close(host.make_cpu_param(), resting)
-
-
-@pytest.mark.parametrize("invalid", [torch.empty(6), torch.empty(8), torch.empty(8)[1:], torch.empty(7, 2)[:, 0]])
-def test_rejects_partial_or_mismatched_anonymous_storage_allocations(invalid):
-    backings = HostMemoryManager().capture((torch.empty(7),))
-    (backing,) = backings.values()
-    with pytest.raises(ValueError, match="complete CPU allocation"):
-        backing.try_set_anonymous_storage(invalid)
-
-
-def test_rejects_unrelated_view_and_source_as_anonymous_storage():
-    source = torch.arange(7)
-    backings = HostMemoryManager().capture((source,))
-    (backing,) = backings.values()
-    with pytest.raises(ValueError, match="does not belong"):
-        backing.acquire(source.clone())
-    with pytest.raises(ValueError, match="source storage"):
-        backing.try_set_anonymous_storage(source)
 
 
 def test_empty_and_meta_parameters():
     empty = HostParam(nn.Parameter(torch.empty(0), requires_grad=False))
     (backing,) = empty.backing_handles()
-    assert backing.nbytes == 0
-    assert backing.try_set_anonymous_storage(torch.empty(0))
-    with backing.acquire(empty.storage_tensors()[0]) as lease:
-        assert lease.tensor.numel() == 0
+    assert backing.storage.nbytes() == 0
+    with backing._read(empty.storage_tensors()[0]) as view:
+        assert view.numel() == 0
     meta = HostParam(nn.Parameter(torch.empty(7, device="meta"), requires_grad=False))
     assert meta.backing_handles() == ()
 
 
 @CUDA
-def test_plain_parameter_and_buffer_copies_read_from_anonymous_storage(monkeypatch):
+def test_plain_parameter_and_buffer_copies_read_from_the_copy(tmp_path, monkeypatch):
     module = nn.Linear(4, 3, bias=False).requires_grad_(False)
-    module.register_buffer("scale", torch.arange(3.0))
-    store = HostModuleStore.from_module(module)
+    module.weight.data = _file_tensor(tmp_path, module.weight.data, "weight.bin")
+    module.register_buffer("scale", _file_tensor(tmp_path, torch.arange(3.0), "scale.bin"))
+    manager = HostMemoryManager(BUDGET, backend=RecordingBackend())
+    store = HostModuleStore.from_module(module, memory_manager=manager)
     plan = store.bind(module).resolve_load_plan()
     expected_weight = module.weight.detach().clone()
     expected_scale = module.scale.clone()
-    pointers = set()
-    handles = []
-    for host in (*store.params.values(), *store.buffers.values()):
-        (backing,) = host.backing_handles()
-        anonymous_storage = _bytes(host.storage_tensors()[0]).clone()
-        pointers.add(anonymous_storage.data_ptr())
-        assert backing.try_set_anonymous_storage(anonymous_storage)
-        handles.append(backing)
-
-    observed = set()
-    raw_copy = host_copy._copy_host_to_device
-
-    def observe(destination, source, *, non_blocking):
-        observed.add(source.untyped_storage().data_ptr())
-        raw_copy(destination, source, non_blocking=non_blocking)
-
-    monkeypatch.setattr(host_copy, "_copy_host_to_device", observe)
+    hosts = (*store.params.values(), *store.buffers.values())
+    handles = [backing for host in hosts for backing in host.backing_handles()]
+    sources = {backing.storage.data_ptr() for backing in handles}
+    observed = _observe_transfers(monkeypatch)
     target = plan.allocate_target(torch.device("cuda"))
-    plan.copy_to_target(target)
-    assert observed == pointers
+    with manager.acquire(handles) as lease:
+        assert lease.pinned
+        copies = {backing.span[0] for backing in handles}
+        assert copies.isdisjoint(sources)
+        plan.copy_to_target(target)
+        torch.cuda.synchronize()
+    assert set(observed) == copies
     torch.testing.assert_close(target.param_targets["weight"].param.cpu(), expected_weight)
     torch.testing.assert_close(target.buffer_targets["scale"].tensor.cpu(), expected_scale)
-    torch.cuda.synchronize()
-    for backing in handles:
-        assert backing.try_set_anonymous_storage(None)
+    manager.clear()
+    assert manager.stats.copy_bytes == 0
     observed.clear()
     plan.copy_to_target(target)
-    assert not observed.intersection(pointers)
+    assert set(observed) == sources
 
 
 @CUDA
@@ -319,39 +469,24 @@ def test_quantized_copies_resolve_physical_storage_without_rewriting_state(kind,
         source_param = _make_quantized(kind)
     if not isinstance(source_param, nn.Parameter):
         source_param = nn.Parameter(source_param, requires_grad=False)
-    memory_manager = HostMemoryManager()
-    host = HostParam(source_param, memory_manager=memory_manager)
+    manager = HostMemoryManager(BUDGET, backend=RecordingBackend())
+    host = HostParam(source_param, memory_manager=manager)
     state = host.host_state
     sources = host.storage_tensors()
-    pointers = {}
-    for source in sources:
-        key = source.untyped_storage()._cdata
-        if key in pointers:
-            continue
-        backings = memory_manager.capture((source,))
-        (backing,) = backings.values()
-        anonymous_storage = _bytes(source).clone()
-        assert backing.try_set_anonymous_storage(anonymous_storage)
-        pointers[key] = anonymous_storage.data_ptr()
-    observed = set()
-    raw_copy = host_copy._copy_host_to_device
-
-    def observe(destination, source, *, non_blocking):
-        assert source.untyped_storage().data_ptr() in pointers.values()
-        observed.add(source.untyped_storage().data_ptr())
-        raw_copy(destination, source, non_blocking=non_blocking)
-
-    monkeypatch.setattr(host_copy, "_copy_host_to_device", observe)
+    raw_copy = host_backing_module._transfer
+    observed = _observe_transfers(monkeypatch)
     target = host.allocate_gpu_storage(torch.device("cuda"))
-    host.copy_to_gpu(target, non_blocking=True)
-    torch.cuda.synchronize()
-    assert observed
+    with manager.acquire(host.backing_handles()) as lease:
+        assert lease.pinned
+        pointers = {backing.span[0] for backing in host.backing_handles() if backing.storage.nbytes()}
+        host.copy_to_gpu(target, non_blocking=True)
+        torch.cuda.synchronize()
+    assert observed and set(observed) <= pointers
     assert host.host_state is state
     assert all(a is b for a, b in zip(host.storage_tensors(), sources, strict=True))
     actual = host.make_gpu_param(target)
-    for backing in host.backing_handles():
-        assert backing.try_set_anonymous_storage(None)
-    monkeypatch.setattr(host_copy, "_copy_host_to_device", raw_copy)
+    manager.clear()
+    monkeypatch.setattr(host_backing_module, "_transfer", raw_copy)
     expected_target = host.allocate_gpu_storage(torch.device("cuda"))
     host.copy_to_gpu(expected_target)
     # Compare physical recaptures so no format-specific dequantization tolerance
@@ -368,62 +503,97 @@ def test_quantized_copies_resolve_physical_storage_without_rewriting_state(kind,
 
 @CUDA
 @pytest.mark.parametrize("fail_after_copy", [False, True])
-def test_async_copy_prevents_early_reuse_including_partial_failure(monkeypatch, fail_after_copy):
-    source = torch.arange(1024.0)
-    backings = HostMemoryManager().capture((source,))
-    (backing,) = backings.values()
-    anonymous_storage = source.pin_memory()
-    assert backing.try_set_anonymous_storage(anonymous_storage)
+def test_async_copy_prevents_eviction_until_it_completes(tmp_path, monkeypatch, fail_after_copy):
+    source = _file_tensor(tmp_path, torch.arange(1024.0))
+    manager = HostMemoryManager(BUDGET, backend=RecordingBackend())
+    (backing,) = manager.capture((source,)).values()
+    with manager.acquire([backing]):
+        assert backing.copy_bytes == source.nbytes  # pinned through a copy; stays after the lease
     destination = torch.empty_like(source, device="cuda")
     stream = torch.cuda.Stream()
-    # Warm the path before adding a delay, avoiding lazy initialization waits.
-    with torch.cuda.stream(stream):
-        host_copy.copy_host_to_device(destination, source, backings=backings, non_blocking=True)
-        torch.cuda._sleep(1)
-    stream.synchronize()
-    raw_copy = host_copy._copy_host_to_device
+    raw_copy = host_backing_module._transfer
 
     def copy_then_fail(destination, source, *, non_blocking):
         raw_copy(destination, source, non_blocking=non_blocking)
         raise RuntimeError("after enqueue")
 
+    # Warm the path before adding a delay, avoiding lazy initialization waits.
+    with torch.cuda.stream(stream):
+        backing.copy_to(destination, source, non_blocking=True)
+        torch.cuda._sleep(1)
+    stream.synchronize()
     if fail_after_copy:
-        monkeypatch.setattr(host_copy, "_copy_host_to_device", copy_then_fail)
-    try:
-        with torch.cuda.stream(stream):
-            torch.cuda._sleep(500_000_000)
-            if fail_after_copy:
-                with pytest.raises(RuntimeError, match="after enqueue"):
-                    host_copy.copy_host_to_device(destination, source, backings=backings, non_blocking=True)
-            else:
-                host_copy.copy_host_to_device(destination, source, backings=backings, non_blocking=True)
-        assert not backing.try_set_anonymous_storage(None)
-    finally:
-        stream.synchronize()
-    assert backing.try_set_anonymous_storage(None)
+        monkeypatch.setattr(host_backing_module, "_transfer", copy_then_fail)
+    # No lease is held: the in-flight copy alone must keep the copy alive.
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(500_000_000)
+        if fail_after_copy:
+            with pytest.raises(RuntimeError, match="after enqueue"):
+                backing.copy_to(destination, source, non_blocking=True)
+        else:
+            backing.copy_to(destination, source, non_blocking=True)
+    assert backing.in_flight and not backing.idle
+    assert not backing.evict()
+    manager.clear()
+    assert backing.copy_bytes == source.nbytes
+    stream.synchronize()
+    assert backing.idle
+    manager.clear()
+    assert backing.copy_bytes == 0
     torch.testing.assert_close(destination.cpu(), source)
 
 
 @CUDA
-def test_existing_target_lease_copies_from_anonymous_storage_and_then_source():
+def test_copy_by_an_unleased_caller_survives_another_sessions_lease_closing(tmp_path):
+    source = _file_tensor(tmp_path, torch.arange(1024.0))
+    manager = HostMemoryManager(BUDGET, backend=RecordingBackend())
+    (backing,) = manager.capture((source,)).values()
+    destination = torch.empty_like(source, device="cuda")
+    stream = torch.cuda.Stream()
+    session = manager.acquire([backing])  # some other session's lease
+    with torch.cuda.stream(stream):
+        backing.copy_to(destination, source, non_blocking=True)
+    stream.synchronize()
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(500_000_000)
+        backing.copy_to(destination, source, non_blocking=True)  # this caller holds no lease
+    session.close()
+    manager.clear()  # the session is gone; the copy is not
+    assert backing.copy_bytes == source.nbytes
+    stream.synchronize()
+    manager.clear()
+    assert backing.copy_bytes == 0
+    torch.testing.assert_close(destination.cpu(), source)
+
+
+@CUDA
+def test_existing_target_lease_copies_from_the_copy_and_then_the_source(tmp_path, monkeypatch):
     module = nn.Linear(16, 16, bias=False).requires_grad_(False)
-    store = HostModuleStore.from_module(module)
+    module.weight.data = _file_tensor(tmp_path, module.weight.data)
+    manager = HostMemoryManager(BUDGET, backend=RecordingBackend())
+    store = HostModuleStore.from_module(module, memory_manager=manager)
     instance = store.bind(module)
     plan = instance.resolve_load_plan()
-    host = store.params["weight"]
-    (backing,) = host.backing_handles()
-    assert backing.try_set_anonymous_storage(host.storage_tensors()[0].pin_memory())
+    (backing,) = store.params["weight"].backing_handles()
+    observed = _observe_transfers(monkeypatch)
     target = CudaTargetLease.allocate(plan, torch.device("cuda"))
     stream = torch.cuda.Stream()
     try:
-        for _ in range(2):
+        for pinned in (True, False):
+            lease = manager.acquire([backing]) if pinned else None
+            expected_pointer = backing.span[0]
+            assert (expected_pointer != backing.storage.data_ptr()) == pinned
+            observed.clear()
             target.stage(plan, stream)
             with torch.cuda.stream(stream):
                 active = target.acquire(stream)
                 actual = active.param_targets["weight"].param.cpu()
             target.release()
             stream.synchronize()
-            assert backing.try_set_anonymous_storage(None)
+            if lease is not None:
+                lease.close()
+                manager.clear()
+            assert observed == [expected_pointer]
             torch.testing.assert_close(actual, module.weight)
     finally:
         target.close()
@@ -431,46 +601,53 @@ def test_existing_target_lease_copies_from_anonymous_storage_and_then_source():
 
 @CUDA
 @pytest.mark.parametrize("mode", ["streaming", "rolling", "resident"])
-def test_runtime_reuses_then_evicts_anonymous_storage_without_changing_weights(mode, monkeypatch):
+def test_runtime_reuses_then_evicts_copies_without_changing_weights(tmp_path, mode, monkeypatch):
     model = _BlockModel(num_blocks=3, width=64)
+    for name, parameter in model.named_parameters():
+        parameter.data = _file_tensor(tmp_path, parameter.data, f"{name}.bin")
     value = torch.randn(2, 64)
     expected = model(value)
+    backend = RecordingBackend()
+    manager = HostMemoryManager(BUDGET, backend=backend)
     offloader = _make_offloader(
         model,
+        memory_manager=manager,
         block_mode=mode,
         block_compile=BlockCompileConfig(fullgraph=True) if mode == "rolling" else None,
     )
-    handles = []
-    pointers = set()
-    for instance in block_components(offloader)[0]._block_instances:
-        for host in instance.params.values():
-            (backing,) = host.backing_handles()
-            anonymous_storage = host.storage_tensors()[0].pin_memory()
-            pointers.add(anonymous_storage.data_ptr())
-            assert backing.try_set_anonymous_storage(anonymous_storage)
-            handles.append(backing)
-
-    observed = set()
-    raw_copy = host_copy._copy_host_to_device
-
-    def observe(destination, source, *, non_blocking):
-        observed.add(source.data_ptr())
-        raw_copy(destination, source, non_blocking=non_blocking)
-
-    monkeypatch.setattr(host_copy, "_copy_host_to_device", observe)
+    handles = [
+        backing
+        for instance in block_components(offloader)[0]._block_instances
+        for host in instance.params.values()
+        for backing in host.backing_handles()
+    ]
+    sources = {backing.storage.data_ptr() for backing in handles}
+    assert not any(backing.pin_in_place for backing in handles)
+    observed = _observe_transfers(monkeypatch)
     try:
-        for use_anonymous_storage in (True, True, False):
-            if not use_anonymous_storage:
-                for backing in handles:
-                    assert backing.try_set_anonymous_storage(None)
+        for step in ("pin", "reuse", "evicted"):
+            if step == "evicted":
+                manager.clear()
+                assert manager.stats.copy_bytes == 0
+                # Without a finite budget a file-backed weight is not copied
+                # again, so the next session reads the mapping itself.
+                manager.max_pinned_bytes = None
             observed.clear()
+            registrations = len(backend.registrations)
             with activated_model(offloader, "cuda"), torch.inference_mode():
+                copies = {backing.span[0] for backing in handles}
                 actual = model(value.cuda()).cpu()
             torch.testing.assert_close(actual, expected)
-            if use_anonymous_storage:
-                assert observed == pointers
+            if mode == "resident":
+                # Resident blocks copy once at activation without a host lease.
+                assert set(observed) == sources
+                continue
+            if step == "evicted":
+                assert set(observed) == sources
             else:
-                assert not observed.intersection(pointers)
+                assert copies.isdisjoint(sources)
+                assert set(observed) == copies
+                assert len(backend.registrations) == registrations + (len(handles) if step == "pin" else 0)
     finally:
         offloader.deactivate()
         if mode == "rolling":
@@ -478,82 +655,55 @@ def test_runtime_reuses_then_evicts_anonymous_storage_without_changing_weights(m
 
 
 @CUDA
-def test_event_record_failure_waits_before_releasing_source(monkeypatch):
-    source = torch.arange(1024.0)
-    backings = HostMemoryManager().capture((source,))
-    (backing,) = backings.values()
-    assert backing.try_set_anonymous_storage(source.pin_memory())
-    destination = torch.empty_like(source, device="cuda")
-    actual_stream = torch.cuda.current_stream()
-
-    class FailingStream:
-        waited = False
-
-        def record_event(self):
-            raise RuntimeError("cannot record")
-
-        def synchronize(self):
-            actual_stream.synchronize()
-            self.waited = True
-
-    failing = FailingStream()
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: failing)
-    with pytest.raises(RuntimeError, match="cannot record"):
-        host_copy.copy_host_to_device(destination, source, backings=backings, non_blocking=True)
-    assert failing.waited
-    assert backing.try_set_anonymous_storage(None)
-    torch.testing.assert_close(destination.cpu(), source)
-
-
-@CUDA
-def test_copy_from_anonymous_storage_rejects_graph_capture_before_borrowed_pointer_escapes():
-    source = torch.ones(16)
-    backings = HostMemoryManager().capture((source,))
-    (backing,) = backings.values()
-    assert backing.try_set_anonymous_storage(source.pin_memory())
+@pytest.mark.parametrize("pinned_in_place", [True, False])
+def test_host_copies_reject_graph_capture(tmp_path, pinned_in_place):
+    # Neither a registration nor a copy can be kept alive for a graph's
+    # replays, so capture is refused whichever storage would be read.
+    source = torch.ones(16) if pinned_in_place else _file_tensor(tmp_path, torch.ones(16))
+    manager = HostMemoryManager(BUDGET, backend=RecordingBackend())
+    (backing,) = manager.capture((source,)).values()
     destination = torch.empty_like(source, device="cuda")
     stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        host_copy.copy_host_to_device(destination, source, backings=backings, non_blocking=True)
-    stream.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        with pytest.raises(RuntimeError, match="cannot be captured"):
-            host_copy.copy_host_to_device(destination, source, backings=backings, non_blocking=True)
-        # Include ordinary device work so capture is nonempty.
-        destination.add_(1)
-    assert backing.try_set_anonymous_storage(None)
+    with manager.acquire([backing]):
+        assert backing.pinned
+        with torch.cuda.stream(stream):
+            backing.copy_to(destination, source, non_blocking=True)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            with pytest.raises(RuntimeError, match="cannot be captured"):
+                backing.copy_to(destination, source, non_blocking=True)
+            # Include ordinary device work so capture is nonempty.
+            destination.add_(1)
+    manager.clear()
 
 
-def test_backing_handle_keeps_its_manager_alive_without_retaining_siblings():
+def test_backing_handle_does_not_retain_its_manager():
     manager = HostMemoryManager()
     manager_ref = weakref.ref(manager)
     source = torch.arange(16.0)
     backings = manager.capture((source,))
     (backing,) = backings.values()
-    assert backing.memory_manager is manager
     del manager, backings
     gc.collect()
-    assert manager_ref() is backing.memory_manager
-    with backing.acquire(source) as lease:
-        torch.testing.assert_close(lease.tensor, source)
-    del backing
-    gc.collect()
     assert manager_ref() is None
+    destination = torch.empty_like(source)
+    backing.copy_to(destination, source, non_blocking=False)
+    torch.testing.assert_close(destination, source)
 
 
-def test_live_manager_does_not_retain_discarded_anonymous_copy():
-    manager = HostMemoryManager()
-    host = HostParam(nn.Parameter(torch.arange(8.0)), memory_manager=manager)
+def test_disposing_the_owner_unregisters_and_frees_the_copy(tmp_path):
+    backend = FakeBackend()
+    manager = HostMemoryManager(backend=backend)
+    host = HostParam(nn.Parameter(_file_tensor(tmp_path, torch.arange(8.0))), memory_manager=manager)
     (backing,) = host.backing_handles()
-    anonymous = torch.arange(8.0)
+    assert backing.pin()
+    copy_pointer = backing.span[0]
     source_ref = weakref.ref(host.storage_tensors()[0].untyped_storage())
-    anonymous_ref = weakref.ref(anonymous.untyped_storage())
-    assert backing.try_set_anonymous_storage(anonymous)
-    del anonymous, backing, host
+    del backing, host
     gc.collect()
     assert source_ref() is None
-    assert anonymous_ref() is None
+    assert backend.unregister_calls == [copy_pointer]
     assert not manager._backings
 
 
@@ -571,4 +721,4 @@ def test_adapter_capture_shares_the_explicit_manager_across_all_sources():
     value = adapter.targets["replacement.weight"]
     for host in (delta.lora.a, delta.lora.b, delta.dense, value.backing):
         assert host.memory_manager is manager
-        assert all(handle.memory_manager is manager for handle in host.backing_handles())
+        assert all(manager._backings.get(handle.storage._cdata) is handle for handle in host.backing_handles())

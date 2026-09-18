@@ -1,8 +1,8 @@
-"""Registration ownership, page accounting, and explicit pin leases."""
+"""Registration ownership, page accounting, and explicit host leases."""
 
 import gc
+import logging
 import mmap
-import sys
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +13,6 @@ import pytest
 import torch
 
 import piper_offload._host_registration as registration_module
-import piper_offload.host_memory as host_memory_module
 from piper_offload._host_registration import HostRegistrationError, RuntimeHostRegistration
 from piper_offload import HostMemoryManager
 
@@ -25,6 +24,11 @@ def _tensors(*ranges: tuple[int, int]) -> list[torch.Tensor]:
     size = max(start + length for start, length in ranges)
     buffer = mmap.mmap(-1, size)
     return [torch.frombuffer(buffer, dtype=torch.uint8, offset=start, count=length) for start, length in ranges]
+
+
+def _backings(manager: HostMemoryManager, *tensors: torch.Tensor):
+    # Test tensors wrap anonymous mmaps for address control; opt them in.
+    return [next(iter(manager.capture([tensor], pin_in_place=True).values())) for tensor in tensors]
 
 
 class FakeBackend:
@@ -88,65 +92,93 @@ def test_zero_budget_disables_registration_without_initializing_runtime(monkeypa
 
     monkeypatch.setattr(registration_module, "_load_runtime", unexpected_runtime)
     manager = HostMemoryManager(0)
-    tensor = torch.ones(8)
-    with manager.acquire([tensor]) as lease:
-        assert lease.registered_bytes == 0
-        assert lease.pageable_bytes == tensor.nbytes
+    (backing,) = _backings(manager, torch.ones(8))
+    with manager.acquire([backing]) as lease:
+        assert not lease.pinned
+        assert lease.backings == (backing,)
     assert manager.stats.pinned_bytes == 0
 
 
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="private file VMA detection uses /proc/self/maps",
-)
-def test_private_file_mapping_stays_pageable(
-    tmp_path,
-    backend: FakeBackend,
-) -> None:
+def _file_mapping(tmp_path) -> torch.Tensor:
     path = tmp_path / "weights.bin"
     path.write_bytes(bytes(2 * PAGE))
-    with path.open("r+b") as file:
-        mapped = mmap.mmap(file.fileno(), 2 * PAGE, access=mmap.ACCESS_COPY)
-    tensor = torch.frombuffer(mapped, dtype=torch.uint8)
+    return torch.from_file(str(path), shared=False, size=2 * PAGE, dtype=torch.uint8)
+
+
+def test_file_mapping_is_pinned_through_a_copy_under_a_finite_budget(tmp_path, backend: FakeBackend) -> None:
+    mapped = _file_mapping(tmp_path)
     manager = HostMemoryManager(2 * PAGE, backend=backend)
-    with manager.acquire([tensor]) as lease:
-        assert lease.registered_bytes == 0
-        assert lease.pageable_bytes == tensor.nbytes
-        assert backend.register_calls == []
-    del tensor
-    mapped.close()
+    (backing,) = manager.capture([mapped]).values()
+    assert not backing.pin_in_place
+    with manager.acquire([backing]) as lease:
+        assert lease.pinned
+        copy_pointer, size = backing.span
+        assert copy_pointer != mapped.data_ptr() and size == 2 * PAGE
+        assert backend.register_calls == [(copy_pointer, 2 * PAGE)]
+        assert manager.stats.pinned_bytes == manager.stats.copy_bytes == 2 * PAGE
+    manager.clear()
+    assert backend.unregister_calls == [copy_pointer]
+    assert manager.stats.copy_bytes == 0
+    assert backing.span == (mapped.data_ptr(), 2 * PAGE)
 
 
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="Linux-only conservative VMA fallback",
-)
-def test_unavailable_vma_metadata_leaves_nonresizable_storage_pageable(
-    monkeypatch: pytest.MonkeyPatch,
-    backend: FakeBackend,
-) -> None:
-    monkeypatch.setattr(
-        host_memory_module,
-        "_linux_private_file_mappings",
-        lambda: None,
-    )
-    (tensor,) = _tensors((0, PAGE))
+def test_file_mapping_stays_pageable_under_an_unbounded_budget(tmp_path, backend: FakeBackend) -> None:
+    mapped = _file_mapping(tmp_path)
+    (idle,) = _backings(manager := HostMemoryManager(backend=backend), torch.empty(PAGE, dtype=torch.uint8))
+    with manager.acquire([idle]):
+        pass
+    owned = torch.empty(PAGE, dtype=torch.uint8)
+    (backing,) = manager.capture([mapped]).values()
+    (owned_backing,) = manager.capture([owned]).values()
+    # Skipping the mapping is not a refusal: nothing is evicted and the
+    # anonymous weight after it in the batch is still registered.
+    with manager.acquire([backing, owned_backing]) as lease:
+        assert not lease.pinned
+        assert not backing.pinned and backing.copy_bytes == 0
+        assert owned_backing.pinned and idle.pinned
+        assert backend.unregister_calls == []
+    manager.clear()
+
+
+def test_wrapped_memory_defaults_to_copying_and_owned_allocations_register(backend: FakeBackend) -> None:
+    manager = HostMemoryManager(4 * PAGE, backend=backend)
+    (wrapped,) = _tensors((0, PAGE))
+    owned = torch.empty(PAGE, dtype=torch.uint8)
+    wrapped_backing, owned_backing = (next(iter(manager.capture([t]).values())) for t in (wrapped, owned))
+    assert not wrapped_backing.pin_in_place
+    assert owned_backing.pin_in_place
+    with manager.acquire([wrapped_backing, owned_backing]) as lease:
+        assert lease.pinned
+        assert wrapped_backing.copy_bytes == PAGE and owned_backing.copy_bytes == 0
+        assert backend.register_calls == [(wrapped_backing.span[0], PAGE), (owned.data_ptr(), PAGE)]
+    manager.clear()
+
+
+def test_pin_in_place_override_is_fixed_at_first_capture(backend: FakeBackend) -> None:
     manager = HostMemoryManager(PAGE, backend=backend)
-    with manager.acquire([tensor]) as lease:
-        assert lease.registered_bytes == 0
-        assert lease.pageable_bytes == tensor.nbytes
-    assert backend.register_calls == []
+    (tensor,) = _tensors((0, PAGE))
+    (backing,) = manager.capture([tensor], pin_in_place=True).values()
+    assert manager.capture([tensor]) == {tensor.untyped_storage()._cdata: backing}
+    with pytest.raises(ValueError, match="different pin_in_place"):
+        manager.capture([tensor], pin_in_place=False)
+    with manager.acquire([backing]) as lease:
+        assert lease.pinned
+    manager.clear()
 
 
-def test_aliases_share_whole_allocation_and_reference_counts(manager: HostMemoryManager, backend: FakeBackend) -> None:
+def test_aliases_share_one_backing_and_count_per_backing(manager: HostMemoryManager, backend: FakeBackend) -> None:
     (tensor,) = _tensors((0, 2 * PAGE))
     view = tensor[64:128:2]
-    first = manager.acquire([tensor, view, tensor])
-    second = manager.acquire([view])
+    handles = manager.capture([tensor, view, tensor], pin_in_place=True)
+    (backing,) = handles.values()
+    assert manager.capture([view]) == handles
+    first = manager.acquire([backing, backing])
+    second = manager.acquire([backing])
     assert backend.register_calls == [(tensor.data_ptr(), tensor.nbytes)]
-    assert first.registered_bytes == second.registered_bytes == tensor.nbytes
-    assert first.pageable_bytes == 0
-    assert manager.stats.active_leases == 2
+    assert first.pinned and second.pinned
+    assert first.backings == second.backings == (backing,)
+    assert manager.stats.active_backings == 1
+    assert manager.stats.registrations == 1
 
     first.close()
     first.close()
@@ -154,7 +186,7 @@ def test_aliases_share_whole_allocation_and_reference_counts(manager: HostMemory
     assert backend.unregister_calls == []
     second.close()
     assert manager.stats.idle_registrations == 1
-    with manager.acquire([tensor]):
+    with manager.acquire([backing]):
         assert len(backend.register_calls) == 1
     manager.clear()
     assert backend.unregister_calls == [tensor.data_ptr()]
@@ -162,78 +194,61 @@ def test_aliases_share_whole_allocation_and_reference_counts(manager: HostMemory
 
 def test_lru_evicts_only_idle_registrations(backend: FakeBackend) -> None:
     manager = HostMemoryManager(2 * PAGE, backend=backend)
-    a, b, c = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
-    for tensor in (a, b, a):
-        with manager.acquire([tensor]):
+    tensors = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
+    a, b, c = _backings(manager, *tensors)
+    for backing in (a, b, a):
+        with manager.acquire([backing]):
             pass
     with manager.acquire([c]):
-        assert backend.unregister_calls == [b.data_ptr()]
+        assert backend.unregister_calls == [tensors[1].data_ptr()]
         assert manager.stats.pinned_bytes == 2 * PAGE
     manager.clear()
 
 
 def test_batch_protects_cached_inputs_before_new_admissions(backend: FakeBackend) -> None:
     manager = HostMemoryManager(PAGE, backend=backend)
-    cached, new = _tensors((0, PAGE), (2 * PAGE, PAGE))
+    tensors = _tensors((0, PAGE), (2 * PAGE, PAGE))
+    cached, new = _backings(manager, *tensors)
     with manager.acquire([cached]):
         pass
     with manager.acquire([new, cached]) as lease:
-        assert lease.registered_bytes == PAGE
-        assert lease.pageable_bytes == PAGE
-        assert backend.register_calls == [(cached.data_ptr(), PAGE)]
+        assert not lease.pinned
+        assert cached.pinned and not new.pinned
+        assert backend.register_calls == [(tensors[0].data_ptr(), PAGE)]
         assert backend.unregister_calls == []
     manager.clear()
 
 
 def test_oversized_request_preserves_idle_cache(backend: FakeBackend) -> None:
     manager = HostMemoryManager(PAGE, backend=backend)
-    cached, oversized = _tensors((0, PAGE), (2 * PAGE, 2 * PAGE))
+    cached, oversized = _backings(manager, *_tensors((0, PAGE), (2 * PAGE, 2 * PAGE)))
     with manager.acquire([cached]):
         pass
     with manager.acquire([oversized]) as lease:
-        assert lease.registered_bytes == 0
-        assert lease.pageable_bytes == 2 * PAGE
+        assert not lease.pinned
         assert backend.unregister_calls == []
     manager.clear()
 
 
-def test_shared_boundary_pages_are_charged_once(backend: FakeBackend) -> None:
-    manager = HostMemoryManager(PAGE, backend=backend)
-    a, b = _tensors((64, 128), (512, 256))
-    first, second = manager.acquire([a]), manager.acquire([b])
-    assert manager.stats.registrations == 2
-    assert manager.stats.pinned_bytes == PAGE
-    assert backend.register_calls == [(a.data_ptr(), a.nbytes), (b.data_ptr(), b.nbytes)]
-    first.close()
+def test_pinned_bytes_are_page_rounded_per_allocation(backend: FakeBackend) -> None:
+    manager = HostMemoryManager(4 * PAGE, backend=backend)
+    tensors = _tensors((64, 128), (512, 256), (PAGE - 100, 400))
+    handles = _backings(manager, *tensors)
+    leases = [manager.acquire([backing]) for backing in handles]
+    assert manager.stats.registrations == 3
+    assert manager.stats.pinned_bytes == 4 * PAGE
+    leases[2].close()
     manager.clear()
-    assert manager.stats.pinned_bytes == PAGE
-    assert set(backend.registered) == {b.data_ptr()}
-    second.close()
+    assert manager.stats.pinned_bytes == 2 * PAGE
+    for lease in leases:
+        lease.close()
     manager.clear()
     assert manager.stats.pinned_bytes == 0
 
 
-def test_page_accounting_matches_union_through_release_and_eviction(backend: FakeBackend) -> None:
-    manager = HostMemoryManager(32 * PAGE, backend=backend)
-    tensors = _tensors((64, 128), (512, 256), (PAGE - 100, 400), (2 * PAGE + 100, 3 * PAGE), (8 * PAGE, PAGE))
-    leases = [manager.acquire([tensor]) for tensor in tensors]
-
-    def expected_bytes() -> int:
-        pages = set()
-        for pointer, size in backend.registered.items():
-            pages.update(range(pointer // PAGE, (pointer + size - 1) // PAGE + 1))
-        return len(pages) * PAGE
-
-    assert manager.stats.pinned_bytes == expected_bytes()
-    for index in (2, 0, 3, 1, 4):
-        leases[index].close()
-        manager.clear()
-        assert manager.stats.pinned_bytes == expected_bytes()
-
-
 def test_budget_reduction_waits_for_active_leases(manager: HostMemoryManager, backend: FakeBackend) -> None:
-    (tensor,) = _tensors((0, 2 * PAGE))
-    lease = manager.acquire([tensor])
+    (backing,) = _backings(manager, *_tensors((0, 2 * PAGE)))
+    lease = manager.acquire([backing])
     manager.max_pinned_bytes = 0
     assert manager.stats.pinned_bytes == 2 * PAGE
     assert backend.unregister_calls == []
@@ -242,55 +257,51 @@ def test_budget_reduction_waits_for_active_leases(manager: HostMemoryManager, ba
 
 
 def test_capacity_failure_stops_later_registration_attempts(manager: HostMemoryManager, backend: FakeBackend) -> None:
-    a, b, c = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
-    backend.refuse.add(a.data_ptr())
-    with manager.acquire([a, b, c]) as lease:
-        assert lease.registered_bytes == 0
-        assert lease.pageable_bytes == 3 * PAGE
-        assert manager.stats.registration_failures == 1
-        assert backend.register_calls == [(a.data_ptr(), PAGE)]
+    tensors = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
+    handles = _backings(manager, *tensors)
+    backend.refuse.add(tensors[0].data_ptr())
+    with manager.acquire(handles) as lease:
+        assert not lease.pinned
+        assert not any(backing.pinned for backing in handles)
+        assert backend.register_calls == [(tensors[0].data_ptr(), PAGE)]
 
 
 def test_default_budget_reclaims_idle_lru_and_retries(backend: FakeBackend) -> None:
     manager = HostMemoryManager(backend=backend)
-    a, b, c = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
+    tensors = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
+    a, b, c = _backings(manager, *tensors)
     backend.capacity = 2 * PAGE
-    for tensor in (a, b):
-        with manager.acquire([tensor]):
+    for backing in (a, b):
+        with manager.acquire([backing]):
             pass
 
     with manager.acquire([c]) as lease:
-        assert lease.registered_bytes == PAGE
-        assert lease.pageable_bytes == 0
-        assert backend.unregister_calls == [a.data_ptr()]
-        assert set(backend.registered) == {b.data_ptr(), c.data_ptr()}
+        assert lease.pinned
+        assert backend.unregister_calls == [tensors[0].data_ptr()]
+        assert set(backend.registered) == {tensors[1].data_ptr(), tensors[2].data_ptr()}
         assert manager.stats.max_pinned_bytes is None
-        assert manager.stats.registration_failures == 1
     manager.clear()
 
 
 def test_opportunistic_reclaim_protects_requested_idle_registration(backend: FakeBackend) -> None:
     manager = HostMemoryManager(None, backend=backend)
-    requested, unrelated, new = _tensors(
-        (0, PAGE),
-        (2 * PAGE, PAGE),
-        (4 * PAGE, PAGE),
-    )
+    tensors = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
+    requested, unrelated, new = _backings(manager, *tensors)
     backend.capacity = 2 * PAGE
-    for tensor in (requested, unrelated):
-        with manager.acquire([tensor]):
+    for backing in (requested, unrelated):
+        with manager.acquire([backing]):
             pass
 
     with manager.acquire([requested, new]) as lease:
-        assert lease.registered_bytes == 2 * PAGE
-        assert backend.unregister_calls == [unrelated.data_ptr()]
-        assert set(backend.registered) == {requested.data_ptr(), new.data_ptr()}
+        assert lease.pinned
+        assert backend.unregister_calls == [tensors[1].data_ptr()]
+        assert set(backend.registered) == {tensors[0].data_ptr(), tensors[2].data_ptr()}
     manager.clear()
 
 
 def test_budget_can_switch_between_finite_and_opportunistic(backend: FakeBackend) -> None:
     manager = HostMemoryManager(PAGE, backend=backend)
-    a, b = _tensors((0, PAGE), (2 * PAGE, PAGE))
+    a, b = _backings(manager, *_tensors((0, PAGE), (2 * PAGE, PAGE)))
     with manager.acquire([a]):
         pass
 
@@ -304,183 +315,193 @@ def test_budget_can_switch_between_finite_and_opportunistic(backend: FakeBackend
     manager.clear()
 
 
-def test_pageable_storage_waits_for_all_active_leases_before_registration(backend: FakeBackend) -> None:
+def test_pageable_backing_waits_for_all_active_leases_before_registration(backend: FakeBackend) -> None:
     manager = HostMemoryManager(0, backend=backend)
-    (tensor,) = _tensors((0, PAGE))
-    first = manager.acquire([tensor])
+    (backing,) = _backings(manager, *_tensors((0, PAGE)))
+    first = manager.acquire([backing])
     manager.max_pinned_bytes = PAGE
-    second = manager.acquire([tensor[64:128]])
+    second = manager.acquire([backing])
     first.close()
-    with manager.acquire([tensor]) as third:
-        assert second.pageable_bytes == third.pageable_bytes == PAGE
+    with manager.acquire([backing]) as third:
+        assert not second.pinned and not third.pinned
         assert backend.register_calls == []
     second.close()
-    with manager.acquire([tensor]) as fourth:
-        assert fourth.registered_bytes == PAGE
+    with manager.acquire([backing]) as fourth:
+        assert fourth.pinned
         assert len(backend.register_calls) == 1
-    manager.clear()
-
-
-def test_active_pageable_ranges_also_reject_partial_overlaps(backend: FakeBackend) -> None:
-    manager = HostMemoryManager(0, backend=backend)
-    a, b = _tensors((0, 2 * PAGE), (PAGE, 2 * PAGE))
-    with manager.acquire([a]):
-        manager.max_pinned_bytes = 4 * PAGE
-        with pytest.raises(ValueError, match="Overlapping"):
-            manager.acquire([b])
-        assert backend.register_calls == []
-    with manager.acquire([b]) as lease:
-        assert lease.registered_bytes == b.nbytes
     manager.clear()
 
 
 def test_unexpected_registration_error_rolls_back_new_registrations(
     manager: HostMemoryManager, backend: FakeBackend,
 ) -> None:
-    a, b = _tensors((0, PAGE), (2 * PAGE, PAGE))
-    backend.register_errors.add(b.data_ptr())
+    tensors = _tensors((0, PAGE), (2 * PAGE, PAGE))
+    a, b = _backings(manager, *tensors)
+    backend.register_errors.add(tensors[1].data_ptr())
     with pytest.raises(HostRegistrationError):
         manager.acquire([a, b])
     assert not backend.registered
     assert manager.stats.pinned_bytes == 0
-    assert manager.stats.active_leases == 0
+    assert manager.stats.active_backings == 0
 
 
 def test_validation_finishes_before_registration(manager: HostMemoryManager, backend: FakeBackend) -> None:
-    (tensor,) = _tensors((0, PAGE))
+    (backing,) = _backings(manager, *_tensors((0, PAGE)))
     with pytest.raises(ValueError, match="CPU"):
-        manager.acquire([tensor, torch.empty(8, device="meta")])
-    assert backend.register_calls == []
+        manager.capture([torch.empty(8, device="meta")])
     with pytest.raises(ValueError, match="strided"):
-        manager.acquire([torch.empty(8).to_sparse()])
-    with pytest.raises(TypeError, match="plain"):
-        manager.acquire([object()])
+        manager.capture([torch.empty(8).to_sparse()])
+    with pytest.raises(TypeError, match="HostBacking"):
+        manager.acquire([backing, object()])  # type: ignore[list-item]
+    (foreign,) = _backings(HostMemoryManager(backend=backend), torch.ones(8))
+    with pytest.raises(ValueError, match="not captured"):
+        manager.acquire([backing, foreign])
+    assert backend.register_calls == []
+    assert manager.stats.active_backings == 0
 
 
-def test_distinct_overlapping_storage_ranges_are_rejected_before_mutation(
-    manager: HostMemoryManager,
-    backend: FakeBackend,
-) -> None:
-    a, b, same_start = _tensors((0, 2 * PAGE), (PAGE, 2 * PAGE), (0, PAGE))
-    for other in (b, same_start):
-        with pytest.raises(ValueError, match="Overlapping"):
-            manager.acquire([a, other])
-        assert backend.register_calls == []
-    with manager.acquire([a]):
-        with pytest.raises(ValueError, match="Overlapping"):
-            manager.acquire([b])
-        assert len(backend.register_calls) == 1
-        assert not backend.unregister_calls
-
-
-def test_empty_views_do_not_register_their_backing(manager: HostMemoryManager, backend: FakeBackend) -> None:
-    (tensor,) = _tensors((0, PAGE))
-    with manager.acquire([tensor[:0], torch.empty(0)]) as lease:
-        assert lease.registered_bytes == lease.pageable_bytes == 0
+def test_empty_allocations_are_never_registered(manager: HostMemoryManager, backend: FakeBackend) -> None:
+    (backing,) = _backings(manager, torch.empty(0))
+    with manager.acquire([backing]) as lease:
+        assert not lease.pinned
     assert backend.register_calls == []
 
 
-def test_source_disposal_unregisters_before_storage_dies(manager: HostMemoryManager, backend: FakeBackend) -> None:
+def test_disposing_the_last_owner_unregisters_before_storage_dies(
+    manager: HostMemoryManager, backend: FakeBackend,
+) -> None:
     (tensor,) = _tensors((0, PAGE))
+    (backing,) = _backings(manager, tensor)
     pointer = tensor.data_ptr()
-    tensor_ref = weakref.ref(tensor)
     storage_ref = weakref.ref(tensor.untyped_storage())
-    with manager.acquire([tensor]):
+    with manager.acquire([backing]):
         pass
-    assert storage_ref() is not None
     del tensor
     gc.collect()
-    assert tensor_ref() is None
+    assert storage_ref() is not None
+    assert backend.unregister_calls == []
+    del backing
+    gc.collect()
     assert backend.unregister_calls == [pointer]
     assert storage_ref() is None
     assert manager.stats.pinned_bytes == 0
+    assert manager.stats.backings == 0
 
 
-def test_disposed_owner_waits_for_an_alias_lease(manager: HostMemoryManager, backend: FakeBackend) -> None:
+def test_pending_copy_keeps_backing_pageable(backend: FakeBackend) -> None:
+    manager = HostMemoryManager(PAGE, backend=backend)
     (tensor,) = _tensors((0, PAGE))
-    alias = tensor[16:32].detach()
-    with manager.acquire([tensor]):
+    (backing,) = _backings(manager, tensor)
+    completion = SimpleNamespace(done=False, query=lambda: completion.done, synchronize=lambda: None)
+    stream = SimpleNamespace(record_event=lambda: completion, synchronize=lambda: None)
+    with backing._read(tensor, stream):
         pass
-    lease = manager.acquire([alias])
-    del tensor
+    with manager.acquire([backing]) as lease:
+        assert not lease.pinned
+        assert backend.register_calls == []
+    completion.done = True
+    with manager.acquire([backing]) as lease:
+        assert lease.pinned
+    manager.clear()
+
+
+def test_lease_retains_backing_until_close(manager: HostMemoryManager, backend: FakeBackend) -> None:
+    (tensor,) = _tensors((0, PAGE))
+    (backing,) = _backings(manager, tensor)
+    backing_ref = weakref.ref(backing)
+    with manager.acquire([backing]):
+        pass
+    lease = manager.acquire([backing])
+    del backing, tensor
     gc.collect()
+    assert backing_ref() is not None
     assert backend.unregister_calls == []
+    assert manager.stats.active_backings == 1
     lease.close()
+    gc.collect()
+    assert backing_ref() is None
     assert len(backend.unregister_calls) == 1
     assert manager.stats.pinned_bytes == 0
 
 
-def test_failed_unregistration_retains_storage_and_charge_for_retry(
+def test_failed_unregistration_of_idle_backing_is_retried_by_clear(
     manager: HostMemoryManager, backend: FakeBackend,
 ) -> None:
     (tensor,) = _tensors((0, PAGE))
-    storage_ref = weakref.ref(tensor.untyped_storage())
+    (backing,) = _backings(manager, tensor)
     pointer = tensor.data_ptr()
-    with manager.acquire([tensor]):
+    with manager.acquire([backing]):
         pass
     backend.unregister_errors.add(pointer)
-    del tensor
-    gc.collect()
-    assert storage_ref() is not None
-    assert manager.stats.pinned_bytes == PAGE
     with pytest.raises(RuntimeError, match="remains retained"):
         manager.clear()
+    assert backing.pinned
+    assert manager.stats.pinned_bytes == PAGE
     backend.unregister_errors.clear()
     manager.clear()
-    assert storage_ref() is None
+    assert not backing.pinned
     assert manager.stats.pinned_bytes == 0
+
+
+def test_failed_unregistration_at_disposal_is_logged_and_storage_freed(
+    manager: HostMemoryManager, backend: FakeBackend, caplog: pytest.LogCaptureFixture,
+) -> None:
+    (tensor,) = _tensors((0, PAGE))
+    (backing,) = _backings(manager, tensor)
+    pointer = tensor.data_ptr()
+    storage_ref = weakref.ref(tensor.untyped_storage())
+    with manager.acquire([backing]):
+        pass
+    backend.unregister_errors.add(pointer)
+    with caplog.at_level(logging.WARNING, logger="piper_offload._host_backing"):
+        del tensor, backing
+        gc.collect()
+    assert backend.unregister_calls == [pointer]
+    assert storage_ref() is None
+    assert manager.stats.backings == 0
+    assert "unregistration failed during cleanup" in caplog.text
+    backend.unregister_errors.clear()
+    backend.unregister(pointer)
 
 
 def test_failed_eviction_does_not_oversubscribe_budget(backend: FakeBackend) -> None:
     manager = HostMemoryManager(PAGE, backend=backend)
-    a, b = _tensors((0, PAGE), (2 * PAGE, PAGE))
+    tensors = _tensors((0, PAGE), (2 * PAGE, PAGE))
+    a, b = _backings(manager, *tensors)
     with manager.acquire([a]):
         pass
-    backend.unregister_errors.add(a.data_ptr())
+    backend.unregister_errors.add(tensors[0].data_ptr())
     with manager.acquire([b]) as lease:
-        assert lease.pageable_bytes == PAGE
+        assert not lease.pinned
         assert manager.stats.pinned_bytes == PAGE
-        assert set(backend.registered) == {a.data_ptr()}
+        assert set(backend.registered) == {tensors[0].data_ptr()}
     backend.unregister_errors.clear()
     manager.clear()
 
 
-def test_lease_retains_pageable_sources_until_close(backend: FakeBackend) -> None:
-    manager = HostMemoryManager(0, backend=backend)
-    tensor = torch.ones(8)
-    tensor_ref = weakref.ref(tensor)
-    lease = manager.acquire([tensor])
-    del tensor
-    gc.collect()
-    assert tensor_ref() is not None
-    assert manager.stats.active_leases == 1
-    lease.close()
-    assert tensor_ref() is None
-    assert manager.stats.active_leases == 0
-
-
 def test_abandoned_lease_releases_registration_protection(manager: HostMemoryManager) -> None:
-    (tensor,) = _tensors((0, PAGE))
-    lease = manager.acquire([tensor])
+    (backing,) = _backings(manager, *_tensors((0, PAGE)))
+    lease = manager.acquire([backing])
     del lease
     gc.collect()
-    assert manager.stats.active_leases == 0
+    assert manager.stats.active_backings == 0
     assert manager.stats.idle_registrations == 1
 
 
-def test_registration_keeps_manager_alive_until_source_disposal(backend: FakeBackend) -> None:
+def test_registration_outlives_its_manager(backend: FakeBackend) -> None:
     manager = HostMemoryManager(PAGE, backend=backend)
     (tensor,) = _tensors((0, PAGE))
+    (backing,) = _backings(manager, tensor)
     manager_ref = weakref.ref(manager)
-    with manager.acquire([tensor]):
+    with manager.acquire([backing]):
         pass
     del manager
     gc.collect()
-    assert manager_ref() is not None
-    assert backend.registered
-    del tensor
-    gc.collect()
     assert manager_ref() is None
+    assert backing.pinned
+    assert backend.registered
+    del backing
+    gc.collect()
     assert not backend.registered
 
 
@@ -490,19 +511,20 @@ def test_negative_budget_is_rejected(manager: HostMemoryManager) -> None:
     with pytest.raises(ValueError, match=">= 0"):
         manager.max_pinned_bytes = -1
 
+
 def test_concurrent_leases_share_one_registration(manager: HostMemoryManager, backend: FakeBackend) -> None:
-    (tensor,) = _tensors((0, PAGE))
+    (backing,) = _backings(manager, *_tensors((0, PAGE)))
     barrier = threading.Barrier(5)
 
     def use_storage() -> None:
-        with manager.acquire([tensor]):
+        with manager.acquire([backing]):
             barrier.wait(timeout=10)
             barrier.wait(timeout=10)
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(use_storage) for _ in range(4)]
         barrier.wait(timeout=10)
-        assert manager.stats.active_leases == 4
+        assert manager.stats.active_backings == 1
         assert len(backend.register_calls) == 1
         barrier.wait(timeout=10)
         for future in futures:
@@ -573,6 +595,35 @@ def test_prior_runtime_error_is_reported_before_registering(monkeypatch: pytest.
     assert runtime.flags is None
 
 
+def test_prior_runtime_error_does_not_skip_unregistration(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime = FakeRuntime(0)
+    unregistered = []
+    runtime.unregister = lambda pointer: unregistered.append(pointer) or 0  # type: ignore[method-assign]
+    runtime.last_error = 700
+    monkeypatch.setattr(registration_module, "_load_runtime", lambda: runtime)
+    with caplog.at_level(logging.WARNING, logger="piper_offload._host_registration"):
+        RuntimeHostRegistration().unregister(PAGE)
+    assert unregistered == [PAGE]
+    assert runtime.last_error == 0
+    assert "700" in caplog.text
+
+
+def test_source_needing_a_copy_is_charged_for_the_aligned_copy(tmp_path, backend: FakeBackend) -> None:
+    # A one-page payload starting mid-page spans two source pages, but its
+    # page-aligned copy fits one, so a one-page budget admits it.
+    (unaligned,) = _tensors((PAGE - 100, PAGE))
+    manager = HostMemoryManager(PAGE, backend=backend)
+    (backing,) = manager.capture([unaligned]).values()
+    assert backing.needs_copy and backing.page_bytes == PAGE
+    with manager.acquire([backing]) as lease:
+        assert lease.pinned
+        assert backing.span[0] % PAGE == 0 and backing.page_bytes == PAGE
+        assert manager.stats.pinned_bytes == PAGE
+    manager.clear()
+
+
 @pytest.mark.parametrize(
     ("hip", "filename", "prefix"),
     [
@@ -631,10 +682,11 @@ def test_real_registration_copy_and_unregistration() -> None:
     (tensor,) = _tensors((64, 2 * PAGE))
     tensor.fill_(17)
     pointer = tensor.data_ptr()
+    (backing,) = _backings(manager, tensor)
     stream = torch.cuda.Stream()
-    lease = manager.acquire([tensor])
+    lease = manager.acquire([backing])
     try:
-        assert lease.registered_bytes == tensor.nbytes
+        assert lease.pinned
         assert tensor.is_pinned()
         with torch.cuda.stream(stream):
             target = tensor.to("cuda", non_blocking=True)
@@ -653,9 +705,10 @@ def test_real_fallback_can_copy_allocation_sharing_a_registered_page() -> None:
     manager = HostMemoryManager(PAGE)
     pinned, pageable = _tensors((64, 128), (512, 2 * PAGE))
     pageable.fill_(23)
-    with manager.acquire([pinned, pageable]) as lease:
-        assert lease.registered_bytes == pinned.nbytes
-        assert lease.pageable_bytes == pageable.nbytes
+    handles = _backings(manager, pinned, pageable)
+    with manager.acquire(handles) as lease:
+        assert not lease.pinned
+        assert handles[0].pinned and not handles[1].pinned
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
             target = pageable.to("cuda", non_blocking=True)
@@ -671,9 +724,10 @@ def test_real_foreign_registration_is_never_unregistered() -> None:
     pointer = tensor.data_ptr()
     assert backend.register(pointer, tensor.nbytes)
     manager = HostMemoryManager(PAGE)
+    (backing,) = _backings(manager, tensor)
     try:
         with pytest.raises(HostRegistrationError) as error:
-            manager.acquire([tensor])
+            manager.acquire([backing])
         assert error.value.code == 712
         manager.clear()
         assert tensor.is_pinned()

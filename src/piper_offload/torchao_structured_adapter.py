@@ -34,8 +34,8 @@ from typing import Any, ClassVar
 import torch
 from torch import nn
 
-from ._host_copy import TensorCopy
 from .tensor_adapters import (
+    TensorCopy,
     capture_host_tensor,
     empty_like_strided,
     optional_tensor_id,

@@ -1,202 +1,68 @@
-"""Explicit ownership of host backing handles and budgeted registrations.
+"""Registry of host backings and the pin budget applied to them.
 
-Share one HostMemoryManager across captures to share allocation handles and a
-pin budget. Host parameters and buffers retain their manager; its weak handle
-index does not keep unused weights alive. Construction and configuration do
-not initialize CUDA. The default pin budget is None (native capacity); zero
-disables registration. Anonymous-copy allocation and RAM eviction are not yet
-implemented.
+Share one HostMemoryManager across captures to share backing handles and a
+pin budget. Host parameters and buffers retain their backings; the manager's
+weak index does not keep unused weights alive, and backings do not reference
+the manager. Construction and configuration do not initialize CUDA. The
+default pin budget is None (native capacity); zero disables registration.
 
-Native registration uses whole storage byte ranges. Linux private file mappings
-stay pageable so registration cannot instantiate persistent copy-on-write
-pages; model H2D copies use bounded pinned staging for that fallback. Budget
-accounting counts the union of registered OS pages, including pages shared by
-separate allocations. Registrations retain storage until unregistration
-succeeds, but track their source tensors weakly while idle so discarded
-resources can release memory. Storage must not be resized or independently
-registered while managed here.
+Each backing pins itself (see ``HostBacking.pin``); the manager decides only
+whether there is room. A private file mapping is pinned through an owned
+copy, and only under a finite budget, so the default unbounded budget never
+duplicates a checkpoint into RAM. The budget charges each registration's OS
+pages, rounded per allocation. A registration lives as long as its backing:
+the last owner's disposal unregisters before the storage is freed. Storage
+must not be resized or independently registered while managed here.
 """
 
-import logging
 import mmap
-import sys
 import threading
 import weakref
-from bisect import bisect_left, bisect_right
-from collections import OrderedDict
 from collections.abc import Iterable
-from dataclasses import dataclass, field
-from typing import Self
+from dataclasses import dataclass
 
 import torch
 
 from ._host_backing import HostBacking
+from ._host_lease import HostLease
 from ._host_registration import HostRegistrationBackend, RuntimeHostRegistration
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
-class PinStats:
-    """Registration counts and the union of charged OS pages."""
+class HostMemoryStats:
+    """Budget, page-rounded pinned bytes, and backing counts."""
 
     max_pinned_bytes: int | None
     pinned_bytes: int
+    copy_bytes: int
+    backings: int
     registrations: int
     idle_registrations: int
-    active_leases: int
-    registration_failures: int
-    unregistration_failures: int
-
-
-@dataclass(eq=False)
-class _Registration:
-    pointer: int
-    size: int
-    storage: torch.UntypedStorage
-    owners: dict[int, weakref.ReferenceType[torch.Tensor]] = field(default_factory=dict)
-    leases: int = 0
-    retired: bool = False
-
-
-@dataclass(slots=True)
-class _Request:
-    storage: torch.UntypedStorage
-    tensors: list[torch.Tensor]
-
-
-@dataclass(slots=True)
-class _Pageable:
-    size: int
-    leases: int = 0
-
-
-@dataclass(slots=True)
-class _LeaseState:
-    registrations: tuple[_Registration, ...]
-    pageable: tuple[int, ...]
-    tensors: tuple[torch.Tensor, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _PrivateFileMapping:
-    start: int
-    end: int
-
-
-def _linux_private_file_mappings() -> tuple[_PrivateFileMapping, ...] | None:
-    """Return private file VMAs whose registration can break COW.
-
-    Linux exposes the provenance and sharing mode needed for this decision in
-    ``/proc/self/maps``.  Anonymous and shared mappings remain eligible for
-    direct registration.
-    """
-    if not sys.platform.startswith("linux"):
-        return ()
-    try:
-        with open("/proc/self/maps", encoding="utf-8") as maps:
-            lines = tuple(maps)
-    except OSError:
-        # A non-resizable-storage fallback is applied by acquire() when VMA
-        # provenance is unavailable.
-        return None
-
-    result: list[_PrivateFileMapping] = []
-    for line in lines:
-        fields = line.split(maxsplit=5)
-        if len(fields) < 5:
-            continue
-        address, permissions, _offset, _device, inode = fields[:5]
-        if len(permissions) < 4 or permissions[3] != "p" or inode == "0":
-            continue
-        start_text, end_text = address.split("-", maxsplit=1)
-        result.append(
-            _PrivateFileMapping(int(start_text, 16), int(end_text, 16))
-        )
-    return tuple(result)
-
-
-def _overlaps_private_file_mapping(
-    pointer: int,
-    size: int,
-    mappings: tuple[_PrivateFileMapping, ...] | None,
-) -> bool:
-    if not mappings or size == 0:
-        return False
-    index = max(
-        0,
-        bisect_right(mappings, pointer, key=lambda mapping: mapping.start) - 1,
-    )
-    end = pointer + size
-    for mapping in mappings[index:]:
-        if mapping.start >= end:
-            break
-        if pointer < mapping.end:
-            return True
-    return False
-
-
-class PinLease:
-    """Protect registrations and source tensors until explicitly released.
-
-    ``registered_bytes`` and ``pageable_bytes`` count unique requested storage
-    bytes, without page rounding. The owner must keep the lease open until no
-    asynchronous operation can read or write its host tensors. CUDA ordering belongs to
-    the runtime that enqueues those operations; the memory manager does not track
-    or synchronize accelerator streams. Dropping the token also releases its
-    protection, so asynchronous owners must retain it through completion.
-    """
-
-    def __init__(
-        self,
-        manager: HostMemoryManager,
-        key: int,
-        registered_bytes: int,
-        pageable_bytes: int,
-    ) -> None:
-        self.registered_bytes = registered_bytes
-        self.pageable_bytes = pageable_bytes
-        self._finalizer = weakref.finalize(self, manager._close_lease, key)
-        self._finalizer.atexit = False
-
-    @property
-    def closed(self) -> bool:
-        return not self._finalizer.alive
-
-    def close(self) -> None:
-        """Release registration and source protection, idempotently."""
-        self._finalizer()
-
-    def __enter__(self) -> Self:
-        if self.closed:
-            raise RuntimeError("Pin lease is closed")
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
+    active_backings: int
 
 
 class HostMemoryManager:
-    """Share host allocation handles and own registrations under one pin budget.
+    """Share backing handles and register them under one pin budget.
 
     A finite ``max_pinned_bytes`` bounds pages registered by this manager.
-    The default, ``None``, treats native CUDA/HIP capacity as the limit, reclaiming
-    unrelated idle registrations when the runtime refuses a new allocation.
-    Linux private file mappings are always left pageable because registering
-    them can break copy-on-write across the complete mapped range.
+    The default, ``None``, treats native CUDA/HIP capacity as the limit,
+    reclaiming unrelated idle registrations when the runtime refuses a new
+    allocation.
 
-    Acquire accepts the plain CPU tensors returned by ``storage_tensors()``.
-    Tensor views share one whole-storage registration. Separate allocations
-    may share OS pages, which are charged once. Distinct overlapping byte
-    ranges (for example separate ``frombuffer`` wrappers) are
-    rejected before registration; registering only part of a copy's range can
-    make the CUDA/HIP copy invalid. Use views of one storage for such aliases.
+    ``capture`` returns one handle per storage and records once whether its
+    source may be pinned in place. Memory PyTorch did not allocate itself
+    (not ``resizable()``) is assumed to be a private file mapping; owners of
+    shared or anonymous mappings pass ``pin_in_place=True``. Distinct
+    storages must not overlap in memory; use views of one storage for
+    aliases. ``acquire`` leases handles: it protects them first, then registers the
+    eligible unpinned ones when the budget and runtime allow.
 
-    Registration metadata and backend operations share a reentrant lock.
-    Active leases also retain pageable sources. Idle entries retain storage,
-    but no model or tensor wrappers. Losing a source tensor retires its
-    registration as soon as active leases have finished with it.
-    Pageable allocations remain pageable until all their active leases close.
+    Registration and backing metadata are read under one reentrant lock;
+    budget state derives from the live handles rather than separate counters.
+    A backing stays pageable while another lease or an unfinished copy may be
+    reading it. Under
+    pin pressure idle backings are unpinned least recently released first,
+    keeping their copies; ``clear`` evicts idle copies as well.
     """
 
     def __init__(
@@ -211,25 +77,17 @@ class HostMemoryManager:
         self._backend = backend if backend is not None else RuntimeHostRegistration()
         self._lock = threading.RLock()
         self._backings: weakref.WeakValueDictionary[int, HostBacking] = weakref.WeakValueDictionary()
-        self._entries: dict[int, _Registration] = {}
-        self._pageable: dict[int, _Pageable] = {}
-        # All registered ranges and actively leased pageable ranges.
-        self._starts: list[int] = []
-        self._idle: OrderedDict[int, None] = OrderedDict()
-        # Disjoint byte ranges can share only their boundary pages. Tracking
-        # those endpoints avoids one Python entry per page of a large model.
-        self._boundary_pages: dict[int, int] = {}
-        self._pinned_bytes = 0
-        self._registration_failures = 0
-        self._unregistration_failures = 0
-        self._leases: dict[int, _LeaseState] = {}
-        self._next_lease = 0
 
-    def capture(self, tensors: Iterable[torch.Tensor]) -> dict[int, HostBacking]:
-        """Share allocation handles within this manager without retaining owners.
+    def capture(
+        self, tensors: Iterable[torch.Tensor], *, pin_in_place: bool | None = None,
+    ) -> dict[int, HostBacking]:
+        """Share backing handles within this manager without retaining owners.
 
-        Host parameters and buffers keep handles alive; each handle retains its
-        manager. Keeping a manager alive alone does not retain captured weights.
+        ``pin_in_place`` overrides the default classification, for example
+        ``True`` for a shared mapping the caller owns, which has no
+        copy-on-write; it must agree with any existing handle. Host
+        parameters and buffers keep handles alive. Keeping a manager alive
+        alone does not retain captured weights.
         """
         result: dict[int, HostBacking] = {}
         with self._lock:
@@ -239,8 +97,11 @@ class HostMemoryManager:
                 storage = tensor.untyped_storage()
                 key = storage._cdata
                 backing = self._backings.get(key)
-                if backing is None:
-                    backing = HostBacking(storage, self)
+                if backing is not None:
+                    if pin_in_place is not None and backing.pin_in_place != pin_in_place:
+                        raise ValueError("Host backing was already captured with a different pin_in_place")
+                else:
+                    backing = HostBacking(storage, self._backend, pin_in_place=pin_in_place)
                     self._backings[key] = backing
                 result[key] = backing
         return result
@@ -256,7 +117,7 @@ class HostMemoryManager:
 
         ``None`` removes the application byte limit. Native capacity failures
         still reclaim unrelated idle registrations before falling back to
-        pageable storage. For a finite limit, releases trim active excess back
+        pageable storage. For a finite limit, releases trim idle excess back
         to budget. Failed unregistrations stay charged and can be retried with
         ``clear()`` or later admission pressure.
         """
@@ -264,289 +125,130 @@ class HostMemoryManager:
             raise ValueError("max_pinned_bytes must be >= 0")
         with self._lock:
             self._max_pinned_bytes = value
-            self._make_room(0, 0)
+            self._make_room(0)
 
     @property
-    def stats(self) -> PinStats:
+    def stats(self) -> HostMemoryStats:
         with self._lock:
-            return PinStats(
+            live = self._live()
+            pinned = [backing for backing in live if backing.pinned]
+            return HostMemoryStats(
                 self._max_pinned_bytes,
-                self._pinned_bytes,
-                len(self._entries),
-                len(self._idle),
-                len(self._leases),
-                self._registration_failures,
-                self._unregistration_failures,
+                sum(backing.page_bytes for backing in pinned),
+                sum(backing.copy_bytes for backing in live),
+                len(live),
+                len(pinned),
+                sum(backing.idle for backing in pinned),
+                sum(backing.leases > 0 for backing in live),
             )
 
-    def acquire(self, tensors: Iterable[torch.Tensor]) -> PinLease:
-        """Lease whole allocations, leaving capacity failures pageable.
+    def acquire(self, backings: Iterable[HostBacking]) -> HostLease:
+        """Lease backings, registering what the budget allows.
 
-        All input validation happens before registration or eviction. Existing
-        registrations anywhere in the request are protected before admitting
-        new ones, avoiding eviction of backing this same lease will use. A
-        native capacity failure reclaims unrelated idle registrations and
-        retries; if capacity remains unavailable, later allocations in this
-        acquisition skip registration.
+        Every requested backing is protected before any registration, so
+        admitting one cannot evict another in the same request. A native
+        capacity failure reclaims unrelated idle registrations and retries; if
+        capacity remains unavailable, later backings in this request skip
+        registration. Budget misses and backings with other active readers
+        stay pageable, as do private file mappings under an unbounded budget,
+        since they would need a copy.
         """
-        requests = self._requests(tensors)
-        private_file_mappings = _linux_private_file_mappings()
-        held: dict[int, _Registration] = {}
-        created: list[_Registration] = []
+        requested = self._requested(backings)
         with self._lock:
-            self._validate_ranges(requests)
+            for backing in requested:
+                backing.hold()
+            registered: list[HostBacking] = []
             try:
-                for pointer, request in requests.items():
-                    entry = self._entries.get(pointer)
-                    if entry is not None:
-                        self._hold(entry, request, held)
-                for pointer, request in requests.items():
-                    if pointer in held or pointer in self._pageable:
+                for backing in requested:
+                    if backing.pinned or backing.storage.nbytes() == 0 or backing.leases > 1 or backing.in_flight:
                         continue
-                    size = request.storage.nbytes()
-                    uncertain_nonresizable = (
-                        private_file_mappings is None
-                        and not request.storage.resizable()
-                    )
-                    if (
-                        uncertain_nonresizable
-                        or _overlaps_private_file_mapping(
-                            pointer, size, private_file_mappings
-                        )
-                        or not self._make_room(pointer, size)
-                    ):
-                        # Registering a MAP_PRIVATE file range can request
-                        # writable pins and instantiate every COW page.  Keep
-                        # checkpoint mappings pageable; H2D uses the bounded
-                        # staging path instead.  Ordinary budget misses take
-                        # the same pageable route.
+                    if backing.needs_copy and self._max_pinned_bytes is None:
+                        # Copies duplicate the mapping into RAM; only a finite
+                        # budget bounds that.
                         continue
-                    registered = self._try_register(pointer, size)
-                    while not registered and self._reclaim_idle_for_native_retry(
-                        pointer,
-                        size,
-                    ):
-                        registered = self._try_register(pointer, size)
-                    if not registered:
+                    if not self._make_room(backing.page_bytes):
+                        continue
+                    admitted = backing.pin()
+                    while not admitted and self._evict_idle(max(mmap.PAGESIZE, backing.page_bytes)):
+                        # Native capacity refused: reclaim an LRU batch and retry.
+                        admitted = backing.pin()
+                    if not admitted:
                         # Native capacity is still unavailable after reclaiming
-                        # every lower-priority idle registration that can help.
-                        # Avoid one failed runtime call per remaining tensor.
+                        # every idle registration that can help. Avoid one
+                        # failed runtime call per remaining backing.
                         break
-                    entry = _Registration(pointer, size, request.storage)
-                    _live_managers.add(self)
-                    self._entries[pointer] = entry
-                    self._starts.insert(bisect_left(self._starts, pointer), pointer)
-                    self._pinned_bytes += self._page_charge(pointer, size)
-                    for page in self._boundaries(pointer, size):
-                        self._boundary_pages[page] = self._boundary_pages.get(page, 0) + 1
-                    created.append(entry)
-                    self._hold(entry, request, held)
+                    registered.append(backing)
             except BaseException:
-                for entry in created:
-                    entry.retired = True
-                self._release(tuple(held.values()))
+                for backing in requested:
+                    backing.release()
+                for backing in registered:
+                    backing.unpin()
                 raise
-
-            key = self._next_lease
-            self._next_lease += 1
-            pageable = tuple(pointer for pointer in requests if pointer not in held)
-            for pointer in pageable:
-                allocation = self._pageable.get(pointer)
-                if allocation is None:
-                    allocation = _Pageable(requests[pointer].storage.nbytes())
-                    self._pageable[pointer] = allocation
-                    self._starts.insert(bisect_left(self._starts, pointer), pointer)
-                allocation.leases += 1
-            self._leases[key] = _LeaseState(
-                tuple(held.values()),
-                pageable,
-                tuple(tensor for request in requests.values() for tensor in request.tensors),
-            )
-            _live_managers.add(self)
-            registered = sum(entry.size for entry in held.values())
-            total = sum(request.storage.nbytes() for request in requests.values())
-            return PinLease(self, key, registered, total - registered)
+            return HostLease(requested, self._trim)
 
     def clear(self) -> None:
-        """Unregister idle entries.
+        """Unregister idle backings and free their copies.
 
         Live leases remain protected. A failed unregistration retains its
         storage and budget charge; cleanup errors propagate so callers can
         retry without losing ownership of registered memory.
         """
         with self._lock:
-            failed = 0
-            for pointer in tuple(self._idle):
-                entry = self._entries.get(pointer)
-                if entry is not None and not self._unregister(entry):
-                    failed += 1
+            failed = sum(
+                not backing.evict()
+                for backing in self._live()
+                if backing.idle and (backing.pinned or backing.copy_bytes)
+            )
             if failed:
                 raise RuntimeError(f"Could not release {failed} host registration(s); storage remains retained")
 
-    @staticmethod
-    def _requests(tensors: Iterable[torch.Tensor]) -> dict[int, _Request]:
-        requests: dict[int, _Request] = {}
-        seen: set[int] = set()
-        for tensor in tensors:
-            if type(tensor) is not torch.Tensor:
-                raise TypeError("HostMemoryManager requires plain CPU storage tensors")
-            if tensor.device.type != "cpu" or tensor.layout is not torch.strided:
-                raise ValueError("HostMemoryManager requires strided CPU storage tensors")
-            if id(tensor) in seen or tensor.numel() == 0:
-                continue
-            seen.add(id(tensor))
-            storage = tensor.untyped_storage()
-            pointer = storage.data_ptr()
-            request = requests.get(pointer)
-            if request is None:
-                requests[pointer] = _Request(storage, [tensor])
-            elif request.storage.nbytes() != storage.nbytes():
-                raise ValueError("Overlapping host storage ranges must use views of one storage")
-            else:
-                request.tensors.append(tensor)
-        return requests
+    def _trim(self) -> None:
+        """Evict idle excess after a release under a finite budget."""
+        with self._lock:
+            self._make_room(0)
 
-    def _validate_ranges(self, requests: dict[int, _Request]) -> None:
-        prior_end = 0
-        for pointer in sorted(requests):
-            end = pointer + requests[pointer].storage.nbytes()
-            index = bisect_left(self._starts, pointer)
-            neighbors = self._starts[max(0, index - 1):index + 1]
-            if pointer < prior_end:
-                raise ValueError("Overlapping host storage ranges must use views of one storage")
-            for other in neighbors:
-                allocation = self._entries.get(other) or self._pageable[other]
-                other_end = other + allocation.size
-                if pointer < other_end and other < end and (pointer != other or end != other_end):
-                    raise ValueError("Overlapping host storage ranges must use views of one storage")
-            prior_end = end
+    def _live(self) -> list[HostBacking]:
+        return list(self._backings.values())
 
-    @staticmethod
-    def _boundaries(pointer: int, size: int) -> tuple[int, ...]:
-        first = pointer // mmap.PAGESIZE
-        last = (pointer + size - 1) // mmap.PAGESIZE
-        return (first,) if first == last else (first, last)
+    def _idle_pinned(self) -> list[HostBacking]:
+        """Idle registrations, least recently released first."""
+        candidates = [backing for backing in self._live() if backing.pinned and backing.idle]
+        candidates.sort(key=lambda backing: backing.released_at)
+        return candidates
 
-    def _page_charge(self, pointer: int, size: int) -> int:
-        if size == 0:
-            return 0
-        pages = (pointer + size - 1) // mmap.PAGESIZE - pointer // mmap.PAGESIZE + 1
-        shared = sum(page in self._boundary_pages for page in self._boundaries(pointer, size))
-        return (pages - shared) * mmap.PAGESIZE
+    def _pinned_bytes(self) -> int:
+        return sum(backing.page_bytes for backing in self._live() if backing.pinned)
 
-    def _try_register(self, pointer: int, size: int) -> bool:
-        try:
-            registered = self._backend.register(pointer, size)
-        except Exception:
-            self._registration_failures += 1
-            raise
-        if not registered:
-            self._registration_failures += 1
-        return registered
+    def _requested(self, backings: Iterable[HostBacking]) -> tuple[HostBacking, ...]:
+        requested: dict[int, HostBacking] = {}
+        for backing in backings:
+            if not isinstance(backing, HostBacking):
+                raise TypeError("HostMemoryManager.acquire requires HostBacking handles from capture()")
+            if self._backings.get(backing.storage._cdata) is not backing:
+                raise ValueError("Host backing was not captured by this manager")
+            requested.setdefault(id(backing), backing)
+        return tuple(requested.values())
 
-    def _reclaim_idle_for_native_retry(self, pointer: int, size: int) -> bool:
-        """Evict an LRU batch before retrying a native-capacity failure."""
-        target = max(mmap.PAGESIZE, self._page_charge(pointer, size))
-        before = self._pinned_bytes
-        for candidate in tuple(self._idle):
-            entry = self._entries.get(candidate)
-            if entry is not None:
-                self._unregister(entry)
-            if before - self._pinned_bytes >= target:
+    def _evict_idle(self, target: int) -> int:
+        """Unregister idle backings, least recently released first, until ``target`` bytes are freed."""
+        freed = 0
+        for candidate in self._idle_pinned():
+            if freed >= target:
                 break
-        return self._pinned_bytes < before
+            charge = candidate.page_bytes
+            if candidate.unpin():
+                freed += charge
+        return freed
 
-    def _make_room(self, pointer: int, size: int) -> bool:
+    def _make_room(self, charge: int) -> bool:
+        """Fit ``charge`` more pinned bytes under a finite budget, evicting idle ones if needed."""
         limit = self._max_pinned_bytes
         if limit is None:
             return True
-        if size:
-            pages = (pointer + size - 1) // mmap.PAGESIZE - pointer // mmap.PAGESIZE + 1
-            if pages * mmap.PAGESIZE > limit:
-                return False
-        if self._pinned_bytes + self._page_charge(pointer, size) <= limit:
-            return True
-        for candidate in tuple(self._idle):
-            entry = self._entries.get(candidate)
-            if entry is not None:
-                self._unregister(entry)
-            if self._pinned_bytes + self._page_charge(pointer, size) <= limit:
-                return True
-        return False
-
-    def _hold(self, entry: _Registration, request: _Request, held: dict[int, _Registration]) -> None:
-        entry.leases += 1
-        held[entry.pointer] = entry
-        self._idle.pop(entry.pointer, None)
-        manager_ref, entry_ref = weakref.ref(self), weakref.ref(entry)
-
-        def owner_gone(_ref: weakref.ReferenceType[torch.Tensor]) -> None:
-            manager, registration = manager_ref(), entry_ref()
-            if manager is not None and registration is not None:
-                with manager._lock:
-                    registration.retired = True
-                    if registration.leases == 0 and manager._entries.get(registration.pointer) is registration:
-                        manager._unregister(registration)
-
-        for tensor in request.tensors:
-            if id(tensor) not in entry.owners:
-                entry.owners[id(tensor)] = weakref.ref(tensor, owner_gone)
-
-    def _unregister(self, entry: _Registration) -> bool:
-        assert entry.leases == 0
-        try:
-            self._backend.unregister(entry.pointer)
-        except Exception as error:
-            self._unregistration_failures += 1
-            # Tracebacks in buffered logs can retain storage after a later retry.
-            logger.warning("Host unregistration failed; retaining storage and budget charge: %s", str(error))
+        if charge > limit:
             return False
-        del self._entries[entry.pointer]
-        self._starts.pop(bisect_left(self._starts, entry.pointer))
-        self._idle.pop(entry.pointer, None)
-        for page in self._boundaries(entry.pointer, entry.size):
-            count = self._boundary_pages[page] - 1
-            if count:
-                self._boundary_pages[page] = count
-            else:
-                del self._boundary_pages[page]
-        self._pinned_bytes -= self._page_charge(entry.pointer, entry.size)
-        self._drop_lifetime_root_if_empty()
-        return True
-
-    def _release(self, entries: tuple[_Registration, ...]) -> None:
-        for entry in entries:
-            entry.leases -= 1
-            if entry.leases == 0:
-                self._idle[entry.pointer] = None
-                if entry.retired:
-                    self._unregister(entry)
-        self._make_room(0, 0)
-
-    def _close_lease(self, key: int) -> None:
-        with self._lock:
-            state = self._leases.get(key)
-            if state is None:
-                return
-            self._release(state.registrations)
-            for pointer in state.pageable:
-                allocation = self._pageable[pointer]
-                allocation.leases -= 1
-                if allocation.leases == 0:
-                    del self._pageable[pointer]
-                    self._starts.pop(bisect_left(self._starts, pointer))
-            del self._leases[key]
-            self._drop_lifetime_root_if_empty()
-
-    def _drop_lifetime_root_if_empty(self) -> None:
-        if not self._entries and not self._leases:
-            _live_managers.discard(self)
+        excess = self._pinned_bytes() + charge - limit
+        return excess <= 0 or self._evict_idle(excess) >= excess
 
 
-# Native registrations must outlive Python references to a manager. This root
-# retains managers with live registrations/leases, but their idle tensor owners
-# remain weak. Discarding the last source retires its registration and releases
-# the root. Failed cleanup keeps storage alive rather than freeing pinned bytes.
-_live_managers: set[HostMemoryManager] = set()
-
-__all__ = ["HostMemoryManager", "PinLease", "PinStats"]
+__all__ = ["HostMemoryManager", "HostMemoryStats"]

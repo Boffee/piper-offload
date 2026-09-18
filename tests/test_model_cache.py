@@ -43,10 +43,6 @@ def test_registered_models_and_adapters_share_cache_manager_after_rebuild():
             hosts = (*_hosts(offloader), delta.lora.a, delta.lora.b, delta.dense, value.backing)
             assert len(hosts) == 7
             assert all(host.memory_manager is memory for host in hosts)
-            assert all(
-                handle.memory_manager is memory
-                for host in hosts for handle in host.backing_handles()
-            )
             previous = offloader
         cache.clear()
 
@@ -105,30 +101,31 @@ def test_cache_activations_share_pin_budget_and_evict_only_idle_weights():
         with torch.no_grad():
             with cache.use(first, device="cuda", adapter_specs=[adapter]) as model:
                 torch.testing.assert_close(model(inputs.cuda()).cpu(), expected["first"])
-                assert memory.stats.active_leases == 1
+                assert memory.stats.active_backings == 3
                 assert len(backend.registrations) == 3  # Model weight and both LoRA factors.
                 budget = memory.stats.pinned_bytes
                 assert budget > 0
                 memory.max_pinned_bytes = budget
 
                 with cache.use(second, device="cuda") as other:
-                    assert memory.stats.active_leases == 2
+                    assert memory.stats.active_backings > 3
                     assert memory.stats.pinned_bytes <= budget
                     assert not backend.unregistrations
                     with cache.lease(second) as offloader:
                         lease = block_components(offloader)[0]._pin_leases[0]
-                        assert lease.pageable_bytes > 0
+                        assert not lease.pinned
                     torch.testing.assert_close(other(inputs.cuda()).cpu(), expected["second"])
 
-            assert memory.stats.active_leases == 0
+            assert memory.stats.active_backings == 0
             with cache.use(second, device="cuda") as other:
                 assert backend.unregistrations
                 assert 0 < memory.stats.pinned_bytes <= budget
                 with cache.lease(second) as offloader:
-                    assert block_components(offloader)[0]._pin_leases[0].registered_bytes > 0
+                    lease = block_components(offloader)[0]._pin_leases[0]
+                    assert any(backing.pinned for backing in lease.backings)
                 torch.testing.assert_close(other(inputs.cuda()).cpu(), expected["second"])
     finally:
         cache.clear()
         memory.clear()
-    assert memory.stats.active_leases == 0
+    assert memory.stats.active_backings == 0
     assert memory.stats.pinned_bytes == 0
