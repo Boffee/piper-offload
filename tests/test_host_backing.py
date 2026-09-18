@@ -194,11 +194,17 @@ def test_disposal_still_unregisters_when_waiting_for_a_copy_fails(tmp_path, capl
         def synchronize(self):
             raise RuntimeError("context is dead")
 
+    # Events from different streams or devices: a failed wait on the first
+    # must not skip the wait on the second, nor the unregistration.
+    later = _Completion()
     with backing._read(source, _Stream(Broken())):
+        pass
+    with backing._read(source, _Stream(later)):
         pass
     with caplog.at_level(logging.WARNING, logger="piper_offload._host_backing"):
         del backing
         gc.collect()
+    assert later.waited
     assert backend.unregister_calls == [copy_pointer]
     assert "context is dead" in caplog.text
 

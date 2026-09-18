@@ -103,13 +103,14 @@ class HostBacking:
         # leaves pages the driver could still touch, so the storage is freed.
         if sys.is_finalizing():
             return
-        try:
-            for event in getattr(self, "_in_flight", ()):
+        for event in getattr(self, "_in_flight", ()):
+            # Each event may belong to a different device or stream, so one
+            # failed wait says nothing about the others: wait for every one
+            # independently, then release the registration regardless.
+            try:
                 event.synchronize()
-        except Exception as error:
-            # A failed wait means the context is dead and nothing can still
-            # be reading; the registration must still be released.
-            logger.warning("Waiting for in-flight host copies failed during cleanup: %s", str(error))
+            except Exception as error:
+                logger.warning("Waiting for an in-flight host copy failed during cleanup: %s", str(error))
         if getattr(self, "_pinned", False):
             try:
                 self._backend.unregister(self._selected().data_ptr())
