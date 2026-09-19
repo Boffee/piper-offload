@@ -8,6 +8,7 @@ from torch import nn
 
 import piper_offload.block_component as block_component_module
 import piper_offload.host_component as host_component_module
+import piper_offload.merge as merge_module
 import piper_offload.model_offloader as model_offloader_module
 import piper_offload.pin_manager as pin_module
 from piper_offload import (
@@ -19,6 +20,7 @@ from piper_offload import (
     MappedCheckpoint,
     ModelOffloader,
     ParameterDelta,
+    merge_adapter,
     ParameterDeltaTransform,
     ParameterValue,
     PinManager,
@@ -60,6 +62,7 @@ def pins(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(host_component_module, "host_pin_manager", manager)
     monkeypatch.setattr(pin_module, "host_pin_manager", manager)
     monkeypatch.setattr(model_offloader_module, "host_pin_manager", manager)
+    monkeypatch.setattr(merge_module, "host_pin_manager", manager)
     yield manager, backend
     manager.clear()
     assert manager.stats.active_leases == 0
@@ -719,3 +722,52 @@ def test_routed_lora_factors_are_leased_while_their_hooks_are_installed(mode, pi
     assert manager.stats.idle_registrations == len(factors) + (2 if mode == "streaming" else 0)
     with pytest.raises(RuntimeError, match="outside a lease"):
         adapter.targets["blocks.0.proj.weight"].lora.a.materialize(torch.device("cuda"), non_blocking=True)
+
+
+def _routed_adapter() -> Adapter:
+    state = {}
+    for index in range(2):
+        state[f"blocks.{index}.proj.lora_A.weight"] = torch.randn(2, 8)
+        state[f"blocks.{index}.proj.lora_B.weight"] = torch.randn(8, 2)
+    return Adapter.from_state_dict(state)
+
+
+def _factor_tensors(adapter: Adapter) -> list[torch.Tensor]:
+    return [
+        tensor
+        for target in adapter.targets.values()
+        for host in (target.lora.a, target.lora.b)
+        for tensor in host.storage_tensors()
+    ]
+
+
+def test_cpu_routed_activation_takes_no_lease(pins) -> None:
+    manager, _backend = pins
+    adapter = _routed_adapter()
+    offloader = _make_offloader(_BlockModel(), block_mode="streaming")
+    try:
+        offloader.activate("cpu", adapters=[adapter], adapter_strengths=[0.5], adapter_mode="routed")
+        assert manager.stats.active_leases == 0
+        offloader.value(torch.randn(2, 8))
+    finally:
+        offloader.deactivate()
+
+
+@CUDA
+def test_permanent_merge_on_a_cuda_model_leases_pinned_factors(pins) -> None:
+    manager, backend = pins
+    adapter = _routed_adapter()
+    with manager.acquire(_factor_tensors(adapter)):
+        pass
+    registered = len(backend.registrations)
+    model = _BlockModel()
+    expected = {}
+    for name, target in adapter.targets.items():
+        a, b = (host.make_cpu_param().data for host in (target.lora.a, target.lora.b))
+        expected[name] = model.get_parameter(name).detach() + 0.5 * (b @ a)
+    model.cuda()
+    assert merge_adapter(model, [(adapter, 0.5)]) == 2
+    assert manager.stats.active_leases == 0
+    assert len(backend.registrations) == registered
+    for name, weight in expected.items():
+        torch.testing.assert_close(model.get_parameter(name).detach().cpu(), weight)

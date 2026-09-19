@@ -97,6 +97,8 @@ def _cgroup_memory_limit() -> int | None:
 
     A container or a systemd service can be far below the host's RAM, and its
     limit lives at the process's own cgroup path, not at the hierarchy root.
+    The hierarchy is assumed to be mounted at the standard ``/sys/fs/cgroup``;
+    set ``max_pinned_bytes`` explicitly on a host that mounts it elsewhere.
     """
     try:
         with open(_PROC_CGROUP, encoding="ascii") as membership:

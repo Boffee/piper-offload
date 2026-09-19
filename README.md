@@ -166,7 +166,8 @@ pin memory.
 `host_pin_manager` pins CPU storage under a separate `max_pinned_bytes`
 budget. Its default is half of the memory available to the process: physical
 RAM, or the tightest cgroup limit on the process's own cgroup or its
-ancestors when that is lower, rounded down to OS pages. Set
+ancestors when that is lower, rounded down to OS pages; the cgroup hierarchy
+is assumed to be mounted at `/sys/fs/cgroup`. Set
 another finite byte limit to cap registration, `max_pinned_bytes = 0` to
 disable it, or `None` to remove the application cap and register
 opportunistically up to the capacity currently available from CUDA/HIP.

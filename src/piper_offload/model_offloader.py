@@ -344,19 +344,21 @@ class ModelOffloader:
                 f"use adapter_mode='merge'. Dense parameter deltas: {dense_names!r}."
             )
 
-        # The hooks stage every factor again on each forward: hold the
-        # factors' storage, pageable, for the session so a pinned copy of it
-        # stays readable and is never evicted under a staging copy.
-        self._routed_lease = host_pin_manager.acquire(
-            (
-                tensor
-                for contributions in updates.values()
-                for factor in contributions.factors
-                for host in (factor.a, factor.b)
-                for tensor in host.storage_tensors()
-            ),
-            pin=False,
-        )
+        if self._active_device is not None and self._active_device.type == "cuda":
+            # The hooks stage every factor again on each forward: hold the
+            # factors' storage, pageable, for the session so a pinned copy of
+            # it stays readable and is never evicted under a staging copy. A
+            # CPU session stages synchronously and needs no lease.
+            self._routed_lease = host_pin_manager.acquire(
+                (
+                    tensor
+                    for contributions in updates.values()
+                    for factor in contributions.factors
+                    for host in (factor.a, factor.b)
+                    for tensor in host.storage_tensors()
+                ),
+                pin=False,
+            )
         for param_name, contributions in updates.items():
             parent, _leaf = resolve_parent_leaf(self._model, param_name)
             if not isinstance(parent, nn.Linear):
