@@ -47,7 +47,7 @@ when you need bespoke composition (e.g., multiple block lists like Flux's
 import contextlib
 import logging
 import weakref
-from collections.abc import Generator, Iterator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Self, cast
 
@@ -66,33 +66,12 @@ from .host_module import (
 )
 from .host_param import HostParam
 from .module_names import walk_attr_path
-from .pin_manager import PinLease, host_pin_manager
+from .pin_manager import PinLease, TransferLease, host_pin_manager
 from .resident_runtime import ResidentBlockRuntime
 from .rolling_runtime import RollingBlockRuntime, create_rolling_block_runtime
 from .streaming_runtime import StreamingBlockRuntime
 
 logger = logging.getLogger(__name__)
-
-
-def _host_transfer_tensors(
-    load_plans: Sequence[HostModuleLoadPlan],
-) -> Iterator[torch.Tensor]:
-    """Enumerate host storage that a streamed activation may read.
-
-    Replacements supersede frozen model sources. Optimizer steps still gather
-    and scatter the instance's own trainable backing, so retain that too. The
-    pin manager deduplicates aliases and whole storage allocations.
-    """
-    for plan in load_plans:
-        for load in plan.loads.values():
-            yield from load.source.storage_tensors()
-            if load.update is not None:
-                yield from load.update.storage_tensors()
-        for buffer in plan.instance.buffers.values():
-            yield from buffer.storage_tensors()
-        for host in plan.instance.params.values():
-            if host.requires_grad:
-                yield from host.storage_tensors()
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -655,6 +634,9 @@ class BlockComponent:
         otherwise uses streaming.
     """
 
+    _pin_lease: PinLease | None
+    _transfer: TransferLease
+
     def __init__(
         self,
         block_instances: Sequence[HostModuleInstance],
@@ -738,7 +720,9 @@ class BlockComponent:
         self._active_device: torch.device | None = None
         self._active_runtime: BlockRuntime | None = None
         self._load_plans: tuple[HostModuleLoadPlan, ...] = ()
-        self._pin_lease: PinLease | None = None
+        # Streaming and rolling hold one lease per session; resident holds
+        # one per transfer.
+        self._pin_lease, self._transfer = None, TransferLease()
         self._param_name_to_block_param = _build_param_name_index(
             self._block_instances,
             name,
@@ -990,9 +974,11 @@ class BlockComponent:
         Idempotent when already acquired. CPU sessions have no CUDA working
         set and therefore need no acquisition. The activation session and any
         installed compiled forwards remain intact across release/acquire
-        cycles. The component leases streaming and rolling host storage under
-        the global pin budget before the selected runtime starts. Resident
-        mode does not use a host pin lease.
+        cycles. The component leases host storage before the selected runtime
+        starts. Streaming and rolling ask the lease to register that storage
+        under the global pin budget, since they read it every step; a resident
+        upload leases it pageable, registers nothing, and releases the lease
+        once the runtime has synchronized the upload.
         """
         active_device = self._active_device
         if active_device is None:
@@ -1004,15 +990,25 @@ class BlockComponent:
             raise RuntimeError("BlockComponent CUDA session has no selected runtime.")
         if runtime.acquired:
             return
+        sources = (tensor for plan in self._load_plans for tensor in plan.storage_tensors())
+        if self._block_mode == "resident":
+            # A one-time upload: lease the sources pageable, for the upload
+            # only; the runtime synchronizes it before returning.
+            self._transfer.start(host_pin_manager, sources, active_device)
+            runtime.acquire(active_device, self._load_plans)
+            self._transfer.finish()
+            return
         if self._pin_lease is not None:
             raise RuntimeError(
                 "BlockComponent cannot acquire while prior pin cleanup is incomplete."
             )
-        if self._block_mode != "resident":
-            self._pin_lease = host_pin_manager.acquire(
-                _host_transfer_tensors(self._load_plans)
-            )
+        self._pin_lease = host_pin_manager.acquire(sources)
         runtime.acquire(active_device, self._load_plans)
+
+    def _close_pin_lease(self) -> None:
+        if self._pin_lease is not None:
+            self._pin_lease.close()
+            self._pin_lease = None
 
     def release(self) -> None:
         """Idempotently release this session's CUDA working set.
@@ -1022,10 +1018,10 @@ class BlockComponent:
         and compiled forwards remain installed, so :meth:`acquire` can prepare
         the same session for another traversal. Target retirement completes
         recorded CUDA work, so release is safe immediately after a forward.
-        Streaming host pin leases are released after the runtime confirms all
-        copies have completed. Their
-        registrations remain in the idle LRU for reuse until budget pressure,
-        explicit clearing, or source disposal unregisters them.
+        Host pin leases are released after the runtime confirms all copies
+        have completed. Their registrations remain in the idle LRU for reuse
+        until budget pressure, explicit clearing, or source disposal
+        unregisters them.
         """
         runtime = self._active_runtime
         if runtime is None:
@@ -1034,10 +1030,8 @@ class BlockComponent:
             runtime.release()
         finally:
             if not runtime.acquired:
-                lease = self._pin_lease
-                if lease is not None:
-                    lease.close()
-                    self._pin_lease = None
+                self._close_pin_lease()
+                self._transfer.finish()
 
     def deactivate(self) -> None:
         """Tear down active resources idempotently — safe to call
@@ -1087,14 +1081,35 @@ class BlockComponent:
             return
 
         runtime = self._active_runtime
-        if runtime is None:
+        active_device = self._active_device
+        if runtime is None or active_device is None:
             raise RuntimeError(
                 "BlockComponent.optimizer_step() called on inactive "
                 "block component. Use it inside the offloader's context "
                 "manager, between backward and the next forward."
             )
-        with runtime.optimizer_step():
-            yield
+        if self._block_mode != "resident":
+            # The session lease already covers the trainables it copies back.
+            with runtime.optimizer_step():
+                yield
+            return
+
+        # The copy-back writes host storage once per step; lease it pageable,
+        # for the copy-back only.
+        self._transfer.start(
+            host_pin_manager,
+            (
+                tensor
+                for instance in self._block_instances
+                for tensor in instance.trainable_storage_tensors()
+            ),
+            active_device,
+        )
+        try:
+            with runtime.optimizer_step():
+                yield
+        finally:
+            self._transfer.finish()
 
     def gather_for_step(self) -> contextlib.AbstractContextManager[None]:
         """Backward-compatible alias for :meth:`optimizer_step`."""

@@ -66,6 +66,7 @@ from .host_module import (
     HostModuleStore,
     ParameterOverride,
 )
+from .pin_manager import TransferLease, host_pin_manager
 from .target_lease import CudaTargetLease
 
 
@@ -162,6 +163,7 @@ class HostComponent:
         self._active_device: torch.device | None = None
         self._load_plan: HostModuleLoadPlan | None = None
         self._lease: CudaTargetLease | None = None
+        self._transfer = TransferLease()
         self._use_hook: torch.utils.hooks.RemovableHandle | None = None
         self._optimizer_step_active: bool = False
 
@@ -251,16 +253,18 @@ class HostComponent:
         if plan is None:
             raise RuntimeError("HostComponent CUDA session has no load plan.")
         current_stream = torch.cuda.current_stream(active_device)
-        lease = CudaTargetLease.allocate(plan, active_device)
-        self._lease = lease
+        # A one-time upload: lease the sources pageable, for the upload only.
+        self._transfer.start(host_pin_manager, plan.storage_tensors(), active_device)
         try:
+            lease = CudaTargetLease.allocate(plan, active_device)
+            self._lease = lease
             lease.stage(
                 plan,
                 current_stream,
                 non_blocking=True,
             )
             self._instance.install_target(lease.acquire(current_stream))
-            torch.cuda.synchronize(active_device)
+            self._transfer.finish()
             # Realign trainable grads with their now-GPU data so the next
             # backward accumulates on-device. A no-op unless a prior CPU
             # optimizer step left a retained CPU grad (set_to_none=False).
@@ -317,6 +321,9 @@ class HostComponent:
         ``.grad`` both on CPU — so a context-free CPU
         ``optimizer.step()`` works the same for host and streamed
         trainables."""
+        # A partial upload or copy-back may still be in flight; its lease
+        # closes only once the device has synchronized.
+        self._transfer.finish()
         lease = self._lease
         if lease is None:
             return
@@ -380,14 +387,19 @@ class HostComponent:
                         "HostComponent optimizer-step state is inconsistent: "
                         "CUDA active without an active target."
                     )
+                self._transfer.start(
+                    host_pin_manager, self._instance.trainable_storage_tensors(), active_device,
+                )
                 try:
                     yield
                 finally:
-                    self._instance.copy_trainables_from_target(
-                        lease.target,
-                        non_blocking=True,
-                    )
-                    torch.cuda.synchronize(active_device)
+                    try:
+                        self._instance.copy_trainables_from_target(
+                            lease.target,
+                            non_blocking=True,
+                        )
+                    finally:
+                        self._transfer.finish()
             else:
                 yield
         finally:
