@@ -1,7 +1,9 @@
 """Budgeted host registrations with active leases and an idle LRU.
 
 Use the process-wide ``host_pin_manager`` for application registrations. Its
-budget defaults to half of physical RAM, rounded down to whole OS pages. Set
+budget defaults to half of the memory available to the process, physical RAM
+or the container's cgroup limit when that is lower, rounded down to whole OS
+pages. Set
 it to zero to disable registration or ``None`` to remove the application cap
 and register opportunistically up to native CUDA/HIP capacity. Construction
 and configuration perform no CUDA initialization. Isolated ``PinManager``
@@ -69,22 +71,45 @@ class _MemoryStatus(ctypes.Structure):
     ]
 
 
+# The process's cgroup memory limit, v2 then v1; "max" or a huge number when unlimited.
+_CGROUP_LIMIT_FILES = ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+
+
+def _physical_memory() -> int:
+    if sys.platform == "win32":
+        status = _MemoryStatus()
+        status.length = ctypes.sizeof(status)
+        query = ctypes.WinDLL("kernel32", use_last_error=True).GlobalMemoryStatusEx
+        query.argtypes = (ctypes.POINTER(_MemoryStatus),)
+        query.restype = ctypes.c_int
+        if not query(ctypes.byref(status)):
+            raise OSError("GlobalMemoryStatusEx failed")
+        return status.total_physical
+    return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+
+
+def _cgroup_memory_limit() -> int | None:
+    """The container's memory limit on Linux, which can be far below the host's RAM."""
+    for path in _CGROUP_LIMIT_FILES:
+        try:
+            with open(path, encoding="ascii") as limit:
+                text = limit.read().strip()
+        except OSError:
+            continue
+        if text.isdigit():
+            return int(text)
+    return None
+
+
 def _default_pin_budget() -> int:
-    """Half of physical RAM, rounded down to OS pages, without touching CUDA."""
+    """Half of the memory available to the process, rounded down to OS pages, without touching CUDA."""
     try:
-        if sys.platform == "win32":
-            status = _MemoryStatus()
-            status.length = ctypes.sizeof(status)
-            query = ctypes.WinDLL("kernel32", use_last_error=True).GlobalMemoryStatusEx
-            query.argtypes = (ctypes.POINTER(_MemoryStatus),)
-            query.restype = ctypes.c_int
-            if not query(ctypes.byref(status)):
-                raise OSError("GlobalMemoryStatusEx failed")
-            total = status.total_physical
-        else:
-            total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        total = _physical_memory()
         if total <= 0:
             raise ValueError("physical RAM is unavailable")
+        limit = _cgroup_memory_limit()
+        if limit is not None:
+            total = min(total, limit)
         return total // (2 * mmap.PAGESIZE) * mmap.PAGESIZE
     except (AttributeError, OSError, ValueError) as error:
         logger.warning("Cannot determine physical RAM; the default host pin budget is zero: %s", error)
@@ -577,22 +602,29 @@ class PinManager:
         size = _page_rounded(request.storage.nbytes())
         if not self._make_room(lambda: size):
             return _Refusal.BUDGET
-        copy = _Copy(size)
+        try:
+            copy = _Copy(size)
+        except (OSError, MemoryError) as error:
+            logger.warning("Could not allocate a pinned copy; the checkpoint storage stays pageable: %s", error)
+            return _Refusal.BUDGET
         # Charged at allocation, before the fill, so nothing else is admitted
         # into the same budget while the read is in progress.
         self._pinned_bytes += size
+        admitted = False
         try:
-            _fill_copy(copy, source)
-        except OSError as error:
-            logger.warning("Could not fill a pinned copy from the checkpoint; it stays pageable: %s", error)
-            refusal = _Refusal.BUDGET
-        else:
-            if self._register(copy.pointer, size):
-                return _Registration(pointer, request.storage.nbytes(), request.storage, copy)
-            refusal = _Refusal.CAPACITY
-        self._pinned_bytes -= size
-        copy.free()
-        return refusal
+            try:
+                _fill_copy(copy, source)
+            except OSError as error:
+                logger.warning("Could not fill a pinned copy from the checkpoint; it stays pageable: %s", error)
+                return _Refusal.BUDGET
+            admitted = self._register(copy.pointer, size)
+            if not admitted:
+                return _Refusal.CAPACITY
+            return _Registration(pointer, request.storage.nbytes(), request.storage, copy)
+        finally:
+            if not admitted:
+                self._pinned_bytes -= size
+                copy.free()
 
     def _register(self, pointer: int, size: int) -> bool:
         """Register natively, reclaiming idle LRU batches while the runtime refuses capacity."""

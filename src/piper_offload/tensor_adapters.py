@@ -217,7 +217,14 @@ class TensorAdapter[HostStateT, GpuStateT](Protocol):
     def copy_to_gpu(
         src: HostStateT, dst: GpuStateT, *, non_blocking: bool = False
     ) -> None:
-        """Bulk DMA the host state's bytes into pre-allocated GPU storage."""
+        """Bulk DMA the host state's bytes into pre-allocated GPU storage.
+
+        Copy every physical tensor through :func:`transfer_` rather than
+        ``Tensor.copy_``: a checkpoint storage pinned through an owned copy
+        is read from that copy only when the transfer asks for it, and an
+        adapter that copies from ``src`` directly pays for the copy without
+        using it.
+        """
         ...
 
     @staticmethod

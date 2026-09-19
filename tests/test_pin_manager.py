@@ -92,7 +92,24 @@ def test_default_budget_is_half_of_physical_ram(monkeypatch) -> None:
     monkeypatch.setattr(pin_module.sys, "platform", "linux")
     values = {"SC_PHYS_PAGES": 101, "SC_PAGE_SIZE": PAGE}
     monkeypatch.setattr(pin_module.os, "sysconf", values.__getitem__, raising=False)
+    monkeypatch.setattr(pin_module, "_CGROUP_LIMIT_FILES", ())
     assert pin_module._default_pin_budget() == 50 * PAGE
+
+
+@pytest.mark.parametrize(
+    ("limit", "expected_pages"),
+    [("20", 10), ("max", 50), ("9223372036854771712", 50)],
+    ids=["below-ram", "v2-unlimited", "v1-unlimited"],
+)
+def test_default_budget_is_bounded_by_the_cgroup_limit(monkeypatch, tmp_path, limit, expected_pages) -> None:
+    monkeypatch.setattr(pin_module.sys, "platform", "linux")
+    values = {"SC_PHYS_PAGES": 101, "SC_PAGE_SIZE": PAGE}
+    monkeypatch.setattr(pin_module.os, "sysconf", values.__getitem__, raising=False)
+    missing = tmp_path / "memory" / "memory.limit_in_bytes"
+    present = tmp_path / "memory.max"
+    present.write_text(f"{limit if not limit.isdigit() else int(limit) * PAGE}\n")
+    monkeypatch.setattr(pin_module, "_CGROUP_LIMIT_FILES", (str(missing), str(present)))
+    assert pin_module._default_pin_budget() == expected_pages * PAGE
 
 
 @pytest.mark.parametrize("success", [False, True])
@@ -842,6 +859,41 @@ def test_failed_fill_leaves_the_storage_pageable(backend: FakeBackend, tmp_path,
         assert (lease.registered_bytes, lease.pageable_bytes) == (0, 2 * PAGE)
         assert backend.register_calls == [] and manager.stats.pinned_bytes == 0
     assert "injected read failure" in caplog.text
+    manager.clear()
+
+
+def test_copy_registration_error_rolls_back_the_charge(backend: FakeBackend, tmp_path, monkeypatch) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    manager = PinManager(4 * PAGE, backend=backend)
+
+    def broken(_pointer: int, _size: int) -> bool:
+        raise HostRegistrationError("registration", 700)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(backend, "register", broken)
+        with pytest.raises(HostRegistrationError):
+            manager.acquire([tensor])
+    assert manager.stats.pinned_bytes == 0 and manager.stats.copy_bytes == 0
+    assert manager.stats.active_leases == 0
+    with manager.acquire([tensor]) as lease:
+        assert lease.registered_bytes == 2 * PAGE
+    manager.clear()
+
+
+def test_copy_allocation_failure_leaves_the_storage_pageable(
+    backend: FakeBackend, tmp_path, monkeypatch, caplog,
+) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+
+    def exhausted(_size: int) -> None:
+        raise MemoryError("injected allocation failure")
+
+    monkeypatch.setattr(pin_module, "_Copy", exhausted)
+    manager = PinManager(4 * PAGE, backend=backend)
+    with caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager"), manager.acquire([tensor]) as lease:
+        assert (lease.registered_bytes, lease.pageable_bytes) == (0, 2 * PAGE)
+        assert backend.register_calls == [] and manager.stats.pinned_bytes == 0
+    assert "injected allocation failure" in caplog.text
     manager.clear()
 
 

@@ -125,7 +125,7 @@ reconstruct without changing its encoding.
 including tensor-valued metadata, without copying or rebuilding wrappers.
 
 The process-wide :data:`host_pin_manager` can pin that storage under a finite
-page-rounded budget, half of physical RAM by default, or opportunistically up
+page-rounded budget, half of the process's available memory by default, or opportunistically up
 to native CUDA/HIP capacity with ``None``; zero disables registration.
 :class:`PinLease` protects backing until its owner explicitly closes it;
 released registrations enter an idle LRU. Anonymous storage registers in
@@ -213,6 +213,7 @@ from .seeding import derive_seed
 from .tensor_adapter_registry import register_adapter
 from .tensor_adapters import (
     TensorAdapter,
+    transfer_,
 )
 
 __all__ = [
@@ -271,4 +272,5 @@ __all__ = [
     "host_pin_manager",
     "merge_adapter",
     "register_adapter",
+    "transfer_",
 ]
