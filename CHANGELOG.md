@@ -17,6 +17,16 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
+- Every host transfer now runs under a pin lease, and `PinManager.acquire()`
+  takes `pin=`. With it, the default used by streaming, rolling, and the
+  relay, the lease registers what the budget allows. Without it, used by
+  resident block uploads, `HostComponent` uploads, and the optimizer
+  copy-back, the lease holds existing registrations and tracks pageable
+  sources but registers nothing, so which storage is pinned is unchanged. A
+  failed synchronization keeps the lease open until cleanup succeeds.
+  `HostModuleLoadPlan.storage_tensors()` and
+  `HostModuleInstance.trainable_storage_tensors()` enumerate the storage a
+  transfer touches.
 - Piper never writes into a file mapping. `HostParam` copies a trainable
   parameter out of storage the process does not own at capture, and
   `merge_adapter()` replaces such a target by an independent parameter under

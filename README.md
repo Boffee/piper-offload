@@ -168,9 +168,11 @@ pin memory.
 registration proceeds opportunistically up to the capacity currently available
 from CUDA/HIP. Set a finite byte limit to cap registration, or set
 `max_pinned_bytes = 0` to disable it. Construction and configuration do not
-initialize CUDA. Ordinary streaming and compiled rolling acquire leases
-automatically with their CUDA working sets. CPU execution, resident blocks,
-and non-block components do not acquire pin leases.
+initialize CUDA. Every CUDA transfer runs under a lease. Ordinary streaming
+and compiled rolling ask their lease to register the storage they read every
+step; resident blocks, non-block components, and the optimizer copy-back lease
+their storage pageable, so a one-time upload never pins anything. CPU
+execution does not acquire leases.
 
 Registering a private file mapping, such as a safetensors checkpoint, locks its
 pages for writing, and the kernel answers by copying every page into private
@@ -210,7 +212,9 @@ with host_pin_manager.acquire([source]):
 # The source may remain registered in the idle LRU after the lease closes.
 ```
 
-Do not write into a private file mapping while it is registered here.
+Pass `pin=False` to protect the sources of a one-time transfer without
+registering them. Do not write into a private file mapping while it is
+registered here.
 
 For model backing, pass tensors from `HostParam.storage_tensors()` and
 `HostBuffer.storage_tensors()`. Acquiring a lease protects existing

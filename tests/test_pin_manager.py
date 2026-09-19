@@ -15,6 +15,7 @@ import torch
 import piper_offload._host_registration as registration_module
 from piper_offload._host_registration import HostRegistrationError, RuntimeHostRegistration
 from piper_offload import PinManager, host_pin_manager
+from piper_offload.pin_manager import TransferLease
 
 PAGE = mmap.PAGESIZE
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device required")
@@ -645,6 +646,68 @@ def test_real_foreign_registration_is_never_unregistered() -> None:
         assert tensor.is_pinned()
     finally:
         backend.unregister(pointer)
+
+
+def test_pageable_lease_registers_nothing_and_tracks_its_sources(backend: FakeBackend) -> None:
+    manager = PinManager(4 * PAGE, backend=backend)
+    first, second = _tensors((0, PAGE), (PAGE, PAGE))
+    with manager.acquire([first, second], pin=False) as lease:
+        assert (lease.registered_bytes, lease.pageable_bytes) == (0, 2 * PAGE)
+        assert backend.register_calls == []
+        assert manager.stats.active_leases == 1
+        assert manager.stats.pinned_bytes == 0
+    assert manager.stats.active_leases == 0
+    manager.clear()
+
+
+def test_pageable_lease_holds_existing_registrations_out_of_eviction(backend: FakeBackend) -> None:
+    manager = PinManager(2 * PAGE, backend=backend)
+    held, fresh, extra = _tensors((0, PAGE), (PAGE, PAGE), (2 * PAGE, PAGE))
+    with manager.acquire([held]):
+        pass
+    assert manager.stats.registrations == 1
+    with manager.acquire([held], pin=False) as lease:
+        assert (lease.registered_bytes, lease.pageable_bytes) == (PAGE, 0)
+        with manager.acquire([fresh, extra]) as pinning:
+            # The held entry is not idle, so only one more page fits the budget.
+            assert (pinning.registered_bytes, pinning.pageable_bytes) == (PAGE, PAGE)
+        assert backend.unregister_calls == []
+    with manager.acquire([extra]) as later:
+        # Once the pageable lease closes, its entry is idle and evictable again.
+        assert later.registered_bytes == PAGE
+        assert len(backend.unregister_calls) == 1
+    manager.clear()
+
+
+def test_transfer_lease_keeps_protection_until_synchronization_succeeds(backend: FakeBackend, monkeypatch) -> None:
+    manager = PinManager(backend=backend)
+    (source,) = _tensors((0, PAGE))
+    device = torch.device("cuda", 3)
+    synchronized: list[torch.device] = []
+    failing = True
+
+    def synchronize(sync_device: torch.device) -> None:
+        synchronized.append(sync_device)
+        if failing:
+            raise RuntimeError("injected synchronization failure")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+    transfer = TransferLease()
+    transfer.start(manager, [source], device)
+    assert transfer.open and manager.stats.active_leases == 1
+    assert backend.register_calls == []
+    with pytest.raises(RuntimeError, match="still unfinished"):
+        transfer.start(manager, [source], device)
+    with pytest.raises(RuntimeError, match="injected"):
+        transfer.finish()
+    assert transfer.open and manager.stats.active_leases == 1
+    failing = False
+    transfer.finish()
+    assert not transfer.open and manager.stats.active_leases == 0
+    # Retries synchronize the transfer's own device, and a closed lease is inert.
+    assert synchronized == [device, device]
+    transfer.finish()
+    assert synchronized == [device, device]
 
 
 def test_read_only_checkpoint_mappings_stay_pageable(backend, tmp_path) -> None:

@@ -301,6 +301,12 @@ class HostModuleInstance:
             seen.add(param_id)
             yield param
 
+    def trainable_storage_tensors(self) -> Iterator[torch.Tensor]:
+        """Host destinations for optimizer copy-back, including tied storage."""
+        for host in self.params.values():
+            if host.requires_grad:
+                yield from host.storage_tensors()
+
 
 @dataclass(frozen=True, slots=True, init=False)
 class HostModuleLoadPlan:
@@ -339,6 +345,21 @@ class HostModuleLoadPlan:
     def sources(self) -> dict[str, HostParam]:
         """Effective source backing for every parameter loaded by this plan."""
         return {name: load.source for name, load in self.loads.items()}
+
+    def storage_tensors(self) -> Iterator[torch.Tensor]:
+        """Host transfer sources and optimizer backing, without alias deduplication.
+
+        Replacements supersede frozen sources; optimizer steps still write
+        the instance's own trainable storage. The pin manager deduplicates
+        aliases and whole storage allocations.
+        """
+        for load in self.loads.values():
+            yield from load.source.storage_tensors()
+            if load.update is not None:
+                yield from load.update.storage_tensors()
+        for buffer in self.instance.buffers.values():
+            yield from buffer.storage_tensors()
+        yield from self.instance.trainable_storage_tensors()
 
     def select_parameters(
         self,

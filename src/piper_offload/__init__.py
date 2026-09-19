@@ -133,11 +133,13 @@ checkpoint in place copies it into private memory until the mapping is
 released; read-only checkpoint mappings are never registered in place. Piper
 never writes into a file mapping: trainable parameters and merge targets are
 copied out first.
-Block components acquire leases for ordinary streaming and compiled rolling,
-then close them only after their runtime has completed pending transfers. CUDA
-runtimes own stream ordering and remain independent of pin-budget policy. CPU
-and resident execution do not acquire pins. Host-data caching remains
-independent of this registration budget.
+Every CUDA transfer runs under a lease that closes only after its runtime
+has completed the pending copies: streaming and rolling register the storage
+they read every step, while resident and host uploads and the optimizer
+copy-back lease it pageable and register nothing. CUDA runtimes own stream
+ordering and remain independent of pin-budget policy. CPU execution does not
+acquire leases. Host-data caching remains independent of this registration
+budget.
 
 :class:`ResourceCache` manages cached backing stores with optional
 policy-driven byte eviction, reference-counted leases, and transactional

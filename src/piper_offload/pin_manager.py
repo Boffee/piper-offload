@@ -6,6 +6,11 @@ CUDA/HIP capacity. Set it to zero to disable registration. Construction and
 configuration perform no CUDA initialization. Isolated ``PinManager`` instances
 can use an injected backend for testing.
 
+Every host transfer runs under a lease, so nothing is read or written while
+it could be evicted, and only transfers that repeat ask the lease to pin:
+streaming, rolling, and the relay register their storage; a resident or host
+upload and the optimizer copy-back lease it pageable.
+
 Native registration uses whole storage byte ranges, including private file
 mappings of checkpoints. Locking such a mapping for writing makes the kernel
 copy every page into private memory, and unregistering does not undo that:
@@ -122,6 +127,55 @@ class PinLease:
         self.close()
 
 
+class TransferLease:
+    """A pageable lease over one transfer, closed only once its device has synchronized.
+
+    ``start`` leases the transfer's sources without registering them, and
+    ``finish`` synchronizes the device the transfer used before closing the
+    lease. A synchronization that fails leaves the lease open, so the sources
+    stay protected until a later ``finish`` succeeds, and no new transfer can
+    start on this token until then.
+    """
+
+    __slots__ = ("_device", "_lease")
+
+    def __init__(self) -> None:
+        self._lease: PinLease | None = None
+        self._device: torch.device | None = None
+
+    @property
+    def open(self) -> bool:
+        return self._lease is not None
+
+    def start(self, manager: PinManager, tensors: Iterable[torch.Tensor], device: torch.device) -> None:
+        if self._lease is not None:
+            raise RuntimeError(
+                "A host transfer is still unfinished; release the component so its "
+                "synchronization can be retried before starting another."
+            )
+        self._lease = manager.acquire(tensors, pin=False)
+        self._device = device
+
+    def finish(self) -> None:
+        """Synchronize the transfer's device, then close the lease; idempotent."""
+        if self._lease is None:
+            return
+        torch.cuda.synchronize(self._device)
+        self.close()
+
+    def close(self) -> None:
+        """Close once the owner has observed the transfer complete; idempotent.
+
+        A runtime that synchronizes the transfer's own stream reaches that
+        point without a second, device-wide synchronization.
+        """
+        if self._lease is None:
+            return
+        self._lease.close()
+        self._lease = None
+        self._device = None
+
+
 class PinManager:
     """Own registrations under a page-rounded budget.
 
@@ -202,8 +256,15 @@ class PinManager:
                 self._unregistration_failures,
             )
 
-    def acquire(self, tensors: Iterable[torch.Tensor]) -> PinLease:
-        """Lease whole allocations, leaving capacity failures pageable.
+    def acquire(self, tensors: Iterable[torch.Tensor], *, pin: bool = True) -> PinLease:
+        """Lease whole allocations for a transfer, registering them only if ``pin``.
+
+        A lease protects its sources until it closes: registrations they
+        already have are held out of eviction, and everything else is tracked
+        as pageable. With ``pin`` the lease also registers what the budget
+        allows, for storage that repeats every step; without it nothing new
+        is registered, for a transfer that runs once, so leasing never
+        changes which storage is pinned.
 
         All input validation happens before registration or eviction. Existing
         registrations anywhere in the request are protected before admitting
@@ -223,7 +284,7 @@ class PinManager:
                     if entry is not None:
                         self._hold(entry, request, held)
                 for pointer, request in requests.items():
-                    if pointer in held or pointer in self._pageable:
+                    if not pin or pointer in held or pointer in self._pageable:
                         continue
                     if file_slice(request.storage) is not None:
                         # A read-only checkpoint mapping cannot be locked for
