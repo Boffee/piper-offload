@@ -20,6 +20,7 @@ from .tensor_adapters import (
     LoRAMergeValidationTensorAdapter,
     MergeLocalityTensorAdapter,
     adapter_name,
+    transfer_,
 )
 
 __all__ = [
@@ -228,6 +229,13 @@ class _MaterializedWeightFactor:
     b: torch.Tensor
 
 
+def _stage(tensor: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """A contiguous ``dtype`` copy of a host tensor on ``device``, read from its pinned copy if any."""
+    staged = torch.empty(tensor.shape, dtype=dtype, device=device)
+    transfer_(staged, tensor, non_blocking=True)
+    return staged
+
+
 def _materialize_weight_factors(
     factors: Sequence[ScaledLoRAFactor],
 ) -> list[_MaterializedWeightFactor]:
@@ -303,8 +311,8 @@ def _pack_materialized_weight_factors(
         next_offset = rank_offset + factor.a.shape[0]
         a_slice = a_packed[rank_offset:next_offset]
         b_slice = b_packed[:, rank_offset:next_offset]
-        a_slice.copy_(factor.a, non_blocking=True)
-        b_slice.copy_(factor.b, non_blocking=True)
+        transfer_(a_slice, factor.a, non_blocking=True)
+        transfer_(b_slice, factor.b, non_blocking=True)
         if factor.strength != 1.0:
             # Scaling the contiguous A slice keeps B's strided destination
             # copy as the only non-contiguous operation for each factor.
@@ -543,16 +551,8 @@ class LoRATransform:
         if len(factors) == 1:
             factor = factors[0]
             return (
-                factor.b.to(
-                    device=data.device,
-                    dtype=compute_dtype,
-                    non_blocking=True,
-                ).contiguous(),
-                factor.a.to(
-                    device=data.device,
-                    dtype=compute_dtype,
-                    non_blocking=True,
-                ).contiguous(),
+                _stage(factor.b, device=data.device, dtype=compute_dtype),
+                _stage(factor.a, device=data.device, dtype=compute_dtype),
                 factor.strength,
             )
 

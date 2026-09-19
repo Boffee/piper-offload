@@ -12,11 +12,13 @@ parameter-value transforms. Permanent merge applies them to resident model
 parameters; activation merge invokes them after individual parameter copies.
 """
 
+import contextlib
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+import torch
 from torch import nn
 
 from .adapter import Adapter, AdapterTargetUpdates
@@ -24,6 +26,7 @@ from .module_names import resolve_parent_leaf
 from .parameter_delta import ParameterDeltaTransform
 from .parameter_transform import ParameterTransform
 from .parameter_value import ParameterValueTransform
+from .pin_manager import host_pin_manager
 from .tensor_adapter_registry import (
     param_representation,
     param_tensor_id,
@@ -184,11 +187,22 @@ def _merge_adapters(
     # Preflight every operation before applying any of them. This catches all
     # expected name, shape, and adapter-capability errors without leaving a
     # permanently half-merged model.
-    for op in merge_ops:
-        op.validate()
-
-    for op in merge_ops:
-        op.apply(model)
+    # Validation and application both stage adapter sources onto a CUDA
+    # target asynchronously, so the sources are leased, pageable, until the
+    # device has synchronized; a failed step may already have enqueued copies.
+    # If the synchronization itself fails the context is unusable and no
+    # later call could retry it, so the lease closes with this function.
+    devices = {op.param.device for op in merge_ops if op.param.device.type == "cuda"}
+    sources = (tensor for op in merge_ops for tensor in op.transform.storage_tensors())
+    with host_pin_manager.acquire(sources, pin=False) if devices else contextlib.nullcontext():
+        try:
+            for op in merge_ops:
+                op.validate()
+            for op in merge_ops:
+                op.apply(model)
+        finally:
+            for device in devices:
+                torch.cuda.synchronize(device)
 
     modified_tensor_ids = {param_tensor_id(op.param) for op in merge_ops}
 

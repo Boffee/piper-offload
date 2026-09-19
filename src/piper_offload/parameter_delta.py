@@ -29,6 +29,7 @@ from .tensor_adapters import (
     LogicalShapeTensorAdapter,
     MergeLocalityTensorAdapter,
     adapter_name,
+    transfer_,
 )
 
 __all__ = [
@@ -372,11 +373,8 @@ class ParameterDeltaTransform:
                 offsets=plan.offsets,
                 local_shape=plan.local_shape,
             )
-            staged = local_source.to(
-                device=target.device,
-                dtype=plan.compute_dtype,
-                non_blocking=True,
-            )
+            staged = torch.empty(local_source.shape, dtype=plan.compute_dtype, device=target.device)
+            transfer_(staged, local_source, non_blocking=True)
             update.add_(staged, alpha=strength)
         self._accumulate_lora(update, plan)
         return update

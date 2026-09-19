@@ -406,7 +406,7 @@ def _activate_loras_for_test(
         strategy._register_routed_lora_hooks(targets)
         return len(strategy._routed_hook_removers) - before
     finally:
-        strategy._clear_active_adapter_hooks()
+        strategy._clear_active_adapter_hooks(synchronized=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1478,7 +1478,7 @@ class TestActivationLoraValidation:
         _activate_loras_for_test(s)
         assert _has_parameter_update(s, "transformer_blocks.0.attn.weight")
         assert s._routed_hook_removers == []
-        s._clear_active_adapter_hooks()
+        s._clear_active_adapter_hooks(synchronized=True)
         assert _has_parameter_update(s, "transformer_blocks.0.attn.weight")
 
     def test_accepts_quanto_target_in_merge_mode(self) -> None:
@@ -4622,7 +4622,7 @@ class TestRoutedMode:
             assert len(model.embed._forward_pre_hooks) == (1 if target == "embed" else 0)
             assert len(model.head._forward_pre_hooks) == (1 if target == "head" else 0)
         finally:
-            s._clear_active_adapter_hooks()
+            s._clear_active_adapter_hooks(synchronized=True)
 
         # Merge mode also matches by name; it mutates the copied backing,
         # so the normal shared-storage effect is preserved.

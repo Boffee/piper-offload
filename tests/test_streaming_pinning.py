@@ -8,13 +8,19 @@ from torch import nn
 
 import piper_offload.block_component as block_component_module
 import piper_offload.host_component as host_component_module
+import piper_offload.merge as merge_module
+import piper_offload.model_offloader as model_offloader_module
+import piper_offload.pin_manager as pin_module
 from piper_offload import (
+    Adapter,
     BlockCompileConfig,
     BlockComponentStore,
     HostComponentStore,
     LoRATransform,
+    MappedCheckpoint,
     ModelOffloader,
     ParameterDelta,
+    merge_adapter,
     ParameterDeltaTransform,
     ParameterValue,
     PinManager,
@@ -54,6 +60,9 @@ def pins(monkeypatch: pytest.MonkeyPatch):
     manager = PinManager(64 * 1024**2, backend=backend)
     monkeypatch.setattr(block_component_module, "host_pin_manager", manager)
     monkeypatch.setattr(host_component_module, "host_pin_manager", manager)
+    monkeypatch.setattr(pin_module, "host_pin_manager", manager)
+    monkeypatch.setattr(model_offloader_module, "host_pin_manager", manager)
+    monkeypatch.setattr(merge_module, "host_pin_manager", manager)
     yield manager, backend
     manager.clear()
     assert manager.stats.active_leases == 0
@@ -623,3 +632,192 @@ def test_optimizer_copy_back_has_its_own_pageable_lease(mode, failure, pins, mon
     if failure != "copy":
         for parameter, updated in zip(model.parameters(), expected, strict=True):
             torch.testing.assert_close(parameter, updated)
+
+
+@CUDA
+@pytest.mark.parametrize("mode", ["streaming", "rolling"])
+def test_mapped_checkpoint_streams_from_owned_copies(mode, pins, tmp_path, monkeypatch) -> None:
+    safetensors = pytest.importorskip("safetensors.torch")
+    manager, backend = pins
+    model = _BlockModel(width=64)
+    inputs = torch.randn(2, 64)
+    expected = model(inputs)
+    path = tmp_path / "model.safetensors"
+    safetensors.save_file(model.state_dict(), str(path))
+    reader = MappedCheckpoint(path)
+    names = reader.keys()
+    sources = {name: reader.get_tensor(name) for name in names}
+    model.load_state_dict(sources, assign=True)
+    mapping_pointers = {tensor.untyped_storage().data_ptr() for tensor in sources.values()}
+    offloader = _make_offloader(
+        model,
+        block_mode=mode,
+        block_compile=BlockCompileConfig(fullgraph=True) if mode == "rolling" else None,
+    )
+    resolved: list[torch.Tensor] = []
+    original_view = pin_module._Copy.view
+
+    def recording(copy: pin_module._Copy, tensor: torch.Tensor) -> torch.Tensor:
+        view = original_view(copy, tensor)
+        resolved.append(view)
+        return view
+
+    monkeypatch.setattr(pin_module._Copy, "view", recording)
+    try:
+        with activated_model(offloader, "cuda"), torch.inference_mode():
+            actual = offloader.value(inputs.cuda()).cpu()
+        torch.testing.assert_close(actual, expected)
+        registered = {pointer for pointer, _size in backend.registrations}
+        # The mappings are never registered; each storage has one page-aligned copy.
+        assert registered.isdisjoint(mapping_pointers)
+        assert len(registered) == len(mapping_pointers)
+        assert all(pointer % mmap.PAGESIZE == 0 for pointer in registered)
+        assert all(not tensor.is_pinned() for tensor in sources.values())
+        # Every storage was transferred from its copy, not from the mapping.
+        assert {view.untyped_storage().data_ptr() for view in resolved} == registered
+        assert manager.stats.copy_bytes == manager.stats.pinned_bytes > 0
+        manager.clear()
+        assert manager.stats.pinned_bytes == 0
+    finally:
+        offloader.deactivate()
+        if mode == "rolling":
+            torch.compiler.reset()
+
+
+@CUDA
+@pytest.mark.parametrize("mode", ["resident", "streaming"])
+def test_routed_lora_factors_are_leased_while_their_hooks_are_installed(mode, pins) -> None:
+    manager, backend = pins
+    model = _BlockModel()
+    state = {}
+    for index in range(2):
+        state[f"blocks.{index}.proj.lora_A.weight"] = torch.randn(2, 8)
+        state[f"blocks.{index}.proj.lora_B.weight"] = torch.randn(8, 2)
+    adapter = Adapter.from_state_dict(state)
+    factors = [
+        tensor
+        for target in adapter.targets.values()
+        for host in (target.lora.a, target.lora.b)
+        for tensor in host.storage_tensors()
+    ]
+    # Pin the factors elsewhere and leave them idle: staging them on every
+    # forward is now a read of registered storage, which needs a lease.
+    with manager.acquire(factors):
+        pass
+    assert manager.stats.idle_registrations == len(factors)
+    registered = len(backend.registrations)
+    offloader = _make_offloader(model, block_mode=mode)
+    inputs = torch.randn(2, 8)
+    try:
+        offloader.activate("cuda", adapters=[adapter], adapter_strengths=[0.5], adapter_mode="routed")
+        assert manager.stats.idle_registrations == 0
+        expected_leases = 2 if mode == "streaming" else 1
+        assert manager.stats.active_leases == expected_leases
+        offloader.value(inputs.cuda())
+        # Streaming registers its two block weights; the factors are not registered again.
+        assert len(backend.registrations) == registered + (2 if mode == "streaming" else 0)
+    finally:
+        offloader.deactivate()
+    assert manager.stats.active_leases == 0
+    assert manager.stats.idle_registrations == len(factors) + (2 if mode == "streaming" else 0)
+    with pytest.raises(RuntimeError, match="outside a lease"):
+        adapter.targets["blocks.0.proj.weight"].lora.a.materialize(torch.device("cuda"), non_blocking=True)
+
+
+def _routed_adapter() -> Adapter:
+    state = {}
+    for index in range(2):
+        state[f"blocks.{index}.proj.lora_A.weight"] = torch.randn(2, 8)
+        state[f"blocks.{index}.proj.lora_B.weight"] = torch.randn(8, 2)
+    return Adapter.from_state_dict(state)
+
+
+def _factor_tensors(adapter: Adapter) -> list[torch.Tensor]:
+    return [
+        tensor
+        for target in adapter.targets.values()
+        for host in (target.lora.a, target.lora.b)
+        for tensor in host.storage_tensors()
+    ]
+
+
+def test_cpu_routed_activation_takes_no_lease(pins) -> None:
+    manager, _backend = pins
+    adapter = _routed_adapter()
+    offloader = _make_offloader(_BlockModel(), block_mode="streaming")
+    try:
+        offloader.activate("cpu", adapters=[adapter], adapter_strengths=[0.5], adapter_mode="routed")
+        assert manager.stats.active_leases == 0
+        offloader.value(torch.randn(2, 8))
+    finally:
+        offloader.deactivate()
+
+
+@CUDA
+def test_permanent_merge_on_a_cuda_model_leases_pinned_factors(pins) -> None:
+    manager, backend = pins
+    adapter = _routed_adapter()
+    with manager.acquire(_factor_tensors(adapter)):
+        pass
+    registered = len(backend.registrations)
+    model = _BlockModel()
+    expected = {}
+    for name, target in adapter.targets.items():
+        a, b = (host.make_cpu_param().data for host in (target.lora.a, target.lora.b))
+        expected[name] = model.get_parameter(name).detach() + 0.5 * (b @ a)
+    model.cuda()
+    assert merge_adapter(model, [(adapter, 0.5)]) == 2
+    assert manager.stats.active_leases == 0
+    assert len(backend.registrations) == registered
+    for name, weight in expected.items():
+        torch.testing.assert_close(model.get_parameter(name).detach().cpu(), weight)
+
+
+@CUDA
+def test_permanent_merge_leases_sources_through_validation(pins, monkeypatch) -> None:
+    from piper_offload import transfer_
+
+    manager, _backend = pins
+    adapter = _routed_adapter()
+    with manager.acquire(_factor_tensors(adapter)):
+        pass
+    original_validate = merge_module._MergeOp.validate
+
+    def staging_validate(op) -> None:
+        # Quantized targets stage their sources while validating.
+        original_validate(op)
+        for tensor in op.transform.storage_tensors():
+            transfer_(torch.empty_like(tensor, device="cuda"), tensor, non_blocking=True)
+
+    monkeypatch.setattr(merge_module._MergeOp, "validate", staging_validate)
+    model = _BlockModel().cuda()
+    assert merge_adapter(model, [(adapter, 0.5)]) == 2
+    assert manager.stats.active_leases == 0
+
+
+@CUDA
+def test_failed_synchronization_keeps_the_routed_lease(pins, monkeypatch) -> None:
+    manager, _backend = pins
+    adapter = _routed_adapter()
+    offloader = _make_offloader(_BlockModel(), block_mode="resident")
+    offloader.activate("cuda", adapters=[adapter], adapter_strengths=[0.5], adapter_mode="routed")
+    offloader.value(torch.randn(2, 8).cuda())
+
+    def failed_sync(*_args, **_kwargs):
+        raise RuntimeError("injected synchronization failure")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.cuda, "synchronize", failed_sync)
+            with pytest.raises(RuntimeError, match="injected"):
+                offloader.deactivate()
+        # Staging may still be in flight: the routed factors stay leased, and
+        # a new session must not silently take over.
+        assert manager.stats.active_leases == 1
+        with pytest.raises(RuntimeError, match="Recreate the CUDA worker"):
+            offloader.activate("cuda", adapters=[adapter], adapter_strengths=[0.5], adapter_mode="routed")
+        # The refused activation's cleanup synchronized the components for real,
+        # which is what finally lets the routed lease close.
+        assert manager.stats.active_leases == 0
+    finally:
+        offloader.deactivate()

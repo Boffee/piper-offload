@@ -997,6 +997,10 @@ class BlockComponent:
             raise RuntimeError("BlockComponent CUDA session has no selected runtime.")
         if runtime.acquired:
             return
+        if self._pin_lease is not None:
+            raise RuntimeError(
+                "BlockComponent cannot acquire while prior pin cleanup is incomplete."
+            )
         sources = (tensor for plan in self._load_plans for tensor in plan.storage_tensors())
         if self._block_mode == "resident":
             # A one-time upload: lease the sources pageable, for the upload
@@ -1005,10 +1009,6 @@ class BlockComponent:
             runtime.acquire(active_device, self._load_plans)
             self._transfer.close()  # the runtime synchronized the upload
             return
-        if self._pin_lease is not None:
-            raise RuntimeError(
-                "BlockComponent cannot acquire while prior pin cleanup is incomplete."
-            )
         self._pin_lease = host_pin_manager.acquire(sources)
         runtime.acquire(active_device, self._load_plans)
 

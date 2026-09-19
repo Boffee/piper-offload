@@ -163,22 +163,36 @@ pin memory.
 
 ### Host registration
 
-`host_pin_manager` registers existing CPU storage in place under a separate
-`max_pinned_bytes` budget. Its default is `None` (no application byte limit), so
-registration proceeds opportunistically up to the capacity currently available
-from CUDA/HIP. Set a finite byte limit to cap registration, or set
-`max_pinned_bytes = 0` to disable it. Construction and configuration do not
-initialize CUDA. Every CUDA transfer runs under a lease. Ordinary streaming
+`host_pin_manager` pins CPU storage under a separate `max_pinned_bytes`
+budget. Its default is half of the memory available to the process: physical
+RAM, or the tightest cgroup limit on the process's own cgroup or its
+ancestors when that is lower, rounded down to OS pages; the cgroup hierarchy
+is assumed to be mounted at `/sys/fs/cgroup`. Set
+another finite byte limit to cap registration, `max_pinned_bytes = 0` to
+disable it, or `None` to remove the application cap and register
+opportunistically up to the capacity currently available from CUDA/HIP.
+Construction and configuration do not initialize CUDA. Every CUDA transfer
+runs under a lease. Ordinary streaming
 and compiled rolling ask their lease to register the storage they read every
 step; resident blocks, non-block components, and the optimizer copy-back lease
 their storage pageable, so a one-time upload never pins anything. CPU
 execution does not acquire leases.
 
-Registering a private file mapping, such as a safetensors checkpoint, locks its
-pages for writing, and the kernel answers by copying every page into private
-memory, so a pinned mapping costs RAM until the mapping is released.
-`MappedCheckpoint` tensors are read-only mappings and are never registered in
-place; they stay pageable until the owned-copy path from #112 lands.
+Storage that records a checkpoint file slice, which is every tensor from
+`MappedCheckpoint`, is never registered in place. Pinning it allocates an
+owned page-aligned copy, fills the copy from the file with positional reads,
+and registers that; the mapping stays read-only page cache the whole time.
+Transfers read the copy under their lease. An asynchronous transfer of
+pinned storage outside a lease raises, because eviction is safe only while
+every such reader holds one; a synchronous transfer completes under the
+manager's lock and needs none. Routed LoRA factors, staged on every forward,
+are held under a pageable lease for as long as their hooks are installed. The
+module's own tensors keep pointing at the mapping for CPU execution and
+`state_dict`. Evicting the copy unregisters and frees it, so the RAM returns. Registering
+any other private file mapping in place, such as a mapping from
+`safetensors.safe_open`, still locks its pages for writing and makes the
+kernel copy every page into private memory that stays until the mapping is
+released.
 
 **Piper never writes into a file mapping.** Host storage it writes on your
 behalf is copied into memory the process owns first: a trainable parameter
@@ -198,16 +212,16 @@ Explicit leases are also available for custom transfers:
 
 ```python
 import torch
-from piper_offload import host_pin_manager
+from piper_offload import host_pin_manager, transfer_
 
-host_pin_manager.max_pinned_bytes = 4 * 1024**3  # optional cap; default is None
+host_pin_manager.max_pinned_bytes = 4 * 1024**3  # optional; default is half of RAM
 source = torch.randn(1024, 1024)
 target = torch.empty_like(source, device="cuda")
 copy_stream = torch.cuda.Stream()
 
 with host_pin_manager.acquire([source]):
     with torch.cuda.stream(copy_stream):
-        target.copy_(source, non_blocking=True)
+        transfer_(target, source, non_blocking=True)  # reads a pinned copy when one exists
     copy_stream.synchronize()  # finish every host read before closing the lease
 # The source may remain registered in the idle LRU after the lease closes.
 ```
@@ -1270,6 +1284,12 @@ Every adapter must implement `storage_tensors(state)` alongside
 tensors, including tensor-valued metadata that stays on the CPU. Omit absent
 optional tensors, preserve shared allocations and views, and delegate through
 composing wrappers instead of reconstructing them.
+
+Every adapter's `copy_to_gpu()` must copy each physical tensor through
+`transfer_(destination, source, non_blocking=...)` rather than
+`Tensor.copy_`. A checkpoint storage pinned through an owned copy is read
+from that copy only when the transfer asks for it; an adapter that copies
+from the host state directly pays for the copy without using it.
 
 ```python
 from piper_offload import (

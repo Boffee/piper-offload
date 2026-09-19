@@ -17,6 +17,24 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
+- A tensor from `MappedCheckpoint` now pins through an owned page-aligned
+  copy filled from the file with positional reads and registered, instead of
+  staying pageable: transfers read the copy under their lease through
+  `transfer_()`, the module's tensors keep pointing at the
+  read-only mapping, and evicting the copy unregisters and frees it.
+  `PinStats.copy_bytes` reports the copies' share of `pinned_bytes`.
+- `max_pinned_bytes` defaults to half of the memory available to the process,
+  physical RAM or the tightest cgroup limit on the process's cgroup and its
+  ancestors when that is lower, rounded down to OS pages, instead of `None`, because owned copies cost RAM where
+  in-place registration did not. Zero still disables registration and `None`
+  still removes the cap. If the memory cannot be determined, the default is
+  zero.
+- Every adapter's `copy_to_gpu()` must copy through the new public
+  `transfer_()` helper, which reads a pinned copy when one exists and raises
+  on an asynchronous transfer of pinned storage outside a lease; the
+  built-in adapters do.
+  Routed LoRA factors are held under a pageable lease while their hooks are
+  installed, since they are staged on every forward.
 - Every host transfer now runs under a pin lease, and `PinManager.acquire()`
   takes `pin=`. With it, the default used by streaming, rolling, and the
   relay, the lease registers what the budget allows. Without it, used by

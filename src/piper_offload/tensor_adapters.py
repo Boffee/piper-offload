@@ -38,6 +38,8 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 from torch import nn
 
+from .pin_manager import transfer_
+
 __all__ = [
     "BindLayoutTensorAdapter",
     "CpuRoundTripTensorAdapter",
@@ -62,6 +64,7 @@ __all__ = [
     "metadata_key",
     "optional_tensor_id",
     "tensor_layout",
+    "transfer_",
 ]
 
 _force_host_copy: ContextVar[bool] = ContextVar("force_host_copy", default=False)
@@ -204,7 +207,14 @@ class TensorAdapter[HostStateT, GpuStateT](Protocol):
     def copy_to_gpu(
         src: HostStateT, dst: GpuStateT, *, non_blocking: bool = False
     ) -> None:
-        """Bulk DMA the host state's bytes into pre-allocated GPU storage."""
+        """Bulk DMA the host state's bytes into pre-allocated GPU storage.
+
+        Copy every physical tensor through :func:`transfer_` rather than
+        ``Tensor.copy_``: a checkpoint storage pinned through an owned copy
+        is read from that copy only when the transfer asks for it, and an
+        adapter that copies from ``src`` directly pays for the copy without
+        using it.
+        """
         ...
 
     @staticmethod
@@ -803,7 +813,7 @@ class RegularAdapter:
     def copy_to_gpu(
         src: _RegularHost, dst: _RegularGpu, *, non_blocking: bool = False
     ) -> None:
-        dst.data.copy_(src.data, non_blocking=non_blocking)
+        transfer_(dst.data, src.data, non_blocking=non_blocking)
 
     @staticmethod
     def copy_to_cpu(

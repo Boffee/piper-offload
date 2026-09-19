@@ -3,6 +3,7 @@
 import gc
 import logging
 import mmap
+import os
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -13,8 +14,9 @@ import pytest
 import torch
 
 import piper_offload._host_registration as registration_module
+import piper_offload.pin_manager as pin_module
 from piper_offload._host_registration import HostRegistrationError, RuntimeHostRegistration
-from piper_offload import PinManager, host_pin_manager
+from piper_offload import MappedCheckpoint, PinManager, file_slice, host_pin_manager
 from piper_offload.pin_manager import TransferLease
 
 PAGE = mmap.PAGESIZE
@@ -69,18 +71,91 @@ def manager(backend: FakeBackend):
     result.clear()
 
 
-def test_default_budget_is_unlimited_without_initializing_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_default_budget_is_finite_without_initializing_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     def unexpected_runtime():
         raise AssertionError("construction and configuration must not initialize CUDA/HIP")
 
     monkeypatch.setattr(registration_module, "_load_runtime", unexpected_runtime)
     manager = PinManager()
-    assert manager.max_pinned_bytes is None
-    assert host_pin_manager.max_pinned_bytes is None
+    assert manager.max_pinned_bytes == pin_module._default_pin_budget()
+    assert manager.max_pinned_bytes > 0
+    assert manager.max_pinned_bytes % PAGE == 0
+    assert host_pin_manager.max_pinned_bytes == manager.max_pinned_bytes
+    assert PinManager(None).max_pinned_bytes is None
     manager.max_pinned_bytes = PAGE
     manager.max_pinned_bytes = None
     assert manager.stats.max_pinned_bytes is None
     assert manager.stats.pinned_bytes == 0
+
+
+def test_default_budget_is_half_of_physical_ram(monkeypatch) -> None:
+    monkeypatch.setattr(pin_module.sys, "platform", "linux")
+    values = {"SC_PHYS_PAGES": 101, "SC_PAGE_SIZE": PAGE}
+    monkeypatch.setattr(pin_module.os, "sysconf", values.__getitem__, raising=False)
+    monkeypatch.setattr(pin_module, "_PROC_CGROUP", "/nonexistent/cgroup")
+    assert pin_module._default_pin_budget() == 50 * PAGE
+
+
+def _cgroups(monkeypatch, tmp_path, membership: str, files: dict[str, str]) -> None:
+    """Fake the process's cgroup membership and a cgroup mount holding ``files``."""
+    monkeypatch.setattr(pin_module.sys, "platform", "linux")
+    values = {"SC_PHYS_PAGES": 101, "SC_PAGE_SIZE": PAGE}
+    monkeypatch.setattr(pin_module.os, "sysconf", values.__getitem__, raising=False)
+    (tmp_path / "cgroup").write_text(membership)
+    for relative, text in files.items():
+        path = tmp_path / "mount" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n")
+    monkeypatch.setattr(pin_module, "_PROC_CGROUP", str(tmp_path / "cgroup"))
+    monkeypatch.setattr(pin_module, "_CGROUP_MOUNT", str(tmp_path / "mount"))
+
+
+@pytest.mark.parametrize(
+    ("membership", "files", "expected_pages"),
+    [
+        ("0::/a/b\n", {"a/b/memory.max": "20", "a/memory.max": "max", "memory.max": "max"}, 10),
+        ("0::/a/b\n", {"a/b/memory.max": "max", "a/memory.max": "12"}, 6),
+        ("0::/\n", {"memory.max": "30"}, 15),
+        ("0::/a\n", {"a/memory.max": "max", "memory.max": "max"}, 50),
+        ("4:memory:/a\n", {"memory/a/memory.limit_in_bytes": "16"}, 8),
+        ("4:memory:/a\n", {"memory/a/memory.limit_in_bytes": "9223372036854771712"}, 50),
+        ("3:cpu:/a\n", {"cpu/a/memory.max": "2"}, 50),
+    ],
+    ids=[
+        "v2-own", "v2-ancestor", "v2-namespaced-root", "v2-unlimited", "v1", "v1-unlimited", "no-memory-controller",
+    ],
+)
+def test_default_budget_is_bounded_by_the_process_cgroup(
+    monkeypatch, tmp_path, membership, files, expected_pages,
+) -> None:
+    # Small numbers are page counts; the v1 unlimited sentinel is passed through.
+    scaled = {
+        name: str(int(text) * PAGE) if text.isdigit() and len(text) < 10 else text for name, text in files.items()
+    }
+    _cgroups(monkeypatch, tmp_path, membership, scaled)
+    assert pin_module._default_pin_budget() == expected_pages * PAGE
+
+
+@pytest.mark.parametrize("success", [False, True])
+def test_windows_default_budget_uses_physical_ram_without_cuda(monkeypatch, success) -> None:
+    def query(pointer):
+        status = pointer._obj
+        assert status.length == 64
+        status.total_physical = 101 * PAGE
+        return success
+
+    monkeypatch.setattr(pin_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        pin_module.ctypes, "WinDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(GlobalMemoryStatusEx=Mock(side_effect=query)), raising=False,
+    )
+    assert pin_module._default_pin_budget() == (50 * PAGE if success else 0)
+
+
+def test_unknown_physical_ram_disables_default_admission(monkeypatch) -> None:
+    monkeypatch.setattr(pin_module.sys, "platform", "linux")
+    monkeypatch.setattr(pin_module.os, "sysconf", Mock(side_effect=OSError("unavailable")), raising=False)
+    assert pin_module._default_pin_budget() == 0
 
 
 def test_zero_budget_disables_registration_without_initializing_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -209,8 +284,8 @@ def test_capacity_failure_stops_later_registration_attempts(manager: PinManager,
         assert backend.register_calls == [(a.data_ptr(), PAGE)]
 
 
-def test_default_budget_reclaims_idle_lru_and_retries(backend: FakeBackend) -> None:
-    manager = PinManager(backend=backend)
+def test_unbounded_budget_reclaims_idle_lru_and_retries(backend: FakeBackend) -> None:
+    manager = PinManager(None, backend=backend)
     a, b, c = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
     backend.capacity = 2 * PAGE
     for tensor in (a, b):
@@ -710,21 +785,201 @@ def test_transfer_lease_keeps_protection_until_synchronization_succeeds(backend:
     assert synchronized == [device, device]
 
 
-def test_read_only_checkpoint_mappings_stay_pageable(backend, tmp_path) -> None:
-    from piper_offload import MappedCheckpoint, file_slice
-
-    path = tmp_path / "model.safetensors"
-    payload = torch.arange(2 * PAGE, dtype=torch.uint8)
-    header = b'{"w": {"dtype": "U8", "shape": [%d], "data_offsets": [0, %d]}}' % (2 * PAGE, 2 * PAGE)
+def _checkpoint(tmp_path, nbytes: int, name: str = "model") -> torch.Tensor:
+    """A tensor over a read-only ``MappedCheckpoint`` mapping whose bytes follow a checkable pattern."""
+    path = tmp_path / f"{name}.safetensors"
+    header = b'{"w": {"dtype": "U8", "shape": [%d], "data_offsets": [0, %d]}}' % (nbytes, nbytes)
     header += b" " * (-(8 + len(header)) % 8)
-    path.write_bytes(len(header).to_bytes(8, "little") + header + payload.numpy().tobytes())
-    tensor = MappedCheckpoint(path).get_tensor("w")
+    payload = (bytes(range(256)) * (nbytes // 256 + 1))[:nbytes]
+    path.write_bytes(len(header).to_bytes(8, "little") + header + payload)
+    return MappedCheckpoint(path).get_tensor("w")
+
+
+def _transferred(manager: PinManager, tensor: torch.Tensor) -> torch.Tensor:
+    """What a synchronous transfer of ``tensor`` delivers."""
+    destination = torch.zeros_like(tensor)
+    manager.transfer(destination, tensor, non_blocking=False)
+    return destination
+
+
+def test_checkpoint_storage_pins_through_an_owned_copy(backend: FakeBackend, tmp_path) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE - 100)
     assert file_slice(tensor) is not None
-    manager = PinManager(backend=backend)
+    manager = PinManager(4 * PAGE, backend=backend)
     (anonymous,) = _tensors((0, PAGE))
     with manager.acquire([tensor, anonymous]) as lease:
-        # Never registered in place: a read-only mapping cannot be write-locked.
-        assert lease.pageable_bytes == tensor.nbytes
-        assert lease.registered_bytes == anonymous.nbytes
-        assert backend.register_calls == [(anonymous.data_ptr(), PAGE)]
+        assert (lease.registered_bytes, lease.pageable_bytes) == (tensor.nbytes + PAGE, 0)
+        (copy_pointer, copy_size), anonymous_call = backend.register_calls
+        # The mapping itself is never registered; its copy is page-aligned and page-rounded.
+        assert copy_pointer != tensor.data_ptr() and copy_pointer % PAGE == 0 and copy_size == 2 * PAGE
+        assert anonymous_call == (anonymous.data_ptr(), PAGE)
+        assert manager.stats.pinned_bytes == 3 * PAGE and manager.stats.copy_bytes == 2 * PAGE
+        region = manager._entries[tensor.untyped_storage().data_ptr()].copy.region
+        torch.testing.assert_close(_transferred(manager, tensor), tensor)
+        # Transfers read the copy, not the mapping: a byte changed in the copy
+        # shows up in what a transfer delivers, through a view's geometry too.
+        region[300] = (tensor[300].item() + 1) % 256
+        assert _transferred(manager, tensor)[300] != tensor[300]
+        part = tensor[300:1000].view(torch.int16)
+        expected = torch.frombuffer(region, dtype=torch.uint8)[300:1000].view(torch.int16)
+        torch.testing.assert_close(_transferred(manager, part), expected)
+        torch.testing.assert_close(_transferred(manager, anonymous), anonymous)
+    manager.clear()
+    assert backend.unregister_calls == [copy_pointer, anonymous.data_ptr()]
+    assert region.closed
+    assert manager.stats.pinned_bytes == 0 and manager.stats.copy_bytes == 0
+
+
+def test_copy_is_charged_at_allocation_and_evicted_by_freeing(backend: FakeBackend, tmp_path) -> None:
+    first = _checkpoint(tmp_path, 2 * PAGE, "first")
+    second = _checkpoint(tmp_path, 2 * PAGE, "second")
+    manager = PinManager(2 * PAGE, backend=backend)
+    with manager.acquire([first, second]) as lease:
+        # Only one copy fits, and it is charged before the second is considered.
+        assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 2 * PAGE)
+        assert len(backend.register_calls) == 1
+        region = manager._entries[first.untyped_storage().data_ptr()].copy.region
+    with manager.acquire([second]):
+        # The idle copy is evicted to make room: unregistered and freed.
+        assert backend.unregister_calls == [backend.register_calls[0][0]]
+        assert region.closed
+        assert manager.stats.copy_bytes == 2 * PAGE
+    manager.clear()
+
+
+@pytest.mark.skipif(not hasattr(os, "preadv"), reason="positional reads")
+def test_copy_fill_loops_over_short_reads(backend: FakeBackend, tmp_path, monkeypatch) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    original = os.preadv
+    calls = 0
+
+    def short_preadv(fd, buffers, offset):
+        nonlocal calls
+        calls += 1
+        (buffer,) = buffers
+        return original(fd, [buffer[:100]], offset)
+
+    monkeypatch.setattr(os, "preadv", short_preadv)
+    manager = PinManager(4 * PAGE, backend=backend)
+    with manager.acquire([tensor]):
+        torch.testing.assert_close(_transferred(manager, tensor), tensor)
+    assert calls == -(-2 * PAGE // 100)
+    manager.clear()
+
+
+def test_seek_and_read_fallback_fills_the_copy(backend: FakeBackend, tmp_path, monkeypatch) -> None:
+    monkeypatch.delattr(os, "preadv", raising=False)
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    manager = PinManager(4 * PAGE, backend=backend)
+    with manager.acquire([tensor]):
+        torch.testing.assert_close(_transferred(manager, tensor), tensor)
+    manager.clear()
+
+
+def test_failed_fill_leaves_the_storage_pageable(backend: FakeBackend, tmp_path, monkeypatch, caplog) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+
+    def broken(_copy, _source):
+        raise OSError("injected read failure")
+
+    monkeypatch.setattr(pin_module, "_fill_copy", broken)
+    manager = PinManager(4 * PAGE, backend=backend)
+    with caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager"), manager.acquire([tensor]) as lease:
+        assert (lease.registered_bytes, lease.pageable_bytes) == (0, 2 * PAGE)
+        assert backend.register_calls == [] and manager.stats.pinned_bytes == 0
+    assert "injected read failure" in caplog.text
+    manager.clear()
+
+
+def test_copy_registration_error_rolls_back_the_charge(backend: FakeBackend, tmp_path, monkeypatch) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    manager = PinManager(4 * PAGE, backend=backend)
+
+    def broken(_pointer: int, _size: int) -> bool:
+        raise HostRegistrationError("registration", 700)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(backend, "register", broken)
+        with pytest.raises(HostRegistrationError):
+            manager.acquire([tensor])
+    assert manager.stats.pinned_bytes == 0 and manager.stats.copy_bytes == 0
+    assert manager.stats.active_leases == 0
+    with manager.acquire([tensor]) as lease:
+        assert lease.registered_bytes == 2 * PAGE
+    manager.clear()
+
+
+def test_copy_allocation_failure_leaves_the_storage_pageable(
+    backend: FakeBackend, tmp_path, monkeypatch, caplog,
+) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+
+    def exhausted(_size: int) -> None:
+        raise MemoryError("injected allocation failure")
+
+    monkeypatch.setattr(pin_module, "_Copy", exhausted)
+    manager = PinManager(4 * PAGE, backend=backend)
+    with caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager"), manager.acquire([tensor]) as lease:
+        assert (lease.registered_bytes, lease.pageable_bytes) == (0, 2 * PAGE)
+        assert backend.register_calls == [] and manager.stats.pinned_bytes == 0
+    assert "injected allocation failure" in caplog.text
+    manager.clear()
+
+
+def test_copy_registration_failure_frees_the_copy(backend: FakeBackend, tmp_path) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    backend.capacity = PAGE
+    manager = PinManager(4 * PAGE, backend=backend)
+    with manager.acquire([tensor]) as lease:
+        assert (lease.registered_bytes, lease.pageable_bytes) == (0, 2 * PAGE)
+        assert manager.stats.pinned_bytes == 0 and manager.stats.registration_failures == 1
+    manager.clear()
+
+
+def test_failed_copy_unregistration_keeps_the_copy_and_its_charge(backend: FakeBackend, tmp_path) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    manager = PinManager(4 * PAGE, backend=backend)
+    with manager.acquire([tensor]):
+        ((copy_pointer, _size),) = backend.register_calls
+    backend.unregister_errors.add(copy_pointer)
+    with pytest.raises(RuntimeError, match="remains retained"):
+        manager.clear()
+    assert manager.stats.pinned_bytes == 2 * PAGE and manager.stats.copy_bytes == 2 * PAGE
+    backend.unregister_errors.clear()
+    manager.clear()
+    assert manager.stats.pinned_bytes == 0
+
+
+def test_synchronous_transfer_of_pinned_storage_needs_no_lease(backend: FakeBackend, tmp_path) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    manager = PinManager(4 * PAGE, backend=backend)
+    with manager.acquire([tensor]):
+        pass
+    destination = torch.zeros(2 * PAGE, dtype=torch.uint8)
+    # The copy is idle, but a synchronous transfer completes under the lock.
+    manager.transfer(destination, tensor, non_blocking=False)
+    torch.testing.assert_close(destination, tensor)
+    manager.clear()
+    destination.zero_()
+    manager.transfer(destination, tensor, non_blocking=False)
+    torch.testing.assert_close(destination, tensor)
+
+
+@CUDA
+def test_asynchronous_transfer_of_pinned_storage_requires_a_lease(backend: FakeBackend, tmp_path) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    (anonymous,) = _tensors((0, PAGE))
+    manager = PinManager(4 * PAGE, backend=backend)
+    with manager.acquire([tensor, anonymous]):
+        pass
+    destination = torch.zeros(2 * PAGE, dtype=torch.uint8, device="cuda")
+    # Idle registrations, the copy and the in-place one, may be evicted at any
+    # moment, so an asynchronous read without a lease is refused, not raced.
+    for source in (tensor, anonymous):
+        with pytest.raises(RuntimeError, match="outside a lease"):
+            manager.transfer(destination[: source.numel()], source, non_blocking=True)
+    with manager.acquire([tensor], pin=False):
+        manager.transfer(destination, tensor, non_blocking=True)
+        torch.cuda.synchronize()
+    torch.testing.assert_close(destination.cpu(), tensor)
     manager.clear()

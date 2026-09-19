@@ -124,15 +124,16 @@ reconstruct without changing its encoding.
 ``storage_tensors(state)`` exposes that state's physical CPU tensors directly,
 including tensor-valued metadata, without copying or rebuilding wrappers.
 
-The process-wide :data:`host_pin_manager` can register that storage in place
-under a finite page-rounded budget or opportunistically up to native CUDA/HIP
-capacity. :class:`PinLease` protects backing until its owner explicitly closes
-it; released registrations enter an idle LRU. The default budget is ``None``
-(no application byte limit); zero disables registration. Registering a mapped
-checkpoint in place copies it into private memory until the mapping is
-released; read-only checkpoint mappings are never registered in place. Piper
-never writes into a file mapping: trainable parameters and merge targets are
-copied out first.
+The process-wide :data:`host_pin_manager` can pin that storage under a finite
+page-rounded budget, half of the process's available memory by default, or opportunistically up
+to native CUDA/HIP capacity with ``None``; zero disables registration.
+:class:`PinLease` protects backing until its owner explicitly closes it;
+released registrations enter an idle LRU. Anonymous storage registers in
+place. A tensor from :class:`MappedCheckpoint` pins through an owned copy
+filled from the file, which transfers read under their lease and which
+eviction frees, while the mapping stays read-only page cache. Piper never
+writes into a file mapping: trainable parameters and merge targets are copied
+out first.
 Every CUDA transfer runs under a lease that closes only after its runtime
 has completed the pending copies: streaming and rolling register the storage
 they read every step, while resident and host uploads and the optimizer
@@ -212,6 +213,7 @@ from .seeding import derive_seed
 from .tensor_adapter_registry import register_adapter
 from .tensor_adapters import (
     TensorAdapter,
+    transfer_,
 )
 
 __all__ = [
@@ -270,4 +272,5 @@ __all__ = [
     "host_pin_manager",
     "merge_adapter",
     "register_adapter",
+    "transfer_",
 ]
