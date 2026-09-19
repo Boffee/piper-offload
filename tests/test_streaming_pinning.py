@@ -8,11 +8,13 @@ from torch import nn
 
 import piper_offload.block_component as block_component_module
 import piper_offload.host_component as host_component_module
+import piper_offload.pin_manager as pin_module
 from piper_offload import (
     BlockCompileConfig,
     BlockComponentStore,
     HostComponentStore,
     LoRATransform,
+    MappedCheckpoint,
     ModelOffloader,
     ParameterDelta,
     ParameterDeltaTransform,
@@ -54,6 +56,7 @@ def pins(monkeypatch: pytest.MonkeyPatch):
     manager = PinManager(64 * 1024**2, backend=backend)
     monkeypatch.setattr(block_component_module, "host_pin_manager", manager)
     monkeypatch.setattr(host_component_module, "host_pin_manager", manager)
+    monkeypatch.setattr(pin_module, "host_pin_manager", manager)
     yield manager, backend
     manager.clear()
     assert manager.stats.active_leases == 0
@@ -623,3 +626,54 @@ def test_optimizer_copy_back_has_its_own_pageable_lease(mode, failure, pins, mon
     if failure != "copy":
         for parameter, updated in zip(model.parameters(), expected, strict=True):
             torch.testing.assert_close(parameter, updated)
+
+
+@CUDA
+@pytest.mark.parametrize("mode", ["streaming", "rolling"])
+def test_mapped_checkpoint_streams_from_owned_copies(mode, pins, tmp_path, monkeypatch) -> None:
+    safetensors = pytest.importorskip("safetensors.torch")
+    manager, backend = pins
+    model = _BlockModel(width=64)
+    inputs = torch.randn(2, 64)
+    expected = model(inputs)
+    path = tmp_path / "model.safetensors"
+    safetensors.save_file(model.state_dict(), str(path))
+    reader = MappedCheckpoint(path)
+    names = reader.keys()
+    sources = {name: reader.get_tensor(name) for name in names}
+    model.load_state_dict(sources, assign=True)
+    mapping_pointers = {tensor.untyped_storage().data_ptr() for tensor in sources.values()}
+    offloader = _make_offloader(
+        model,
+        block_mode=mode,
+        block_compile=BlockCompileConfig(fullgraph=True) if mode == "rolling" else None,
+    )
+    resolved: list[torch.Tensor] = []
+    original = manager.transfer_source
+
+    def recording(tensor: torch.Tensor) -> torch.Tensor:
+        source = original(tensor)
+        resolved.append(source)
+        return source
+
+    monkeypatch.setattr(manager, "transfer_source", recording)
+    try:
+        with activated_model(offloader, "cuda"), torch.inference_mode():
+            actual = offloader.value(inputs.cuda()).cpu()
+        torch.testing.assert_close(actual, expected)
+        registered = {pointer for pointer, _size in backend.registrations}
+        # The mappings are never registered; each storage has one page-aligned copy.
+        assert registered.isdisjoint(mapping_pointers)
+        assert len(registered) == len(mapping_pointers)
+        assert all(pointer % mmap.PAGESIZE == 0 for pointer in registered)
+        assert all(not tensor.is_pinned() for tensor in sources.values())
+        # Every transfer read a copy, not the mapping.
+        assert resolved
+        assert all(source.untyped_storage().data_ptr() in registered for source in resolved)
+        assert manager.stats.copy_bytes == manager.stats.pinned_bytes > 0
+        manager.clear()
+        assert manager.stats.pinned_bytes == 0
+    finally:
+        offloader.deactivate()
+        if mode == "rolling":
+            torch.compiler.reset()

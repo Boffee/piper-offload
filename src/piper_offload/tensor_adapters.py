@@ -38,6 +38,8 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 from torch import nn
 
+from .pin_manager import host_transfer_source
+
 __all__ = [
     "BindLayoutTensorAdapter",
     "CpuRoundTripTensorAdapter",
@@ -62,6 +64,7 @@ __all__ = [
     "metadata_key",
     "optional_tensor_id",
     "tensor_layout",
+    "transfer_",
 ]
 
 _force_host_copy: ContextVar[bool] = ContextVar("force_host_copy", default=False)
@@ -78,6 +81,16 @@ def host_state_is_owned[HostStateT](
     writes, trainable parameters and merge targets, must be owned first.
     """
     return all(tensor.untyped_storage().resizable() for tensor in adapter.storage_tensors(state))
+
+
+def transfer_(destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool) -> None:
+    """Copy ``source`` into ``destination``, reading a host source's pinned copy when its lease provides one.
+
+    Every host-to-device copy of a physical tensor goes through here, so a
+    checkpoint storage pinned through an owned copy is read from that copy
+    while the module's own tensor keeps pointing at the resting mapping.
+    """
+    destination.copy_(host_transfer_source(source), non_blocking=non_blocking)
 
 
 @contextlib.contextmanager
@@ -803,7 +816,7 @@ class RegularAdapter:
     def copy_to_gpu(
         src: _RegularHost, dst: _RegularGpu, *, non_blocking: bool = False
     ) -> None:
-        dst.data.copy_(src.data, non_blocking=non_blocking)
+        transfer_(dst.data, src.data, non_blocking=non_blocking)
 
     @staticmethod
     def copy_to_cpu(

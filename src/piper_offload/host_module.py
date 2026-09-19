@@ -27,6 +27,7 @@ from .tensor_adapter_registry import (
     param_representation,
     param_tensor_id,
 )
+from .tensor_adapters import transfer_
 
 
 @dataclass(frozen=True, slots=True)
@@ -829,7 +830,7 @@ def _copy_buffers_to_target(
         key = id(host)
         if key in copied:
             continue
-        targets[name].tensor.copy_(host.tensor, non_blocking=non_blocking)
+        transfer_(targets[name].tensor, host.tensor, non_blocking=non_blocking)
         copied.add(key)
 
 
