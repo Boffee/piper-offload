@@ -795,6 +795,13 @@ def _checkpoint(tmp_path, nbytes: int, name: str = "model") -> torch.Tensor:
     return MappedCheckpoint(path).get_tensor("w")
 
 
+def _transferred(manager: PinManager, tensor: torch.Tensor) -> torch.Tensor:
+    """What a synchronous transfer of ``tensor`` delivers."""
+    destination = torch.zeros_like(tensor)
+    manager.transfer(destination, tensor, non_blocking=False)
+    return destination
+
+
 def test_checkpoint_storage_pins_through_an_owned_copy(backend: FakeBackend, tmp_path) -> None:
     tensor = _checkpoint(tmp_path, 2 * PAGE - 100)
     assert file_slice(tensor) is not None
@@ -807,18 +814,16 @@ def test_checkpoint_storage_pins_through_an_owned_copy(backend: FakeBackend, tmp
         assert copy_pointer != tensor.data_ptr() and copy_pointer % PAGE == 0 and copy_size == 2 * PAGE
         assert anonymous_call == (anonymous.data_ptr(), PAGE)
         assert manager.stats.pinned_bytes == 3 * PAGE and manager.stats.copy_bytes == 2 * PAGE
-        # Transfers read the copy while the lease protects it; views keep their geometry.
-        source = manager.transfer_source(tensor)
-        assert source is not tensor and source.data_ptr() == copy_pointer
-        torch.testing.assert_close(source, tensor)
-        part = tensor[300:1000].view(torch.int16)
-        resolved = manager.transfer_source(part)
-        assert resolved.data_ptr() == copy_pointer + 300 and resolved.dtype is torch.int16
-        torch.testing.assert_close(resolved, part)
-        assert manager.transfer_source(anonymous) is anonymous
         region = manager._entries[tensor.untyped_storage().data_ptr()].copy.region
-    # The copy stays resolvable while idle; a transfer's read is tracked instead.
-    assert manager.transfer_source(tensor).data_ptr() == copy_pointer
+        torch.testing.assert_close(_transferred(manager, tensor), tensor)
+        # Transfers read the copy, not the mapping: a byte changed in the copy
+        # shows up in what a transfer delivers, through a view's geometry too.
+        region[300] = (tensor[300].item() + 1) % 256
+        assert _transferred(manager, tensor)[300] != tensor[300]
+        part = tensor[300:1000].view(torch.int16)
+        expected = torch.frombuffer(region, dtype=torch.uint8)[300:1000].view(torch.int16)
+        torch.testing.assert_close(_transferred(manager, part), expected)
+        torch.testing.assert_close(_transferred(manager, anonymous), anonymous)
     manager.clear()
     assert backend.unregister_calls == [copy_pointer, anonymous.data_ptr()]
     assert region.closed
@@ -857,7 +862,7 @@ def test_copy_fill_loops_over_short_reads(backend: FakeBackend, tmp_path, monkey
     monkeypatch.setattr(os, "preadv", short_preadv)
     manager = PinManager(4 * PAGE, backend=backend)
     with manager.acquire([tensor]):
-        torch.testing.assert_close(manager.transfer_source(tensor), tensor)
+        torch.testing.assert_close(_transferred(manager, tensor), tensor)
     assert calls == -(-2 * PAGE // 100)
     manager.clear()
 
@@ -867,7 +872,7 @@ def test_seek_and_read_fallback_fills_the_copy(backend: FakeBackend, tmp_path, m
     tensor = _checkpoint(tmp_path, 2 * PAGE)
     manager = PinManager(4 * PAGE, backend=backend)
     with manager.acquire([tensor]):
-        torch.testing.assert_close(manager.transfer_source(tensor), tensor)
+        torch.testing.assert_close(_transferred(manager, tensor), tensor)
     manager.clear()
 
 

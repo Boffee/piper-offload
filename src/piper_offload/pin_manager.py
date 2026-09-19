@@ -555,20 +555,6 @@ class PinManager:
         # The lease keeps the entry, so the copy itself needs no lock.
         destination.copy_(view, non_blocking=True)
 
-    def transfer_source(self, tensor: torch.Tensor) -> torch.Tensor:
-        """``tensor``, or its geometry over its storage's pinned copy; for inspection, not for copying.
-
-        Reads of the result are not tracked, so it is safe only under a lease
-        that holds the copy: use :meth:`transfer` for the copy itself.
-        """
-        if tensor.device.type != "cpu":
-            return tensor
-        with self._lock:
-            entry = self._entries.get(tensor.untyped_storage().data_ptr())
-            if entry is None or entry.copy is None:
-                return tensor
-            return entry.copy.view(tensor)
-
     def clear(self) -> None:
         """Unregister idle entries and free their copies.
 
@@ -824,9 +810,16 @@ _live_managers: set[PinManager] = set()
 host_pin_manager = PinManager()
 
 
-def host_transfer(destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool) -> None:
-    """:meth:`PinManager.transfer` on the process-wide manager, for adapter transfer loops."""
+def transfer_(destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool) -> None:
+    """Copy ``source`` into ``destination`` through the process-wide manager.
+
+    Every host-to-device copy of a physical tensor goes through here, so a
+    checkpoint storage pinned through an owned copy is read from that copy
+    while the module's own tensor keeps pointing at the resting mapping. An
+    asynchronous copy of pinned storage must run under a lease kept until the
+    copy has completed, and raises otherwise; a synchronous copy needs none.
+    """
     host_pin_manager.transfer(destination, source, non_blocking=non_blocking)
 
 
-__all__ = ["PinLease", "PinManager", "PinStats", "TransferLease", "host_pin_manager", "host_transfer"]
+__all__ = ["PinLease", "PinManager", "PinStats", "TransferLease", "host_pin_manager", "transfer_"]

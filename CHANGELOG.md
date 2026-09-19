@@ -20,7 +20,7 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - A tensor from `MappedCheckpoint` now pins through an owned page-aligned
   copy filled from the file with positional reads and registered, instead of
   staying pageable: transfers read the copy under their lease through
-  `host_transfer_source()`, the module's tensors keep pointing at the
+  `transfer_()`, the module's tensors keep pointing at the
   read-only mapping, and evicting the copy unregisters and frees it.
   `PinStats.copy_bytes` reports the copies' share of `pinned_bytes`.
 - `max_pinned_bytes` defaults to half of the memory available to the process,

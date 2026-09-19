@@ -38,7 +38,7 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 from torch import nn
 
-from .pin_manager import host_transfer
+from .pin_manager import transfer_
 
 __all__ = [
     "BindLayoutTensorAdapter",
@@ -81,18 +81,6 @@ def host_state_is_owned[HostStateT](
     writes, trainable parameters and merge targets, must be owned first.
     """
     return all(tensor.untyped_storage().resizable() for tensor in adapter.storage_tensors(state))
-
-
-def transfer_(destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool) -> None:
-    """Copy ``source`` into ``destination``, reading a host source's pinned copy when one exists.
-
-    Every host-to-device copy of a physical tensor goes through here, so a
-    checkpoint storage pinned through an owned copy is read from that copy
-    while the module's own tensor keeps pointing at the resting mapping. An
-    asynchronous copy of pinned storage must run under a lease kept until the
-    copy has completed, and raises otherwise; a synchronous copy needs none.
-    """
-    host_transfer(destination, source, non_blocking=non_blocking)
 
 
 @contextlib.contextmanager
