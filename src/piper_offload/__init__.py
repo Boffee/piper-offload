@@ -169,6 +169,7 @@ from .adapter import Adapter, AdapterMode, AdapterTarget
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent, BlockComponentStore
 from .block_mode import BlockMode
+from .checkpoint import CheckpointError, FileSlice, MappedCheckpoint, file_slice
 from .host_component import HostComponent, HostComponentStore
 from .lora import LoRAFactor, LoRATransform, ScaledLoRAFactor
 from .merge import merge_adapter
@@ -220,17 +221,20 @@ __all__ = [
     "BlockComponentStore",
     "BlockMode",
     "CacheError",
+    "CheckpointError",
     "DuplicateResourceKeyError",
     "EvictionCandidate",
     "EvictionContext",
     "EvictionPolicy",
     "EvictionPolicyError",
+    "FileSlice",
     "HostComponent",
     "HostComponentStore",
     "HostRegistrationError",
     "LRUEvictionPolicy",
     "LoRAFactor",
     "LoRATransform",
+    "MappedCheckpoint",
     "ModelCache",
     "ModelOffloader",
     "ModelRuntimeInUseError",
@@ -259,6 +263,7 @@ __all__ = [
     "ScaledParameterValue",
     "TensorAdapter",
     "derive_seed",
+    "file_slice",
     "host_pin_manager",
     "merge_adapter",
     "register_adapter",
