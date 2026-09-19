@@ -870,9 +870,14 @@ class BlockComponent:
                 "active. Deactivate first, or check for a leaked "
                 "context manager."
             )
-        if self._pin_lease is not None or self._transfer.open:
-            # The runtime is still acquired too; a new session would silently
-            # reuse its targets and load plan.
+        if (
+            self._pin_lease is not None
+            or self._transfer.open
+            or self._runtime.acquired
+            or self._eager_runtime.acquired
+        ):
+            # A runtime whose release failed to synchronize is still acquired;
+            # a new session would silently reuse its targets and load plan.
             raise RuntimeError(
                 "BlockComponent cannot activate after its prior CUDA session "
                 "failed to finish host transfers. Recreate the CUDA worker."
@@ -998,7 +1003,7 @@ class BlockComponent:
             # only; the runtime synchronizes it before returning.
             self._transfer.start(host_pin_manager, sources, active_device)
             runtime.acquire(active_device, self._load_plans)
-            self._transfer.finish()
+            self._transfer.close()  # the runtime synchronized the upload
             return
         if self._pin_lease is not None:
             raise RuntimeError(
@@ -1032,8 +1037,9 @@ class BlockComponent:
             runtime.release()
         finally:
             if not runtime.acquired:
+                # The runtime synchronized before releasing its targets.
                 self._close_pin_lease()
-                self._transfer.finish()
+                self._transfer.close()
 
     def deactivate(self) -> None:
         """Tear down active resources idempotently — safe to call
@@ -1113,8 +1119,12 @@ class BlockComponent:
         try:
             with runtime.optimizer_step():
                 yield
-        finally:
+        except BaseException:
+            # The copy-back may still be in flight; a failed synchronization
+            # keeps the lease for release() to retry.
             self._transfer.finish()
+            raise
+        self._transfer.close()  # the runtime synchronized its copy-back stream
 
     def gather_for_step(self) -> contextlib.AbstractContextManager[None]:
         """Backward-compatible alias for :meth:`optimizer_step`."""

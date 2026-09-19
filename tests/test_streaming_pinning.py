@@ -498,6 +498,59 @@ def test_partial_upload_keeps_its_lease_until_cleanup_synchronizes(mode, fail_sy
 
 
 @CUDA
+def test_resident_copy_back_closes_at_the_runtime_completion_point(pins, monkeypatch) -> None:
+    manager, _backend = pins
+    model = _BlockModel().requires_grad_(True)
+    expected = [parameter.detach().clone() + 1 for parameter in model.parameters()]
+    component = _resident_component(model, "resident")
+
+    def failed_sync(*_args, **_kwargs):
+        raise RuntimeError("a device-wide synchronization is not needed here")
+
+    try:
+        component.activate(torch.device("cuda"))
+        with monkeypatch.context() as patch:
+            # The runtime synchronizes its own stream after the copy-back, which
+            # is the completion point the lease closes at.
+            patch.setattr(torch.cuda, "synchronize", failed_sync)
+            with component.optimizer_step(), torch.no_grad():
+                for parameter in model.parameters():
+                    parameter.add_(1)
+        assert manager.stats.active_leases == 0
+    finally:
+        component.deactivate()
+    for parameter, updated in zip(model.parameters(), expected, strict=True):
+        torch.testing.assert_close(parameter, updated)
+
+
+@CUDA
+def test_failed_deactivation_refuses_resident_reactivation(pins, monkeypatch) -> None:
+    manager, _backend = pins
+    component = _resident_component(_BlockModel(), "resident")
+    runtime = component._runtime
+
+    def failed_sync(*_args, **_kwargs):
+        raise RuntimeError("injected synchronization failure")
+
+    try:
+        component.activate(torch.device("cuda"))
+        assert manager.stats.active_leases == 0
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.cuda, "synchronize", failed_sync)
+            with pytest.raises(RuntimeError, match="injected"):
+                component.deactivate()
+        assert runtime.acquired
+        assert component._active_device is None
+        # The runtime still holds the old targets and load plan; a new session
+        # must not silently reuse them.
+        with pytest.raises(RuntimeError, match="Recreate the CUDA worker"):
+            component.activate(torch.device("cuda"))
+    finally:
+        runtime.release()
+        component.deactivate()
+
+
+@CUDA
 @pytest.mark.parametrize("mode", ["resident", "host"])
 def test_frozen_optimizer_step_takes_no_transfer_lease(mode, pins, monkeypatch) -> None:
     manager, _backend = pins
@@ -552,7 +605,9 @@ def test_optimizer_copy_back_has_its_own_pageable_lease(mode, failure, pins, mon
         with monkeypatch.context() as patch:
             patch.setattr(HostModuleInstance, "copy_trainables_from_target", checked_copy)
             if failure == "sync":
+                # Both the runtime's stream synchronization and the device-wide retry fail.
                 patch.setattr(torch.cuda, "synchronize", failed_sync)
+                patch.setattr(torch.cuda.Stream, "synchronize", failed_sync)
             if failure is None:
                 step()
             else:

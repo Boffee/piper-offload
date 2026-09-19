@@ -161,6 +161,16 @@ class TransferLease:
         if self._lease is None:
             return
         torch.cuda.synchronize(self._device)
+        self.close()
+
+    def close(self) -> None:
+        """Close once the owner has observed the transfer complete; idempotent.
+
+        A runtime that synchronizes the transfer's own stream reaches that
+        point without a second, device-wide synchronization.
+        """
+        if self._lease is None:
+            return
         self._lease.close()
         self._lease = None
         self._device = None
