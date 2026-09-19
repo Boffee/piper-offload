@@ -51,10 +51,8 @@ _DTYPES: dict[str, torch.dtype] = {
     "U64": torch.uint64,
     "U8": torch.uint8,
 }
-# safetensors refuses headers above this size; a larger length field means a corrupt file.
-_HEADER_LIMIT = 100 * 2**20
-# PyTorch sizes are int64; a larger dimension cannot describe a tensor even when the byte count is zero.
-_MAX_DIMENSION = 2**63 - 1
+# safetensors refuses headers above this many bytes; a larger length field means a corrupt file.
+_HEADER_LIMIT = 100_000_000
 
 
 class CheckpointError(ValueError):
@@ -125,7 +123,11 @@ def file_slice(tensor: torch.Tensor) -> FileSlice | None:
     Views share their base tensor's storage and so its slice. A storage that
     merely reuses a dead mapping's address is not matched.
     """
-    storage = tensor.untyped_storage()
+    return storage_slice(tensor.untyped_storage())
+
+
+def storage_slice(storage: torch.UntypedStorage) -> FileSlice | None:
+    """The checkpoint bytes behind ``storage``, or ``None`` when it is not a mapped checkpoint."""
     with _registry_lock:
         entry = _slices.get(storage.data_ptr())
     if entry is None:
@@ -212,11 +214,11 @@ class MappedCheckpoint:
     def get_tensor(self, name: str) -> torch.Tensor:
         """A tensor over the mapping. Its storage is exactly the tensor's bytes and records their file slice."""
         entry = self._entry(name)
-        if entry.length == 0:
-            return torch.empty(entry.shape, dtype=entry.dtype)
         mapping = self._mapping
         if mapping is None:
             raise RuntimeError(f"{self.path} is closed")
+        if entry.length == 0:
+            return torch.empty(entry.shape, dtype=entry.dtype)
         window = memoryview(mapping)[entry.offset:entry.offset + entry.length]
         with warnings.catch_warnings():
             # Non-writable is the point: nothing may write through a checkpoint mapping.
@@ -239,9 +241,14 @@ def _read_header(file: io.BufferedReader, size: int) -> tuple[dict[str, _Entry],
     (header_size,) = struct.unpack("<Q", file.read(8))
     if header_size > _HEADER_LIMIT or 8 + header_size > size:
         raise CheckpointError(f"header length {header_size} exceeds the file or the {_HEADER_LIMIT}-byte limit")
+    raw = file.read(header_size)
+    # safetensors requires strict UTF-8 starting at the object brace: no BOM,
+    # no leading whitespace, and no other encoding json.loads would guess.
+    if not raw.startswith(b"{"):
+        raise CheckpointError("header must begin with '{'")
     try:
         header = json.loads(
-            file.read(header_size), object_pairs_hook=_reject_duplicates, parse_constant=_reject_constant,
+            raw.decode("utf-8"), object_pairs_hook=_reject_duplicates, parse_constant=_reject_constant,
         )
     except (UnicodeDecodeError, ValueError) as error:
         raise CheckpointError(f"header is not valid JSON: {error}") from None
@@ -258,7 +265,9 @@ def _read_header(file: io.BufferedReader, size: int) -> tuple[dict[str, _Entry],
     # The data section must be covered exactly, in order and without gaps:
     # unclaimed bytes are how a file smuggles a payload past its header.
     previous_end = data_start
-    for name, entry in sorted(entries.items(), key=lambda item: item[1].offset):
+    # Zero-length entries sort before a tensor starting at the same offset;
+    # header order must not decide whether the file is valid.
+    for name, entry in sorted(entries.items(), key=lambda item: (item[1].offset, item[1].length)):
         if entry.offset < previous_end:
             raise CheckpointError(f"tensor {name!r} overlaps the previous tensor's bytes")
         if entry.offset > previous_end:
@@ -277,10 +286,14 @@ def _parse_entry(name: str, raw: object, data_start: int, data_size: int) -> _En
         raise CheckpointError(f"tensor {name!r} has unsupported dtype {tag!r}")
     dtype = _DTYPES[tag]
     shape = raw.get("shape")
-    if not isinstance(shape, list) or not all(
-        isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= _MAX_DIMENSION for n in shape
-    ):
+    if not isinstance(shape, list) or not all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in shape):
         raise CheckpointError(f"tensor {name!r} has an invalid shape {shape!r}")
+    try:
+        # A meta tensor allocates nothing but runs every size and stride
+        # check, so a shape PyTorch cannot represent fails here, not later.
+        torch.empty(shape, dtype=dtype, device="meta")
+    except (RuntimeError, TypeError, OverflowError) as error:
+        raise CheckpointError(f"tensor {name!r} has a shape PyTorch cannot represent: {error}") from None
     offsets = raw.get("data_offsets")
     if (
         not isinstance(offsets, list)
@@ -312,4 +325,4 @@ def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-__all__ = ["CheckpointError", "FileSlice", "MappedCheckpoint", "TensorSlice", "file_slice"]
+__all__ = ["CheckpointError", "FileSlice", "MappedCheckpoint", "TensorSlice", "file_slice", "storage_slice"]

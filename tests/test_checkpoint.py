@@ -183,7 +183,7 @@ _BAD_HEADERS = [
     ({"w": _ENTRY, "v": {"dtype": "F32", "shape": [1], "data_offsets": [4, 8]}}, b"\0" * 8, "overlaps"),
     ({"w": "not an object"}, b"", "must be a JSON object"),
     ({"__metadata__": {"a": 1}, "w": _ENTRY}, b"\0" * 8, "__metadata__ must map strings to strings"),
-    ([], b"", "header must be a JSON object"),
+    ([], b"", "must begin with"),
     ({"w": {**_ENTRY, "data_offsets": [4, 12]}}, b"\0" * 12, "4 unclaimed bytes before tensor 'w'"),
     ({"w": _ENTRY}, b"\0" * 12, "4 unclaimed bytes after the last tensor"),
     (
@@ -192,7 +192,11 @@ _BAD_HEADERS = [
         "4 unclaimed bytes before tensor 'v'",
     ),
     ({}, b"\0" * 4, "4 unclaimed bytes after the last tensor"),
-    ({"w": {"dtype": "F32", "shape": [0, 2**63], "data_offsets": [0, 0]}}, b"", "invalid shape"),
+    ({"w": {"dtype": "F32", "shape": [0, 2**63], "data_offsets": [0, 0]}}, b"", "cannot represent"),
+    ({"w": {"dtype": "F32", "shape": [0, 2**62, 4], "data_offsets": [0, 0]}}, b"", "cannot represent"),
+    ({"w": {"dtype": "F32", "shape": [2**40, 2**40, 0], "data_offsets": [0, 0]}}, b"", "cannot represent"),
+    ({"w": {"dtype": "F32", "shape": [2, -1], "data_offsets": [0, 0]}}, b"", "invalid shape"),
+    ({"w": _ENTRY, "e": {"dtype": "F32", "shape": [0], "data_offsets": [4, 4]}}, b"\0" * 8, "overlaps"),
     ({"w": {**_ENTRY, "note": float("nan")}}, b"\0" * 8, "NaN is not valid JSON"),
     ({"w": {**_ENTRY, "note": float("inf")}}, b"\0" * 8, "Infinity is not valid JSON"),
 ]
@@ -222,6 +226,44 @@ def test_duplicate_keys_truncation_and_bad_length_are_rejected(tmp_path: Path) -
     path.write_bytes(struct.pack("<Q", 2) + b"{]")
     with pytest.raises(CheckpointError, match="not valid JSON"):
         MappedCheckpoint(path)
+
+
+def test_empty_tensor_at_a_shared_offset_is_valid_in_either_header_order(tmp_path: Path) -> None:
+    for order in (("w", "e"), ("e", "w")):
+        entries = {
+            "w": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]},
+            "e": {"dtype": "F32", "shape": [0], "data_offsets": [0, 0]},
+        }
+        path = tmp_path / f"{'-'.join(order)}.safetensors"
+        _write_raw(path, {name: entries[name] for name in order}, b"\0" * 8)
+        reader = MappedCheckpoint(path)
+        assert reader.get_tensor("e").shape == (0,)
+        assert reader.get_tensor("w").shape == (2,)
+
+
+def test_header_must_be_strict_utf8_starting_at_the_brace(tmp_path: Path) -> None:
+    path = tmp_path / "enc.safetensors"
+    for raw, message in (
+        (b" {}", "must begin with"),
+        (b"\xef\xbb\xbf{}", "must begin with"),
+        ("{}".encode("utf-16-le"), "not valid JSON"),  # starts with the brace byte, then NULs
+        ("{}".encode("utf-16-be"), "must begin with"),
+        (b"{\x00}\x00", "not valid JSON"),
+        (b'{"\xff": 1}', "not valid JSON"),
+    ):
+        path.write_bytes(struct.pack("<Q", len(raw)) + raw)
+        with pytest.raises(CheckpointError, match=message):
+            MappedCheckpoint(path)
+    assert checkpoint_module._HEADER_LIMIT == 100_000_000
+
+
+def test_closed_reader_refuses_empty_tensors_too(tmp_path: Path) -> None:
+    path = tmp_path / "empty.safetensors"
+    _write(path, {"e": torch.empty(0)})
+    reader = MappedCheckpoint(path)
+    reader.close()
+    with pytest.raises(RuntimeError, match="is closed"):
+        reader.get_tensor("e")
 
 
 def test_scalars_and_empty_tensors(tmp_path: Path) -> None:

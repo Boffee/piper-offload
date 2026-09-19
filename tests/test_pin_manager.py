@@ -750,6 +750,26 @@ def test_file_mapping_on_tmpfs_is_discarded(backend, madvise) -> None:
         assert madvise == [(*span, pin_module._MADV_DONTNEED), (*span, pin_module._MADV_WILLNEED)]
 
 
+def test_read_only_checkpoint_mappings_stay_pageable(backend, tmp_path) -> None:
+    from piper_offload import MappedCheckpoint, file_slice
+
+    path = tmp_path / "model.safetensors"
+    payload = torch.arange(2 * PAGE, dtype=torch.uint8)
+    header = b'{"w": {"dtype": "U8", "shape": [%d], "data_offsets": [0, %d]}}' % (2 * PAGE, 2 * PAGE)
+    header += b" " * (-(8 + len(header)) % 8)
+    path.write_bytes(len(header).to_bytes(8, "little") + header + payload.numpy().tobytes())
+    tensor = MappedCheckpoint(path).get_tensor("w")
+    assert file_slice(tensor) is not None
+    manager = PinManager(backend=backend)
+    (anonymous,) = _tensors((0, PAGE))
+    with manager.acquire([tensor, anonymous]) as lease:
+        # Never registered in place: a read-only mapping cannot be write-locked.
+        assert lease.pageable_bytes == tensor.nbytes
+        assert lease.registered_bytes == anonymous.nbytes
+        assert backend.register_calls == [(anonymous.data_ptr(), PAGE)]
+    manager.clear()
+
+
 def _anonymous_bytes(pointer: int) -> int:
     """Private page bytes of the mapping containing ``pointer``, from ``/proc/self/smaps``."""
     inside = False
