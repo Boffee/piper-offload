@@ -345,6 +345,11 @@ class ModelOffloader:
             )
 
         if self._active_device is not None and self._active_device.type == "cuda":
+            if self._routed_lease is not None:
+                raise RuntimeError(
+                    "ModelOffloader cannot activate after its prior CUDA session "
+                    "failed to finish host transfers. Recreate the CUDA worker."
+                )
             # The hooks stage every factor again on each forward: hold the
             # factors' storage, pageable, for the session so a pinned copy of
             # it stays readable and is never evicted under a staging copy. A
@@ -441,12 +446,15 @@ class ModelOffloader:
         for remove_hook in reversed(remove_hooks):
             remove_hook()
 
-    def _clear_active_adapter_hooks(self) -> None:
+    def _clear_active_adapter_hooks(self, *, synchronized: bool) -> None:
         remove_hooks = self._routed_hook_removers
         self._routed_hook_removers = []
         for remove_hook in reversed(remove_hooks):
             remove_hook()
-        if self._routed_lease is not None:
+        # Routed staging may still be in flight when the components failed to
+        # synchronize; the lease then stays, like theirs, until a later
+        # deactivation synchronizes or the worker is recreated.
+        if synchronized and self._routed_lease is not None:
             self._routed_lease.close()
             self._routed_lease = None
 
@@ -562,17 +570,20 @@ class ModelOffloader:
     def deactivate(self) -> None:
         if self._active_device is None:
             return
-        # Scheduling hooks must stop before their components deactivate. Drain
-        # asynchronous copies before removing routed hooks. Cleanup and
-        # activation-lock release still run if component teardown raises.
+        # Scheduling hooks must stop before their components deactivate; the
+        # components synchronize before routed hooks and their lease go.
+        # Cleanup and the activation-lock release still run if component
+        # teardown raises.
+        synchronized = False
         try:
             self._clear_transient_hooks()
         finally:
             try:
                 self._composite.deactivate()
+                synchronized = True
             finally:
                 try:
-                    self._clear_active_adapter_hooks()
+                    self._clear_active_adapter_hooks(synchronized=synchronized)
                 finally:
                     self._active_device = None
                     self._activation_lock.release()

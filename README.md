@@ -212,7 +212,7 @@ Explicit leases are also available for custom transfers:
 
 ```python
 import torch
-from piper_offload import host_pin_manager
+from piper_offload import host_pin_manager, transfer_
 
 host_pin_manager.max_pinned_bytes = 4 * 1024**3  # optional; default is half of RAM
 source = torch.randn(1024, 1024)
@@ -221,7 +221,7 @@ copy_stream = torch.cuda.Stream()
 
 with host_pin_manager.acquire([source]):
     with torch.cuda.stream(copy_stream):
-        target.copy_(source, non_blocking=True)
+        transfer_(target, source, non_blocking=True)  # reads a pinned copy when one exists
     copy_stream.synchronize()  # finish every host read before closing the lease
 # The source may remain registered in the idle LRU after the lease closes.
 ```

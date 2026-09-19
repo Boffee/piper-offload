@@ -187,18 +187,20 @@ def _merge_adapters(
     # Preflight every operation before applying any of them. This catches all
     # expected name, shape, and adapter-capability errors without leaving a
     # permanently half-merged model.
-    for op in merge_ops:
-        op.validate()
-
-    # Staging onto a CUDA target is asynchronous, so the adapter sources are
-    # leased, pageable, until the device has consumed them.
+    # Validation and application both stage adapter sources onto a CUDA
+    # target asynchronously, so the sources are leased, pageable, until the
+    # device has synchronized; a failed step may already have enqueued copies.
     devices = {op.param.device for op in merge_ops if op.param.device.type == "cuda"}
     sources = (tensor for op in merge_ops for tensor in op.transform.storage_tensors())
     with host_pin_manager.acquire(sources, pin=False) if devices else contextlib.nullcontext():
-        for op in merge_ops:
-            op.apply(model)
-        for device in devices:
-            torch.cuda.synchronize(device)
+        try:
+            for op in merge_ops:
+                op.validate()
+            for op in merge_ops:
+                op.apply(model)
+        finally:
+            for device in devices:
+                torch.cuda.synchronize(device)
 
     modified_tensor_ids = {param_tensor_id(op.param) for op in merge_ops}
 

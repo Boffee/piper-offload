@@ -771,3 +771,53 @@ def test_permanent_merge_on_a_cuda_model_leases_pinned_factors(pins) -> None:
     assert len(backend.registrations) == registered
     for name, weight in expected.items():
         torch.testing.assert_close(model.get_parameter(name).detach().cpu(), weight)
+
+
+@CUDA
+def test_permanent_merge_leases_sources_through_validation(pins, monkeypatch) -> None:
+    from piper_offload import transfer_
+
+    manager, _backend = pins
+    adapter = _routed_adapter()
+    with manager.acquire(_factor_tensors(adapter)):
+        pass
+    original_validate = merge_module._MergeOp.validate
+
+    def staging_validate(op) -> None:
+        # Quantized targets stage their sources while validating.
+        original_validate(op)
+        for tensor in op.transform.storage_tensors():
+            transfer_(torch.empty_like(tensor, device="cuda"), tensor, non_blocking=True)
+
+    monkeypatch.setattr(merge_module._MergeOp, "validate", staging_validate)
+    model = _BlockModel().cuda()
+    assert merge_adapter(model, [(adapter, 0.5)]) == 2
+    assert manager.stats.active_leases == 0
+
+
+@CUDA
+def test_failed_synchronization_keeps_the_routed_lease(pins, monkeypatch) -> None:
+    manager, _backend = pins
+    adapter = _routed_adapter()
+    offloader = _make_offloader(_BlockModel(), block_mode="resident")
+    offloader.activate("cuda", adapters=[adapter], adapter_strengths=[0.5], adapter_mode="routed")
+    offloader.value(torch.randn(2, 8).cuda())
+
+    def failed_sync(*_args, **_kwargs):
+        raise RuntimeError("injected synchronization failure")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.cuda, "synchronize", failed_sync)
+            with pytest.raises(RuntimeError, match="injected"):
+                offloader.deactivate()
+        # Staging may still be in flight: the routed factors stay leased, and
+        # a new session must not silently take over.
+        assert manager.stats.active_leases == 1
+        with pytest.raises(RuntimeError, match="Recreate the CUDA worker"):
+            offloader.activate("cuda", adapters=[adapter], adapter_strengths=[0.5], adapter_mode="routed")
+        # The refused activation's cleanup synchronized the components for real,
+        # which is what finally lets the routed lease close.
+        assert manager.stats.active_leases == 0
+    finally:
+        offloader.deactivate()
