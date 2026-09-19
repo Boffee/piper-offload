@@ -174,19 +174,15 @@ and non-block components do not acquire pin leases.
 
 Registering a private file mapping, such as a safetensors checkpoint, locks its
 pages for writing, and the kernel answers by copying every page into private
-memory, so pinned mappings cost RAM. On Linux, when the manager
-unregisters an immutable mapping it discards those private pages, so the
-mapping refaults from the file, and asks the kernel to keep the file in the
-page cache so the next registration copies from RAM rather than disk.
+memory, so a pinned mapping costs RAM until the mapping is released.
+`MappedCheckpoint` tensors are read-only mappings and are never registered in
+place; they stay pageable until the owned-copy path from #112 lands.
 
-This relies on one contract: **Piper never writes into a file mapping.** Host
-storage it writes on your behalf is copied into memory the process owns
-first: a trainable parameter when its host parameter is captured, and a
-`merge_adapter()` target before the merge. Do not modify an mmap-backed
-parameter in place yourself before handing the model to Piper; on Linux those
-pages would revert to the file's bytes on the first eviction. Windows cannot
-discard the pages of a view it did not create, so private pages there persist
-until the mapping is released.
+**Piper never writes into a file mapping.** Host storage it writes on your
+behalf is copied into memory the process owns first: a trainable parameter
+when its host parameter is captured, and a `merge_adapter()` target before
+the merge. Do not modify an mmap-backed parameter in place yourself before
+handing the model to Piper.
 
 Deactivation releases the lease after transfers finish and leaves registrations
 in the idle LRU. Reactivating the same backing reuses its retained registrations
@@ -214,8 +210,7 @@ with host_pin_manager.acquire([source]):
 # The source may remain registered in the idle LRU after the lease closes.
 ```
 
-Do not write into a private file mapping while it is registered here: on
-Linux the manager returns its pages to the file when it unregisters them.
+Do not write into a private file mapping while it is registered here.
 
 For model backing, pass tensors from `HostParam.storage_tensors()` and
 `HostBuffer.storage_tensors()`. Acquiring a lease protects existing

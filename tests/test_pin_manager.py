@@ -3,9 +3,6 @@
 import gc
 import logging
 import mmap
-import sys
-import tempfile
-from pathlib import Path
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -16,17 +13,11 @@ import pytest
 import torch
 
 import piper_offload._host_registration as registration_module
-import piper_offload.pin_manager as pin_module
 from piper_offload._host_registration import HostRegistrationError, RuntimeHostRegistration
 from piper_offload import PinManager, host_pin_manager
 
 PAGE = mmap.PAGESIZE
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device required")
-LINUX = pytest.mark.skipif(sys.platform != "linux", reason="private file mappings are recognized through /proc")
-NVIDIA = pytest.mark.skipif(
-    torch.version.hip is not None,
-    reason="HIP repopulates a discarded private mapping on its own; in-place mapping registration retires in #119",
-)
 
 
 def _tensors(*ranges: tuple[int, int]) -> list[torch.Tensor]:
@@ -656,100 +647,6 @@ def test_real_foreign_registration_is_never_unregistered() -> None:
         backend.unregister(pointer)
 
 
-def _file_tensor(tmp_path, size: int) -> torch.Tensor:
-    """A private mapping of a file whose bytes follow a checkable pattern."""
-    path = tmp_path / "weights.bin"
-    path.write_bytes(bytes(range(256)) * (size // 256))
-    return torch.from_file(str(path), shared=False, size=size, dtype=torch.uint8)
-
-
-@pytest.fixture
-def madvise(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int, int]]:
-    calls: list[tuple[int, int, int]] = []
-
-    def record(start: int, length: int, advice: int) -> int:
-        calls.append((start, length, advice))
-        return 0
-
-    monkeypatch.setattr(pin_module, "_madvise", lambda: record)
-    return calls
-
-
-def test_interior_pages_leave_boundary_pages_to_their_neighbours() -> None:
-    assert pin_module._interior_pages(PAGE, 2 * PAGE) == (PAGE, 2 * PAGE)
-    assert pin_module._interior_pages(PAGE + 100, 3 * PAGE) == (2 * PAGE, 2 * PAGE)
-    assert pin_module._interior_pages(PAGE, PAGE + 1) == (PAGE, PAGE)
-    assert pin_module._interior_pages(PAGE + 1, PAGE - 1) == (2 * PAGE, 0)
-    assert pin_module._interior_pages(PAGE + 1, 2 * PAGE) == (2 * PAGE, PAGE)
-
-
-@LINUX
-def test_unregistering_a_file_mapping_discards_and_warms_its_pages(backend, madvise, tmp_path) -> None:
-    manager = PinManager(backend=backend)
-    tensor = _file_tensor(tmp_path, 4 * PAGE)
-    with manager.acquire([tensor]) as lease:
-        assert lease.registered_bytes == tensor.nbytes
-        assert madvise == []
-    assert madvise == []  # idle registrations keep their pages for a cheap re-pin
-    manager.clear()
-    span = (tensor.data_ptr(), 4 * PAGE)
-    assert madvise == [(*span, pin_module._MADV_DONTNEED), (*span, pin_module._MADV_WILLNEED)]
-    assert backend.registered == {}
-
-
-@LINUX
-def test_anonymous_storage_is_never_discarded(backend, madvise) -> None:
-    manager = PinManager(backend=backend)
-    (buffer,) = _tensors((0, 4 * PAGE))
-    heap = torch.full((4 * PAGE,), 9, dtype=torch.uint8)
-    with manager.acquire([buffer, heap]) as lease:
-        assert lease.registered_bytes == buffer.nbytes + heap.nbytes
-    manager.clear()
-    assert madvise == []
-    assert heap.eq(9).all()
-
-
-@LINUX
-def test_dropping_the_last_owner_discards_without_reading_the_file_back(backend, madvise, tmp_path) -> None:
-    manager = PinManager(backend=backend)
-    tensor = _file_tensor(tmp_path, 4 * PAGE)
-    span = (tensor.data_ptr(), 4 * PAGE)
-    with manager.acquire([tensor]):
-        pass
-    del tensor
-    gc.collect()
-    assert madvise == [(*span, pin_module._MADV_DONTNEED)]
-    assert backend.registered == {}
-
-
-@LINUX
-def test_budget_eviction_discards_the_evicted_mapping(backend, madvise, tmp_path) -> None:
-    manager = PinManager(4 * PAGE, backend=backend)
-    first = _file_tensor(tmp_path, 4 * PAGE)
-    (second,) = _tensors((0, 4 * PAGE))
-    with manager.acquire([first]):
-        pass
-    with manager.acquire([second]) as lease:
-        assert lease.registered_bytes == second.nbytes
-    assert [advice for _start, _length, advice in madvise] == [pin_module._MADV_DONTNEED, pin_module._MADV_WILLNEED]
-    manager.clear()
-
-
-@LINUX
-@pytest.mark.skipif(not Path("/dev/shm").is_dir(), reason="tmpfs at /dev/shm required")
-def test_file_mapping_on_tmpfs_is_discarded(backend, madvise) -> None:
-    manager = PinManager(backend=backend)
-    with tempfile.NamedTemporaryFile(dir="/dev/shm", prefix="piper-test-") as file:
-        file.write(bytes(range(256)) * (4 * PAGE // 256))
-        file.flush()
-        tensor = torch.from_file(file.name, shared=False, size=4 * PAGE, dtype=torch.uint8)
-        with manager.acquire([tensor]):
-            pass
-        manager.clear()
-        span = (tensor.data_ptr(), 4 * PAGE)
-        assert madvise == [(*span, pin_module._MADV_DONTNEED), (*span, pin_module._MADV_WILLNEED)]
-
-
 def test_read_only_checkpoint_mappings_stay_pageable(backend, tmp_path) -> None:
     from piper_offload import MappedCheckpoint, file_slice
 
@@ -768,44 +665,3 @@ def test_read_only_checkpoint_mappings_stay_pageable(backend, tmp_path) -> None:
         assert lease.registered_bytes == anonymous.nbytes
         assert backend.register_calls == [(anonymous.data_ptr(), PAGE)]
     manager.clear()
-
-
-def _anonymous_bytes(pointer: int) -> int:
-    """Private page bytes of the mapping containing ``pointer``, from ``/proc/self/smaps``."""
-    inside = False
-    with open("/proc/self/smaps", encoding="utf-8") as smaps:
-        for line in smaps:
-            fields = line.split()
-            if not fields[0].endswith(":"):
-                start, end = (int(part, 16) for part in fields[0].split("-"))
-                inside = start <= pointer < end
-            elif inside and fields[0] == "Anonymous:":
-                return int(fields[1]) * 1024
-    raise AssertionError("mapping not found")
-
-
-@CUDA
-@LINUX
-@NVIDIA
-def test_real_unregistration_returns_a_file_mapping_to_its_file(tmp_path) -> None:
-    size = 16 * 2**20
-    tensor = _file_tensor(tmp_path, size)
-    pointer = tensor.data_ptr()
-    expected = tensor.clone()
-    assert _anonymous_bytes(pointer) == 0
-    manager = PinManager(2 * size)
-    try:
-        for _ in range(2):
-            with manager.acquire([tensor]) as lease:
-                assert lease.registered_bytes == size
-                # The writable lock made the kernel copy every page.
-                assert _anonymous_bytes(pointer) == size
-                target = tensor.to("cuda", non_blocking=True)
-                torch.cuda.synchronize()
-            manager.clear()
-            assert _anonymous_bytes(pointer) == 0
-            assert not tensor.is_pinned()
-            torch.testing.assert_close(target.cpu(), expected)
-            torch.testing.assert_close(tensor, expected)
-    finally:
-        manager.clear()

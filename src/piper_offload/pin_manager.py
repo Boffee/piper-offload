@@ -8,16 +8,12 @@ can use an injected backend for testing.
 
 Native registration uses whole storage byte ranges, including private file
 mappings of checkpoints. Locking such a mapping for writing makes the kernel
-copy every page into private memory, and unregistering does not undo that. On
-Linux the manager discards those pages when it unregisters an immutable
-mapping (``MADV_DONTNEED``), so the mapping refaults from the file, then warms
-the page cache (``MADV_WILLNEED``) so the next registration copies from RAM.
-Piper never writes into a file mapping: ``HostParam`` copies trainable
-parameters out at capture and ``merge_adapter`` copies its targets out before
-merging, so a mapping's private pages never hold anything the file does not.
-Windows cannot discard the pages
-of a view it did not create, so private pages there stay until the mapping is
-released, within the budget.
+copy every page into private memory, and unregistering does not undo that:
+the private pages stay until the mapping is released, within the budget.
+Read-only checkpoint mappings (:func:`file_slice`) are never registered in
+place; they stay pageable until #112 moves pinning to owned copies. Piper
+never writes into a file mapping: ``HostParam`` copies trainable parameters
+out at capture and ``merge_adapter`` copies its targets out before merging.
 
 Budget accounting counts the union of OS pages, including pages shared by
 separate allocations. Registrations retain storage until unregistration
@@ -26,16 +22,13 @@ resources can release memory. Storage must not be resized or independently
 registered while managed here.
 """
 
-import ctypes
-import functools
 import logging
 import mmap
-import sys
 import threading
 import weakref
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left
 from collections import OrderedDict
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Self
 
@@ -65,9 +58,6 @@ class _Registration:
     pointer: int
     size: int
     storage: torch.UntypedStorage
-    # A private file mapping: its copied pages return to the file on
-    # unregistration.
-    discard: bool = False
     owners: dict[int, weakref.ReferenceType[torch.Tensor]] = field(default_factory=dict)
     leases: int = 0
     retired: bool = False
@@ -77,96 +67,6 @@ class _Registration:
 class _Request:
     storage: torch.UntypedStorage
     tensors: list[torch.Tensor]
-
-
-@dataclass(frozen=True, slots=True)
-class _Mapping:
-    start: int
-    end: int
-
-
-def _private_file_mappings() -> tuple[_Mapping, ...]:
-    """Private file mappings of this process in address order; empty off Linux.
-
-    Only the kernel knows whether storage is a private file mapping.
-    ``storage.resizable()`` cannot tell one from ``frombuffer`` over anonymous
-    memory, which ``MADV_DONTNEED`` would zero. ``/dev/zero`` is skipped for
-    the same reason: it is anonymous memory with an inode. Files on tmpfs,
-    such as a checkpoint under ``/dev/shm``, refault like any other file.
-    """
-    if not sys.platform.startswith("linux"):
-        return ()
-    try:
-        with open("/proc/self/maps", encoding="utf-8") as maps:
-            lines = maps.readlines()
-    except OSError:
-        return ()
-    mappings: list[_Mapping] = []
-    for line in lines:
-        fields = line.split(maxsplit=5)
-        if len(fields) < 5 or fields[1][3:4] != "p" or fields[4] == "0":
-            continue
-        if len(fields) == 6 and fields[5].rstrip() == "/dev/zero":
-            continue
-        start, end = fields[0].split("-", maxsplit=1)
-        mappings.append(_Mapping(int(start, 16), int(end, 16)))
-    return tuple(mappings)
-
-
-class _PrivateFileMappings:
-    """The process's private file mappings, read on first use.
-
-    Relay collectives re-acquire an already registered buffer per operation;
-    the memory map is read only when a new registration needs it.
-    """
-
-    @functools.cached_property
-    def ranges(self) -> tuple[_Mapping, ...]:
-        return _private_file_mappings()
-
-    def cover(self, pointer: int, size: int) -> bool:
-        ranges = self.ranges
-        index = bisect_right(ranges, pointer, key=lambda mapping: mapping.start) - 1
-        return index >= 0 and pointer + size <= ranges[index].end
-
-
-_MADV_WILLNEED = 3
-_MADV_DONTNEED = 4
-
-
-@functools.cache
-def _madvise() -> Callable[[int, int, int], int]:
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
-    libc.madvise.restype = ctypes.c_int
-    return libc.madvise
-
-
-def _interior_pages(pointer: int, size: int) -> tuple[int, int]:
-    """The whole pages inside a range, as (start, length).
-
-    A page shared with a neighbouring registration may still be locked for
-    the device; discarding it would split the host and device views of that
-    page. Such a boundary page keeps its private copy instead.
-    """
-    start = -(-pointer // mmap.PAGESIZE) * mmap.PAGESIZE
-    end = (pointer + size) // mmap.PAGESIZE * mmap.PAGESIZE
-    return start, max(0, end - start)
-
-
-def _discard_and_warm(pointer: int, size: int, *, warm: bool) -> None:
-    """Return a private file mapping's copied pages to the file, then read the file back into cache."""
-    start, length = _interior_pages(pointer, size)
-    if length == 0:
-        return
-    try:
-        madvise = _madvise()
-        if madvise(start, length, _MADV_DONTNEED):
-            logger.warning("MADV_DONTNEED failed with errno %d; private pages stay resident", ctypes.get_errno())
-        elif warm:
-            madvise(start, length, _MADV_WILLNEED)
-    except Exception as error:
-        logger.warning("Discarding private pages failed: %s", str(error))
 
 
 @dataclass(slots=True)
@@ -305,11 +205,6 @@ class PinManager:
     def acquire(self, tensors: Iterable[torch.Tensor]) -> PinLease:
         """Lease whole allocations, leaving capacity failures pageable.
 
-        Storage inside a private file mapping returns to the file when it is
-        unregistered (Linux). The host must not write into such storage
-        while it is managed here; anonymous and shared storage is never
-        discarded.
-
         All input validation happens before registration or eviction. Existing
         registrations anywhere in the request are protected before admitting
         new ones, avoiding eviction of backing this same lease will use. A
@@ -320,7 +215,6 @@ class PinManager:
         requests = self._requests(tensors)
         held: dict[int, _Registration] = {}
         created: list[_Registration] = []
-        mappings = _PrivateFileMappings()
         with self._lock:
             self._validate_ranges(requests)
             try:
@@ -334,7 +228,7 @@ class PinManager:
                     if file_slice(request.storage) is not None:
                         # A read-only checkpoint mapping cannot be locked for
                         # writing and must never be registered in place; it
-                        # stays pageable until the copy path (#119) exists.
+                        # stays pageable until the copy path (#112) exists.
                         continue
                     size = request.storage.nbytes()
                     if not self._make_room(pointer, size):
@@ -350,7 +244,7 @@ class PinManager:
                         # every lower-priority idle registration that can help.
                         # Avoid one failed runtime call per remaining tensor.
                         break
-                    entry = _Registration(pointer, size, request.storage, discard=mappings.cover(pointer, size))
+                    entry = _Registration(pointer, size, request.storage)
                     _live_managers.add(self)
                     self._entries[pointer] = entry
                     self._starts.insert(bisect_left(self._starts, pointer), pointer)
@@ -533,9 +427,6 @@ class PinManager:
                 del self._boundary_pages[page]
         self._pinned_bytes -= self._page_charge(entry.pointer, entry.size)
         self._drop_lifetime_root_if_empty()
-        if entry.discard:
-            # A retired mapping is on its way out; do not read its file back.
-            _discard_and_warm(entry.pointer, entry.size, warm=not entry.retired)
         return True
 
     def _release(self, entries: tuple[_Registration, ...]) -> None:
