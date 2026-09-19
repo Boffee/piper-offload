@@ -23,6 +23,10 @@ from piper_offload import PinManager, host_pin_manager
 PAGE = mmap.PAGESIZE
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device required")
 LINUX = pytest.mark.skipif(sys.platform != "linux", reason="private file mappings are recognized through /proc")
+NVIDIA = pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="HIP repopulates a discarded private mapping on its own; in-place mapping registration retires in #119",
+)
 
 
 def _tensors(*ranges: tuple[int, int]) -> list[torch.Tensor]:
@@ -762,6 +766,7 @@ def _anonymous_bytes(pointer: int) -> int:
 
 @CUDA
 @LINUX
+@NVIDIA
 def test_real_unregistration_returns_a_file_mapping_to_its_file(tmp_path) -> None:
     size = 16 * 2**20
     tensor = _file_tensor(tmp_path, size)
