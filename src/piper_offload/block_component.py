@@ -870,7 +870,9 @@ class BlockComponent:
                 "active. Deactivate first, or check for a leaked "
                 "context manager."
             )
-        if self._pin_lease is not None:
+        if self._pin_lease is not None or self._transfer.open:
+            # The runtime is still acquired too; a new session would silently
+            # reuse its targets and load plan.
             raise RuntimeError(
                 "BlockComponent cannot activate after its prior CUDA session "
                 "failed to finish host transfers. Recreate the CUDA worker."
@@ -1088,8 +1090,11 @@ class BlockComponent:
                 "block component. Use it inside the offloader's context "
                 "manager, between backward and the next forward."
             )
-        if self._block_mode != "resident":
-            # The session lease already covers the trainables it copies back.
+        if self._block_mode != "resident" or not any(
+            instance.has_trainables for instance in self._block_instances
+        ):
+            # The session lease already covers the trainables streaming copies
+            # back, and a frozen resident group copies nothing back.
             with runtime.optimizer_step():
                 yield
             return

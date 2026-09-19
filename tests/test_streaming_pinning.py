@@ -468,21 +468,51 @@ def test_partial_upload_keeps_its_lease_until_cleanup_synchronizes(mode, fail_sy
                 with pytest.raises(RuntimeError, match="synchronization failure"):
                     component.release()
                 assert manager.stats.active_leases == 1
-                if mode == "host":
-                    with pytest.raises(RuntimeError, match="synchronization failure"):
-                        component.deactivate()
-                    assert component._active_device is None
+                with pytest.raises(RuntimeError, match="synchronization failure"):
+                    component.deactivate()
+                assert component._active_device is None
+                # The old target and transfer are still open; a new session
+                # must not silently reuse them.
+                with pytest.raises(RuntimeError, match="Recreate the CUDA worker"):
+                    component.activate(torch.device("cuda"))
+                assert manager.stats.active_leases == 1
 
         def checked_sync(sync_device):
-            # Host deactivation clears session metadata, but retry must still
+            # Deactivation cleared the session, but the retry must still
             # synchronize the original transfer device, not the current one.
             assert sync_device == device
             original_sync(sync_device)
 
         with monkeypatch.context() as patch:
             patch.setattr(torch.cuda, "synchronize", checked_sync)
-            component.release()
+            if mode == "host" or not fail_sync:
+                component.release()
+            else:
+                # A block component has no session left to retry through; the
+                # cleanup below is what recreating the worker would do.
+                component._runtime.release()
+                component._transfer.finish()
         assert manager.stats.active_leases == 0
+    finally:
+        component.deactivate()
+
+
+@CUDA
+@pytest.mark.parametrize("mode", ["resident", "host"])
+def test_frozen_optimizer_step_takes_no_transfer_lease(mode, pins, monkeypatch) -> None:
+    manager, _backend = pins
+    component = _resident_component(_BlockModel().requires_grad_(False), mode)
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("a frozen model has nothing to copy back")
+
+    try:
+        component.activate(torch.device("cuda"))
+        with monkeypatch.context() as patch:
+            patch.setattr(manager, "acquire", unexpected)
+            patch.setattr(torch.cuda, "synchronize", unexpected)
+            with component.optimizer_step():
+                pass
     finally:
         component.deactivate()
 

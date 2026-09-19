@@ -213,6 +213,13 @@ class HostComponent:
                 f"on {self._active_device}. Deactivate first, or check "
                 "for a leaked context manager."
             )
+        if self._transfer.open or self._lease is not None:
+            # deactivate() cleared the session, but its target and transfer
+            # are still open; a new session would silently reuse them.
+            raise RuntimeError(
+                "HostComponent cannot activate after its prior CUDA session "
+                "failed to finish host transfers. Recreate the CUDA worker."
+            )
         active_device = canonical_device(device)
         if active_device.type == "cpu":
             if parameter_overrides:
