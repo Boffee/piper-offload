@@ -7,6 +7,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
+- Linux private file-backed registrations are released at the last pin lease
+  close. Anonymous registrations retain the budgeted idle LRU. Resident block
+  uploads, host component uploads, and their optimizer copy-back transfers now
+  hold leases until synchronization, including partial-transfer cleanup.
+- The default host pin budget is half of physical RAM, rounded down to OS pages.
+  Explicit `None` still removes the application cap; zero disables registration.
 - On Linux, unregistering a private file mapping discards its copied pages,
   returning the mapping to file backing, and warms the page cache so the next
   registration copies from RAM.

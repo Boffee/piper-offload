@@ -1,10 +1,10 @@
 """Budgeted host registrations with active leases and an idle LRU.
 
 Use the process-wide ``host_pin_manager`` for application registrations. Its
-budget defaults to ``None``, enabling opportunistic registration up to native
-CUDA/HIP capacity. Set it to zero to disable registration. Construction and
-configuration perform no CUDA initialization. Isolated ``PinManager`` instances
-can use an injected backend for testing.
+budget defaults to half of physical RAM, rounded down to whole OS pages. Set
+it to zero to disable registration or ``None`` to remove the application cap.
+Construction and configuration perform no CUDA initialization. Isolated
+``PinManager`` instances can use an injected backend for testing.
 
 Native registration uses whole storage byte ranges, including private file
 mappings of checkpoints. Locking such a mapping for writing makes the kernel
@@ -30,6 +30,7 @@ import ctypes
 import functools
 import logging
 import mmap
+import os
 import sys
 import threading
 import weakref
@@ -44,6 +45,46 @@ import torch
 from ._host_registration import HostRegistrationBackend, RuntimeHostRegistration
 
 logger = logging.getLogger(__name__)
+
+
+class _MemoryStatus(ctypes.Structure):
+    # Windows MEMORYSTATUSEX; fixed-width types also allow testing on POSIX.
+    _fields_ = [
+        ("length", ctypes.c_uint32),
+        ("load", ctypes.c_uint32),
+        ("total_physical", ctypes.c_uint64),
+        ("available_physical", ctypes.c_uint64),
+        ("total_page_file", ctypes.c_uint64),
+        ("available_page_file", ctypes.c_uint64),
+        ("total_virtual", ctypes.c_uint64),
+        ("available_virtual", ctypes.c_uint64),
+        ("available_extended_virtual", ctypes.c_uint64),
+    ]
+
+
+def _default_pin_budget() -> int:
+    """Use half of physical RAM as the cap without touching CUDA."""
+    try:
+        if sys.platform == "win32":
+            status = _MemoryStatus()
+            status.length = ctypes.sizeof(status)
+            query = ctypes.WinDLL("kernel32", use_last_error=True).GlobalMemoryStatusEx
+            query.argtypes = (ctypes.POINTER(_MemoryStatus),)
+            query.restype = ctypes.c_int
+            if not query(ctypes.byref(status)):
+                raise OSError("GlobalMemoryStatusEx failed")
+            total = status.total_physical
+        else:
+            total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        if total <= 0:
+            raise ValueError("physical RAM is unavailable")
+        return total // (2 * mmap.PAGESIZE) * mmap.PAGESIZE
+    except (AttributeError, OSError, ValueError) as error:
+        logger.warning("Cannot determine physical RAM; default host pin budget is zero: %s", error)
+        return 0
+
+
+_DEFAULT_PIN_BUDGET = _default_pin_budget()
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,8 +266,9 @@ class PinManager:
     """Own registrations under a page-rounded budget.
 
     A finite ``max_pinned_bytes`` bounds registered pages in this process.
-    The default, ``None``, treats native CUDA/HIP capacity as the limit, reclaiming
-    unrelated idle registrations when the runtime refuses a new allocation.
+    The default is half of physical RAM at import, rounded down to OS pages.
+    Explicit ``None`` removes the application cap; native capacity failures
+    still reclaim unrelated idle registrations and fall back to pageable memory.
 
     Acquire accepts the plain CPU tensors returned by ``storage_tensors()``.
     Tensor views share one whole-storage registration. Separate allocations
@@ -244,7 +286,7 @@ class PinManager:
 
     def __init__(
         self,
-        max_pinned_bytes: int | None = None,
+        max_pinned_bytes: int | None = _DEFAULT_PIN_BUDGET,
         *,
         backend: HostRegistrationBackend | None = None,
     ) -> None:
@@ -534,7 +576,7 @@ class PinManager:
             entry.leases -= 1
             if entry.leases == 0:
                 self._idle[entry.pointer] = None
-                if entry.retired:
+                if entry.retired or entry.discard:
                     self._unregister(entry)
         self._make_room(0, 0)
 

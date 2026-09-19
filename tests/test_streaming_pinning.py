@@ -1,15 +1,18 @@
-"""Host registration across streaming sessions and asynchronous copies."""
+"""Host registration across CUDA sessions and asynchronous copies."""
 
 import mmap
+import sys
 
 import pytest
 import torch
 from torch import nn
 
 import piper_offload.block_component as block_component_module
+import piper_offload.host_component as host_component_module
 from piper_offload import (
     BlockCompileConfig,
     BlockComponentStore,
+    HostComponentStore,
     LoRATransform,
     ModelOffloader,
     ParameterDelta,
@@ -27,6 +30,7 @@ from piper_offload.tensor_adapter_registry import param_representation, select_a
 from tests._block_compile_helpers import _BlockModel, _make_offloader
 from tests.conftest import CallbackParameterTransform, activated_model, block_components
 from tests.test_quantized_parameter_value import _QUANT_KINDS, _make_quantized
+from tests.test_pin_manager import _anonymous_bytes
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device required")
 
@@ -52,6 +56,7 @@ def pins(monkeypatch: pytest.MonkeyPatch):
     backend = RecordingBackend()
     manager = PinManager(64 * 1024**2, backend=backend)
     monkeypatch.setattr(block_component_module, "host_pin_manager", manager)
+    monkeypatch.setattr(host_component_module, "host_pin_manager", manager)
     yield manager, backend
     manager.clear()
     assert manager.stats.active_leases == 0
@@ -151,11 +156,11 @@ def test_another_component_evicts_only_released_registrations(pins) -> None:
     ("device", "mode"),
     [
         ("cpu", "streaming"),
-        pytest.param("cuda", "resident", marks=CUDA),
-        pytest.param("cuda", "host", marks=CUDA),
+        ("cpu", "resident"),
+        ("cpu", "host"),
     ],
 )
-def test_cpu_and_resident_execution_do_not_acquire_pins(device: str, mode: str, pins, monkeypatch) -> None:
+def test_cpu_execution_does_not_acquire_pins(device: str, mode: str, pins, monkeypatch) -> None:
     manager, _backend = pins
 
     def unexpected_acquire(_tensors):
@@ -229,8 +234,9 @@ def test_transfer_sources_include_parameter_transform_backing() -> None:
 
 
 @CUDA
+@pytest.mark.parametrize("mode", ["streaming", "resident", "host"])
 @pytest.mark.parametrize("kind", _QUANT_KINDS)
-def test_quantized_replacements_pin_payload_and_metadata_without_conversion(kind: str, pins) -> None:
+def test_quantized_replacements_pin_payload_and_metadata_without_conversion(kind: str, mode: str, pins) -> None:
     manager, backend = pins
     source = _make_quantized(kind)
     expected = select_adapter(source).dequantize(source).cpu()
@@ -241,7 +247,10 @@ def test_quantized_replacements_pin_payload_and_metadata_without_conversion(kind
     block.register_buffer("alias", block.buffer)
     model = nn.Module()
     model.blocks = nn.ModuleList([block])
-    component = BlockComponentStore.from_module(model, blocks_path="blocks").bind(model)
+    if mode == "host":
+        component = HostComponentStore.from_module(model).bind(model)
+    else:
+        component = BlockComponentStore.from_module(model, blocks_path="blocks").bind(model, block_mode=mode)
     tensors = backing.storage_tensors()
     pointers = {tensor.untyped_storage().data_ptr() for tensor in tensors if tensor.numel()}
     try:
@@ -388,3 +397,212 @@ def test_trainable_copy_back_preserves_registered_host_storage(pins) -> None:
     for parameter, updated in zip(model.parameters(), expected, strict=True):
         torch.testing.assert_close(parameter, updated)
         assert parameter.is_pinned()
+
+
+def _resident_component(model, mode):
+    if mode == "host":
+        return HostComponentStore.from_module(model).bind(model)
+    return BlockComponentStore.from_module(
+        model, blocks_path="blocks", include_block_trainables=True,
+    ).bind(model, block_mode="resident")
+
+
+@CUDA
+@pytest.mark.parametrize("mode", ["resident", "host"])
+@pytest.mark.parametrize("budget", [0, 64 * 1024**2])
+def test_resident_upload_leases_end_after_transfer_completion(mode, budget, pins, monkeypatch) -> None:
+    manager, backend = pins
+    manager.max_pinned_bytes = budget
+    model = _BlockModel()
+    inputs = torch.randn(2, 8)
+    expected = model(inputs)
+    component = _resident_component(model, mode)
+    original_stage = CudaTargetLease.stage
+    streams = []
+
+    def checked_stage(lease, plan, stream, **kwargs):
+        assert manager.stats.active_leases == 1
+        assert all(tensor.is_pinned() == bool(budget) for tensor in plan.storage_tensors())
+        original_stage(lease, plan, stream, **kwargs)
+        streams.append(stream)
+
+    monkeypatch.setattr(CudaTargetLease, "stage", checked_stage)
+    try:
+        component.activate(torch.device("cuda"))
+        assert streams and all(stream.query() for stream in streams)
+        assert manager.stats.active_leases == 0
+        torch.testing.assert_close(model(inputs.cuda()).cpu(), expected)
+        count = len(backend.registrations)
+        component.release()
+        component.acquire()
+        assert len(backend.registrations) == count
+        assert manager.stats.active_leases == 0
+    finally:
+        component.deactivate()
+
+
+@CUDA
+@pytest.mark.parametrize("mode", ["resident", "host"])
+@pytest.mark.parametrize("fail_sync", [False, True])
+def test_partial_resident_upload_keeps_pins_until_cleanup_synchronizes(mode, fail_sync, pins, monkeypatch) -> None:
+    manager, backend = pins
+    component = _resident_component(_BlockModel(), mode)
+    original_stage = CudaTargetLease.stage
+    original_sync = torch.cuda.synchronize
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    def fail_after_upload(lease, plan, stream, **kwargs):
+        original_stage(lease, plan, stream, **kwargs)
+        manager.max_pinned_bytes = 0
+        assert manager.stats.active_leases == 1
+        assert not backend.unregistrations
+        raise RuntimeError("injected upload failure")
+
+    def failed_sync(*_args, **_kwargs):
+        raise RuntimeError("injected synchronization failure")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(CudaTargetLease, "stage", fail_after_upload)
+            if fail_sync:
+                patch.setattr(torch.cuda, "synchronize", failed_sync)
+            with pytest.raises(RuntimeError, match="injected"):
+                component.activate(torch.device("cuda"))
+            if fail_sync:
+                assert manager.stats.active_leases == 1
+                assert not backend.unregistrations
+                with pytest.raises(RuntimeError, match="synchronization failure"):
+                    component.release()
+                assert manager.stats.active_leases == 1
+                if mode == "host":
+                    with pytest.raises(RuntimeError, match="synchronization failure"):
+                        component.deactivate()
+                    assert component._active_device is None
+
+        def checked_sync(sync_device):
+            # Host deactivation clears session metadata, but retry must still
+            # synchronize the original transfer device, not the current one.
+            assert sync_device == device
+            original_sync(sync_device)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.cuda, "synchronize", checked_sync)
+            component.release()
+        assert manager.stats.active_leases == 0
+        assert manager.stats.pinned_bytes == 0
+    finally:
+        component.deactivate()
+
+
+@CUDA
+@pytest.mark.parametrize("mode", ["resident", "host"])
+@pytest.mark.parametrize("failure", [None, "copy", "sync"])
+def test_resident_optimizer_copy_back_has_its_own_lease(mode, failure, pins, monkeypatch) -> None:
+    manager, backend = pins
+    model = _BlockModel().requires_grad_(True)
+    expected = [parameter.detach().clone() + 1 for parameter in model.parameters()]
+    component = _resident_component(model, mode)
+    original_copy = block_component_module.HostModuleInstance.copy_trainables_from_target
+    copied = False
+
+    def checked_copy(instance, target, **kwargs):
+        nonlocal copied
+        assert manager.stats.active_leases == 1
+        assert all(tensor.is_pinned() for tensor in instance.trainable_storage_tensors())
+        original_copy(instance, target, **kwargs)
+        copied = True
+        if failure == "copy":
+            raise RuntimeError("injected copy-back failure")
+
+    def failed_sync(*_args, **_kwargs):
+        raise RuntimeError("injected synchronization failure")
+
+    def step():
+        with component.optimizer_step(), torch.no_grad():
+            # Shrinking the budget cannot unregister in-flight destinations.
+            manager.max_pinned_bytes = 0
+            assert not backend.unregistrations
+            for parameter in model.parameters():
+                parameter.add_(1)
+
+    try:
+        component.activate(torch.device("cuda"))
+        assert manager.stats.active_leases == 0
+        manager.clear()  # force optimizer destinations to be registered again
+        backend.unregistrations.clear()
+        with monkeypatch.context() as patch:
+            patch.setattr(block_component_module.HostModuleInstance, "copy_trainables_from_target", checked_copy)
+            if failure == "sync":
+                patch.setattr(torch.cuda, "synchronize", failed_sync)
+            if failure is None:
+                step()
+            else:
+                with pytest.raises(RuntimeError, match="injected"):
+                    step()
+            assert copied
+            assert manager.stats.active_leases == (1 if failure == "sync" else 0)
+            if failure == "sync":
+                assert not backend.unregistrations
+        component.release()
+        assert manager.stats.active_leases == 0
+        assert manager.stats.pinned_bytes == 0
+    finally:
+        component.deactivate()
+    if failure != "copy":
+        for parameter, updated in zip(model.parameters(), expected, strict=True):
+            torch.testing.assert_close(parameter, updated)
+
+
+@CUDA
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux file discard required")
+@pytest.mark.parametrize("mode", ["streaming", "rolling", "resident", "host"])
+def test_mapped_model_rotation_releases_pages_but_respects_shared_leases(mode, pins, tmp_path) -> None:
+    safetensors = pytest.importorskip("safetensors.torch")
+    manager, _backend = pins
+    inputs = torch.randn(2, 64)
+    subjects = []
+    for index in range(2):
+        model = _BlockModel(width=64)
+        expected = model(inputs)
+        path = tmp_path / f"model-{index}.safetensors"
+        safetensors.save_file(model.state_dict(), str(path))
+        with safetensors.safe_open(path, framework="pt") as reader:
+            names = reader.keys()
+            sources = [reader.get_tensor(name) for name in names]
+            model.load_state_dict(dict(zip(names, sources, strict=True)), assign=True)
+        offloader = _make_offloader(
+            model,
+            block_paths=[] if mode == "host" else ["blocks"],
+            block_mode="streaming" if mode == "host" else mode,
+            block_compile=BlockCompileConfig(fullgraph=True) if mode == "rolling" else None,
+        )
+        subjects.append((offloader, sources, expected))
+
+    try:
+        for _ in range(2):
+            for offloader, sources, expected in subjects:
+                # Keep one allocation alive independently of the component.
+                shared = manager.acquire([sources[0]])
+                try:
+                    with activated_model(offloader, "cuda"), torch.inference_mode():
+                        actual = offloader.value(inputs.cuda()).cpu()
+                        assert sources[0].is_pinned()
+                    torch.testing.assert_close(actual, expected)
+                    assert manager.stats.active_leases == 1
+                    assert sources[0].is_pinned()
+                    assert _anonymous_bytes(sources[0].data_ptr()) > 0
+                finally:
+                    shared.close()
+                assert manager.stats.active_leases == 0
+                assert manager.stats.pinned_bytes == 0
+                assert all(not source.is_pinned() for source in sources)
+                # smaps reports the entire file mapping, including the
+                # partial boundary pages of every distinct tensor storage.
+                stores = {source.untyped_storage().data_ptr() for source in sources}
+                bound = 2 * len(stores) * mmap.PAGESIZE
+                assert all(_anonymous_bytes(source.data_ptr()) <= bound for source in sources)
+    finally:
+        for offloader, _sources, _expected in subjects:
+            offloader.deactivate()
+        if mode == "rolling":
+            torch.compiler.reset()
