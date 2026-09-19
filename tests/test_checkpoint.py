@@ -184,6 +184,17 @@ _BAD_HEADERS = [
     ({"w": "not an object"}, b"", "must be a JSON object"),
     ({"__metadata__": {"a": 1}, "w": _ENTRY}, b"\0" * 8, "__metadata__ must map strings to strings"),
     ([], b"", "header must be a JSON object"),
+    ({"w": {**_ENTRY, "data_offsets": [4, 12]}}, b"\0" * 12, "4 unclaimed bytes before tensor 'w'"),
+    ({"w": _ENTRY}, b"\0" * 12, "4 unclaimed bytes after the last tensor"),
+    (
+        {"w": _ENTRY, "v": {"dtype": "F32", "shape": [1], "data_offsets": [12, 16]}},
+        b"\0" * 16,
+        "4 unclaimed bytes before tensor 'v'",
+    ),
+    ({}, b"\0" * 4, "4 unclaimed bytes after the last tensor"),
+    ({"w": {"dtype": "F32", "shape": [0, 2**63], "data_offsets": [0, 0]}}, b"", "invalid shape"),
+    ({"w": {**_ENTRY, "note": float("nan")}}, b"\0" * 8, "NaN is not valid JSON"),
+    ({"w": {**_ENTRY, "note": float("inf")}}, b"\0" * 8, "Infinity is not valid JSON"),
 ]
 
 
@@ -231,7 +242,13 @@ def test_every_supported_dtype_round_trips(tmp_path: Path) -> None:
     tensors = {}
     for tag, dtype in checkpoint_module._DTYPES.items():
         base = torch.arange(4, dtype=torch.float32)
-        tensors[tag] = base.to(dtype) if dtype not in (torch.bool,) else base.bool()
+        if dtype is torch.bool:
+            tensors[tag] = base.bool()
+        elif dtype is torch.float8_e8m0fnu:
+            tensors[tag] = torch.arange(4, dtype=torch.uint8).view(dtype)  # E8M0 has no conversion from float
+        else:
+            tensors[tag] = base.to(dtype)
+    assert "F8_E8M0" in tensors
     _write(path, tensors)
     reader = MappedCheckpoint(path)
     for tag, expected in tensors.items():

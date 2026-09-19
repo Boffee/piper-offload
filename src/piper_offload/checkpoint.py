@@ -26,7 +26,7 @@ import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, NoReturn, Self
 
 import torch
 
@@ -41,6 +41,7 @@ _DTYPES: dict[str, torch.dtype] = {
     "F8_E4M3FNUZ": torch.float8_e4m3fnuz,
     "F8_E5M2": torch.float8_e5m2,
     "F8_E5M2FNUZ": torch.float8_e5m2fnuz,
+    "F8_E8M0": torch.float8_e8m0fnu,
     "I16": torch.int16,
     "I32": torch.int32,
     "I64": torch.int64,
@@ -52,6 +53,8 @@ _DTYPES: dict[str, torch.dtype] = {
 }
 # safetensors refuses headers above this size; a larger length field means a corrupt file.
 _HEADER_LIMIT = 100 * 2**20
+# PyTorch sizes are int64; a larger dimension cannot describe a tensor even when the byte count is zero.
+_MAX_DIMENSION = 2**63 - 1
 
 
 class CheckpointError(ValueError):
@@ -237,7 +240,9 @@ def _read_header(file: io.BufferedReader, size: int) -> tuple[dict[str, _Entry],
     if header_size > _HEADER_LIMIT or 8 + header_size > size:
         raise CheckpointError(f"header length {header_size} exceeds the file or the {_HEADER_LIMIT}-byte limit")
     try:
-        header = json.loads(file.read(header_size), object_pairs_hook=_reject_duplicates)
+        header = json.loads(
+            file.read(header_size), object_pairs_hook=_reject_duplicates, parse_constant=_reject_constant,
+        )
     except (UnicodeDecodeError, ValueError) as error:
         raise CheckpointError(f"header is not valid JSON: {error}") from None
     if not isinstance(header, dict):
@@ -250,11 +255,17 @@ def _read_header(file: io.BufferedReader, size: int) -> tuple[dict[str, _Entry],
     ):
         raise CheckpointError("__metadata__ must map strings to strings")
     entries = {name: _parse_entry(name, raw, data_start, data_size) for name, raw in header.items()}
-    previous_end = 0
+    # The data section must be covered exactly, in order and without gaps:
+    # unclaimed bytes are how a file smuggles a payload past its header.
+    previous_end = data_start
     for name, entry in sorted(entries.items(), key=lambda item: item[1].offset):
         if entry.offset < previous_end:
             raise CheckpointError(f"tensor {name!r} overlaps the previous tensor's bytes")
+        if entry.offset > previous_end:
+            raise CheckpointError(f"{entry.offset - previous_end} unclaimed bytes before tensor {name!r}")
         previous_end = entry.offset + entry.length
+    if previous_end != data_start + data_size:
+        raise CheckpointError(f"{data_start + data_size - previous_end} unclaimed bytes after the last tensor")
     return entries, metadata
 
 
@@ -266,7 +277,9 @@ def _parse_entry(name: str, raw: object, data_start: int, data_size: int) -> _En
         raise CheckpointError(f"tensor {name!r} has unsupported dtype {tag!r}")
     dtype = _DTYPES[tag]
     shape = raw.get("shape")
-    if not isinstance(shape, list) or not all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in shape):
+    if not isinstance(shape, list) or not all(
+        isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= _MAX_DIMENSION for n in shape
+    ):
         raise CheckpointError(f"tensor {name!r} has an invalid shape {shape!r}")
     offsets = raw.get("data_offsets")
     if (
@@ -284,6 +297,10 @@ def _parse_entry(name: str, raw: object, data_start: int, data_size: int) -> _En
     if end - start != expected:
         raise CheckpointError(f"tensor {name!r} holds {end - start} bytes but its shape and dtype need {expected}")
     return _Entry(dtype, tag, tuple(shape), data_start + start, end - start)
+
+
+def _reject_constant(constant: str) -> NoReturn:
+    raise CheckpointError(f"{constant} is not valid JSON")
 
 
 def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
