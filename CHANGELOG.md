@@ -7,6 +7,20 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
+- Resident block uploads, host component uploads, and their optimizer
+  copy-back transfers hold host pin leases until synchronization, including
+  partial-transfer cleanup, so every host-to-GPU transfer is protected.
+- The default host pin budget is half of physical RAM, rounded down to OS pages.
+  Explicit `None` still removes the application cap; zero disables registration.
+- Add `PinManager.trim()`, which evicts idle registrations least recently
+  released first and reports released pin charge, memory actually freed, and
+  failed unregistrations separately; `clear()` is now a trim of everything.
+- Add `PinManager.reserve()` for budget held by a copy before it is registered,
+  consumed by `acquire(reservation=...)`, and `PinManager.ensure_available()`
+  to evict idle registrations ahead of a known pageable allocation.
+- Admissions that consume memory, reservations and in-place registration of
+  private file mappings, must leave a configurable `headroom_bytes` of
+  available memory, a sixteenth of RAM and at least 1 GiB by default.
 - On Linux, unregistering a private file mapping discards its copied pages,
   returning the mapping to file backing, and warms the page cache so the next
   registration copies from RAM.

@@ -75,10 +75,9 @@ class ResidentBlockRuntime:
     def release(self) -> None:
         first_error: BaseException | None = None
         if self._device is not None:
-            try:
-                torch.cuda.synchronize(self._device)
-            except BaseException as exc:
-                first_error = exc
+            # Leave acquired state intact on failure so the component keeps
+            # its host lease while an upload or copy-back may still be live.
+            torch.cuda.synchronize(self._device)
 
         for instance in self._instances:
             try:

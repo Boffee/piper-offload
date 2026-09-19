@@ -77,18 +77,51 @@ def manager(backend: FakeBackend):
     result.clear()
 
 
-def test_default_budget_is_unlimited_without_initializing_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_default_budget_is_finite_without_initializing_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     def unexpected_runtime():
         raise AssertionError("construction and configuration must not initialize CUDA/HIP")
 
     monkeypatch.setattr(registration_module, "_load_runtime", unexpected_runtime)
     manager = PinManager()
-    assert manager.max_pinned_bytes is None
-    assert host_pin_manager.max_pinned_bytes is None
+    assert manager.max_pinned_bytes == pin_module._default_pin_budget()
+    assert manager.max_pinned_bytes > 0
+    assert manager.max_pinned_bytes % PAGE == 0
+    assert host_pin_manager.max_pinned_bytes == manager.max_pinned_bytes
+    assert PinManager(None).max_pinned_bytes is None
     manager.max_pinned_bytes = PAGE
     manager.max_pinned_bytes = None
     assert manager.stats.max_pinned_bytes is None
     assert manager.stats.pinned_bytes == 0
+
+
+def test_default_budget_reserves_half_of_physical_ram(monkeypatch) -> None:
+    monkeypatch.setattr(pin_module.sys, "platform", "linux")
+    values = {"SC_PHYS_PAGES": 101, "SC_PAGE_SIZE": PAGE}
+    monkeypatch.setattr(pin_module.os, "sysconf", values.__getitem__, raising=False)
+    assert pin_module._default_pin_budget() == 50 * PAGE
+
+
+@pytest.mark.parametrize("success", [False, True])
+def test_windows_budget_uses_physical_ram_without_cuda(monkeypatch, success) -> None:
+    def query(pointer):
+        status = pointer._obj
+        assert status.length == 64
+        status.total_physical = 101 * PAGE
+        return success
+
+    query = Mock(side_effect=query)
+    monkeypatch.setattr(pin_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        pin_module.ctypes, "WinDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(GlobalMemoryStatusEx=query), raising=False,
+    )
+    assert pin_module._default_pin_budget() == (50 * PAGE if success else 0)
+
+
+def test_unknown_physical_ram_disables_default_admission(monkeypatch) -> None:
+    monkeypatch.setattr(pin_module.sys, "platform", "linux")
+    monkeypatch.setattr(pin_module.os, "sysconf", Mock(side_effect=OSError("unavailable")), raising=False)
+    assert pin_module._default_pin_budget() == 0
 
 
 def test_zero_budget_disables_registration_without_initializing_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -217,8 +250,9 @@ def test_capacity_failure_stops_later_registration_attempts(manager: PinManager,
         assert backend.register_calls == [(a.data_ptr(), PAGE)]
 
 
-def test_default_budget_reclaims_idle_lru_and_retries(backend: FakeBackend) -> None:
-    manager = PinManager(backend=backend)
+@pytest.mark.parametrize("budget", [None, 64 * PAGE])
+def test_capacity_failure_reclaims_idle_lru_and_retries(backend: FakeBackend, budget) -> None:
+    manager = PinManager(budget, backend=backend)
     a, b, c = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
     backend.capacity = 2 * PAGE
     for tensor in (a, b):
@@ -230,7 +264,7 @@ def test_default_budget_reclaims_idle_lru_and_retries(backend: FakeBackend) -> N
         assert lease.pageable_bytes == 0
         assert backend.unregister_calls == [a.data_ptr()]
         assert set(backend.registered) == {b.data_ptr(), c.data_ptr()}
-        assert manager.stats.max_pinned_bytes is None
+        assert manager.stats.max_pinned_bytes == budget
         assert manager.stats.registration_failures == 1
     manager.clear()
 
@@ -690,11 +724,15 @@ def test_unregistering_a_file_mapping_discards_and_warms_its_pages(backend, madv
     with manager.acquire([tensor]) as lease:
         assert lease.registered_bytes == tensor.nbytes
         assert madvise == []
-    assert madvise == []  # idle registrations keep their pages for a cheap re-pin
+    # An idle registration is retained, pages and all, for a cheap reactivation.
+    assert madvise == []
+    assert manager.stats.idle_registrations == 1
+    assert manager.stats.pinned_bytes == 4 * PAGE
     manager.clear()
     span = (tensor.data_ptr(), 4 * PAGE)
     assert madvise == [(*span, pin_module._MADV_DONTNEED), (*span, pin_module._MADV_WILLNEED)]
     assert backend.registered == {}
+    assert manager.stats.pinned_bytes == 0
 
 
 @LINUX
@@ -704,6 +742,8 @@ def test_anonymous_storage_is_never_discarded(backend, madvise) -> None:
     heap = torch.full((4 * PAGE,), 9, dtype=torch.uint8)
     with manager.acquire([buffer, heap]) as lease:
         assert lease.registered_bytes == buffer.nbytes + heap.nbytes
+    assert manager.stats.idle_registrations == 2
+    assert manager.stats.pinned_bytes >= buffer.nbytes + heap.nbytes
     manager.clear()
     assert madvise == []
     assert heap.eq(9).all()
@@ -716,6 +756,7 @@ def test_dropping_the_last_owner_discards_without_reading_the_file_back(backend,
     span = (tensor.data_ptr(), 4 * PAGE)
     with manager.acquire([tensor]):
         pass
+    assert not madvise
     del tensor
     gc.collect()
     assert madvise == [(*span, pin_module._MADV_DONTNEED)]
@@ -729,10 +770,79 @@ def test_budget_eviction_discards_the_evicted_mapping(backend, madvise, tmp_path
     (second,) = _tensors((0, 4 * PAGE))
     with manager.acquire([first]):
         pass
+    assert manager.stats.pinned_bytes == 4 * PAGE
     with manager.acquire([second]) as lease:
         assert lease.registered_bytes == second.nbytes
     assert [advice for _start, _length, advice in madvise] == [pin_module._MADV_DONTNEED, pin_module._MADV_WILLNEED]
     manager.clear()
+
+
+@LINUX
+def test_shared_mapping_is_retained_across_leases_and_can_be_registered_again(backend, madvise, tmp_path) -> None:
+    manager = PinManager(backend=backend)
+    tensor = _file_tensor(tmp_path, 4 * PAGE)
+    view = tensor[128:256]  # a live view shares the storage; a dropped owner would retire it
+    first = manager.acquire([tensor])
+    second = manager.acquire([view])
+    first.close()
+    manager.clear()
+    assert not backend.unregister_calls
+    assert not madvise
+    assert manager.stats.pinned_bytes == 4 * PAGE
+    second.close()
+    assert manager.stats.pinned_bytes == 4 * PAGE
+    assert manager.stats.idle_registrations == 1
+    manager.clear()
+    assert manager.stats.pinned_bytes == 0
+    assert len(madvise) == 2
+    with manager.acquire([tensor]):
+        assert len(backend.register_calls) == 2
+    manager.clear()
+    assert len(backend.unregister_calls) == 2
+
+
+@LINUX
+def test_file_unregister_failure_keeps_storage_and_charge_until_retry(backend, madvise, tmp_path) -> None:
+    manager = PinManager(backend=backend)
+    tensor = _file_tensor(tmp_path, 4 * PAGE)
+    backend.unregister_errors.add(tensor.data_ptr())
+    with manager.acquire([tensor]):
+        pass
+    assert not madvise
+    assert manager.stats.active_leases == 0
+    assert manager.stats.idle_registrations == 1
+    assert manager.stats.pinned_bytes == 4 * PAGE
+    assert manager._entries[tensor.data_ptr()].storage.data_ptr() == tensor.data_ptr()
+    backend.unregister_errors.clear()
+    manager.clear()
+    assert manager.stats.pinned_bytes == 0
+    assert len(madvise) == 2
+
+
+@LINUX
+def test_adjacent_file_registrations_discard_only_interior_pages(backend, madvise, tmp_path) -> None:
+    path = tmp_path / "adjacent.bin"
+    path.write_bytes(bytes(4 * PAGE))
+    with path.open("r+b") as file:
+        mapping = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_COPY)
+    first = torch.frombuffer(mapping, dtype=torch.uint8, count=PAGE + 100)
+    second = torch.frombuffer(mapping, dtype=torch.uint8, offset=PAGE + 100)
+    manager = PinManager(backend=backend)
+    lease = manager.acquire([second])
+    with manager.acquire([first]):
+        assert manager.stats.pinned_bytes == 4 * PAGE
+    # Trimming while the neighbour is leased evicts only the idle registration
+    # and leaves the page they share intact.
+    manager.clear()
+    assert madvise == [(first.data_ptr(), PAGE, pin_module._MADV_DONTNEED),
+                       (first.data_ptr(), PAGE, pin_module._MADV_WILLNEED)]
+    assert manager.stats.pinned_bytes == 3 * PAGE
+    assert second.data_ptr() in backend.registered
+    lease.close()
+    assert manager.stats.pinned_bytes == 3 * PAGE
+    manager.clear()
+    assert madvise[2][0:2] == (first.data_ptr() + 2 * PAGE, 2 * PAGE)
+    assert manager.stats.pinned_bytes == 0
 
 
 @LINUX
@@ -748,6 +858,166 @@ def test_file_mapping_on_tmpfs_is_discarded(backend, madvise) -> None:
         manager.clear()
         span = (tensor.data_ptr(), 4 * PAGE)
         assert madvise == [(*span, pin_module._MADV_DONTNEED), (*span, pin_module._MADV_WILLNEED)]
+
+
+def test_trim_evicts_idle_entries_least_recently_released_first(backend: FakeBackend) -> None:
+    manager = PinManager(backend=backend)
+    a, b, c = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
+    for tensor in (a, b, c):
+        with manager.acquire([tensor]):
+            pass
+    lease = manager.acquire([c])
+    result = manager.trim(PAGE)
+    assert result == pin_module.TrimResult(released_bytes=PAGE, freed_bytes=0, failures=0)
+    assert backend.unregister_calls == [a.data_ptr()]
+    # The rest: b is idle and goes; c is leased and stays.
+    result = manager.trim()
+    assert result.released_bytes == PAGE and result.failures == 0
+    assert set(backend.registered) == {c.data_ptr()}
+    assert manager.stats.pinned_bytes == PAGE
+    lease.close()
+    manager.clear()
+
+
+def test_trim_reports_failures_without_raising_and_clear_raises(backend: FakeBackend) -> None:
+    manager = PinManager(backend=backend)
+    (a,) = _tensors((0, PAGE))
+    with manager.acquire([a]):
+        pass
+    backend.unregister_errors.add(a.data_ptr())
+    assert manager.trim() == pin_module.TrimResult(released_bytes=0, freed_bytes=0, failures=1)
+    assert manager.stats.pinned_bytes == PAGE
+    with pytest.raises(RuntimeError, match="Could not release 1"):
+        manager.clear()
+    backend.unregister_errors.clear()
+    manager.clear()
+    assert manager.stats.pinned_bytes == 0
+
+
+@LINUX
+def test_trim_counts_only_returned_memory_as_freed(backend, madvise, tmp_path) -> None:
+    manager = PinManager(backend=backend)
+    mapped = _file_tensor(tmp_path, 4 * PAGE)
+    (anonymous,) = _tensors((0, 4 * PAGE))
+    with manager.acquire([mapped, anonymous]):
+        pass
+    result = manager.trim()
+    assert result.released_bytes == 8 * PAGE
+    assert result.freed_bytes == 4 * PAGE  # the mapping's pages; the anonymous storage is still the model's
+    assert result.failures == 0
+
+
+def test_reservation_holds_budget_until_consumed_or_released(backend: FakeBackend) -> None:
+    manager = PinManager(4 * PAGE, backend=backend)
+    a, b = _tensors((0, 4 * PAGE), (8 * PAGE, 4 * PAGE))
+    with manager.acquire([a]):
+        pass
+    reservation = manager.reserve(4 * PAGE)
+    assert reservation is not None and reservation.active
+    # Admission evicted the idle entry to make room, and the hold shows in the stats.
+    assert backend.unregister_calls == [a.data_ptr()]
+    assert manager.stats.reserved_bytes == 4 * PAGE
+    with manager.acquire([b]) as lease:
+        assert lease.pageable_bytes == b.nbytes  # no budget left while the reservation stands
+    with manager.acquire([b], reservation=reservation) as lease:
+        assert lease.registered_bytes == b.nbytes
+        assert not reservation.active
+        assert manager.stats.reserved_bytes == 0
+    assert manager.reserve(8 * PAGE) is None  # larger than the whole budget
+    with manager.reserve(4 * PAGE) as held:
+        assert held is not None and manager.stats.reserved_bytes == 4 * PAGE
+    assert manager.stats.reserved_bytes == 0
+    manager.clear()
+
+
+def test_reservation_is_consumed_even_when_registration_is_refused(backend: FakeBackend) -> None:
+    manager = PinManager(4 * PAGE, backend=backend)
+    (a,) = _tensors((0, 4 * PAGE))
+    reservation = manager.reserve(4 * PAGE)
+    assert reservation is not None
+    backend.refuse.add(a.data_ptr())
+    with manager.acquire([a], reservation=reservation) as lease:
+        assert lease.pageable_bytes == a.nbytes
+    assert manager.stats.reserved_bytes == 0
+    assert not reservation.active
+
+
+def test_admissions_that_consume_memory_keep_the_headroom(backend: FakeBackend, madvise, tmp_path) -> None:
+    available = {"bytes": 6 * PAGE}
+    manager = PinManager(headroom_bytes=3 * PAGE, backend=backend, available_memory=lambda: available["bytes"])
+    (anonymous,) = _tensors((0, 4 * PAGE))
+    # Registering resident anonymous storage consumes nothing and is always admitted.
+    with manager.acquire([anonymous]) as lease:
+        assert lease.registered_bytes == anonymous.nbytes
+    # A reservation is a copy about to be filled: 4 pages would leave 2, below the headroom.
+    assert manager.reserve(4 * PAGE) is None
+    available["bytes"] = 7 * PAGE
+    reservation = manager.reserve(4 * PAGE)
+    assert reservation is not None
+    reservation.release()
+    if sys.platform == "linux":
+        # Registering a private file mapping copies its pages, so it is gated too.
+        mapped = _file_tensor(tmp_path, 4 * PAGE)
+        available["bytes"] = 6 * PAGE
+        with manager.acquire([mapped]) as lease:
+            assert lease.pageable_bytes == mapped.nbytes
+        available["bytes"] = 7 * PAGE
+        with manager.acquire([mapped]) as lease:
+            assert lease.registered_bytes == mapped.nbytes
+    manager.clear()
+
+
+@LINUX
+def test_ensure_available_trims_idle_entries_that_return_memory(backend, madvise, tmp_path) -> None:
+    available = {"bytes": 2 * PAGE}
+    manager = PinManager(headroom_bytes=PAGE, backend=backend, available_memory=lambda: available["bytes"])
+    mapped = _file_tensor(tmp_path, 4 * PAGE)
+    available["bytes"] = 9 * PAGE
+    with manager.acquire([mapped]):
+        pass
+    available["bytes"] = 2 * PAGE
+
+    def madvise_frees(start: int, length: int, advice: int) -> int:
+        if advice == pin_module._MADV_DONTNEED:
+            available["bytes"] += length
+        return 0
+
+    manager._available_memory = lambda: available["bytes"]
+    pin_module_madvise = pin_module._madvise
+    pin_module._madvise = lambda: madvise_frees
+    try:
+        assert manager.ensure_available(4 * PAGE) == 0
+        assert manager.stats.pinned_bytes == 0
+        assert available["bytes"] == 6 * PAGE
+        # Nothing idle is left, so a bigger request reports what is missing.
+        assert manager.ensure_available(8 * PAGE) == 3 * PAGE
+    finally:
+        pin_module._madvise = pin_module_madvise
+
+
+def test_ensure_available_does_nothing_when_availability_is_unknown(backend: FakeBackend) -> None:
+    manager = PinManager(backend=backend, available_memory=lambda: None)
+    (a,) = _tensors((0, PAGE))
+    with manager.acquire([a]):
+        pass
+    assert manager.ensure_available(2**40) == 0
+    assert manager.stats.idle_registrations == 1
+    manager.clear()
+
+
+def test_headroom_configuration_and_stats(backend: FakeBackend) -> None:
+    manager = PinManager(headroom_bytes=PAGE, backend=backend, available_memory=lambda: None)
+    assert manager.headroom_bytes == PAGE
+    assert manager.stats.headroom_bytes == PAGE
+    manager.headroom_bytes = 2 * PAGE
+    assert manager.stats.headroom_bytes == 2 * PAGE
+    with pytest.raises(ValueError, match="headroom_bytes must be >= 0"):
+        manager.headroom_bytes = -1
+    with pytest.raises(ValueError, match="headroom_bytes must be >= 0"):
+        PinManager(headroom_bytes=-1, backend=backend)
+    default = PinManager(backend=backend)
+    assert default.headroom_bytes >= 2**30 and default.headroom_bytes % PAGE == 0
+    assert pin_module.available_memory_bytes() is None or pin_module.available_memory_bytes() > 0
 
 
 def _anonymous_bytes(pointer: int) -> int:
@@ -782,6 +1052,9 @@ def test_real_unregistration_returns_a_file_mapping_to_its_file(tmp_path) -> Non
                 assert _anonymous_bytes(pointer) == size
                 target = tensor.to("cuda", non_blocking=True)
                 torch.cuda.synchronize()
+            # Idle, the registration and its pages are retained until evicted.
+            assert _anonymous_bytes(pointer) == size
+            assert tensor.is_pinned()
             manager.clear()
             assert _anonymous_bytes(pointer) == 0
             assert not tensor.is_pinned()

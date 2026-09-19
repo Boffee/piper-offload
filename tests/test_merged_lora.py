@@ -1581,8 +1581,8 @@ class TestLifecycle:
         _request_loras(s, [(_make_lora(4, 16), 1.0)])
         _activate(s, "cuda")
         s.deactivate()
-        assert not m.embed.weight.is_pinned()
-        assert not m.head.weight.is_pinned()
+        assert m.embed.weight.is_pinned()
+        assert m.head.weight.is_pinned()
 
     @CUDA
     def test_reactivation_with_different_loras(self) -> None:
@@ -1594,7 +1594,7 @@ class TestLifecycle:
         _request_loras(s, [(_make_lora(4, 16, seed=2), 1.0)])
         _activate(s, "cuda")
         s.deactivate()
-        assert not m.embed.weight.is_pinned()
+        assert m.embed.weight.is_pinned()
 
     @CUDA
     def test_base_only_reactivation_does_not_reuse_previous_merge_hooks(self) -> None:

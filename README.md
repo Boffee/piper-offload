@@ -163,13 +163,19 @@ pin memory.
 ### Host registration
 
 `host_pin_manager` registers existing CPU storage in place under a separate
-`max_pinned_bytes` budget. Its default is `None` (no application byte limit), so
-registration proceeds opportunistically up to the capacity currently available
-from CUDA/HIP. Set a finite byte limit to cap registration, or set
-`max_pinned_bytes = 0` to disable it. Construction and configuration do not
-initialize CUDA. Ordinary streaming and compiled rolling acquire leases
-automatically with their CUDA working sets. CPU execution, resident blocks,
-and non-block components do not acquire pin leases.
+`max_pinned_bytes` budget. The default is half of physical RAM at import, rounded
+down to whole OS pages, leaving headroom for the page cache and other memory.
+Set a smaller limit for containers or applications sharing RAM with other
+workers; this is a per-process cap, not a reservation. If physical RAM cannot be
+queried, the default is zero. Set `max_pinned_bytes = 0` to disable registration,
+or explicitly choose `None` to remove the application cap. Supported native
+capacity failures fall back to pageable transfers; unexpected errors propagate.
+Construction and configuration do not initialize CUDA.
+
+Ordinary streaming and compiled rolling acquire leases with their CUDA working
+sets. Resident blocks and host components acquire a lease for upload and close
+it after synchronization; optimizer copy-back takes a fresh lease over the
+trainable destinations. CPU execution does not acquire pin leases.
 
 Registering a private file mapping, such as a safetensors checkpoint, locks its
 pages for writing, and the kernel answers by copying every page into private
@@ -183,17 +189,42 @@ storage it writes on your behalf is copied into memory the process owns
 first: a trainable parameter when its host parameter is captured, and a
 `merge_adapter()` target before the merge. Do not modify an mmap-backed
 parameter in place yourself before handing the model to Piper; on Linux those
-pages would revert to the file's bytes on the first eviction. Windows cannot
-discard the pages of a view it did not create, so private pages there persist
-until the mapping is released.
+pages would revert to the file's bytes when the registration is evicted.
+Windows cannot discard the pages of a view it did not create, so private pages
+there persist until the mapping is released.
 
-Deactivation releases the lease after transfers finish and leaves registrations
-in the idle LRU. Reactivating the same backing reuses its retained registrations
-without native register/unregister calls. `BlockComponent.release()` also
-releases pin protection during a temporary working-set release; `acquire()`
-reuses or registers backing again. This lets transient components share the
-budget. Resolved replacement sources, quantized payloads and metadata, buffers,
-and trainable optimizer backing all participate in the same lease.
+Closing the last lease does not unregister anything. The registration moves to
+an idle LRU, still charged to the budget, so reactivating the same backing
+costs no native register call and no copy. Idle entries leave only under
+pressure: budget admission of a newer request, a native capacity refusal, an
+available-memory headroom check, an explicit `trim()` or `ensure_available()`,
+or the source tensor being dropped. Evicting a private file mapping discards
+its interior pages, leaving shared boundary pages to their neighbours; evicting
+anonymous storage releases its pin charge but frees no memory, since the model
+still owns it. `BlockComponent.release()` also releases pin protection during a
+temporary working-set release; `acquire()` reuses or registers backing again.
+This lets transient components share the budget. Resolved replacement sources,
+quantized payloads and metadata, buffers, and trainable optimizer backing all
+participate in the same lease.
+
+Three calls let a caller shape memory pressure explicitly:
+
+- `trim(size)` evicts idle entries, least recently released first, until `size`
+  bytes of pin charge are released, or all of them with no argument. It returns
+  released charge, memory actually freed, and failed unregistrations separately;
+  `clear()` is a trim of everything that raises on failures.
+- `reserve(size)` holds budget for a copy that is about to be filled, admitting
+  it under the same budget and headroom rules as a registration, and returns
+  `None` when it cannot fit. Pass the reservation to `acquire(...)` once the copy
+  is registered, or release it on error.
+- `ensure_available(size)` evicts idle entries until the OS reports `size` plus
+  the headroom available, for a large pageable allocation the caller is about
+  to make, and returns the shortfall.
+
+Admissions that consume memory, a reservation or the in-place registration of
+a private file mapping, must leave `headroom_bytes` available afterwards, a
+sixteenth of RAM and at least 1 GiB by default. Registering anonymous storage
+the model already holds consumes nothing and is never gated by headroom.
 
 Explicit leases are also available for custom transfers:
 
@@ -201,7 +232,8 @@ Explicit leases are also available for custom transfers:
 import torch
 from piper_offload import host_pin_manager
 
-host_pin_manager.max_pinned_bytes = 4 * 1024**3  # optional cap; default is None
+host_pin_manager.max_pinned_bytes = 4 * 1024**3  # override the half-RAM default
+host_pin_manager.headroom_bytes = 2 * 1024**3  # optional; default is a sixteenth of RAM
 source = torch.randn(1024, 1024)
 target = torch.empty_like(source, device="cuda")
 copy_stream = torch.cuda.Stream()
@@ -214,7 +246,7 @@ with host_pin_manager.acquire([source]):
 ```
 
 Do not write into a private file mapping while it is registered here: on
-Linux the manager returns its pages to the file when it unregisters them.
+Linux the manager returns its pages to the file when it evicts them.
 
 For model backing, pass tensors from `HostParam.storage_tensors()` and
 `HostBuffer.storage_tensors()`. Acquiring a lease protects existing
@@ -226,8 +258,9 @@ another request arrives after capacity becomes available. A lease reports
 requested allocations. `host_pin_manager.stats.pinned_bytes` instead counts
 the union of covered OS pages, including shared boundary pages only once.
 
-Released registrations enter an idle LRU. Budget pressure evicts idle entries;
-active leases remain protected. A native capacity failure evicts unrelated idle
+Released anonymous registrations enter an idle LRU and still count toward the
+pin budget. Budget pressure evicts idle entries; active leases remain protected.
+A native capacity failure evicts unrelated idle
 registrations in LRU order and retries the current allocation. If capacity
 remains unavailable, the rest of that acquisition stays pageable without
 repeated registration attempts. Discarding a source tensor retires its

@@ -127,15 +127,19 @@ including tensor-valued metadata, without copying or rebuilding wrappers.
 The process-wide :data:`host_pin_manager` can register that storage in place
 under a finite page-rounded budget or opportunistically up to native CUDA/HIP
 capacity. :class:`PinLease` protects backing until its owner explicitly closes
-it; released registrations enter an idle LRU. The default budget is ``None``
-(no application byte limit); zero disables registration. Registering a mapped
-checkpoint in place copies it into private memory; on Linux, unregistering an
-idle mapping returns those pages to the file. Piper never writes into a file
-mapping: trainable parameters and merge targets are copied out first.
+it; released registrations enter a budgeted idle LRU and leave only under
+pressure, budget admission, a headroom check, ``trim()``, or source disposal.
+The default budget is half of physical RAM at import, rounded down to OS
+pages; zero disables registration and explicit ``None`` removes the
+application cap. Registering a mapped checkpoint in place copies it into
+private memory; on Linux, evicting it returns its private interior pages to
+the file. Piper never writes into a file mapping: trainable parameters and
+merge targets are copied out first.
 Block components acquire leases for ordinary streaming and compiled rolling,
-then close them only after their runtime has completed pending transfers. CUDA
-runtimes own stream ordering and remain independent of pin-budget policy. CPU
-and resident execution do not acquire pins. Host-data caching remains
+then close them only after their runtime has completed pending transfers.
+Resident blocks and host components lease their uploads through synchronization
+and take fresh leases for optimizer copy-back. CUDA runtimes own stream ordering.
+CPU execution does not acquire pins. Host-data caching remains
 independent of this registration budget.
 
 :class:`ResourceCache` manages cached backing stores with optional
@@ -182,7 +186,7 @@ from .parameter_value import (
     ParameterValueTransform,
     ScaledParameterValue,
 )
-from .pin_manager import PinLease, PinManager, PinStats, host_pin_manager
+from .pin_manager import PinLease, PinManager, PinStats, Reservation, TrimResult, host_pin_manager
 from .protocols import (
     ResourceBinding,
     ResourceSpec,
@@ -245,6 +249,7 @@ __all__ = [
     "PinLease",
     "PinManager",
     "PinStats",
+    "Reservation",
     "ResourceBinding",
     "ResourceCache",
     "ResourceCachedError",
@@ -258,6 +263,7 @@ __all__ = [
     "ScaledParameterDelta",
     "ScaledParameterValue",
     "TensorAdapter",
+    "TrimResult",
     "derive_seed",
     "host_pin_manager",
     "merge_adapter",

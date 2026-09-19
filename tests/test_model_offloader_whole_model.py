@@ -236,7 +236,7 @@ class TestHostComponentStoreBind:
             assert component._active_device.type == "cuda"
             assert component._lease is None
             assert not model._forward_pre_hooks
-            assert all(not param.is_pinned() for param in model.parameters())
+            assert all(param.is_pinned() for param in model.parameters())
 
             component.acquire()
             component.acquire()
@@ -252,7 +252,7 @@ class TestHostComponentStoreBind:
 
         assert component._active_device is None
         assert component._lease is None
-        assert all(not param.is_pinned() for param in model.parameters())
+        assert all(param.is_pinned() for param in model.parameters())
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +319,7 @@ class TestTrainableParams:
                 assert m.weight.is_cuda
                 assert m.weight.requires_grad
             assert m.weight is param
-            assert not m.weight.is_pinned()
+            assert m.weight.is_pinned()
         finally:
             pw.deactivate()
 
@@ -340,7 +340,7 @@ class TestTrainableParams:
                 updated = m.weight.detach().cpu().clone()
 
             assert m.weight is param
-            assert not m.weight.is_pinned()
+            assert m.weight.is_pinned()
             assert torch.equal(m.weight.detach(), updated)
 
             with activated_model(pw, "cuda"):
@@ -383,7 +383,7 @@ class TestTrainableParams:
 
             # Deactivated: data and grad are both host-resident, and the
             # grad is preserved (moved, not cleared).
-            assert m.weight.data.device.type == "cpu" and not m.weight.is_pinned()
+            assert m.weight.data.device.type == "cpu" and m.weight.is_pinned()
             assert m.weight.grad is not None
             assert m.weight.grad.device.type == "cpu"
         finally:
@@ -408,7 +408,7 @@ class TestTrainableParams:
                     gpu_model(x).sum().backward()
 
                 # Deactivated: trainable data + grad are host-resident.
-                assert m.weight.device.type == "cpu" and not m.weight.is_pinned()
+                assert m.weight.device.type == "cpu" and m.weight.is_pinned()
                 assert m.weight.grad is not None
                 assert m.weight.grad.device.type == "cpu"
 
@@ -451,7 +451,7 @@ class TestLifecycle:
             pw.deactivate()
             for p in m.parameters():
                 assert not p.is_cuda
-                assert not p.is_pinned()
+                assert p.is_pinned()
         finally:
             pw.deactivate()
 
@@ -904,8 +904,8 @@ class TestQuanto:
                 assert m.weight._data.is_cuda
                 assert m.weight._scale.is_cuda
             # Back to host after deactivate
-            assert not m.weight._data.is_pinned()
-            assert not m.weight._scale.is_pinned()
+            assert m.weight._data.is_pinned()
+            assert m.weight._scale.is_pinned()
         finally:
             pw.deactivate()
 

@@ -324,8 +324,8 @@ class TestLifecycle:
             assert m.embed.weight.is_cuda
             strategy.deactivate()
             assert m.embed.weight.device != target
-            assert not m.embed.weight.is_pinned()
-            assert not m.head.weight.is_pinned()
+            assert m.embed.weight.is_pinned()
+            assert m.head.weight.is_pinned()
         finally:
             strategy.deactivate()
 
@@ -1747,7 +1747,7 @@ class TestBufferOnlyNonBlock:
             strategy.activate("cuda")
             assert m.rope.table.is_cuda
             strategy.deactivate()
-            assert not m.rope.table.is_pinned()
+            assert m.rope.table.is_pinned()
         finally:
             strategy.deactivate()
 
@@ -2320,7 +2320,7 @@ class TestMultiComponentCleanup:
 
             # HostComponent restored registry entries before raising, and streamers
             # were already unwound in LIFO order.
-            assert not m.embed.weight.is_pinned()  # type: ignore[union-attr]
+            assert m.embed.weight.is_pinned()  # type: ignore[union-attr]
             assert not block_components(strategy)[0]._runtime._hooks
             assert strategy._composite._teardown_stack is None
         finally:
@@ -2622,8 +2622,8 @@ class TestMixedGradTieDetection:
                     torch.testing.assert_close(b.detach().cpu(), expected)
                 optimizer.zero_grad(set_to_none=True)
 
-            assert not a.is_pinned()
-            assert not b.is_pinned()
+            assert a.is_pinned()
+            assert b.is_pinned()
             assert a.data_ptr() == b.data_ptr()
             torch.testing.assert_close(a.detach(), expected)
             torch.testing.assert_close(b.detach(), expected)

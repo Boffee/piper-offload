@@ -1,10 +1,18 @@
 """Budgeted host registrations with active leases and an idle LRU.
 
 Use the process-wide ``host_pin_manager`` for application registrations. Its
-budget defaults to ``None``, enabling opportunistic registration up to native
-CUDA/HIP capacity. Set it to zero to disable registration. Construction and
-configuration perform no CUDA initialization. Isolated ``PinManager`` instances
-can use an injected backend for testing.
+budget defaults to half of physical RAM, rounded down to whole OS pages. Set
+it to zero to disable registration or ``None`` to remove the application cap.
+Construction and configuration perform no CUDA initialization. Isolated
+``PinManager`` instances can use an injected backend for testing.
+
+A registration whose last lease closes stays registered in an idle LRU so a
+reactivation costs nothing. Idle entries leave only under pressure: budget
+admission, a native capacity refusal, an available-memory headroom check for
+admissions that consume memory, ``trim()``, ``ensure_available()`` ahead of
+a known pageable allocation, or the source tensor being dropped. Releasing a
+pin is not the same as freeing memory: unregistering anonymous storage a
+model still owns frees nothing, and results report the two separately.
 
 Native registration uses whole storage byte ranges, including private file
 mappings of checkpoints. Locking such a mapping for writing makes the kernel
@@ -30,6 +38,7 @@ import ctypes
 import functools
 import logging
 import mmap
+import os
 import sys
 import threading
 import weakref
@@ -46,9 +55,78 @@ from ._host_registration import HostRegistrationBackend, RuntimeHostRegistration
 logger = logging.getLogger(__name__)
 
 
+class _MemoryStatus(ctypes.Structure):
+    # Windows MEMORYSTATUSEX; fixed-width types also allow testing on POSIX.
+    _fields_ = [
+        ("length", ctypes.c_uint32),
+        ("load", ctypes.c_uint32),
+        ("total_physical", ctypes.c_uint64),
+        ("available_physical", ctypes.c_uint64),
+        ("total_page_file", ctypes.c_uint64),
+        ("available_page_file", ctypes.c_uint64),
+        ("total_virtual", ctypes.c_uint64),
+        ("available_virtual", ctypes.c_uint64),
+        ("available_extended_virtual", ctypes.c_uint64),
+    ]
+
+
+def _default_pin_budget() -> int:
+    """Use half of physical RAM as the cap without touching CUDA."""
+    try:
+        if sys.platform == "win32":
+            status = _MemoryStatus()
+            status.length = ctypes.sizeof(status)
+            query = ctypes.WinDLL("kernel32", use_last_error=True).GlobalMemoryStatusEx
+            query.argtypes = (ctypes.POINTER(_MemoryStatus),)
+            query.restype = ctypes.c_int
+            if not query(ctypes.byref(status)):
+                raise OSError("GlobalMemoryStatusEx failed")
+            total = status.total_physical
+        else:
+            total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        if total <= 0:
+            raise ValueError("physical RAM is unavailable")
+        return total // (2 * mmap.PAGESIZE) * mmap.PAGESIZE
+    except (AttributeError, OSError, ValueError) as error:
+        logger.warning("Cannot determine physical RAM; default host pin budget is zero: %s", error)
+        return 0
+
+
+_DEFAULT_PIN_BUDGET = _default_pin_budget()
+
+
+def available_memory_bytes() -> int | None:
+    """Memory the OS could hand out now without swapping, or ``None`` when unknown."""
+    try:
+        if sys.platform == "win32":
+            status = _MemoryStatus()
+            status.length = ctypes.sizeof(status)
+            query = ctypes.WinDLL("kernel32", use_last_error=True).GlobalMemoryStatusEx
+            query.argtypes = (ctypes.POINTER(_MemoryStatus),)
+            query.restype = ctypes.c_int
+            return int(status.available_physical) if query(ctypes.byref(status)) else None
+        with open("/proc/meminfo", encoding="utf-8") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def _default_headroom() -> int:
+    """Keep a sixteenth of RAM, at least 1 GiB, for the page cache and everything else."""
+    total = _DEFAULT_PIN_BUDGET * 2
+    return max(2**30, total // 16) // mmap.PAGESIZE * mmap.PAGESIZE
+
+
 @dataclass(frozen=True, slots=True)
 class PinStats:
-    """Registration counts and the union of charged OS pages."""
+    """Registration counts and the union of charged OS pages.
+
+    ``reserved_bytes`` are pending admissions (see :meth:`PinManager.reserve`)
+    that count against the budget before their registration exists.
+    """
 
     max_pinned_bytes: int | None
     pinned_bytes: int
@@ -57,6 +135,53 @@ class PinStats:
     active_leases: int
     registration_failures: int
     unregistration_failures: int
+    reserved_bytes: int = 0
+    headroom_bytes: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class TrimResult:
+    """What an eviction pass did.
+
+    ``released_bytes`` is pin charge given back to the budget. ``freed_bytes``
+    is memory the manager itself returned to the OS by evicting, which today
+    is the discarded interior pages of a private file mapping; unregistering
+    anonymous storage a model still owns frees nothing. ``failures`` counts
+    entries whose native unregistration failed and stay charged.
+    """
+
+    released_bytes: int
+    freed_bytes: int
+    failures: int
+
+
+class Reservation:
+    """Budget held for a copy that is not registered yet.
+
+    Obtained from :meth:`PinManager.reserve`. The bytes count against the pin
+    budget until the reservation is consumed by ``acquire(reservation=...)``
+    or released. Use as a context manager to release on error.
+    """
+
+    def __init__(self, manager: PinManager, size: int) -> None:
+        self.size = size
+        self._manager: PinManager | None = manager
+
+    @property
+    def active(self) -> bool:
+        return self._manager is not None
+
+    def release(self) -> None:
+        manager, self._manager = self._manager, None
+        if manager is not None:
+            with manager._lock:
+                manager._reserved_bytes -= self.size
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
 
 
 @dataclass(eq=False)
@@ -225,8 +350,9 @@ class PinManager:
     """Own registrations under a page-rounded budget.
 
     A finite ``max_pinned_bytes`` bounds registered pages in this process.
-    The default, ``None``, treats native CUDA/HIP capacity as the limit, reclaiming
-    unrelated idle registrations when the runtime refuses a new allocation.
+    The default is half of physical RAM at import, rounded down to OS pages.
+    Explicit ``None`` removes the application cap; native capacity failures
+    still reclaim unrelated idle registrations and fall back to pageable memory.
 
     Acquire accepts the plain CPU tensors returned by ``storage_tensors()``.
     Tensor views share one whole-storage registration. Separate allocations
@@ -244,13 +370,20 @@ class PinManager:
 
     def __init__(
         self,
-        max_pinned_bytes: int | None = None,
+        max_pinned_bytes: int | None = _DEFAULT_PIN_BUDGET,
         *,
+        headroom_bytes: int | None = None,
         backend: HostRegistrationBackend | None = None,
+        available_memory: Callable[[], int | None] = available_memory_bytes,
     ) -> None:
         if max_pinned_bytes is not None and max_pinned_bytes < 0:
             raise ValueError("max_pinned_bytes must be >= 0")
+        if headroom_bytes is not None and headroom_bytes < 0:
+            raise ValueError("headroom_bytes must be >= 0")
         self._max_pinned_bytes = max_pinned_bytes
+        # Available memory that an admission consuming memory must leave behind.
+        self._headroom_bytes = _default_headroom() if headroom_bytes is None else headroom_bytes
+        self._available_memory = available_memory
         self._backend = backend if backend is not None else RuntimeHostRegistration()
         self._lock = threading.RLock()
         self._entries: dict[int, _Registration] = {}
@@ -262,6 +395,8 @@ class PinManager:
         # those endpoints avoids one Python entry per page of a large model.
         self._boundary_pages: dict[int, int] = {}
         self._pinned_bytes = 0
+        self._reserved_bytes = 0
+        self._freed_bytes = 0
         self._registration_failures = 0
         self._unregistration_failures = 0
         self._leases: dict[int, _LeaseState] = {}
@@ -289,6 +424,18 @@ class PinManager:
             self._make_room(0, 0)
 
     @property
+    def headroom_bytes(self) -> int:
+        with self._lock:
+            return self._headroom_bytes
+
+    @headroom_bytes.setter
+    def headroom_bytes(self, value: int) -> None:
+        if value < 0:
+            raise ValueError("headroom_bytes must be >= 0")
+        with self._lock:
+            self._headroom_bytes = value
+
+    @property
     def stats(self) -> PinStats:
         with self._lock:
             return PinStats(
@@ -299,10 +446,17 @@ class PinManager:
                 len(self._leases),
                 self._registration_failures,
                 self._unregistration_failures,
+                self._reserved_bytes,
+                self._headroom_bytes,
             )
 
-    def acquire(self, tensors: Iterable[torch.Tensor]) -> PinLease:
+    def acquire(self, tensors: Iterable[torch.Tensor], *, reservation: Reservation | None = None) -> PinLease:
         """Lease whole allocations, leaving capacity failures pageable.
+
+        ``reservation`` hands back budget held by :meth:`reserve` for these
+        allocations, so a copy admitted before it was filled is not charged
+        twice. The reservation is consumed whether or not registration
+        succeeds; a refused registration simply returns its bytes.
 
         Storage inside a private file mapping returns to the file when it is
         unregistered (Linux). The host must not write into such storage
@@ -322,6 +476,8 @@ class PinManager:
         mappings = _PrivateFileMappings()
         with self._lock:
             self._validate_ranges(requests)
+            if reservation is not None:
+                reservation.release()
             try:
                 for pointer, request in requests.items():
                     entry = self._entries.get(pointer)
@@ -331,7 +487,10 @@ class PinManager:
                     if pointer in held or pointer in self._pageable:
                         continue
                     size = request.storage.nbytes()
-                    if not self._make_room(pointer, size):
+                    # Registering a private file mapping in place makes the
+                    # kernel copy every page, so it consumes memory.
+                    discard = mappings.cover(pointer, size)
+                    if not self._make_room(pointer, size, consumes_memory=discard):
                         continue
                     registered = self._try_register(pointer, size)
                     while not registered and self._reclaim_idle_for_native_retry(
@@ -344,7 +503,7 @@ class PinManager:
                         # every lower-priority idle registration that can help.
                         # Avoid one failed runtime call per remaining tensor.
                         break
-                    entry = _Registration(pointer, size, request.storage, discard=mappings.cover(pointer, size))
+                    entry = _Registration(pointer, size, request.storage, discard=discard)
                     _live_managers.add(self)
                     self._entries[pointer] = entry
                     self._starts.insert(bisect_left(self._starts, pointer), pointer)
@@ -359,41 +518,114 @@ class PinManager:
                 self._release(tuple(held.values()))
                 raise
 
-            key = self._next_lease
-            self._next_lease += 1
-            pageable = tuple(pointer for pointer in requests if pointer not in held)
-            for pointer in pageable:
-                allocation = self._pageable.get(pointer)
-                if allocation is None:
-                    allocation = _Pageable(requests[pointer].storage.nbytes())
-                    self._pageable[pointer] = allocation
-                    self._starts.insert(bisect_left(self._starts, pointer), pointer)
-                allocation.leases += 1
-            self._leases[key] = _LeaseState(
-                tuple(held.values()),
-                pageable,
-                tuple(tensor for request in requests.values() for tensor in request.tensors),
-            )
-            _live_managers.add(self)
-            registered = sum(entry.size for entry in held.values())
-            total = sum(request.storage.nbytes() for request in requests.values())
-            return PinLease(self, key, registered, total - registered)
+            return self._open_lease(requests, held)
+
+    def _open_lease(self, requests: dict[int, _Request], held: dict[int, _Registration]) -> PinLease:
+        key = self._next_lease
+        self._next_lease += 1
+        pageable = tuple(pointer for pointer in requests if pointer not in held)
+        for pointer in pageable:
+            allocation = self._pageable.get(pointer)
+            if allocation is None:
+                allocation = _Pageable(requests[pointer].storage.nbytes())
+                self._pageable[pointer] = allocation
+                self._starts.insert(bisect_left(self._starts, pointer), pointer)
+            allocation.leases += 1
+        self._leases[key] = _LeaseState(
+            tuple(held.values()),
+            pageable,
+            tuple(tensor for request in requests.values() for tensor in request.tensors),
+        )
+        _live_managers.add(self)
+        registered = sum(entry.size for entry in held.values())
+        total = sum(request.storage.nbytes() for request in requests.values())
+        return PinLease(self, key, registered, total - registered)
 
     def clear(self) -> None:
-        """Unregister idle entries.
+        """Unregister every idle entry.
 
         Live leases remain protected. A failed unregistration retains its
         storage and budget charge; cleanup errors propagate so callers can
         retry without losing ownership of registered memory.
         """
+        result = self.trim()
+        if result.failures:
+            raise RuntimeError(
+                f"Could not release {result.failures} host registration(s); storage remains retained",
+            )
+
+    def trim(self, size: int | None = None) -> TrimResult:
+        """Evict idle entries, least recently released first, until ``size`` bytes of pin charge are released.
+
+        ``None`` evicts every idle entry. Live leases are never touched, so
+        the result may fall short; a failed unregistration counts as a
+        failure and keeps its charge. Freed memory is reported separately
+        from released charge, since unregistering anonymous storage a model
+        still owns frees nothing.
+        """
         with self._lock:
-            failed = 0
+            released = freed = failures = 0
+            freed_before = self._freed_bytes
             for pointer in tuple(self._idle):
+                if size is not None and released >= size:
+                    break
                 entry = self._entries.get(pointer)
-                if entry is not None and not self._unregister(entry):
-                    failed += 1
-            if failed:
-                raise RuntimeError(f"Could not release {failed} host registration(s); storage remains retained")
+                if entry is None:
+                    continue
+                charged_before = self._pinned_bytes
+                if self._unregister(entry):
+                    released += charged_before - self._pinned_bytes
+                else:
+                    failures += 1
+            freed = self._freed_bytes - freed_before
+            return TrimResult(released, freed, failures)
+
+    def reserve(self, size: int) -> Reservation | None:
+        """Hold ``size`` bytes of budget for a copy that is about to be filled.
+
+        Admission is the same as for a registration: idle entries are
+        evicted to fit the budget, and available memory must keep the
+        headroom. Returns ``None`` when the bytes cannot be admitted, in
+        which case the caller keeps the source pageable. Pass the result to
+        :meth:`acquire` once the copy is registered, or release it on error.
+        """
+        if size < 0:
+            raise ValueError("size must be >= 0")
+        with self._lock:
+            if not self._make_room(0, size, consumes_memory=True):
+                return None
+            self._reserved_bytes += size
+            return Reservation(self, size)
+
+    def ensure_available(self, size: int) -> int:
+        """Make room for a known pageable allocation of ``size`` bytes, returning the shortfall.
+
+        Idle entries are evicted, least recently released first, until the OS
+        reports ``size`` plus the headroom available or nothing idle remains.
+        Only evictions that return memory help; unregistering anonymous
+        storage a model owns changes nothing, and the loop stops when no
+        idle entry is left. Returns zero when satisfied, or the bytes still
+        missing. Returns zero without evicting when availability is unknown.
+        """
+        if size < 0:
+            raise ValueError("size must be >= 0")
+        with self._lock:
+            shortfall = self._headroom_shortfall(size)
+            for pointer in tuple(self._idle):
+                if shortfall <= 0:
+                    break
+                entry = self._entries.get(pointer)
+                if entry is not None:
+                    self._unregister(entry)
+                shortfall = self._headroom_shortfall(size)
+            return max(0, shortfall)
+
+    def _headroom_shortfall(self, size: int) -> int:
+        """Bytes by which ``size`` plus the headroom exceeds available memory; zero when unknown."""
+        available = self._available_memory()
+        if available is None:
+            return 0
+        return size + self._headroom_bytes - available
 
     @staticmethod
     def _requests(tensors: Iterable[torch.Tensor]) -> dict[int, _Request]:
@@ -468,23 +700,28 @@ class PinManager:
                 break
         return self._pinned_bytes < before
 
-    def _make_room(self, pointer: int, size: int) -> bool:
+    def _make_room(self, pointer: int, size: int, *, consumes_memory: bool = False) -> bool:
+        """Evict idle entries until ``size`` fits the budget and, if it consumes memory, the headroom."""
         limit = self._max_pinned_bytes
-        if limit is None:
-            return True
-        if size:
+        if limit is not None and size:
             pages = (pointer + size - 1) // mmap.PAGESIZE - pointer // mmap.PAGESIZE + 1
             if pages * mmap.PAGESIZE > limit:
                 return False
-        if self._pinned_bytes + self._page_charge(pointer, size) <= limit:
+        if self._fits(pointer, size, consumes_memory):
             return True
         for candidate in tuple(self._idle):
             entry = self._entries.get(candidate)
             if entry is not None:
                 self._unregister(entry)
-            if self._pinned_bytes + self._page_charge(pointer, size) <= limit:
+            if self._fits(pointer, size, consumes_memory):
                 return True
         return False
+
+    def _fits(self, pointer: int, size: int, consumes_memory: bool) -> bool:
+        limit = self._max_pinned_bytes
+        if limit is not None and self._pinned_bytes + self._reserved_bytes + self._page_charge(pointer, size) > limit:
+            return False
+        return not consumes_memory or self._headroom_shortfall(size) <= 0
 
     def _hold(self, entry: _Registration, request: _Request, held: dict[int, _Registration]) -> None:
         entry.leases += 1
@@ -527,6 +764,7 @@ class PinManager:
         if entry.discard:
             # A retired mapping is on its way out; do not read its file back.
             _discard_and_warm(entry.pointer, entry.size, warm=not entry.retired)
+            self._freed_bytes += _interior_pages(entry.pointer, entry.size)[1]
         return True
 
     def _release(self, entries: tuple[_Registration, ...]) -> None:
@@ -566,4 +804,12 @@ _live_managers: set[PinManager] = set()
 
 host_pin_manager = PinManager()
 
-__all__ = ["PinLease", "PinManager", "PinStats", "host_pin_manager"]
+__all__ = [
+    "PinLease",
+    "PinManager",
+    "PinStats",
+    "Reservation",
+    "TrimResult",
+    "available_memory_bytes",
+    "host_pin_manager",
+]

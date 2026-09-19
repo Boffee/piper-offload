@@ -77,22 +77,9 @@ logger = logging.getLogger(__name__)
 def _host_transfer_tensors(
     load_plans: Sequence[HostModuleLoadPlan],
 ) -> Iterator[torch.Tensor]:
-    """Enumerate host storage that a streamed activation may read.
-
-    Replacements supersede frozen model sources. Optimizer steps still gather
-    and scatter the instance's own trainable backing, so retain that too. The
-    pin manager deduplicates aliases and whole storage allocations.
-    """
+    """Enumerate host storage read or written by this activation."""
     for plan in load_plans:
-        for load in plan.loads.values():
-            yield from load.source.storage_tensors()
-            if load.update is not None:
-                yield from load.update.storage_tensors()
-        for buffer in plan.instance.buffers.values():
-            yield from buffer.storage_tensors()
-        for host in plan.instance.params.values():
-            if host.requires_grad:
-                yield from host.storage_tensors()
+        yield from plan.storage_tensors()
 
 
 def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
@@ -990,9 +977,9 @@ class BlockComponent:
         Idempotent when already acquired. CPU sessions have no CUDA working
         set and therefore need no acquisition. The activation session and any
         installed compiled forwards remain intact across release/acquire
-        cycles. The component leases streaming and rolling host storage under
-        the global pin budget before the selected runtime starts. Resident
-        mode does not use a host pin lease.
+        cycles. The component leases host storage under the global pin budget
+        before the selected runtime starts. Resident uploads release their
+        lease once the runtime has synchronized the upload.
         """
         active_device = self._active_device
         if active_device is None:
@@ -1008,11 +995,17 @@ class BlockComponent:
             raise RuntimeError(
                 "BlockComponent cannot acquire while prior pin cleanup is incomplete."
             )
-        if self._block_mode != "resident":
-            self._pin_lease = host_pin_manager.acquire(
-                _host_transfer_tensors(self._load_plans)
-            )
+        self._pin_lease = host_pin_manager.acquire(
+            _host_transfer_tensors(self._load_plans)
+        )
         runtime.acquire(active_device, self._load_plans)
+        if self._block_mode == "resident":
+            self._close_pin_lease()
+
+    def _close_pin_lease(self) -> None:
+        if self._pin_lease is not None:
+            self._pin_lease.close()
+            self._pin_lease = None
 
     def release(self) -> None:
         """Idempotently release this session's CUDA working set.
@@ -1022,10 +1015,9 @@ class BlockComponent:
         and compiled forwards remain installed, so :meth:`acquire` can prepare
         the same session for another traversal. Target retirement completes
         recorded CUDA work, so release is safe immediately after a forward.
-        Streaming host pin leases are released after the runtime confirms all
-        copies have completed. Their
-        registrations remain in the idle LRU for reuse until budget pressure,
-        explicit clearing, or source disposal unregisters them.
+        Host pin leases are released after the runtime confirms all copies
+        have completed. Registrations stay in the idle LRU for reactivation
+        until budget pressure, a trim, or source disposal evicts them.
         """
         runtime = self._active_runtime
         if runtime is None:
@@ -1034,10 +1026,7 @@ class BlockComponent:
             runtime.release()
         finally:
             if not runtime.acquired:
-                lease = self._pin_lease
-                if lease is not None:
-                    lease.close()
-                    self._pin_lease = None
+                self._close_pin_lease()
 
     def deactivate(self) -> None:
         """Tear down active resources idempotently — safe to call
@@ -1093,8 +1082,26 @@ class BlockComponent:
                 "block component. Use it inside the offloader's context "
                 "manager, between backward and the next forward."
             )
-        with runtime.optimizer_step():
-            yield
+        if self._block_mode != "resident":
+            with runtime.optimizer_step():
+                yield
+            return
+
+        if self._pin_lease is not None:
+            raise RuntimeError("BlockComponent optimizer step has unfinished host transfers or reentrant entry.")
+        self._pin_lease = host_pin_manager.acquire(
+            tensor
+            for instance in self._block_instances
+            for tensor in instance.trainable_storage_tensors()
+        )
+        try:
+            with runtime.optimizer_step():
+                yield
+        finally:
+            # Also covers a copy-back that failed after enqueueing earlier
+            # copies. A failed synchronization must retain host protection.
+            torch.cuda.synchronize(self._active_device)
+            self._close_pin_lease()
 
     def gather_for_step(self) -> contextlib.AbstractContextManager[None]:
         """Backward-compatible alias for :meth:`optimizer_step`."""

@@ -66,6 +66,7 @@ from .host_module import (
     HostModuleStore,
     ParameterOverride,
 )
+from .pin_manager import PinLease, host_pin_manager
 from .target_lease import CudaTargetLease
 
 
@@ -162,6 +163,8 @@ class HostComponent:
         self._active_device: torch.device | None = None
         self._load_plan: HostModuleLoadPlan | None = None
         self._lease: CudaTargetLease | None = None
+        self._pin_lease: PinLease | None = None
+        self._pin_device: torch.device | None = None
         self._use_hook: torch.utils.hooks.RemovableHandle | None = None
         self._optimizer_step_active: bool = False
 
@@ -211,6 +214,11 @@ class HostComponent:
                 f"on {self._active_device}. Deactivate first, or check "
                 "for a leaked context manager."
             )
+        if self._pin_lease is not None:
+            raise RuntimeError(
+                "HostComponent cannot activate after its prior CUDA session "
+                "failed to finish host transfers. Recreate the CUDA worker."
+            )
         active_device = canonical_device(device)
         if active_device.type == "cpu":
             if parameter_overrides:
@@ -244,16 +252,22 @@ class HostComponent:
                 "HostComponent.acquire() requires an active session; "
                 "call activate() first."
             )
-        if active_device.type == "cpu" or self._lease is not None:
+        if active_device.type == "cpu":
+            return
+        if self._pin_lease is not None:
+            raise RuntimeError("HostComponent cannot acquire while prior pin cleanup is incomplete.")
+        if self._lease is not None:
             return
 
         plan = self._load_plan
         if plan is None:
             raise RuntimeError("HostComponent CUDA session has no load plan.")
         current_stream = torch.cuda.current_stream(active_device)
-        lease = CudaTargetLease.allocate(plan, active_device)
-        self._lease = lease
+        self._pin_lease = host_pin_manager.acquire(plan.storage_tensors())
+        self._pin_device = active_device
         try:
+            lease = CudaTargetLease.allocate(plan, active_device)
+            self._lease = lease
             lease.stage(
                 plan,
                 current_stream,
@@ -261,6 +275,7 @@ class HostComponent:
             )
             self._instance.install_target(lease.acquire(current_stream))
             torch.cuda.synchronize(active_device)
+            self._close_pin_lease()
             # Realign trainable grads with their now-GPU data so the next
             # backward accumulates on-device. A no-op unless a prior CPU
             # optimizer step left a retained CPU grad (set_to_none=False).
@@ -269,6 +284,12 @@ class HostComponent:
         except BaseException:
             self.release()
             raise
+
+    def _close_pin_lease(self) -> None:
+        if self._pin_lease is not None:
+            self._pin_lease.close()
+            self._pin_lease = None
+            self._pin_device = None
 
     def _install_use_hook(self) -> None:
         """Track the CUDA stream that actually executes the bound module."""
@@ -317,6 +338,11 @@ class HostComponent:
         ``.grad`` both on CPU — so a context-free CPU
         ``optimizer.step()`` works the same for host and streamed
         trainables."""
+        if self._pin_lease is not None:
+            # Even a partial upload/copy-back needs completion before host
+            # pages can be unregistered or discarded. Retain on sync failure.
+            torch.cuda.synchronize(self._pin_device)
+            self._close_pin_lease()
         lease = self._lease
         if lease is None:
             return
@@ -380,14 +406,21 @@ class HostComponent:
                         "HostComponent optimizer-step state is inconsistent: "
                         "CUDA active without an active target."
                     )
+                if self._pin_lease is not None:
+                    raise RuntimeError("HostComponent optimizer step has unfinished host transfers.")
+                self._pin_lease = host_pin_manager.acquire(self._instance.trainable_storage_tensors())
+                self._pin_device = active_device
                 try:
                     yield
                 finally:
-                    self._instance.copy_trainables_from_target(
-                        lease.target,
-                        non_blocking=True,
-                    )
-                    torch.cuda.synchronize(active_device)
+                    try:
+                        self._instance.copy_trainables_from_target(
+                            lease.target,
+                            non_blocking=True,
+                        )
+                    finally:
+                        torch.cuda.synchronize(active_device)
+                        self._close_pin_lease()
             else:
                 yield
         finally:
