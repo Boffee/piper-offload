@@ -17,9 +17,6 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
-- On Linux, unregistering a private file mapping discards its copied pages,
-  returning the mapping to file backing, and warms the page cache so the next
-  registration copies from RAM.
 - Piper never writes into a file mapping. `HostParam` copies a trainable
   parameter out of storage the process does not own at capture, and
   `merge_adapter()` replaces such a target by an independent parameter under
