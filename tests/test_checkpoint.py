@@ -2,6 +2,7 @@
 
 import gc
 import json
+import os
 import struct
 import weakref
 from pathlib import Path
@@ -85,6 +86,15 @@ def test_matches_safetensors_reader(sample) -> None:
             torch.testing.assert_close(reader.get_tensor(name), reference.get_tensor(name))
             assert reader.get_slice(name).get_dtype() == reference.get_slice(name).get_dtype()
             assert reader.get_slice(name).get_shape() == reference.get_slice(name).get_shape()
+
+
+@pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="POSIX readahead advice")
+def test_reader_advises_sequential_readahead_like_torch_from_file(sample, monkeypatch) -> None:
+    path, _tensors = sample
+    calls: list[tuple[int, int, int]] = []
+    monkeypatch.setattr(os, "posix_fadvise", lambda fd, offset, length, advice: calls.append((offset, length, advice)))
+    MappedCheckpoint(path)
+    assert calls == [(0, path.stat().st_size, os.POSIX_FADV_SEQUENTIAL)]
 
 
 def test_no_metadata_reads_as_none(tmp_path: Path) -> None:
