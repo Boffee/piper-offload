@@ -1,0 +1,245 @@
+{
+  "path": "/home/brian/git/apps/ComfyUI/models/diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors",
+  "tensor_bytes": 32442261598,
+  "tensors": 1016,
+  "torch": "2.14.0+cu130",
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "mapping_s": 0.07569919399975333,
+  "exclude_prefix": [
+    "token_refiner.",
+    "condition_proj.",
+    "context_embedder."
+  ],
+  "samples": [
+    {
+      "policy": "discard",
+      "repeat": 0,
+      "acquire_s": 7.173897224012762,
+      "native_register_s": 7.15835727727972,
+      "register_calls": 1016,
+      "register_disk_bytes": 655360,
+      "release_s": 1.180308913011686,
+      "native_unregister_s": 0.8771475737885339,
+      "discard_s": 0.2986891519103665,
+      "warm_s": 0.0012644511589314789,
+      "before": {
+        "Rss": 32442437632,
+        "Anonymous": 0,
+        "Locked": 0
+      },
+      "registered": {
+        "Rss": 32442437632,
+        "Anonymous": 32442273792,
+        "Locked": 0
+      },
+      "released": {
+        "Rss": 2932736,
+        "Anonymous": 2768896,
+        "Locked": 0
+      },
+      "stats": {
+        "max_pinned_bytes": null,
+        "pinned_bytes": 0,
+        "registrations": 0,
+        "idle_registrations": 0,
+        "active_leases": 0,
+        "registration_failures": 0,
+        "unregistration_failures": 0
+      },
+      "transfer_s": 0.631317521998426,
+      "byte_samples_match": true
+    },
+    {
+      "policy": "discard",
+      "repeat": 1,
+      "acquire_s": 4.56700851599453,
+      "native_register_s": 4.556438914165483,
+      "register_calls": 1016,
+      "register_disk_bytes": 8192,
+      "release_s": 1.2026491959986743,
+      "native_unregister_s": 0.8942945080780191,
+      "discard_s": 0.3029742319340585,
+      "warm_s": 0.0014060260000405833,
+      "before": {
+        "Rss": 2932736,
+        "Anonymous": 2768896,
+        "Locked": 0
+      },
+      "registered": {
+        "Rss": 32442437632,
+        "Anonymous": 32442273792,
+        "Locked": 0
+      },
+      "released": {
+        "Rss": 2932736,
+        "Anonymous": 2768896,
+        "Locked": 0
+      },
+      "stats": {
+        "max_pinned_bytes": null,
+        "pinned_bytes": 0,
+        "registrations": 0,
+        "idle_registrations": 0,
+        "active_leases": 0,
+        "registration_failures": 0,
+        "unregistration_failures": 0
+      },
+      "transfer_s": 0.6314183060021605,
+      "byte_samples_match": true
+    },
+    {
+      "policy": "discard",
+      "repeat": 2,
+      "acquire_s": 4.619551643001614,
+      "native_register_s": 4.608964888786431,
+      "register_calls": 1016,
+      "register_disk_bytes": 0,
+      "release_s": 1.1819301649957197,
+      "native_unregister_s": 0.8854752476327121,
+      "discard_s": 0.29184382110543083,
+      "warm_s": 0.0012890587968286127,
+      "before": {
+        "Rss": 2932736,
+        "Anonymous": 2768896,
+        "Locked": 0
+      },
+      "registered": {
+        "Rss": 32442437632,
+        "Anonymous": 32442273792,
+        "Locked": 0
+      },
+      "released": {
+        "Rss": 2932736,
+        "Anonymous": 2768896,
+        "Locked": 0
+      },
+      "stats": {
+        "max_pinned_bytes": null,
+        "pinned_bytes": 0,
+        "registrations": 0,
+        "idle_registrations": 0,
+        "active_leases": 0,
+        "registration_failures": 0,
+        "unregistration_failures": 0
+      },
+      "transfer_s": 0.6298203519982053,
+      "byte_samples_match": true
+    },
+    {
+      "policy": "retain_private",
+      "repeat": 0,
+      "acquire_s": 4.598295365009108,
+      "native_register_s": 4.5881380190112395,
+      "register_calls": 1016,
+      "register_disk_bytes": 0,
+      "release_s": 0.29459698700520676,
+      "native_unregister_s": 0.2922271080315113,
+      "discard_s": 0.0,
+      "warm_s": 0.0,
+      "before": {
+        "Rss": 2932736,
+        "Anonymous": 2768896,
+        "Locked": 0
+      },
+      "registered": {
+        "Rss": 32442437632,
+        "Anonymous": 32442273792,
+        "Locked": 0
+      },
+      "released": {
+        "Rss": 32442437632,
+        "Anonymous": 32442273792,
+        "Locked": 0
+      },
+      "stats": {
+        "max_pinned_bytes": null,
+        "pinned_bytes": 0,
+        "registrations": 0,
+        "idle_registrations": 0,
+        "active_leases": 0,
+        "registration_failures": 0,
+        "unregistration_failures": 0
+      },
+      "transfer_s": 0.6302620399947045,
+      "byte_samples_match": true
+    },
+    {
+      "policy": "retain_private",
+      "repeat": 1,
+      "acquire_s": 0.6763666220067535,
+      "native_register_s": 0.6687949388724519,
+      "register_calls": 1016,
+      "register_disk_bytes": 0,
+      "release_s": 0.26489580699126236,
+      "native_unregister_s": 0.2625909019698156,
+      "discard_s": 0.0,
+      "warm_s": 0.0,
+      "before": {
+        "Rss": 32442437632,
+        "Anonymous": 32442273792,
+        "Locked": 0
+      },
+      "registered": {
+        "Rss": 32442437632,
+        "Anonymous": 32442273792,
+        "Locked": 0
+      },
+      "released": {
+        "Rss": 32442437632,
+        "Anonymous": 32442273792,
+        "Locked": 0
+      },
+      "stats": {
+        "max_pinned_bytes": null,
+        "pinned_bytes": 0,
+        "registrations": 0,
+        "idle_registrations": 0,
+        "active_leases": 0,
+        "registration_failures": 0,
+        "unregistration_failures": 0
+      },
+      "transfer_s": 0.6299392149958294,
+      "byte_samples_match": true
+    },
+    {
+      "policy": "retain_private",
+      "repeat": 2,
+      "acquire_s": 0.6594005059887422,
+      "native_register_s": 0.6518215338437585,
+      "register_calls": 1016,
+      "register_disk_bytes": 0,
+      "release_s": 0.2649813070020173,
+      "native_unregister_s": 0.2623363811871968,
+      "discard_s": 0.0,
+      "warm_s": 0.0,
+      "before": {
+        "Rss": 32442437632,
+        "Anonymous": 32442273792,
+        "Locked": 0
+      },
+      "registered": {
+        "Rss": 32442437632,
+        "Anonymous": 32442273792,
+        "Locked": 0
+      },
+      "released": {
+        "Rss": 32442437632,
+        "Anonymous": 32442273792,
+        "Locked": 0
+      },
+      "stats": {
+        "max_pinned_bytes": null,
+        "pinned_bytes": 0,
+        "registrations": 0,
+        "idle_registrations": 0,
+        "active_leases": 0,
+        "registration_failures": 0,
+        "unregistration_failures": 0
+      },
+      "transfer_s": 0.6302877249981975,
+      "byte_samples_match": true
+    }
+  ],
+  "prefetch_s": 5.222154183997191,
+  "prefetch_disk_bytes": 32339959808
+}

@@ -1,0 +1,1881 @@
+{
+  "platform": "Linux-7.0.0-31-generic-x86_64-with-glibc2.39",
+  "torch": "2.14.0+cu130",
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "model_bytes": 268435456,
+  "budget_bytes": 1073741824,
+  "samples": [
+    {
+      "mode": "streaming",
+      "model": 0,
+      "activation_ms": 45.47887398803141,
+      "deactivation_ms": 1.194679003674537,
+      "before": {
+        "process_rss_bytes": 1697140736,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1697296384,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 268439552,
+          "registrations": 4,
+          "idle_registrations": 0,
+          "active_leases": 1,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1697300480,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 268439552,
+          "registrations": 4,
+          "idle_registrations": 4,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "streaming",
+      "model": 1,
+      "activation_ms": 41.80664400337264,
+      "deactivation_ms": 1.176211007987149,
+      "before": {
+        "process_rss_bytes": 1698394112,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 268439552,
+          "registrations": 4,
+          "idle_registrations": 4,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1698406400,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 4,
+          "active_leases": 1,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1698414592,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "streaming",
+      "model": 0,
+      "activation_ms": 1.8929810030385852,
+      "deactivation_ms": 1.4005190023453906,
+      "before": {
+        "process_rss_bytes": 1698414592,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1698418688,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 4,
+          "active_leases": 1,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1698422784,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "streaming",
+      "model": 1,
+      "activation_ms": 1.5560329920845106,
+      "deactivation_ms": 1.1770920100389048,
+      "before": {
+        "process_rss_bytes": 1698422784,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1698422784,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 4,
+          "active_leases": 1,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1698430976,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "streaming",
+      "model": 0,
+      "activation_ms": 1.8620040063979104,
+      "deactivation_ms": 1.460019004298374,
+      "before": {
+        "process_rss_bytes": 1698430976,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1698430976,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 4,
+          "active_leases": 1,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1698435072,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "streaming",
+      "model": 1,
+      "activation_ms": 1.550815999507904,
+      "deactivation_ms": 1.1746789969038218,
+      "before": {
+        "process_rss_bytes": 1698435072,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1698435072,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 4,
+          "active_leases": 1,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1698439168,
+        "mappings": {
+          "streaming-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "streaming-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "rolling",
+      "model": 0,
+      "activation_ms": 44.12998400221113,
+      "deactivation_ms": 1.191333998576738,
+      "before": {
+        "process_rss_bytes": 1723543552,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723559936,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 268439552,
+          "registrations": 4,
+          "idle_registrations": 0,
+          "active_leases": 1,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723559936,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 268439552,
+          "registrations": 4,
+          "idle_registrations": 4,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "rolling",
+      "model": 1,
+      "activation_ms": 39.69464400142897,
+      "deactivation_ms": 1.1716550070559606,
+      "before": {
+        "process_rss_bytes": 1723559936,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 268439552,
+          "registrations": 4,
+          "idle_registrations": 4,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 4,
+          "active_leases": 1,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "rolling",
+      "model": 0,
+      "activation_ms": 1.729384995996952,
+      "deactivation_ms": 1.2792470079148188,
+      "before": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 4,
+          "active_leases": 1,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "rolling",
+      "model": 1,
+      "activation_ms": 1.4901340036885813,
+      "deactivation_ms": 1.1879289959324524,
+      "before": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 4,
+          "active_leases": 1,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "rolling",
+      "model": 0,
+      "activation_ms": 1.6490940033691004,
+      "deactivation_ms": 1.3094019959680736,
+      "before": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 4,
+          "active_leases": 1,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "rolling",
+      "model": 1,
+      "activation_ms": 1.518236007541418,
+      "deactivation_ms": 1.1845539993373677,
+      "before": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 4,
+          "active_leases": 1,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723564032,
+        "mappings": {
+          "rolling-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          },
+          "rolling-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 268439552,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 536879104,
+          "registrations": 8,
+          "idle_registrations": 8,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "resident",
+      "model": 0,
+      "activation_ms": 9.500898988335393,
+      "deactivation_ms": 0.10409600508864969,
+      "before": {
+        "process_rss_bytes": 1723588608,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "resident",
+      "model": 1,
+      "activation_ms": 9.387229001731612,
+      "deactivation_ms": 0.098307995358482,
+      "before": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "resident",
+      "model": 0,
+      "activation_ms": 9.38266099547036,
+      "deactivation_ms": 0.09720600792206824,
+      "before": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "resident",
+      "model": 1,
+      "activation_ms": 9.318434007582255,
+      "deactivation_ms": 0.09701598901301622,
+      "before": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "resident",
+      "model": 0,
+      "activation_ms": 9.374267989187501,
+      "deactivation_ms": 0.09779800893738866,
+      "before": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "resident",
+      "model": 1,
+      "activation_ms": 9.317253003246151,
+      "deactivation_ms": 0.10100199142470956,
+      "before": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "resident-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "resident-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "host",
+      "model": 0,
+      "activation_ms": 9.024812999996357,
+      "deactivation_ms": 0.06605000817216933,
+      "before": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "host",
+      "model": 1,
+      "activation_ms": 9.111933992244303,
+      "deactivation_ms": 0.08288498793262988,
+      "before": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "host",
+      "model": 0,
+      "activation_ms": 9.31933699757792,
+      "deactivation_ms": 0.08331499702762812,
+      "before": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "host",
+      "model": 1,
+      "activation_ms": 9.131753002293408,
+      "deactivation_ms": 0.08684099884703755,
+      "before": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "host",
+      "model": 0,
+      "activation_ms": 9.145464005996473,
+      "deactivation_ms": 0.08123199222609401,
+      "before": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    },
+    {
+      "mode": "host",
+      "model": 1,
+      "activation_ms": 9.154298008070327,
+      "deactivation_ms": 0.0799510016804561,
+      "before": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "active": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      },
+      "released": {
+        "process_rss_bytes": 1723609088,
+        "mappings": {
+          "host-0.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          },
+          "host-1.safetensors": {
+            "Rss": 268439552,
+            "Anonymous": 0,
+            "Locked": 0
+          }
+        },
+        "pins": {
+          "max_pinned_bytes": 1073741824,
+          "pinned_bytes": 0,
+          "registrations": 0,
+          "idle_registrations": 0,
+          "active_leases": 0,
+          "registration_failures": 0,
+          "unregistration_failures": 0
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,140 @@
+[
+  {
+    "budget": 0,
+    "repeat": 0,
+    "activation_s": 0.03635426099936012,
+    "release_s": 0.0034542840003268793,
+    "register_s": 0.0,
+    "unregister_s": 0.0,
+    "register_calls": 0,
+    "active_pins": {
+      "max_pinned_bytes": 0,
+      "pinned_bytes": 0,
+      "registrations": 0,
+      "idle_registrations": 0,
+      "active_leases": 1,
+      "registration_failures": 0,
+      "unregistration_failures": 0
+    },
+    "released_memory": {
+      "Rss": 32442458112,
+      "Anonymous": 0,
+      "Locked": 0
+    }
+  },
+  {
+    "budget": 0,
+    "repeat": 1,
+    "activation_s": 0.0328396969998721,
+    "release_s": 0.0035202730068704113,
+    "register_s": 0.0,
+    "unregister_s": 0.0,
+    "register_calls": 0,
+    "active_pins": {
+      "max_pinned_bytes": 0,
+      "pinned_bytes": 0,
+      "registrations": 0,
+      "idle_registrations": 0,
+      "active_leases": 1,
+      "registration_failures": 0,
+      "unregistration_failures": 0
+    },
+    "released_memory": {
+      "Rss": 32442458112,
+      "Anonymous": 0,
+      "Locked": 0
+    }
+  },
+  {
+    "budget": 0,
+    "repeat": 2,
+    "activation_s": 0.03284595599689055,
+    "release_s": 0.0035377100139157847,
+    "register_s": 0.0,
+    "unregister_s": 0.0,
+    "register_calls": 0,
+    "active_pins": {
+      "max_pinned_bytes": 0,
+      "pinned_bytes": 0,
+      "registrations": 0,
+      "idle_registrations": 0,
+      "active_leases": 1,
+      "registration_failures": 0,
+      "unregistration_failures": 0
+    },
+    "released_memory": {
+      "Rss": 32442458112,
+      "Anonymous": 0,
+      "Locked": 0
+    }
+  },
+  {
+    "budget": 67191017472,
+    "repeat": 0,
+    "activation_s": 8.191598895005882,
+    "release_s": 1.0429185130051337,
+    "register_s": 8.142542662128108,
+    "unregister_s": 0.6494561316794716,
+    "register_calls": 766,
+    "active_pins": {
+      "max_pinned_bytes": 67191017472,
+      "pinned_bytes": 32315539456,
+      "registrations": 751,
+      "idle_registrations": 1,
+      "active_leases": 1,
+      "registration_failures": 0,
+      "unregistration_failures": 0
+    },
+    "released_memory": {
+      "Rss": 2953216,
+      "Anonymous": 2752512,
+      "Locked": 0
+    }
+  },
+  {
+    "budget": 67191017472,
+    "repeat": 1,
+    "activation_s": 4.56399787600094,
+    "release_s": 1.0487853160011582,
+    "register_s": 4.520094506282476,
+    "unregister_s": 0.652011270110961,
+    "register_calls": 765,
+    "active_pins": {
+      "max_pinned_bytes": 67191017472,
+      "pinned_bytes": 32315539456,
+      "registrations": 751,
+      "idle_registrations": 1,
+      "active_leases": 1,
+      "registration_failures": 0,
+      "unregistration_failures": 0
+    },
+    "released_memory": {
+      "Rss": 2953216,
+      "Anonymous": 2752512,
+      "Locked": 0
+    }
+  },
+  {
+    "budget": 67191017472,
+    "repeat": 2,
+    "activation_s": 4.571694975005812,
+    "release_s": 1.054815897005028,
+    "register_s": 4.526896338866209,
+    "unregister_s": 0.6542912158329273,
+    "register_calls": 765,
+    "active_pins": {
+      "max_pinned_bytes": 67191017472,
+      "pinned_bytes": 32315539456,
+      "registrations": 751,
+      "idle_registrations": 1,
+      "active_leases": 1,
+      "registration_failures": 0,
+      "unregistration_failures": 0
+    },
+    "released_memory": {
+      "Rss": 2953216,
+      "Anonymous": 2752512,
+      "Locked": 0
+    }
+  }
+]

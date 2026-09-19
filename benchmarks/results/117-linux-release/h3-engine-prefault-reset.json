@@ -1,0 +1,74 @@
+[
+  {
+    "budget": 67191017472,
+    "repeat": 0,
+    "populate_s": 1.0392949800152564,
+    "activation_s": 1.8229103530029533,
+    "release_s": 1.0562344940117327,
+    "register_s": 0.7244261391460896,
+    "unregister_s": 0.6661323308217106,
+    "register_calls": 766,
+    "active_pins": {
+      "max_pinned_bytes": 67191017472,
+      "pinned_bytes": 32315539456,
+      "registrations": 751,
+      "idle_registrations": 1,
+      "active_leases": 1,
+      "registration_failures": 0,
+      "unregistration_failures": 0
+    },
+    "released_memory": {
+      "Rss": 2953216,
+      "Anonymous": 2752512,
+      "Locked": 0
+    }
+  },
+  {
+    "budget": 67191017472,
+    "repeat": 1,
+    "populate_s": 0.8516313670115778,
+    "activation_s": 1.6124225110106636,
+    "release_s": 1.0979446359997382,
+    "register_s": 0.7066875870223157,
+    "unregister_s": 0.6851893700513756,
+    "register_calls": 765,
+    "active_pins": {
+      "max_pinned_bytes": 67191017472,
+      "pinned_bytes": 32315539456,
+      "registrations": 751,
+      "idle_registrations": 1,
+      "active_leases": 1,
+      "registration_failures": 0,
+      "unregistration_failures": 0
+    },
+    "released_memory": {
+      "Rss": 2953216,
+      "Anonymous": 2752512,
+      "Locked": 0
+    }
+  },
+  {
+    "budget": 67191017472,
+    "repeat": 2,
+    "populate_s": 0.8488727619987912,
+    "activation_s": 1.6115735020139255,
+    "release_s": 1.0579924230114557,
+    "register_s": 0.7068488555669319,
+    "unregister_s": 0.6658718726830557,
+    "register_calls": 765,
+    "active_pins": {
+      "max_pinned_bytes": 67191017472,
+      "pinned_bytes": 32315539456,
+      "registrations": 751,
+      "idle_registrations": 1,
+      "active_leases": 1,
+      "registration_failures": 0,
+      "unregistration_failures": 0
+    },
+    "released_memory": {
+      "Rss": 2953216,
+      "Anonymous": 2752512,
+      "Locked": 0
+    }
+  }
+]

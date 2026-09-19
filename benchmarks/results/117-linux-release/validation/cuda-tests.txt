@@ -1,0 +1,47 @@
+........................................................................ [ 10%]
+........................................................................ [ 20%]
+........................................................................ [ 30%]
+........................................................................ [ 40%]
+........................................................................ [ 50%]
+........................................................................ [ 60%]
+........................................................................ [ 71%]
+........................................................................ [ 81%]
+........................................................................ [ 91%]
+.............................................................            [100%]
+=============================== warnings summary ===============================
+tests/test_model_offloader_whole_model.py::TestTrainableParams::test_cuda_optimizer_step_copies_updates_back_to_host
+  /home/brian/git/piper/piper-offload/.venv/lib/python3.14/site-packages/torch/autograd/graph.py:1072: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:410.)
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+
+tests/test_rolling_compile.py::TestRollingCompile::test_supported_quant_slots_match_compiled[torchao-float8]
+  /home/brian/git/piper/piper-offload/.venv/lib/python3.14/site-packages/torch/_functorch/_aot_autograd/autograd_cache.py:707: UserWarning: Float8Tensor does not implement _stable_hash_for_caching. For PT2-compatible tensor subclasses, it is recommended to implement _stable_hash_for_caching(self) -> str for stable AOT autograd caching.
+    warn_once(
+
+tests/test_rolling_compile.py::TestRollingCompile::test_supported_quant_slots_match_compiled[torchao-static-float8]
+  /home/brian/git/piper/piper-offload/.venv/lib/python3.14/site-packages/torch/_functorch/_aot_autograd/autograd_cache.py:707: UserWarning: PrototypeFloat8Tensor does not implement _stable_hash_for_caching. For PT2-compatible tensor subclasses, it is recommended to implement _stable_hash_for_caching(self) -> str for stable AOT autograd caching.
+    warn_once(
+
+tests/test_rolling_compile.py::TestRollingCompile::test_supported_quant_slots_match_compiled[torchao-int8]
+  /home/brian/git/piper/piper-offload/.venv/lib/python3.14/site-packages/torch/_functorch/_aot_autograd/autograd_cache.py:707: UserWarning: Int8Tensor does not implement _stable_hash_for_caching. For PT2-compatible tensor subclasses, it is recommended to implement _stable_hash_for_caching(self) -> str for stable AOT autograd caching.
+    warn_once(
+
+tests/test_rolling_compile.py::TestRollingCompile::test_supported_quant_slots_match_compiled[torchao-int4-tile]
+  /home/brian/git/piper/piper-offload/.venv/lib/python3.14/site-packages/torch/_functorch/_aot_autograd/autograd_cache.py:707: UserWarning: Int4TilePackedTo4dTensor does not implement _stable_hash_for_caching. For PT2-compatible tensor subclasses, it is recommended to implement _stable_hash_for_caching(self) -> str for stable AOT autograd caching.
+    warn_once(
+
+tests/test_rolling_compile.py::TestRollingCompile::test_supported_quant_slots_match_compiled[torchao-mxfp8]
+tests/test_rolling_compile.py::TestRollingCompile::test_supported_quant_slots_match_compiled[torchao-mxfp4]
+  /home/brian/git/piper/piper-offload/.venv/lib/python3.14/site-packages/torch/_functorch/_aot_autograd/autograd_cache.py:707: UserWarning: MXTensor does not implement _stable_hash_for_caching. For PT2-compatible tensor subclasses, it is recommended to implement _stable_hash_for_caching(self) -> str for stable AOT autograd caching.
+    warn_once(
+
+tests/test_rolling_compile.py::TestRollingCompile::test_supported_quant_slots_match_compiled[torchao-nvfp4]
+  /home/brian/git/piper/piper-offload/.venv/lib/python3.14/site-packages/torch/_functorch/_aot_autograd/autograd_cache.py:707: UserWarning: NVFP4Tensor does not implement _stable_hash_for_caching. For PT2-compatible tensor subclasses, it is recommended to implement _stable_hash_for_caching(self) -> str for stable AOT autograd caching.
+    warn_once(
+
+tests/test_rolling_compile.py::TestRollingCompile::test_supported_quant_slots_match_compiled[quanto-qint8]
+tests/test_rolling_compile.py::TestRollingCompile::test_supported_quant_slots_match_compiled[quanto-qfloat8]
+  /home/brian/git/piper/piper-offload/.venv/lib/python3.14/site-packages/torch/_functorch/_aot_autograd/autograd_cache.py:707: UserWarning: WeightQBytesTensor does not implement _stable_hash_for_caching. For PT2-compatible tensor subclasses, it is recommended to implement _stable_hash_for_caching(self) -> str for stable AOT autograd caching.
+    warn_once(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+709 passed, 10 warnings in 24.92s

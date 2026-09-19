@@ -1,0 +1,205 @@
+{
+    "version": "1.1.411",
+    "time": "1789793430574",
+    "generalDiagnostics": [
+        {
+            "file": "/home/brian/git/piper/piper-offload/src/piper_offload/_triton_bnb4_lora.py",
+            "severity": "error",
+            "message": "Object of type \"(input_ptr: Unknown, output_ptr: Unknown, NUM_VALUES: Unknown, BLOCK_SIZE: Unknown) -> None\" is not subscriptable",
+            "range": {
+                "start": {
+                    "line": 420,
+                    "character": 8
+                },
+                "end": {
+                    "line": 420,
+                    "character": 26
+                }
+            },
+            "rule": "reportIndexIssue"
+        },
+        {
+            "file": "/home/brian/git/piper/piper-offload/src/piper_offload/_triton_bnb4_lora.py",
+            "severity": "error",
+            "message": "Object of type \"(input_ptr: Unknown, output_ptr: Unknown, NUM_VALUES: Unknown, TOTAL_VALUES: Unknown, BLOCK_SIZE: Unknown) -> None\" is not subscriptable",
+            "range": {
+                "start": {
+                    "line": 432,
+                    "character": 4
+                },
+                "end": {
+                    "line": 432,
+                    "character": 16
+                }
+            },
+            "rule": "reportIndexIssue"
+        },
+        {
+            "file": "/home/brian/git/piper/piper-offload/src/piper_offload/_triton_bnb4_lora.py",
+            "severity": "error",
+            "message": "Object of type \"(packed_ptr: Unknown, absmax_ptr: Unknown, code_ptr: Unknown, nested_absmax_ptr: Unknown, nested_code_ptr: Unknown, offset_ptr: Unknown, b_ptr: Unknown, a_ptr: Unknown, update_ptr: Unknown, output_absmax_ptr: Unknown, output_packed_ptr: Unknown, strength: Unknown, rounding_seed: Unknown, M: Unknown, N: Unknown, K: Unknown, DENSE_UPDATE: Unknown, QUANT_TYPE: Unknown, NESTED: Unknown, COMPUTE_DTYPE: Unknown, STOCHASTIC: Unknown, BLOCK_M: Unknown, BLOCK_K: Unknown, QUANT_BLOCK: Unknown, NESTED_BLOCK: Unknown) -> None\" is not subscriptable",
+            "range": {
+                "start": {
+                    "line": 574,
+                    "character": 4
+                },
+                "end": {
+                    "line": 574,
+                    "character": 26
+                }
+            },
+            "rule": "reportIndexIssue"
+        },
+        {
+            "file": "/home/brian/git/piper/piper-offload/src/piper_offload/_triton_bnb4_lora.py",
+            "severity": "error",
+            "message": "Object of type \"(absmax_ptr: Unknown, offset_ptr: Unknown, code_ptr: Unknown, output_qabsmax_ptr: Unknown, output_nested_absmax_ptr: Unknown, NUM_VALUES: Unknown, BLOCK_SIZE: Unknown) -> None\" is not subscriptable",
+            "range": {
+                "start": {
+                    "line": 611,
+                    "character": 4
+                },
+                "end": {
+                    "line": 611,
+                    "character": 34
+                }
+            },
+            "rule": "reportIndexIssue"
+        },
+        {
+            "file": "/home/brian/git/piper/piper-offload/src/piper_offload/_triton_bnb8_lora.py",
+            "severity": "error",
+            "message": "Object of type \"(cb_ptr: Unknown, scb_ptr: Unknown, b_ptr: Unknown, a_ptr: Unknown, update_ptr: Unknown, dense_ptr: Unknown, row_tile_max_ptr: Unknown, strength: Unknown, M: Unknown, N: Unknown, K: Unknown, DENSE_UPDATE: Unknown, BLOCK_M: Unknown, BLOCK_N: Unknown, BLOCK_K: Unknown) -> None\" is not subscriptable",
+            "range": {
+                "start": {
+                    "line": 223,
+                    "character": 4
+                },
+                "end": {
+                    "line": 223,
+                    "character": 24
+                }
+            },
+            "rule": "reportIndexIssue"
+        },
+        {
+            "file": "/home/brian/git/piper/piper-offload/src/piper_offload/_triton_bnb8_lora.py",
+            "severity": "error",
+            "message": "Object of type \"(row_tile_max_ptr: Unknown, output_scb_ptr: Unknown, NUM_TILES: Unknown, BLOCK_TILES: Unknown) -> None\" is not subscriptable",
+            "range": {
+                "start": {
+                    "line": 241,
+                    "character": 4
+                },
+                "end": {
+                    "line": 241,
+                    "character": 26
+                }
+            },
+            "rule": "reportIndexIssue"
+        },
+        {
+            "file": "/home/brian/git/piper/piper-offload/src/piper_offload/_triton_bnb8_lora.py",
+            "severity": "error",
+            "message": "Object of type \"(dense_ptr: Unknown, scb_ptr: Unknown, output_cb_ptr: Unknown, rounding_seed: Unknown, M: Unknown, N: Unknown, STOCHASTIC: Unknown, BLOCK_M: Unknown, BLOCK_N: Unknown) -> None\" is not subscriptable",
+            "range": {
+                "start": {
+                    "line": 248,
+                    "character": 4
+                },
+                "end": {
+                    "line": 248,
+                    "character": 20
+                }
+            },
+            "rule": "reportIndexIssue"
+        },
+        {
+            "file": "/home/brian/git/piper/piper-offload/src/piper_offload/_triton_mx_lora.py",
+            "severity": "error",
+            "message": "Object of type \"(qdata_ptr: Unknown, scale_ptr: Unknown, b_ptr: Unknown, a_ptr: Unknown, update_ptr: Unknown, strength: Unknown, rounding_seed: Unknown, M: Unknown, N: Unknown, NUM_SCALE_BLOCKS: Unknown, K: Unknown, DENSE_UPDATE: Unknown, FORMAT: Unknown, COMPUTE_DTYPE: Unknown, SCALING_MODE: Unknown, SWIZZLED: Unknown, TARGET_MAX_POW2: Unknown, MAX_POS: Unknown, MBITS: Unknown, STOCHASTIC: Unknown, BLOCK_M: Unknown, BLOCK_K: Unknown) -> None\" is not subscriptable",
+            "range": {
+                "start": {
+                    "line": 424,
+                    "character": 4
+                },
+                "end": {
+                    "line": 424,
+                    "character": 20
+                }
+            },
+            "rule": "reportIndexIssue"
+        },
+        {
+            "file": "/home/brian/git/piper/piper-offload/src/piper_offload/communication.py",
+            "severity": "error",
+            "message": "\"detach\" is not a known attribute of \"None\"",
+            "range": {
+                "start": {
+                    "line": 197,
+                    "character": 25
+                },
+                "end": {
+                    "line": 197,
+                    "character": 31
+                }
+            },
+            "rule": "reportOptionalMemberAccess"
+        },
+        {
+            "file": "/home/brian/git/piper/piper-offload/src/piper_offload/dtensor_adapter.py",
+            "severity": "error",
+            "message": "\"Replicate\" is unknown import symbol",
+            "range": {
+                "start": {
+                    "line": 68,
+                    "character": 4
+                },
+                "end": {
+                    "line": 68,
+                    "character": 13
+                }
+            },
+            "rule": "reportAttributeAccessIssue"
+        },
+        {
+            "file": "/home/brian/git/piper/piper-offload/src/piper_offload/dtensor_adapter.py",
+            "severity": "error",
+            "message": "\"Shard\" is unknown import symbol",
+            "range": {
+                "start": {
+                    "line": 69,
+                    "character": 4
+                },
+                "end": {
+                    "line": 69,
+                    "character": 9
+                }
+            },
+            "rule": "reportAttributeAccessIssue"
+        },
+        {
+            "file": "/home/brian/git/piper/piper-offload/src/piper_offload/host_param.py",
+            "severity": "error",
+            "message": "Cannot access attribute \"is_meta\" for class \"object\"\n  Attribute \"is_meta\" is unknown",
+            "range": {
+                "start": {
+                    "line": 308,
+                    "character": 73
+                },
+                "end": {
+                    "line": 308,
+                    "character": 80
+                }
+            },
+            "rule": "reportAttributeAccessIssue"
+        }
+    ],
+    "summary": {
+        "filesAnalyzed": 78,
+        "errorCount": 12,
+        "warningCount": 0,
+        "informationCount": 0,
+        "timeInSec": 1.387
+    }
+}
