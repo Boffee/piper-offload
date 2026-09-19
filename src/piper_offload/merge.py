@@ -190,6 +190,8 @@ def _merge_adapters(
     # Validation and application both stage adapter sources onto a CUDA
     # target asynchronously, so the sources are leased, pageable, until the
     # device has synchronized; a failed step may already have enqueued copies.
+    # If the synchronization itself fails the context is unusable and no
+    # later call could retry it, so the lease closes with this function.
     devices = {op.param.device for op in merge_ops if op.param.device.type == "cuda"}
     sources = (tensor for op in merge_ops for tensor in op.transform.storage_tensors())
     with host_pin_manager.acquire(sources, pin=False) if devices else contextlib.nullcontext():
