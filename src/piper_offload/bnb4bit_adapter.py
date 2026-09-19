@@ -59,6 +59,7 @@ from .tensor_adapters import (
     empty_like_strided,
     optional_tensor_id,
     tensor_layout,
+    transfer_,
 )
 
 try:
@@ -401,11 +402,11 @@ class Bnb4bitAdapter:
     def copy_to_gpu(
         src: _Bnb4bitHost, dst: _Bnb4bitGpu, *, non_blocking: bool = False
     ) -> None:
-        dst.data.copy_(src.data, non_blocking=non_blocking)
+        transfer_(dst.data, src.data, non_blocking=non_blocking)
         for key, value in src.buffers.items():
-            dst.buffers[key].copy_(value, non_blocking=non_blocking)
+            transfer_(dst.buffers[key], value, non_blocking=non_blocking)
         if src.offset is not None and dst.offset is not None:
-            dst.offset.copy_(src.offset, non_blocking=non_blocking)
+            transfer_(dst.offset, src.offset, non_blocking=non_blocking)
 
     @staticmethod
     def compute_dtype(t: torch.Tensor) -> torch.dtype:

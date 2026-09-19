@@ -43,7 +43,7 @@ from ._torchao_int8 import (
     require_int8_tensor,
     validate_layout,
 )
-from .tensor_adapters import metadata_key
+from .tensor_adapters import metadata_key, transfer_
 from .torchao_structured_adapter import TorchaoStructuredAdapter, copy_storage_into
 
 try:
@@ -392,12 +392,9 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
         for strength, a, b in factors:
             next_offset = rank_offset + a.shape[0]
             stored_a = a_packed[rank_offset:next_offset]
-            stored_a.copy_(a, non_blocking=True)
+            transfer_(stored_a, a, non_blocking=True)
             stored_a.mul_(strength).div_(stored_pre_scale)
-            b_packed[:, rank_offset:next_offset].copy_(
-                b,
-                non_blocking=True,
-            )
+            transfer_(b_packed[:, rank_offset:next_offset], b, non_blocking=True)
             rank_offset = next_offset
 
         return b_packed, a_packed, 1.0

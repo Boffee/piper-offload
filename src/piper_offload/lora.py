@@ -13,6 +13,7 @@ import torch
 from torch import nn
 
 from .host_param import HostParam
+from .pin_manager import host_transfer_source
 from .seeding import derive_seed
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
@@ -20,6 +21,7 @@ from .tensor_adapters import (
     LoRAMergeValidationTensorAdapter,
     MergeLocalityTensorAdapter,
     adapter_name,
+    transfer_,
 )
 
 __all__ = [
@@ -303,8 +305,8 @@ def _pack_materialized_weight_factors(
         next_offset = rank_offset + factor.a.shape[0]
         a_slice = a_packed[rank_offset:next_offset]
         b_slice = b_packed[:, rank_offset:next_offset]
-        a_slice.copy_(factor.a, non_blocking=True)
-        b_slice.copy_(factor.b, non_blocking=True)
+        transfer_(a_slice, factor.a, non_blocking=True)
+        transfer_(b_slice, factor.b, non_blocking=True)
         if factor.strength != 1.0:
             # Scaling the contiguous A slice keeps B's strided destination
             # copy as the only non-contiguous operation for each factor.
@@ -543,12 +545,12 @@ class LoRATransform:
         if len(factors) == 1:
             factor = factors[0]
             return (
-                factor.b.to(
+                host_transfer_source(factor.b).to(
                     device=data.device,
                     dtype=compute_dtype,
                     non_blocking=True,
                 ).contiguous(),
-                factor.a.to(
+                host_transfer_source(factor.a).to(
                     device=data.device,
                     dtype=compute_dtype,
                     non_blocking=True,

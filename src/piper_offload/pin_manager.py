@@ -1,24 +1,30 @@
 """Budgeted host registrations with active leases and an idle LRU.
 
 Use the process-wide ``host_pin_manager`` for application registrations. Its
-budget defaults to ``None``, enabling opportunistic registration up to native
-CUDA/HIP capacity. Set it to zero to disable registration. Construction and
-configuration perform no CUDA initialization. Isolated ``PinManager`` instances
-can use an injected backend for testing.
+budget defaults to half of the memory available to the process, physical RAM
+or the container's cgroup limit when that is lower, rounded down to whole OS
+pages. Set
+it to zero to disable registration or ``None`` to remove the application cap
+and register opportunistically up to native CUDA/HIP capacity. Construction
+and configuration perform no CUDA initialization. Isolated ``PinManager``
+instances can use an injected backend for testing.
 
 Every host transfer runs under a lease, so nothing is read or written while
 it could be evicted, and only transfers that repeat ask the lease to pin:
 streaming, rolling, and the relay register their storage; a resident or host
 upload and the optimizer copy-back lease it pageable.
 
-Native registration uses whole storage byte ranges, including private file
-mappings of checkpoints. Locking such a mapping for writing makes the kernel
-copy every page into private memory, and unregistering does not undo that:
-the private pages stay until the mapping is released, within the budget.
-Read-only checkpoint mappings (:func:`file_slice`) are never registered in
-place; they stay pageable until #112 moves pinning to owned copies. Piper
-never writes into a file mapping: ``HostParam`` copies trainable parameters
-out at capture and ``merge_adapter`` copies its targets out before merging.
+Native registration uses whole storage byte ranges. Storage that records a
+checkpoint file slice (:func:`file_slice`) is never registered in place: the
+mapping stays read-only page cache, and pinning it means allocating an owned
+page-aligned copy, filling it from the file with positional reads, and
+registering that. Evicting the copy unregisters and frees it, so the RAM
+returns. Transfers reach the copy through :func:`host_transfer_source`,
+looked up per source tensor under the transfer's lease and never retained.
+Other storage, anonymous memory and mappings without provenance, registers
+where it is, as before. Piper never writes into a file mapping: ``HostParam``
+copies trainable parameters out at capture and ``merge_adapter`` copies its
+targets out before merging.
 
 Budget accounting counts the union of OS pages, including pages shared by
 separate allocations. Registrations retain storage until unregistration
@@ -27,27 +33,99 @@ resources can release memory. Storage must not be resized or independently
 registered while managed here.
 """
 
+import contextlib
+import ctypes
+import enum
 import logging
 import mmap
+import os
+import sys
 import threading
 import weakref
 from bisect import bisect_left
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Self
 
 import torch
 
 from ._host_registration import HostRegistrationBackend, RuntimeHostRegistration
-from .checkpoint import file_slice
+from .checkpoint import FileSlice, file_slice
 
 logger = logging.getLogger(__name__)
 
 
+class _MemoryStatus(ctypes.Structure):
+    # Windows MEMORYSTATUSEX; fixed-width types also allow testing on POSIX.
+    _fields_ = [
+        ("length", ctypes.c_uint32),
+        ("load", ctypes.c_uint32),
+        ("total_physical", ctypes.c_uint64),
+        ("available_physical", ctypes.c_uint64),
+        ("total_page_file", ctypes.c_uint64),
+        ("available_page_file", ctypes.c_uint64),
+        ("total_virtual", ctypes.c_uint64),
+        ("available_virtual", ctypes.c_uint64),
+        ("available_extended_virtual", ctypes.c_uint64),
+    ]
+
+
+# The process's cgroup memory limit, v2 then v1; "max" or a huge number when unlimited.
+_CGROUP_LIMIT_FILES = ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+
+
+def _physical_memory() -> int:
+    if sys.platform == "win32":
+        status = _MemoryStatus()
+        status.length = ctypes.sizeof(status)
+        query = ctypes.WinDLL("kernel32", use_last_error=True).GlobalMemoryStatusEx
+        query.argtypes = (ctypes.POINTER(_MemoryStatus),)
+        query.restype = ctypes.c_int
+        if not query(ctypes.byref(status)):
+            raise OSError("GlobalMemoryStatusEx failed")
+        return status.total_physical
+    return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+
+
+def _cgroup_memory_limit() -> int | None:
+    """The container's memory limit on Linux, which can be far below the host's RAM."""
+    for path in _CGROUP_LIMIT_FILES:
+        try:
+            with open(path, encoding="ascii") as limit:
+                text = limit.read().strip()
+        except OSError:
+            continue
+        if text.isdigit():
+            return int(text)
+    return None
+
+
+def _default_pin_budget() -> int:
+    """Half of the memory available to the process, rounded down to OS pages, without touching CUDA."""
+    try:
+        total = _physical_memory()
+        if total <= 0:
+            raise ValueError("physical RAM is unavailable")
+        limit = _cgroup_memory_limit()
+        if limit is not None:
+            total = min(total, limit)
+        return total // (2 * mmap.PAGESIZE) * mmap.PAGESIZE
+    except (AttributeError, OSError, ValueError) as error:
+        logger.warning("Cannot determine physical RAM; the default host pin budget is zero: %s", error)
+        return 0
+
+
+_DEFAULT_PIN_BUDGET = _default_pin_budget()
+
+
 @dataclass(frozen=True, slots=True)
 class PinStats:
-    """Registration counts and the union of charged OS pages."""
+    """Registration counts and the union of charged OS pages.
+
+    ``copy_bytes`` is the part of ``pinned_bytes`` held by owned copies of
+    checkpoint storage; the rest is storage registered in place.
+    """
 
     max_pinned_bytes: int | None
     pinned_bytes: int
@@ -56,6 +134,91 @@ class PinStats:
     active_leases: int
     registration_failures: int
     unregistration_failures: int
+    copy_bytes: int
+
+
+def _page_rounded(nbytes: int) -> int:
+    return -(-nbytes // mmap.PAGESIZE) * mmap.PAGESIZE
+
+
+class _Copy:
+    """An owned page-aligned region holding one checkpoint storage's bytes.
+
+    Page alignment keeps two copies from sharing an OS page, which the
+    runtime would refuse to register twice. ``size`` is the registered and
+    charged extent, whole pages.
+    """
+
+    __slots__ = ("region", "size", "storage")
+
+    def __init__(self, size: int) -> None:
+        assert size % mmap.PAGESIZE == 0
+        self.size = size
+        self.region = mmap.mmap(-1, size)
+        # None once freed; the region cannot close while a storage exports it.
+        self.storage: torch.UntypedStorage | None = (
+            torch.frombuffer(self.region, dtype=torch.uint8).untyped_storage()
+        )
+
+    @property
+    def pointer(self) -> int:
+        assert self.storage is not None
+        return self.storage.data_ptr()
+
+    def view(self, tensor: torch.Tensor) -> torch.Tensor:
+        """``tensor``'s geometry over the copy, including its lazy conjugation and negation."""
+        assert self.storage is not None
+        view = torch.empty(0, dtype=tensor.dtype, device="cpu").set_(
+            self.storage, tensor.storage_offset(), tensor.shape, tensor.stride(),
+        )
+        if tensor.is_conj():
+            view = view.conj()
+        if tensor.is_neg():
+            view = torch._neg_view(view)
+        return view
+
+    def free(self) -> None:
+        self.storage = None
+        try:
+            self.region.close()
+        except BufferError:
+            # A transfer view outlived its lease; the region returns with it.
+            logger.warning("An evicted pinned copy is still referenced; its memory returns when the reference dies")
+
+
+# The seek-and-read fallback moves the shared file position.
+_fill_lock = threading.Lock()
+
+
+def _fill_copy(copy: _Copy, source: FileSlice) -> None:
+    """Read the storage's bytes from the file into the copy, or raise ``OSError``."""
+    if hasattr(os, "preadv"):
+        fd = source.file.fileno()
+
+        def read_at(buffer: memoryview, offset: int) -> int:
+            return os.preadv(fd, [buffer], offset)
+
+        guard: contextlib.AbstractContextManager[object] = contextlib.nullcontext()
+    else:
+
+        def read_at(buffer: memoryview, offset: int) -> int:
+            source.file.seek(offset)
+            return source.file.readinto(buffer)
+
+        guard = _fill_lock
+    length = source.length
+    with guard, memoryview(copy.region)[:length] as view:
+        done = 0
+        while done < length:
+            count = read_at(view[done:], source.offset + done)
+            if count <= 0:
+                raise OSError(f"checkpoint ended after {done} of {length} bytes")
+            done += count
+
+
+class _Refusal(enum.Enum):
+    BUDGET = "budget"  # this storage does not fit; a later one in the batch may
+    CAPACITY = "capacity"  # native capacity is exhausted; stop registering
 
 
 @dataclass(eq=False)
@@ -63,9 +226,15 @@ class _Registration:
     pointer: int
     size: int
     storage: torch.UntypedStorage
+    copy: _Copy | None = None
     owners: dict[int, weakref.ReferenceType[torch.Tensor]] = field(default_factory=dict)
     leases: int = 0
     retired: bool = False
+
+    @property
+    def registered(self) -> int:
+        """The pointer the backend registered: the copy's, or the storage's own."""
+        return self.pointer if self.copy is None else self.copy.pointer
 
 
 @dataclass(slots=True)
@@ -179,9 +348,11 @@ class TransferLease:
 class PinManager:
     """Own registrations under a page-rounded budget.
 
-    A finite ``max_pinned_bytes`` bounds registered pages in this process.
-    The default, ``None``, treats native CUDA/HIP capacity as the limit, reclaiming
-    unrelated idle registrations when the runtime refuses a new allocation.
+    A finite ``max_pinned_bytes`` bounds registered pages in this process,
+    including the owned copies made for checkpoint storage; the default is
+    half of physical RAM at import. ``None`` treats native CUDA/HIP capacity
+    as the limit, reclaiming unrelated idle registrations when the runtime
+    refuses a new allocation.
 
     Acquire accepts the plain CPU tensors returned by ``storage_tensors()``.
     Tensor views share one whole-storage registration. Separate allocations
@@ -199,7 +370,7 @@ class PinManager:
 
     def __init__(
         self,
-        max_pinned_bytes: int | None = None,
+        max_pinned_bytes: int | None = _DEFAULT_PIN_BUDGET,
         *,
         backend: HostRegistrationBackend | None = None,
     ) -> None:
@@ -241,7 +412,7 @@ class PinManager:
             raise ValueError("max_pinned_bytes must be >= 0")
         with self._lock:
             self._max_pinned_bytes = value
-            self._make_room(0, 0)
+            self._make_room(lambda: 0)
 
     @property
     def stats(self) -> PinStats:
@@ -254,6 +425,7 @@ class PinManager:
                 len(self._leases),
                 self._registration_failures,
                 self._unregistration_failures,
+                sum(entry.copy.size for entry in self._entries.values() if entry.copy is not None),
             )
 
     def acquire(self, tensors: Iterable[torch.Tensor], *, pin: bool = True) -> PinLease:
@@ -286,32 +458,14 @@ class PinManager:
                 for pointer, request in requests.items():
                     if not pin or pointer in held or pointer in self._pageable:
                         continue
-                    if file_slice(request.storage) is not None:
-                        # A read-only checkpoint mapping cannot be locked for
-                        # writing and must never be registered in place; it
-                        # stays pageable until the copy path (#112) exists.
-                        continue
-                    size = request.storage.nbytes()
-                    if not self._make_room(pointer, size):
-                        continue
-                    registered = self._try_register(pointer, size)
-                    while not registered and self._reclaim_idle_for_native_retry(
-                        pointer,
-                        size,
-                    ):
-                        registered = self._try_register(pointer, size)
-                    if not registered:
+                    entry = self._admit(pointer, request)
+                    if entry is _Refusal.CAPACITY:
                         # Native capacity is still unavailable after reclaiming
                         # every lower-priority idle registration that can help.
                         # Avoid one failed runtime call per remaining tensor.
                         break
-                    entry = _Registration(pointer, size, request.storage)
-                    _live_managers.add(self)
-                    self._entries[pointer] = entry
-                    self._starts.insert(bisect_left(self._starts, pointer), pointer)
-                    self._pinned_bytes += self._page_charge(pointer, size)
-                    for page in self._boundaries(pointer, size):
-                        self._boundary_pages[page] = self._boundary_pages.get(page, 0) + 1
+                    if entry is _Refusal.BUDGET:
+                        continue
                     created.append(entry)
                     self._hold(entry, request, held)
             except BaseException:
@@ -343,8 +497,23 @@ class PinManager:
         total = sum(request.storage.nbytes() for request in requests.values())
         return PinLease(self, key, registered, total - registered)
 
+    def transfer_source(self, tensor: torch.Tensor) -> torch.Tensor:
+        """The tensor a transfer should read: ``tensor``, or its geometry over a pinned copy.
+
+        The copy is returned only while a lease protects its registration, so
+        the caller must be inside that lease and must not retain the result:
+        once the lease closes the copy may be evicted and freed.
+        """
+        if tensor.device.type != "cpu":
+            return tensor
+        with self._lock:
+            entry = self._entries.get(tensor.untyped_storage().data_ptr())
+            if entry is None or entry.copy is None or entry.leases == 0:
+                return tensor
+            return entry.copy.view(tensor)
+
     def clear(self) -> None:
-        """Unregister idle entries.
+        """Unregister idle entries and free their copies.
 
         Live leases remain protected. A failed unregistration retains its
         storage and budget charge; cleanup errors propagate so callers can
@@ -410,6 +579,74 @@ class PinManager:
         shared = sum(page in self._boundary_pages for page in self._boundaries(pointer, size))
         return (pages - shared) * mmap.PAGESIZE
 
+    def _admit(self, pointer: int, request: _Request) -> _Registration | _Refusal:
+        """Register one storage under the budget: through a copy for checkpoint storage, in place otherwise."""
+        source = file_slice(request.storage)
+        entry = self._admit_in_place(pointer, request) if source is None else self._admit_copy(pointer, request, source)
+        if isinstance(entry, _Registration):
+            _live_managers.add(self)
+            self._entries[pointer] = entry
+            self._starts.insert(bisect_left(self._starts, pointer), pointer)
+        return entry
+
+    def _admit_in_place(self, pointer: int, request: _Request) -> _Registration | _Refusal:
+        size = request.storage.nbytes()
+        if not self._make_room(lambda: self._page_charge(pointer, size)):
+            return _Refusal.BUDGET
+        if not self._register(pointer, size):
+            return _Refusal.CAPACITY
+        self._charge_range(pointer, size)
+        return _Registration(pointer, size, request.storage)
+
+    def _admit_copy(self, pointer: int, request: _Request, source: FileSlice) -> _Registration | _Refusal:
+        size = _page_rounded(request.storage.nbytes())
+        if not self._make_room(lambda: size):
+            return _Refusal.BUDGET
+        try:
+            copy = _Copy(size)
+        except (OSError, MemoryError) as error:
+            logger.warning("Could not allocate a pinned copy; the checkpoint storage stays pageable: %s", error)
+            return _Refusal.BUDGET
+        # Charged at allocation, before the fill, so nothing else is admitted
+        # into the same budget while the read is in progress.
+        self._pinned_bytes += size
+        admitted = False
+        try:
+            try:
+                _fill_copy(copy, source)
+            except OSError as error:
+                logger.warning("Could not fill a pinned copy from the checkpoint; it stays pageable: %s", error)
+                return _Refusal.BUDGET
+            admitted = self._register(copy.pointer, size)
+            if not admitted:
+                return _Refusal.CAPACITY
+            return _Registration(pointer, request.storage.nbytes(), request.storage, copy)
+        finally:
+            if not admitted:
+                self._pinned_bytes -= size
+                copy.free()
+
+    def _register(self, pointer: int, size: int) -> bool:
+        """Register natively, reclaiming idle LRU batches while the runtime refuses capacity."""
+        registered = self._try_register(pointer, size)
+        while not registered and self._reclaim_idle_for_native_retry(size):
+            registered = self._try_register(pointer, size)
+        return registered
+
+    def _charge_range(self, pointer: int, size: int) -> None:
+        self._pinned_bytes += self._page_charge(pointer, size)
+        for page in self._boundaries(pointer, size):
+            self._boundary_pages[page] = self._boundary_pages.get(page, 0) + 1
+
+    def _discharge_range(self, pointer: int, size: int) -> None:
+        for page in self._boundaries(pointer, size):
+            count = self._boundary_pages[page] - 1
+            if count:
+                self._boundary_pages[page] = count
+            else:
+                del self._boundary_pages[page]
+        self._pinned_bytes -= self._page_charge(pointer, size)
+
     def _try_register(self, pointer: int, size: int) -> bool:
         try:
             registered = self._backend.register(pointer, size)
@@ -420,35 +657,39 @@ class PinManager:
             self._registration_failures += 1
         return registered
 
-    def _reclaim_idle_for_native_retry(self, pointer: int, size: int) -> bool:
+    def _reclaim_idle_for_native_retry(self, size: int) -> bool:
         """Evict an LRU batch before retrying a native-capacity failure."""
-        target = max(mmap.PAGESIZE, self._page_charge(pointer, size))
+        target = max(mmap.PAGESIZE, _page_rounded(size))
         before = self._pinned_bytes
-        for candidate in tuple(self._idle):
-            entry = self._entries.get(candidate)
-            if entry is not None:
-                self._unregister(entry)
-            if before - self._pinned_bytes >= target:
-                break
+        self._evict_idle(lambda: before - self._pinned_bytes >= target)
         return self._pinned_bytes < before
 
-    def _make_room(self, pointer: int, size: int) -> bool:
+    def _make_room(self, needed: Callable[[], int]) -> bool:
+        """Fit ``needed()`` more bytes under a finite limit, evicting idle entries in LRU order.
+
+        The charge is re-evaluated after each eviction: an in-place range's
+        boundary page stops being shared once its neighbour is gone.
+        """
         limit = self._max_pinned_bytes
         if limit is None:
             return True
-        if size:
-            pages = (pointer + size - 1) // mmap.PAGESIZE - pointer // mmap.PAGESIZE + 1
-            if pages * mmap.PAGESIZE > limit:
-                return False
-        if self._pinned_bytes + self._page_charge(pointer, size) <= limit:
-            return True
+        if needed() > limit:
+            return False
+
+        def fits() -> bool:
+            return self._pinned_bytes + needed() <= limit
+
+        self._evict_idle(fits)
+        return fits()
+
+    def _evict_idle(self, until: Callable[[], bool]) -> None:
+        """Unregister idle entries, least recently released first, until ``until()`` holds."""
         for candidate in tuple(self._idle):
+            if until():
+                return
             entry = self._entries.get(candidate)
             if entry is not None:
                 self._unregister(entry)
-            if self._pinned_bytes + self._page_charge(pointer, size) <= limit:
-                return True
-        return False
 
     def _hold(self, entry: _Registration, request: _Request, held: dict[int, _Registration]) -> None:
         entry.leases += 1
@@ -471,7 +712,7 @@ class PinManager:
     def _unregister(self, entry: _Registration) -> bool:
         assert entry.leases == 0
         try:
-            self._backend.unregister(entry.pointer)
+            self._backend.unregister(entry.registered)
         except Exception as error:
             self._unregistration_failures += 1
             # Tracebacks in buffered logs can retain storage after a later retry.
@@ -480,13 +721,11 @@ class PinManager:
         del self._entries[entry.pointer]
         self._starts.pop(bisect_left(self._starts, entry.pointer))
         self._idle.pop(entry.pointer, None)
-        for page in self._boundaries(entry.pointer, entry.size):
-            count = self._boundary_pages[page] - 1
-            if count:
-                self._boundary_pages[page] = count
-            else:
-                del self._boundary_pages[page]
-        self._pinned_bytes -= self._page_charge(entry.pointer, entry.size)
+        if entry.copy is None:
+            self._discharge_range(entry.pointer, entry.size)
+        else:
+            self._pinned_bytes -= entry.copy.size
+            entry.copy.free()
         self._drop_lifetime_root_if_empty()
         return True
 
@@ -497,7 +736,7 @@ class PinManager:
                 self._idle[entry.pointer] = None
                 if entry.retired:
                     self._unregister(entry)
-        self._make_room(0, 0)
+        self._make_room(lambda: 0)
 
     def _close_lease(self, key: int) -> None:
         with self._lock:
@@ -527,4 +766,10 @@ _live_managers: set[PinManager] = set()
 
 host_pin_manager = PinManager()
 
-__all__ = ["PinLease", "PinManager", "PinStats", "host_pin_manager"]
+
+def host_transfer_source(tensor: torch.Tensor) -> torch.Tensor:
+    """:meth:`PinManager.transfer_source` on the process-wide manager, for adapter transfer loops."""
+    return host_pin_manager.transfer_source(tensor)
+
+
+__all__ = ["PinLease", "PinManager", "PinStats", "TransferLease", "host_pin_manager", "host_transfer_source"]

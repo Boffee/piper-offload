@@ -39,6 +39,7 @@ from .tensor_adapters import (
     empty_like_strided,
     optional_tensor_id,
     tensor_layout,
+    transfer_,
 )
 
 __all__ = [
@@ -87,7 +88,7 @@ def copy_storage(
         if s is None:
             continue
         assert d is not None
-        d.copy_(s, non_blocking=non_blocking)
+        transfer_(d, s, non_blocking=non_blocking)
 
 
 def copy_storage_into(
@@ -111,7 +112,7 @@ def copy_storage_into(
         if d is None:
             continue
         assert s is not None
-        d.copy_(s, non_blocking=non_blocking)
+        transfer_(d, s, non_blocking=non_blocking)
 
 
 class TorchaoStructuredAdapter[MetaT](ABC):

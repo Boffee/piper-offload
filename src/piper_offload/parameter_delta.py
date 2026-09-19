@@ -20,6 +20,7 @@ from .lora import (
     _validate_factor_shapes,
     _validate_materialized_weight_factors,
 )
+from .pin_manager import host_transfer_source
 from .seeding import derive_seed
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
@@ -372,7 +373,7 @@ class ParameterDeltaTransform:
                 offsets=plan.offsets,
                 local_shape=plan.local_shape,
             )
-            staged = local_source.to(
+            staged = host_transfer_source(local_source).to(
                 device=target.device,
                 dtype=plan.compute_dtype,
                 non_blocking=True,
