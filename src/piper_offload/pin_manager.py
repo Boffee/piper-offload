@@ -19,12 +19,15 @@ checkpoint file slice (:func:`file_slice`) is never registered in place: the
 mapping stays read-only page cache, and pinning it means allocating an owned
 page-aligned copy, filling it from the file with positional reads, and
 registering that. Evicting the copy unregisters and frees it, so the RAM
-returns. Transfers reach the copy through :func:`host_transfer_source`,
-looked up per source tensor under the transfer's lease and never retained.
-Other storage, anonymous memory and mappings without provenance, registers
-where it is, as before. Piper never writes into a file mapping: ``HostParam``
-copies trainable parameters out at capture and ``merge_adapter`` copies its
-targets out before merging.
+returns. Transfers reach the copy through ``transfer_``, which resolves each
+source tensor at copy time; an asynchronous transfer of pinned storage
+outside a lease raises, since eviction is safe only because every such
+reader holds one, while a synchronous one completes under the manager's
+lock. Other storage, anonymous memory and mappings without provenance,
+registers where it is, as before.
+Piper never writes into a file mapping: ``HostParam`` copies trainable
+parameters out at capture and ``merge_adapter`` copies its targets out before
+merging.
 
 Budget accounting counts the union of OS pages, including pages shared by
 separate allocations. Registrations retain storage until unregistration
@@ -46,6 +49,7 @@ from bisect import bisect_left
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Self
 
 import torch
@@ -71,8 +75,8 @@ class _MemoryStatus(ctypes.Structure):
     ]
 
 
-# The process's cgroup memory limit, v2 then v1; "max" or a huge number when unlimited.
-_CGROUP_LIMIT_FILES = ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+_PROC_CGROUP = "/proc/self/cgroup"
+_CGROUP_MOUNT = "/sys/fs/cgroup"
 
 
 def _physical_memory() -> int:
@@ -89,16 +93,38 @@ def _physical_memory() -> int:
 
 
 def _cgroup_memory_limit() -> int | None:
-    """The container's memory limit on Linux, which can be far below the host's RAM."""
-    for path in _CGROUP_LIMIT_FILES:
-        try:
-            with open(path, encoding="ascii") as limit:
-                text = limit.read().strip()
-        except OSError:
+    """The tightest memory limit on the process's cgroup or any ancestor, v2 or v1; None if unlimited.
+
+    A container or a systemd service can be far below the host's RAM, and its
+    limit lives at the process's own cgroup path, not at the hierarchy root.
+    """
+    try:
+        with open(_PROC_CGROUP, encoding="ascii") as membership:
+            lines = membership.read().splitlines()
+    except OSError:
+        return None
+    limits: list[int] = []
+    for line in lines:
+        hierarchy, _, rest = line.partition(":")
+        controllers, _, path = rest.partition(":")
+        if hierarchy == "0":
+            base, name = Path(_CGROUP_MOUNT), "memory.max"
+        elif "memory" in controllers.split(","):
+            base, name = Path(_CGROUP_MOUNT, "memory"), "memory.limit_in_bytes"
+        else:
             continue
-        if text.isdigit():
-            return int(text)
-    return None
+        directory = base.joinpath(*path.strip("/").split("/")) if path.strip("/") else base
+        while True:
+            try:
+                text = (directory / name).read_text(encoding="ascii").strip()
+            except OSError:
+                text = ""
+            if text.isdigit():
+                limits.append(int(text))
+            if directory == base or base not in directory.parents:
+                break
+            directory = directory.parent
+    return min(limits, default=None)
 
 
 def _default_pin_budget() -> int:
@@ -497,18 +523,49 @@ class PinManager:
         total = sum(request.storage.nbytes() for request in requests.values())
         return PinLease(self, key, registered, total - registered)
 
-    def transfer_source(self, tensor: torch.Tensor) -> torch.Tensor:
-        """The tensor a transfer should read: ``tensor``, or its geometry over a pinned copy.
+    def transfer(self, destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool) -> None:
+        """Copy ``source`` into ``destination``, reading ``source``'s pinned copy when one exists.
 
-        The copy is returned only while a lease protects its registration, so
-        the caller must be inside that lease and must not retain the result:
-        once the lease closes the copy may be evicted and freed.
+        A synchronous transfer has completed when this returns and runs under
+        the manager's lock, so nothing can evict its source meanwhile. An
+        asynchronous one, a non-blocking copy to a CUDA device, may still be
+        in flight afterwards, so it must run under a lease that holds the
+        source, and raises otherwise: eviction is safe only because every
+        such reader holds one. Unregistered storage copies as is.
+        """
+        if source.device.type != "cpu":
+            destination.copy_(source, non_blocking=non_blocking)
+            return
+        asynchronous = non_blocking and destination.device.type == "cuda"
+        with self._lock:
+            entry = self._entries.get(source.untyped_storage().data_ptr())
+            view = source
+            if entry is not None:
+                if asynchronous and entry.leases == 0:
+                    raise RuntimeError(
+                        "Asynchronous transfer of pinned host storage outside a lease; acquire one "
+                        "over the tensors first (pin=False for a one-time transfer) and keep it "
+                        "until the transfer has completed."
+                    )
+                if entry.copy is not None:
+                    view = entry.copy.view(source)
+            if not asynchronous:
+                destination.copy_(view, non_blocking=non_blocking)
+                return
+        # The lease keeps the entry, so the copy itself needs no lock.
+        destination.copy_(view, non_blocking=True)
+
+    def transfer_source(self, tensor: torch.Tensor) -> torch.Tensor:
+        """``tensor``, or its geometry over its storage's pinned copy; for inspection, not for copying.
+
+        Reads of the result are not tracked, so it is safe only under a lease
+        that holds the copy: use :meth:`transfer` for the copy itself.
         """
         if tensor.device.type != "cpu":
             return tensor
         with self._lock:
             entry = self._entries.get(tensor.untyped_storage().data_ptr())
-            if entry is None or entry.copy is None or entry.leases == 0:
+            if entry is None or entry.copy is None:
                 return tensor
             return entry.copy.view(tensor)
 
@@ -767,9 +824,9 @@ _live_managers: set[PinManager] = set()
 host_pin_manager = PinManager()
 
 
-def host_transfer_source(tensor: torch.Tensor) -> torch.Tensor:
-    """:meth:`PinManager.transfer_source` on the process-wide manager, for adapter transfer loops."""
-    return host_pin_manager.transfer_source(tensor)
+def host_transfer(destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool) -> None:
+    """:meth:`PinManager.transfer` on the process-wide manager, for adapter transfer loops."""
+    host_pin_manager.transfer(destination, source, non_blocking=non_blocking)
 
 
-__all__ = ["PinLease", "PinManager", "PinStats", "TransferLease", "host_pin_manager", "host_transfer_source"]
+__all__ = ["PinLease", "PinManager", "PinStats", "TransferLease", "host_pin_manager", "host_transfer"]

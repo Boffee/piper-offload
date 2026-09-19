@@ -8,8 +8,10 @@ from torch import nn
 
 import piper_offload.block_component as block_component_module
 import piper_offload.host_component as host_component_module
+import piper_offload.model_offloader as model_offloader_module
 import piper_offload.pin_manager as pin_module
 from piper_offload import (
+    Adapter,
     BlockCompileConfig,
     BlockComponentStore,
     HostComponentStore,
@@ -57,6 +59,7 @@ def pins(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(block_component_module, "host_pin_manager", manager)
     monkeypatch.setattr(host_component_module, "host_pin_manager", manager)
     monkeypatch.setattr(pin_module, "host_pin_manager", manager)
+    monkeypatch.setattr(model_offloader_module, "host_pin_manager", manager)
     yield manager, backend
     manager.clear()
     assert manager.stats.active_leases == 0
@@ -649,14 +652,14 @@ def test_mapped_checkpoint_streams_from_owned_copies(mode, pins, tmp_path, monke
         block_compile=BlockCompileConfig(fullgraph=True) if mode == "rolling" else None,
     )
     resolved: list[torch.Tensor] = []
-    original = manager.transfer_source
+    original_view = pin_module._Copy.view
 
-    def recording(tensor: torch.Tensor) -> torch.Tensor:
-        source = original(tensor)
-        resolved.append(source)
-        return source
+    def recording(copy: pin_module._Copy, tensor: torch.Tensor) -> torch.Tensor:
+        view = original_view(copy, tensor)
+        resolved.append(view)
+        return view
 
-    monkeypatch.setattr(manager, "transfer_source", recording)
+    monkeypatch.setattr(pin_module._Copy, "view", recording)
     try:
         with activated_model(offloader, "cuda"), torch.inference_mode():
             actual = offloader.value(inputs.cuda()).cpu()
@@ -667,9 +670,8 @@ def test_mapped_checkpoint_streams_from_owned_copies(mode, pins, tmp_path, monke
         assert len(registered) == len(mapping_pointers)
         assert all(pointer % mmap.PAGESIZE == 0 for pointer in registered)
         assert all(not tensor.is_pinned() for tensor in sources.values())
-        # Every transfer read a copy, not the mapping.
-        assert resolved
-        assert all(source.untyped_storage().data_ptr() in registered for source in resolved)
+        # Every storage was transferred from its copy, not from the mapping.
+        assert {view.untyped_storage().data_ptr() for view in resolved} == registered
         assert manager.stats.copy_bytes == manager.stats.pinned_bytes > 0
         manager.clear()
         assert manager.stats.pinned_bytes == 0
@@ -677,3 +679,43 @@ def test_mapped_checkpoint_streams_from_owned_copies(mode, pins, tmp_path, monke
         offloader.deactivate()
         if mode == "rolling":
             torch.compiler.reset()
+
+
+@CUDA
+@pytest.mark.parametrize("mode", ["resident", "streaming"])
+def test_routed_lora_factors_are_leased_while_their_hooks_are_installed(mode, pins) -> None:
+    manager, backend = pins
+    model = _BlockModel()
+    state = {}
+    for index in range(2):
+        state[f"blocks.{index}.proj.lora_A.weight"] = torch.randn(2, 8)
+        state[f"blocks.{index}.proj.lora_B.weight"] = torch.randn(8, 2)
+    adapter = Adapter.from_state_dict(state)
+    factors = [
+        tensor
+        for target in adapter.targets.values()
+        for host in (target.lora.a, target.lora.b)
+        for tensor in host.storage_tensors()
+    ]
+    # Pin the factors elsewhere and leave them idle: staging them on every
+    # forward is now a read of registered storage, which needs a lease.
+    with manager.acquire(factors):
+        pass
+    assert manager.stats.idle_registrations == len(factors)
+    registered = len(backend.registrations)
+    offloader = _make_offloader(model, block_mode=mode)
+    inputs = torch.randn(2, 8)
+    try:
+        offloader.activate("cuda", adapters=[adapter], adapter_strengths=[0.5], adapter_mode="routed")
+        assert manager.stats.idle_registrations == 0
+        expected_leases = 2 if mode == "streaming" else 1
+        assert manager.stats.active_leases == expected_leases
+        offloader.value(inputs.cuda())
+        # Streaming registers its two block weights; the factors are not registered again.
+        assert len(backend.registrations) == registered + (2 if mode == "streaming" else 0)
+    finally:
+        offloader.deactivate()
+    assert manager.stats.active_leases == 0
+    assert manager.stats.idle_registrations == len(factors) + (2 if mode == "streaming" else 0)
+    with pytest.raises(RuntimeError, match="outside a lease"):
+        adapter.targets["blocks.0.proj.weight"].lora.a.materialize(torch.device("cuda"), non_blocking=True)

@@ -164,9 +164,9 @@ pin memory.
 ### Host registration
 
 `host_pin_manager` pins CPU storage under a separate `max_pinned_bytes`
-budget. Its default is half of the memory available to the process, physical
-RAM or the container's cgroup limit when that is lower, rounded down to OS
-pages. Set
+budget. Its default is half of the memory available to the process: physical
+RAM, or the tightest cgroup limit on the process's own cgroup or its
+ancestors when that is lower, rounded down to OS pages. Set
 another finite byte limit to cap registration, `max_pinned_bytes = 0` to
 disable it, or `None` to remove the application cap and register
 opportunistically up to the capacity currently available from CUDA/HIP.
@@ -181,9 +181,13 @@ Storage that records a checkpoint file slice, which is every tensor from
 `MappedCheckpoint`, is never registered in place. Pinning it allocates an
 owned page-aligned copy, fills the copy from the file with positional reads,
 and registers that; the mapping stays read-only page cache the whole time.
-Transfers read the copy while their lease holds it, and the module's own
-tensors keep pointing at the mapping for CPU execution and `state_dict`.
-Evicting the copy unregisters and frees it, so the RAM returns. Registering
+Transfers read the copy under their lease. An asynchronous transfer of
+pinned storage outside a lease raises, because eviction is safe only while
+every such reader holds one; a synchronous transfer completes under the
+manager's lock and needs none. Routed LoRA factors, staged on every forward,
+are held under a pageable lease for as long as their hooks are installed. The
+module's own tensors keep pointing at the mapping for CPU execution and
+`state_dict`. Evicting the copy unregisters and frees it, so the RAM returns. Registering
 any other private file mapping in place, such as a mapping from
 `safetensors.safe_open`, still locks its pages for writing and makes the
 kernel copy every page into private memory that stays until the mapping is

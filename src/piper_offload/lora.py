@@ -13,7 +13,6 @@ import torch
 from torch import nn
 
 from .host_param import HostParam
-from .pin_manager import host_transfer_source
 from .seeding import derive_seed
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
@@ -228,6 +227,13 @@ class _MaterializedWeightFactor:
     strength: float
     a: torch.Tensor
     b: torch.Tensor
+
+
+def _stage(tensor: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """A contiguous ``dtype`` copy of a host tensor on ``device``, read from its pinned copy if any."""
+    staged = torch.empty(tensor.shape, dtype=dtype, device=device)
+    transfer_(staged, tensor, non_blocking=True)
+    return staged
 
 
 def _materialize_weight_factors(
@@ -545,16 +551,8 @@ class LoRATransform:
         if len(factors) == 1:
             factor = factors[0]
             return (
-                host_transfer_source(factor.b).to(
-                    device=data.device,
-                    dtype=compute_dtype,
-                    non_blocking=True,
-                ).contiguous(),
-                host_transfer_source(factor.a).to(
-                    device=data.device,
-                    dtype=compute_dtype,
-                    non_blocking=True,
-                ).contiguous(),
+                _stage(factor.b, device=data.device, dtype=compute_dtype),
+                _stage(factor.a, device=data.device, dtype=compute_dtype),
                 factor.strength,
             )
 

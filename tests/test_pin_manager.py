@@ -92,23 +92,47 @@ def test_default_budget_is_half_of_physical_ram(monkeypatch) -> None:
     monkeypatch.setattr(pin_module.sys, "platform", "linux")
     values = {"SC_PHYS_PAGES": 101, "SC_PAGE_SIZE": PAGE}
     monkeypatch.setattr(pin_module.os, "sysconf", values.__getitem__, raising=False)
-    monkeypatch.setattr(pin_module, "_CGROUP_LIMIT_FILES", ())
+    monkeypatch.setattr(pin_module, "_PROC_CGROUP", "/nonexistent/cgroup")
     assert pin_module._default_pin_budget() == 50 * PAGE
 
 
-@pytest.mark.parametrize(
-    ("limit", "expected_pages"),
-    [("20", 10), ("max", 50), ("9223372036854771712", 50)],
-    ids=["below-ram", "v2-unlimited", "v1-unlimited"],
-)
-def test_default_budget_is_bounded_by_the_cgroup_limit(monkeypatch, tmp_path, limit, expected_pages) -> None:
+def _cgroups(monkeypatch, tmp_path, membership: str, files: dict[str, str]) -> None:
+    """Fake the process's cgroup membership and a cgroup mount holding ``files``."""
     monkeypatch.setattr(pin_module.sys, "platform", "linux")
     values = {"SC_PHYS_PAGES": 101, "SC_PAGE_SIZE": PAGE}
     monkeypatch.setattr(pin_module.os, "sysconf", values.__getitem__, raising=False)
-    missing = tmp_path / "memory" / "memory.limit_in_bytes"
-    present = tmp_path / "memory.max"
-    present.write_text(f"{limit if not limit.isdigit() else int(limit) * PAGE}\n")
-    monkeypatch.setattr(pin_module, "_CGROUP_LIMIT_FILES", (str(missing), str(present)))
+    (tmp_path / "cgroup").write_text(membership)
+    for relative, text in files.items():
+        path = tmp_path / "mount" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n")
+    monkeypatch.setattr(pin_module, "_PROC_CGROUP", str(tmp_path / "cgroup"))
+    monkeypatch.setattr(pin_module, "_CGROUP_MOUNT", str(tmp_path / "mount"))
+
+
+@pytest.mark.parametrize(
+    ("membership", "files", "expected_pages"),
+    [
+        ("0::/a/b\n", {"a/b/memory.max": "20", "a/memory.max": "max", "memory.max": "max"}, 10),
+        ("0::/a/b\n", {"a/b/memory.max": "max", "a/memory.max": "12"}, 6),
+        ("0::/\n", {"memory.max": "30"}, 15),
+        ("0::/a\n", {"a/memory.max": "max", "memory.max": "max"}, 50),
+        ("4:memory:/a\n", {"memory/a/memory.limit_in_bytes": "16"}, 8),
+        ("4:memory:/a\n", {"memory/a/memory.limit_in_bytes": "9223372036854771712"}, 50),
+        ("3:cpu:/a\n", {"cpu/a/memory.max": "2"}, 50),
+    ],
+    ids=[
+        "v2-own", "v2-ancestor", "v2-namespaced-root", "v2-unlimited", "v1", "v1-unlimited", "no-memory-controller",
+    ],
+)
+def test_default_budget_is_bounded_by_the_process_cgroup(
+    monkeypatch, tmp_path, membership, files, expected_pages,
+) -> None:
+    # Small numbers are page counts; the v1 unlimited sentinel is passed through.
+    scaled = {
+        name: str(int(text) * PAGE) if text.isdigit() and len(text) < 10 else text for name, text in files.items()
+    }
+    _cgroups(monkeypatch, tmp_path, membership, scaled)
     assert pin_module._default_pin_budget() == expected_pages * PAGE
 
 
@@ -793,8 +817,8 @@ def test_checkpoint_storage_pins_through_an_owned_copy(backend: FakeBackend, tmp
         torch.testing.assert_close(resolved, part)
         assert manager.transfer_source(anonymous) is anonymous
         region = manager._entries[tensor.untyped_storage().data_ptr()].copy.region
-    # Unleased, the copy may be evicted at any moment, so a transfer falls back to the mapping.
-    assert manager.transfer_source(tensor) is tensor
+    # The copy stays resolvable while idle; a transfer's read is tracked instead.
+    assert manager.transfer_source(tensor).data_ptr() == copy_pointer
     manager.clear()
     assert backend.unregister_calls == [copy_pointer, anonymous.data_ptr()]
     assert region.closed
@@ -919,3 +943,38 @@ def test_failed_copy_unregistration_keeps_the_copy_and_its_charge(backend: FakeB
     backend.unregister_errors.clear()
     manager.clear()
     assert manager.stats.pinned_bytes == 0
+
+
+def test_synchronous_transfer_of_pinned_storage_needs_no_lease(backend: FakeBackend, tmp_path) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    manager = PinManager(4 * PAGE, backend=backend)
+    with manager.acquire([tensor]):
+        pass
+    destination = torch.zeros(2 * PAGE, dtype=torch.uint8)
+    # The copy is idle, but a synchronous transfer completes under the lock.
+    manager.transfer(destination, tensor, non_blocking=False)
+    torch.testing.assert_close(destination, tensor)
+    manager.clear()
+    destination.zero_()
+    manager.transfer(destination, tensor, non_blocking=False)
+    torch.testing.assert_close(destination, tensor)
+
+
+@CUDA
+def test_asynchronous_transfer_of_pinned_storage_requires_a_lease(backend: FakeBackend, tmp_path) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    (anonymous,) = _tensors((0, PAGE))
+    manager = PinManager(4 * PAGE, backend=backend)
+    with manager.acquire([tensor, anonymous]):
+        pass
+    destination = torch.zeros(2 * PAGE, dtype=torch.uint8, device="cuda")
+    # Idle registrations, the copy and the in-place one, may be evicted at any
+    # moment, so an asynchronous read without a lease is refused, not raced.
+    for source in (tensor, anonymous):
+        with pytest.raises(RuntimeError, match="outside a lease"):
+            manager.transfer(destination[: source.numel()], source, non_blocking=True)
+    with manager.acquire([tensor], pin=False):
+        manager.transfer(destination, tensor, non_blocking=True)
+        torch.cuda.synchronize()
+    torch.testing.assert_close(destination.cpu(), tensor)
+    manager.clear()
