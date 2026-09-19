@@ -1,5 +1,6 @@
 """Read-only checkpoint mapping: safe_open surface, validation, lifetime, and provenance."""
 
+import errno
 import gc
 import json
 import os
@@ -86,6 +87,20 @@ def test_matches_safetensors_reader(sample) -> None:
             torch.testing.assert_close(reader.get_tensor(name), reference.get_tensor(name))
             assert reader.get_slice(name).get_dtype() == reference.get_slice(name).get_dtype()
             assert reader.get_slice(name).get_shape() == reference.get_slice(name).get_shape()
+        torch.testing.assert_close(
+            reader.get_slice("block.0.weight")[1:3, 2:5], reference.get_slice("block.0.weight")[1:3, 2:5],
+        )
+
+
+def test_indexing_a_slice_views_the_mapped_tensor(sample) -> None:
+    path, tensors = sample
+    with MappedCheckpoint(path) as reader:
+        weight = tensors["block.0.weight"]
+        piece = reader.get_slice("block.0.weight")
+        torch.testing.assert_close(piece[1:3], weight[1:3])
+        torch.testing.assert_close(piece[..., 2], weight[..., 2])
+        torch.testing.assert_close(piece[0], weight[0])
+        assert file_slice(piece[1:3]) == file_slice(reader.get_tensor("block.0.weight"))
 
 
 @pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="POSIX readahead advice")
@@ -95,6 +110,18 @@ def test_reader_advises_sequential_readahead_like_torch_from_file(sample, monkey
     monkeypatch.setattr(os, "posix_fadvise", lambda fd, offset, length, advice: calls.append((offset, length, advice)))
     MappedCheckpoint(path)
     assert calls == [(0, path.stat().st_size, os.POSIX_FADV_SEQUENTIAL)]
+
+
+@pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="POSIX readahead advice")
+def test_reader_ignores_rejected_readahead_advice(sample, monkeypatch) -> None:
+    path, tensors = sample
+
+    def refuse(fd: int, offset: int, length: int, advice: int) -> None:
+        raise OSError(errno.EINVAL, "advice not supported here")
+
+    monkeypatch.setattr(os, "posix_fadvise", refuse)
+    with MappedCheckpoint(path) as reader:
+        torch.testing.assert_close(reader.get_tensor("block.0.weight"), tensors["block.0.weight"])
 
 
 def test_no_metadata_reads_as_none(tmp_path: Path) -> None:

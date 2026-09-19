@@ -13,6 +13,7 @@ and are never closed explicitly. The file must not change while any tensor
 maps it.
 """
 
+import contextlib
 import io
 import json
 import mmap
@@ -23,6 +24,7 @@ import warnings
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
+from types import EllipsisType
 from typing import Any, NoReturn, Self, TypeGuard
 
 import torch
@@ -64,10 +66,19 @@ class FileSlice:
     length: int
 
 
+type _Index = int | slice | EllipsisType | torch.Tensor | None
+
+
 @dataclass(frozen=True, slots=True)
 class TensorSlice:
-    """Header-only view of one tensor, as ``safe_open().get_slice()`` returns."""
+    """One tensor's header entry, as ``safe_open().get_slice()`` returns.
 
+    Indexing it indexes the mapped tensor, so the result is a view whose
+    pages are read when the view is.
+    """
+
+    checkpoint: MappedCheckpoint
+    name: str
     tag: str
     shape: tuple[int, ...]
 
@@ -77,6 +88,9 @@ class TensorSlice:
 
     def get_shape(self) -> list[int]:
         return list(self.shape)
+
+    def __getitem__(self, key: _Index | tuple[_Index, ...]) -> torch.Tensor:
+        return self.checkpoint.get_tensor(self.name)[key]
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,8 +166,11 @@ class MappedCheckpoint:
             mapping = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
             if hasattr(os, "posix_fadvise"):
                 # Doubles the kernel's readahead window for this file, as
-                # PyTorch's own file mapping does; cold loads run twice as fast.
-                os.posix_fadvise(file.fileno(), 0, size, os.POSIX_FADV_SEQUENTIAL)
+                # PyTorch's own file mapping does; cold loads run twice as
+                # fast. It is only advice: a file system or sandbox that
+                # rejects it costs the readahead, not the checkpoint.
+                with contextlib.suppress(OSError):
+                    os.posix_fadvise(file.fileno(), 0, size, os.POSIX_FADV_SEQUENTIAL)
         except BaseException:
             file.close()
             raise
@@ -179,7 +196,7 @@ class MappedCheckpoint:
 
     def get_slice(self, name: str) -> TensorSlice:
         entry = self._entry(name)
-        return TensorSlice(entry.tag, entry.shape)
+        return TensorSlice(self, name, entry.tag, entry.shape)
 
     def get_tensor(self, name: str) -> torch.Tensor:
         """A tensor over the mapping whose storage is exactly its bytes and records their file slice."""
