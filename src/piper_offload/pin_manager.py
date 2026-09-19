@@ -42,7 +42,7 @@ from typing import Self
 import torch
 
 from ._host_registration import HostRegistrationBackend, RuntimeHostRegistration
-from .checkpoint import storage_slice
+from .checkpoint import file_slice
 
 logger = logging.getLogger(__name__)
 
@@ -331,7 +331,7 @@ class PinManager:
                 for pointer, request in requests.items():
                     if pointer in held or pointer in self._pageable:
                         continue
-                    if storage_slice(request.storage) is not None:
+                    if file_slice(request.storage) is not None:
                         # A read-only checkpoint mapping cannot be locked for
                         # writing and must never be registered in place; it
                         # stays pageable until the copy path (#119) exists.
