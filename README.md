@@ -41,6 +41,7 @@ is not required.
 | Module | Role |
 |---|---|
 | `resource_cache.py` | `ResourceCache`, eviction policy, cache metadata, and cache errors |
+| `checkpoint.py` | `MappedCheckpoint` — read-only safetensors mapping with `safe_open`'s reading surface, whose tensors record their file slice (`file_slice`) |
 | `pin_manager.py` | `PinManager`, `PinLease`, `PinStats`, and the process-wide `host_pin_manager` for budgeted host registration |
 | `communication.py` | Experimental `piper_relay` process group: blocking collectives through CPU Gloo or shared host memory, independently usable with DTensor |
 | `sequential.py` | Experimental `SequentialExecutor`: two DTensor ranks sharing one process, GPU and compute stream |

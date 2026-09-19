@@ -5,6 +5,16 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Add `MappedCheckpoint`, a read-only safetensors reader with `safe_open`'s
+  surface (`keys`, `metadata`, `get_tensor`, `get_slice`). Tensors are views
+  into a mapping that cannot be written, so no registration or transfer can
+  copy its pages, and each tensor's storage records the open file and byte
+  range it came from, exposed by `file_slice()` for positional reads. The
+  mapping lives as long as any tensor over it and is never closed explicitly.
+  Headers are validated before any tensor is built.
+
 ### Changed
 
 - On Linux, unregistering a private file mapping discards its copied pages,

@@ -42,6 +42,7 @@ from typing import Self
 import torch
 
 from ._host_registration import HostRegistrationBackend, RuntimeHostRegistration
+from .checkpoint import file_slice
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +331,11 @@ class PinManager:
                 for pointer, request in requests.items():
                     if pointer in held or pointer in self._pageable:
                         continue
+                    if file_slice(request.storage) is not None:
+                        # A read-only checkpoint mapping cannot be locked for
+                        # writing and must never be registered in place; it
+                        # stays pageable until the copy path (#119) exists.
+                        continue
                     size = request.storage.nbytes()
                     if not self._make_room(pointer, size):
                         continue
@@ -359,25 +365,28 @@ class PinManager:
                 self._release(tuple(held.values()))
                 raise
 
-            key = self._next_lease
-            self._next_lease += 1
-            pageable = tuple(pointer for pointer in requests if pointer not in held)
-            for pointer in pageable:
-                allocation = self._pageable.get(pointer)
-                if allocation is None:
-                    allocation = _Pageable(requests[pointer].storage.nbytes())
-                    self._pageable[pointer] = allocation
-                    self._starts.insert(bisect_left(self._starts, pointer), pointer)
-                allocation.leases += 1
-            self._leases[key] = _LeaseState(
-                tuple(held.values()),
-                pageable,
-                tuple(tensor for request in requests.values() for tensor in request.tensors),
-            )
-            _live_managers.add(self)
-            registered = sum(entry.size for entry in held.values())
-            total = sum(request.storage.nbytes() for request in requests.values())
-            return PinLease(self, key, registered, total - registered)
+            return self._open_lease(requests, held)
+
+    def _open_lease(self, requests: dict[int, _Request], held: dict[int, _Registration]) -> PinLease:
+        key = self._next_lease
+        self._next_lease += 1
+        pageable = tuple(pointer for pointer in requests if pointer not in held)
+        for pointer in pageable:
+            allocation = self._pageable.get(pointer)
+            if allocation is None:
+                allocation = _Pageable(requests[pointer].storage.nbytes())
+                self._pageable[pointer] = allocation
+                self._starts.insert(bisect_left(self._starts, pointer), pointer)
+            allocation.leases += 1
+        self._leases[key] = _LeaseState(
+            tuple(held.values()),
+            pageable,
+            tuple(tensor for request in requests.values() for tensor in request.tensors),
+        )
+        _live_managers.add(self)
+        registered = sum(entry.size for entry in held.values())
+        total = sum(request.storage.nbytes() for request in requests.values())
+        return PinLease(self, key, registered, total - registered)
 
     def clear(self) -> None:
         """Unregister idle entries.
