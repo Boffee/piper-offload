@@ -5,6 +5,16 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- `PinManager.clear()` now frees the evicted copies together on a small pool,
+  with the manager's lock released, instead of one at a time while holding it.
+  Unmapping is page-table teardown, and it is most of what eviction costs:
+  releasing the 32 GB H3 transformer drops from 2.09 s to 1.21 s, of which
+  0.49 s is the native unregistration that stays serial because the driver
+  serializes it anyway. A caller racing `clear()` can now see the budget
+  available just before the memory is back.
+
 ## [0.10.0rc4] - 2026-09-19
 
 ### Fixed
