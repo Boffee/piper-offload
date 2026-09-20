@@ -12,7 +12,6 @@ from .host_param import HostParam
 from .lora import (
     LoRAFactor,
     LoRATransform,
-    ScaledLoRAFactor,
     _localize_materialized_weight_factors,
     _materialize_weight_factors,
     _MaterializedWeightFactor,
@@ -67,8 +66,10 @@ class ParameterDelta:
     ``lora`` stores an optional low-rank contribution and ``dense`` an
     optional full-rank contribution. At least one representation must be
     present. Strength is deliberately extrinsic: binding this resource to an
-    activation produces ``strength * (lora.B @ lora.A + dense)`` without
-    mutating or copying its host backing. Tensor payload numerical validity is
+    activation produces
+    ``strength * (lora.scaling * lora.B @ lora.A + dense)`` without mutating or
+    copying its host backing. Only the factors carry an intrinsic scaling; a
+    dense contribution has no magnitude of its own. Tensor payload numerical validity is
     the caller's responsibility.
     """
 
@@ -93,8 +94,13 @@ class ParameterDelta:
         b: torch.Tensor | None = None,
         dense: torch.Tensor | None = None,
         dtype: torch.dtype | None = None,
+        lora_alpha: float | None = None,
     ) -> Self:
-        """Validate and capture an optional LoRA pair and dense contribution."""
+        """Validate and capture an optional LoRA pair, its ``alpha``, and a dense contribution.
+
+        ``lora_alpha`` belongs to the factors alone; a delta with no factors has
+        no use for it.
+        """
         if (a is None) != (b is None):
             raise ValueError("ParameterDelta requires both LoRA A and LoRA B when either factor is provided.")
         lora = (
@@ -104,6 +110,7 @@ class ParameterDelta:
                 a,
                 b,
                 dtype=dtype,
+                alpha=lora_alpha,
             )
         )
         dense_backing = (
@@ -191,7 +198,7 @@ class ParameterDeltaTransform:
                 "Stochastic ParameterDeltaTransform requires a non-empty target_key."
             )
         self._lora_factors = tuple(
-            ScaledLoRAFactor(scaled.delta.lora, scaled.strength)
+            scaled.delta.lora.scaled(scaled.strength)
             for scaled in self._deltas
             if scaled.delta.lora is not None
         )

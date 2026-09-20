@@ -696,9 +696,16 @@ shape and compute dtype.
 adapter for their required capabilities.
 
 `Adapter.from_state_dict()` reserves the exact suffixes `.lora_A.weight` and
-`.lora_B.weight` for low-rank factors, and `.delta.weight` and `.delta.bias`
-for full-rank additive updates. `module.delta.weight` targets `module.weight`,
-while `module.delta.bias` targets `module.bias`. LoRA and dense terms for the
+`.lora_B.weight` for low-rank factors, `.alpha` for a factor pair's magnitude,
+and `.delta.weight` and `.delta.bias` for full-rank additive updates. A
+`module.alpha` scalar beside `module.lora_A.weight` gives that pair an
+intrinsic `alpha / rank` scaling, so a caller need not fold the magnitude into
+the factors: folding is host arithmetic, and it would replace a mapped
+checkpoint tensor with an anonymous one that can no longer be pinned through an
+owned copy. An `.alpha` without a factor pair is an error.
+
+`module.delta.weight` targets `module.weight`, while `module.delta.bias`
+targets `module.bias`. LoRA and dense terms for the
 same parameter form one `ParameterDelta`. Every other entry is a
 `ParameterValue` whose key is the exact model parameter name and whose source
 is the complete value for a plain floating-point meta parameter. The source may
@@ -712,6 +719,7 @@ feature_adapter = Adapter.from_state_dict(
     {
         "projection.lora_A.weight": projection_a,
         "projection.lora_B.weight": projection_b,
+        "projection.alpha": torch.tensor(16.0),
         "projection.delta.weight": projection_dense_delta,
         "projection.delta.bias": projection_bias_delta,
         "guidance_embedder.weight": guidance_weight,
@@ -723,8 +731,10 @@ feature_adapter = Adapter.from_state_dict(
 `Adapter.targets` is one immutable exact-name mapping. `AdapterTarget` is the
 union `ParameterDelta | ParameterValue`, so every mapped target is already in
 a valid, concrete form. A parameter delta contributes
-`strength * (B @ A + dense)` with whichever low-rank and dense terms are
-present. A parameter value materializes the complete value unchanged by
+`strength * (scaling * B @ A + dense)` with whichever low-rank and dense
+terms are present, where `scaling` is the factors' intrinsic magnitude — the
+`alpha / rank` an `.alpha` supplied, or `1.0`. A dense term has no magnitude
+of its own. A parameter value materializes the complete value unchanged by
 default. Pass `scale_parameter_values=True` to `Adapter.from_state_dict()` or
 `AdapterSpec` when active adapter strength should scale those values. Explicit
 non-unit scaling requires the value representation to support both

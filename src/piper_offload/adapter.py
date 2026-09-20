@@ -28,6 +28,7 @@ type AdapterMode = Literal["merge", "routed"]
 
 _LORA_A_SUFFIX = ".lora_A.weight"
 _LORA_B_SUFFIX = ".lora_B.weight"
+_ALPHA_SUFFIX = ".alpha"
 _DELTA_WEIGHT_SUFFIX = ".delta.weight"
 _DELTA_BIAS_SUFFIX = ".delta.bias"
 
@@ -65,7 +66,7 @@ class AdapterTargetUpdates:
     def factors(self) -> list[ScaledLoRAFactor]:
         """Low-rank contributions extracted for routed execution."""
         return [
-            ScaledLoRAFactor(bound.delta.lora, bound.strength) for bound in self.deltas if bound.delta.lora is not None
+            bound.delta.lora.scaled(bound.strength) for bound in self.deltas if bound.delta.lora is not None
         ]
 
     @property
@@ -80,6 +81,7 @@ class _AdapterSources:
 
     a: dict[str, torch.Tensor]
     b: dict[str, torch.Tensor]
+    alphas: dict[str, torch.Tensor]
     deltas: dict[str, torch.Tensor]
     values: dict[str, torch.Tensor]
 
@@ -153,7 +155,15 @@ class Adapter:
         """Validate and capture factor and/or parameter-value tensors.
 
         Keys ending in ``.lora_A.weight`` and ``.lora_B.weight`` form factor
-        targets. Keys ending in ``.delta.weight`` or ``.delta.bias`` are
+        targets, and a matching ``.alpha`` scalar gives that target its
+        intrinsic ``alpha / rank`` magnitude. A checkpoint that states its
+        alpha out of band, such as in safetensors metadata, states it per
+        factor here, the same way it states the factors themselves. Carrying
+        the magnitude means a caller need not fold it into the factors: folding
+        is host arithmetic that replaces a mapped checkpoint tensor with an
+        anonymous one, which cannot then be pinned through an owned copy.
+
+        Keys ending in ``.delta.weight`` or ``.delta.bias`` are
         full-rank additive updates targeting the corresponding model weight or
         bias. Every other key is an exact model parameter name whose tensor is
         the complete dense or supported prequantized value for a meta
@@ -196,7 +206,7 @@ def _parse_adapter_state_dict(
     state_dict: Mapping[str, torch.Tensor],
 ) -> _AdapterSources:
     """Parse and validate canonical adapter sources in one pass."""
-    sources = _AdapterSources({}, {}, {}, {})
+    sources = _AdapterSources({}, {}, {}, {}, {})
     for key, tensor in state_dict.items():
         if key.endswith(_LORA_A_SUFFIX):
             base = key[: -len(_LORA_A_SUFFIX)]
@@ -206,6 +216,10 @@ def _parse_adapter_state_dict(
             base = key[: -len(_LORA_B_SUFFIX)]
             _validate_lora_base(base)
             sources.b[base] = tensor
+        elif key.endswith(_ALPHA_SUFFIX):
+            base = key[: -len(_ALPHA_SUFFIX)]
+            _validate_lora_base(base)
+            sources.alphas[base] = tensor
         elif key.endswith(_DELTA_WEIGHT_SUFFIX):
             base = key[: -len(_DELTA_WEIGHT_SUFFIX)]
             _validate_delta_base(base)
@@ -233,6 +247,12 @@ def _validate_factor_pairing(sources: _AdapterSources) -> None:
             f"B-only={sorted(b_only)}. Each target needs both "
             f".lora_A.weight and .lora_B.weight."
         )
+    orphaned = sorted(set(sources.alphas) - set(sources.a))
+    if orphaned:
+        raise ValueError(
+            f"LoRA alpha without a factor pair: {orphaned}. Each .alpha needs "
+            f"its .lora_A.weight and .lora_B.weight."
+        )
 
 
 def _validate_lora_base(base: str) -> None:
@@ -243,6 +263,20 @@ def _validate_lora_base(base: str) -> None:
 def _validate_delta_base(base: str) -> None:
     if not base:
         raise ValueError("Parameter delta target names must be non-empty")
+
+
+def _factor_alpha(base: str, sources: _AdapterSources) -> float | None:
+    """The magnitude a factor declares, or ``None`` when it declares none.
+
+    Dividing by the rank belongs to :meth:`LoRAFactor.from_tensors`, which has
+    already validated the tensor it reads that rank from.
+    """
+    alpha = sources.alphas.get(base)
+    if alpha is None:
+        return None
+    if alpha.numel() != 1:
+        raise ValueError(f"LoRA alpha for {base!r} must be a scalar; got shape {tuple(alpha.shape)}.")
+    return float(alpha.item())
 
 
 def _build_adapter_targets(
@@ -262,6 +296,7 @@ def _build_adapter_targets(
             b=None if base is None else sources.b[base],
             dense=sources.deltas.get(target_key),
             dtype=dtype,
+            lora_alpha=None if base is None else _factor_alpha(base, sources),
         )
 
     for target_key, source in sources.values.items():

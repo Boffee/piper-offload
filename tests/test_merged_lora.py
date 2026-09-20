@@ -14,6 +14,7 @@ from weakref import WeakKeyDictionary
 import pytest
 import torch
 import torch.nn.functional as F
+from safetensors.torch import save_file
 from torch import nn
 
 import piper_offload.lora as lora_impl
@@ -23,6 +24,8 @@ import piper_offload.quanto_adapter as quanto_adapter_impl
 from piper_offload import (
     BlockCompileConfig,
     Adapter,
+    MappedCheckpoint,
+    file_slice,
     AdapterTarget,
     LoRAFactor,
     AdapterMode,
@@ -5423,3 +5426,121 @@ class TestMergeIntoMappedModel:
         assert model.target.weight.untyped_storage().resizable()
         torch.testing.assert_close(model.target.weight, base + 0.5 * dense)
         torch.testing.assert_close(mapped, base)
+
+
+class TestIntrinsicLoRAScale:
+    """``alpha / rank`` carried on the factor instead of folded into its tensors."""
+
+    RANK = 4
+
+    @classmethod
+    def _state(cls, alpha: float | None = None) -> dict[str, torch.Tensor]:
+        sd = {
+            "target.lora_A.weight": torch.randn(cls.RANK, 16),
+            "target.lora_B.weight": torch.randn(16, cls.RANK),
+        }
+        if alpha is not None:
+            sd["target.alpha"] = torch.tensor(alpha)
+        return sd
+
+    def test_alpha_key_sets_the_scale_and_is_not_a_parameter_value(self) -> None:
+        adapter = Adapter.from_state_dict(state_dict=self._state(alpha=8.0))
+        assert set(adapter.targets) == {"target.weight"}
+        assert _require_factor(adapter.targets["target.weight"]).scaling == pytest.approx(2.0)
+
+    def test_absent_alpha_leaves_the_scaling_neutral(self) -> None:
+        adapter = Adapter.from_state_dict(state_dict=self._state())
+        assert _require_factor(adapter.targets["target.weight"]).scaling == 1.0
+
+    def test_each_factor_carries_its_own_alpha(self) -> None:
+        """Alpha is per factor, like the factors themselves, not one value for the file."""
+        sd = {
+            "first.lora_A.weight": torch.randn(4, 16),
+            "first.lora_B.weight": torch.randn(16, 4),
+            "first.alpha": torch.tensor(8.0),
+            "second.lora_A.weight": torch.randn(2, 16),
+            "second.lora_B.weight": torch.randn(16, 2),
+            "second.alpha": torch.tensor(1.0),
+        }
+        targets = Adapter.from_state_dict(state_dict=sd).targets
+        assert _require_factor(targets["first.weight"]).scaling == pytest.approx(2.0)
+        assert _require_factor(targets["second.weight"]).scaling == pytest.approx(0.5)
+
+    def test_strength_composes_with_the_intrinsic_scale(self) -> None:
+        factor = _require_factor(
+            Adapter.from_state_dict(state_dict=self._state(alpha=8.0)).targets["target.weight"]
+        )
+        assert factor.scaling == pytest.approx(2.0)
+        assert factor.scaled(3.0).coefficient == pytest.approx(6.0)
+
+    @pytest.mark.parametrize("strength", [1.0, 0.5, 2.0])
+    def test_a_merge_matches_pre_scaled_factors(self, strength: float) -> None:
+        """Through a real merge, an intrinsic scale equals the fold it replaces."""
+        sd = self._state(alpha=8.0)
+        scaling = 8.0 / self.RANK
+        folded = {
+            "target.lora_A.weight": sd["target.lora_A.weight"] * scaling,
+            "target.lora_B.weight": sd["target.lora_B.weight"].clone(),
+        }
+
+        def merged(state: dict[str, torch.Tensor]) -> torch.Tensor:
+            factor = _require_factor(Adapter.from_state_dict(state_dict=state).targets["target.weight"])
+            param = nn.Parameter(torch.zeros(16, 16), requires_grad=False)
+            transform = LoRATransform([factor.scaled(strength)])
+            transform.validate_target(param)
+            transform.apply_weight(param)
+            return param.detach()
+
+        torch.testing.assert_close(merged(sd), merged(folded))
+
+    def test_alpha_without_a_factor_pair_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="alpha without a factor pair"):
+            Adapter.from_state_dict(state_dict={"orphan.alpha": torch.tensor(8.0)})
+
+    def test_a_non_scalar_alpha_is_rejected(self) -> None:
+        sd = self._state()
+        sd["target.alpha"] = torch.ones(2)
+        with pytest.raises(ValueError, match="must be a scalar"):
+            Adapter.from_state_dict(state_dict=sd)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_an_unusable_alpha_is_rejected(self, bad: float) -> None:
+        with pytest.raises(ValueError, match="LoRA scaling must be"):
+            Adapter.from_state_dict(state_dict=self._state(alpha=bad))
+
+    def test_a_rank_zero_factor_with_an_alpha_is_rejected(self) -> None:
+        sd = {
+            "target.lora_A.weight": torch.zeros(0, 16),
+            "target.lora_B.weight": torch.zeros(16, 0),
+            "target.alpha": torch.tensor(8.0),
+        }
+        with pytest.raises(ValueError, match="rank-0 LoRA factor"):
+            Adapter.from_state_dict(state_dict=sd)
+
+    def test_a_mapped_factor_stays_mapped(self, tmp_path) -> None:
+        """Why the scale is intrinsic: folding alpha here would replace the mapping."""
+        path = tmp_path / "lora.safetensors"
+        save_file(
+            {
+                "target.lora_A.weight": torch.randn(4, 32),
+                "target.lora_B.weight": torch.randn(32, 4),
+            },
+            str(path),
+            metadata={"alpha": "8"},
+        )
+        reader = MappedCheckpoint(path)
+        keys = reader.keys()
+        state = {key: reader.get_tensor(key) for key in keys}
+        assert all(file_slice(tensor) is not None for tensor in state.values())
+
+        # A checkpoint-wide alpha reaches here as a per-factor entry, the way
+        # the caller already canonicalizes factor names. The mapped tensors are
+        # never touched, which is what keeps them mapped.
+        state["target.alpha"] = torch.tensor(float((reader.metadata() or {})["alpha"]))
+        adapter = Adapter.from_state_dict(state_dict=state)
+        factor = _require_factor(adapter.targets["target.weight"])
+        assert factor.scaling == pytest.approx(2.0)
+        a, b = _factor_tensors(adapter.targets["target.weight"])
+        assert file_slice(a) is not None
+        assert file_slice(b) is not None
+        torch.testing.assert_close(a, state["target.lora_A.weight"], atol=0, rtol=0)
