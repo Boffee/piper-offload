@@ -229,7 +229,7 @@ class TensorAdapter[HostStateT, GpuStateT](Protocol):
 
     @staticmethod
     def cache_bytes(state: HostStateT) -> int:
-        """Logical representation bytes charged to :class:`ResourceCache`.
+        """Logical representation bytes reserved in the :class:`ResourceCache`.
 
         Count the physical representation tensors, including auxiliary
         storage and metadata retained by the adapter.

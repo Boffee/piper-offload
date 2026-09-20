@@ -77,7 +77,7 @@ class HostParam:
     this optimization because ``.data =`` can drop wrapper state.
 
     A frozen plain floating-point meta parameter retains its shape, dtype, and
-    stride without host backing or cache charge. It remains meta unless a
+    stride without host backing or a cache reservation. It remains meta unless a
     merge-mode parameter value allocates and fills active device storage.
     Low-rank factors cannot materialize it.
     """

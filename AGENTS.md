@@ -56,12 +56,12 @@ file holds what agents get wrong without it.
 - Every tensor adapter implements `storage_tensors()` alongside
   `capture_host()` and copies to the device through `transfer_()`.
 - Every asynchronous host-to-device transfer runs under a pin lease, and
-  `transfer_()` raises otherwise. A lease protects a transfer; it never
+  `transfer_()` raises otherwise. A lease holds a transfer's storage; it never
   decides pinning. Only transfers that repeat pin: streaming, rolling, and
   the relay. Resident and host uploads lease pageable.
-- `max_pinned_bytes` caps pinned bytes only. Everything outside the pinned
-  set is reclaimable by the OS, so there is no trim call; lower the cap or
-  call `clear()`.
+- `max_pinned_bytes` is a budget for pinned bytes only. Everything outside
+  the pinned set is reclaimable by the OS, so there is no trim call; lower
+  the budget or call `clear()`.
 - Checkpoint storage with file provenance pins through an owned copy filled
   by positional reads; the mapping stays read-only page cache. The pinning
   mechanism is chosen statically per platform, never probed at runtime.
@@ -92,11 +92,13 @@ One name per concept, taken from the code.
 - Storage is *pinned* when the manager has *registered* it with the CUDA/HIP
   runtime, either *in place* or through a *copy*, the owned page-aligned
   region filled from a checkpoint file; unregistered storage is *pageable*.
-  A *pin lease* protects a set of storages until it closes: a *session
-  lease* lasts a component's activation, a *transfer lease* covers one
-  transfer. The *budget* is `max_pinned_bytes`. A lease *closes*; an idle
-  registration is *evicted*, which *unregisters* it and, for a copy, *frees*
-  its region; a registration whose owning tensors are gone is *retired* and
+  A *pin lease* holds a set of storages until it closes: a *session lease*
+  lasts a component's activation, a *transfer lease* covers one transfer.
+  The *budget* is `max_pinned_bytes`; storage an acquisition has *reserved*
+  under it but not yet registered is *pending*. A lease *closes*; an idle
+  registration or pending storage is *evicted*, which unregisters or
+  unreserves it and, for a copy, *frees* its region; a registration whose
+  *owners*, the tensors over its storage, are gone is *retired* and
   unregistered once no lease holds it.
 
 ## Working in the repo

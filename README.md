@@ -168,9 +168,9 @@ budget. Its default is half of the memory available to the process: physical
 RAM, or the tightest cgroup limit on the process's own cgroup or its
 ancestors when that is lower, rounded down to OS pages; the cgroup hierarchy
 is assumed to be mounted at `/sys/fs/cgroup`. Set
-another finite byte limit to cap registration, `max_pinned_bytes = 0` to
-disable it, or `None` to remove the application cap and register
-opportunistically up to the capacity currently available from CUDA/HIP.
+another finite budget, `max_pinned_bytes = 0` to disable registration, or
+`None` to remove the budget and register up to the capacity currently
+available from the CUDA/HIP runtime.
 Construction and configuration do not initialize CUDA. Every CUDA transfer
 runs under a lease. Ordinary streaming
 and compiled rolling ask their lease to register the storage they read every
@@ -180,8 +180,8 @@ execution does not acquire leases.
 
 Storage that records a checkpoint file slice, which is every tensor from
 `MappedCheckpoint`, is never registered in place. Pinning it allocates an
-owned page-aligned copy, fills the copy from the file with positional reads,
-and registers that; the mapping stays read-only page cache the whole time.
+owned page-aligned copy, fills the copy from the file with parallel positional
+reads, and registers that; the mapping stays read-only page cache the whole time.
 Transfers read the copy under their lease. An asynchronous transfer of
 pinned storage outside a lease raises, because eviction is safe only while
 every such reader holds one; a synchronous transfer completes under the
@@ -202,8 +202,8 @@ handing the model to Piper.
 
 Deactivation releases the lease after transfers finish and leaves registrations
 in the idle LRU. Reactivating the same backing reuses its retained registrations
-without native register/unregister calls. `BlockComponent.release()` also
-releases pin protection during a temporary working-set release; `acquire()`
+without runtime register or unregister calls. `BlockComponent.release()` also
+releases its lease during a temporary working-set release; `acquire()`
 reuses or registers backing again. This lets transient components share the
 budget. Resolved replacement sources, quantized payloads and metadata, buffers,
 and trainable optimizer backing all participate in the same lease.
@@ -223,31 +223,31 @@ with host_pin_manager.acquire([source]):
     with torch.cuda.stream(copy_stream):
         transfer_(target, source, non_blocking=True)  # reads a pinned copy when one exists
     copy_stream.synchronize()  # finish every host read before closing the lease
-# The source may remain registered in the idle LRU after the lease closes.
+# The source may stay pinned in the idle LRU after the lease closes.
 ```
 
-Pass `pin=False` to protect the sources of a one-time transfer without
-registering them. Do not write into a private file mapping while it is
+Pass `pin=False` to hold the storage of a one-time transfer without
+registering it. Do not write into a private file mapping while it is
 registered here.
 
 For model backing, pass tensors from `HostParam.storage_tensors()` and
-`HostBuffer.storage_tensors()`. Acquiring a lease protects existing
-registrations and registers additional whole allocations when capacity allows.
-Budget or supported runtime-capacity failures leave complete allocations
-pageable. They remain pageable until all their active leases close, even if
+`HostBuffer.storage_tensors()`. Acquiring a lease holds existing
+registrations and registers additional whole storages when the budget and the
+runtime allow. Budget or supported runtime capacity failures leave whole
+storages pageable. They remain pageable until all their active leases close, even if
 another request arrives after capacity becomes available. A lease reports
-`registered_bytes` and `pageable_bytes` for unique
-requested allocations. `host_pin_manager.stats.pinned_bytes` instead counts
+`registered_bytes` and `pageable_bytes` for the unique
+storages requested. `host_pin_manager.stats.pinned_bytes` instead counts
 the union of covered OS pages, including shared boundary pages only once.
 
-Released registrations enter an idle LRU. Budget pressure evicts idle entries;
-active leases remain protected. A native capacity failure evicts unrelated idle
-registrations in LRU order and retries the current allocation. If capacity
+Released registrations enter an idle LRU. Budget pressure evicts idle
+registrations; what active leases hold stays. A runtime capacity failure evicts
+unrelated idle registrations in LRU order and retries the current registration. If capacity
 remains unavailable, the rest of that acquisition stays pageable without
-repeated registration attempts. Discarding a source tensor retires its
-registration once active users finish. Storage remains alive until successful
+repeated registration attempts. Dropping an owning tensor retires its
+registration once the leases holding it close. Storage remains alive until successful
 unregistration, including after cleanup errors; `clear()` retries failed cleanup
-and evicts idle entries. `ModelCache` retains host stores until explicit
+and evicts idle registrations. `ModelCache` retains host stores until explicit
 eviction; unpinned mapped pages remain reclaimable by the OS.
 Do not resize storage or register/unregister it outside the manager while it is
 managed. Use views of one storage for aliases; distinct overlapping byte ranges
