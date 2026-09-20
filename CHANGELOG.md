@@ -5,8 +5,31 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- `LoRAFactor` carries an intrinsic `scaling`, the checkpoint's own `alpha / rank`
+  magnitude. `LoRAFactor.scaled()` composes it with the extrinsic strength into
+  `ScaledLoRAFactor.coefficient`, the one coefficient every merge and routing
+  path applies.
+- `Adapter.from_state_dict()` reads a factor's magnitude from a `.alpha` entry
+  beside its `.lora_A.weight` and `.lora_B.weight`, which is where adapters put
+  it. A caller that folded `alpha / rank` into the factors themselves no longer
+  has to: that fold is host arithmetic, so it replaced a mapped checkpoint
+  tensor with an anonymous one, which could not then be pinned through an owned
+  copy. Factors without an `.alpha` are unchanged, so pre-scaled adapters keep
+  working.
+
 ### Changed
 
+- `ScaledLoRAFactor` holds one scalar, `coefficient`, in place of `strength`.
+  It is the strength already composed with the factor's intrinsic scaling, so no
+  application path has to remember to combine them, and `LoRAFactor.scaled()`
+  is now the way to build one rather than a documented path nothing took.
+- `.alpha` joins `.lora_A.weight`, `.lora_B.weight`, `.delta.weight` and
+  `.delta.bias` as a reserved adapter suffix, so a key ending in it names a
+  factor's magnitude rather than a complete parameter value. An `.alpha`
+  without a factor pair, or one holding more than a single element, is
+  refused.
 - `PinManager.clear()` now frees the evicted copies together on a small pool,
   with the manager's lock released, instead of one at a time while holding it.
   Unmapping is page-table teardown, and it is most of what eviction costs:

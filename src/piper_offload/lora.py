@@ -50,6 +50,11 @@ def _validate_factor_tensors(
         )
 
 
+def _validate_factor_scaling(scaling: float) -> None:
+    if not math.isfinite(scaling):
+        raise ValueError(f"LoRA scaling must be finite; got {scaling}.")
+
+
 def _capture_factor_tensor(
     source: torch.Tensor,
     *,
@@ -67,11 +72,17 @@ class LoRAFactor:
 
     ``a`` is the ``(rank, in_dim)`` down-projection and ``b`` the
     ``(out_dim, rank)`` up-projection, each held as a :class:`HostParam`.
-    Strength is *not* part of the pair — it is extrinsic and supplied when the
-    adapter is bound to a target. :meth:`from_tensors` validates the stored
-    pair before capture; direct construction enforces the same invariant. The
-    match against a concrete target shape is checked separately, where the
-    target is known.
+    :meth:`from_tensors` validates the stored pair before capture; direct
+    construction enforces the same invariant. The match against a concrete
+    target shape is checked separately, where the target is known.
+
+    Two scalars meet here and they are not the same thing. ``scale`` is
+    *intrinsic*: the checkpoint's own ``alpha / rank`` magnitude, a property of
+    these tensors. Strength is *extrinsic*, supplied when the adapter is bound
+    to a target. Carrying ``scale`` here rather than folding it into the
+    tensors keeps a mapped factor mapped, so it can still be pinned through an
+    owned copy; folding is host arithmetic that would replace the mapping with
+    an anonymous tensor.
 
     :meth:`scaled` binds the extrinsic strength without discarding the host
     representation, so each application path can materialize the factors
@@ -80,9 +91,11 @@ class LoRAFactor:
 
     a: HostParam
     b: HostParam
+    scaling: float = 1.0
 
     def __post_init__(self) -> None:
         """Keep direct construction subject to the same data invariants."""
+        _validate_factor_scaling(self.scaling)
         _validate_factor_tensors(
             param_representation(self.a.make_cpu_param()),
             param_representation(self.b.make_cpu_param()),
@@ -95,12 +108,17 @@ class LoRAFactor:
         b: torch.Tensor,
         *,
         dtype: torch.dtype | None = None,
+        alpha: float | None = None,
     ) -> Self:
-        """Validate and capture one unscaled factor pair."""
+        """Validate and capture one factor pair, dividing ``alpha`` by the rank it just validated."""
         _validate_factor_tensors(a, b)
+        rank = a.shape[0]
+        if alpha is not None and rank == 0:
+            raise ValueError("A rank-0 LoRA factor has no rank for its alpha to scale.")
         return cls(
             _capture_factor_tensor(a, dtype=dtype),
             _capture_factor_tensor(b, dtype=dtype),
+            1.0 if alpha is None else alpha / rank,
         )
 
     @property
@@ -109,8 +127,10 @@ class LoRAFactor:
         return self.a.cache_bytes + self.b.cache_bytes
 
     def scaled(self, strength: float) -> ScaledLoRAFactor:
-        """Bind this host-backed factor pair to ``strength``."""
-        return ScaledLoRAFactor(self, strength)
+        """Bind this pair to ``strength``, composing it with the factor's intrinsic scaling."""
+        if not math.isfinite(strength):
+            raise ValueError(f"LoRA strength must be finite; got {strength}.")
+        return ScaledLoRAFactor(self, strength * self.scaling)
 
 
 @dataclass(slots=True, frozen=True)
@@ -121,19 +141,21 @@ class ScaledLoRAFactor:
     hooks. Keeping :class:`HostParam` rather than CPU tensor views preserves
     adapter-specific reconstruction metadata such as a ``DTensor``'s original
     device mesh. The contribution to the base weight is
-    ``strength * (b @ a)``.
+    ``coefficient * (b @ a)``.
 
-    Use :meth:`from_tensors` when constructing a standalone transform from
-    source tensors. Adapter resources normally create this through
-    :meth:`LoRAFactor.scaled` and reuse their existing host backing.
+    One scalar, not two: :attr:`coefficient` is the caller's strength already
+    composed with the factor's intrinsic scaling, so no application path has to
+    remember to combine them. Build it through :meth:`LoRAFactor.scaled`,
+    which does that composition, or :meth:`from_tensors` for a standalone
+    transform from source tensors.
     """
 
     factor: LoRAFactor
-    strength: float
+    coefficient: float
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.strength):
-            raise ValueError(f"LoRA strength must be finite; got {self.strength}.")
+        if not math.isfinite(self.coefficient):
+            raise ValueError(f"LoRA coefficient must be finite; got {self.coefficient}.")
 
     @classmethod
     def from_tensors(
@@ -142,7 +164,11 @@ class ScaledLoRAFactor:
         b: torch.Tensor,
         strength: float,
     ) -> Self:
-        """Capture unbound adapter tensors and bind them to ``strength``."""
+        """Capture unbound adapter tensors and bind them to ``strength``.
+
+        These factors declare no alpha, so their scale is neutral and the
+        composed coefficient is ``strength`` itself.
+        """
         return cls(LoRAFactor.from_tensors(a, b), strength)
 
     @property
@@ -171,6 +197,8 @@ class ScaledLoRAFactor:
         return (self.b.shape[0], self.a.shape[1])
 
 
+# The float is the coefficient on ``B @ A``: a factor's intrinsic scaling already
+# composed with the strength it was bound to, never the strength alone.
 type _RawLoRAFactor = tuple[float, torch.Tensor, torch.Tensor]
 
 
@@ -178,10 +206,10 @@ type _RawLoRAFactor = tuple[float, torch.Tensor, torch.Tensor]
 class _FactorAwareLoRAMergeAdapter(Protocol):
     """Optional staging path for formats that transform individual factors.
 
-    The ordinary packer folds each strength into an already-low-precision
-    ``A`` slice. Formats whose stored-weight coordinates require another
-    transform can instead stage every factor atomically, before packing loses
-    the original strength boundaries.
+    The ordinary packer folds each factor's coefficient into an
+    already-low-precision ``A`` slice. Formats whose stored-weight coordinates
+    require another transform can instead stage every factor atomically, before
+    packing loses the original factor boundaries.
     """
 
     @staticmethod
@@ -192,7 +220,7 @@ class _FactorAwareLoRAMergeAdapter(Protocol):
         logical_shape: tuple[int, ...],
         compute_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
-        """Return a prepared ``(B, A, strength)`` or defer to normal staging."""
+        """Return a prepared ``(B, A, coefficient)`` or defer to normal staging."""
         ...
 
     @staticmethod
@@ -224,7 +252,7 @@ class _FactorAwareLoRAMergeAdapter(Protocol):
 class _MaterializedWeightFactor:
     """One scaled weight factor exposed as plain host tensors."""
 
-    strength: float
+    coefficient: float
     a: torch.Tensor
     b: torch.Tensor
 
@@ -242,7 +270,7 @@ def _materialize_weight_factors(
     """Expose scaled factors as plain host tensors."""
     return [
         _MaterializedWeightFactor(
-            strength=factor.strength,
+            coefficient=factor.coefficient,
             a=param_representation(factor.a.make_cpu_param()),
             b=param_representation(factor.b.make_cpu_param()),
         )
@@ -278,7 +306,7 @@ def _localize_materialized_weight_factors(
     in_offset, in_size = in_range
     return [
         _MaterializedWeightFactor(
-            strength=factor.strength,
+            coefficient=factor.coefficient,
             a=factor.a.narrow(1, in_offset, in_size),
             b=factor.b.narrow(0, out_offset, out_size),
         )
@@ -313,10 +341,10 @@ def _pack_materialized_weight_factors(
         b_slice = b_packed[:, rank_offset:next_offset]
         transfer_(a_slice, factor.a, non_blocking=True)
         transfer_(b_slice, factor.b, non_blocking=True)
-        if factor.strength != 1.0:
+        if factor.coefficient != 1.0:
             # Scaling the contiguous A slice keeps B's strided destination
             # copy as the only non-contiguous operation for each factor.
-            a_slice.mul_(factor.strength)
+            a_slice.mul_(factor.coefficient)
         rank_offset = next_offset
 
     return a_packed, b_packed
@@ -553,7 +581,7 @@ class LoRATransform:
             return (
                 _stage(factor.b, device=data.device, dtype=compute_dtype),
                 _stage(factor.a, device=data.device, dtype=compute_dtype),
-                factor.strength,
+                factor.coefficient,
             )
 
         a, b = cls._pack_factors(
@@ -578,7 +606,7 @@ class LoRATransform:
         if isinstance(adapter, _FactorAwareLoRAMergeAdapter):
             prepared = adapter.stage_lora_factors(
                 data,
-                tuple((factor.strength, factor.a, factor.b) for factor in factors),
+                tuple((factor.coefficient, factor.a, factor.b) for factor in factors),
                 logical_shape=logical_shape,
                 compute_dtype=compute_dtype,
             )
@@ -693,7 +721,7 @@ class _StagedLoRAFactor:
 
     a: nn.Parameter
     b: nn.Parameter
-    strength: float
+    coefficient: float
 
 
 def _routed_residual(
@@ -715,7 +743,7 @@ def _routed_residual(
         # DTensor and their device meshes.
         a = param_representation(factor.a).to(dtype=output_dtype)
         b = param_representation(factor.b).to(dtype=output_dtype)
-        part = ((x_compute @ a.T) * factor.strength) @ b.T
+        part = ((x_compute @ a.T) * factor.coefficient) @ b.T
         total = part if total is None else total + part
     if total is None:
         raise ValueError("Routed LoRA residual requires at least one factor")
@@ -749,7 +777,7 @@ def _stage_routed_factors(
         _StagedLoRAFactor(
             factor.a.materialize(x.device, non_blocking=True),
             factor.b.materialize(x.device, non_blocking=True),
-            factor.strength,
+            factor.coefficient,
         )
         for factor in factors
     )
