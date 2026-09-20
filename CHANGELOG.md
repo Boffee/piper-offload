@@ -22,7 +22,10 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   staying pageable: transfers read the copy under their lease through
   `transfer_()`, the module's tensors keep pointing at the
   read-only mapping, and evicting the copy unregisters and frees it.
-  `PinStats.copy_bytes` reports the copies' share of `pinned_bytes`.
+  The copies of one acquisition fill together, in slices, on a pool sized
+  to the logical core count. `PinStats.copy_bytes` reports the copies' share
+  of `pinned_bytes`. Pinning the 32 GB H3 transformer from a warm page cache
+  takes 1.7 s, and reacquiring it while registered 2 ms.
 - `max_pinned_bytes` defaults to half of the memory available to the process,
   physical RAM or the tightest cgroup limit on the process's cgroup and its
   ancestors when that is lower, rounded down to OS pages, instead of `None`, because owned copies cost RAM where

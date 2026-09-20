@@ -180,8 +180,8 @@ execution does not acquire leases.
 
 Storage that records a checkpoint file slice, which is every tensor from
 `MappedCheckpoint`, is never registered in place. Pinning it allocates an
-owned page-aligned copy, fills the copy from the file with positional reads,
-and registers that; the mapping stays read-only page cache the whole time.
+owned page-aligned copy, fills the copy from the file with parallel positional
+reads, and registers that; the mapping stays read-only page cache the whole time.
 Transfers read the copy under their lease. An asynchronous transfer of
 pinned storage outside a lease raises, because eviction is safe only while
 every such reader holds one; a synchronous transfer completes under the

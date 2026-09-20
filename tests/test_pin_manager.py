@@ -8,6 +8,7 @@ import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from typing import Self
 from unittest.mock import Mock
 
 import pytest
@@ -17,7 +18,7 @@ import piper_offload._host_registration as registration_module
 import piper_offload.pin_manager as pin_module
 from piper_offload._host_registration import HostRegistrationError, RuntimeHostRegistration
 from piper_offload import MappedCheckpoint, PinManager, file_slice, host_pin_manager
-from piper_offload.pin_manager import TransferLease
+from piper_offload.pin_manager import PinLease, TransferLease
 
 PAGE = mmap.PAGESIZE
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device required")
@@ -809,10 +810,11 @@ def test_checkpoint_storage_pins_through_an_owned_copy(backend: FakeBackend, tmp
     (anonymous,) = _tensors((0, PAGE))
     with manager.acquire([tensor, anonymous]) as lease:
         assert (lease.registered_bytes, lease.pageable_bytes) == (tensor.nbytes + PAGE, 0)
-        (copy_pointer, copy_size), anonymous_call = backend.register_calls
+        calls = dict(backend.register_calls)
+        assert calls.pop(anonymous.data_ptr()) == PAGE
         # The mapping itself is never registered; its copy is page-aligned and page-rounded.
+        ((copy_pointer, copy_size),) = calls.items()
         assert copy_pointer != tensor.data_ptr() and copy_pointer % PAGE == 0 and copy_size == 2 * PAGE
-        assert anonymous_call == (anonymous.data_ptr(), PAGE)
         assert manager.stats.pinned_bytes == 3 * PAGE and manager.stats.copy_bytes == 2 * PAGE
         region = manager._entries[tensor.untyped_storage().data_ptr()].copy.region
         torch.testing.assert_close(_transferred(manager, tensor), tensor)
@@ -825,7 +827,7 @@ def test_checkpoint_storage_pins_through_an_owned_copy(backend: FakeBackend, tmp
         torch.testing.assert_close(_transferred(manager, part), expected)
         torch.testing.assert_close(_transferred(manager, anonymous), anonymous)
     manager.clear()
-    assert backend.unregister_calls == [copy_pointer, anonymous.data_ptr()]
+    assert set(backend.unregister_calls) == {copy_pointer, anonymous.data_ptr()}
     assert region.closed
     assert manager.stats.pinned_bytes == 0 and manager.stats.copy_bytes == 0
 
@@ -848,22 +850,69 @@ def test_copy_is_charged_at_allocation_and_evicted_by_freeing(backend: FakeBacke
 
 
 @pytest.mark.skipif(not hasattr(os, "preadv"), reason="positional reads")
-def test_copy_fill_loops_over_short_reads(backend: FakeBackend, tmp_path, monkeypatch) -> None:
-    tensor = _checkpoint(tmp_path, 2 * PAGE)
+def test_sliced_fill_covers_the_copy_through_short_reads(backend: FakeBackend, tmp_path, monkeypatch) -> None:
+    tensor = _checkpoint(tmp_path, 8 * PAGE)
     original = os.preadv
-    calls = 0
+    reads: list[tuple[int, int]] = []
+    lock = threading.Lock()
 
-    def short_preadv(fd, buffers, offset):
-        nonlocal calls
-        calls += 1
+    def recording_preadv(fd, buffers, offset):
         (buffer,) = buffers
-        return original(fd, [buffer[:100]], offset)
+        count = original(fd, [buffer[:100]], offset)  # short reads inside every slice too
+        with lock:
+            reads.append((offset, count))
+        return count
 
-    monkeypatch.setattr(os, "preadv", short_preadv)
-    manager = PinManager(4 * PAGE, backend=backend)
+    monkeypatch.setattr(os, "preadv", recording_preadv)
+    monkeypatch.setattr(pin_module, "_FILL_SLICE", PAGE)
+    manager = PinManager(16 * PAGE, backend=backend)
     with manager.acquire([tensor]):
         torch.testing.assert_close(_transferred(manager, tensor), tensor)
-    assert calls == -(-2 * PAGE // 100)
+    base = file_slice(tensor).offset
+    # Every byte was read exactly once, in slices of one page each.
+    covered = sorted((offset - base, count) for offset, count in reads)
+    assert sum(count for _offset, count in covered) == 8 * PAGE
+    assert [start for start, _count in covered if start % PAGE == 0] == [page * PAGE for page in range(8)]
+    manager.clear()
+
+
+@pytest.mark.skipif(not hasattr(os, "preadv"), reason="positional reads")
+def test_copies_of_one_acquisition_fill_together(backend: FakeBackend, tmp_path, monkeypatch) -> None:
+    first = _checkpoint(tmp_path, 8 * PAGE, "first")
+    second = _checkpoint(tmp_path, 4 * PAGE, "second")
+
+    class _Pool:
+        """Stands in for the executor: a slice reads when awaited, noting how many slices were submitted by then."""
+
+        in_flight_at_wait: list[int] = []
+
+        def __init__(self, max_workers: int, *, thread_name_prefix: str) -> None:
+            self.submitted = 0
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            pass
+
+        def submit(self, function, *args) -> SimpleNamespace:
+            self.submitted += 1
+
+            def result() -> None:
+                self.in_flight_at_wait.append(self.submitted)
+                function(*args)
+
+            return SimpleNamespace(result=result)
+
+    monkeypatch.setattr(pin_module, "ThreadPoolExecutor", _Pool)
+    monkeypatch.setattr(pin_module, "_FILL_SLICE", PAGE)
+    manager = PinManager(16 * PAGE, backend=backend)
+    with manager.acquire([first, second]) as lease:
+        assert lease.registered_bytes == 12 * PAGE
+        torch.testing.assert_close(_transferred(manager, first), first)
+        torch.testing.assert_close(_transferred(manager, second), second)
+    # All twelve slices of both copies were submitted before any was waited on.
+    assert _Pool.in_flight_at_wait == [12] * 12
     manager.clear()
 
 
@@ -879,10 +928,10 @@ def test_seek_and_read_fallback_fills_the_copy(backend: FakeBackend, tmp_path, m
 def test_failed_fill_leaves_the_storage_pageable(backend: FakeBackend, tmp_path, monkeypatch, caplog) -> None:
     tensor = _checkpoint(tmp_path, 2 * PAGE)
 
-    def broken(_copy, _source):
+    def broken(*_args):
         raise OSError("injected read failure")
 
-    monkeypatch.setattr(pin_module, "_fill_copy", broken)
+    monkeypatch.setattr(pin_module, "_read_range", broken)
     manager = PinManager(4 * PAGE, backend=backend)
     with caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager"), manager.acquire([tensor]) as lease:
         assert (lease.registered_bytes, lease.pageable_bytes) == (0, 2 * PAGE)
@@ -891,21 +940,27 @@ def test_failed_fill_leaves_the_storage_pageable(backend: FakeBackend, tmp_path,
     manager.clear()
 
 
-def test_copy_registration_error_rolls_back_the_charge(backend: FakeBackend, tmp_path, monkeypatch) -> None:
-    tensor = _checkpoint(tmp_path, 2 * PAGE)
-    manager = PinManager(4 * PAGE, backend=backend)
+def test_copy_registration_error_rolls_back_the_acquisition(backend: FakeBackend, tmp_path, monkeypatch) -> None:
+    first = _checkpoint(tmp_path, 2 * PAGE, "first")
+    second = _checkpoint(tmp_path, 2 * PAGE, "second")
+    manager = PinManager(8 * PAGE, backend=backend)
+    register = backend.register
 
-    def broken(_pointer: int, _size: int) -> bool:
-        raise HostRegistrationError("registration", 700)
+    def broken_after_one(pointer: int, size: int) -> bool:
+        if backend.register_calls:
+            raise HostRegistrationError("registration", 700)
+        return register(pointer, size)
 
     with monkeypatch.context() as patch:
-        patch.setattr(backend, "register", broken)
+        patch.setattr(backend, "register", broken_after_one)
         with pytest.raises(HostRegistrationError):
-            manager.acquire([tensor])
+            manager.acquire([first, second])
+    # The first copy was registered and is retired; the second was never registered. Both are freed.
+    assert backend.registered == {} and len(backend.unregister_calls) == 1
     assert manager.stats.pinned_bytes == 0 and manager.stats.copy_bytes == 0
     assert manager.stats.active_leases == 0
-    with manager.acquire([tensor]) as lease:
-        assert lease.registered_bytes == 2 * PAGE
+    with manager.acquire([first, second]) as lease:
+        assert lease.registered_bytes == 4 * PAGE
     manager.clear()
 
 
@@ -934,6 +989,89 @@ def test_copy_registration_failure_frees_the_copy(backend: FakeBackend, tmp_path
         assert (lease.registered_bytes, lease.pageable_bytes) == (0, 2 * PAGE)
         assert manager.stats.pinned_bytes == 0 and manager.stats.registration_failures == 1
     manager.clear()
+
+
+def test_capacity_refusal_stops_registering_the_rest_of_the_acquisition(backend: FakeBackend, tmp_path) -> None:
+    copies = [_checkpoint(tmp_path, 2 * PAGE, name) for name in ("first", "second", "third")]
+    backend.capacity = 2 * PAGE
+    manager = PinManager(8 * PAGE, backend=backend)
+    with manager.acquire(copies) as lease:
+        # The first copy registers, the second is refused, and the third is
+        # not attempted; both of those are freed and only the first is charged.
+        assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 4 * PAGE)
+        assert len(backend.register_calls) == 2 and manager.stats.registration_failures == 1
+        assert manager.stats.pinned_bytes == 2 * PAGE and manager.stats.copy_bytes == 2 * PAGE
+    manager.clear()
+    assert manager.stats.pinned_bytes == 0
+
+
+def test_copies_allocated_before_an_in_place_capacity_refusal_still_register(backend: FakeBackend, tmp_path) -> None:
+    copy = _checkpoint(tmp_path, 2 * PAGE)
+    (anonymous,) = _tensors((0, 3 * PAGE))
+    backend.capacity = 2 * PAGE
+    manager = PinManager(8 * PAGE, backend=backend)
+    with manager.acquire([copy, anonymous]) as lease:
+        # In-place storage registers first and is refused; the copy allocated
+        # before that refusal still fills and registers, as it did when the
+        # storage was met in order.
+        assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 3 * PAGE)
+        assert [size for _pointer, size in backend.register_calls] == [3 * PAGE, 2 * PAGE]
+        assert manager.stats.copy_bytes == 2 * PAGE
+    manager.clear()
+
+
+@pytest.mark.skipif(not hasattr(os, "preadv"), reason="positional reads")
+def test_one_failed_fill_leaves_the_other_copies_registered(
+    backend: FakeBackend, tmp_path, monkeypatch, caplog,
+) -> None:
+    first = _checkpoint(tmp_path, 2 * PAGE, "first")
+    second = _checkpoint(tmp_path, 2 * PAGE, "second")
+    broken_fd = file_slice(second).file.fileno()
+    original = os.preadv
+
+    def failing_preadv(fd, buffers, offset):
+        if fd == broken_fd:
+            raise OSError("injected read failure")
+        return original(fd, buffers, offset)
+
+    monkeypatch.setattr(os, "preadv", failing_preadv)
+    manager = PinManager(8 * PAGE, backend=backend)
+    warnings = caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager")
+    with warnings, manager.acquire([first, second]) as lease:
+        assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 2 * PAGE)
+        assert len(backend.register_calls) == 1 and manager.stats.copy_bytes == 2 * PAGE
+        torch.testing.assert_close(_transferred(manager, first), first)
+        torch.testing.assert_close(_transferred(manager, second), second)
+    assert "injected read failure" in caplog.text
+    manager.clear()
+
+
+def test_a_copy_registered_by_another_acquisition_during_the_fill_is_held_instead(
+    backend: FakeBackend, tmp_path, monkeypatch,
+) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    manager = PinManager(8 * PAGE, backend=backend)
+    original = pin_module._fill_copies
+    inner: list[PinLease] = []
+
+    def fill_after_another_acquisition(pending):
+        if not inner:
+            # The fill runs without the manager's lock, so another acquisition
+            # of the same storage can complete meanwhile, copy and all.
+            monkeypatch.setattr(pin_module, "_fill_copies", original)
+            inner.append(manager.acquire([tensor]))
+        original(pending)
+
+    monkeypatch.setattr(pin_module, "_fill_copies", fill_after_another_acquisition)
+    with manager.acquire([tensor]) as outer:
+        assert outer.registered_bytes == 2 * PAGE and manager.stats.active_leases == 2
+        # One registration serves both leases; the outer acquisition's own copy was freed.
+        assert len(backend.register_calls) == 1
+        assert manager.stats.pinned_bytes == 2 * PAGE and manager.stats.copy_bytes == 2 * PAGE
+        torch.testing.assert_close(_transferred(manager, tensor), tensor)
+    inner[0].close()
+    manager.clear()
+    assert manager.stats.pinned_bytes == 0
 
 
 def test_failed_copy_unregistration_keeps_the_copy_and_its_charge(backend: FakeBackend, tmp_path) -> None:
