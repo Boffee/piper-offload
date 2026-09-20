@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.10.0rc3] - 2026-09-19
+
 ### Added
 
 - Add `MappedCheckpoint`, a read-only safetensors reader with `safe_open`'s
@@ -559,7 +561,11 @@ under 0.9.0rc1, 0.9.0rc2, and 0.9.0rc3 below.
 - Python 3.14, PyTorch 2.13, TorchAO 0.18, Apache-2.0 licensing, and the Piper Offload package
   identity.
 
-[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.9.0rc3...HEAD
+[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc3...HEAD
+[0.10.0rc3]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc2...v0.10.0rc3
+[0.10.0rc2]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc1...v0.10.0rc2
+[0.10.0rc1]: https://github.com/Boffee/piper-offload/compare/v0.9.0...v0.10.0rc1
+[0.9.0]: https://github.com/Boffee/piper-offload/compare/v0.9.0rc3...v0.9.0
 [0.9.0rc3]: https://github.com/Boffee/piper-offload/compare/v0.9.0rc2...v0.9.0rc3
 [0.9.0rc2]: https://github.com/Boffee/piper-offload/compare/v0.9.0rc1...v0.9.0rc2
 [0.9.0rc1]: https://github.com/Boffee/piper-offload/compare/v0.8.0...v0.9.0rc1
