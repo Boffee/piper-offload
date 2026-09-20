@@ -206,7 +206,7 @@ def test_lru_evicts_only_idle_registrations(backend: FakeBackend) -> None:
     manager.clear()
 
 
-def test_batch_protects_cached_inputs_before_new_admissions(backend: FakeBackend) -> None:
+def test_an_acquisition_holds_existing_registrations_before_reserving(backend: FakeBackend) -> None:
     manager = PinManager(PAGE, backend=backend)
     cached, new = _tensors((0, PAGE), (2 * PAGE, PAGE))
     with manager.acquire([cached]):
@@ -285,7 +285,7 @@ def test_capacity_failure_stops_later_registration_attempts(manager: PinManager,
         assert backend.register_calls == [(a.data_ptr(), PAGE)]
 
 
-def test_unbounded_budget_reclaims_idle_lru_and_retries(backend: FakeBackend) -> None:
+def test_unbounded_budget_evicts_idle_lru_and_retries(backend: FakeBackend) -> None:
     manager = PinManager(None, backend=backend)
     a, b, c = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
     backend.capacity = 2 * PAGE
@@ -303,7 +303,7 @@ def test_unbounded_budget_reclaims_idle_lru_and_retries(backend: FakeBackend) ->
     manager.clear()
 
 
-def test_opportunistic_reclaim_protects_requested_idle_registration(backend: FakeBackend) -> None:
+def test_eviction_for_a_runtime_retry_keeps_the_requested_idle_registration(backend: FakeBackend) -> None:
     manager = PinManager(None, backend=backend)
     requested, unrelated, new = _tensors(
         (0, PAGE),
@@ -412,7 +412,7 @@ def test_empty_views_do_not_register_their_backing(manager: PinManager, backend:
     assert backend.register_calls == []
 
 
-def test_source_disposal_unregisters_before_storage_dies(manager: PinManager, backend: FakeBackend) -> None:
+def test_owner_disposal_unregisters_before_storage_dies(manager: PinManager, backend: FakeBackend) -> None:
     (tensor,) = _tensors((0, PAGE))
     pointer = tensor.data_ptr()
     tensor_ref = weakref.ref(tensor)
@@ -477,7 +477,7 @@ def test_failed_eviction_does_not_oversubscribe_budget(backend: FakeBackend) -> 
     manager.clear()
 
 
-def test_lease_retains_pageable_sources_until_close(backend: FakeBackend) -> None:
+def test_lease_holds_pageable_storage_until_close(backend: FakeBackend) -> None:
     manager = PinManager(0, backend=backend)
     tensor = torch.ones(8)
     tensor_ref = weakref.ref(tensor)
@@ -491,7 +491,7 @@ def test_lease_retains_pageable_sources_until_close(backend: FakeBackend) -> Non
     assert manager.stats.active_leases == 0
 
 
-def test_abandoned_lease_releases_registration_protection(manager: PinManager) -> None:
+def test_a_dropped_lease_releases_its_registrations(manager: PinManager) -> None:
     (tensor,) = _tensors((0, PAGE))
     lease = manager.acquire([tensor])
     del lease
@@ -500,7 +500,7 @@ def test_abandoned_lease_releases_registration_protection(manager: PinManager) -
     assert manager.stats.idle_registrations == 1
 
 
-def test_registration_keeps_manager_alive_until_source_disposal(backend: FakeBackend) -> None:
+def test_registration_keeps_manager_alive_until_owner_disposal(backend: FakeBackend) -> None:
     manager = PinManager(PAGE, backend=backend)
     (tensor,) = _tensors((0, PAGE))
     manager_ref = weakref.ref(manager)
@@ -726,7 +726,7 @@ def test_real_foreign_registration_is_never_unregistered() -> None:
         backend.unregister(pointer)
 
 
-def test_pageable_lease_registers_nothing_and_tracks_its_sources(backend: FakeBackend) -> None:
+def test_pageable_lease_registers_nothing_and_holds_its_storage(backend: FakeBackend) -> None:
     manager = PinManager(4 * PAGE, backend=backend)
     first, second = _tensors((0, PAGE), (PAGE, PAGE))
     with manager.acquire([first, second], pin=False) as lease:
@@ -757,7 +757,7 @@ def test_pageable_lease_holds_existing_registrations_out_of_eviction(backend: Fa
     manager.clear()
 
 
-def test_transfer_lease_keeps_protection_until_synchronization_succeeds(backend: FakeBackend, monkeypatch) -> None:
+def test_transfer_lease_holds_its_storage_until_synchronization_succeeds(backend: FakeBackend, monkeypatch) -> None:
     manager = PinManager(backend=backend)
     (source,) = _tensors((0, PAGE))
     device = torch.device("cuda", 3)
@@ -818,7 +818,7 @@ def test_checkpoint_storage_pins_through_an_owned_copy(backend: FakeBackend, tmp
         ((copy_pointer, copy_size),) = calls.items()
         assert copy_pointer != tensor.data_ptr() and copy_pointer % PAGE == 0 and copy_size == 2 * PAGE
         assert manager.stats.pinned_bytes == 3 * PAGE and manager.stats.copy_bytes == 2 * PAGE
-        region = manager._entries[tensor.untyped_storage().data_ptr()].copy.region
+        region = manager._registrations[tensor.untyped_storage().data_ptr()].copy.region
         torch.testing.assert_close(_transferred(manager, tensor), tensor)
         # Transfers read the copy, not the mapping: a byte changed in the copy
         # shows up in what a transfer delivers, through a view's geometry too.
@@ -842,7 +842,7 @@ def test_copy_is_reserved_at_allocation_and_evicted_by_freeing(backend: FakeBack
         # Only one copy fits, and it is reserved before the second is considered.
         assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 2 * PAGE)
         assert len(backend.register_calls) == 1
-        region = manager._entries[first.untyped_storage().data_ptr()].copy.region
+        region = manager._registrations[first.untyped_storage().data_ptr()].copy.region
     with manager.acquire([second]):
         # The idle copy is evicted to make room: unregistered and freed.
         assert backend.unregister_calls == [backend.register_calls[0][0]]
@@ -1008,7 +1008,7 @@ def test_a_pinning_acquisition_waits_for_a_pending_fill_while_a_pageable_one_pro
     with manager.acquire([tensor]) as lease:
         pinner.join()
         # The pageable acquisition of other storage completed during the fill;
-        # the pinning one waited, so the copy took native capacity first.
+        # the pinning one waited, so the copy took runtime capacity first.
         assert during_fill == [False, True]
         assert lease.registered_bytes == 2 * PAGE and leases["pinning"].registered_bytes == PAGE
         assert backend.register_calls[1] == (pinning.data_ptr(), PAGE)
@@ -1062,7 +1062,7 @@ def test_capacity_refusal_stops_registering_the_rest_of_the_acquisition(backend:
     assert manager.stats.pinned_bytes == 0
 
 
-def test_native_capacity_goes_to_the_storage_requested_first(backend: FakeBackend, tmp_path) -> None:
+def test_runtime_capacity_goes_to_the_storage_requested_first(backend: FakeBackend, tmp_path) -> None:
     copy = _checkpoint(tmp_path, 2 * PAGE)
     (anonymous,) = _tensors((0, 2 * PAGE))
     backend.capacity = 2 * PAGE
@@ -1092,7 +1092,7 @@ def test_an_exhausted_runtime_is_found_before_the_rest_is_read(backend: FakeBack
 
     monkeypatch.setattr(pin_module, "_fill_copies", counting_fill)
     with manager.acquire(copies) as lease:
-        # Only the first copy was read: its refusal settled the other two unfilled.
+        # Only the first copy was read: its refusal evicted the other two unfilled.
         assert filled == [1] and len(backend.register_calls) == 1
         assert (lease.registered_bytes, lease.pageable_bytes) == (0, 6 * PAGE)
         assert manager.stats.pinned_bytes == 0
@@ -1138,7 +1138,7 @@ def test_one_failed_fill_leaves_the_other_copies_registered(
     manager.clear()
 
 
-def test_an_acquisition_of_reserved_storage_waits_for_it_to_settle(
+def test_an_acquisition_of_pending_storage_waits_until_it_registers(
     backend: FakeBackend, tmp_path, monkeypatch,
 ) -> None:
     tensor = _checkpoint(tmp_path, 2 * PAGE)

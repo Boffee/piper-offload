@@ -5,7 +5,7 @@ checkpoint go through the real pin manager and the real CUDA backend. Phases:
 a cold first pin (file evicted from the page cache before any tensor data
 is touched),
 a pinned transfer of every selected byte into a reused 64 MiB GPU buffer, a
-cached reactivation, an eviction, a warm refill, and a warm pageable transfer
+reacquisition of registered storage, an eviction, a warm refill, and a warm pageable transfer
 from the mapping. Fill and native registration time are split by
 instrumenting the manager; the kernel's disk-read counter proves which phases
 read from disk; and process RSS shows the copies' memory arriving and leaving.
