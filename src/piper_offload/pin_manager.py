@@ -155,7 +155,8 @@ class PinStats:
     """Registration counts and the union of charged OS pages.
 
     ``copy_bytes`` is the part of ``pinned_bytes`` held by owned copies of
-    checkpoint storage; the rest is storage registered in place.
+    checkpoint storage, filling or registered; the rest is storage
+    registered in place.
     """
 
     max_pinned_bytes: int | None
@@ -244,6 +245,14 @@ def _read_range(
 
 
 @dataclass(eq=False, slots=True)
+class _InPlace:
+    """In-place storage charged under the budget for one request, registered with the rest of its acquisition."""
+
+    pointer: int
+    request: _Request
+
+
+@dataclass(eq=False, slots=True)
 class _PendingCopy:
     """A copy allocated and charged for one request, filled and registered with the rest of its acquisition."""
 
@@ -252,6 +261,9 @@ class _PendingCopy:
     source: FileSlice
     copy: _Copy
     error: OSError | None = None
+
+
+type _Pending = _InPlace | _PendingCopy
 
 
 def _fill_copies(pending: list[_PendingCopy]) -> None:
@@ -299,7 +311,7 @@ def _detached(error: OSError) -> OSError:
 
 
 class _Refusal(enum.Enum):
-    BUDGET = "budget"  # this storage stays pageable; a later one in the batch may register
+    BUDGET = "budget"  # this storage stays pageable; a later one in the acquisition may register
     CAPACITY = "capacity"  # native capacity is exhausted; stop registering
 
 
@@ -463,6 +475,10 @@ class PinManager:
         self._lock = threading.RLock()
         self._entries: dict[int, _Registration] = {}
         self._pageable: dict[int, _Pageable] = {}
+        # Storage charged by an acquisition that has not registered it yet;
+        # an acquisition of the same storage waits until it settles.
+        self._pending: dict[int, _Pending] = {}
+        self._settled = threading.Condition(self._lock)
         # All registered ranges and actively leased pageable ranges.
         self._starts: list[int] = []
         self._idle: OrderedDict[int, None] = OrderedDict()
@@ -507,7 +523,8 @@ class PinManager:
                 len(self._leases),
                 self._registration_failures,
                 self._unregistration_failures,
-                sum(entry.copy.size for entry in self._entries.values() if entry.copy is not None),
+                sum(entry.copy.size for entry in self._entries.values() if entry.copy is not None)
+                + sum(item.copy.size for item in self._pending.values() if isinstance(item, _PendingCopy)),
             )
 
     def acquire(self, tensors: Iterable[torch.Tensor], *, pin: bool = True) -> PinLease:
@@ -520,39 +537,44 @@ class PinManager:
         is registered, for a transfer that runs once, so leasing never
         changes which storage is pinned.
 
-        All input validation happens before registration or eviction. Existing
+        Storage another acquisition has charged but not yet registered is
+        waited for, so acquisitions of one storage settle in turn. All input
+        validation happens before registration or eviction. Existing
         registrations anywhere in the request are protected before admitting
-        new ones, avoiding eviction of backing this same lease will use.
-        Storage that registers in place does so at once, and a copy for
-        checkpoint storage is allocated and charged then; the copies fill
-        together with the lock released and register afterwards, in order.
-        A native capacity failure reclaims unrelated idle registrations and
-        retries; if capacity remains unavailable, later storage in the same
-        pass skips registration.
+        new ones, avoiding eviction of backing this same lease will use. New
+        storage is charged under the budget in request order, with a copy
+        allocated for checkpoint storage; the copies fill together with the
+        lock released; then everything registers in request order. A native
+        capacity failure reclaims unrelated idle registrations and retries;
+        if capacity remains unavailable, later storage in this acquisition
+        skips registration.
         """
         requests = self._requests(tensors)
         held: dict[int, _Registration] = {}
         created: list[_Registration] = []
-        pending: list[_PendingCopy] = []
+        pending: list[_Pending] = []
         try:
             with self._lock:
+                while not self._pending.keys().isdisjoint(requests):
+                    self._settled.wait()
                 self._validate_ranges(requests)
                 for pointer, request in requests.items():
                     entry = self._entries.get(pointer)
                     if entry is not None:
                         self._hold(entry, request, held)
                 if pin:
-                    self._admit(requests, held, created, pending)
-                if not pending:
+                    self._reserve(requests, held, pending)
+                copies = [item for item in pending if isinstance(item, _PendingCopy)]
+                if not copies:
+                    self._register_pending(pending, held, created)
                     return self._open_lease(requests, held)
-            _fill_copies(pending)
+            _fill_copies(copies)
             with self._lock:
-                self._register_copies(pending, held, created)
+                self._register_pending(pending, held, created)
                 return self._open_lease(requests, held)
         except BaseException:
             with self._lock:
-                for item in pending:
-                    self._discard_copy(item)
+                self._abandon(pending)
                 for entry in created:
                     entry.retired = True
                 self._release(tuple(held.values()))
@@ -678,79 +700,32 @@ class PinManager:
         shared = sum(page in self._boundary_pages for page in self._boundaries(pointer, size))
         return (pages - shared) * mmap.PAGESIZE
 
-    def _admit(
-        self,
-        requests: dict[int, _Request],
-        held: dict[int, _Registration],
-        created: list[_Registration],
-        pending: list[_PendingCopy],
-    ) -> None:
-        """Register unheld in-place storage the budget allows; allocate and charge a copy per checkpoint storage.
+    def _reserve(self, requests: dict[int, _Request], held: dict[int, _Registration], pending: list[_Pending]) -> None:
+        """Charge every unheld storage the budget allows, in request order, into ``pending``.
 
-        The copies go into ``pending`` to fill and register later. Once native
-        capacity is exhausted nothing further is registered or allocated,
-        avoiding one failed runtime call per remaining storage.
+        In-place storage takes its page charge; checkpoint storage gets an
+        allocated, charged copy. Each reservation stays in ``self._pending``
+        until it registers or settles.
         """
         for pointer, request in requests.items():
             if pointer in held or pointer in self._pageable:
                 continue
             source = file_slice(request.storage)
-            if source is not None:
-                copy = self._allocate_copy(request.storage.nbytes())
-                if copy is not None:
-                    pending.append(_PendingCopy(pointer, request, source, copy))
-                continue
-            entry = self._admit_in_place(pointer, request)
-            if entry is _Refusal.CAPACITY:
-                return
-            if isinstance(entry, _Registration):
-                self._publish(entry, request, held, created)
-
-    def _register_copies(
-        self, pending: list[_PendingCopy], held: dict[int, _Registration], created: list[_Registration],
-    ) -> None:
-        """Register the filled copies in order, consuming ``pending``; what is not registered is freed.
-
-        While the fill ran without the lock, another acquisition may have
-        registered the same storage, which this lease then holds instead,
-        or leased it pageable. Once native capacity is exhausted the rest
-        are freed unregistered.
-        """
-        exhausted = False
-        while pending:
-            item = pending[0]
-            entry = self._entries.get(item.pointer)
-            if entry is not None:
-                self._hold(entry, item.request, held)
-                self._discard_copy(item)
-            elif exhausted or item.pointer in self._pageable:
-                self._discard_copy(item)
+            if source is None:
+                item: _Pending | None = self._reserve_in_place(pointer, request)
             else:
-                registration = self._register_copy(item)
-                if isinstance(registration, _Registration):
-                    self._publish(registration, item.request, held, created)
-                else:
-                    self._discard_copy(item)
-                    exhausted = registration is _Refusal.CAPACITY
-            del pending[0]
+                copy = self._allocate_copy(request.storage.nbytes())
+                item = None if copy is None else _PendingCopy(pointer, request, source, copy)
+            if item is not None:
+                pending.append(item)
+                self._pending[pointer] = item
 
-    def _publish(
-        self, entry: _Registration, request: _Request, held: dict[int, _Registration], created: list[_Registration],
-    ) -> None:
-        _live_managers.add(self)
-        self._entries[entry.pointer] = entry
-        self._starts.insert(bisect_left(self._starts, entry.pointer), entry.pointer)
-        created.append(entry)
-        self._hold(entry, request, held)
-
-    def _admit_in_place(self, pointer: int, request: _Request) -> _Registration | _Refusal:
+    def _reserve_in_place(self, pointer: int, request: _Request) -> _InPlace | None:
         size = request.storage.nbytes()
         if not self._make_room(lambda: self._page_charge(pointer, size)):
-            return _Refusal.BUDGET
-        if not self._register(pointer, size):
-            return _Refusal.CAPACITY
+            return None
         self._charge_range(pointer, size)
-        return _Registration(pointer, size, request.storage)
+        return _InPlace(pointer, request)
 
     def _allocate_copy(self, nbytes: int) -> _Copy | None:
         """Allocate and charge a copy under the budget, or None if it does not fit or cannot be allocated."""
@@ -767,18 +742,65 @@ class PinManager:
         self._pinned_bytes += size
         return copy
 
-    def _register_copy(self, item: _PendingCopy) -> _Registration | _Refusal:
-        """Register a filled copy; a failed fill leaves the storage pageable."""
+    def _register_pending(
+        self, pending: list[_Pending], held: dict[int, _Registration], created: list[_Registration],
+    ) -> None:
+        """Register the reservations in request order, consuming ``pending``.
+
+        A refused reservation is discharged, and a copy freed; once native
+        capacity is exhausted the rest settle the same way, avoiding one
+        failed runtime call per remaining storage.
+        """
+        exhausted = False
+        while pending:
+            item = pending[0]
+            registration = _Refusal.CAPACITY if exhausted else self._register_reserved(item)
+            if isinstance(registration, _Registration):
+                self._publish(registration, item.request, held, created)
+            else:
+                self._discard(item)
+                exhausted = registration is _Refusal.CAPACITY
+            del self._pending[item.pointer]
+            del pending[0]
+        self._settled.notify_all()
+
+    def _register_reserved(self, item: _Pending) -> _Registration | _Refusal:
+        """Register one reservation natively; a copy whose fill failed leaves its storage pageable."""
+        size = item.request.storage.nbytes()
+        if isinstance(item, _InPlace):
+            if not self._register(item.pointer, size):
+                return _Refusal.CAPACITY
+            return _Registration(item.pointer, size, item.request.storage)
         if item.error is not None:
             logger.warning("Could not fill a pinned copy from the checkpoint; it stays pageable: %s", item.error)
             return _Refusal.BUDGET
         if not self._register(item.copy.pointer, item.copy.size):
             return _Refusal.CAPACITY
-        return _Registration(item.pointer, item.request.storage.nbytes(), item.request.storage, item.copy)
+        return _Registration(item.pointer, size, item.request.storage, item.copy)
 
-    def _discard_copy(self, item: _PendingCopy) -> None:
-        self._pinned_bytes -= item.copy.size
-        item.copy.free()
+    def _publish(
+        self, entry: _Registration, request: _Request, held: dict[int, _Registration], created: list[_Registration],
+    ) -> None:
+        _live_managers.add(self)
+        self._entries[entry.pointer] = entry
+        self._starts.insert(bisect_left(self._starts, entry.pointer), entry.pointer)
+        created.append(entry)
+        self._hold(entry, request, held)
+
+    def _discard(self, item: _Pending) -> None:
+        """Take back a reservation's charge, freeing its copy."""
+        if isinstance(item, _InPlace):
+            self._discharge_range(item.pointer, item.request.storage.nbytes())
+        else:
+            self._pinned_bytes -= item.copy.size
+            item.copy.free()
+
+    def _abandon(self, pending: list[_Pending]) -> None:
+        """Discard every reservation still pending after a failure."""
+        for item in pending:
+            self._discard(item)
+            del self._pending[item.pointer]
+        self._settled.notify_all()
 
     def _register(self, pointer: int, size: int) -> bool:
         """Register natively, reclaiming idle LRU batches while the runtime refuses capacity."""

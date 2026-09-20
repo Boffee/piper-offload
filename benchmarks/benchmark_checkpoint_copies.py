@@ -197,7 +197,8 @@ def _run(path: Path, device: torch.device) -> dict[str, object]:
         manager.clear()
 
         started = phases.start()
-        phases.result["pageable_transfer_ok"] = _transfer_all(manager, tensors, device)
+        with manager.acquire(tensors, pin=False):
+            phases.result["pageable_transfer_ok"] = _transfer_all(manager, tensors, device)
         phases.stop("pageable_warm", started)
     finally:
         phases.restore()

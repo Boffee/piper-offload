@@ -1005,19 +1005,34 @@ def test_capacity_refusal_stops_registering_the_rest_of_the_acquisition(backend:
     assert manager.stats.pinned_bytes == 0
 
 
-def test_copies_allocated_before_an_in_place_capacity_refusal_still_register(backend: FakeBackend, tmp_path) -> None:
+def test_native_capacity_goes_to_the_storage_requested_first(backend: FakeBackend, tmp_path) -> None:
     copy = _checkpoint(tmp_path, 2 * PAGE)
-    (anonymous,) = _tensors((0, 3 * PAGE))
+    (anonymous,) = _tensors((0, 2 * PAGE))
     backend.capacity = 2 * PAGE
-    manager = PinManager(8 * PAGE, backend=backend)
-    with manager.acquire([copy, anonymous]) as lease:
-        # In-place storage registers first and is refused; the copy allocated
-        # before that refusal still fills and registers, as it did when the
-        # storage was met in order.
-        assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 3 * PAGE)
-        assert [size for _pointer, size in backend.register_calls] == [3 * PAGE, 2 * PAGE]
-        assert manager.stats.copy_bytes == 2 * PAGE
-    manager.clear()
+    for first, second in ((copy, anonymous), (anonymous, copy)):
+        manager = PinManager(8 * PAGE, backend=backend)
+        with manager.acquire([first, second]) as lease:
+            # Registration follows request order whether the storage registers
+            # in place or through a copy, as it did before copies filled together.
+            assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 2 * PAGE)
+            assert len(backend.register_calls) == 2 and manager.stats.registration_failures == 1
+            assert manager.stats.copy_bytes == (2 * PAGE if first is copy else 0)
+        manager.clear()
+        assert manager.stats.pinned_bytes == 0
+        backend.register_calls.clear()
+
+
+def test_the_budget_goes_to_the_storage_requested_first(backend: FakeBackend, tmp_path) -> None:
+    copy = _checkpoint(tmp_path, 2 * PAGE)
+    (anonymous,) = _tensors((0, 2 * PAGE))
+    for first, second in ((copy, anonymous), (anonymous, copy)):
+        manager = PinManager(2 * PAGE, backend=backend)
+        with manager.acquire([first, second]) as lease:
+            assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 2 * PAGE)
+            assert len(backend.register_calls) == 1 and manager.stats.registration_failures == 0
+            assert manager.stats.copy_bytes == (2 * PAGE if first is copy else 0)
+        manager.clear()
+        backend.register_calls.clear()
 
 
 @pytest.mark.skipif(not hasattr(os, "preadv"), reason="positional reads")
@@ -1046,30 +1061,33 @@ def test_one_failed_fill_leaves_the_other_copies_registered(
     manager.clear()
 
 
-def test_a_copy_registered_by_another_acquisition_during_the_fill_is_held_instead(
+def test_an_acquisition_of_charged_storage_waits_for_it_to_settle(
     backend: FakeBackend, tmp_path, monkeypatch,
 ) -> None:
     tensor = _checkpoint(tmp_path, 2 * PAGE)
     manager = PinManager(8 * PAGE, backend=backend)
     original = pin_module._fill_copies
-    inner: list[PinLease] = []
+    other: list[PinLease] = []
+    thread = threading.Thread(target=lambda: other.append(manager.acquire([tensor], pin=False)))
+    during_fill: list[tuple[int, bool]] = []
 
-    def fill_after_another_acquisition(pending):
-        if not inner:
-            # The fill runs without the manager's lock, so another acquisition
-            # of the same storage can complete meanwhile, copy and all.
-            monkeypatch.setattr(pin_module, "_fill_copies", original)
-            inner.append(manager.acquire([tensor]))
+    def fill_while_another_acquisition_waits(pending):
+        thread.start()
+        thread.join(0.2)
+        during_fill.append((manager.stats.copy_bytes, thread.is_alive()))
         original(pending)
 
-    monkeypatch.setattr(pin_module, "_fill_copies", fill_after_another_acquisition)
-    with manager.acquire([tensor]) as outer:
-        assert outer.registered_bytes == 2 * PAGE and manager.stats.active_leases == 2
-        # One registration serves both leases; the outer acquisition's own copy was freed.
-        assert len(backend.register_calls) == 1
-        assert manager.stats.pinned_bytes == 2 * PAGE and manager.stats.copy_bytes == 2 * PAGE
-        torch.testing.assert_close(_transferred(manager, tensor), tensor)
-    inner[0].close()
+    monkeypatch.setattr(pin_module, "_fill_copies", fill_while_another_acquisition_waits)
+    with manager.acquire([tensor]) as lease:
+        thread.join()
+        assert lease.registered_bytes == 2 * PAGE
+        # The fill ran without the lock, yet the pageable acquisition of the
+        # same storage waited for the copy and holds its registration, rather
+        # than tracking the storage as pageable; the copy counted meanwhile.
+        assert during_fill == [(2 * PAGE, True)]
+        assert (other[0].registered_bytes, other[0].pageable_bytes) == (2 * PAGE, 0)
+        assert len(backend.register_calls) == 1 and manager.stats.active_leases == 2
+    other[0].close()
     manager.clear()
     assert manager.stats.pinned_bytes == 0
 
