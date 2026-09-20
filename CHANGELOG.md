@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.10.0rc5] - 2026-09-20
+
 ### Added
 
 - `LoRAFactor` carries an intrinsic `scaling`, the checkpoint's own `alpha / rank`
@@ -604,7 +606,8 @@ under 0.9.0rc1, 0.9.0rc2, and 0.9.0rc3 below.
 - Python 3.14, PyTorch 2.13, TorchAO 0.18, Apache-2.0 licensing, and the Piper Offload package
   identity.
 
-[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc4...HEAD
+[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc5...HEAD
+[0.10.0rc5]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc4...v0.10.0rc5
 [0.10.0rc4]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc3...v0.10.0rc4
 [0.10.0rc3]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc2...v0.10.0rc3
 [0.10.0rc2]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc1...v0.10.0rc2
