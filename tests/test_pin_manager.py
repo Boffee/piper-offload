@@ -1216,3 +1216,38 @@ def test_asynchronous_transfer_of_pinned_storage_requires_a_lease(backend: FakeB
         torch.cuda.synchronize()
     torch.testing.assert_close(destination.cpu(), tensor)
     manager.clear()
+
+
+def test_clear_frees_every_copy_off_the_lock(backend: FakeBackend, tmp_path) -> None:
+    """Freeing runs on workers with the lock released, so a finalizer there cannot deadlock.
+
+    The lock is reentrant, so the caller could always reacquire it; what matters
+    is that the copies are freed from other threads and that those threads can
+    take the lock, which they could not if ``clear`` still held it.
+    """
+    tensors = [_checkpoint(tmp_path, 2 * PAGE, f"copy{index}") for index in range(3)]
+    manager = PinManager(backend=backend)
+    with manager.acquire(tensors):
+        pass
+    regions = [
+        manager._registrations[tensor.untyped_storage().data_ptr()].copy.region for tensor in tensors
+    ]
+    freed_by: list[tuple[str, bool]] = []
+    original = pin_module._Copy.free
+
+    def watch_free(copy: pin_module._Copy) -> None:
+        acquired = manager._lock.acquire(blocking=False)
+        if acquired:
+            manager._lock.release()
+        freed_by.append((threading.current_thread().name, acquired))
+        original(copy)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(pin_module._Copy, "free", watch_free)
+        manager.clear()
+
+    assert all(region.closed for region in regions)
+    assert len(freed_by) == 3
+    assert all(name.startswith("piper-offload-free") for name, _ in freed_by), freed_by
+    assert all(acquired for _, acquired in freed_by), freed_by
+    assert (manager.stats.pinned_bytes, manager.stats.copy_bytes) == (0, 0)

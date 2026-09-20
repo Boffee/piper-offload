@@ -439,6 +439,30 @@ class TransferLease:
         self._device = None
 
 
+# Unmapping is page-table teardown, and the kernel's address-space lock lets
+# only a few threads through at once: freeing 32 GiB of copies measures 1.79 s
+# on one thread, 0.64 s on four, and no better beyond eight. This is why the
+# number is small where ``_fill_copies`` uses one thread per core.
+_FREE_WORKERS = 4
+
+
+def _free_copies(copies: list[_Copy]) -> None:
+    """Free owned regions together, returning their memory to the OS.
+
+    Runs without the manager's lock, for the reason ``_fill_copies`` does: the
+    workers run Python code, so a garbage collection on one of them may run a
+    finalizer that needs that lock.
+    """
+    if len(copies) < 2:
+        for copy in copies:
+            copy.free()
+        return
+    workers = min(_FREE_WORKERS, len(copies))
+    with ThreadPoolExecutor(workers, thread_name_prefix="piper-offload-free") as pool:
+        for future in [pool.submit(copy.free) for copy in copies]:
+            future.result()
+
+
 class PinManager:
     """Own registrations under a page-rounded budget.
 
@@ -648,15 +672,21 @@ class PinManager:
         What active leases hold stays. A failed unregistration retains its
         storage and budget reservation; cleanup errors propagate so callers can
         retry without losing ownership of pinned memory.
+
+        The copies are unregistered under the lock and freed together once it is
+        released, so an acquisition racing this call can see the budget before
+        the memory is back.
         """
+        released: list[_Copy] = []
         with self._lock:
             failed = 0
             for pointer in tuple(self._idle):
                 registration = self._registrations.get(pointer)
-                if registration is not None and not self._unregister(registration):
+                if registration is not None and not self._unregister(registration, released):
                     failed += 1
-            if failed:
-                raise RuntimeError(f"Could not release {failed} host registration(s); storage remains retained")
+        _free_copies(released)
+        if failed:
+            raise RuntimeError(f"Could not release {failed} host registration(s); storage remains retained")
 
     @staticmethod
     def _requests(tensors: Iterable[torch.Tensor]) -> dict[int, _Request]:
@@ -898,7 +928,7 @@ class PinManager:
             if id(tensor) not in registration.owners:
                 registration.owners[id(tensor)] = weakref.ref(tensor, owner_gone)
 
-    def _unregister(self, registration: _Registration) -> bool:
+    def _unregister(self, registration: _Registration, released: list[_Copy] | None = None) -> bool:
         assert registration.leases == 0
         try:
             self._backend.unregister(registration.registered)
@@ -914,7 +944,11 @@ class PinManager:
             self._unreserve_range(registration.pointer, registration.size)
         else:
             self._pinned_bytes -= registration.copy.size
-            registration.copy.free()
+            if released is None:
+                registration.copy.free()
+            else:
+                # Freed by the caller once it has released the lock.
+                released.append(registration.copy)
         self._drop_lifetime_root_if_empty()
         return True
 
