@@ -120,7 +120,10 @@ class _MappedFile:
         return memoryview(self.mmap)
 
 
-_lock = threading.Lock()
+# Reentrant: ``_forget_dead_mappings`` is a garbage-collection finalizer, so it can
+# run in a thread that already holds this lock, at any allocation inside a locked
+# block. A plain Lock deadlocks that thread against itself.
+_lock = threading.RLock()
 # Storage pointer -> (its mapping, weakly, and its slice).
 _provenance: dict[int, tuple[weakref.ReferenceType[_MappedFile], FileSlice]] = {}
 
@@ -143,7 +146,7 @@ def file_slice(source: torch.Tensor | torch.UntypedStorage) -> FileSlice | None:
 def _forget_dead_mappings() -> None:
     with _lock:
         for pointer in [pointer for pointer, (mapping, _) in _provenance.items() if mapping() is None]:
-            del _provenance[pointer]
+            _provenance.pop(pointer, None)
 
 
 class MappedCheckpoint:

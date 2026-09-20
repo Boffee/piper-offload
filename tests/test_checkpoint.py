@@ -306,3 +306,29 @@ def test_every_supported_dtype_round_trips(tmp_path: Path) -> None:
         actual = reader.get_tensor(tag)
         assert actual.dtype == expected.dtype
         assert _raw_bytes(actual) == _raw_bytes(expected)
+
+
+def test_collecting_a_mapping_inside_the_lock_does_not_deadlock(tmp_path: Path) -> None:
+    """A finalizer runs wherever the collector fires, including under the provenance lock.
+
+    ``get_tensor`` allocates while holding that lock, and any such allocation can
+    trigger a cycle collection that drops the last reference to another mapping.
+    A non-reentrant lock deadlocks the collecting thread against itself.
+    """
+    path = tmp_path / "collected.safetensors"
+    _write(path, {"t": torch.arange(8, dtype=torch.float32)})
+
+    def strand_a_mapping() -> None:
+        reader = MappedCheckpoint(path)
+        reader.get_tensor("t")
+        cycle: dict[str, object] = {}
+        cycle["self"] = cycle  # reachable only as a cycle, so only gc.collect() frees it
+        cycle["reader"] = reader
+
+    gc.disable()
+    try:
+        strand_a_mapping()
+        with checkpoint_module._lock:
+            gc.collect()
+    finally:
+        gc.enable()
