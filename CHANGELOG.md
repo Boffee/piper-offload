@@ -55,7 +55,7 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   mappings as before.
 - `RuntimeHostRegistration.unregister()` issues the native call even when a
   stale error from earlier runtime work is pending, logging that error
-  instead of leaving the registration and its budget charge behind.
+  instead of leaving the registration and its budget reservation behind.
 
 ### Removed
 

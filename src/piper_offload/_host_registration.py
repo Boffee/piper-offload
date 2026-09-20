@@ -126,7 +126,7 @@ class RuntimeHostRegistration:
 
         A stale error from earlier runtime work is consumed either way; if it
         also stopped the native call, the registration, its storage, and its
-        budget charge would stay behind. It is logged instead, and a sticky
+        budget reservation would stay behind. It is logged instead, and a sticky
         error resurfaces from the native call.
         """
         runtime = self._runtime

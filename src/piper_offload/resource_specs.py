@@ -114,7 +114,7 @@ class _ObjectStore[T]:
 class ObjectSpec[T]:
     """Resource spec for a tokenizer, processor, config, or other object.
 
-    Every lease yields the same object instance. The default zero-byte charge
+    Every lease yields the same object instance. The default zero-byte reservation
     keeps ordinary heap objects outside the host-memory budget.
     """
 

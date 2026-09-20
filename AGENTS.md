@@ -97,7 +97,9 @@ One name per concept, taken from the code.
   transfer. The *budget* is `max_pinned_bytes`. A lease *closes*; an idle
   registration is *evicted*, which *unregisters* it and, for a copy, *frees*
   its region; a registration whose owning tensors are gone is *retired* and
-  unregistered once no lease holds it.
+  unregistered once no lease holds it. Storage an acquisition has *reserved*
+  under the budget but not yet registered is *pending*; it *settles* by
+  registering or being *discarded*, which takes the reservation back.
 
 ## Working in the repo
 

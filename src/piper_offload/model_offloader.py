@@ -470,7 +470,7 @@ class ModelOffloader:
 
     @property
     def cache_bytes(self) -> int:
-        """Stable host-backing bytes charged to :class:`ResourceCache`."""
+        """Stable host-backing bytes reserved in the :class:`ResourceCache`."""
         return self._cache_bytes
 
     @property

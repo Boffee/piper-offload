@@ -231,7 +231,7 @@ def test_oversized_request_preserves_idle_cache(backend: FakeBackend) -> None:
     manager.clear()
 
 
-def test_shared_boundary_pages_are_charged_once(backend: FakeBackend) -> None:
+def test_shared_boundary_pages_are_reserved_once(backend: FakeBackend) -> None:
     manager = PinManager(PAGE, backend=backend)
     a, b = _tensors((64, 128), (512, 256))
     first, second = manager.acquire([a]), manager.acquire([b])
@@ -442,7 +442,9 @@ def test_disposed_owner_waits_for_an_alias_lease(manager: PinManager, backend: F
     assert manager.stats.pinned_bytes == 0
 
 
-def test_failed_unregistration_retains_storage_and_charge_for_retry(manager: PinManager, backend: FakeBackend) -> None:
+def test_failed_unregistration_retains_storage_and_reservation_for_retry(
+    manager: PinManager, backend: FakeBackend,
+) -> None:
     (tensor,) = _tensors((0, PAGE))
     storage_ref = weakref.ref(tensor.untyped_storage())
     pointer = tensor.data_ptr()
@@ -832,12 +834,12 @@ def test_checkpoint_storage_pins_through_an_owned_copy(backend: FakeBackend, tmp
     assert manager.stats.pinned_bytes == 0 and manager.stats.copy_bytes == 0
 
 
-def test_copy_is_charged_at_allocation_and_evicted_by_freeing(backend: FakeBackend, tmp_path) -> None:
+def test_copy_is_reserved_at_allocation_and_evicted_by_freeing(backend: FakeBackend, tmp_path) -> None:
     first = _checkpoint(tmp_path, 2 * PAGE, "first")
     second = _checkpoint(tmp_path, 2 * PAGE, "second")
     manager = PinManager(2 * PAGE, backend=backend)
     with manager.acquire([first, second]) as lease:
-        # Only one copy fits, and it is charged before the second is considered.
+        # Only one copy fits, and it is reserved before the second is considered.
         assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 2 * PAGE)
         assert len(backend.register_calls) == 1
         region = manager._entries[first.untyped_storage().data_ptr()].copy.region
@@ -904,15 +906,16 @@ def test_copies_of_one_acquisition_fill_together(backend: FakeBackend, tmp_path,
 
             return SimpleNamespace(result=result)
 
+    third = _checkpoint(tmp_path, 2 * PAGE, "third")
     monkeypatch.setattr(pin_module, "ThreadPoolExecutor", _Pool)
     monkeypatch.setattr(pin_module, "_FILL_SLICE", PAGE)
     manager = PinManager(16 * PAGE, backend=backend)
-    with manager.acquire([first, second]) as lease:
-        assert lease.registered_bytes == 12 * PAGE
-        torch.testing.assert_close(_transferred(manager, first), first)
-        torch.testing.assert_close(_transferred(manager, second), second)
-    # All twelve slices of both copies were submitted before any was waited on.
-    assert _Pool.in_flight_at_wait == [12] * 12
+    with manager.acquire([first, second, third]) as lease:
+        assert lease.registered_bytes == 14 * PAGE
+        for tensor in (first, second, third):
+            torch.testing.assert_close(_transferred(manager, tensor), tensor)
+    # The first copy filled alone; every slice of the other two was submitted before any was waited on.
+    assert _Pool.in_flight_at_wait == [8] * 8 + [6] * 6
     manager.clear()
 
 
@@ -981,6 +984,60 @@ def test_copy_allocation_failure_leaves_the_storage_pageable(
     manager.clear()
 
 
+def test_a_pinning_acquisition_waits_for_a_pending_fill_while_a_pageable_one_proceeds(
+    backend: FakeBackend, tmp_path, monkeypatch,
+) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    pinning, pageable = _tensors((0, PAGE), (2 * PAGE, PAGE))
+    manager = PinManager(8 * PAGE, backend=backend)
+    original = pin_module._fill_copies
+    leases: dict[str, PinLease] = {}
+    pinner = threading.Thread(target=lambda: leases.__setitem__("pinning", manager.acquire([pinning])))
+    pager = threading.Thread(target=lambda: leases.__setitem__("pageable", manager.acquire([pageable], pin=False)))
+    during_fill: list[bool] = []
+
+    def fill_while_others_acquire(pending):
+        pinner.start()
+        pager.start()
+        pager.join(2.0)
+        pinner.join(0.2)
+        during_fill.extend((pager.is_alive(), pinner.is_alive()))
+        original(pending)
+
+    monkeypatch.setattr(pin_module, "_fill_copies", fill_while_others_acquire)
+    with manager.acquire([tensor]) as lease:
+        pinner.join()
+        # The pageable acquisition of other storage completed during the fill;
+        # the pinning one waited, so the copy took native capacity first.
+        assert during_fill == [False, True]
+        assert lease.registered_bytes == 2 * PAGE and leases["pinning"].registered_bytes == PAGE
+        assert backend.register_calls[1] == (pinning.data_ptr(), PAGE)
+    for other in leases.values():
+        other.close()
+    manager.clear()
+
+
+def test_an_alias_of_pending_storage_is_rejected_during_the_fill(backend: FakeBackend, tmp_path, monkeypatch) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    anonymous, alias = _tensors((0, 2 * PAGE), (PAGE, 2 * PAGE))
+    manager = PinManager(8 * PAGE, backend=backend)
+    original = pin_module._fill_copies
+    rejected: list[bool] = []
+
+    def fill_while_an_alias_is_acquired(pending):
+        # The in-place storage is reserved but not yet registered; a distinct
+        # storage overlapping it is still rejected, as it is once registered.
+        with pytest.raises(ValueError, match="Overlapping"):
+            manager.acquire([alias], pin=False)
+        rejected.append(True)
+        original(pending)
+
+    monkeypatch.setattr(pin_module, "_fill_copies", fill_while_an_alias_is_acquired)
+    with manager.acquire([tensor, anonymous]) as lease:
+        assert rejected == [True] and lease.registered_bytes == 4 * PAGE
+    manager.clear()
+
+
 def test_copy_registration_failure_frees_the_copy(backend: FakeBackend, tmp_path) -> None:
     tensor = _checkpoint(tmp_path, 2 * PAGE)
     backend.capacity = PAGE
@@ -997,7 +1054,7 @@ def test_capacity_refusal_stops_registering_the_rest_of_the_acquisition(backend:
     manager = PinManager(8 * PAGE, backend=backend)
     with manager.acquire(copies) as lease:
         # The first copy registers, the second is refused, and the third is
-        # not attempted; both of those are freed and only the first is charged.
+        # not attempted; both of those are freed and only the first is reserved.
         assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 4 * PAGE)
         assert len(backend.register_calls) == 2 and manager.stats.registration_failures == 1
         assert manager.stats.pinned_bytes == 2 * PAGE and manager.stats.copy_bytes == 2 * PAGE
@@ -1020,6 +1077,26 @@ def test_native_capacity_goes_to_the_storage_requested_first(backend: FakeBacken
         manager.clear()
         assert manager.stats.pinned_bytes == 0
         backend.register_calls.clear()
+
+
+def test_an_exhausted_runtime_is_found_before_the_rest_is_read(backend: FakeBackend, tmp_path, monkeypatch) -> None:
+    copies = [_checkpoint(tmp_path, 2 * PAGE, name) for name in ("first", "second", "third")]
+    backend.capacity = PAGE
+    manager = PinManager(8 * PAGE, backend=backend)
+    original = pin_module._fill_copies
+    filled: list[int] = []
+
+    def counting_fill(pending):
+        filled.append(len(pending))
+        original(pending)
+
+    monkeypatch.setattr(pin_module, "_fill_copies", counting_fill)
+    with manager.acquire(copies) as lease:
+        # Only the first copy was read: its refusal settled the other two unfilled.
+        assert filled == [1] and len(backend.register_calls) == 1
+        assert (lease.registered_bytes, lease.pageable_bytes) == (0, 6 * PAGE)
+        assert manager.stats.pinned_bytes == 0
+    manager.clear()
 
 
 def test_the_budget_goes_to_the_storage_requested_first(backend: FakeBackend, tmp_path) -> None:
@@ -1061,7 +1138,7 @@ def test_one_failed_fill_leaves_the_other_copies_registered(
     manager.clear()
 
 
-def test_an_acquisition_of_charged_storage_waits_for_it_to_settle(
+def test_an_acquisition_of_reserved_storage_waits_for_it_to_settle(
     backend: FakeBackend, tmp_path, monkeypatch,
 ) -> None:
     tensor = _checkpoint(tmp_path, 2 * PAGE)
@@ -1092,7 +1169,7 @@ def test_an_acquisition_of_charged_storage_waits_for_it_to_settle(
     assert manager.stats.pinned_bytes == 0
 
 
-def test_failed_copy_unregistration_keeps_the_copy_and_its_charge(backend: FakeBackend, tmp_path) -> None:
+def test_failed_copy_unregistration_keeps_the_copy_and_its_reservation(backend: FakeBackend, tmp_path) -> None:
     tensor = _checkpoint(tmp_path, 2 * PAGE)
     manager = PinManager(4 * PAGE, backend=backend)
     with manager.acquire([tensor]):

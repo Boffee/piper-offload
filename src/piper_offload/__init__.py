@@ -9,8 +9,8 @@ High-level API:
   a leased :class:`ModelSpec` with optional :class:`AdapterSpec` resources and
   activates the cached :class:`ModelOffloader`.
   :class:`ObjectSpec` caches general Python objects (tokenizers,
-  processors, configs) in the same registry; by default they are
-  charged zero bytes and live until explicitly evicted.
+  processors, configs) in the same registry; by default they
+  reserve zero bytes and live until explicitly evicted.
 
 Lower-level resource bindings:
 
