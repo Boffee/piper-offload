@@ -564,8 +564,52 @@ class FakeRuntime:
         return result
 
 
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_rejected_range_stays_pageable_without_evicting_or_skipping_other_storage(
+    checkpoint: bool, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = FakeRuntime(0)
+    register = runtime.register
+    attempts = []
+
+    def refuse_second(pointer: int, size: int, flags: int) -> int:
+        runtime.code = int(len(attempts) == 1)
+        attempts.append((pointer, size))
+        return register(pointer, size, flags)
+
+    monkeypatch.setattr(runtime, "register", refuse_second)
+    monkeypatch.setattr(registration_module, "_load_runtime", lambda: runtime)
+    manager = PinManager(4 * PAGE)
+    cached, rejected, fresh = _tensors((0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, PAGE))
+    if checkpoint:
+        rejected = _checkpoint(tmp_path, PAGE)
+    try:
+        with manager.acquire([cached]):
+            pass
+        with manager.acquire([rejected, fresh]) as lease:
+            assert (lease.registered_bytes, lease.pageable_bytes) == (PAGE, PAGE)
+            assert len(attempts) == 3
+            assert attempts[0] == (cached.data_ptr(), PAGE)
+            assert attempts[2] == (fresh.data_ptr(), PAGE)
+            assert runtime.unregistered == []
+            assert runtime.last_error == 0
+            assert manager.stats.pinned_bytes == 2 * PAGE
+            assert manager.stats.copy_bytes == 0
+            assert manager.stats.registration_failures == 1
+            torch.testing.assert_close(_transferred(manager, rejected), rejected)
+        with manager.acquire([cached, fresh]) as lease:
+            assert lease.registered_bytes == 2 * PAGE
+            assert len(attempts) == 3
+    finally:
+        runtime.code = 0
+        manager.clear()
+    assert set(runtime.unregistered) == {cached.data_ptr(), fresh.data_ptr()}
+    assert manager.stats.pinned_bytes == 0
+    assert manager.stats.active_leases == 0
+
+
 @pytest.mark.parametrize("code", [0, 2, 801, 1, 700, 712])
-def test_runtime_backend_only_falls_back_for_capacity_or_unsupported_errors(
+def test_runtime_backend_classifies_registration_errors(
     code: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -597,14 +641,18 @@ def test_runtime_backend_without_device_does_not_initialize_cuda(monkeypatch: py
     monkeypatch.setattr(torch.cuda, "cudart", unexpected_runtime)
     assert not RuntimeHostRegistration().register(PAGE, PAGE)
 
-def test_prior_runtime_error_is_reported_before_registering(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("code", [1, 700])
+def test_prior_runtime_error_is_reported_before_registering(code: int, monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = FakeRuntime(0)
-    runtime.last_error = 700
+    runtime.last_error = code
     monkeypatch.setattr(registration_module, "_load_runtime", lambda: runtime)
+    manager = PinManager(PAGE)
+    (tensor,) = _tensors((0, PAGE))
     with pytest.raises(HostRegistrationError, match="prior runtime work") as error:
-        RuntimeHostRegistration().register(PAGE, PAGE)
-    assert error.value.code == 700
+        manager.acquire([tensor])
+    assert error.value.code == code
     assert runtime.flags is None
+    assert manager.stats.active_leases == manager.stats.pinned_bytes == 0
 
 
 def test_stale_runtime_error_does_not_block_unregistration(monkeypatch: pytest.MonkeyPatch, caplog) -> None:

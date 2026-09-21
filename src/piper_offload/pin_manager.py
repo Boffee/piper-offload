@@ -57,7 +57,7 @@ from typing import Self
 
 import torch
 
-from ._host_registration import HostRegistrationBackend, RuntimeHostRegistration
+from ._host_registration import HostRegistrationBackend, HostRegistrationRefusedError, RuntimeHostRegistration
 from .checkpoint import FileSlice, file_slice
 
 logger = logging.getLogger(__name__)
@@ -311,7 +311,7 @@ def _detached(error: OSError) -> OSError:
 
 
 class _Refusal(enum.Enum):
-    BUDGET = "budget"  # this storage stays pageable; a later one in the acquisition may register
+    STORAGE = "storage"  # this storage stays pageable; a later one in the acquisition may register
     CAPACITY = "capacity"  # the runtime's capacity is exhausted; stop registering
 
 
@@ -573,7 +573,9 @@ class PinManager:
         together once it has registered; then everything registers in
         request order. A runtime capacity failure evicts unrelated idle
         registrations and retries; if capacity remains unavailable, later
-        storage in this acquisition skips registration.
+        storage in this acquisition skips registration. A rejected range alone
+        stays pageable, without evicting other registrations or skipping later
+        storage.
         """
         requests = self._requests(tensors)
         held: dict[int, _Registration] = {}
@@ -807,7 +809,10 @@ class PinManager:
         exhausted = False
         while pending:
             item = pending[0]
-            outcome = _Refusal.CAPACITY if exhausted else self._register_pending_item(item)
+            try:
+                outcome = _Refusal.CAPACITY if exhausted else self._register_pending_item(item)
+            except HostRegistrationRefusedError:
+                outcome = _Refusal.STORAGE
             if isinstance(outcome, _Registration):
                 _live_managers.add(self)
                 self._registrations[item.pointer] = outcome
@@ -831,7 +836,7 @@ class PinManager:
             return _Registration(item.pointer, size, item.request.storage)
         if item.error is not None:
             logger.warning("Could not fill a pinned copy from the checkpoint; it stays pageable: %s", item.error)
-            return _Refusal.BUDGET
+            return _Refusal.STORAGE
         if not self._register(item.copy.pointer, item.copy.size):
             return _Refusal.CAPACITY
         return _Registration(item.pointer, size, item.request.storage, item.copy)
