@@ -5,6 +5,14 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- A CUDA/HIP invalid-value refusal during host registration leaves that storage
+  pageable, allowing shared-relay collectives to continue with synchronous
+  copies. The refusal preserves unrelated registrations and does not prevent
+  later storage in the acquisition from being pinned. Errors from prior GPU
+  work and unexpected runtime errors still propagate.
+
 ## [0.10.0rc6] - 2026-09-20
 
 ### Changed

@@ -242,9 +242,10 @@ registered here.
 For model backing, pass tensors from `HostParam.storage_tensors()` and
 `HostBuffer.storage_tensors()`. Acquiring a lease holds existing
 registrations and registers additional whole storages when the budget and the
-runtime allow. Budget or supported runtime capacity failures leave whole
-storages pageable. They remain pageable until all their active leases close, even if
-another request arrives after capacity becomes available. A lease reports
+runtime allow. Budget limits, supported runtime capacity failures, and
+invalid-value registration refusals leave whole storages pageable. They remain
+pageable until all their active leases close, even if another request arrives
+after capacity becomes available. A lease reports
 `registered_bytes` and `pageable_bytes` for the unique
 storages requested. `host_pin_manager.stats.pinned_bytes` instead counts
 the union of covered OS pages, including shared boundary pages only once.
@@ -263,7 +264,10 @@ managed. Use views of one storage for aliases; distinct overlapping byte ranges
 are rejected before mutation.
 
 The backend binds the CUDA or HIP runtime already loaded by PyTorch. It clears
-errors from handled registration failures and reports unexpected errors through
+errors from handled registration failures. An invalid-value result from the
+registration call leaves that range pageable without evicting unrelated pins
+or skipping later storage in the acquisition. Errors from prior GPU work still
+propagate. The backend reports unexpected errors through
 `HostRegistrationError`, including conflicting foreign registrations. CUDA
 registration semantics follow the [CUDA memory API](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html);
 the corresponding HIP calls are documented in the
@@ -345,7 +349,8 @@ RelayOptions(transport="shared", staging_bytes=8 * 1024 * 1024)
 All ranks must be able to attach the same host allocation; use Gloo for separate
 machines. Staging registration uses `host_pin_manager`'s process-wide budget.
 Each process registers the full shared allocation under its own budget.
-Insufficient pin capacity falls back to synchronous pageable copies.
+Insufficient pin capacity or an invalid-value registration refusal falls back to
+synchronous pageable copies.
 
 The backend remains **blocking**, including `async_op=True`: returned work
 handles represent completed uploads. Coalesced calls process tensors sequentially.

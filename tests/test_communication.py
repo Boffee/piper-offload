@@ -914,6 +914,68 @@ def test_shared_chunks_on_gpu(tmp_path, size, mixed_pinning, pipeline_buffers, s
     )
 
 
+def _run_shared_registration_refusal(rank, path):
+    from dataclasses import replace
+
+    torch.set_num_threads(1)
+    torch.cuda.set_device(0)
+    device = torch.device("cuda", 0)
+    register_relay_backend()
+    dist.init_process_group(
+        "piper_relay", store=dist.FileStore(path, 2), rank=rank, world_size=2,
+        timeout=timedelta(seconds=10),
+        pg_options=RelayOptions(transport="shared", staging_bytes=1024),
+    )
+    shared = dist.group.WORLD._shared
+    registration = RuntimeHostRegistration()
+    runtime = registration._runtime
+    assert runtime is not None
+    manager = PinManager(16384, backend=registration)
+    refusing = True
+    refusals = 0
+
+    def register(pointer, size, flags):
+        nonlocal refusals
+        if rank == 0 and refusing and pointer == shared.buffer.data_ptr():
+            refusals += 1
+            return 1
+        return runtime.register(pointer, size, flags)
+
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(registration, "_runtime", replace(runtime, register=register))
+            patch.setattr(communication, "host_pin_manager", manager)
+            # One peer repeatedly refuses registration while the other pins.
+            # All operations must finish and the same group must remain usable.
+            for _ in range(2):
+                _check_chunked_values(rank, 2, device, torch.float32)
+                assert not shared.broken
+                assert manager.stats.active_leases == 0
+            assert manager.stats.registration_failures == refusals
+            if rank == 0:
+                assert refusals > 1
+                assert manager.stats.pinned_bytes == 0
+                assert shared.device is None
+            else:
+                assert manager.stats.registrations == 1
+                assert shared.device == device
+            # A later successful registration can use asynchronous copies.
+            refusing = False
+            _check_chunked_values(rank, 2, device, torch.float32)
+            assert manager.stats.registrations == 1
+            assert shared.device == device
+            assert not shared.broken
+    finally:
+        dist.destroy_process_group()
+        manager.clear()
+    assert manager.stats.active_leases == manager.stats.pinned_bytes == 0
+
+
+@CUDA
+def test_shared_registration_refusal_keeps_group_usable(tmp_path):
+    mp.spawn(_run_shared_registration_refusal, args=(str(tmp_path / "registration-refusal"),), nprocs=2)
+
+
 def _run_shared_failure(rank, path, operation):
     torch.set_num_threads(1)
     torch.cuda.set_device(0)

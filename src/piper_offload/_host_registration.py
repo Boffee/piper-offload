@@ -24,7 +24,11 @@ class HostRegistrationBackend(Protocol):
     """Register complete byte ranges; never allocate or copy their contents."""
 
     def register(self, pointer: int, size: int) -> bool:
-        """Return False for unavailable registration or exhausted capacity."""
+        """Return False for unavailable registration or exhausted capacity.
+
+        Raise HostRegistrationRefusedError if this range must stay pageable without
+        evicting other registrations or skipping later ranges.
+        """
         ...
 
     def unregister(self, pointer: int) -> None:
@@ -33,11 +37,15 @@ class HostRegistrationBackend(Protocol):
 
 
 class HostRegistrationError(RuntimeError):
-    """An unexpected runtime error during registration or unregistration."""
+    """A runtime error during registration or unregistration."""
 
     def __init__(self, operation: str, code: int) -> None:
         super().__init__(f"Host memory {operation} failed with CUDA/HIP error {code}")
         self.code = code
+
+
+class HostRegistrationRefusedError(HostRegistrationError):
+    """The runtime rejected this range; its storage can still be leased pageable."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +96,7 @@ class RuntimeHostRegistration:
 
     Portable registration (flag 1) permits use across device contexts. CUDA
     and HIP use error 2 for allocation failure and 801 for unsupported calls.
+    Error 1 rejects the requested range and raises HostRegistrationRefusedError.
     Other errors propagate, including foreign registrations: their ownership
     and coverage cannot be assumed to match our requested storage.
     """
@@ -118,6 +127,8 @@ class RuntimeHostRegistration:
             self._clear_failed_call(runtime, code)
             if code in (2, 801):
                 return False
+            if code == 1:
+                raise HostRegistrationRefusedError("registration", code)
             raise HostRegistrationError("registration", code)
         return True
 
