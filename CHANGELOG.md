@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.10.0rc6] - 2026-09-20
+
 ### Changed
 
 - `piper-kernels` is a required dependency. It is pure Python and declares no
