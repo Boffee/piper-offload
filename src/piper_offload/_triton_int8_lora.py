@@ -11,8 +11,8 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from ._triton_stochastic_quantization import (
-    _seed_argument,
-    _stochastic_round_to_int,
+    seed_argument,
+    stochastic_round_to_int,
 )
 
 _COMPUTE_FP16 = 0
@@ -231,7 +231,7 @@ def _quantize_kernel(
     )
     quantized = libdevice.llrint(scaled) + zero_point
     if STOCHASTIC:
-        quantized = _stochastic_round_to_int(
+        quantized = stochastic_round_to_int(
             stochastic_scaled + zero_point,
             quantized,
             rounding_seed,
@@ -415,7 +415,7 @@ def _merge_int8(
         output_scale,
         output_zero_point,
         output_qdata,
-        _seed_argument(rounding_seed),
+        seed_argument(rounding_seed),
         NUMEL=qdata.numel(),
         BLOCK_NUMEL=block_numel,
         QPARAM_DTYPE=qparam_dtype,

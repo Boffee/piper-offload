@@ -13,7 +13,7 @@ from typing import Any, cast
 
 import torch
 
-from ._stochastic_quantization import _stochastic_codebook_indices
+from ._stochastic_quantization import stochastic_codebook_indices
 
 LAYOUT_ATTRS = (
     "qdata",
@@ -243,7 +243,7 @@ def _stochastic_recode_nvfp4_(
     )
     deterministic_codes = unpack_uint4(nv.qdata.contiguous().view(torch.uint8))
     codebook = f4_unpacked_to_f32(torch.arange(16, device=source.device, dtype=torch.uint8))
-    codes = _stochastic_codebook_indices(
+    codes = stochastic_codebook_indices(
         normalized,
         codebook,
         seed=rounding_seed,

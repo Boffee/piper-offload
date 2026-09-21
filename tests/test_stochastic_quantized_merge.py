@@ -176,7 +176,7 @@ def test_bnb4_nested_probabilities_use_decoded_final_scale(
         blocksize=64,
     )
     captured: dict[str, torch.Tensor] = {}
-    original = bnb_impl._stochastic_codebook_indices
+    original = bnb_impl.stochastic_codebook_indices
 
     def capture_normalized(
         normalized: torch.Tensor,
@@ -188,7 +188,7 @@ def test_bnb4_nested_probabilities_use_decoded_final_scale(
 
     monkeypatch.setattr(
         bnb_impl,
-        "_stochastic_codebook_indices",
+        "stochastic_codebook_indices",
         capture_normalized,
     )
     rounded = requantize_params_4bit(
@@ -461,7 +461,7 @@ def test_nvfp4_probabilities_use_final_block_times_global_scale(
         use_triton_kernel=False,
     )
     captured: dict[str, torch.Tensor] = {}
-    original = nvfp4_impl._stochastic_codebook_indices
+    original = nvfp4_impl.stochastic_codebook_indices
 
     def capture_normalized(
         normalized: torch.Tensor,
@@ -473,7 +473,7 @@ def test_nvfp4_probabilities_use_final_block_times_global_scale(
 
     monkeypatch.setattr(
         nvfp4_impl,
-        "_stochastic_codebook_indices",
+        "stochastic_codebook_indices",
         capture_normalized,
     )
     rounded = nvfp4_impl.requantize_nvfp4_tensor(

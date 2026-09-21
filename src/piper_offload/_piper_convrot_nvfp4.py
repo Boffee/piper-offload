@@ -5,8 +5,9 @@
 storage and metadata during movement, then delegates LoRA and dense merges to
 those operations.
 
-The dependency remains optional: importing :mod:`piper_offload` succeeds when
-``piper-kernels`` or TorchAO is absent.
+``piper-kernels`` is a required dependency; TorchAO is not. This import reaches
+TorchAO's NVFP4 encoder, so it fails without the ``torchao`` extra and the
+adapter then reports the format unavailable.
 """
 
 from typing import Any, cast

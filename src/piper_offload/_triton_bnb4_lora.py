@@ -10,9 +10,9 @@ import triton
 import triton.language as tl
 
 from ._triton_stochastic_quantization import (
-    _random,
-    _seed_argument,
     _stochastic_sorted_code,
+    random_uniform,
+    seed_argument,
 )
 
 _COMPUTE_FP16 = 0
@@ -144,7 +144,7 @@ def _stochastic_fp4_code(values, deterministic, seed, offsets):
     lower = _fp4_level_value(lower_level)
     upper = _fp4_level_value(upper_level)
     probability = tl.where(upper > lower, (magnitude - lower) / (upper - lower), 0.0)
-    level = tl.where(_random(seed, offsets) < probability, upper_level, lower_level)
+    level = tl.where(random_uniform(seed, offsets) < probability, upper_level, lower_level)
     positive_code = tl.where(
         level < 2,
         level,
@@ -585,7 +585,7 @@ def _merge_bnb4(
         raw_absmax,
         output_packed,
         strength,
-        _seed_argument(rounding_seed),
+        seed_argument(rounding_seed),
         M=rows,
         N=cols,
         K=rank,

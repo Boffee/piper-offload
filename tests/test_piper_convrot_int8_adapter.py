@@ -83,22 +83,28 @@ def _make_convrot(
     )
 
 
-def test_package_import_does_not_require_piper_kernels() -> None:
+def test_package_import_does_not_require_torchao() -> None:
+    # piper-kernels is required, but its ConvRot tensors subclass
+    # TorchAOBaseTensor. Without the `torchao` extra both ConvRot adapters
+    # report their format unavailable rather than failing the package import.
     script = (
         "import builtins\n"
         "real_import = builtins.__import__\n"
-        "def import_without_piper("
+        "def import_without_torchao("
         "name, globals=None, locals=None, fromlist=(), level=0):\n"
-        "    if name == 'piper_kernels' or name.startswith('piper_kernels.'):\n"
+        "    if name == 'torchao' or name.startswith('torchao.'):\n"
         "        raise ModuleNotFoundError("
-        "'No module named piper_kernels', name='piper_kernels')\n"
+        "'No module named torchao', name='torchao')\n"
         "    return real_import(name, globals, locals, fromlist, level)\n"
-        "builtins.__import__ = import_without_piper\n"
+        "builtins.__import__ = import_without_torchao\n"
         "import torch\n"
         "import piper_offload\n"
         "from piper_offload.piper_convrot_int8_adapter import "
         "PiperConvRotInt8Adapter\n"
+        "from piper_offload.piper_convrot_nvfp4_adapter import "
+        "PiperConvRotNVFP4Adapter\n"
         "assert not PiperConvRotInt8Adapter.matches(torch.zeros(1))\n"
+        "assert not PiperConvRotNVFP4Adapter.matches(torch.zeros(1))\n"
     )
     completed = subprocess.run(
         [sys.executable, "-c", script],

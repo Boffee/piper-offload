@@ -6,8 +6,9 @@ Offload uses the public wrapper constructor and storage fields to preserve the
 representation during movement; its adapter delegates LoRA and dense merges,
 including optional stochastic rounding, to those public operations.
 
-The dependency remains optional: importing :mod:`piper_offload` succeeds when
-``piper-kernels`` (or its ``convrot`` extra) is absent.
+``piper-kernels`` is a required dependency; TorchAO is not. ``ConvRotInt8Tensor``
+subclasses ``TorchAOBaseTensor``, so this import fails without the ``torchao``
+extra and the adapter then reports the format unavailable.
 """
 
 from typing import Any

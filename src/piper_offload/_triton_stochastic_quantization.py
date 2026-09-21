@@ -1,4 +1,9 @@
-"""Shared Triton primitives for stochastic terminal-code selection."""
+"""Triton primitives for stochastic terminal-code selection.
+
+`piper-kernels` owns the seeded draw and integer rounding. This module adds the
+sorted-codebook, E2M1, and float8 selections that the adapters' LoRA kernels
+round against, which the kernel package has no use for.
+"""
 
 # Triton JIT helper signatures intentionally use untyped tensor parameters
 # and upper-case constexpr names.
@@ -6,37 +11,11 @@
 
 import triton
 import triton.language as tl
-
-
-def _seed_argument(seed: int | None) -> int:
-    """Return a launch-safe signed scalar with the seed's uint64 bit pattern."""
-    if seed is None:
-        return 0
-    return seed if seed < (1 << 63) else seed - (1 << 64)
-
-
-@triton.jit
-def _random(seed, offsets):
-    """Draw by logical element offset so launch geometry cannot affect samples."""
-    return tl.rand(seed, offsets.to(tl.uint64))
-
-
-@triton.jit
-def _stochastic_round_to_int(
-    values,
-    deterministic,
-    seed,
-    offsets,
-    QMIN: tl.constexpr,
-    QMAX: tl.constexpr,
-):
-    """Round finite interior values to adjacent integers."""
-    interior = (values > QMIN) & (values < QMAX)
-    safe = tl.where(interior, values, 0.0)
-    lower = tl.floor(safe)
-    probability = safe - lower
-    rounded = lower + (_random(seed, offsets) < probability)
-    return tl.where(interior & (probability > 0.0), rounded, deterministic)
+from piper_kernels.stochastic_quantization.triton import (
+    random_uniform,
+    seed_argument,
+    stochastic_round_to_int,
+)
 
 
 @triton.jit
@@ -67,7 +46,7 @@ def _stochastic_sorted_code(
     width = upper - lower
     probability = tl.where(width > 0.0, (values - lower) / width, 0.0)
     chosen = tl.where(
-        _random(seed, offsets) < probability,
+        random_uniform(seed, offsets) < probability,
         upper_index,
         lower_index,
     )
@@ -119,7 +98,7 @@ def _stochastic_e2m1_code(values, deterministic, seed, offsets):
     upper = _e2m1_value(upper_code)
     probability = tl.where(upper > lower, (magnitude - lower) / (upper - lower), 0.0)
     magnitude_code = tl.where(
-        _random(seed, offsets) < probability,
+        random_uniform(seed, offsets) < probability,
         upper_code,
         lower_code,
     )
@@ -159,7 +138,7 @@ def _stochastic_float8(
 
     probability = tl.where(upper > lower, (magnitude - lower) / (upper - lower), 0.0)
     magnitude_bits = tl.where(
-        _random(seed, offsets) < probability,
+        random_uniform(seed, offsets) < probability,
         upper_bits,
         lower_bits,
     )
@@ -175,4 +154,4 @@ def _stochastic_float8(
     return output
 
 
-__all__: list[str] = []
+__all__ = ["random_uniform", "seed_argument", "stochastic_round_to_int"]

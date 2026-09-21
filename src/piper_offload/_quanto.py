@@ -25,7 +25,7 @@ import torch
 
 from ._stochastic_quantization import (
     _stochastic_cast_float8,
-    _stochastic_round_to_int,
+    stochastic_round_to_int,
 )
 
 LAYOUT_ATTRS = ("_data", "_scale", "qtype", "axis")
@@ -302,7 +302,7 @@ def _stochastic_recode_qbytes_(
         )
     else:
         limits = torch.iinfo(storage_dtype)
-        qdata = _stochastic_round_to_int(
+        qdata = stochastic_round_to_int(
             scaled,
             seed=rounding_seed,
             quant_min=limits.min,

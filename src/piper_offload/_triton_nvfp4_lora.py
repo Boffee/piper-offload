@@ -10,8 +10,8 @@ import triton
 import triton.language as tl
 
 from ._triton_stochastic_quantization import (
-    _seed_argument,
     _stochastic_e2m1_code,
+    seed_argument,
 )
 
 _COMPUTE_BF16 = 0
@@ -619,7 +619,7 @@ def _merge_nvfp4(
         output_qdata,
         output_scale,
         strength,
-        _seed_argument(rounding_seed),
+        seed_argument(rounding_seed),
         M=rows,
         PACKED_N=cols // 2,
         NUM_SWIZZLE_COL_BLOCKS=num_swizzle_col_blocks,

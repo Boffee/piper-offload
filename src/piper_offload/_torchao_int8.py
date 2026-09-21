@@ -21,7 +21,7 @@ from typing import Any
 
 import torch
 
-from ._stochastic_quantization import _stochastic_round_to_int
+from ._stochastic_quantization import stochastic_round_to_int
 from ._torchao_granularity import (
     expand_block_parameter,
     granularity_from_block_size,
@@ -202,7 +202,7 @@ def _stochastic_recode_int8_(
         torch.zeros_like(t, dtype=torch.float32),
     )
     quant_min, quant_max = (-64, 63) if out.reduce_range else (-128, 127)
-    qdata = _stochastic_round_to_int(
+    qdata = stochastic_round_to_int(
         scaled,
         seed=rounding_seed,
         quant_min=quant_min,

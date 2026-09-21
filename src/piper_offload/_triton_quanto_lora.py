@@ -11,9 +11,9 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from ._triton_stochastic_quantization import (
-    _seed_argument,
     _stochastic_float8,
-    _stochastic_round_to_int,
+    seed_argument,
+    stochastic_round_to_int,
 )
 
 _AXIS_TENSOR = 0
@@ -149,7 +149,7 @@ def _quantize_qbytes_kernel(
     if INTEGER_STORAGE:
         deterministic = libdevice.rint(scaled)
         if STOCHASTIC:
-            scaled = _stochastic_round_to_int(
+            scaled = stochastic_round_to_int(
                 stochastic_scaled,
                 deterministic,
                 rounding_seed,
@@ -315,7 +315,7 @@ def _merge_quanto_qbytes(
         dense,
         output_scale,
         output,
-        _seed_argument(rounding_seed),
+        seed_argument(rounding_seed),
         M=rows,
         N=cols,
         SCALE_AXIS=scale_axis,
