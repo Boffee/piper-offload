@@ -4,9 +4,11 @@ A model-agnostic GPU/CPU memory manager for PyTorch. It caches reusable
 model and adapter resources, preserves compatible file-backed CPU mappings,
 and swaps independent models in and out of GPU memory.
 
-Piper Offload is self-contained and library-friendly: it has no required
-dependency beyond `torch`. Optional integrations support `bitsandbytes`,
-`optimum.quanto`, `gguf`, `piper-kernels`, and `torchao` quantized models.
+Piper Offload is self-contained and library-friendly: it requires only
+`torch` and `piper-kernels`, which is pure Python and adds no dependency of its
+own beyond `torch`. Optional integrations support `bitsandbytes`,
+`optimum.quanto`, `gguf`, and `torchao` quantized models, and the Piper ConvRot
+formats that `piper-kernels` owns.
 
 Requires Python 3.14 or newer and PyTorch 2.14.
 
@@ -19,22 +21,28 @@ pip install piper-offload
 ```
 
 Optional integrations are available individually through the `bnb`, `torchao`,
-`gguf`, `quanto`, and `convrot` extras. Triton acceleration is a separate,
-composable extra, while `all` includes every integration plus Triton:
+`gguf`, and `quanto` extras. Triton acceleration is a separate, composable
+extra, while `all` includes every integration plus Triton:
 
 ```bash
 pip install "piper-offload[all]"
 ```
 
+The `torchao` extra covers TorchAO's own quantized formats and the Piper
+ConvRot INT8 and NVFP4 formats, which share one requirement: ConvRot tensors
+subclass TorchAO's base tensor, and the NVFP4 encoder reaches TorchAO's
+`mx_formats` kernels, which import NumPy.
+
 The `triton` extra selects upstream `triton` on Linux and `triton-windows` on
 64-bit Windows. Combine it with any individual quantization extra whose
 optimized kernels you want; without it, those integrations retain their
 portable fallback paths. The `all` extra includes this acceleration runtime.
-The same installed Triton runtime enables Piper Kernels' ConvRot backend when
-`convrot` is also selected. Windows execution requires Windows 10 or 11, a
-supported NVIDIA GPU with a current driver, and the Visual C++ Redistributable
-for Visual Studio 2015-2022; a separate CUDA toolkit or Visual Studio install
-is not required.
+The same installed Triton runtime enables Piper Kernels' ConvRot backend. The
+`gguf` extra depends on it outright, because GGUF weights are decoded by a
+Triton converter that has no portable fallback. Windows execution requires
+Windows 10 or 11, a supported NVIDIA GPU with a current driver, and the Visual
+C++ Redistributable for Visual Studio 2015-2022; a separate CUDA toolkit or
+Visual Studio install is not required.
 
 ## What's in here
 
@@ -948,9 +956,8 @@ parameters, then samples only the terminal weight code between the two
 neighboring values on that finalized grid. Exact endpoints and saturation
 retain the upstream code. Exact-zero strengths are discarded before target
 lookup or factor staging. Standard CUDA layouts use the same format-specific
-Triton merge kernels for deterministic and stochastic rounding. Random samples
-are keyed by logical element index, so launch geometry does not change the
-result. The Torch and
+Triton merge kernels for deterministic and stochastic rounding. Random samples are keyed by logical element index, so launch geometry does not
+change the result. The Torch and
 Triton backends replay independently for a fixed seed but do not promise
 byte-identical samples across implementations or Triton versions. Nested
 bitsandbytes 4-bit scales still use the reference path because their final
@@ -1541,9 +1548,9 @@ target exists only while the offloader is active.
 
 Direct conversion supports Piper Kernels' GGUF formats: F32, F16, BF16, Q4_0,
 Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS.
-The logical input width must be divisible by 16. Install the `gguf` extra;
-direct conversion requires
-`piper-kernels[convrot]>=0.7.0rc3`.
+The logical input width must be divisible by 16. Install the `gguf` extra,
+which pulls in the `torchao` and `triton` extras that direct conversion
+requires.
 
 ## Piper ConvRot INT8 support
 
@@ -1552,7 +1559,7 @@ from `piper_kernels.weights`. Earlier tensor import paths are no longer supporte
 
 Piper ConvRot weights
 (`piper_kernels.weights.convrot.int8.ConvRotInt8Tensor`) are handled when the
-`convrot` optional extra is installed. `piper-kernels` owns the tensor semantics
+`torchao` optional extra is installed. `piper-kernels` owns the tensor semantics
 plus reference and optimized execution backends; Piper Offload owns only the
 built-in `PiperConvRotInt8Adapter`. `HostParam` captures the INT8 `qdata` and
 float32 per-output `scale`, preserves `group_size` and the logical floating
@@ -1568,8 +1575,8 @@ Piper uses its optimized Triton backend on supported CUDA devices and its
 portable reference backend elsewhere. Use routed LoRA when the base must
 remain untouched.
 The base package remains
-importable without `piper-kernels`; use
-`uv sync --extra convrot --group dev` and then
+importable without TorchAO, which is what gates the format; use
+`uv sync --extra torchao --group dev` and then
 `pytest tests/test_piper_convrot_int8_adapter.py -q -rs` to exercise the
 optional suite.
 
@@ -1602,7 +1609,7 @@ This keeps rotation and quantization semantics out of Piper Offload. Use
 routed LoRA to avoid the lossy 4-bit re-encode or when the packed target is
 non-contiguous. Dense merge requires Piper Kernels 0.7.0rc1 or newer.
 
-Install the `convrot` extra and run
+Install the `torchao` extra and run
 `pytest tests/test_piper_convrot_nvfp4_adapter.py -q -rs` to exercise this
 optional integration, including exact-SM120 forward coverage when available.
 

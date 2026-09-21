@@ -5,6 +5,30 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- `piper-kernels` is a required dependency. It is pure Python and declares no
+  dependency beyond `torch`, so requiring it does not change the install
+  footprint, and it removes the only reason the repository could not share the
+  kernel package's code.
+- The `convrot` extra is removed. Every ConvRot path needs NumPy and TorchAO
+  and nothing else, which is exactly what the `torchao` extra already declared,
+  so the two extras had identical contents once `piper-kernels` became
+  required. Install `torchao` for Piper ConvRot INT8 and NVFP4 support.
+- The `gguf` extra depends on `piper-offload[torchao,triton]`. GGUF weights are
+  decoded by ConvRot INT8's Triton converter, which has no portable fallback,
+  so both were already required in fact.
+- The `all` extra is a self-reference to the individual extras rather than a
+  hand-copied union of their contents.
+
+### Fixed
+
+- Piper ConvRot NVFP4 weights are recognized under every extra that claims to
+  support them. The former `convrot` extra installed TorchAO but not NumPy,
+  which TorchAO's `mx_formats` kernels import at module scope; the resulting
+  `ImportError` was caught as "format unavailable", so ConvRot NVFP4 tensors
+  were silently ignored rather than reported as a missing dependency.
+
 ## [0.10.0rc5] - 2026-09-20
 
 ### Added

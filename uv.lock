@@ -636,24 +636,15 @@ wheels = [
 
 [[package]]
 name = "piper-kernels"
-version = "0.7.0rc6"
+version = "0.7.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "torch", version = "2.14.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torch", version = "2.14.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c7/bf/53c523543d896fd7a358219a2953a27ca2f078f41c665673863ae74c4a1c/piper_kernels-0.7.0rc6.tar.gz", hash = "sha256:b11313d9130965524cd5a3854e7fd1a8d3be97239d20ebb5c135d286699a5379", size = 273190, upload-time = "2026-09-11T08:46:00.519Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/d5/414051af81cf2dd911aa8912777937358b2edfd732d0a5de72d953a42f94/piper_kernels-0.7.2.tar.gz", hash = "sha256:dc13475a7a841fc2b6318819fe151832902f233153f5575228295a36efca22c2", size = 309184, upload-time = "2026-09-21T03:54:00.784Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/40/28/1e63966dc722b6e878564e9995394c0debddc0a7b0a53f3bc52ebc8d26f2/piper_kernels-0.7.0rc6-py3-none-any.whl", hash = "sha256:e2c7f70d73b50b431e299dc3743d53625842abb39728e2ab08457ec0cbecc3e6", size = 377928, upload-time = "2026-09-11T08:45:58.708Z" },
-]
-
-[package.optional-dependencies]
-convrot = [
-    { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
-    { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
-]
-triton = [
-    { name = "triton-windows", marker = "sys_platform == 'win32'" },
+    { url = "https://files.pythonhosted.org/packages/45/46/28ad5074d95381679edb995860412a6f0932545d99c8e90ffb09f67d0444/piper_kernels-0.7.2-py3-none-any.whl", hash = "sha256:329169ad63c52766cde3a7587c507522222d6666e8c3360732390a5a3a3ea911", size = 432291, upload-time = "2026-09-21T03:53:59.251Z" },
 ]
 
 [[package]]
@@ -661,6 +652,7 @@ name = "piper-offload"
 version = "0.10.0rc5"
 source = { editable = "." }
 dependencies = [
+    { name = "piper-kernels" },
     { name = "torch", version = "2.14.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torch", version = "2.14.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
@@ -671,7 +663,6 @@ all = [
     { name = "gguf" },
     { name = "numpy" },
     { name = "optimum-quanto" },
-    { name = "piper-kernels", extra = ["convrot"] },
     { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
     { name = "triton", marker = "sys_platform == 'linux'" },
@@ -680,14 +671,13 @@ all = [
 bnb = [
     { name = "bitsandbytes" },
 ]
-convrot = [
-    { name = "piper-kernels", extra = ["convrot"] },
-    { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
-    { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
-]
 gguf = [
     { name = "gguf" },
-    { name = "piper-kernels", extra = ["convrot", "triton"] },
+    { name = "numpy" },
+    { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
+    { name = "triton", marker = "sys_platform == 'linux'" },
+    { name = "triton-windows", marker = "sys_platform == 'win32'" },
 ]
 quanto = [
     { name = "optimum-quanto" },
@@ -713,31 +703,21 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "bitsandbytes", marker = "extra == 'all'", specifier = ">=0.49,<0.51" },
     { name = "bitsandbytes", marker = "extra == 'bnb'", specifier = ">=0.49,<0.51" },
-    { name = "gguf", marker = "extra == 'all'", specifier = ">=0.18,<0.20" },
     { name = "gguf", marker = "extra == 'gguf'", specifier = ">=0.18,<0.20" },
-    { name = "numpy", marker = "extra == 'all'", specifier = ">=2.3.2,<3" },
     { name = "numpy", marker = "extra == 'torchao'", specifier = ">=2.3.2,<3" },
-    { name = "optimum-quanto", marker = "extra == 'all'", specifier = ">=0.2.7,<0.3" },
     { name = "optimum-quanto", marker = "extra == 'quanto'", specifier = ">=0.2.7,<0.3" },
-    { name = "piper-kernels", extras = ["convrot"], marker = "extra == 'all'", specifier = ">=0.7.0rc6,<0.8" },
-    { name = "piper-kernels", extras = ["convrot"], marker = "extra == 'convrot'", specifier = ">=0.7.0rc6,<0.8" },
-    { name = "piper-kernels", extras = ["convrot", "triton"], marker = "extra == 'gguf'", specifier = ">=0.7.0rc6,<0.8" },
+    { name = "piper-kernels", specifier = ">=0.7.2,<0.8" },
+    { name = "piper-offload", extras = ["bnb", "gguf", "quanto", "torchao", "triton"], marker = "extra == 'all'" },
+    { name = "piper-offload", extras = ["torchao", "triton"], marker = "extra == 'gguf'" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.14,<2.15" },
     { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.14,<2.15", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchao", marker = "sys_platform == 'linux' and extra == 'all'", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchao", marker = "sys_platform == 'linux' and extra == 'convrot'", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchao", marker = "sys_platform == 'linux' and extra == 'torchao'", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchao", marker = "sys_platform != 'linux' and extra == 'all'", specifier = ">=0.18,<0.19" },
-    { name = "torchao", marker = "sys_platform != 'linux' and extra == 'convrot'", specifier = ">=0.18,<0.19" },
     { name = "torchao", marker = "sys_platform != 'linux' and extra == 'torchao'", specifier = ">=0.18,<0.19" },
-    { name = "triton", marker = "sys_platform == 'linux' and extra == 'all'", specifier = ">=3.8,<3.9" },
     { name = "triton", marker = "sys_platform == 'linux' and extra == 'triton'", specifier = ">=3.8,<3.9" },
-    { name = "triton-windows", marker = "sys_platform == 'win32' and extra == 'all'", specifier = ">=3.8,<3.9" },
     { name = "triton-windows", marker = "sys_platform == 'win32' and extra == 'triton'", specifier = ">=3.8,<3.9" },
 ]
-provides-extras = ["bnb", "torchao", "gguf", "quanto", "convrot", "triton", "all"]
+provides-extras = ["bnb", "quanto", "torchao", "gguf", "triton", "all"]
 
 [package.metadata.requires-dev]
 dev = [

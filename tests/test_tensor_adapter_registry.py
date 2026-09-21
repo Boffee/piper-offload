@@ -43,7 +43,7 @@ def test_package_import_does_not_require_dtensor() -> None:
     script = """
 import sys
 # Model a minimal installation; quant libraries may themselves require DTensor.
-for package in ('torchao', 'bitsandbytes', 'optimum.quanto', 'piper_kernels'):
+for package in ('torchao', 'bitsandbytes', 'optimum.quanto'):
     sys.modules[package] = None
 sys.modules['torch.distributed.tensor'] = None
 import torch
