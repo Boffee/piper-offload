@@ -11,6 +11,16 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   dependency beyond `torch`, so requiring it does not change the install
   footprint, and it removes the only reason the repository could not share the
   kernel package's code.
+- Stochastic rounding comes from `piper_kernels.stochastic_quantization`, which
+  Piper Kernels 0.7.2 makes public. Both repositories carried the same seeded
+  draw, integer rounding, and codebook selection; two implementations of one
+  reproducible draw cannot be held in agreement by review alone, and a merge's
+  seed only reproduces a result if every backend applying it rounds the same
+  way. Piper Offload keeps the parts that have no upstream equivalent: the
+  8-bit float codebook, and the sorted-codebook, E2M1, and float8 selections in
+  its LoRA kernels. It also adopts the kernel package's names for the shared
+  primitives, so `random_uniform`, `seed_argument`, `stochastic_round_to_int`,
+  and `stochastic_codebook_indices` mean one thing across both repositories.
 - The `convrot` extra is removed. Every ConvRot path needs NumPy and TorchAO
   and nothing else, which is exactly what the `torchao` extra already declared,
   so the two extras had identical contents once `piper-kernels` became

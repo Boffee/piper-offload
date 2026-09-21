@@ -11,8 +11,8 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from ._triton_stochastic_quantization import (
-    _seed_argument,
-    _stochastic_round_to_int,
+    seed_argument,
+    stochastic_round_to_int,
 )
 
 
@@ -137,7 +137,7 @@ def _quantize_kernel(
     scaled = tl.where(scb[:, None] == 0.0, 0.0, scaled)
     quantized = libdevice.rint(scaled)
     if STOCHASTIC:
-        quantized = _stochastic_round_to_int(
+        quantized = stochastic_round_to_int(
             scaled,
             quantized,
             rounding_seed,
@@ -250,7 +250,7 @@ def _merge_bnb8(
         dense,
         output_scb,
         output_cb,
-        _seed_argument(rounding_seed),
+        seed_argument(rounding_seed),
         M=rows,
         N=cols,
         STOCHASTIC=rounding_seed is not None,

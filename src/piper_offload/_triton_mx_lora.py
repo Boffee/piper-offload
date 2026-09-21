@@ -10,9 +10,9 @@ import triton
 import triton.language as tl
 
 from ._triton_stochastic_quantization import (
-    _seed_argument,
     _stochastic_e2m1_code,
     _stochastic_float8,
+    seed_argument,
 )
 
 _COMPUTE_BF16 = 0
@@ -429,7 +429,7 @@ def _merge_mx_(
         a,
         update,
         strength,
-        _seed_argument(rounding_seed),
+        seed_argument(rounding_seed),
         M=rows,
         N=cols,
         NUM_SCALE_BLOCKS=cols // _MX_BLOCK_SIZE,

@@ -22,7 +22,7 @@ import torch
 
 from ._stochastic_quantization import (
     _stochastic_cast_float8,
-    _stochastic_codebook_indices,
+    stochastic_codebook_indices,
 )
 
 LAYOUT_ATTRS = (
@@ -252,7 +252,7 @@ def _stochastic_recode_mx_(
     codebook = f4_unpacked_to_f32(
         torch.arange(16, device=source.device, dtype=torch.uint8)
     )
-    codes = _stochastic_codebook_indices(
+    codes = stochastic_codebook_indices(
         normalized,
         codebook,
         seed=rounding_seed,

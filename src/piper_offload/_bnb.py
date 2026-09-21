@@ -34,8 +34,8 @@ from typing import Any
 import torch
 
 from ._stochastic_quantization import (
-    _stochastic_codebook_indices,
-    _stochastic_round_to_int,
+    stochastic_codebook_indices,
+    stochastic_round_to_int,
 )
 
 LAYOUT_ATTRS = ("quant_state", "blocksize", "quant_type")
@@ -274,7 +274,7 @@ def _stochastic_recode_params_4bit_(
         # negative/positive values choose the corresponding zero code.
         codebook = codebook.clone()
         codebook[8] = -0.0
-    codes = _stochastic_codebook_indices(
+    codes = stochastic_codebook_indices(
         normalized,
         codebook,
         seed=rounding_seed,
@@ -452,7 +452,7 @@ def _stochastic_recode_int8_params_(
         quant_input.to(torch.float32).mul(127.0).div(scale),
         torch.zeros_like(quant_input, dtype=torch.float32),
     )
-    cb = _stochastic_round_to_int(
+    cb = stochastic_round_to_int(
         scaled,
         seed=rounding_seed,
         quant_min=-127,

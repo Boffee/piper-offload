@@ -10,8 +10,8 @@ import triton
 import triton.language as tl
 
 from ._triton_stochastic_quantization import (
-    _seed_argument,
     _stochastic_float8,
+    seed_argument,
 )
 
 _COMPUTE_FP16 = 0
@@ -436,7 +436,7 @@ def _merge_group(
         output_qdata,
         output_scale,
         strength,
-        _seed_argument(rounding_seed),
+        seed_argument(rounding_seed),
         M=rows,
         N=cols,
         K=rank,
@@ -616,7 +616,7 @@ def _merge_float8(
         dense,
         output_scale,
         output_qdata,
-        _seed_argument(rounding_seed),
+        seed_argument(rounding_seed),
         NUMEL=qdata.numel(),
         N=cols,
         PER_ROW=per_row,

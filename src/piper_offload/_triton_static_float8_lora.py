@@ -10,8 +10,8 @@ import triton
 import triton.language as tl
 
 from ._triton_stochastic_quantization import (
-    _seed_argument,
     _stochastic_float8,
+    seed_argument,
 )
 
 _COMPUTE_FP16 = 0
@@ -300,7 +300,7 @@ def _merge_static_float8(
         dense,
         output_scale,
         output_qdata,
-        _seed_argument(rounding_seed),
+        seed_argument(rounding_seed),
         NUMEL=qdata.numel(),
         FP8_LIMIT=fp8_limit,
         E4M3=qdata.dtype is torch.float8_e4m3fn,

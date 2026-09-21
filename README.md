@@ -75,6 +75,7 @@ Visual Studio install is not required.
 | `tensor_adapter_registry.py` | Public external-adapter registration plus adapter dispatch and tensor-identity helpers |
 | `module_names.py` | Internal name traversal and mutation helpers |
 | `_quanto.py` | Internal: optimum-quanto optional-import + layout validation; consumed by `quanto_adapter.py` and `merge.py` |
+| `_stochastic_quantization.py`, `_triton_stochastic_quantization.py` | Internal: re-export `piper-kernels`' stochastic rounding and add the 8-bit float codebook and the sorted-codebook, E2M1, and float8 selections this repo's merge kernels need |
 | `_piper_convrot_int8.py` | Internal: Piper ConvRot INT8 optional-import, public-layout validation, and wrapper reconstruction; consumed by `piper_convrot_int8_adapter.py` |
 | `_piper_convrot_nvfp4.py` | Internal: Piper ConvRot NVFP4 optional-import, public-layout and merge-capability validation, and wrapper reconstruction; consumed by `piper_convrot_nvfp4_adapter.py` |
 | `_torchao_nvfp4.py` | Internal: TorchAO NVFP4 optional-import + layout validation and dequant/requant; consumed by `nvfp4_adapter.py` |
@@ -956,7 +957,10 @@ parameters, then samples only the terminal weight code between the two
 neighboring values on that finalized grid. Exact endpoints and saturation
 retain the upstream code. Exact-zero strengths are discarded before target
 lookup or factor staging. Standard CUDA layouts use the same format-specific
-Triton merge kernels for deterministic and stochastic rounding. Random samples are keyed by logical element index, so launch geometry does not
+Triton merge kernels for deterministic and stochastic rounding. The seeded draw
+and the rounding it feeds come from `piper_kernels.stochastic_quantization` and
+its `triton` submodule, so every format rounds through one implementation.
+Random samples are keyed by logical element index, so launch geometry does not
 change the result. The Torch and
 Triton backends replay independently for a fixed seed but do not promise
 byte-identical samples across implementations or Triton versions. Nested
