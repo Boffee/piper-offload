@@ -5,6 +5,18 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- `MappedCheckpoint` reads GGUF through the upstream parser and shares the
+  safetensors read-only mapping and file-provenance machinery. Streaming pins
+  packed bytes through owned copies that eviction can free.
+- `GgufParameter` carries packed GGUF bytes with logical shape and BF16 dtype,
+  supporting ordinary parameter assignment and structural projection splits
+  without a Diffusers dependency. Existing Diffusers parameters remain supported.
+- `TensorSlice.get_nbytes()` describes stored bytes independently of logical
+  shape and dtype; `requires_activation()` identifies source representations
+  that need Offload conversion before module execution.
+
 ### Fixed
 
 - A CUDA/HIP invalid-value refusal during host registration leaves that storage

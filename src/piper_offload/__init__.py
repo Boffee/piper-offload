@@ -174,6 +174,7 @@ from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent, BlockComponentStore
 from .block_mode import BlockMode
 from .checkpoint import CheckpointError, FileSlice, MappedCheckpoint, file_slice
+from .gguf_parameter import GgufParameter
 from .host_component import HostComponent, HostComponentStore
 from .lora import LoRAFactor, LoRATransform, ScaledLoRAFactor
 from .merge import merge_adapter
@@ -210,7 +211,7 @@ from .resource_cache import (
 )
 from .resource_specs import AdapterSpec, ModelSpec, ObjectSpec
 from .seeding import derive_seed
-from .tensor_adapter_registry import register_adapter
+from .tensor_adapter_registry import register_adapter, requires_activation
 from .tensor_adapters import (
     TensorAdapter,
     transfer_,
@@ -233,6 +234,7 @@ __all__ = [
     "EvictionPolicy",
     "EvictionPolicyError",
     "FileSlice",
+    "GgufParameter",
     "HostComponent",
     "HostComponentStore",
     "HostRegistrationError",
@@ -272,5 +274,6 @@ __all__ = [
     "host_pin_manager",
     "merge_adapter",
     "register_adapter",
+    "requires_activation",
     "transfer_",
 ]

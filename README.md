@@ -49,7 +49,8 @@ Visual Studio install is not required.
 | Module | Role |
 |---|---|
 | `resource_cache.py` | `ResourceCache`, eviction policy, cache metadata, and cache errors |
-| `checkpoint.py` | `MappedCheckpoint` — read-only safetensors mapping with `safe_open`'s reading surface, whose tensors record their file slice (`file_slice`) |
+| `checkpoint.py`, `_mapped_file.py` | `MappedCheckpoint` — read-only safetensors and GGUF mapping with `safe_open`'s reading surface, whose tensor storages record their file slice (`file_slice`) |
+| `gguf_parameter.py` | `GgufParameter` — logical BF16 parameter backed by packed GGUF bytes, with structural operations for model loading |
 | `pin_manager.py` | `PinManager`, `PinLease`, `PinStats`, and the process-wide `host_pin_manager` for budgeted host registration |
 | `communication.py` | Experimental `piper_relay` process group: blocking collectives through CPU Gloo or shared host memory, independently usable with DTensor |
 | `sequential.py` | Experimental `SequentialExecutor`: two DTensor ranks sharing one process, GPU and compute stream |
@@ -187,7 +188,7 @@ step; resident blocks, non-block components, and the optimizer copy-back lease
 their storage pageable, so a one-time upload never pins anything. CPU
 execution does not acquire leases.
 
-Storage that records a checkpoint file slice, which is every tensor from
+Storage that records a checkpoint file slice, including the packed backing of GGUF tensors from
 `MappedCheckpoint`, is never registered in place. Pinning it allocates an
 owned page-aligned copy, fills the copy from the file with parallel positional
 reads, and registers that; the mapping stays read-only page cache the whole time.
@@ -1535,12 +1536,28 @@ to switch without reloading it.
 
 ## GGUF source support
 
-Piper Offload recognizes Diffusers `GGUFParameter` objects directly through
-their existing packed tensor, `quant_type`, and `quant_shape` metadata; it does
-not import or depend on Diffusers. Piper Engine can therefore load and remap a
-GGUF model, normalize its GGUF linear modules to ordinary linear behavior, and
-pass the model directly to `ModelOffloader`. No target policy, parameter
-wrapping, or runtime option is required.
+`MappedCheckpoint(path)` reads both safetensors and GGUF. The upstream `gguf`
+package parses GGUF descriptors; Offload creates read-only mappings with exact
+file provenance through the same storage machinery as safetensors. F32, F16,
+and BF16 entries return ordinary tensors. Quantized entries return
+`GgufParameter` objects: their `shape` is the logical matrix shape and their
+`dtype` is BF16, while `as_tensor()` exposes the packed bytes without decoding
+them. `get_slice()` reports logical shape and dtype; `get_nbytes()` reports
+stored bytes. GGUF metadata is not exposed as safetensors application metadata.
+
+The parameter supports row splits, row indexing, concatenation, and regrouping rows while
+preserving quantization metadata. Contiguous splits retain the mapping and its
+file provenance; operations that copy have independent storage. Encoded rows
+must stay intact. The parameter can be assigned with ordinary
+`model.load_state_dict(state, assign=True)`, with no packed-shape workaround.
+Freeze the model before capturing it, as for other inference-only weights.
+Arithmetic requires Offload activation; `requires_activation(parameter)` lets a
+loader report that requirement without knowing the source format.
+
+Piper Offload also recognizes externally supplied Diffusers `GGUFParameter`
+objects through their packed tensor, `quant_type`, and `quant_shape` metadata.
+It does not import or depend on Diffusers. External Diffusers GGUF linear
+modules must be normalized to ordinary linear behavior before activation.
 
 On activation, the host backing remains packed GGUF. The GPU target owns one
 same-size packed staging buffer plus reusable ConvRot storage. Every load or
