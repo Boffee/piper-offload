@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.10.0rc7] - 2026-09-21
+
 ### Added
 
 - `MappedCheckpoint` reads GGUF through the upstream parser and shares the
