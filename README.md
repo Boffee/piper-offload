@@ -10,7 +10,8 @@ own beyond `torch`. Optional integrations support `bitsandbytes`,
 `optimum.quanto`, `gguf`, and `torchao` quantized models, and the Piper ConvRot
 formats that `piper-kernels` owns.
 
-Requires Python 3.14 or newer and PyTorch 2.13 or 2.14. The experimental
+Requires Python 3.14. Linux supports PyTorch 2.13 or 2.14; Windows requires
+PyTorch 2.14 to match Triton Windows 3.8. The experimental
 `SequentialExecutor` requires PyTorch 2.14.
 
 ## Installation

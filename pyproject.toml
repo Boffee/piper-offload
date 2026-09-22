@@ -5,7 +5,7 @@ description = "Model-agnostic GPU/CPU memory management for PyTorch — host off
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-requires-python = ">=3.14"
+requires-python = ">=3.14,<3.15"
 keywords = ["inference", "offloading", "pytorch", "quantization", "streaming"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -15,7 +15,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.13,<2.15",
+    "torch>=2.13,<2.15; sys_platform != 'win32'",
+    # Triton Windows 3.8 is paired with PyTorch 2.14.
+    "torch>=2.14,<2.15; sys_platform == 'win32'",
     "piper-kernels>=0.7.3,<0.8",
 ]
 
