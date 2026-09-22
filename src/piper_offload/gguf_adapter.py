@@ -5,9 +5,9 @@ CUDA staging buffer and a BF16 ConvRot INT8 representation. Refills DMA the
 packed bytes and ask Piper Kernels to decode, rotate, and requantize directly
 into that target; no dense weight is materialized.
 
-Diffusers ``GGUFParameter`` objects are consumed through their existing
-``quant_type`` and ``as_tensor()`` interface without taking a Diffusers
-dependency or introducing another parameter wrapper.
+Offload's ``GgufParameter`` and externally supplied Diffusers ``GGUFParameter``
+objects share the ``quant_type``, ``quant_shape``, and ``as_tensor()`` interface.
+No Diffusers dependency is needed for reading or activating GGUF checkpoints.
 """
 
 from __future__ import annotations
@@ -19,17 +19,17 @@ import torch
 from torch import nn
 
 from ._piper_convrot_int8 import create_convrot_int8_tensor
+from .gguf_parameter import GGUF_COMPUTE_DTYPE
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from .tensor_adapters import capture_host_tensor, transfer_
 
 __all__ = ["GgufAdapter"]
 
 _CONVROT_GROUP_SIZES = (256, 64, 16)
-_LOGICAL_DTYPE = torch.bfloat16
 
 
 def _is_gguf_parameter(tensor: torch.Tensor) -> bool:
-    """Recognize Diffusers' parameter contract without importing Diffusers."""
+    """Recognize native and external GGUF parameters without importing Diffusers."""
     return (
         isinstance(tensor, nn.Parameter)
         and type(tensor) is not nn.Parameter
@@ -131,7 +131,7 @@ class GgufAdapter:
         logical_shape = _logical_shape(t)
         return (
             logical_shape,
-            _LOGICAL_DTYPE,
+            GGUF_COMPUTE_DTYPE,
             tuple(data.shape),
             data.stride(),
             quant_type,
@@ -184,7 +184,7 @@ class GgufAdapter:
                 torch.empty((rows, features), dtype=torch.int8, device=device),
                 torch.empty((rows, 1), dtype=torch.float32, device=device),
                 state.group_size,
-                _LOGICAL_DTYPE,
+                GGUF_COMPUTE_DTYPE,
             ),
         )
 
@@ -216,7 +216,7 @@ class GgufAdapter:
     @staticmethod
     def compute_dtype(t: torch.Tensor) -> torch.dtype:
         _source_data(t)
-        return _LOGICAL_DTYPE
+        return GGUF_COMPUTE_DTYPE
 
     @staticmethod
     def logical_shape(t: torch.Tensor) -> tuple[int, ...]:

@@ -1,6 +1,6 @@
-"""Read-only safetensors mapping with file provenance per storage.
+"""Read-only safetensors and GGUF mappings with file provenance per storage.
 
-``MappedCheckpoint`` maps a safetensors file read-only and hands out tensors
+``MappedCheckpoint`` maps a checkpoint file read-only and hands out tensors
 that are views into the mapping, like ``safetensors.safe_open`` with
 ``device="cpu"``. Two things differ, both for the pin manager. The mapping
 can never be written, so registering or transferring it can never make the
@@ -19,15 +19,16 @@ import json
 import mmap
 import os
 import struct
-import threading
-import warnings
-import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from types import EllipsisType
 from typing import Any, NoReturn, Self, TypeGuard
 
 import torch
+from piper_kernels.gguf import GGUFQuantizationType
+
+from ._mapped_file import FileSlice, MappedFile, file_slice
+from .gguf_parameter import GgufParameter
 
 _DTYPES: dict[str, torch.dtype] = {
     "BF16": torch.bfloat16,
@@ -54,16 +55,7 @@ _HEADER_LIMIT = 100_000_000  # safetensors' own cap on the header
 
 
 class CheckpointError(ValueError):
-    """A safetensors file whose header does not describe its bytes."""
-
-
-@dataclass(frozen=True, slots=True)
-class FileSlice:
-    """Where a storage's bytes live: ``length`` bytes at ``offset`` in the reader's open ``file``."""
-
-    file: io.BufferedReader
-    offset: int
-    length: int
+    """A checkpoint whose header does not describe supported tensor bytes."""
 
 
 type _Index = int | slice | EllipsisType | torch.Tensor | None
@@ -89,74 +81,52 @@ class TensorSlice:
     def get_shape(self) -> list[int]:
         return list(self.shape)
 
+    def get_nbytes(self, *, dtype: torch.dtype | None = None) -> int:
+        """Stored bytes, optionally estimating a cast of ordinary safetensors floats.
+
+        GGUF loads preserve their stored encodings, including their plain float
+        tensors, so a dtype override does not change their storage estimate.
+        """
+        entry = self.checkpoint._entry(self.name)
+        if (
+            dtype is not None
+            and self.checkpoint.path.suffix.lower() != ".gguf"
+            and self.tag in {"F32", "F16", "BF16"}
+        ):
+            return entry.length // entry.storage_dtype.itemsize * dtype.itemsize
+        return entry.length
+
     def __getitem__(self, key: _Index | tuple[_Index, ...]) -> torch.Tensor:
         return self.checkpoint.get_tensor(self.name)[key]
 
 
 @dataclass(frozen=True, slots=True)
 class _TensorEntry:
-    dtype: torch.dtype
-    tag: str
-    shape: tuple[int, ...]
+    """Logical descriptor and the byte layout used to build its mapped tensor."""
+
+    storage_dtype: torch.dtype
+    tag: str  # logical dtype, in safetensors notation
+    shape: tuple[int, ...]  # logical shape
     offset: int  # from the start of the file
     length: int
-
-
-class _MappedFile:
-    """Buffer the tensors are built over.
-
-    Every tensor's storage references this object through the buffer
-    protocol, so the file and the mapping live exactly as long as the tensors.
-    Provenance references it weakly.
-    """
-
-    __slots__ = ("__weakref__", "file", "mmap")
-
-    def __init__(self, file: io.BufferedReader, mapping: mmap.mmap) -> None:
-        self.file = file
-        self.mmap = mapping
-
-    def __buffer__(self, flags: int, /) -> memoryview:
-        return memoryview(self.mmap)
-
-
-# Reentrant: ``_forget_dead_mappings`` is a garbage-collection finalizer, so it can
-# run in a thread that already holds this lock, at any allocation inside a locked
-# block. A plain Lock deadlocks that thread against itself.
-_lock = threading.RLock()
-# Storage pointer -> (its mapping, weakly, and its slice).
-_provenance: dict[int, tuple[weakref.ReferenceType[_MappedFile], FileSlice]] = {}
-
-
-def file_slice(source: torch.Tensor | torch.UntypedStorage) -> FileSlice | None:
-    """The checkpoint bytes behind a tensor's storage, or ``None`` for storage that is not a mapped checkpoint.
-
-    Views share their base tensor's storage and so its slice. Storage that
-    merely reuses a dead mapping's address does not match.
-    """
-    storage = source if isinstance(source, torch.UntypedStorage) else source.untyped_storage()
-    with _lock:
-        entry = _provenance.get(storage.data_ptr())
-    if entry is None:
-        return None
-    mapping, piece = entry
-    return piece if mapping() is not None and piece.length == storage.nbytes() else None
-
-
-def _forget_dead_mappings() -> None:
-    with _lock:
-        for pointer in [pointer for pointer, (mapping, _) in _provenance.items() if mapping() is None]:
-            _provenance.pop(pointer, None)
+    quant_type: int | None = None
+    packed_shape: tuple[int, ...] | None = None
 
 
 class MappedCheckpoint:
-    """A safetensors file mapped read-only, with ``safe_open``'s reading surface.
+    """A safetensors or GGUF file mapped read-only, with ``safe_open``'s reading surface.
 
     ``keys()``, ``metadata()``, ``get_tensor()`` and ``get_slice()`` are named
     and behave as on ``safetensors.safe_open(path, framework="pt",
     device="cpu")`` so the reader is a drop-in replacement; the getter names
-    are deliberate. The header is validated in full before any tensor can be
-    built. Tensors are views into the mapping and outlive the reader.
+    are deliberate. The safetensors header is validated in full before any
+    tensor can be built. GGUF encoding support is checked when a tensor's
+    descriptor or value is requested, allowing selective loads to skip unused
+    encodings. Tensors are views into the mapping and outlive the reader. GGUF
+    parsing uses the optional ``gguf`` package; quantized tensors are returned
+    as ``GgufParameter`` objects with logical shape and BF16 compute dtype.
+    GGUF ``metadata()`` returns None: its format metadata is handled by the
+    parser and is not safetensors' application metadata.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -165,7 +135,10 @@ class MappedCheckpoint:
         try:
             size = file.seek(0, io.SEEK_END)
             file.seek(0)
-            self._entries, self._metadata = _read_header(file, size)
+            if self.path.suffix.lower() == ".gguf":
+                self._entries, self._metadata = _read_gguf_header(self.path, size), None
+            else:
+                self._entries, self._metadata = _read_header(file, size)
             mapping = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
             if hasattr(os, "posix_fadvise"):
                 # Doubles the kernel's readahead window for this file, as
@@ -177,8 +150,7 @@ class MappedCheckpoint:
         except BaseException:
             file.close()
             raise
-        self._mapping: _MappedFile | None = _MappedFile(file, mapping)
-        weakref.finalize(self._mapping, _forget_dead_mappings)
+        self._mapping: MappedFile | None = MappedFile(file, mapping)
 
     def __enter__(self) -> Self:
         return self
@@ -207,25 +179,61 @@ class MappedCheckpoint:
         mapping = self._mapping
         if mapping is None:
             raise RuntimeError(f"{self.path} is closed")
-        if entry.length == 0:
-            return torch.empty(entry.shape, dtype=entry.dtype)
-        window = memoryview(mapping)[entry.offset:entry.offset + entry.length]
-        with warnings.catch_warnings():
-            # Non-writable is the point: nothing may write through a checkpoint mapping.
-            warnings.filterwarnings("ignore", message="The given buffer is not writable")
-            tensor = torch.frombuffer(window, dtype=entry.dtype).reshape(entry.shape)
-        with _lock:
-            _provenance[tensor.untyped_storage().data_ptr()] = (
-                weakref.ref(mapping),
-                FileSlice(mapping.file, entry.offset, entry.length),
-            )
+        tensor = mapping.tensor(
+            entry.offset, entry.length, entry.storage_dtype, entry.packed_shape or entry.shape,
+        )
+        if entry.quant_type is not None:
+            return GgufParameter(tensor, quant_type=entry.quant_type)
         return tensor
 
     def _entry(self, name: str) -> _TensorEntry:
         try:
-            return self._entries[name]
+            entry = self._entries[name]
         except KeyError:
             raise KeyError(f"{self.path} has no tensor {name!r}") from None
+        if entry.quant_type is not None:
+            try:
+                GGUFQuantizationType(entry.quant_type)
+            except ValueError as error:
+                raise CheckpointError(
+                    f"unsupported GGUF quantization type {entry.quant_type!r} for {name!r}",
+                ) from error
+            if len(entry.shape) != 2:
+                raise CheckpointError(f"quantized GGUF tensor {name!r} must be a matrix, got {entry.shape}")
+        return entry
+
+
+def _read_gguf_header(path: Path, size: int) -> dict[str, _TensorEntry]:
+    from gguf import GGUFReader  # noqa: PLC0415 — optional parser, only needed for GGUF files
+
+    # GGUFReader owns parsing and creates only NumPy views over the payload.
+    # Retain plain descriptors, not its arrays: tensors use our mapping and
+    # the open file held by their storage, just as safetensors tensors do.
+    reader = GGUFReader(path, mode="r")
+    if reader.byte_order != "I":
+        raise CheckpointError("GGUF byte-swapped weights cannot be used by the native conversion kernels")
+    plain: dict[int, str] = {
+        GGUFQuantizationType.F32: "F32",
+        GGUFQuantizationType.F16: "F16",
+        GGUFQuantizationType.BF16: "BF16",
+    }
+    entries: dict[str, _TensorEntry] = {}
+    for tensor in reader.tensors:
+        quant_type = int(tensor.tensor_type)
+        shape = tuple(int(dim) for dim in reversed(tensor.shape))
+        offset, length = int(tensor.data_offset), int(tensor.n_bytes)
+        if not 0 <= offset <= offset + length <= size:
+            raise CheckpointError(f"GGUF tensor {tensor.name!r} extends outside the checkpoint")
+        if quant_type in plain:
+            tag = plain[quant_type]
+            entries[tensor.name] = _TensorEntry(_DTYPES[tag], tag, shape, offset, length)
+        else:
+            entries[tensor.name] = _TensorEntry(
+                torch.uint8, "BF16", shape, offset, length,
+                quant_type=quant_type,
+                packed_shape=tuple(int(dim) for dim in tensor.data.shape),
+            )
+    return entries
 
 
 def _read_header(file: io.BufferedReader, size: int) -> tuple[dict[str, _TensorEntry], dict[str, str] | None]:

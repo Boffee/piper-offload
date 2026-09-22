@@ -154,6 +154,15 @@ def param_representation(param: torch.Tensor) -> torch.Tensor:
     return param
 
 
+def requires_activation(tensor: torch.Tensor) -> bool:
+    """Whether a stored representation needs Offload conversion before module execution.
+
+    Packed GGUF sources execute as ConvRot targets. Other supported tensors
+    can execute in their stored representation and do not need this conversion.
+    """
+    return GgufAdapter.matches(param_representation(tensor))
+
+
 def param_tensor_id(param: nn.Parameter) -> tuple[Any, ...]:
     """Return an adapter-defined tensor identity for a parameter."""
     if param.is_meta or param.numel() == 0:
@@ -176,6 +185,7 @@ __all__ = [
     "param_representation",
     "param_tensor_id",
     "register_adapter",
+    "requires_activation",
     "select_adapter",
     "tensor_id",
 ]

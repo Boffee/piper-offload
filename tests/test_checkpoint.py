@@ -12,6 +12,7 @@ import pytest
 import torch
 
 import piper_offload.checkpoint as checkpoint_module
+from piper_offload import _mapped_file
 from piper_offload import CheckpointError, MappedCheckpoint, file_slice
 
 _TAGS = {dtype: tag for tag, dtype in checkpoint_module._DTYPES.items()}
@@ -176,7 +177,7 @@ def test_tensors_and_provenance_outlive_the_reader_and_die_with_the_last_tensor(
     gc.collect()
     assert mapping_ref() is None
     assert file_ref() is None
-    assert pointer not in checkpoint_module._provenance
+    assert pointer not in _mapped_file._provenance
 
 
 def test_closed_reader_refuses_new_tensors_but_keeps_existing_ones(sample) -> None:
@@ -328,7 +329,7 @@ def test_collecting_a_mapping_inside_the_lock_does_not_deadlock(tmp_path: Path) 
     gc.disable()
     try:
         strand_a_mapping()
-        with checkpoint_module._lock:
+        with _mapped_file._lock:
             gc.collect()
     finally:
         gc.enable()
