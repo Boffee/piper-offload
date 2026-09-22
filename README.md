@@ -10,7 +10,8 @@ own beyond `torch`. Optional integrations support `bitsandbytes`,
 `optimum.quanto`, `gguf`, and `torchao` quantized models, and the Piper ConvRot
 formats that `piper-kernels` owns.
 
-Requires Python 3.14 or newer and PyTorch 2.14.
+Requires Python 3.14 or newer and PyTorch 2.13 or 2.14. The experimental
+`SequentialExecutor` requires PyTorch 2.14.
 
 ## Installation
 
@@ -33,10 +34,12 @@ ConvRot INT8 and NVFP4 formats, which share one requirement: ConvRot tensors
 subclass TorchAO's base tensor, and the NVFP4 encoder reaches TorchAO's
 `mx_formats` kernels, which import NumPy.
 
-The `triton` extra selects upstream `triton` on Linux and `triton-windows` on
-64-bit Windows. Combine it with any individual quantization extra whose
-optimized kernels you want; without it, those integrations retain their
-portable fallback paths. The `all` extra includes this acceleration runtime.
+On Linux, PyTorch supplies its matching CUDA or ROCm Triton runtime; the
+`triton` extra does not replace it. On 64-bit Windows, the extra selects
+`triton-windows`. Combine it with any individual quantization extra whose
+optimized kernels you want; without a compatible Triton runtime, those
+integrations retain their portable fallback paths. The `all` extra includes
+the Windows acceleration runtime.
 The same installed Triton runtime enables Piper Kernels' ConvRot backend. The
 `gguf` extra depends on it outright, because GGUF weights are decoded by a
 Triton converter that has no portable fallback. Windows execution requires

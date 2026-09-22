@@ -15,8 +15,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.14,<2.15",
-    "piper-kernels>=0.7.2,<0.8",
+    "torch>=2.13,<2.15",
+    "piper-kernels>=0.7.3,<0.8",
 ]
 
 [project.urls]
@@ -38,7 +38,7 @@ gguf = [
     "piper-offload[torchao,triton]",
 ]
 triton = [
-    "triton>=3.8,<3.9; sys_platform == 'linux'",
+    # Linux PyTorch distributions supply their matching CUDA or ROCm Triton.
     "triton-windows>=3.8,<3.9; sys_platform == 'win32'",
 ]
 all = ["piper-offload[bnb,gguf,quanto,torchao,triton]"]

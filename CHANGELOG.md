@@ -5,6 +5,14 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Support PyTorch 2.13 for loading, pinning, streaming, rolling, and block
+  compilation. Linux installations use the CUDA or ROCm Triton runtime supplied
+  by PyTorch instead of replacing it through Piper's extras. The experimental
+  `SequentialExecutor` remains a PyTorch 2.14 feature. Piper Kernels integrations
+  require 0.7.3 or newer, whose production kernels support PyTorch 2.13.
+
 ## [0.10.0rc7] - 2026-09-21
 
 ### Added

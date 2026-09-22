@@ -636,15 +636,15 @@ wheels = [
 
 [[package]]
 name = "piper-kernels"
-version = "0.7.2"
+version = "0.7.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "torch", version = "2.14.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torch", version = "2.14.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/94/d5/414051af81cf2dd911aa8912777937358b2edfd732d0a5de72d953a42f94/piper_kernels-0.7.2.tar.gz", hash = "sha256:dc13475a7a841fc2b6318819fe151832902f233153f5575228295a36efca22c2", size = 309184, upload-time = "2026-09-21T03:54:00.784Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/43/86/f2aaa13dd9c1857973ba8019acf7264f602e210eb39749d82de917c2a1be/piper_kernels-0.7.3.tar.gz", hash = "sha256:ab9c0c3b70e892171d2702b20937e79eb3930f934a0796fe9ca15e88acdba526", size = 309803, upload-time = "2026-09-22T20:39:03.623Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/45/46/28ad5074d95381679edb995860412a6f0932545d99c8e90ffb09f67d0444/piper_kernels-0.7.2-py3-none-any.whl", hash = "sha256:329169ad63c52766cde3a7587c507522222d6666e8c3360732390a5a3a3ea911", size = 432291, upload-time = "2026-09-21T03:53:59.251Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/67/84e1436307cc024812fa097b8a4726eaea09f0a0783f10a21860494f9a3d/piper_kernels-0.7.3-py3-none-any.whl", hash = "sha256:0b209e0e1a4d96df90ff8e90141d82f13acf6d7c086f7f7b16ef9573dcbee029", size = 432772, upload-time = "2026-09-22T20:39:02.136Z" },
 ]
 
 [[package]]
@@ -665,7 +665,6 @@ all = [
     { name = "optimum-quanto" },
     { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
-    { name = "triton", marker = "sys_platform == 'linux'" },
     { name = "triton-windows", marker = "sys_platform == 'win32'" },
 ]
 bnb = [
@@ -676,7 +675,6 @@ gguf = [
     { name = "numpy" },
     { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
-    { name = "triton", marker = "sys_platform == 'linux'" },
     { name = "triton-windows", marker = "sys_platform == 'win32'" },
 ]
 quanto = [
@@ -688,7 +686,6 @@ torchao = [
     { name = "torchao", version = "0.18.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
 ]
 triton = [
-    { name = "triton", marker = "sys_platform == 'linux'" },
     { name = "triton-windows", marker = "sys_platform == 'win32'" },
 ]
 
@@ -707,14 +704,13 @@ requires-dist = [
     { name = "gguf", marker = "extra == 'gguf'", specifier = ">=0.18,<0.20" },
     { name = "numpy", marker = "extra == 'torchao'", specifier = ">=2.3.2,<3" },
     { name = "optimum-quanto", marker = "extra == 'quanto'", specifier = ">=0.2.7,<0.3" },
-    { name = "piper-kernels", specifier = ">=0.7.2,<0.8" },
+    { name = "piper-kernels", specifier = ">=0.7.3,<0.8" },
     { name = "piper-offload", extras = ["bnb", "gguf", "quanto", "torchao", "triton"], marker = "extra == 'all'" },
     { name = "piper-offload", extras = ["torchao", "triton"], marker = "extra == 'gguf'" },
-    { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.14,<2.15" },
-    { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.14,<2.15", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.13,<2.15" },
+    { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.13,<2.15", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchao", marker = "sys_platform == 'linux' and extra == 'torchao'", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchao", marker = "sys_platform != 'linux' and extra == 'torchao'", specifier = ">=0.18,<0.19" },
-    { name = "triton", marker = "sys_platform == 'linux' and extra == 'triton'", specifier = ">=3.8,<3.9" },
     { name = "triton-windows", marker = "sys_platform == 'win32' and extra == 'triton'", specifier = ">=3.8,<3.9" },
 ]
 provides-extras = ["bnb", "quanto", "torchao", "gguf", "triton", "all"]
