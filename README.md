@@ -10,9 +10,9 @@ own beyond `torch`. Optional integrations support `bitsandbytes`,
 `optimum.quanto`, `gguf`, and `torchao` quantized models, and the Piper ConvRot
 formats that `piper-kernels` owns.
 
-Requires Python 3.14. Linux supports PyTorch 2.13 or 2.14; Windows requires
-PyTorch 2.14 to match Triton Windows 3.8. The experimental
-`SequentialExecutor` requires PyTorch 2.14.
+Requires Python 3.14 and PyTorch 2.13 or 2.14. On Windows, the optional
+`triton` extra requires PyTorch 2.14 to match Triton Windows 3.8. The
+experimental `SequentialExecutor` also requires PyTorch 2.14.
 
 ## Installation
 
@@ -43,7 +43,7 @@ integrations retain their portable fallback paths. The `all` extra includes
 the Windows acceleration runtime.
 The same installed Triton runtime enables Piper Kernels' ConvRot backend. The
 `gguf` extra depends on it outright, because GGUF weights are decoded by a
-Triton converter that has no portable fallback. Windows execution requires
+Triton converter that has no portable fallback. Windows Triton execution requires
 Windows 10 or 11, a supported NVIDIA GPU with a current driver, and the Visual
 C++ Redistributable for Visual Studio 2015-2022; a separate CUDA toolkit or
 Visual Studio install is not required.

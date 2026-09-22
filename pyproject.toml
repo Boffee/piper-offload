@@ -15,9 +15,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.13,<2.15; sys_platform != 'win32'",
-    # Triton Windows 3.8 is paired with PyTorch 2.14.
-    "torch>=2.14,<2.15; sys_platform == 'win32'",
+    "torch>=2.13,<2.15",
     "piper-kernels>=0.7.3,<0.8",
 ]
 
@@ -41,6 +39,9 @@ gguf = [
 ]
 triton = [
     # Linux PyTorch distributions supply their matching CUDA or ROCm Triton.
+    # Triton Windows 3.8 is paired with PyTorch 2.14; the base package also
+    # supports Windows ROCm 10's PyTorch 2.13 without this optional extra.
+    "torch>=2.14,<2.15; sys_platform == 'win32'",
     "triton-windows>=3.8,<3.9; sys_platform == 'win32'",
 ]
 all = ["piper-offload[bnb,gguf,quanto,torchao,triton]"]
