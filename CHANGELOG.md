@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.10.0rc8] - 2026-09-22
+
 ### Changed
 
 - Require Piper Kernels 0.7.4 or newer, restoring the PyTorch 2.14 minimum
