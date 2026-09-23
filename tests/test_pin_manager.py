@@ -882,6 +882,30 @@ def test_checkpoint_storage_pins_through_an_owned_copy(backend: FakeBackend, tmp
     assert manager.stats.pinned_bytes == 0 and manager.stats.copy_bytes == 0
 
 
+@pytest.mark.skipif(torch.version.hip is None or not torch.cuda.is_available(), reason="ROCm device required")
+@pytest.mark.parametrize("budget", [0, 2 * PAGE])
+def test_real_rocm_checkpoint_transfer_uses_owned_copy_or_pageable_fallback(tmp_path, budget: int) -> None:
+    tensor = _checkpoint(tmp_path, 2 * PAGE - 100)
+    source = tensor[100:1100]
+    original = tensor.clone()
+    manager = PinManager(budget)
+    destination = torch.empty_like(source, device="cuda")
+    stream = torch.cuda.Stream()
+    try:
+        with manager.acquire([tensor]) as lease:
+            assert lease.registered_bytes == (tensor.nbytes if budget else 0)
+            assert manager.stats.copy_bytes == budget
+            with torch.cuda.stream(stream):
+                manager.transfer(destination, source, non_blocking=True)
+            stream.synchronize()
+        torch.testing.assert_close(destination.cpu(), original[100:1100], rtol=0, atol=0)
+    finally:
+        stream.synchronize()
+        manager.clear()
+    assert manager.stats.pinned_bytes == manager.stats.copy_bytes == 0
+    torch.testing.assert_close(tensor, original, rtol=0, atol=0)
+
+
 def test_copy_is_reserved_at_allocation_and_evicted_by_freeing(backend: FakeBackend, tmp_path) -> None:
     first = _checkpoint(tmp_path, 2 * PAGE, "first")
     second = _checkpoint(tmp_path, 2 * PAGE, "second")
