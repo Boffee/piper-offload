@@ -2319,6 +2319,41 @@ def test_only_the_spans_windows_discarded_are_read_again(
     manager.clear()
 
 
+@pytest.mark.parametrize(
+    ("kept_pages", "capacity_pages", "pinned_count"),
+    [(1, 0, 0), (1, 1, 1), (1, 2, 2), (1, 3, 3), (4, 2, 2), (4, None, 3)],
+)
+def test_ready_requests_register_before_a_later_intact_copy(
+    kept_pages, capacity_pages, pinned_count, backend, offering, reads, tmp_path,
+) -> None:
+    """Ready storage needs no fill, so it can register first without leaving intact pages waiting on reads."""
+    first, second = _tensors((0, PAGE), (2 * PAGE, PAGE))
+    kept = _checkpoint(tmp_path, kept_pages * PAGE, "kept")
+    manager = PinManager((kept_pages + 2) * PAGE, max_offered_bytes=kept_pages * PAGE, backend=backend)
+    with manager.acquire([kept]):
+        pass
+    kept_copy = _copy_pointer(backend)
+    manager.max_pinned_bytes = 0
+    manager.max_pinned_bytes = (kept_pages + 2) * PAGE
+    backend.capacity = None if capacity_pages is None else capacity_pages * PAGE
+    backend.register_calls.clear()
+    reads.clear()
+    requests = [first, second, kept]
+    try:
+        with manager.acquire(requests) as lease:
+            expected = requests[:pinned_count]
+            assert set(manager._registrations) == {tensor.untyped_storage().data_ptr() for tensor in expected}
+            assert lease.registered_bytes == sum(tensor.nbytes for tensor in expected)
+            assert not manager._pending
+            for tensor in requests:
+                torch.testing.assert_close(_transferred(manager, tensor), tensor)
+        attempts = [(first.data_ptr(), PAGE), (second.data_ptr(), PAGE), (kept_copy, kept_pages * PAGE)]
+        assert backend.register_calls == attempts[: min(pinned_count + 1, len(attempts))]
+        assert reads == []
+    finally:
+        manager.clear()
+
+
 @pytest.mark.parametrize("first_kind", ["fresh", "discarded"])
 @pytest.mark.parametrize("capacity", [None, 2 * PAGE])
 def test_an_intact_copy_registers_before_an_earlier_copy_is_read(

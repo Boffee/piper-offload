@@ -91,9 +91,10 @@ file holds what agents get wrong without it.
 - Every copy is touched a byte per page before it registers, and the copies
   that came back intact register before the rest is filled: both keep
   `cudaHostRegister` off its one-page-at-a-time path, and the second also
-  stops the fill pushing those pages out again. An intact copy registers as
-  soon as its own reclaim returns, beside the rest, and the acquisition waits
-  for the next reclaim only with the lock released. Nothing may be filled while
+  stops the fill pushing those pages out again. As each reclaim returns, the
+  ready request prefix registers, then the intact copy, without waiting for
+  earlier fills. The acquisition waits for the next reclaim only with the
+  lock released. Nothing may be filled while
   another copy is still offered, which is why every reclaim runs first: the
   fill's own demand is what Windows discards offered pages for. While the
   tier is on a fill reads through the file cache at the lowest memory

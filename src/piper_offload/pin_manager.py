@@ -418,10 +418,10 @@ class PinManager:
         from the offered tier when the storage has one there; the copies are
         reclaimed and fill with the lock released, the first alone and the
         rest together once it has registered, and a reclaimed copy whose pages
-        Windows kept intact is not read but registers as soon as it is back,
-        while the rest are still being reclaimed; everything else registers in
-        request order. A runtime capacity failure evicts unrelated idle
-        registrations and retries; if capacity remains unavailable, the
+        Windows kept intact registers after the ready prefix, without waiting
+        for earlier fills, while the rest are still being reclaimed;
+        everything else registers in request order. A runtime capacity failure
+        evicts unrelated idle registrations and retries; if capacity remains unavailable, the
         storage this acquisition has not registered yet skips registration. A
         rejected range alone stays pageable, without evicting other
         registrations or skipping later storage.
@@ -468,7 +468,7 @@ class PinManager:
         held: dict[int, _Registration],
         created: list[_Registration],
     ) -> bool:
-        """Register copies as memory prepares them, off the lock; whether the runtime's capacity ran out.
+        """Register under the lock as memory prepares copies off it; whether runtime capacity ran out.
 
         A ready copy that preparation hands back registers at once, ahead of
         earlier storage still waiting for its fill, because registering locks
@@ -666,18 +666,22 @@ class PinManager:
         created: list[_Registration],
         early: _Pending | None = None,
     ) -> bool:
-        """Register ``early``, then the ready prefix in request order; return whether runtime capacity is exhausted.
+        """Register the ready prefix, letting ``early`` pass an unfinished copy; whether runtime capacity ran out.
 
         Refused storage is evicted. Capacity exhaustion stops the pass; the
         caller joins workers before discarding the remaining pending storage.
         Memory preparation publishes readiness after joining the worker, so
         registration never races a worker.
         """
-        exhausted = early is not None and self._settle_pending(early, pending, held, created)
+        exhausted = False
         while not exhausted and pending:
             item = pending[0]
             if isinstance(item, _PendingCopy) and not item.load.ready:
-                break
+                if early is None:
+                    break
+                item = early
+            if item is early:
+                early = None
             exhausted = self._settle_pending(item, pending, held, created)
         self._pending_changed.notify_all()
         return exhausted

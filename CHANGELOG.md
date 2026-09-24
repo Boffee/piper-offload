@@ -120,6 +120,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Fixed
 
+- Ready request prefixes retain their registration priority ahead of intact offered
+  copies, so an oversized reclaimed copy cannot prevent earlier ready storage
+  from using available runtime capacity. Intact copies still skip earlier fills.
 - A copy's storage is now built over a `memoryview` of its region, so the
   region counts it as an export and cannot be released while a tensor still
   points into it. Freeing an evicted copy under a transfer view that outlived

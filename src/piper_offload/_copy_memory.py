@@ -291,10 +291,9 @@ class Memory(ABC):
     def prepare(self, copies: list[CopyLoad]) -> Generator[CopyLoad | None]:
         """Snapshot policy under the lock; advance and close the generator outside it.
 
-        Each result is a copy whose preparation has just finished, which the
-        manager registers at once if it is ready, ahead of storage before it,
-        or None, after which what is ready registers in request order. The
-        first result lets the manager detect exhausted runtime capacity
+        A yielded copy registers after the ready prefix if it is ready,
+        without waiting for earlier fills. None advances registration only
+        in request order. The first result lets the manager detect exhausted runtime capacity
         before reading the remaining copies. Close this generator before
         freeing any acquisition copy.
         """

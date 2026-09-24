@@ -300,6 +300,12 @@ returns, so registration runs beside the rest of the reclaims rather than
 after them: that checkpoint comes back intact and registered in 0.93 to
 0.97 s this way, against 1.16 to 1.20 s as two passes.
 
+Registration processes the ready prefix in request order before an intact
+copy passes an earlier copy still needing a fill. In-place storage at the front
+therefore keeps its priority without delaying intact copies behind file reads.
+The pin budget is reserved in request order, but if the runtime cannot pin
+everything reserved, intact copies can take capacity before unfilled copies.
+
 Offered pages are what Windows takes back first when memory runs short, so
 whether they survive depends on what else wants the memory. Copies are offered
 at normal offer priority; at the lowest, Windows drops every offered page as
