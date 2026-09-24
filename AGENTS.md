@@ -19,12 +19,16 @@ file holds what agents get wrong without it.
   DTensor), `tensor_adapter_registry.py`.
 - Adapters: `adapter.py`, `lora.py`, `parameter_delta.py`,
   `parameter_value.py`, `parameter_transform.py`, `merge.py`.
-- Host memory: `pin_manager.py`, `checkpoint.py`, `_host_registration.py`,
-  `_host_memory.py` (import-time platform selection), `_host_memory_linux.py`
-  (anonymous mappings, cgroup limits, positional reads), and
-  `_host_memory_windows.py` (VirtualAlloc regions, per-worker readers,
-  memory priorities, and the commitment event). Leases, budgets, and
-  registration ordering stay shared in `pin_manager.py`.
+- Host memory: `pin_manager.py`, `checkpoint.py`, `_host_registration.py`.
+  `_host_memory.py` selects one memory component at import. `_copy_memory.py`
+  holds shared copies and fill scheduling; `_host_memory_linux.py` supplies
+  anonymous mappings, cgroup limits, and positional reads.
+  `_copy_memory_windows.py` owns offered-copy retention, reclaim scheduling,
+  and the commitment watcher, using native calls in `_host_memory_windows.py`.
+  Leases, pin accounting, and registration order stay in `pin_manager.py`.
+  Memory shares its lock; preparation and release batches join workers only
+  outside that lock. Copy ownership transfers at reservation and successful
+  unregistration, and the memory component must never retain the manager.
 - Experimental DTensor: `communication.py`, `sequential.py`.
 
 ## Engineering rules

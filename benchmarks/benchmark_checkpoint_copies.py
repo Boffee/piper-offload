@@ -32,7 +32,8 @@ from pathlib import Path
 import _process_memory as process_memory
 import torch
 
-import piper_offload.pin_manager as pin_module
+import piper_offload._copy_memory as copy_memory
+import piper_offload._copy_memory_windows as windows_memory
 from piper_offload import MappedCheckpoint, PinManager
 from piper_offload._host_registration import RuntimeHostRegistration
 
@@ -96,13 +97,13 @@ class _Phases:
         self.reclaims = process_memory.Reclaims()
         self.fill_s = self.reclaim_s = self.offer_s = 0.0
         self.result: dict[str, object] = {}
-        self._original_fill = pin_module._fill_copies
-        self._original_reclaim = pin_module._reclaimed
-        self._original_offer = pin_module._OfferBatch.take
-        pin_module._fill_copies = self._timed_fill
-        pin_module._reclaimed = self._timed_reclaim
+        self._original_fill = copy_memory._fill_copies
+        self._original_reclaim = windows_memory._reclaimed
+        self._original_offer = windows_memory._OfferBatch.take
+        copy_memory._fill_copies = self._timed_fill
+        windows_memory._reclaimed = self._timed_reclaim
 
-        def timed_take(batch: pin_module._OfferBatch) -> tuple[list[object], list[str | None]]:
+        def timed_take(batch: windows_memory._OfferBatch) -> list[tuple[copy_memory.CopyOwner, str | None]]:
             """What an eviction still waits for once it has unregistered everything; the rest overlapped that."""
             start = time.perf_counter()
             try:
@@ -110,14 +111,16 @@ class _Phases:
             finally:
                 self.offer_s += time.perf_counter() - start
 
-        pin_module._OfferBatch.take = timed_take
+        windows_memory._OfferBatch.take = timed_take
 
-    def _timed_fill(self, pending: list[pin_module._PendingCopy], **options: bool) -> None:
+    def _timed_fill(
+        self, pending: list[copy_memory.CopyLoad], *, readers: copy_memory.Readers, read: copy_memory.ReadRange,
+    ) -> None:
         start = time.perf_counter()
-        self._original_fill(pending, **options)
+        self._original_fill(pending, readers=readers, read=read)
         self.fill_s += time.perf_counter() - start
 
-    def _timed_reclaim(self, pending: list[pin_module._PendingCopy]) -> Generator[pin_module._PendingCopy]:
+    def _timed_reclaim(self, pending: list[copy_memory.CopyLoad]) -> Generator[copy_memory.CopyLoad]:
         """The reclaim phase, including the registration of intact copies that runs beside it."""
         start = time.perf_counter()
         try:
@@ -126,9 +129,9 @@ class _Phases:
             self.reclaim_s += time.perf_counter() - start
 
     def restore(self) -> None:
-        pin_module._fill_copies = self._original_fill
-        pin_module._reclaimed = self._original_reclaim
-        pin_module._OfferBatch.take = self._original_offer
+        copy_memory._fill_copies = self._original_fill
+        windows_memory._reclaimed = self._original_reclaim
+        windows_memory._OfferBatch.take = self._original_offer
         self.reclaims.restore()
 
     def start(self) -> float:

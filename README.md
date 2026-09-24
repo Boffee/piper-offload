@@ -206,6 +206,14 @@ released.
 
 #### Offered copies on Windows
 
+`PinManager` uses a platform memory component selected once at import.
+The manager owns leases, pin accounting, registration order, and the shared
+lock. The Linux component allocates and frees mappings; the Windows component
+also owns offered-copy retention, reclamation, and commitment monitoring.
+Both use the same copy-fill scheduling. Copies transfer to the manager at
+reservation and back to memory only after successful unregistration;
+preparation and release batches join their workers outside the shared lock.
+
 Copies are `VirtualAlloc` regions on Windows and anonymous mappings
 elsewhere. `host_pin_manager.max_offered_bytes`, zero by default, turns on an
 optional Windows tier that keeps an evicted copy's bytes instead of freeing

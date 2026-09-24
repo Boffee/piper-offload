@@ -362,11 +362,6 @@ def available_memory() -> int:
     return status.total_physical
 
 
-def new_region(size: int) -> VirtualRegion:
-    """An owned page-aligned allocation whose pages can be offered after unregistration."""
-    return VirtualRegion(size)
-
-
 class Readers(contextlib.AbstractContextManager["Readers"]):
     """Checkpoint reads through one handle per file per worker, closed after the fill.
 
@@ -401,4 +396,4 @@ class Readers(contextlib.AbstractContextManager["Readers"]):
         return handle.readinto(buffer)
 
 
-__all__ = ["Readers", "VirtualRegion", "available_memory", "commit_exhausted", "new_region", "reading_below_offers"]
+__all__ = ["Readers", "VirtualRegion", "available_memory", "commit_exhausted", "reading_below_offers"]

@@ -9,6 +9,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
+from ._copy_memory import Copy
+from ._copy_memory import Memory as CopyMemory
+
 _PROC_CGROUP = "/proc/self/cgroup"
 _CGROUP_MOUNT = "/sys/fs/cgroup"
 
@@ -62,11 +65,6 @@ def available_memory() -> int:
     return total if limit is None else min(total, limit)
 
 
-def new_region(size: int) -> mmap.mmap:
-    """An owned page-aligned anonymous mapping, freed on eviction."""
-    return mmap.mmap(-1, size)
-
-
 def _preadv(fd: int, buffer: memoryview, offset: int) -> int:
     # preadv is absent on Windows, where the selector uses per-worker handles.
     preadv = cast(Callable[[int, list[memoryview], int], int], getattr(os, "preadv"))  # noqa: B009
@@ -83,4 +81,13 @@ class Readers(contextlib.AbstractContextManager["Readers"]):
         pass
 
 
-__all__ = ["Readers", "available_memory", "new_region"]
+class Memory(CopyMemory):
+    """Linux copies use anonymous mappings and return to the OS on eviction."""
+
+    readers = Readers
+
+    def new_copy(self, size: int) -> Copy:
+        return Copy(size, mmap.mmap(-1, size))
+
+
+__all__ = ["Memory", "Readers", "available_memory"]

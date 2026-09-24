@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+import piper_offload._copy_memory as copy_memory
 import piper_offload.block_component as block_component_module
 import piper_offload.host_component as host_component_module
 import piper_offload.merge as merge_module
@@ -656,14 +657,14 @@ def test_mapped_checkpoint_streams_from_owned_copies(mode, pins, tmp_path, monke
         block_compile=BlockCompileConfig(fullgraph=True) if mode == "rolling" else None,
     )
     resolved: list[torch.Tensor] = []
-    original_view = pin_module._Copy.view
+    original_view = copy_memory.Copy.view
 
-    def recording(copy: pin_module._Copy, tensor: torch.Tensor) -> torch.Tensor:
+    def recording(copy: copy_memory.Copy, tensor: torch.Tensor) -> torch.Tensor:
         view = original_view(copy, tensor)
         resolved.append(view)
         return view
 
-    monkeypatch.setattr(pin_module._Copy, "view", recording)
+    monkeypatch.setattr(copy_memory.Copy, "view", recording)
     try:
         with activated_model(offloader, "cuda"), torch.inference_mode():
             actual = offloader.value(inputs.cuda()).cpu()
@@ -826,11 +827,12 @@ def test_failed_synchronization_keeps_the_routed_lease(pins, monkeypatch) -> Non
 
 @CUDA
 @pytest.mark.parametrize("reclaim_code", [0, 170], ids=["intact", "discarded"])
-def test_rotating_mapped_models_streams_from_offered_copies(reclaim_code, pins, tmp_path, monkeypatch) -> None:
+def test_rotating_mapped_models_streams_from_offered_copies(reclaim_code, tmp_path, monkeypatch, request) -> None:
     """Two streamed checkpoints over a budget that holds one: each switch offers a copy and takes the other back."""
     safetensors = pytest.importorskip("safetensors.torch")
-    manager, backend = pins
     kernel = install_fake_kernel(monkeypatch, [])
+    # The platform component is selected when the manager is constructed.
+    manager, backend = request.getfixturevalue("pins")
     kernel.reclaim_code = reclaim_code
     rotation = []
     for name in ("first", "second"):
@@ -857,9 +859,9 @@ def test_rotating_mapped_models_streams_from_offered_copies(reclaim_code, pins, 
         assert manager.stats.offered_bytes == manager.max_offered_bytes > 0
         counts = {name: sum(event == name for event, _pointer in kernel.events) for name in ("offer", "reclaim")}
         # Every offer but the ones still held was taken back by the next activation.
-        assert counts["offer"] == counts["reclaim"] + len(manager._offered) > 0
+        assert counts["offer"] == counts["reclaim"] + len(manager._memory._offered) > 0
         # Each storage's copy was built once and reused from the tier thereafter.
-        copies = manager.stats.registrations + len(manager._offered)
+        copies = manager.stats.registrations + len(manager._memory._offered)
         assert sum(event == "allocate" for event, _pointer in kernel.events) == copies
     finally:
         for offloader, _inputs, _expected in rotation:

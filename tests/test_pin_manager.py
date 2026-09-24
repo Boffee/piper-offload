@@ -17,6 +17,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+import piper_offload._copy_memory as copy_memory
+import piper_offload._copy_memory_windows as windows_memory
 import piper_offload._host_memory_linux as linux_memory
 import piper_offload._host_memory_windows as memory_module
 import piper_offload._host_registration as registration_module
@@ -176,9 +178,8 @@ def install_fake_kernel(monkeypatch: pytest.MonkeyPatch, events: list[tuple[str,
     kernel = FakeKernel(events)
     monkeypatch.setattr(memory_module, "_kernel32", lambda: kernel)
     monkeypatch.setattr(memory_module, "_thread_memory_priority", lambda: kernel.priority)
-    monkeypatch.setattr(pin_module, "commit_exhausted", lambda timeout=0.0: kernel.commit_exhausted.wait(timeout))
-    monkeypatch.setattr(pin_module.host_memory, "new_region", VirtualRegion)
-    monkeypatch.setattr(pin_module.host_memory, "Readers", memory_module.Readers)
+    monkeypatch.setattr(windows_memory, "commit_exhausted", lambda timeout=0.0: kernel.commit_exhausted.wait(timeout))
+    monkeypatch.setattr(pin_module.host_memory, "Memory", windows_memory.Memory)
     return kernel
 
 
@@ -191,13 +192,13 @@ def offering(backend: FakeBackend, monkeypatch: pytest.MonkeyPatch) -> FakeKerne
 def reads(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
     """Every (offset, length) a fill reads from a checkpoint."""
     recorded: list[tuple[int, int]] = []
-    original = pin_module._read_range
+    original = copy_memory._read_range
 
     def recording(read_at, view, offset, start, stop) -> None:
         recorded.append((offset + start, stop - start))
         original(read_at, view, offset, start, stop)
 
-    monkeypatch.setattr(pin_module, "_read_range", recording)
+    monkeypatch.setattr(copy_memory, "_read_range", recording)
     return recorded
 
 
@@ -1068,7 +1069,7 @@ def test_sliced_fill_covers_the_copy_through_short_reads(backend: FakeBackend, t
         return count
 
     monkeypatch.setattr(os, "preadv", recording_preadv)
-    monkeypatch.setattr(pin_module, "_FILL_SLICE", PAGE)
+    monkeypatch.setattr(copy_memory, "_FILL_SLICE", PAGE)
     manager = PinManager(16 * PAGE, backend=backend)
     with manager.acquire([tensor]):
         torch.testing.assert_close(_transferred(manager, tensor), tensor)
@@ -1111,8 +1112,8 @@ def test_copies_of_one_acquisition_fill_together(backend: FakeBackend, tmp_path,
             return SimpleNamespace(result=result)
 
     third = _checkpoint(tmp_path, 2 * PAGE, "third")
-    monkeypatch.setattr(pin_module, "ThreadPoolExecutor", _Pool)
-    monkeypatch.setattr(pin_module, "_FILL_SLICE", PAGE)
+    monkeypatch.setattr(copy_memory, "ThreadPoolExecutor", _Pool)
+    monkeypatch.setattr(copy_memory, "_FILL_SLICE", PAGE)
     manager = PinManager(16 * PAGE, backend=backend)
     with manager.acquire([first, second, third]) as lease:
         assert lease.registered_bytes == 14 * PAGE
@@ -1127,8 +1128,8 @@ def test_a_fill_without_positional_reads_uses_a_handle_per_worker(
     backend: FakeBackend, tmp_path, monkeypatch,
 ) -> None:
     """A Windows handle has one position, so each worker reads through its own; they close with the fill."""
-    monkeypatch.setattr(pin_module.host_memory, "Readers", memory_module.Readers)
-    monkeypatch.setattr(pin_module, "_FILL_SLICE", PAGE)
+    monkeypatch.setattr(pin_module.host_memory.Memory, "readers", memory_module.Readers)
+    monkeypatch.setattr(copy_memory, "_FILL_SLICE", PAGE)
     tensors = [_checkpoint(tmp_path, 8 * PAGE, f"copy{index}") for index in range(3)]
     provenance = {file_slice(tensor).file for tensor in tensors}
     opened: list = []
@@ -1158,9 +1159,9 @@ def test_failed_fill_leaves_the_storage_pageable(backend: FakeBackend, tmp_path,
     def broken(*_args):
         raise OSError("injected read failure")
 
-    monkeypatch.setattr(pin_module, "_read_range", broken)
+    monkeypatch.setattr(copy_memory, "_read_range", broken)
     manager = PinManager(4 * PAGE, backend=backend)
-    with caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager"), manager.acquire([tensor]) as lease:
+    with caplog.at_level(logging.WARNING, logger="piper_offload"), manager.acquire([tensor]) as lease:
         assert (lease.registered_bytes, lease.pageable_bytes) == (0, 2 * PAGE)
         assert backend.register_calls == [] and manager.stats.pinned_bytes == 0
     assert "injected read failure" in caplog.text
@@ -1199,9 +1200,9 @@ def test_copy_allocation_failure_leaves_the_storage_pageable(
     def exhausted(_size: int) -> None:
         raise MemoryError("injected allocation failure")
 
-    monkeypatch.setattr(pin_module, "_Copy", exhausted)
+    monkeypatch.setattr(pin_module.host_memory.Memory, "new_copy", lambda _self, size: exhausted(size))
     manager = PinManager(4 * PAGE, backend=backend)
-    with caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager"), manager.acquire([tensor]) as lease:
+    with caplog.at_level(logging.WARNING, logger="piper_offload"), manager.acquire([tensor]) as lease:
         assert (lease.registered_bytes, lease.pageable_bytes) == (0, 2 * PAGE)
         assert backend.register_calls == [] and manager.stats.pinned_bytes == 0
     assert "injected allocation failure" in caplog.text
@@ -1214,7 +1215,7 @@ def test_a_pinning_acquisition_waits_for_a_pending_fill_while_a_pageable_one_pro
     tensor = _checkpoint(tmp_path, 2 * PAGE)
     pinning, pageable = _tensors((0, PAGE), (2 * PAGE, PAGE))
     manager = PinManager(8 * PAGE, backend=backend)
-    original = pin_module._fill_copies
+    original = copy_memory._fill_copies
     leases: dict[str, PinLease] = {}
     pinner = threading.Thread(target=lambda: leases.__setitem__("pinning", manager.acquire([pinning])))
     pager = threading.Thread(target=lambda: leases.__setitem__("pageable", manager.acquire([pageable], pin=False)))
@@ -1228,7 +1229,7 @@ def test_a_pinning_acquisition_waits_for_a_pending_fill_while_a_pageable_one_pro
         during_fill.extend((pager.is_alive(), pinner.is_alive()))
         original(pending, **options)
 
-    monkeypatch.setattr(pin_module, "_fill_copies", fill_while_others_acquire)
+    monkeypatch.setattr(copy_memory, "_fill_copies", fill_while_others_acquire)
     with manager.acquire([tensor]) as lease:
         pinner.join()
         # The pageable acquisition of other storage completed during the fill;
@@ -1245,7 +1246,7 @@ def test_an_alias_of_pending_storage_is_rejected_during_the_fill(backend: FakeBa
     tensor = _checkpoint(tmp_path, 2 * PAGE)
     anonymous, alias = _tensors((0, 2 * PAGE), (PAGE, 2 * PAGE))
     manager = PinManager(8 * PAGE, backend=backend)
-    original = pin_module._fill_copies
+    original = copy_memory._fill_copies
     rejected: list[bool] = []
 
     def fill_while_an_alias_is_acquired(pending, **options):
@@ -1256,7 +1257,7 @@ def test_an_alias_of_pending_storage_is_rejected_during_the_fill(backend: FakeBa
         rejected.append(True)
         original(pending, **options)
 
-    monkeypatch.setattr(pin_module, "_fill_copies", fill_while_an_alias_is_acquired)
+    monkeypatch.setattr(copy_memory, "_fill_copies", fill_while_an_alias_is_acquired)
     with manager.acquire([tensor, anonymous]) as lease:
         assert rejected == [True] and lease.registered_bytes == 4 * PAGE
     manager.clear()
@@ -1307,14 +1308,14 @@ def test_an_exhausted_runtime_is_found_before_the_rest_is_read(backend: FakeBack
     copies = [_checkpoint(tmp_path, 2 * PAGE, name) for name in ("first", "second", "third")]
     backend.capacity = PAGE
     manager = PinManager(8 * PAGE, backend=backend)
-    original = pin_module._fill_copies
+    original = copy_memory._fill_copies
     filled: list[int] = []
 
     def counting_fill(pending, **options):
         filled.append(len(pending))
         original(pending, **options)
 
-    monkeypatch.setattr(pin_module, "_fill_copies", counting_fill)
+    monkeypatch.setattr(copy_memory, "_fill_copies", counting_fill)
     with manager.acquire(copies) as lease:
         # Only the first copy was read: its refusal evicted the other two unfilled.
         assert filled == [1] and len(backend.register_calls) == 1
@@ -1352,7 +1353,7 @@ def test_one_failed_fill_leaves_the_other_copies_registered(
 
     monkeypatch.setattr(os, "preadv", failing_preadv)
     manager = PinManager(8 * PAGE, backend=backend)
-    warnings = caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager")
+    warnings = caplog.at_level(logging.WARNING, logger="piper_offload")
     with warnings, manager.acquire([first, second]) as lease:
         assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 2 * PAGE)
         assert len(backend.register_calls) == 1 and manager.stats.copy_bytes == 2 * PAGE
@@ -1367,7 +1368,7 @@ def test_an_acquisition_of_pending_storage_waits_until_it_registers(
 ) -> None:
     tensor = _checkpoint(tmp_path, 2 * PAGE)
     manager = PinManager(8 * PAGE, backend=backend)
-    original = pin_module._fill_copies
+    original = copy_memory._fill_copies
     other: list[PinLease] = []
     thread = threading.Thread(target=lambda: other.append(manager.acquire([tensor], pin=False)))
     during_fill: list[tuple[int, bool]] = []
@@ -1378,7 +1379,7 @@ def test_an_acquisition_of_pending_storage_waits_until_it_registers(
         during_fill.append((manager.stats.copy_bytes, thread.is_alive()))
         original(pending, **options)
 
-    monkeypatch.setattr(pin_module, "_fill_copies", fill_while_another_acquisition_waits)
+    monkeypatch.setattr(copy_memory, "_fill_copies", fill_while_another_acquisition_waits)
     with manager.acquire([tensor]) as lease:
         thread.join()
         assert lease.registered_bytes == 2 * PAGE
@@ -1457,9 +1458,9 @@ def test_clear_frees_every_copy_off_the_lock(backend: FakeBackend, tmp_path) -> 
         manager._registrations[tensor.untyped_storage().data_ptr()].copy.region for tensor in tensors
     ]
     freed_by: list[tuple[str, bool]] = []
-    original = pin_module._Copy.free
+    original = copy_memory.Copy.free
 
-    def watch_free(copy: pin_module._Copy) -> None:
+    def watch_free(copy: copy_memory.Copy) -> None:
         acquired = manager._lock.acquire(blocking=False)
         if acquired:
             manager._lock.release()
@@ -1467,7 +1468,7 @@ def test_clear_frees_every_copy_off_the_lock(backend: FakeBackend, tmp_path) -> 
         original(copy)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(pin_module._Copy, "free", watch_free)
+        patch.setattr(copy_memory.Copy, "free", watch_free)
         manager.clear()
 
     assert all(region.closed for region in regions)
@@ -1578,13 +1579,13 @@ def test_discarded_pages_are_refilled_in_full_before_the_copy_is_registered(
     offering.reclaim_code = 170  # ERROR_BUSY: Windows discarded the pages
     reads.clear()
     registered_during_fill: list[bool] = []
-    original = pin_module._fill_copies
+    original = copy_memory._fill_copies
 
     def fill_while_unregistered(pending, **options) -> None:
         registered_during_fill.append(_copy_pointer(backend) in backend.registered)
         original(pending, **options)
 
-    monkeypatch.setattr(pin_module, "_fill_copies", fill_while_unregistered)
+    monkeypatch.setattr(copy_memory, "_fill_copies", fill_while_unregistered)
     with manager.acquire([first]) as lease:
         # Every byte is read back, while the copy is still unregistered, so no
         # transfer can reach the undefined contents.
@@ -1693,7 +1694,7 @@ def test_a_failed_offer_frees_the_unregistered_copy(backend, offering, tmp_path,
         pass
     offered_pointer = _copy_pointer(backend)
     offering.offer_code = 1450  # ERROR_NO_SYSTEM_RESOURCES
-    warnings = caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager")
+    warnings = caplog.at_level(logging.WARNING, logger="piper_offload")
     with warnings, manager.acquire([second]) as lease:
         replacement = _copy_pointer(backend, 1)
         assert _offered_after_unregistering(backend, offered_pointer)
@@ -1714,7 +1715,7 @@ def test_a_view_that_outlives_its_lease_frees_the_copy_instead_of_offering_it(
     with manager.acquire([first]):
         stray = manager._registrations[first.untyped_storage().data_ptr()].copy.view(first)
     offered_pointer = _copy_pointer(backend)
-    warnings = caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager")
+    warnings = caplog.at_level(logging.WARNING, logger="piper_offload")
     with warnings, manager.acquire([second]):
         # Offered pages must not be readable, so a copy something still views
         # is freed instead, and its memory returns when that view dies.
@@ -1734,7 +1735,7 @@ def test_an_unreclaimable_copy_is_freed_and_rebuilt(backend, offering, reads, tm
     offering.reclaim_code = 1453  # not ERROR_BUSY: the pages' state is unknown
     reads.clear()
     backend.events.clear()
-    warnings = caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager")
+    warnings = caplog.at_level(logging.WARNING, logger="piper_offload")
     with warnings, manager.acquire([first]) as lease:
         rebuilt = backend.register_calls[-1][0]
         assert backend.events[2:] == [
@@ -1753,7 +1754,7 @@ def test_a_rebuild_that_cannot_allocate_leaves_the_storage_pageable(backend, off
     offered_pointer = _copy_pointer(backend)
     offering.reclaim_code = 1453
     offering.allocation_failures = 1
-    warnings = caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager")
+    warnings = caplog.at_level(logging.WARNING, logger="piper_offload")
     with warnings, manager.acquire([first]) as lease:
         assert ("free", offered_pointer) in backend.events
         assert (lease.registered_bytes, lease.pageable_bytes) == (0, 2 * PAGE)
@@ -1948,7 +1949,8 @@ def test_copies_are_freed_when_the_platform_cannot_offer_them(backend, tmp_path,
     first = _checkpoint(tmp_path, 2 * PAGE, "first")
     second = _checkpoint(tmp_path, 2 * PAGE, "second")
     # Anonymous mappings, as on Linux: the budget is set, but nothing is offered.
-    monkeypatch.setattr(pin_module.host_memory, "new_region", lambda size: mmap.mmap(-1, size))
+    monkeypatch.setattr(linux_memory.Memory, "readers", pin_module.host_memory.Memory.readers)
+    monkeypatch.setattr(pin_module.host_memory, "Memory", linux_memory.Memory)
     manager = _offered_manager(backend)
     with manager.acquire([first]):
         pass
@@ -2106,8 +2108,8 @@ def test_a_failed_refill_after_a_discard_leaves_the_storage_pageable(
     def broken(*_args) -> None:
         raise OSError("injected read failure")
 
-    monkeypatch.setattr(pin_module, "_read_range", broken)
-    warnings = caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager")
+    monkeypatch.setattr(copy_memory, "_read_range", broken)
+    warnings = caplog.at_level(logging.WARNING, logger="piper_offload")
     with warnings, manager.acquire([first]) as lease:
         # The discarded copy could not be rewritten, so it is freed rather than
         # registered, and the transfer falls back to the mapping.
@@ -2127,9 +2129,9 @@ def test_offered_copies_are_reclaimed_together_with_the_lock_released(backend, o
     """
     manager, tensors = _offer_three(backend, tmp_path)
     reclaimed_by: list[tuple[str, bool]] = []
-    original = pin_module._Copy.reclaim
+    original = windows_memory.WindowsCopy.reclaim
 
-    def watch(copy: pin_module._Copy) -> bool:
+    def watch(copy: copy_memory.Copy) -> bool:
         acquired = manager._lock.acquire(timeout=5)
         if acquired:
             manager._lock.release()
@@ -2137,7 +2139,7 @@ def test_offered_copies_are_reclaimed_together_with_the_lock_released(backend, o
         return original(copy)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(pin_module._Copy, "reclaim", watch)
+        patch.setattr(windows_memory.WindowsCopy, "reclaim", watch)
         with manager.acquire(tensors) as lease:
             assert lease.registered_bytes == 6 * PAGE
             for tensor in tensors:
@@ -2159,9 +2161,9 @@ def test_an_eviction_offers_each_copy_while_it_unregisters_the_rest(
         pass
     offering_started = threading.Event()
     during: list[bool] = []
-    offer_copy, unregister = pin_module._offer_copy, backend.unregister
+    offer_copy, unregister = windows_memory._offer_copy, backend.unregister
 
-    def offering_one(copy: pin_module._Copy) -> str | None:
+    def offering_one(copy: copy_memory.Copy) -> str | None:
         failure = offer_copy(copy)
         offering_started.set()
         return failure
@@ -2171,7 +2173,7 @@ def test_an_eviction_offers_each_copy_while_it_unregisters_the_rest(
             during.append(offering_started.wait(5))
         unregister(pointer)
 
-    monkeypatch.setattr(pin_module, "_offer_copy", offering_one)
+    monkeypatch.setattr(windows_memory, "_offer_copy", offering_one)
     monkeypatch.setattr(backend, "unregister", unregistering_one)
     with manager.acquire([other]) as lease:
         assert lease.registered_bytes == 8 * PAGE
@@ -2187,9 +2189,9 @@ def test_an_acquisitions_evictions_are_offered_together_with_the_lock_released(b
     with manager.acquire(tensors):
         pass
     offered_by: list[tuple[str, bool]] = []
-    original = pin_module._Copy.offer
+    original = windows_memory.WindowsCopy.offer
 
-    def watch(copy: pin_module._Copy) -> None:
+    def watch(copy: copy_memory.Copy) -> None:
         # A worker's garbage collection can need the lock, so waiting for one
         # while holding it would deadlock; the manager waits only after it
         # has let go, and this stands in for that finalizer.
@@ -2200,7 +2202,7 @@ def test_an_acquisitions_evictions_are_offered_together_with_the_lock_released(b
         original(copy)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(pin_module._Copy, "offer", watch)
+        patch.setattr(windows_memory.WindowsCopy, "offer", watch)
         with manager.acquire([other]) as lease:
             assert lease.registered_bytes == 8 * PAGE
     # All three evictions made room for one acquisition, and were offered on a
@@ -2219,14 +2221,14 @@ def test_a_lease_that_closes_over_budget_offers_its_copy_as_it_closes(backend, o
     manager.max_pinned_bytes = 0
     assert (manager.stats.pinned_bytes, manager.stats.offered_bytes) == (2 * PAGE, 0)
     offered_on: list[str] = []
-    original = pin_module._Copy.offer
+    original = windows_memory.WindowsCopy.offer
 
-    def watch(copy: pin_module._Copy) -> None:
+    def watch(copy: copy_memory.Copy) -> None:
         offered_on.append(threading.current_thread().name)
         original(copy)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(pin_module._Copy, "offer", watch)
+        patch.setattr(windows_memory.WindowsCopy, "offer", watch)
         lease.close()
     # A lease can close from a finalizer, which is no place for a pool, so the
     # copy is offered right there.
@@ -2245,7 +2247,7 @@ def test_a_copy_whose_storage_is_pinned_again_while_it_is_offered_is_freed(
         with manager.acquire([tensor]):
             pass
     old = _copy_pointer(backend)
-    original = pin_module._OfferBatch.take
+    original = windows_memory._OfferBatch.take
     rebuilt: list[PinLease] = []
     racing: list[bool] = []
 
@@ -2257,7 +2259,7 @@ def test_a_copy_whose_storage_is_pinned_again_while_it_is_offered_is_freed(
             rebuilt.append(manager.acquire([first]))
         return original(batch)
 
-    monkeypatch.setattr(pin_module._OfferBatch, "take", take_while_first_is_pinned_again)
+    monkeypatch.setattr(windows_memory._OfferBatch, "take", take_while_first_is_pinned_again)
     manager.max_pinned_bytes = 2 * PAGE  # evicts the least recent copy, the first
     new = manager._registrations[first.untyped_storage().data_ptr()].copy.pointer
     # The old copy was offered, then freed rather than kept beside its
@@ -2277,14 +2279,14 @@ def test_a_copy_whose_owner_is_dropped_while_it_is_offered_is_freed(backend, off
     with manager.acquire(owners):
         pass
     offered_pointer = _copy_pointer(backend)
-    original = pin_module._OfferBatch.take
+    original = windows_memory._OfferBatch.take
 
     def take_after_the_owner_is_dropped(batch):
         owners.clear()
         gc.collect()
         return original(batch)
 
-    monkeypatch.setattr(pin_module._OfferBatch, "take", take_after_the_owner_is_dropped)
+    monkeypatch.setattr(windows_memory._OfferBatch, "take", take_after_the_owner_is_dropped)
     with manager.acquire([second]) as lease:
         assert lease.registered_bytes == 2 * PAGE
         assert backend.events.index(("offer", offered_pointer)) < backend.events.index(("free", offered_pointer))
@@ -2366,7 +2368,7 @@ def test_a_failed_earlier_fill_does_not_block_an_intact_copy(
     def failed_read(*_args):
         raise OSError("injected read failure")
 
-    monkeypatch.setattr(pin_module, "_read_range", failed_read)
+    monkeypatch.setattr(copy_memory, "_read_range", failed_read)
     try:
         with manager.acquire([first, kept]) as lease:
             assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 2 * PAGE)
@@ -2390,13 +2392,13 @@ def test_copies_that_come_back_intact_register_before_the_rest_is_read(
         pass
     offered = _copy_pointer(backend)
     manager.max_pinned_bytes = 0  # the idle copy is evicted, and so offered
-    original = pin_module._fill_copies
+    original = copy_memory._fill_copies
 
     def noting(pending, **options):
         backend.events.append(("fill", len(pending)))
         return original(pending, **options)
 
-    monkeypatch.setattr(pin_module, "_fill_copies", noting)
+    monkeypatch.setattr(copy_memory, "_fill_copies", noting)
     manager.max_pinned_bytes = 8 * PAGE
     backend.events.clear()  # only what the reacquisition does is of interest
     with manager.acquire([kept, fresh]) as lease:
@@ -2419,9 +2421,9 @@ def test_an_intact_copy_registers_while_the_rest_are_still_being_reclaimed(
     last = _copy_pointer(backend, 2)
     first_registered = threading.Event()
     waited: list[bool] = []
-    reclaim, register = pin_module._Copy.reclaim, backend.register
+    reclaim, register = windows_memory.WindowsCopy.reclaim, backend.register
 
-    def reclaiming(copy: pin_module._Copy) -> list[tuple[int, int]]:
+    def reclaiming(copy: copy_memory.Copy) -> list[tuple[int, int]]:
         if copy.region.address == last:
             waited.append(first_registered.wait(5))
         return reclaim(copy)
@@ -2430,7 +2432,7 @@ def test_an_intact_copy_registers_while_the_rest_are_still_being_reclaimed(
         first_registered.set()
         return register(pointer, size)
 
-    monkeypatch.setattr(pin_module._Copy, "reclaim", reclaiming)
+    monkeypatch.setattr(windows_memory.WindowsCopy, "reclaim", reclaiming)
     monkeypatch.setattr(backend, "register", registering)
     with manager.acquire(tensors) as lease:
         assert lease.registered_bytes == 6 * PAGE
@@ -2449,9 +2451,9 @@ def test_capacity_running_out_on_a_reclaimed_copy_frees_the_rest_once_reclaimed(
     first = _copy_pointer(backend)
     backend.refuse.add(first)
     refused = threading.Event()
-    reclaim, register = pin_module._Copy.reclaim, backend.register
+    reclaim, register = windows_memory.WindowsCopy.reclaim, backend.register
 
-    def reclaiming(copy: pin_module._Copy) -> list[tuple[int, int]]:
+    def reclaiming(copy: copy_memory.Copy) -> list[tuple[int, int]]:
         address = copy.region.address
         if address != first:
             refused.wait(5)  # still reclaiming once the first copy has been refused
@@ -2465,7 +2467,7 @@ def test_capacity_running_out_on_a_reclaimed_copy_frees_the_rest_once_reclaimed(
         finally:
             refused.set()
 
-    monkeypatch.setattr(pin_module._Copy, "reclaim", reclaiming)
+    monkeypatch.setattr(windows_memory.WindowsCopy, "reclaim", reclaiming)
     monkeypatch.setattr(backend, "register", registering)
     reads.clear()
     backend.register_calls.clear()
@@ -2487,13 +2489,13 @@ def test_every_copy_is_touched_after_it_comes_back_and_before_it_registers(
 ) -> None:
     """Registration faults pages that left the working set one at a time, so a copy is touched first."""
     tensors = [_checkpoint(tmp_path, 2 * PAGE, f"model{index}") for index in range(2)]
-    original = pin_module._Copy.touch
+    original = copy_memory.Copy.touch
 
     def recording(self) -> None:
         backend.events.append(("touch", self.pointer))
         original(self)
 
-    monkeypatch.setattr(pin_module._Copy, "touch", recording)
+    monkeypatch.setattr(copy_memory.Copy, "touch", recording)
     manager = PinManager(8 * PAGE, max_offered_bytes=8 * PAGE, backend=backend)
     with manager.acquire(tensors) as lease:
         assert lease.registered_bytes == 4 * PAGE
@@ -2521,9 +2523,9 @@ def test_tier_fills_fault_each_slice_in_then_read_it_below_offers(
 ) -> None:
     """The file enters the cache below offered copies, and the copy's own pages fault in before the priority drops."""
     tensor = _checkpoint(tmp_path, 3 * PAGE)
-    monkeypatch.setattr(pin_module, "_FILL_SLICE", PAGE)
+    monkeypatch.setattr(copy_memory, "_FILL_SLICE", PAGE)
     steps: list[tuple[str, int, int]] = []
-    fault_in, read_range = pin_module._fault_in, pin_module._read_range
+    fault_in, read_range = copy_memory._fault_in, copy_memory._read_range
 
     def faulting(view, start, stop) -> None:
         steps.append(("fault", start, offering.priority.get()))
@@ -2533,8 +2535,8 @@ def test_tier_fills_fault_each_slice_in_then_read_it_below_offers(
         steps.append(("read", start, offering.priority.get()))
         read_range(read_at, view, offset, start, stop)
 
-    monkeypatch.setattr(pin_module, "_fault_in", faulting)
-    monkeypatch.setattr(pin_module, "_read_range", reading)
+    monkeypatch.setattr(copy_memory, "_fault_in", faulting)
+    monkeypatch.setattr(copy_memory, "_read_range", reading)
     manager = PinManager(8 * PAGE, max_offered_bytes=offered, backend=backend)
     with manager.acquire([tensor]) as lease:
         assert lease.registered_bytes == 3 * PAGE
@@ -2562,7 +2564,8 @@ def test_tier_fills_fault_each_slice_in_then_read_it_below_offers(
 def test_copies_the_platform_cannot_offer_fill_at_the_normal_priority(backend, tmp_path, monkeypatch) -> None:
     """Off Windows the budget has no effect, so the tier being on changes nothing about how copies fill."""
     tensor = _checkpoint(tmp_path, 2 * PAGE)
-    monkeypatch.setattr(pin_module.host_memory, "new_region", lambda size: mmap.mmap(-1, size))
+    monkeypatch.setattr(linux_memory.Memory, "readers", pin_module.host_memory.Memory.readers)
+    monkeypatch.setattr(pin_module.host_memory, "Memory", linux_memory.Memory)
 
     def no_priorities():
         raise AssertionError("a copy that cannot be offered changed its fill's memory priority")
@@ -2579,13 +2582,13 @@ def test_copies_the_platform_cannot_offer_fill_at_the_normal_priority(backend, t
 def test_real_tier_fill_reads_at_the_lowest_memory_priority(backend, tmp_path, monkeypatch) -> None:
     tensor = _checkpoint(tmp_path, 3 * PAGE + 100)
     priorities: list[int] = []
-    read_range = pin_module._read_range
+    read_range = copy_memory._read_range
 
     def reading(read_at, view, offset, start, stop) -> None:
         priorities.append(memory_module._thread_memory_priority().get())
         read_range(read_at, view, offset, start, stop)
 
-    monkeypatch.setattr(pin_module, "_read_range", reading)
+    monkeypatch.setattr(copy_memory, "_read_range", reading)
     before = memory_module._thread_memory_priority().get()
     manager = PinManager(8 * PAGE, max_offered_bytes=8 * PAGE, backend=backend)
     with manager.acquire([tensor]) as lease:
@@ -2601,15 +2604,15 @@ def test_exhausted_commitment_frees_every_offered_copy(backend, offering, tmp_pa
     """Offered copies keep their commitment after Windows takes their RAM, which is what others run short of."""
     manager, _tensors = _offer_three(backend, tmp_path)
     offered = [_copy_pointer(backend, index) for index in range(3)]
-    assert manager._keep_commit()
+    assert manager._memory._keep_commit()
     assert manager.stats.offered_bytes == 6 * PAGE
     offering.commit_exhausted.set()
-    with caplog.at_level(logging.WARNING, logger="piper_offload.pin_manager"):
+    with caplog.at_level(logging.WARNING, logger="piper_offload"):
         # Windows can commit no more: the tier gives all of it back, and there is nothing left to watch.
-        assert not manager._keep_commit()
+        assert not manager._memory._keep_commit()
     assert all(("free", pointer) in backend.events for pointer in offered)
     assert manager.stats.offered_bytes == 0
-    assert not manager._watching_commit
+    assert not manager._memory._watching_commit
     assert "cannot commit more memory" in caplog.text
     manager.clear()
 
@@ -2636,7 +2639,7 @@ def test_an_evicted_copy_is_freed_instead_of_offered_while_commitment_is_exhaust
 def test_a_new_copy_frees_the_tier_first_while_commitment_is_exhausted(
     backend, offering, tmp_path, monkeypatch,
 ) -> None:
-    monkeypatch.setattr(pin_module, "_watch_commit", lambda _manager: None)  # only the allocation checks here
+    monkeypatch.setattr(windows_memory, "_watch_commit", lambda _manager: None)  # only the allocation checks here
     manager, _tensors = _offer_three(backend, tmp_path)
     fresh = _checkpoint(tmp_path, 2 * PAGE, "fresh")
     offered = [_copy_pointer(backend, index) for index in range(3)]
@@ -2653,26 +2656,50 @@ def test_a_new_copy_frees_the_tier_first_while_commitment_is_exhausted(
 
 def test_a_watcher_frees_the_tier_as_soon_as_commitment_is_exhausted(backend, offering, tmp_path) -> None:
     manager, _tensors = _offer_three(backend, tmp_path)
-    assert manager._watching_commit
+    assert manager._memory._watching_commit
     # Another program takes the last of the commitment while the manager does nothing.
     offering.commit_exhausted.set()
     deadline = time.monotonic() + 5
-    while (manager.stats.offered_bytes or manager._watching_commit) and time.monotonic() < deadline:
+    while (manager.stats.offered_bytes or manager._memory._watching_commit) and time.monotonic() < deadline:
         time.sleep(0.01)
     assert manager.stats.offered_bytes == 0
-    assert not manager._watching_commit
+    assert not manager._memory._watching_commit
     manager.clear()
+
+
+def test_offered_memory_does_not_retain_its_manager(backend, offering, tmp_path, monkeypatch) -> None:
+    # Leave the real watcher waiting while the manager and its component die.
+    entered, stopped = threading.Event(), threading.Event()
+    watch = windows_memory._watch_commit
+
+    def watching(memory_ref):
+        entered.set()
+        watch(memory_ref)
+        stopped.set()
+
+    monkeypatch.setattr(windows_memory, "_watch_commit", watching)
+    manager, tensors = _offer_three(backend, tmp_path)
+    assert tensors and manager.stats.offered_bytes == 6 * PAGE
+    assert manager.stats.pinned_bytes == 0
+    assert entered.wait(5)
+    manager_ref, memory_ref = weakref.ref(manager), weakref.ref(manager._memory)
+    del manager
+    gc.collect()
+    assert manager_ref() is None
+    assert stopped.wait(5)
+    assert memory_ref() is None
+    assert offering.regions == {}
 
 
 def test_a_watcher_stops_once_the_tier_is_empty(backend, offering, tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(pin_module, "_COMMIT_WATCH_SECONDS", 0.01)
+    monkeypatch.setattr(windows_memory, "_COMMIT_WATCH_SECONDS", 0.01)
     manager, _tensors = _offer_three(backend, tmp_path)
-    assert manager._watching_commit
+    assert manager._memory._watching_commit
     manager.clear()
     deadline = time.monotonic() + 5
-    while manager._watching_commit and time.monotonic() < deadline:
+    while manager._memory._watching_commit and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert not manager._watching_commit
+    assert not manager._memory._watching_commit
 
 
 def test_an_unobservable_commit_condition_is_never_exhausted(monkeypatch, caplog) -> None:

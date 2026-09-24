@@ -1,21 +1,18 @@
-"""Select host allocation, memory limits, and checkpoint readers once at import.
-
-Native Windows calls remain lazy in ``_host_memory_windows``. The pin manager
-owns leases and budgets; these modules supply only the OS mechanisms.
-"""
+"""Select the host memory component once at import; native calls remain lazy."""
 
 import os
 import sys
 
 if sys.platform == "win32":
-    from ._host_memory_windows import available_memory, new_region
+    from ._copy_memory_windows import Memory
+    from ._host_memory_windows import available_memory
 else:
-    from ._host_memory_linux import available_memory, new_region
+    from ._host_memory_linux import Memory, available_memory
 
-# Preserve the per-worker handle fallback on systems without positional reads.
-if hasattr(os, "preadv"):
-    from ._host_memory_linux import Readers
-else:
-    from ._host_memory_windows import Readers
+    # Preserve per-worker handles on systems without positional reads.
+    if not hasattr(os, "preadv"):
+        from ._host_memory_windows import Readers
 
-__all__ = ["Readers", "available_memory", "new_region"]
+        Memory.readers = Readers
+
+__all__ = ["Memory", "available_memory"]
