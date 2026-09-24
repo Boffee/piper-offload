@@ -40,15 +40,11 @@ registered while managed here.
 """
 
 import contextlib
-import ctypes
 import enum
-import functools
-import io
 import logging
 import mmap
 import operator
 import os
-import sys
 import threading
 import weakref
 from bisect import bisect_left
@@ -56,96 +52,22 @@ from collections import OrderedDict
 from collections.abc import Callable, Generator, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Self
 
 import torch
 
-from ._host_memory import VirtualRegion, commit_exhausted, reading_below_offers
+from . import _host_memory as host_memory
+from ._host_memory_windows import VirtualRegion, commit_exhausted, reading_below_offers
 from ._host_registration import HostRegistrationBackend, HostRegistrationRefusedError, RuntimeHostRegistration
 from .checkpoint import FileSlice, file_slice
 
 logger = logging.getLogger(__name__)
 
 
-class _MemoryStatus(ctypes.Structure):
-    # Windows MEMORYSTATUSEX; fixed-width types also allow testing on POSIX.
-    _fields_ = [
-        ("length", ctypes.c_uint32),
-        ("load", ctypes.c_uint32),
-        ("total_physical", ctypes.c_uint64),
-        ("available_physical", ctypes.c_uint64),
-        ("total_page_file", ctypes.c_uint64),
-        ("available_page_file", ctypes.c_uint64),
-        ("total_virtual", ctypes.c_uint64),
-        ("available_virtual", ctypes.c_uint64),
-        ("available_extended_virtual", ctypes.c_uint64),
-    ]
-
-
-_PROC_CGROUP = "/proc/self/cgroup"
-_CGROUP_MOUNT = "/sys/fs/cgroup"
-
-
-def _physical_memory() -> int:
-    if sys.platform == "win32":
-        status = _MemoryStatus()
-        status.length = ctypes.sizeof(status)
-        query = ctypes.WinDLL("kernel32", use_last_error=True).GlobalMemoryStatusEx
-        query.argtypes = (ctypes.POINTER(_MemoryStatus),)
-        query.restype = ctypes.c_int
-        if not query(ctypes.byref(status)):
-            raise OSError("GlobalMemoryStatusEx failed")
-        return status.total_physical
-    return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-
-
-def _cgroup_memory_limit() -> int | None:
-    """The tightest memory limit on the process's cgroup or any ancestor, v2 or v1; None if unlimited.
-
-    A container or a systemd service can be far below the host's RAM, and its
-    limit lives at the process's own cgroup path, not at the hierarchy root.
-    The hierarchy is assumed to be mounted at the standard ``/sys/fs/cgroup``;
-    set ``max_pinned_bytes`` explicitly on a host that mounts it elsewhere.
-    """
-    try:
-        with open(_PROC_CGROUP, encoding="ascii") as membership:
-            lines = membership.read().splitlines()
-    except OSError:
-        return None
-    limits: list[int] = []
-    for line in lines:
-        hierarchy, _, rest = line.partition(":")
-        controllers, _, path = rest.partition(":")
-        if hierarchy == "0":
-            base, name = Path(_CGROUP_MOUNT), "memory.max"
-        elif "memory" in controllers.split(","):
-            base, name = Path(_CGROUP_MOUNT, "memory"), "memory.limit_in_bytes"
-        else:
-            continue
-        directory = base.joinpath(*path.strip("/").split("/")) if path.strip("/") else base
-        while True:
-            try:
-                text = (directory / name).read_text(encoding="ascii").strip()
-            except OSError:
-                text = ""
-            if text.isdigit():
-                limits.append(int(text))
-            if directory == base or base not in directory.parents:
-                break
-            directory = directory.parent
-    return min(limits, default=None)
-
-
 def _default_pin_budget() -> int:
     """Half of the memory available to the process, rounded down to OS pages, without touching CUDA."""
     try:
-        total = _physical_memory()
-        if total <= 0:
-            raise ValueError("physical RAM is unavailable")
-        limit = _cgroup_memory_limit()
-        if limit is not None:
-            total = min(total, limit)
+        total = host_memory.available_memory()
         return total // (2 * mmap.PAGESIZE) * mmap.PAGESIZE
     except (AttributeError, OSError, ValueError) as error:
         logger.warning("Cannot determine physical RAM; the default host pin budget is zero: %s", error)
@@ -182,13 +104,6 @@ def _page_rounded(nbytes: int) -> int:
     return -(-nbytes // mmap.PAGESIZE) * mmap.PAGESIZE
 
 
-def _new_region(size: int) -> mmap.mmap | VirtualRegion:
-    """A copy's memory: a ``VirtualAlloc`` region on Windows, which can be offered; an anonymous map elsewhere."""
-    if sys.platform == "win32":
-        return VirtualRegion(size)
-    return mmap.mmap(-1, size)
-
-
 class _Copy:
     """An owned page-aligned region holding one checkpoint storage's bytes.
 
@@ -202,7 +117,7 @@ class _Copy:
     def __init__(self, size: int) -> None:
         assert size % mmap.PAGESIZE == 0
         self.size = size
-        self.region = _new_region(size)
+        self.region = host_memory.new_region(size)
         # None once freed or offered.
         self.storage: torch.UntypedStorage | None = None
         self._expose()
@@ -287,52 +202,6 @@ _RECLAIM_WORKERS = 6
 _COMMIT_WATCH_SECONDS = 0.5
 
 
-def _preadv(fd: int, buffer: memoryview, offset: int) -> int:
-    return os.preadv(fd, [buffer], offset)
-
-
-class _Readers:
-    """Positional reads of the checkpoints a fill needs, one way per platform.
-
-    ``preadv`` reads at an offset without moving the descriptor's position, so
-    every worker shares the reader's own descriptor. A Windows handle has one
-    position and the kernel serializes concurrent reads on it, so a worker
-    reads through a handle of its own, opened from the file's path; the
-    handles close when the fill is over. Provenance names an open file on
-    disk, which is what ``MappedCheckpoint`` holds.
-    """
-
-    def __init__(self) -> None:
-        self._local = threading.local()
-        self._opened: list[io.FileIO] = []
-        self._lock = threading.Lock()
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        for handle in self._opened:
-            handle.close()
-
-    def read_at(self, file: io.BufferedReader) -> Callable[[memoryview, int], int]:
-        """A positional read of ``file`` that any worker may call."""
-        if hasattr(os, "preadv"):
-            return functools.partial(_preadv, file.fileno())
-        return functools.partial(self._read_alone, file)
-
-    def _read_alone(self, file: io.BufferedReader, buffer: memoryview, offset: int) -> int:
-        handles: dict[int, io.FileIO] = getattr(self._local, "handles", None) or {}
-        self._local.handles = handles
-        handle = handles.get(id(file))
-        if handle is None:
-            handle = open(file.name, "rb", buffering=0)  # noqa: SIM115 - closed with the fill's readers
-            handles[id(file)] = handle
-            with self._lock:
-                self._opened.append(handle)
-        handle.seek(offset)
-        return handle.readinto(buffer)
-
-
 def _read_range(
     read_at: Callable[[memoryview, int], int], view: memoryview, offset: int, start: int, stop: int,
 ) -> None:
@@ -410,7 +279,7 @@ def _fill_copies(pending: list[_PendingCopy], *, below_offers: bool = False) -> 
     one thread per logical core, hyperthreads included: the fill is bound
     by page faults on the fresh regions, which overlap across threads, and
     a checkpoint's tensors are mostly smaller than one slice. Each worker
-    reads through the reader that suits the platform (:class:`_Readers`),
+    reads through the reader that suits the platform (:class:`~piper_offload._host_memory.Readers`),
     bringing the file into the cache below offered copies if
     ``below_offers``. Runs without the manager's lock: the workers run Python
     code, so a garbage collection on one of them may run a finalizer that
@@ -433,7 +302,7 @@ def _fill_copies(pending: list[_PendingCopy], *, below_offers: bool = False) -> 
     # The pool closes before the views, so a failure waits for the queued
     # slices to finish, and the readers close after all of them.
     with (
-        _Readers() as readers,
+        host_memory.Readers() as readers,
         contextlib.ExitStack() as views,
         ThreadPoolExecutor(workers, thread_name_prefix="piper-offload-fill") as pool,
     ):

@@ -20,8 +20,11 @@ file holds what agents get wrong without it.
 - Adapters: `adapter.py`, `lora.py`, `parameter_delta.py`,
   `parameter_value.py`, `parameter_transform.py`, `merge.py`.
 - Host memory: `pin_manager.py`, `checkpoint.py`, `_host_registration.py`,
-  `_host_memory.py` (the Windows regions an evicted copy can be offered in,
-  and the memory priority that ranks a fill's file-cache pages below them).
+  `_host_memory.py` (import-time platform selection), `_host_memory_linux.py`
+  (anonymous mappings, cgroup limits, positional reads), and
+  `_host_memory_windows.py` (VirtualAlloc regions, per-worker readers,
+  memory priorities, and the commitment event). Leases, budgets, and
+  registration ordering stay shared in `pin_manager.py`.
 - Experimental DTensor: `communication.py`, `sequential.py`.
 
 ## Engineering rules

@@ -17,7 +17,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from piper_offload._host_memory import VirtualRegion
+from piper_offload._host_memory_windows import VirtualRegion
 
 _READ_CHUNK = 64 * 2**20
 

@@ -17,10 +17,11 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-import piper_offload._host_memory as memory_module
+import piper_offload._host_memory_linux as linux_memory
+import piper_offload._host_memory_windows as memory_module
 import piper_offload._host_registration as registration_module
 import piper_offload.pin_manager as pin_module
-from piper_offload._host_memory import VirtualRegion
+from piper_offload._host_memory_windows import VirtualRegion
 from piper_offload._host_registration import HostRegistrationError, RuntimeHostRegistration
 from piper_offload import MappedCheckpoint, PinManager, file_slice, host_pin_manager
 from piper_offload.pin_manager import PinLease, TransferLease
@@ -176,7 +177,8 @@ def install_fake_kernel(monkeypatch: pytest.MonkeyPatch, events: list[tuple[str,
     monkeypatch.setattr(memory_module, "_kernel32", lambda: kernel)
     monkeypatch.setattr(memory_module, "_thread_memory_priority", lambda: kernel.priority)
     monkeypatch.setattr(pin_module, "commit_exhausted", lambda timeout=0.0: kernel.commit_exhausted.wait(timeout))
-    monkeypatch.setattr(pin_module, "_new_region", VirtualRegion)
+    monkeypatch.setattr(pin_module.host_memory, "new_region", VirtualRegion)
+    monkeypatch.setattr(pin_module.host_memory, "Readers", memory_module.Readers)
     return kernel
 
 
@@ -217,25 +219,25 @@ def test_default_budget_is_finite_without_initializing_runtime(monkeypatch: pyte
 
 
 def test_default_budget_is_half_of_physical_ram(monkeypatch) -> None:
-    monkeypatch.setattr(pin_module.sys, "platform", "linux")
+    monkeypatch.setattr(pin_module.host_memory, "available_memory", linux_memory.available_memory)
     values = {"SC_PHYS_PAGES": 101, "SC_PAGE_SIZE": PAGE}
-    monkeypatch.setattr(pin_module.os, "sysconf", values.__getitem__, raising=False)
-    monkeypatch.setattr(pin_module, "_PROC_CGROUP", "/nonexistent/cgroup")
+    monkeypatch.setattr(linux_memory.os, "sysconf", values.__getitem__, raising=False)
+    monkeypatch.setattr(linux_memory, "_PROC_CGROUP", "/nonexistent/cgroup")
     assert pin_module._default_pin_budget() == 50 * PAGE
 
 
 def _cgroups(monkeypatch, tmp_path, membership: str, files: dict[str, str]) -> None:
     """Fake the process's cgroup membership and a cgroup mount holding ``files``."""
-    monkeypatch.setattr(pin_module.sys, "platform", "linux")
+    monkeypatch.setattr(pin_module.host_memory, "available_memory", linux_memory.available_memory)
     values = {"SC_PHYS_PAGES": 101, "SC_PAGE_SIZE": PAGE}
-    monkeypatch.setattr(pin_module.os, "sysconf", values.__getitem__, raising=False)
+    monkeypatch.setattr(linux_memory.os, "sysconf", values.__getitem__, raising=False)
     (tmp_path / "cgroup").write_text(membership)
     for relative, text in files.items():
         path = tmp_path / "mount" / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text + "\n")
-    monkeypatch.setattr(pin_module, "_PROC_CGROUP", str(tmp_path / "cgroup"))
-    monkeypatch.setattr(pin_module, "_CGROUP_MOUNT", str(tmp_path / "mount"))
+    monkeypatch.setattr(linux_memory, "_PROC_CGROUP", str(tmp_path / "cgroup"))
+    monkeypatch.setattr(linux_memory, "_CGROUP_MOUNT", str(tmp_path / "mount"))
 
 
 @pytest.mark.parametrize(
@@ -272,17 +274,17 @@ def test_windows_default_budget_uses_physical_ram_without_cuda(monkeypatch, succ
         status.total_physical = 101 * PAGE
         return success
 
-    monkeypatch.setattr(pin_module.sys, "platform", "win32")
+    monkeypatch.setattr(pin_module.host_memory, "available_memory", memory_module.available_memory)
     monkeypatch.setattr(
-        pin_module.ctypes, "WinDLL",
+        memory_module.ctypes, "WinDLL",
         lambda *_args, **_kwargs: SimpleNamespace(GlobalMemoryStatusEx=Mock(side_effect=query)), raising=False,
     )
     assert pin_module._default_pin_budget() == (50 * PAGE if success else 0)
 
 
 def test_unknown_physical_ram_disables_default_admission(monkeypatch) -> None:
-    monkeypatch.setattr(pin_module.sys, "platform", "linux")
-    monkeypatch.setattr(pin_module.os, "sysconf", Mock(side_effect=OSError("unavailable")), raising=False)
+    monkeypatch.setattr(pin_module.host_memory, "available_memory", linux_memory.available_memory)
+    monkeypatch.setattr(linux_memory.os, "sysconf", Mock(side_effect=OSError("unavailable")), raising=False)
     assert pin_module._default_pin_budget() == 0
 
 
@@ -1125,7 +1127,8 @@ def test_a_fill_without_positional_reads_uses_a_handle_per_worker(
     backend: FakeBackend, tmp_path, monkeypatch,
 ) -> None:
     """A Windows handle has one position, so each worker reads through its own; they close with the fill."""
-    monkeypatch.delattr(os, "preadv", raising=False)
+    monkeypatch.setattr(pin_module.host_memory, "Readers", memory_module.Readers)
+    monkeypatch.setattr(pin_module, "_FILL_SLICE", PAGE)
     tensors = [_checkpoint(tmp_path, 8 * PAGE, f"copy{index}") for index in range(3)]
     provenance = {file_slice(tensor).file for tensor in tensors}
     opened: list = []
@@ -1136,7 +1139,7 @@ def test_a_fill_without_positional_reads_uses_a_handle_per_worker(
         opened.append(handle)
         return handle
 
-    monkeypatch.setattr(pin_module, "open", recording_open, raising=False)
+    monkeypatch.setattr(memory_module, "open", recording_open, raising=False)
     manager = PinManager(64 * PAGE, backend=backend)
     with manager.acquire(tensors) as lease:
         assert lease.registered_bytes == 24 * PAGE
@@ -1945,7 +1948,7 @@ def test_copies_are_freed_when_the_platform_cannot_offer_them(backend, tmp_path,
     first = _checkpoint(tmp_path, 2 * PAGE, "first")
     second = _checkpoint(tmp_path, 2 * PAGE, "second")
     # Anonymous mappings, as on Linux: the budget is set, but nothing is offered.
-    monkeypatch.setattr(pin_module, "_new_region", lambda size: mmap.mmap(-1, size))
+    monkeypatch.setattr(pin_module.host_memory, "new_region", lambda size: mmap.mmap(-1, size))
     manager = _offered_manager(backend)
     with manager.acquire([first]):
         pass
@@ -2559,7 +2562,7 @@ def test_tier_fills_fault_each_slice_in_then_read_it_below_offers(
 def test_copies_the_platform_cannot_offer_fill_at_the_normal_priority(backend, tmp_path, monkeypatch) -> None:
     """Off Windows the budget has no effect, so the tier being on changes nothing about how copies fill."""
     tensor = _checkpoint(tmp_path, 2 * PAGE)
-    monkeypatch.setattr(pin_module, "_new_region", lambda size: mmap.mmap(-1, size))
+    monkeypatch.setattr(pin_module.host_memory, "new_region", lambda size: mmap.mmap(-1, size))
 
     def no_priorities():
         raise AssertionError("a copy that cannot be offered changed its fill's memory priority")
@@ -2679,7 +2682,7 @@ def test_an_unobservable_commit_condition_is_never_exhausted(monkeypatch, caplog
     monkeypatch.setattr(memory_module, "_open_maximum_commit_condition", refused)
     memory_module._maximum_commit_condition.cache_clear()
     try:
-        with caplog.at_level(logging.WARNING, logger="piper_offload._host_memory"):
+        with caplog.at_level(logging.WARNING, logger="piper_offload._host_memory_windows"):
             assert not memory_module.commit_exhausted()
             assert not memory_module.commit_exhausted()
         assert caplog.text.count("Cannot watch Windows commitment") == 1
