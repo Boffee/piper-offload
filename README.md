@@ -190,8 +190,8 @@ execution does not acquire leases.
 
 Storage that records a checkpoint file slice, including the packed backing of GGUF tensors from
 `MappedCheckpoint`, is never registered in place. Pinning it allocates an
-owned page-aligned copy, fills the copy from the file with parallel positional
-reads, and registers that; the mapping stays read-only page cache the whole time.
+owned page-aligned copy, fills the copy from the file with parallel reads, and
+registers that; the mapping stays read-only page cache the whole time.
 Transfers read the copy under their lease. An asynchronous transfer of
 pinned storage outside a lease raises, because eviction is safe only while
 every such reader holds one; a synchronous transfer completes under the
@@ -203,6 +203,138 @@ any other private file mapping in place, such as a mapping from
 `safetensors.safe_open`, still locks its pages for writing and makes the
 kernel copy every page into private memory that stays until the mapping is
 released.
+
+#### Offered copies on Windows
+
+Copies are `VirtualAlloc` regions on Windows and anonymous mappings
+elsewhere. `host_pin_manager.max_offered_bytes`, zero by default, turns on an
+optional Windows tier that keeps an evicted copy's bytes instead of freeing
+them: the copy is unregistered, and its pages are offered to Windows with
+[`OfferVirtualMemory`](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-offervirtualmemory),
+which removes them from the working set and leaves the OS free to discard
+them under memory pressure. Pinning the same storage again reclaims them with
+[`ReclaimVirtualMemory`](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-reclaimvirtualmemory):
+pages Windows kept are registered as they are, with no file read, and pages it
+discarded are refilled before the copy registers, so a transfer never reads
+undefined bytes. A copy is offered in spans of 16 MiB rather than as one
+range, because Windows discards a span at a time and a reclaim reports one at
+a time: refilling then costs the spans that were dropped instead of every
+copy that lost a page. On a host with 21 GiB available, reacquiring an 18 GiB
+checkpoint after a 7 GiB one kept 13.0 GiB of it against 11.6 to 12.6 whole-
+region, and took 12.2 s against 13.1 to 14.9. Spans cost nothing to keep
+small at that size: offering and reclaiming 6.9 GiB takes 0.38 s in 16 MiB
+spans against 0.40 s as whole regions, where 1 MiB spans take 0.86 s, and a
+switch that reads nothing is unchanged at 1.00 s. Offered pages are unreadable
+until they are reclaimed, and nothing resolves a transfer to them.
+
+Idle pinned retention is still the normal policy: deactivation leaves copies
+registered in the idle LRU, and only an eviction chooses between offering and
+freeing. An eviction that makes room — for the pin budget, a budget
+reduction, or a runtime capacity retry — offers the copy once its
+unregistration succeeds, if it fits `max_offered_bytes` and nothing outside
+the manager still views it. A failed unregistration keeps the copy registered
+and charged for a later retry, and a failed offer frees the copy. Everything
+else frees: `clear()`, dropping the storage's owner, a copy larger than the
+budget, and one still viewed by a transfer that outlived its lease.
+
+The two budgets are separate and both page-rounded. `max_pinned_bytes` bounds
+pinned RAM; offered pages are no longer pinned and leave the working set, but
+they stay committed, so `max_offered_bytes` bounds the commitment the tier
+holds. `PinStats.offered_bytes` reports it. The least recently offered copies
+are freed to fit a new one, when the budget is lowered, and when allocating a
+new copy fails, since their commitment is what that allocation lacks.
+
+Offered copies give their RAM back when Windows discards them but keep their
+commitment until they are freed, and commitment is what allocations anywhere
+on the system fail for once Windows can no longer grow its paging files. The
+memory manager signals that condition through its `MaximumCommitCondition`
+kernel event, and when it is set the tier frees every offered copy: a thread
+waits on it while the tier holds copies, and the tier checks it before taking
+a copy, which it then frees instead, and before allocating a new one. The
+current commit limit is no guide, because Windows grows a system-managed
+paging file on demand: in the 21 GiB reload below, available commitment fell
+to 0.8 GiB of an unchanged 83.1 GiB limit with the event never set, and a tier
+that kept a tenth of that limit free threw away all 18 GiB of H3's copies,
+making its 13 s reload a 39 s read from disk. Where the event cannot be
+opened, the tier warns once and is bounded by its budget alone, and `clear()`
+or `max_offered_bytes = 0` releases its commitment at any time. On other
+platforms the setting has no effect.
+
+Whether the tier pays off is a measurement, not a given. On a 64 GiB Windows
+11 desktop, a 6.9 GiB checkpoint's copies take 0.33 to 0.39 s to evict and
+offer and 0.93 to 0.97 s to reclaim and register intact, against 0.30 to
+0.32 s to evict and free and 1.17 to 1.26 s to refill from a warm page cache.
+While the page cache holds the file the two cost about the same, and freeing
+is simpler; the tier earns its keep where that refill reads from storage
+instead, 13.5 to 13.6 s there, which is what a host short of RAM for its
+checkpoints faces every time.
+
+Every copy is registered after a one-byte-per-page write that brings its
+pages into the working set, because `cudaHostRegister` faults pages that are
+outside it in one at a time: the write runs at 42 GiB/s and leaves
+registration running at 55, where registering them cold runs at 8. Copies
+Windows returned intact register before the rest of the acquisition is read,
+since registering locks their pages and a long fill would otherwise push them
+out again: reacquiring an 18 GiB checkpoint whose fill was 6 GiB took 19.4 s
+with them registered after the fill and 14.1 s before it, the registration
+itself 5.3 s against 0.5. Each copy an acquisition evicts is offered as soon
+as its own unregistration succeeds, on a pool of one thread per core that the
+manager waits for only once it has released its lock, because a worker
+collecting garbage may run a finalizer that needs it. The runtime unregisters
+serially whatever the caller does — 6.9 GiB of copies leave it at 28.7 GiB/s
+on one thread and 26.1 on sixteen — so offering beside that stream rather than
+after it costs what the slower of the two does: evicting and offering that
+checkpoint takes 0.36 s this way against 0.48 s as two passes, with 0.004 s
+left to wait for at the end. Reclaims run on a pool of six, beyond which
+threads contend for the kernel's page tables and slow each other down, and
+each copy Windows returned intact registers as soon as its own reclaim
+returns, so registration runs beside the rest of the reclaims rather than
+after them: that checkpoint comes back intact and registered in 0.93 to
+0.97 s this way, against 1.16 to 1.20 s as two passes.
+
+Offered pages are what Windows takes back first when memory runs short, so
+whether they survive depends on what else wants the memory. Copies are offered
+at normal offer priority; at the lowest, Windows drops every offered page as
+soon as free memory runs low, where at normal it drops only what it needs. A
+fill leaves a second copy of every byte it reads in the file cache, which at
+the normal memory priority ranks above offered pages. So while the tier is
+on, fills read through the cache at the lowest memory priority
+(`SetThreadInformation`'s `MEMORY_PRIORITY_VERY_LOW`), which ranks those
+cache pages below offered ones; each fill thread first faults in the part of
+the copy it is about to read, at its normal priority, so that the copy's own
+pages do not take the low one. Measured with a process holding enough locked
+memory to leave 21 GiB available: offering the 18 GiB H3 checkpoint's
+copies, pinning the 6.9 GiB Hunyuan 3D checkpoint and pinning H3 again kept
+12.4 to 12.7 GiB of it intact and took 13.1 to 13.7 s, against 4.1 GiB and
+28.2 s reading through the cache at the normal priority and 35.4 s with the
+tier off. The low priority is needed from the first load, before anything is
+offered: read at the normal priority, the first load left the file cached
+above the copies offered later, and at full RAM every switch between H3 and
+Hunyuan 3D then found its offered copies discarded and took 10.1 to 10.4 s.
+Reading around the cache, through handles reopened with
+`FILE_FLAG_NO_BUFFERING`, kept as much, 12.3 to 12.7 GiB in 12.8 to 13.6 s,
+but never read from the file cache, even when it held the checkpoint: H3
+pinned from a warm cache in 35.7 s that way, and pins in 2.3 to 2.4 s at the
+lowest priority, as it does with the tier off. Windows does not document where
+offered pages rank among memory priorities; in the same reload, fills read at
+priorities 1 to 3 kept 10.8 to 14.4 GiB and fills at 4 or 5 kept 3.6 to
+6.2 GiB, so offered pages sit between 3 and 4 and the lowest priority leaves
+two levels of margin.
+
+A second model streamed through its mapping instead of pinned does not
+disturb the tier more than a pinned one of the same size: with 4.9 GiB of
+Hunyuan left unpinned, 13.8 GiB survived. One that streams most of the
+available memory through the mapping leaves nothing to keep: after 16 GiB
+streamed, 0.9 GiB survived, and the reload took 37.9 s against 44.4 s with
+the tier off. The tier cannot keep what does not fit either. With 25 GiB
+available and a 20 GiB pin budget rotating the same two checkpoints, pinned
+copies and the offered part of the other model exceed RAM, every offered copy
+was discarded before its next use, and a switch took 10.5 to 11.0 s against
+10.1 to 10.2 s with the tier off. With the whole 64 GiB available, the same
+rotation switched in 1.1 to 1.4 s from the file cache with the tier off, and
+in 0.87 to 0.95 s from intact offered copies, reading nothing, with it on.
+Compare a rotation's time and read traffic with the budget at zero before
+leaving it on.
 
 **Piper never writes into a file mapping.** Host storage it writes on your
 behalf is copied into memory the process owns first: a trainable parameter

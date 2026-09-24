@@ -6,6 +6,13 @@ file is pulled fully into the page cache first, then fully evicted, to bound the
 refill from both sides. Rotation then gives two checkpoints one manager whose
 budget holds only one, so admitting either must evict the other in LRU order.
 
+``--offered-gib`` repeats the rotation with the Windows offered tier, which
+turns each switch's eviction into an offer and each admission into a reclaim.
+Both rotations run in the same process against the same page-cache state, so
+their times, working sets, and commitment are comparable; ``--cold`` evicts
+both files from the page cache first, which is when a reclaim has the most to
+save. The tier's rotation also reports how much Windows kept intact.
+
 Times are host pinning only: no model is built and nothing is denoised.
 """
 
@@ -13,48 +20,16 @@ Times are host pinning only: no model is built and nothing is denoised.
 
 import argparse
 import json
-import os
 import time
 from pathlib import Path
 
+import _process_memory as process_memory
 import torch
 
 from piper_offload import MappedCheckpoint, PinManager
 
 # What Piper Engine's H3 transformer loader leaves out.
 EXCLUDED_PREFIXES = ("token_refiner.", "condition_proj.", "context_embedder.")
-READ_CHUNK = 64 * 2**20
-
-
-def _rss() -> int:
-    with open("/proc/self/status", encoding="utf-8") as status:
-        for line in status:
-            if line.startswith("VmRSS:"):
-                return int(line.split()[1]) * 1024
-    return 0
-
-
-def _disk_read_bytes() -> int:
-    with open("/proc/self/io", encoding="utf-8") as counters:
-        for line in counters:
-            if line.startswith("read_bytes:"):
-                return int(line.split()[1])
-    return 0
-
-
-def _evict_from_cache(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-    finally:
-        os.close(fd)
-
-
-def _fill_cache(path: Path) -> None:
-    """Read the whole file so a refill of it touches no disk."""
-    with open(path, "rb", buffering=0) as source:
-        while source.read(READ_CHUNK):
-            pass
 
 
 def _selected(path: Path) -> list[torch.Tensor]:
@@ -63,50 +38,76 @@ def _selected(path: Path) -> list[torch.Tensor]:
     return [reader.get_tensor(name) for name in keys if not name.startswith(EXCLUDED_PREFIXES)]
 
 
-def _acquire(manager: PinManager, tensors: list[torch.Tensor], label: str, out: dict) -> None:
-    disk_before = _disk_read_bytes()
+def _acquire(
+    manager: PinManager, tensors: list[torch.Tensor], label: str, out: dict, reclaims: process_memory.Reclaims,
+) -> None:
+    read_before = process_memory.read_bytes()
     started = time.perf_counter()
     lease = manager.acquire(tensors)
     seconds = time.perf_counter() - started
-    disk = _disk_read_bytes() - disk_before
+    read = process_memory.read_bytes() - read_before
     stats = manager.stats
+    held = process_memory.memory()
     lease.close()
+    intact, discarded = reclaims.take()
     out[label] = {
         "seconds": round(seconds, 3),
-        "disk_read_bytes": disk,
+        "read_bytes": read,
         "pinned_bytes": stats.pinned_bytes,
         "copy_bytes": stats.copy_bytes,
-        "rss_bytes": _rss(),
+        "offered_bytes": stats.offered_bytes,
+        "resident_bytes": held.resident,
+        "committed_bytes": held.committed,
+        "intact_bytes": intact,
+        "discarded_bytes": discarded,
     }
     print(
-        f"{label:<26} {seconds:8.3f} s  disk {disk / 1e9:6.2f} GB  "
-        f"pinned {stats.pinned_bytes / 2**30:6.1f} GiB  copies {stats.copy_bytes / 2**30:6.1f} GiB  "
-        f"rss {_rss() / 2**30:6.1f} GiB",
+        f"{label:<26} {seconds:8.3f} s  read {read / 1e9:6.2f} GB  "
+        f"pinned {stats.pinned_bytes / 2**30:5.1f}  copies {stats.copy_bytes / 2**30:5.1f}  "
+        f"offered {stats.offered_bytes / 2**30:5.1f} GiB  resident {held.resident / 2**30:6.1f}  "
+        f"commit {held.committed / 2**30:6.1f} GiB  intact {intact / 2**30:5.1f} GiB",
         flush=True,
     )
 
 
-def _refill(path: Path, out: dict) -> None:
+def _refill(path: Path, out: dict, reclaims: process_memory.Reclaims) -> None:
     tensors = _selected(path)
     manager = PinManager()
-    _fill_cache(path)
-    _acquire(manager, tensors, "refill_fully_warm", out)
+    process_memory.fill_cache(path)
+    _acquire(manager, tensors, "refill_fully_warm", out, reclaims)
     manager.clear()
-    _evict_from_cache(path)
-    _acquire(manager, tensors, "refill_cold", out)
+    process_memory.drop_from_cache(path)
+    _acquire(manager, tensors, "refill_cold", out, reclaims)
     manager.clear()
 
 
-def _rotate(first: Path, second: Path, budget: int, rounds: int, out: dict) -> None:
-    """One budget that holds a single checkpoint, so each switch evicts the other."""
+def _rotate(
+    first: Path,
+    second: Path,
+    budget: int,
+    offered: int,
+    rounds: int,
+    cold: bool,
+    out: dict,
+    reclaims: process_memory.Reclaims,
+) -> None:
+    """One budget that holds a single checkpoint, so each switch evicts or offers the other."""
+    # The page-cache state is set before the files are mapped: Windows keeps
+    # the pages a mapping covers.
+    for path in (first, second):
+        if cold:
+            process_memory.drop_from_cache(path)
+        else:
+            process_memory.fill_cache(path)
     selected = {"A": _selected(first), "B": _selected(second)}
-    manager = PinManager(budget)
-    out["rotation_budget_bytes"] = budget
-    _fill_cache(first)
-    _fill_cache(second)
+    manager = PinManager(budget, max_offered_bytes=offered)
+    suffix = "offered" if offered else "freed"
+    out[f"rotation_{suffix}_budget_bytes"] = budget
+    out[f"rotation_{suffix}_offered_budget_bytes"] = offered
     for index in range(rounds):
         for name, tensors in selected.items():
-            _acquire(manager, tensors, f"rotate_{name}_round{index}", out)
+            _acquire(manager, tensors, f"rotate_{suffix}_{name}_round{index}", out, reclaims)
+    manager.max_offered_bytes = 0
     manager.clear()
 
 
@@ -115,15 +116,30 @@ def _main() -> None:
     parser.add_argument("checkpoints", nargs=2, type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--budget-gib", type=float, default=40.0)
+    parser.add_argument("--offered-gib", type=float, default=0.0, help="offered-copy budget; Windows only")
     parser.add_argument("--rounds", type=int, default=2)
+    parser.add_argument("--cold", action="store_true", help="evict both checkpoints from the page cache first")
+    parser.add_argument("--skip-refill", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     torch.empty(1, device=torch.device(args.device))  # context creation stays out of the timings
     out: dict[str, object] = {}
-    print("=== refill under a known page-cache state", flush=True)
-    _refill(args.checkpoints[0], out)
-    print("=== rotation over a budget that holds one checkpoint", flush=True)
-    _rotate(args.checkpoints[0], args.checkpoints[1], int(args.budget_gib * 2**30), args.rounds, out)
+    limit, available = process_memory.system_commit()
+    out.update(commit_limit_bytes=limit, available_commit_bytes=available)
+    reclaims = process_memory.Reclaims()
+    budget = int(args.budget_gib * 2**30)
+    try:
+        if not args.skip_refill:
+            print("=== refill under a known page-cache state", flush=True)
+            _refill(args.checkpoints[0], out, reclaims)
+        print("=== rotation over a budget that holds one checkpoint, freeing on eviction", flush=True)
+        _rotate(args.checkpoints[0], args.checkpoints[1], budget, 0, args.rounds, args.cold, out, reclaims)
+        if args.offered_gib > 0:
+            print("=== the same rotation, offering evicted copies instead", flush=True)
+            offered = int(args.offered_gib * 2**30)
+            _rotate(args.checkpoints[0], args.checkpoints[1], budget, offered, args.rounds, args.cold, out, reclaims)
+    finally:
+        reclaims.restore()
     if args.output:
         args.output.write_text(json.dumps(out, indent=2))
 
