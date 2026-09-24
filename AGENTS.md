@@ -20,6 +20,15 @@ file holds what agents get wrong without it.
 - Adapters: `adapter.py`, `lora.py`, `parameter_delta.py`,
   `parameter_value.py`, `parameter_transform.py`, `merge.py`.
 - Host memory: `pin_manager.py`, `checkpoint.py`, `_host_registration.py`.
+  `_host_memory.py` selects one memory component at import. `_copy_memory.py`
+  holds shared copies and fill scheduling; `_host_memory_linux.py` supplies
+  anonymous mappings, cgroup limits, and positional reads.
+  `_copy_memory_windows.py` owns offered-copy retention, reclaim scheduling,
+  and the commitment watcher, using native calls in `_host_memory_windows.py`.
+  Leases, pin accounting, and registration order stay in `pin_manager.py`.
+  Memory shares its lock; preparation and release batches join workers only
+  outside that lock. Copy ownership transfers at reservation and successful
+  unregistration, and the memory component must never retain the manager.
 - Experimental DTensor: `communication.py`, `sequential.py`.
 
 ## Engineering rules
@@ -63,8 +72,37 @@ file holds what agents get wrong without it.
   the pinned set is reclaimable by the OS, so there is no trim call; lower
   the budget or call `clear()`.
 - Checkpoint storage with file provenance pins through an owned copy filled
-  by positional reads; the mapping stays read-only page cache. The pinning
-  mechanism is chosen statically per platform, never probed at runtime.
+  by parallel reads, positional where the platform has them and through a
+  handle per worker where it does not; the mapping stays read-only page
+  cache. The pinning mechanism is chosen statically per platform, never
+  probed at runtime.
+- Idle pinned retention is the eviction policy; only an eviction that makes
+  room may offer a copy instead of freeing it, and only after its
+  unregistration succeeds. Offered pages are unreadable, cost commitment
+  rather than pinned RAM, and are reclaimed before anything registers or
+  reads them, at normal offer priority. A copy is offered in spans, so a
+  discard costs the spans it hit rather than the whole copy, and a reclaim
+  returns the spans left to refill. An eviction offers each copy as its own
+  unregistration succeeds, and waits for that pool only with the lock
+  released, where a worker's finalizer may need it. Offered copies keep
+  their commitment, so every one is freed when Windows sets its
+  `MaximumCommitCondition` event; never judge commit pressure by the current
+  commit limit, which Windows grows on demand.
+- Every copy is touched a byte per page before it registers, and the copies
+  that came back intact register before the rest is filled: both keep
+  `cudaHostRegister` off its one-page-at-a-time path, and the second also
+  stops the fill pushing those pages out again. As each reclaim returns, the
+  ready request prefix registers, then the intact copy, without waiting for
+  earlier fills. The acquisition waits for the next reclaim only with the
+  lock released. Nothing may be filled while
+  another copy is still offered, which is why every reclaim runs first: the
+  fill's own demand is what Windows discards offered pages for. While the
+  tier is on a fill reads through the file cache at the lowest memory
+  priority, from the first load on, because at the normal one the cache
+  outranks offered pages; each fill thread faults its slice of the copy in
+  at its normal priority first, or the copy's own pages would take the low
+  one and be trimmed first. With the tier off, fills read through the cache
+  at the normal priority, which is what makes a refill warm.
 - Shared storage is preserved within one streamed block and within host
   state, not across a streamed block or block group boundary.
 - Activation and deactivation are the caller's job. A failed activation
@@ -97,7 +135,10 @@ One name per concept, taken from the code.
   The *budget* is `max_pinned_bytes`; storage an acquisition has *reserved*
   under it but not yet registered is *pending*. A lease *closes*; an idle
   registration or pending storage is *evicted*, which unregisters or
-  unreserves it and, for a copy, *frees* its region; a registration whose
+  unreserves it and, for a copy, *frees* its region or, on Windows, *offers*
+  it: the copy leaves the pin budget for the *offered* tier's own budget,
+  where Windows may discard its pages until a later acquisition *reclaims*
+  it, intact or discarded. A registration whose
   *owners*, the tensors over its storage, are gone is *retired* and
   unregistered once no lease holds it.
 

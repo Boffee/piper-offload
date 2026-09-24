@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+import piper_offload._copy_memory as copy_memory
 import piper_offload.block_component as block_component_module
 import piper_offload.host_component as host_component_module
 import piper_offload.merge as merge_module
@@ -33,6 +34,7 @@ from piper_offload.target_lease import CudaTargetLease
 from piper_offload.tensor_adapter_registry import param_representation, select_adapter
 from tests._block_compile_helpers import _BlockModel, _make_offloader
 from tests.conftest import CallbackParameterTransform, activated_model, block_components
+from tests.test_pin_manager import install_fake_kernel
 from tests.test_quantized_parameter_value import _QUANT_KINDS, _make_quantized
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device required")
@@ -655,14 +657,14 @@ def test_mapped_checkpoint_streams_from_owned_copies(mode, pins, tmp_path, monke
         block_compile=BlockCompileConfig(fullgraph=True) if mode == "rolling" else None,
     )
     resolved: list[torch.Tensor] = []
-    original_view = pin_module._Copy.view
+    original_view = copy_memory.Copy.view
 
-    def recording(copy: pin_module._Copy, tensor: torch.Tensor) -> torch.Tensor:
+    def recording(copy: copy_memory.Copy, tensor: torch.Tensor) -> torch.Tensor:
         view = original_view(copy, tensor)
         resolved.append(view)
         return view
 
-    monkeypatch.setattr(pin_module._Copy, "view", recording)
+    monkeypatch.setattr(copy_memory.Copy, "view", recording)
     try:
         with activated_model(offloader, "cuda"), torch.inference_mode():
             actual = offloader.value(inputs.cuda()).cpu()
@@ -821,3 +823,46 @@ def test_failed_synchronization_keeps_the_routed_lease(pins, monkeypatch) -> Non
         assert manager.stats.active_leases == 0
     finally:
         offloader.deactivate()
+
+
+@CUDA
+@pytest.mark.parametrize("reclaim_code", [0, 170], ids=["intact", "discarded"])
+def test_rotating_mapped_models_streams_from_offered_copies(reclaim_code, tmp_path, monkeypatch, request) -> None:
+    """Two streamed checkpoints over a budget that holds one: each switch offers a copy and takes the other back."""
+    safetensors = pytest.importorskip("safetensors.torch")
+    kernel = install_fake_kernel(monkeypatch, [])
+    # The platform component is selected when the manager is constructed.
+    manager, backend = request.getfixturevalue("pins")
+    kernel.reclaim_code = reclaim_code
+    rotation = []
+    for name in ("first", "second"):
+        model = _BlockModel(num_blocks=2, width=64)
+        inputs = torch.randn(2, 64)
+        expected = model(inputs)
+        path = tmp_path / f"{name}.safetensors"
+        safetensors.save_file(model.state_dict(), str(path))
+        reader = MappedCheckpoint(path)
+        names = reader.keys()
+        model.load_state_dict({name: reader.get_tensor(name) for name in names}, assign=True)
+        rotation.append((_make_offloader(model), inputs, expected))
+    try:
+        for round_index in range(3):
+            for offloader, inputs, expected in rotation:
+                with activated_model(offloader, "cuda"), torch.inference_mode():
+                    actual = offloader.value(inputs.cuda()).cpu()
+                    if round_index == 0:
+                        # One model's copies are the whole budget, so activating
+                        # the other must evict, and therefore offer, them.
+                        manager.max_pinned_bytes = manager.stats.copy_bytes
+                        manager.max_offered_bytes = manager.stats.copy_bytes
+                torch.testing.assert_close(actual, expected)
+        assert manager.stats.offered_bytes == manager.max_offered_bytes > 0
+        counts = {name: sum(event == name for event, _pointer in kernel.events) for name in ("offer", "reclaim")}
+        # Every offer but the ones still held was taken back by the next activation.
+        assert counts["offer"] == counts["reclaim"] + len(manager._memory._offered) > 0
+        # Each storage's copy was built once and reused from the tier thereafter.
+        copies = manager.stats.registrations + len(manager._memory._offered)
+        assert sum(event == "allocate" for event, _pointer in kernel.events) == copies
+    finally:
+        for offloader, _inputs, _expected in rotation:
+            offloader.deactivate()

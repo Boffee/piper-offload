@@ -131,7 +131,10 @@ to native CUDA/HIP capacity with ``None``; zero disables registration.
 released registrations enter an idle LRU. Anonymous storage registers in
 place. A tensor from :class:`MappedCheckpoint` pins through an owned copy
 filled from the file, which transfers read under their lease and which
-eviction frees, while the mapping stays read-only page cache. Piper never
+eviction frees, while the mapping stays read-only page cache. On Windows
+``max_offered_bytes`` can instead have an eviction offer the copy's pages to
+the OS, under a separate budget, so a later pin takes them back without
+rereading the file unless Windows discarded them. Piper never
 writes into a file mapping: trainable parameters and merge targets are copied
 out first.
 Every CUDA transfer runs under a lease that closes only after its runtime

@@ -1,28 +1,39 @@
 """Time the owned-copy pin path on a real checkpoint, phase by phase.
 
-Mirrors the archived H3 diagnosis: the selected tensors of the H3 transformer
+Mirrors the archived H3 diagnosis: the selected tensors of a transformer
 checkpoint go through the real pin manager and the real CUDA backend. Phases:
 a cold first pin (file evicted from the page cache before any tensor data
 is touched),
 a pinned transfer of every selected byte into a reused 64 MiB GPU buffer, a
 reacquisition of registered storage, an eviction, a warm refill, and a warm pageable transfer
 from the mapping. Fill and native registration time are split by
-instrumenting the manager; the kernel's disk-read counter proves which phases
-read from disk; and process RSS shows the copies' memory arriving and leaving.
+instrumenting the manager; the kernel's read counter shows which phases
+read, and process memory shows the copies' memory arriving and leaving.
+
+``--offered-gib`` adds the Windows offered tier to the same checkpoint, right
+after the free-and-refill pair it is meant to replace, so the two are measured
+against the same page cache: an eviction that offers the copies instead of
+freeing them, and the reacquisition that takes them back. ``--pressure-gib``
+then has a child process commit and touch that much memory, so Windows
+discards the offered pages and the reacquisition after it measures the refill
+that a discard costs.
 """
 
 # ruff: noqa: T201 - benchmark CLI prints its report.
 
 import argparse
 import json
-import os
+import subprocess
+import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from pathlib import Path
 
+import _process_memory as process_memory
 import torch
 
-import piper_offload.pin_manager as pin_module
+import piper_offload._copy_memory as copy_memory
+import piper_offload._copy_memory_windows as windows_memory
 from piper_offload import MappedCheckpoint, PinManager
 from piper_offload._host_registration import RuntimeHostRegistration
 
@@ -30,33 +41,19 @@ CHUNK = 64 * 2**20
 # What Piper Engine's H3 transformer loader leaves out.
 EXCLUDED_PREFIXES = ("token_refiner.", "condition_proj.", "context_embedder.")
 
-
-def _rss() -> tuple[int, int]:
-    """Process RSS and its shared part, which is where anonymous ``mmap`` regions are counted."""
-    rss = shared = 0
-    with open("/proc/self/status", encoding="utf-8") as status:
-        for line in status:
-            if line.startswith("VmRSS:"):
-                rss = int(line.split()[1]) * 1024
-            elif line.startswith("RssShmem:"):
-                shared = int(line.split()[1]) * 1024
-    return rss, shared
-
-
-def _disk_read_bytes() -> int:
-    with open("/proc/self/io", encoding="utf-8") as counters:
-        for line in counters:
-            if line.startswith("read_bytes:"):
-                return int(line.split()[1])
-    return 0
-
-
-def _drop_from_cache(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
+_PRESSURE = """
+import ctypes, sys
+target, held = int(sys.argv[1]), []
+while sum(len(block) for block in held) < target:
+    size = min(1 << 30, target - sum(len(block) for block in held))
     try:
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-    finally:
-        os.close(fd)
+        block = ctypes.create_string_buffer(size)
+    except MemoryError:
+        break
+    ctypes.memset(block, 1, size)
+    held.append(block)
+print(sum(len(block) for block in held))
+"""
 
 
 def _chunks(tensors: list[torch.Tensor]) -> Iterator[torch.Tensor]:
@@ -91,51 +88,89 @@ class _Timed(RuntimeHostRegistration):
 
 
 class _Phases:
-    """Times each phase and records the fill, registration, and RSS behind it."""
+    """Times each phase and records the fill, registration, and memory behind it."""
 
     def __init__(self, manager: PinManager, backend: _Timed) -> None:
         self.manager = manager
         self.backend = backend
-        self.fill_s = 0.0
+        # Offers and reclaims run on pools, so their own elapsed times overlap; each stage is timed whole.
+        self.reclaims = process_memory.Reclaims()
+        self.fill_s = self.reclaim_s = self.offer_s = 0.0
         self.result: dict[str, object] = {}
-        self._original_fill = pin_module._fill_copies
-        pin_module._fill_copies = self._timed_fill
+        self._original_fill = copy_memory._fill_copies
+        self._original_reclaim = windows_memory._reclaimed
+        self._original_offer = windows_memory._OfferBatch.take
+        copy_memory._fill_copies = self._timed_fill
+        windows_memory._reclaimed = self._timed_reclaim
 
-    def _timed_fill(self, pending: list[pin_module._PendingCopy]) -> None:
+        def timed_take(batch: windows_memory._OfferBatch) -> list[tuple[copy_memory.CopyOwner, str | None]]:
+            """What an eviction still waits for once it has unregistered everything; the rest overlapped that."""
+            start = time.perf_counter()
+            try:
+                return self._original_offer(batch)
+            finally:
+                self.offer_s += time.perf_counter() - start
+
+        windows_memory._OfferBatch.take = timed_take
+
+    def _timed_fill(
+        self, pending: list[copy_memory.CopyLoad], *, readers: copy_memory.Readers, read: copy_memory.ReadRange,
+    ) -> None:
         start = time.perf_counter()
-        self._original_fill(pending)
+        self._original_fill(pending, readers=readers, read=read)
         self.fill_s += time.perf_counter() - start
 
+    def _timed_reclaim(self, pending: list[copy_memory.CopyLoad]) -> Generator[copy_memory.CopyLoad]:
+        """The reclaim phase, including the registration of intact copies that runs beside it."""
+        start = time.perf_counter()
+        try:
+            yield from self._original_reclaim(pending)
+        finally:
+            self.reclaim_s += time.perf_counter() - start
+
     def restore(self) -> None:
-        pin_module._fill_copies = self._original_fill
+        copy_memory._fill_copies = self._original_fill
+        windows_memory._reclaimed = self._original_reclaim
+        windows_memory._OfferBatch.take = self._original_offer
+        self.reclaims.restore()
 
     def start(self) -> float:
         self.backend.register_s = self.backend.unregister_s = 0.0
         self.backend.register_calls = 0
-        self.fill_s = 0.0
-        self._disk_before = _disk_read_bytes()
+        self.fill_s = self.reclaim_s = self.offer_s = 0.0
+        self.reclaims.take()
+        self._read_before = process_memory.read_bytes()
         return time.perf_counter()
 
     def stop(self, name: str, started: float) -> None:
         seconds = time.perf_counter() - started
-        rss, shared = _rss()
-        disk = _disk_read_bytes() - self._disk_before
-        backend = self.backend
+        held = process_memory.memory()
+        read = process_memory.read_bytes() - self._read_before
+        backend, stats = self.backend, self.manager.stats
+        intact, discarded = self.reclaims.take()
         self.result[name] = {
             "seconds": round(seconds, 3),
             "fill_s": round(self.fill_s, 3),
             "register_s": round(backend.register_s, 3),
             "unregister_s": round(backend.unregister_s, 3),
+            "offer_s": round(self.offer_s, 3),
+            "reclaim_s": round(self.reclaim_s, 3),
             "register_calls": backend.register_calls,
-            "disk_read_bytes": disk,
-            "rss_bytes": rss,
-            "shared_rss_bytes": shared,
-            "pinned_bytes": self.manager.stats.pinned_bytes,
+            "read_bytes": read,
+            "resident_bytes": held.resident,
+            "committed_bytes": held.committed,
+            "shared_resident_bytes": held.shared,
+            "pinned_bytes": stats.pinned_bytes,
+            "offered_bytes": stats.offered_bytes,
+            "intact_bytes": intact,
+            "discarded_bytes": discarded,
         }
         print(
-            f"{name:<20} {seconds:8.3f} s  fill {self.fill_s:7.3f}  register {backend.register_s:7.3f}  "
-            f"unregister {backend.unregister_s:7.3f}  disk {disk / 1e9:6.2f} GB  rss {rss / 2**30:6.1f} GiB  "
-            f"pinned {self.manager.stats.pinned_bytes / 2**30:6.1f} GiB",
+            f"{name:<22} {seconds:8.3f} s  fill {self.fill_s:7.3f}  register {backend.register_s:7.3f}  "
+            f"unregister {backend.unregister_s:7.3f}  offer {self.offer_s:6.3f}  "
+            f"reclaim {self.reclaim_s:6.3f}  read {read / 1e9:6.2f} GB  "
+            f"resident {held.resident / 2**30:6.1f} GiB  commit {held.committed / 2**30:6.1f} GiB  "
+            f"pinned {stats.pinned_bytes / 2**30:5.1f}  offered {stats.offered_bytes / 2**30:5.1f} GiB",
             flush=True,
         )
 
@@ -153,23 +188,70 @@ def _transfer_all(manager: PinManager, tensors: list[torch.Tensor], device: torc
     return ok
 
 
-def _run(path: Path, device: torch.device) -> dict[str, object]:
+def _apply_pressure(gib: float) -> int:
+    """Commit and touch ``gib`` GiB in a child process, so Windows discards what it can."""
+    print(f"--- committing {gib:.1f} GiB in a child process", flush=True)
+    finished = subprocess.run(
+        [sys.executable, "-c", _PRESSURE, str(int(gib * 2**30))],
+        check=True, capture_output=True, text=True,
+    )
+    touched = int(finished.stdout.strip() or 0)
+    print(f"    it touched {touched / 2**30:.1f} GiB", flush=True)
+    return touched
+
+
+def _offered_phases(
+    manager: PinManager,
+    phases: _Phases,
+    tensors: list[torch.Tensor],
+    offered_bytes: int,
+    pressure_gib: float,
+) -> None:
+    """Offer the copies instead of freeing them, and take them back, before and after memory pressure."""
+    budget = manager.max_pinned_bytes
+    manager.max_offered_bytes = offered_bytes
+
+    def evict_into_the_tier(name: str) -> None:
+        started = phases.start()
+        manager.max_pinned_bytes = 0  # every idle copy is evicted, and so offered
+        manager.max_pinned_bytes = budget
+        phases.stop(name, started)
+
+    def reacquire(name: str) -> None:
+        started = phases.start()
+        lease = manager.acquire(tensors)
+        phases.stop(name, started)
+        lease.close()
+
+    evict_into_the_tier("evict_offer")
+    reacquire("reacquire_intact")
+    if pressure_gib > 0:
+        evict_into_the_tier("evict_offer_again")
+        phases.result["pressure_bytes"] = _apply_pressure(pressure_gib)
+        reacquire("reacquire_after_pressure")
+    manager.max_offered_bytes = 0
+    manager.clear()
+
+
+def _run(path: Path, device: torch.device, offered_gib: float, pressure_gib: float) -> dict[str, object]:
+    # Before the file is mapped: Windows keeps the pages a mapping covers.
+    process_memory.drop_from_cache(path)
     reader = MappedCheckpoint(path)
     keys = reader.keys()
     tensors = [reader.get_tensor(name) for name in keys if not name.startswith(EXCLUDED_PREFIXES)]
     backend = _Timed()
     manager = PinManager(backend=backend)
     phases = _Phases(manager, backend)
+    limit, available = process_memory.system_commit()
     phases.result.update(
         checkpoint=path.name,
         tensors=len(tensors),
         selected_bytes=sum(t.numel() * t.element_size() for t in tensors),
         budget_bytes=manager.max_pinned_bytes,
+        commit_limit_bytes=limit,
+        available_commit_bytes=available,
     )
     try:
-        # No tensor data has been touched yet, so the drop actually evicts
-        # it; a page already mapped into the process ignores the advice.
-        _drop_from_cache(path)
         started = phases.start()
         lease = manager.acquire(tensors)
         phases.stop("first_pin_cold", started)
@@ -194,7 +276,11 @@ def _run(path: Path, device: torch.device) -> dict[str, object]:
         lease = manager.acquire(tensors)
         phases.stop("refill_warm", started)
         lease.close()
-        manager.clear()
+
+        if offered_gib > 0:
+            _offered_phases(manager, phases, tensors, int(offered_gib * 2**30), pressure_gib)
+        else:
+            manager.clear()
 
         started = phases.start()
         with manager.acquire(tensors, pin=False):
@@ -202,6 +288,7 @@ def _run(path: Path, device: torch.device) -> dict[str, object]:
         phases.stop("pageable_warm", started)
     finally:
         phases.restore()
+        manager.clear()
     return phases.result
 
 
@@ -209,6 +296,8 @@ def _main() -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("checkpoints", nargs="+", type=Path)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--offered-gib", type=float, default=0.0, help="offered-copy budget; Windows only")
+    parser.add_argument("--pressure-gib", type=float, default=0.0, help="memory a child commits to force a discard")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -216,7 +305,7 @@ def _main() -> None:
     results = []
     for path in args.checkpoints:
         print(f"=== {path.name}", flush=True)
-        results.append(_run(path, device))
+        results.append(_run(path, device, args.offered_gib, args.pressure_gib))
     if args.output:
         args.output.write_text(json.dumps(results, indent=2))
 

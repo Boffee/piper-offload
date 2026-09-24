@@ -5,6 +5,130 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- `PinManager.max_offered_bytes`, zero by default, adds an optional Windows
+  tier that keeps an evicted copy's bytes instead of freeing them: the copy is
+  unregistered and its pages are offered to Windows, which may discard them
+  under memory pressure but leaves them committed. Pinning that storage again
+  reclaims them, registering what Windows kept without rereading the file and
+  refilling what it discarded, before any transfer can read the copy. Idle
+  pinned retention is unchanged; only an eviction that makes room offers a
+  copy, and everything else — `clear()`, a dropped owner, a failed offer, a
+  copy something still views — frees it as before. The offered budget is
+  page-rounded and separate from `max_pinned_bytes`, because offered pages
+  cost commitment rather than pinned RAM, and its least recently offered
+  copies are freed to fit a new one, when it is lowered, and when a new
+  copy's allocation fails. `PinStats` reports `offered_bytes` and
+  `max_offered_bytes`.
+- Offered copies keep their commitment after Windows discards their pages, so
+  the tier frees every offered copy when the memory manager sets its
+  `MaximumCommitCondition` event, which it does once commitment nears the most
+  the system can commit and the paging files cannot grow: that is when
+  allocations elsewhere start to fail. A thread waits on the event while the
+  tier holds copies, and the tier checks it before taking a copy and before
+  allocating a new one. A reserve kept against the current commit limit was
+  tried and dropped: Windows grows a system-managed paging file on demand, and
+  with 21 GiB of RAM available, available commitment fell to 0.8 GiB of an
+  unchanged 83.1 GiB limit with the event never set, while a tier keeping a
+  tenth of that limit free threw away all 18 GiB of H3's offered copies and
+  its reload took 39.1 s instead of 12.9 to 15.4 s.
+- The tier stays off by default because what it saves depends on the
+  workload: on a 64 GiB Windows 11 desktop, evicting the 6.9 GiB Hunyuan 3D
+  checkpoint into the tier takes 0.33 to 0.39 s and reclaiming and
+  registering it intact 0.93 to 0.97 s, against 0.30 to 0.32 s to free it and
+  1.17 to 1.26 s to refill it from a warm page cache. It pays where that
+  refill would read the file instead, 13.5 to 13.6 s cold there, and only
+  while Windows keeps the pages, which it cannot once pinned copies and the
+  offered ones together exceed RAM.
+- Copies are offered at normal offer priority, because at the lowest Windows
+  drops every offered page as soon as free memory runs low, and in spans of
+  16 MiB, since Windows discards and reports them a span at a time:
+  reacquiring an 18 GiB checkpoint after a 7 GiB one on a host with 21 GiB
+  available kept 13.0 GiB of it and took 12.2 s, against 11.6 to 12.6 GiB and
+  13.1 to 14.9 s when each copy was offered as a single range. The spans cost
+  nothing at that size — offering and reclaiming 6.9 GiB takes 0.38 s in
+  16 MiB spans against 0.40 s whole-region, and a switch that reads nothing is
+  unchanged — where 1 MiB spans cost 0.86 s.
+- While the tier is on, fills on Windows read through the file cache at the
+  lowest memory priority, because a fill leaves a second copy of every byte
+  it reads in the cache, which at the normal priority ranks above offered
+  pages. Each fill thread faults in the part of the copy it is about to read
+  first, at its normal priority, since at the low one the copy's own pages
+  would be what Windows trims first: under pressure, registering 18 GiB of
+  refilled copies took 11.0 s that way, against 3.2 s. With 21 GiB of RAM
+  available and the 18 GiB H3 checkpoint's copies offered, pinning the
+  6.9 GiB Hunyuan 3D checkpoint and then H3 again kept 12.4 to 12.7 GiB of it
+  intact and took 13.1 to 13.7 s, against 4.1 GiB and 28.2 s reading through
+  the cache at the normal priority and 35.4 s with the tier off. The low
+  priority is needed from the first load: read at the normal priority until
+  something is offered, the first load left the file cached above the copies
+  offered later, and at full RAM every switch between the two then found its
+  offered copies discarded, 10.1 to 10.4 s a switch against 0.87 to 0.95 s.
+  Windows does not document where offered pages rank; measured, they sit
+  between memory priorities 3 and 4, two levels above the fills. Reading
+  around the cache through `FILE_FLAG_NO_BUFFERING` handles was tried and
+  dropped: it kept as much, 12.3 to 12.7 GiB in 12.8 to 13.6 s, but read a
+  file the cache already held from disk, so a first pin of H3 from a warm
+  cache took 35.7 s against 2.3 to 2.4 s, and its cold fills ran 2 to 3%
+  slower. With the tier off, fills read through the cache as before.
+- Each copy an acquisition or a budget change evicts is offered as soon as
+  its own unregistration succeeds, on a pool of one thread per core, and the
+  manager waits for that pool only once it has released its lock, since a
+  worker that collects garbage may run a finalizer needing it; until then no
+  other thread can see those copies. The runtime unregisters serially
+  whatever the caller does, at 28.7 GiB/s on one thread and 26.1 on sixteen,
+  so offering runs beside that stream rather than after it: evicting and
+  offering a 6.9 GiB checkpoint takes 0.36 s this way against 0.48 s as two
+  passes, and what is left to wait for at the end is 0.004 s. Offering scales
+  where reclaiming does not: 1.03 s on one thread to 0.27 s on sixteen,
+  against reclaims that are fastest on five to seven and twice as slow on
+  sixteen, so they use six. A lease that closes over budget, possibly from a
+  finalizer, offers its copies as it closes.
+- Reclaimed copies come back on that pool of six, all of them before anything
+  is filled, and every copy's pages are written back over themselves a byte
+  per page before it registers: `cudaHostRegister` faults pages outside the
+  working set in one at a time, at 8 GiB/s, where that write brings them back
+  at 42 and leaves registration running at 55. The copies Windows returned
+  intact register before the rest of the acquisition is read, because
+  registering locks their pages and the fill of the rest would otherwise push
+  them out again: reacquiring an 18 GiB checkpoint whose fill was 6 GiB took
+  19.4 s with them registered after the fill and 14.1 s before it, the
+  registration itself 5.3 s against 0.5, and it also answers whether the
+  runtime is out of capacity before any read. Each registers as soon as its
+  own reclaim returns, so the runtime's serial registration runs beside the
+  rest of the reclaims rather than after them: reclaiming and registering the
+  6.9 GiB checkpoint intact takes 0.93 to 0.97 s this way against 1.16 to
+  1.20 s as two passes, and the 18 GiB H3 checkpoint 2.08 to 2.14 s against
+  2.53 to 2.60 s.
+
+### Changed
+
+- Copies fill in parallel on every platform. Where there are no positional
+  reads, which is Windows, the copies used to fill one at a time under a
+  process-wide lock, because a handle has a single position and the kernel
+  serializes concurrent reads on it; each worker now reads through a handle of
+  its own instead, and the two platforms share one path. Refilling the 6.9 GiB
+  Hunyuan 3D checkpoint from a warm page cache drops from 1.92 s to 1.17 to
+  1.26 s, most of it in by four workers.
+  A cold refill is unchanged at 13.6 s, because the drive is what bounds it:
+  reading that file takes 0.53 GB/s on one thread and 0.56 GB/s on sixteen.
+- Owned copies of checkpoint storage are `VirtualAlloc` regions on Windows,
+  which is what can be offered and what `VirtualFree` releases in one call,
+  instead of pagefile-backed mappings. They stay anonymous `mmap` regions
+  elsewhere.
+
+### Fixed
+
+- Ready request prefixes retain their registration priority ahead of intact offered
+  copies, so an oversized reclaimed copy cannot prevent earlier ready storage
+  from using available runtime capacity. Intact copies still skip earlier fills.
+- A copy's storage is now built over a `memoryview` of its region, so the
+  region counts it as an export and cannot be released while a tensor still
+  points into it. Freeing an evicted copy under a transfer view that outlived
+  its lease used to unmap it silently; it now warns and returns the memory
+  when the last view dies, as the code already documented.
+
 ## [0.10.0rc8] - 2026-09-22
 
 ### Changed
