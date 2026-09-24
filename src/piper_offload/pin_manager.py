@@ -418,13 +418,13 @@ class PinManager:
         from the offered tier when the storage has one there; the copies are
         reclaimed and fill with the lock released, the first alone and the
         rest together once it has registered, and a reclaimed copy whose pages
-        Windows kept intact is not read and registers as soon as preceding
-        requests are settled, while later copies can still be reclaiming.
-        Registration always follows request order. A runtime capacity failure
-        evicts unrelated idle registrations and retries; if capacity remains unavailable, later
-        storage in this acquisition skips registration. A rejected range alone
-        stays pageable, without evicting other registrations or skipping later
-        storage.
+        Windows kept intact is not read but registers as soon as it is back,
+        while the rest are still being reclaimed; everything else registers in
+        request order. A runtime capacity failure evicts unrelated idle
+        registrations and retries; if capacity remains unavailable, the
+        storage this acquisition has not registered yet skips registration. A
+        rejected range alone stays pageable, without evicting other
+        registrations or skipping later storage.
         """
         requests = self._requests(tensors)
         held: dict[int, _Registration] = {}
@@ -463,16 +463,26 @@ class PinManager:
 
     def _prepare_copies(
         self,
-        prepared: Generator[None],
+        prepared: Generator[CopyLoad | None],
         pending: list[_Pending],
         held: dict[int, _Registration],
         created: list[_Registration],
     ) -> bool:
-        """Register ready copies in request order while memory preparation progresses off the lock."""
+        """Register copies as memory prepares them, off the lock; whether the runtime's capacity ran out.
+
+        A ready copy that preparation hands back registers at once, ahead of
+        earlier storage still waiting for its fill, because registering locks
+        its pages where that fill would otherwise push them out of the
+        working set: reacquiring an 18 GiB checkpoint whose fill was 6 GiB
+        took 19.4 s with the intact copies registered after the fill and
+        14.1 s before it, the registration itself 5.3 s against 0.5.
+        """
+        waiting = {item.load: item for item in pending if isinstance(item, _PendingCopy)}
         with contextlib.closing(prepared):
-            for _ in prepared:
+            for load in prepared:
+                early = waiting[load] if load is not None and load.ready else None
                 with self._lock:
-                    if self._register_pending(pending, held, created):
+                    if self._register_pending(pending, held, created, early):
                         return True
         return False
 
@@ -654,37 +664,46 @@ class PinManager:
         pending: list[_Pending],
         held: dict[int, _Registration],
         created: list[_Registration],
+        early: _Pending | None = None,
     ) -> bool:
-        """Register the ready prefix in request order; return whether runtime capacity is exhausted.
+        """Register ``early``, then the ready prefix in request order; return whether runtime capacity is exhausted.
 
         Refused storage is evicted. Capacity exhaustion stops the pass; the
         caller joins workers before discarding the remaining pending storage.
         Memory preparation publishes readiness after joining the worker, so
         registration never races a worker.
         """
-        exhausted = False
-        while pending:
+        exhausted = early is not None and self._settle_pending(early, pending, held, created)
+        while not exhausted and pending:
             item = pending[0]
             if isinstance(item, _PendingCopy) and not item.load.ready:
                 break
-            try:
-                outcome = self._register_pending_item(item)
-            except HostRegistrationRefusedError:
-                outcome = _Refusal.STORAGE
-            if isinstance(outcome, _Registration):
-                _live_managers.add(self)
-                self._registrations[item.pointer] = outcome
-                created.append(outcome)
-                self._hold(outcome, item.request, held)
-            else:
-                self._evict_pending(item)
-                exhausted = outcome is _Refusal.CAPACITY
-            del self._pending[item.pointer]
-            del pending[0]
-            if exhausted:
-                break
+            exhausted = self._settle_pending(item, pending, held, created)
         self._pending_changed.notify_all()
         return exhausted
+
+    def _settle_pending(
+        self,
+        item: _Pending,
+        pending: list[_Pending],
+        held: dict[int, _Registration],
+        created: list[_Registration],
+    ) -> bool:
+        """Register or evict one pending storage and take it out of ``pending``; whether runtime capacity ran out."""
+        try:
+            outcome = self._register_pending_item(item)
+        except HostRegistrationRefusedError:
+            outcome = _Refusal.STORAGE
+        if isinstance(outcome, _Registration):
+            _live_managers.add(self)
+            self._registrations[item.pointer] = outcome
+            created.append(outcome)
+            self._hold(outcome, item.request, held)
+        else:
+            self._evict_pending(item)
+        del self._pending[item.pointer]
+        pending.remove(item)
+        return outcome is _Refusal.CAPACITY
 
     def _discard_pending(self, pending: list[_Pending]) -> None:
         """Release remaining reservations once all acquisition workers have stopped."""

@@ -336,20 +336,22 @@ class Memory(shared.Memory):
     def clear(self) -> list[Copy]:
         return self._evict_offered(0)
 
-    def prepare(self, copies: list[CopyLoad]) -> Generator[None]:
+    def prepare(self, copies: list[CopyLoad]) -> Generator[CopyLoad | None]:
         # Snapshot the fill policy while reservation still holds the lock.
         return self._prepare(copies, below_offers=self.max_offered_bytes > 0)
 
-    def _prepare(self, copies: list[CopyLoad], *, below_offers: bool) -> Generator[None]:
-        """Reclaim all requested copies before any fill, overlapping intact copies with registration.
+    def _prepare(self, copies: list[CopyLoad], *, below_offers: bool) -> Generator[CopyLoad | None]:
+        """Reclaim all requested copies before any fill, handing each back as soon as its reclaim returns.
 
+        A copy Windows kept intact is then ready, so it registers before
+        anything is read, ahead of earlier copies still to be filled.
         Closing joins all reclaim workers before the manager may free any
         pending copy. Readiness is published only after its worker is joined.
         """
         with contextlib.closing(_reclaimed(copies)) as reclaimed:
             for item in reclaimed:
                 item.offered = False
-                yield
+                yield item
         unfilled = [item for item in copies if item.missing and item.error is None]
         # Apply low-priority file reads from the first load, before anything
         # is offered, so its page cache cannot outrank copies offered later.

@@ -90,15 +90,14 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   per page before it registers: `cudaHostRegister` faults pages outside the
   working set in one at a time, at 8 GiB/s, where that write brings them back
   at 42 and leaves registration running at 55. The copies Windows returned
-  intact can register during reclamation once preceding requests have settled.
-  Registering locks their pages against later fills. In the original Windows
-  measurements, reacquiring an 18 GiB checkpoint whose fill was 6 GiB took
+  intact register before the rest of the acquisition is read, because
+  registering locks their pages and the fill of the rest would otherwise push
+  them out again: reacquiring an 18 GiB checkpoint whose fill was 6 GiB took
   19.4 s with them registered after the fill and 14.1 s before it, the
   registration itself 5.3 s against 0.5, and it also answers whether the
-  runtime is out of capacity before reading later requests. Each registers
-  as soon as its own reclaim returns and preceding requests have settled,
-  so the runtime's serial registration runs beside later reclaims:
-  reclaiming and registering the
+  runtime is out of capacity before any read. Each registers as soon as its
+  own reclaim returns, so the runtime's serial registration runs beside the
+  rest of the reclaims rather than after them: reclaiming and registering the
   6.9 GiB checkpoint intact takes 0.93 to 0.97 s this way against 1.16 to
   1.20 s as two passes, and the 18 GiB H3 checkpoint 2.08 to 2.14 s against
   2.53 to 2.60 s.
@@ -121,11 +120,6 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Fixed
 
-- Acquisitions containing intact offered copies preserve request order when
-  runtime registration capacity is limited. An intact copy waits for earlier
-  fresh, discarded, or in-place storage rather than taking its capacity.
-  Windows timings above predate this correction; mixed intact/refill
-  acquisitions require remeasurement.
 - A copy's storage is now built over a `memoryview` of its region, so the
   region counts it as an export and cannot be released while a tensor still
   points into it. Freeing an evicted copy under a transfer view that outlived

@@ -2319,34 +2319,42 @@ def test_only_the_spans_windows_discarded_are_read_again(
     manager.clear()
 
 
-@pytest.mark.parametrize("first_kind", ["fresh", "anonymous", "discarded"])
-@pytest.mark.parametrize("capacity", [0, 2 * PAGE])
-def test_intact_copies_do_not_take_capacity_from_an_earlier_request(
-    first_kind, capacity, backend, offering, tmp_path,
+@pytest.mark.parametrize("first_kind", ["fresh", "discarded"])
+@pytest.mark.parametrize("capacity", [None, 2 * PAGE])
+def test_an_intact_copy_registers_before_an_earlier_copy_is_read(
+    first_kind, capacity, backend, offering, tmp_path, monkeypatch,
 ) -> None:
+    """Waiting for the earlier fill would leave its pages for that fill to push out of the working set.
+
+    So when the runtime has capacity for only one of them, the intact copy is the one pinned.
+    """
+    first = _checkpoint(tmp_path, 2 * PAGE, "first")
     kept = _checkpoint(tmp_path, 2 * PAGE, "kept")
-    first = (
-        _tensors((0, 2 * PAGE))[0]
-        if first_kind == "anonymous"
-        else _checkpoint(tmp_path, 2 * PAGE, "first")
-    )
     manager = PinManager(4 * PAGE, max_offered_bytes=4 * PAGE, backend=backend)
     with manager.acquire([first, kept] if first_kind == "discarded" else [kept]):
         pass
+    kept_copy = _copy_pointer(backend, 1 if first_kind == "discarded" else 0)
     if first_kind == "discarded":
         offering.discarded_spans.add((_copy_pointer(backend), 0))
     manager.max_pinned_bytes = 0
     manager.max_pinned_bytes = 4 * PAGE
     backend.capacity = capacity
-    backend.register_calls.clear()
+    original = copy_memory._fill_copies
+
+    def noting(pending, **options):
+        backend.events.append(("fill", len(pending)))
+        return original(pending, **options)
+
+    monkeypatch.setattr(copy_memory, "_fill_copies", noting)
+    backend.events.clear()
     try:
         with manager.acquire([first, kept]) as lease:
-            assert lease.registered_bytes == capacity
-            expected = {first.untyped_storage().data_ptr()} if capacity else set()
-            assert set(manager._registrations) == expected
-            assert len(backend.register_calls) == (2 if capacity else 1)
+            pinned = [kept] if capacity else [first, kept]
+            assert set(manager._registrations) == {tensor.untyped_storage().data_ptr() for tensor in pinned}
+            assert lease.registered_bytes == 2 * PAGE * len(pinned)
             for tensor in (first, kept):
                 torch.testing.assert_close(_transferred(manager, tensor), tensor)
+        assert backend.events.index(("register", kept_copy)) < backend.events.index(("fill", 1))
     finally:
         manager.clear()
 

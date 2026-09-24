@@ -288,10 +288,13 @@ class Memory(ABC):
         copy = self.allocate(size)
         return None if copy is None else CopyLoad(source=source, copy=copy, missing=[(0, size)])
 
-    def prepare(self, copies: list[CopyLoad]) -> Generator[None]:
+    def prepare(self, copies: list[CopyLoad]) -> Generator[CopyLoad | None]:
         """Snapshot policy under the lock; advance and close the generator outside it.
 
-        The first result lets the manager detect exhausted runtime capacity
+        Each result is a copy whose preparation has just finished, which the
+        manager registers at once if it is ready, ahead of storage before it,
+        or None, after which what is ready registers in request order. The
+        first result lets the manager detect exhausted runtime capacity
         before reading the remaining copies. Close this generator before
         freeing any acquisition copy.
         """
