@@ -379,10 +379,11 @@ class _InPlace:
 class _PendingCopy:
     """A copy reserved for one request, filled and registered with the rest of its acquisition.
 
-    ``offered`` marks a copy taken from the offered tier, which is reclaimed
-    before anything is filled. ``missing`` is what the fill has to read of
-    the copy, as offsets and lengths: all of a new or rebuilt one, the spans
-    Windows discarded of a reclaimed one, and nothing of one it kept intact.
+    ``offered`` marks a copy whose reclaim worker has not yet been joined;
+    every reclaim finishes before anything is filled. ``missing`` is what the
+    fill has to read of the copy, as offsets and lengths: all of a new or rebuilt one, the spans
+    Windows discarded of a reclaimed one, and nothing of one it kept intact
+    or whose fill completed successfully.
     """
 
     pointer: int
@@ -449,6 +450,9 @@ def _fill_copies(pending: list[_PendingCopy], *, below_offers: bool = False) -> 
                 future.result()
             except OSError as error:
                 item.error = _detached(error)
+    for item in pending:
+        if item.error is None:
+            item.missing.clear()
 
 
 def _on_workers(action: Callable[[_Copy], None], copies: list[_Copy], workers: int, name: str) -> None:
@@ -506,34 +510,27 @@ class _OfferBatch:
     thread can reclaim, free, or read them.
     """
 
-    __slots__ = ("_futures", "_pool", "items")
+    __slots__ = ("_futures", "_pool")
 
     def __init__(self) -> None:
-        self.items: list[tuple[_Registration, _Copy]] = []
-        self._futures: list[Future[str | None]] = []
+        self._futures: list[tuple[_Registration, Future[str | None]]] = []
         self._pool: ThreadPoolExecutor | None = None
 
-    def add(self, registration: _Registration, copy: _Copy) -> None:
+    def add(self, registration: _Registration) -> None:
         """Start offering a copy whose unregistration has just succeeded; called with the lock held."""
+        assert registration.copy is not None
         if self._pool is None:
             workers = os.process_cpu_count() or 1
             self._pool = ThreadPoolExecutor(workers, thread_name_prefix="piper-offload-offer")
-        self.items.append((registration, copy))
-        self._futures.append(self._pool.submit(_offer_copy, copy))
+        self._futures.append((registration, self._pool.submit(_offer_copy, registration.copy)))
 
-    def take(self) -> tuple[list[tuple[_Registration, _Copy]], list[str | None]]:
+    def take(self) -> list[tuple[_Registration, str | None]]:
         """Empty the batch and wait for its offers, returning each copy and why it could not be offered."""
-        items, futures, pool = self.items[:], self._futures[:], self._pool
-        self.items.clear()
-        self._futures.clear()
-        self._pool = None
-        if pool is None:
-            return items, []
-        try:
-            failures = [future.result() for future in futures]
-        finally:
+        futures, self._futures = self._futures, []
+        pool, self._pool = self._pool, None
+        if pool is not None:
             pool.shutdown()
-        return items, failures
+        return [(registration, future.result()) for registration, future in futures]
 
 
 def _reclaim_copy(item: _PendingCopy) -> None:
@@ -876,10 +873,9 @@ class PinManager:
         """
         if value < 0:
             raise ValueError("max_offered_bytes must be >= 0")
-        released: list[_Copy] = []
         with self._lock:
             self._max_offered_bytes = value
-            self._fit_offered(0, released)
+            released = self._evict_offered(value)
         _free_copies(released)
 
     @property
@@ -920,10 +916,10 @@ class PinManager:
         from the offered tier when the storage has one there; the copies are
         reclaimed and fill with the lock released, the first alone and the
         rest together once it has registered, and a reclaimed copy whose pages
-        Windows kept intact is not read but registers as soon as it is back,
-        while the rest are still being reclaimed; then everything registers in
-        request order. A runtime capacity failure evicts unrelated idle
-        registrations and retries; if capacity remains unavailable, later
+        Windows kept intact is not read and registers as soon as preceding
+        requests are settled, while later copies can still be reclaiming.
+        Registration always follows request order. A runtime capacity failure
+        evicts unrelated idle registrations and retries; if capacity remains unavailable, later
         storage in this acquisition skips registration. A rejected range alone
         stays pageable, without evicting other registrations or skipping later
         storage.
@@ -952,14 +948,13 @@ class PinManager:
             self._offer_together(offers)
             exhausted = bool(copies) and self._reclaim_and_fill(copies, pending, held, created, below_offers)
             with self._lock:
-                self._register_pending(pending, list(pending), held, created, exhausted=exhausted)
+                if not exhausted:
+                    self._register_pending(pending, held, created)
+                self._discard_pending(pending)
                 return self._open_lease(requests, held)
         except BaseException:
             with self._lock:
-                for item in pending:
-                    self._evict_pending(item)
-                    del self._pending[item.pointer]
-                self._pending_changed.notify_all()
+                self._discard_pending(pending)
                 for registration in created:
                     registration.retired = True
                 self._release(tuple(held.values()))
@@ -976,9 +971,9 @@ class PinManager:
     ) -> bool:
         """Reclaim and fill an acquisition's copies with the lock released; whether the runtime's capacity ran out.
 
-        Copies Windows returned intact register as each comes back, before
-        anything is read, because registering locks their pages where the
-        fill of the rest would otherwise push them out of the working set
+        Copies Windows returned intact register as each comes back, once
+        preceding requests are settled, because registering locks their pages
+        where the fill of the rest would otherwise push them out of the working set
         again: reacquiring an 18 GiB checkpoint whose fill was 6 GiB took
         19.4 s with those pages registered after the fill and 14.1 s before
         it, the registration itself 5.3 s against 0.5. It also finds a runtime
@@ -987,16 +982,17 @@ class PinManager:
         """
         with contextlib.closing(_reclaimed(copies)) as reclaimed:
             for item in reclaimed:
-                if not item.missing:
-                    with self._lock:
-                        if self._register_pending(pending, [item], held, created):
-                            return True  # the rest can only be evicted, so their reclaims are cancelled
+                # Publish readiness only after this copy's worker has been joined.
+                item.offered = False
+                with self._lock:
+                    if self._register_pending(pending, held, created):
+                        return True  # the rest can only be evicted, so their reclaims are cancelled
         unfilled = [item for item in copies if item.missing and item.error is None]
         if unfilled:
             _fill_copies(unfilled[:1], below_offers=below_offers)
             _touch_copies(unfilled[:1])
             with self._lock:
-                if self._register_pending(pending, pending[: pending.index(unfilled[0]) + 1], held, created):
+                if self._register_pending(pending, held, created):
                     return True
             if len(unfilled) > 1:
                 _fill_copies(unfilled[1:], below_offers=below_offers)
@@ -1074,8 +1070,7 @@ class PinManager:
                 registration = self._registrations.get(pointer)
                 if registration is not None and not self._unregister(registration, released):
                     failed += 1
-            for registration in tuple(self._offered.values()):
-                self._free_offered(registration, released)
+            released.extend(self._evict_offered(0))
         _free_copies(released)
         if failed:
             raise RuntimeError(f"Could not release {failed} host registration(s); storage remains retained")
@@ -1169,15 +1164,13 @@ class PinManager:
 
     def _reserve_copy(self, pointer: int, request: _Request, source: FileSlice) -> _PendingCopy | None:
         """Reserve a copy under the budget: the storage's offered copy if it has one, otherwise a new allocation."""
-        offered = self._offered.pop(pointer, None)
+        offered = self._offered.get(pointer)
         if offered is None:
             copy = self._allocate_copy(request.storage.nbytes())
             return None if copy is None else _PendingCopy(pointer, request, source, copy, [(0, copy.size)])
-        copy = offered.copy
-        assert copy is not None
+        copy = self._take_offered(pointer)
         size = copy.size
         # Out of the tier before making room, so the evictions cannot free it.
-        self._offered_bytes -= size
         if not self._fit(lambda: size):
             # It stays offered, now the most recent. It still fits: the
             # evictions that made room went to this acquisition's offers.
@@ -1193,7 +1186,8 @@ class PinManager:
         if not self._fit(lambda: size):
             return None
         # The new copy's commitment may be what Windows cannot find; the tier's is the process's to give.
-        self._relieve_commit()
+        for released in self._relieve_commit():
+            released.free()
         try:
             copy = _Copy(size)
         except (OSError, MemoryError) as error:
@@ -1212,8 +1206,8 @@ class PinManager:
         Offered pages stay committed, so a failed allocation is the commit
         pressure that has to free them.
         """
-        target = self._offered_bytes - size
-        self._evict_offered(lambda: self._offered_bytes <= target)
+        for copy in self._evict_offered(self._offered_bytes - size):
+            copy.free()
         try:
             return _Copy(size)
         except (OSError, MemoryError):
@@ -1235,110 +1229,88 @@ class PinManager:
         offered its owner was dropped, its storage got another copy, or the
         budget shrank below it.
         """
-        taken, failures = batch.take()
+        taken = batch.take()
         if not taken:
             return
         released: list[_Copy] = []
         with self._lock:
-            for (registration, copy), failure in zip(taken, failures, strict=True):
-                if not self._settle_offer(registration, copy, failure, released):
-                    released.append(copy)
+            for registration, failure in taken:
+                released.extend(self._settle_offer(registration, failure))
         _free_copies(released)
 
-    def _may_offer(self, registration: _Registration, copy: _Copy) -> bool:
-        """Whether an evicted copy is one the tier would take: its owner alive, on Windows, within the budget."""
-        return not registration.retired and copy.offerable and copy.size <= self._max_offered_bytes
-
-    def _settle_offer(
-        self, registration: _Registration, copy: _Copy, failure: str | None, released: list[_Copy] | None = None,
-    ) -> bool:
-        """Put a copy whose offer has run in the tier; False to free it instead, as when Windows refused it."""
+    def _settle_offer(self, registration: _Registration, failure: str | None) -> list[_Copy]:
+        """Admit a completed offer and return the copies its caller must free, including any rejected offer."""
+        copy = registration.copy
+        assert copy is not None
         if failure is not None:
             logger.warning("Could not offer an evicted pinned copy; freeing it: %s", failure)
-            return False
-        return self._admit_offered(registration, copy, released)
-
-    def _admit_offered(self, registration: _Registration, copy: _Copy, released: list[_Copy] | None = None) -> bool:
-        """Put an offered copy in the tier as its most recent, unless it no longer belongs there.
-
-        The copies this frees go to ``released``, if given, to be freed off the lock.
-        """
+            return [copy]
         pointer = registration.pointer
         rebuilt = pointer in self._registrations or pointer in self._pending or pointer in self._offered
-        if registration.retired or rebuilt:
-            return False
-        if not self._fit_offered(copy.size, released):
-            return False
+        if registration.retired or rebuilt or copy.size > self._max_offered_bytes:
+            return [copy]
+        released = self._evict_offered(self._max_offered_bytes - copy.size)
         self._offered[pointer] = registration
         self._offered_bytes += copy.size
-        self._relieve_commit(released)
+        released.extend(self._relieve_commit())
         if self._offered and not self._watching_commit:
             self._watching_commit = True
             threading.Thread(
                 target=_watch_commit, args=(weakref.ref(self),), name="piper-offload-commit", daemon=True,
             ).start()
-        return True
+        return released
 
-    def _relieve_commit(self, released: list[_Copy] | None = None) -> None:
-        """Free every offered copy if Windows reports its commitment exhausted, since theirs is what it lacks."""
+    def _relieve_commit(self) -> list[_Copy]:
+        """Detach offered copies for freeing if Windows reports its commitment exhausted."""
         if self._offered and commit_exhausted():
             logger.warning("Windows cannot commit more memory; freeing %d offered copies", len(self._offered))
-            self._evict_offered(lambda: False, released)
+            return self._evict_offered(0)
+        return []
 
     def _keep_commit(self) -> bool:
         """The watcher's turn: relieve exhausted commitment; False once the tier is empty, which ends the watch."""
-        released: list[_Copy] = []
         with self._lock:
-            self._relieve_commit(released)
+            released = self._relieve_commit()
             watching = self._watching_commit = bool(self._offered)
         _free_copies(released)
         return watching
 
-    def _fit_offered(self, size: int, released: list[_Copy] | None = None) -> bool:
-        """Free offered copies, least recent first, until ``size`` more bytes fit ``max_offered_bytes``."""
-        budget = self._max_offered_bytes
-        if size > budget:
-            return False
-        self._evict_offered(lambda: self._offered_bytes + size <= budget, released)
-        return True
+    def _evict_offered(self, target: int) -> list[_Copy]:
+        """Detach least recently offered copies down to ``target`` bytes; the caller frees their regions."""
+        released: list[_Copy] = []
+        while self._offered and self._offered_bytes > target:
+            released.append(self._take_offered(next(iter(self._offered))))
+        return released
 
-    def _evict_offered(self, until: Callable[[], bool], released: list[_Copy] | None = None) -> None:
-        """Free offered copies, least recently offered first, until ``until()`` holds."""
-        while self._offered and not until():
-            self._free_offered(next(iter(self._offered.values())), released)
-
-    def _free_offered(self, registration: _Registration, released: list[_Copy] | None = None) -> None:
-        """Take a copy out of the offered tier and free it, or leave it in ``released`` to free off the lock."""
-        del self._offered[registration.pointer]
-        copy = registration.copy
+    def _take_offered(self, pointer: int) -> _Copy:
+        """Remove a copy and its charge from the tier, transferring ownership to the caller."""
+        copy = self._offered.pop(pointer).copy
         assert copy is not None
         self._offered_bytes -= copy.size
-        if released is None:
-            copy.free()
-        else:
-            released.append(copy)
+        return copy
 
     def _register_pending(
         self,
         pending: list[_Pending],
-        items: list[_Pending],
         held: dict[int, _Registration],
         created: list[_Registration],
-        *,
-        exhausted: bool = False,
     ) -> bool:
-        """Register ``items``, in request order, taking each out of ``pending`` once it is settled.
+        """Register the ready prefix in request order; return whether runtime capacity is exhausted.
 
-        Refused storage is evicted, which unreserves it and frees its copy.
-        Once the runtime's capacity is exhausted, which the result reports and
-        ``exhausted`` carries into a later call, the rest is evicted the same
-        way, avoiding one failed runtime call per remaining storage. What stays
-        in ``pending`` is left to that later call, since it may still be
-        filling or being reclaimed.
+        Refused storage is evicted. Capacity exhaustion stops the pass; the
+        caller joins workers before discarding the remaining pending storage.
+        Only the acquisition thread marks a copy no longer offered after
+        joining its reclaim worker, so registration never races a worker.
         """
-        for item in items:
+        exhausted = False
+        while pending:
+            item = pending[0]
+            if isinstance(item, _PendingCopy) and (
+                item.offered or (item.missing and item.error is None)
+            ):
+                break
             try:
-                outcome = _Refusal.CAPACITY if exhausted else self._register_pending_item(item)
+                outcome = self._register_pending_item(item)
             except HostRegistrationRefusedError:
                 outcome = _Refusal.STORAGE
             if isinstance(outcome, _Registration):
@@ -1350,9 +1322,19 @@ class PinManager:
                 self._evict_pending(item)
                 exhausted = outcome is _Refusal.CAPACITY
             del self._pending[item.pointer]
-            pending.remove(item)
+            del pending[0]
+            if exhausted:
+                break
         self._pending_changed.notify_all()
         return exhausted
+
+    def _discard_pending(self, pending: list[_Pending]) -> None:
+        """Release remaining reservations once all acquisition workers have stopped."""
+        for item in pending:
+            self._evict_pending(item)
+            del self._pending[item.pointer]
+        pending.clear()
+        self._pending_changed.notify_all()
 
     def _register_pending_item(self, item: _Pending) -> _Registration | _Refusal:
         """Register one pending storage with the runtime; a copy whose fill failed leaves its storage pageable."""
@@ -1459,7 +1441,7 @@ class PinManager:
                     if registration.leases == 0 and manager._registrations.get(registration.pointer) is registration:
                         manager._unregister(registration)
                     elif manager._offered.get(registration.pointer) is registration:
-                        manager._free_offered(registration)
+                        manager._take_offered(registration.pointer).free()
 
         for tensor in request.tensors:
             if id(tensor) not in registration.owners:
@@ -1489,19 +1471,19 @@ class PinManager:
             self._unreserve_range(registration.pointer, registration.size)
         else:
             self._pinned_bytes -= copy.size
-            kept = False
-            if demote and self._may_offer(registration, copy):
+            copies = [copy]
+            if demote and not registration.retired and copy.offerable and copy.size <= self._max_offered_bytes:
                 if self._offering is not None:
-                    self._offering.add(registration, copy)
-                    kept = True
+                    self._offering.add(registration)
+                    copies = []
                 else:
-                    kept = self._settle_offer(registration, copy, _offer_copy(copy), released)
-            if not kept:
-                if released is None:
+                    copies = self._settle_offer(registration, _offer_copy(copy))
+            if released is None:
+                for copy in copies:
                     copy.free()
-                else:
-                    # Freed by the caller once it has released the lock.
-                    released.append(copy)
+            else:
+                # Freed by the caller once it has released the lock.
+                released.extend(copies)
         self._drop_lifetime_root_if_empty()
         return True
 

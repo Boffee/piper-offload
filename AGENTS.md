@@ -81,11 +81,12 @@ file holds what agents get wrong without it.
   their commitment, so every one is freed when Windows sets its
   `MaximumCommitCondition` event; never judge commit pressure by the current
   commit limit, which Windows grows on demand.
-- Every copy is touched a byte per page before it registers, and the copies
-  that came back intact register before the rest is filled: both keep
-  `cudaHostRegister` off its one-page-at-a-time path, and the second also
-  stops the fill pushing those pages out again. An intact copy registers as
-  soon as its own reclaim returns, beside the rest, and the acquisition waits
+- Every copy is touched a byte per page before it registers, keeping
+  `cudaHostRegister` off its one-page-at-a-time path. During reclamation,
+  an intact copy registers once its reclaim returns and preceding requests
+  have settled, protecting its pages against later fills. Registration must
+  follow request order even when later copies are already intact; the runtime
+  may have capacity for only part of an acquisition. The acquisition waits
   for the next reclaim only with the lock released. Nothing may be filled while
   another copy is still offered, which is why every reclaim runs first: the
   fill's own demand is what Windows discards offered pages for. While the

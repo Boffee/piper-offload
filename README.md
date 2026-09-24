@@ -273,11 +273,12 @@ Every copy is registered after a one-byte-per-page write that brings its
 pages into the working set, because `cudaHostRegister` faults pages that are
 outside it in one at a time: the write runs at 42 GiB/s and leaves
 registration running at 55, where registering them cold runs at 8. Copies
-Windows returned intact register before the rest of the acquisition is read,
-since registering locks their pages and a long fill would otherwise push them
-out again: reacquiring an 18 GiB checkpoint whose fill was 6 GiB took 19.4 s
-with them registered after the fill and 14.1 s before it, the registration
-itself 5.3 s against 0.5. Each copy an acquisition evicts is offered as soon
+Windows returned intact can register during reclamation once preceding
+requests have settled. Registering locks their pages against later fills.
+In the original Windows measurements, reacquiring an 18 GiB checkpoint whose
+fill was 6 GiB took 19.4 s with intact copies registered after the fill and
+14.1 s before it, the registration itself 5.3 s against 0.5.
+Each copy an acquisition evicts is offered as soon
 as its own unregistration succeeds, on a pool of one thread per core that the
 manager waits for only once it has released its lock, because a worker
 collecting garbage may run a finalizer that needs it. The runtime unregisters
@@ -288,9 +289,13 @@ checkpoint takes 0.36 s this way against 0.48 s as two passes, with 0.004 s
 left to wait for at the end. Reclaims run on a pool of six, beyond which
 threads contend for the kernel's page tables and slow each other down, and
 each copy Windows returned intact registers as soon as its own reclaim
-returns, so registration runs beside the rest of the reclaims rather than
-after them: that checkpoint comes back intact and registered in 0.93 to
-0.97 s this way, against 1.16 to 1.20 s as two passes.
+returns and preceding requests have settled, so registration runs beside later
+reclaims rather than after them: that checkpoint comes back intact in 0.93 to
+0.97 s this way, against 1.16 to 1.20 s as two passes. A fresh or discarded
+copy earlier in the request is filled first, so intact copies cannot take
+its place when the runtime has capacity for only part of an acquisition.
+The Windows timings above predate that ordering correction; acquisitions
+mixing intact copies with copies needing a fill require remeasurement.
 
 Offered pages are what Windows takes back first when memory runs short, so
 whether they survive depends on what else wants the memory. Copies are offered

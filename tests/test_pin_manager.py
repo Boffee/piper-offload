@@ -2314,6 +2314,68 @@ def test_only_the_spans_windows_discarded_are_read_again(
     manager.clear()
 
 
+@pytest.mark.parametrize("first_kind", ["fresh", "anonymous", "discarded"])
+@pytest.mark.parametrize("capacity", [0, 2 * PAGE])
+def test_intact_copies_do_not_take_capacity_from_an_earlier_request(
+    first_kind, capacity, backend, offering, tmp_path,
+) -> None:
+    kept = _checkpoint(tmp_path, 2 * PAGE, "kept")
+    first = (
+        _tensors((0, 2 * PAGE))[0]
+        if first_kind == "anonymous"
+        else _checkpoint(tmp_path, 2 * PAGE, "first")
+    )
+    manager = PinManager(4 * PAGE, max_offered_bytes=4 * PAGE, backend=backend)
+    with manager.acquire([first, kept] if first_kind == "discarded" else [kept]):
+        pass
+    if first_kind == "discarded":
+        offering.discarded_spans.add((_copy_pointer(backend), 0))
+    manager.max_pinned_bytes = 0
+    manager.max_pinned_bytes = 4 * PAGE
+    backend.capacity = capacity
+    backend.register_calls.clear()
+    try:
+        with manager.acquire([first, kept]) as lease:
+            assert lease.registered_bytes == capacity
+            expected = {first.untyped_storage().data_ptr()} if capacity else set()
+            assert set(manager._registrations) == expected
+            assert len(backend.register_calls) == (2 if capacity else 1)
+            for tensor in (first, kept):
+                torch.testing.assert_close(_transferred(manager, tensor), tensor)
+    finally:
+        manager.clear()
+
+
+def test_a_failed_earlier_fill_does_not_block_an_intact_copy(
+    backend, offering, tmp_path, monkeypatch,
+) -> None:
+    first = _checkpoint(tmp_path, 2 * PAGE, "first")
+    kept = _checkpoint(tmp_path, 2 * PAGE, "kept")
+    manager = PinManager(4 * PAGE, max_offered_bytes=4 * PAGE, backend=backend)
+    with manager.acquire([kept]):
+        pass
+    kept_pointer = _copy_pointer(backend)
+    manager.max_pinned_bytes = 0
+    manager.max_pinned_bytes = 4 * PAGE
+    backend.capacity = 2 * PAGE
+    backend.register_calls.clear()
+
+    def failed_read(*_args):
+        raise OSError("injected read failure")
+
+    monkeypatch.setattr(pin_module, "_read_range", failed_read)
+    try:
+        with manager.acquire([first, kept]) as lease:
+            assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 2 * PAGE)
+            assert backend.register_calls == [(kept_pointer, 2 * PAGE)]
+            assert not manager._pending
+            assert manager.stats.pinned_bytes == 2 * PAGE
+            for tensor in (first, kept):
+                torch.testing.assert_close(_transferred(manager, tensor), tensor)
+    finally:
+        manager.clear()
+
+
 def test_copies_that_come_back_intact_register_before_the_rest_is_read(
     backend, offering, tmp_path, monkeypatch,
 ) -> None:
