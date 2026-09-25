@@ -718,10 +718,13 @@ treats `mode` and `options` as mutually exclusive.
 Only each distinct block module's `forward` is compiled. Its module
 `__call__` stays eager. For streamed groups, the forward-pre hook also stays
 eager, so block activation and prefetch finish before compiled computation.
-Compiled forwards are installed only for CUDA activations and the exact
+Compiled forwards are installed for CPU and CUDA activations and the exact
 original forwards are restored on deactivate or activation rollback. CPU
-activation remains eager. The lazy compiled callables are retained by the
-bound runtime, so later eligible activations can reuse their compiled graphs.
+activation uses ordinary Inductor directly on the existing host-backed weights,
+including checkpoint mappings. It does not acquire a CUDA runtime, pin memory,
+or transfer weights. GPU residency modes do not change CPU execution; even
+`rolling` and `auto` use ordinary compilation on CPU. Lazy compiled callables
+are cached per backend, so later eligible activations can reuse their compiled graphs.
 
 Compilation is inference-only in this initial implementation. Training remains
 available without `block_compile`, but combining block compilation with
@@ -1538,8 +1541,8 @@ This is a low-level library; we don't guard against caller misuse.
 
 - **`torch.compile` support is deliberately narrow.** Use
   `block_compile=BlockCompileConfig(...)` to compile only declared block
-  forwards during CUDA inference. `block_mode` selects resident, whole-block
-  streaming, or rolling execution. External whole-model `torch.compile(model)`,
+  forwards during CPU or CUDA inference. `block_mode` selects resident, whole-block
+  streaming, or rolling CUDA execution. External whole-model `torch.compile(model)`,
   `model.compile()`, compilation outside declared block groups, and compiled
   training remain unsupported. Routed LoRA
   temporarily bypasses compiled blocks. Compiler code/artifact caches and

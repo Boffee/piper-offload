@@ -83,9 +83,9 @@ class ModelOffloader:
     or automatic rolling-with-streaming-fallback execution for groups named by
     ``block_paths`` and ``transient_block_paths``. Other state remains resident
     unless its module is selected by ``transient_paths``. Supplying
-    ``block_compile`` opts declared block forwards into Inductor during CUDA
-    inference. CPU activation is pass-through over the host-backed module state
-    and remains eager.
+    ``block_compile`` opts declared block forwards into Inductor during CPU or CUDA
+    inference. CPU activation uses ordinary Inductor on the existing host-backed
+    module state, without acquiring a CUDA runtime or moving weights.
 
     Composes resident and transient :class:`HostComponent`\\ s with one or
     more :class:`BlockComponent`\\ s internally. Adapter requests are supplied

@@ -28,6 +28,7 @@ from tests.conftest import (
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+DEVICES = ["cpu", pytest.param("cuda", marks=CUDA)]
 
 
 class _TwoGroupModel(nn.Module):
@@ -344,11 +345,13 @@ class TestCompiledForwardConstruction:
 
 
 class TestCompiledForwardLifecycle:
-    @pytest.mark.parametrize("block_mode", ["streaming", "resident"])
-    def test_cpu_activation_remains_eager(
+    @pytest.mark.parametrize("block_mode", ["streaming", "resident", "rolling", "auto"])
+    @pytest.mark.parametrize("transient", [False, True])
+    def test_cpu_activation_compiles_without_cuda_resources(
         self,
         monkeypatch: pytest.MonkeyPatch,
         block_mode: BlockMode,
+        transient: bool,
     ) -> None:
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
@@ -356,16 +359,59 @@ class TestCompiledForwardLifecycle:
         offloader = _make_offloader(
             model,
             block_mode=block_mode,
-            block_compile=BlockCompileConfig(),
+            block_compile=BlockCompileConfig(fullgraph=True),
+            transient_block_paths=("blocks",) if transient else (),
         )
+        component = block_components(offloader)[0]
+        pointers = [param.data_ptr() for param in model.parameters()]
+
+        def forbid_acquire(*args: object, **kwargs: object) -> None:
+            pytest.fail("CPU compilation must not acquire CUDA resources")
+
+        monkeypatch.setattr(component._runtime, "acquire", forbid_acquire)
+        monkeypatch.setattr(component._eager_runtime, "acquire", forbid_acquire)
         try:
-            with activated_model(offloader, "cpu"):
-                with torch.inference_mode():
-                    model(torch.randn(2, 8))
+            for _ in range(2):
+                with activated_model(offloader, "cpu"):
+                    with torch.inference_mode():
+                        model(torch.randn(2, 8))
+                    assert all("forward" in block.__dict__ for block in model.blocks)
+                    assert [param.data_ptr() for param in model.parameters()] == pointers
+                    assert component._active_runtime is None
+                    assert component._pin_lease is None
+                    assert not component._transfer.open
+                    assert all(kwargs["backend"] == "inductor" for _fn, kwargs in spy.calls[-2:])
                 assert all("forward" not in block.__dict__ for block in model.blocks)
-            assert spy.executions == 0
+            assert spy.executions == 4
+            assert len(spy.calls) == (4 if block_mode in ("rolling", "auto") else 2)
         finally:
             offloader.deactivate()
+
+    @pytest.mark.parametrize("block_mode", ["streaming", "resident", "rolling", "auto"])
+    def test_cpu_compile_bypass_is_temporary(self, monkeypatch, block_mode):
+        spy = _CompileSpy()
+        monkeypatch.setattr(torch, "compile", spy)
+        model = _BlockModel()
+        offloader = _make_offloader(
+            model, block_mode=block_mode, block_compile=BlockCompileConfig(fullgraph=True),
+        )
+        component = block_components(offloader)[0]
+        for compile_blocks in (False, True, False):
+            with component.use("cpu", compile_blocks=compile_blocks), torch.inference_mode():
+                model(torch.randn(2, 8))
+                assert all(("forward" in block.__dict__) == compile_blocks for block in model.blocks)
+            assert all("forward" not in block.__dict__ for block in model.blocks)
+        assert spy.executions == 2
+
+    def test_cpu_without_compile_config_remains_eager(self, monkeypatch):
+        spy = _CompileSpy()
+        monkeypatch.setattr(torch, "compile", spy)
+        model = _BlockModel()
+        offloader = _make_offloader(model)
+        with activated_model(offloader, "cpu"), torch.inference_mode():
+            model(torch.randn(2, 8))
+            assert all("forward" not in block.__dict__ for block in model.blocks)
+        assert not spy.calls
 
     @CUDA
     def test_resident_blocks_compile_without_prefetching(
@@ -534,10 +580,11 @@ class TestCompiledForwardLifecycle:
             remove_observer()
             offloader.deactivate()
 
-    @CUDA
+    @pytest.mark.parametrize("device", DEVICES)
     def test_existing_instance_forward_override_is_restored_verbatim(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        device: str,
     ) -> None:
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
@@ -555,25 +602,26 @@ class TestCompiledForwardLifecycle:
             block_compile=BlockCompileConfig(),
         )
         try:
-            with activated_model(offloader, "cuda"):
+            with activated_model(offloader, device):
                 assert block.__dict__["forward"] is not original_override
             assert block.__dict__["forward"] is original_override
         finally:
             offloader.deactivate()
 
-    @CUDA
-    @pytest.mark.parametrize("block_mode", ["streaming", "resident"])
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("block_mode", ["streaming", "resident", "rolling", "auto"])
     def test_activation_failure_restores_original_forwards(
         self,
         monkeypatch: pytest.MonkeyPatch,
         block_mode: BlockMode,
+        device: str,
     ) -> None:
         monkeypatch.setattr(torch, "compile", _CompileSpy())
         model = _BlockModel()
         offloader = _make_offloader(
             model,
             block_mode=block_mode,
-            block_compile=BlockCompileConfig(),
+            block_compile=BlockCompileConfig(fullgraph=True),
         )
         streamer = block_components(offloader)[0]
         compile_state = streamer._block_compile
@@ -590,17 +638,18 @@ class TestCompiledForwardLifecycle:
         with monkeypatch.context() as install_patch:
             install_patch.setattr(state_type, "install", broken_install)
             with pytest.raises(RuntimeError, match="simulated compiled-forward"):
-                offloader.activate("cuda")
+                offloader.activate(device)
 
         assert offloader.active_device is None
         assert not compile_state.installed
+        assert streamer._inductor_compile is None or not streamer._inductor_compile.installed
         assert all("forward" not in block.__dict__ for block in model.blocks)
 
-        with activated_model(offloader, "cuda"):
+        with activated_model(offloader, device):
             pass
 
-    @CUDA
-    def test_real_inductor_supports_dynamic_shapes_and_reactivation(self) -> None:
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_real_inductor_supports_dynamic_shapes_and_reactivation(self, device: str) -> None:
         torch.manual_seed(0)
         model = _BlockModel()
         inputs = [
@@ -616,12 +665,12 @@ class TestCompiledForwardLifecycle:
             block_compile=BlockCompileConfig(),
         )
         try:
-            with activated_model(offloader, "cuda"):
+            with activated_model(offloader, device):
                 with torch.inference_mode():
-                    actual = [model(x.cuda()).cpu() for x in inputs[:2]]
-            with activated_model(offloader, "cuda"):
+                    actual = [model(x.to(device)).cpu() for x in inputs[:2]]
+            with activated_model(offloader, device):
                 with torch.inference_mode():
-                    actual.append(model(inputs[2].cuda()).cpu())
+                    actual.append(model(inputs[2].to(device)).cpu())
 
             for actual_value, expected_value in zip(
                 actual,
@@ -639,10 +688,11 @@ class TestCompiledForwardLifecycle:
 
 
 class TestCompileFailureSemantics:
-    @CUDA
+    @pytest.mark.parametrize("device", DEVICES)
     def test_compiler_failure_propagates_without_eager_retry(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        device: str,
     ) -> None:
         eager_calls = 0
 
@@ -668,17 +718,18 @@ class TestCompileFailureSemantics:
             block_compile=BlockCompileConfig(),
         )
         try:
-            with activated_model(offloader, "cuda"):
+            with activated_model(offloader, device):
                 with pytest.raises(RuntimeError, match="simulated compiler"):
-                    model(torch.randn(2, 8, device="cuda"))
+                    model(torch.randn(2, 8, device=device))
             assert eager_calls == 0
         finally:
             offloader.deactivate()
 
-    @CUDA
+    @pytest.mark.parametrize("device", DEVICES)
     def test_model_exception_propagates_once(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        device: str,
     ) -> None:
         eager_calls = 0
 
@@ -695,9 +746,9 @@ class TestCompileFailureSemantics:
             block_compile=BlockCompileConfig(),
         )
         try:
-            with activated_model(offloader, "cuda"):
+            with activated_model(offloader, device):
                 with pytest.raises(ValueError, match="model forward failed"):
-                    model(torch.randn(2, 8, device="cuda"))
+                    model(torch.randn(2, 8, device=device))
             assert eager_calls == 1
         finally:
             offloader.deactivate()
@@ -751,12 +802,13 @@ class TestCompiledLoRA:
 
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
 
-    @CUDA
+    @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("block_mode", ["streaming", "resident"])
     def test_routed_bypass_is_model_wide_and_temporary(
         self,
         monkeypatch: pytest.MonkeyPatch,
         block_mode: BlockMode,
+        device: str,
     ) -> None:
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
@@ -773,11 +825,11 @@ class TestCompiledLoRA:
             block_mode=block_mode,
             block_compile=BlockCompileConfig(),
         )
-        x = torch.randn(2, 8, device="cuda")
+        x = torch.randn(2, 8, device=device)
         try:
             with activated_model(
                 offloader,
-                "cuda",
+                device,
                 adapters=[lora],
                 adapter_mode="routed",
             ):
@@ -788,21 +840,22 @@ class TestCompiledLoRA:
 
             with activated_model(
                 offloader,
-                "cuda",
+                device,
                 adapter_mode="routed",
             ):
                 with torch.inference_mode():
                     model(x)
             assert spy.executions == 4
 
-            with activated_model(
-                offloader,
-                "cuda",
-                adapters=[lora],
-                adapter_mode="merge",
-            ):
-                with torch.inference_mode():
-                    model(x)
-            assert spy.executions == 8
+            if device == "cuda":
+                with activated_model(
+                    offloader,
+                    device,
+                    adapters=[lora],
+                    adapter_mode="merge",
+                ):
+                    with torch.inference_mode():
+                        model(x)
+                assert spy.executions == 8
         finally:
             offloader.deactivate()

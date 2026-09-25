@@ -24,6 +24,9 @@ class BlockCompileConfig:
     graph-capture controls needed by supported inference workloads, plus an
     optional mapping for target-specific compiler extensions.
 
+    CPU activations compile against the existing host weights with ordinary
+    Inductor. CUDA activations use the selected block runtime's compiler backend.
+
     Attributes
     ----------
     dynamic:

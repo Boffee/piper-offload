@@ -231,7 +231,7 @@ def test_auto_mode_falls_back_for_incompatible_value_adapter() -> None:
     component = block_components(offloader)[0]
     assert component.block_mode == "rolling"
     assert component._auto_rolling
-    assert component._auto_fallback_compile is None
+    assert component._inductor_compile is None
 
     remove_adapter = register_adapter(_ExternalAdapter)
     try:
@@ -247,11 +247,11 @@ def test_auto_mode_falls_back_for_incompatible_value_adapter() -> None:
         )
         offloader.activate("cuda", adapters=[incompatible])
         assert component._active_runtime is component._eager_runtime
-        assert component._auto_fallback_compile is not None
-        assert component._auto_fallback_compile.installed
+        assert component._inductor_compile is not None
+        assert component._inductor_compile.installed
         assert not component._block_compile.installed
     finally:
         offloader.deactivate()
         remove_adapter()
-    assert component._auto_fallback_compile is not None
-    assert not component._auto_fallback_compile.installed
+    assert component._inductor_compile is not None
+    assert not component._inductor_compile.installed
