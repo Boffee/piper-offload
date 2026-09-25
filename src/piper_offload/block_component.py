@@ -579,7 +579,7 @@ class BlockComponent:
     :meth:`acquire` may cycle the CUDA working set without ending the session.
     Optional
     ``block_compile`` policy belongs to this bound runtime and installs lazy
-    compiled forwards only for eligible CUDA inference activations. Ordinary
+    compiled forwards for eligible CPU and CUDA inference activations. Ordinary
     streaming owns one active block and one lookahead target, resident mode
     owns one target per block, and rolling compilation owns one shared
     parameter target. Streaming strategies wrap to block 0 by default;
@@ -620,8 +620,8 @@ class BlockComponent:
         ``0..k-1`` position internally. Defaults to ``0..k-1`` (contiguous).
     block_compile:
         Optional forward-only compile policy. One lazy callable is retained per
-        distinct block module object, installed during eligible CUDA
-        activations, and removed on deactivate. CPU activation stays eager.
+        distinct block module object and compiler backend, installed during eligible
+        activations and removed on deactivate. CPU uses ordinary Inductor on host state.
     wraparound:
         Whether the runtime prepares block 0 while executing the final block.
         :class:`ModelOffloader` disables this for transient streamed pools.
@@ -716,7 +716,9 @@ class BlockComponent:
         self._auto_rolling = (
             block_mode == "auto" and isinstance(runtime, RollingBlockRuntime)
         )
-        self._auto_fallback_compile: _BlockCompileState | None = None
+        self._inductor_compile: _BlockCompileState | None = (
+            self._block_compile if runtime.compile_backend == "inductor" else None
+        )
         self._active_device: torch.device | None = None
         self._active_runtime: BlockRuntime | None = None
         self._load_plans: tuple[HostModuleLoadPlan, ...] = ()
@@ -847,7 +849,7 @@ class BlockComponent:
 
         CUDA activation selects the ordinary, all-resident, or compiled rolling
         block runtime, then installs optional compiled block forwards. CPU
-        activation is pass-through over host-backed state.
+        activation uses host-backed state with optional ordinary Inductor forwards.
         The composite's :meth:`activate` returns the model — this
         method returns ``None`` because the component doesn't own one.
 
@@ -888,7 +890,7 @@ class BlockComponent:
                 raise ValueError(
                     "Parameter overrides require CUDA activation."
                 )
-            self._activate_cpu_resolved()
+            self._activate_cpu_resolved(compile_blocks=compile_blocks)
             return
         if active_device.type != "cuda":
             raise ValueError(f"BlockComponent.activate() supports CUDA or CPU; got {active_device}.")
@@ -923,8 +925,20 @@ class BlockComponent:
             )
         )
 
-    def _activate_cpu_resolved(self) -> None:
+    def _get_inductor_compile(self) -> _BlockCompileState:
+        """Share ordinary compilation between CPU and non-rolling CUDA execution."""
+        if self._inductor_compile is None:
+            self._inductor_compile = _BlockCompileState.create(
+                self._blocks,
+                self._block_compile.config,
+                backend="inductor",
+            )
+        return self._inductor_compile
+
+    def _activate_cpu_resolved(self, *, compile_blocks: bool) -> None:
         self._active_device = torch.device("cpu")
+        if compile_blocks:
+            self._get_inductor_compile().install(True)
 
     def _activate_cuda_resolved(
         self,
@@ -963,15 +977,7 @@ class BlockComponent:
                     "using streaming: %s",
                     exc,
                 )
-                fallback_compile = self._auto_fallback_compile
-                if fallback_compile is None:
-                    fallback_compile = _BlockCompileState.create(
-                        self._blocks,
-                        self._block_compile.config,
-                        backend=self._eager_runtime.compile_backend,
-                    )
-                    self._auto_fallback_compile = fallback_compile
-                return self._eager_runtime, fallback_compile
+                return self._eager_runtime, self._get_inductor_compile()
 
         return self._runtime, self._block_compile
 
@@ -1048,8 +1054,8 @@ class BlockComponent:
         failure retains its pin lease but clears session metadata. Drop the
         binding reference after deactivate to release host memory."""
         self._block_compile.restore()
-        if self._auto_fallback_compile is not None:
-            self._auto_fallback_compile.restore()
+        if self._inductor_compile is not None:
+            self._inductor_compile.restore()
         try:
             self.release()
         finally:

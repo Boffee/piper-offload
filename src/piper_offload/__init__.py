@@ -18,7 +18,7 @@ Lower-level resource bindings:
   created by ``ModelOffloader.from_module(model)``, or configurable block
   residency when constructed with ``block_paths`` or
   ``transient_block_paths``. Block modes support optional adapter merge,
-  opt-in forward-only block compilation for CUDA inference,
+  opt-in forward-only block compilation for CPU and CUDA inference,
   path-selected transient pool lifetimes, trainable-parameter support,
   CUDA prefetch on a secondary stream, and
   activation checkpointing through autograd backward when block compilation
@@ -157,7 +157,8 @@ Compatibility
 -------------
 - **``torch.compile`` support is narrow.** Only declared block forwards
   configured through :class:`BlockCompileConfig` are supported, and only for
-  CUDA inference. Ordinary block groups may be streamed or resident. External
+  CPU or CUDA inference. CPU uses existing host weights; ordinary CUDA block
+  groups may be streamed or resident. External
   whole-model compilation, modules outside declared block groups, routed-LoRA
   activations, and compiled training remain unsupported.
   Experimental rolling compilation additionally requires frozen homogeneous

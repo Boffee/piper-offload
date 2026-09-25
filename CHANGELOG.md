@@ -7,6 +7,10 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- `BlockCompileConfig` now enables CPU block compilation with ordinary Inductor
+  on existing host weights, including mmap-backed checkpoints. CPU activation
+  performs no pinning or transfers, regardless of the configured GPU residency
+  mode, and deactivation restores the original forwards.
 - `PinManager.max_offered_bytes`, zero by default, adds an optional Windows
   tier that keeps an evicted copy's bytes instead of freeing them: the copy is
   unregistered and its pages are offered to Windows, which may discard them

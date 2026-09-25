@@ -26,11 +26,11 @@ class ModelSpec[M: nn.Module]:
     ``factory`` runs once to construct the cached :class:`ModelOffloader`.
     Every lease reuses that same model runtime sequentially; overlapping uses
     are rejected by the offloader. ``block_compile`` is an opt-in construction
-    policy for every group named by ``block_paths`` or
+    policy for CPU and CUDA execution of every group named by ``block_paths`` or
     ``transient_block_paths``. ``block_mode`` selects resident, whole-block
     streaming, compiled rolling, or automatic rolling-with-streaming-fallback
-    execution for every block group. Transient block groups release their CUDA
-    working sets after their final blocks.
+    CUDA execution for every block group. CPU compilation uses existing host state.
+    Transient block groups release their CUDA working sets after their final blocks.
     ``transient_paths`` gives named modules independent CUDA working sets
     scoped to their forwards. The factory transfers compatible pageable CPU
     storage to the cached runtime, preserving checkpoint-backed mappings.
