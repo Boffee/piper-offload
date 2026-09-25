@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.10.0rc9] - 2026-09-25
+
 ### Added
 
 - `BlockCompileConfig` now enables CPU block compilation with ordinary Inductor
@@ -108,6 +110,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
+- Require Piper Kernels 0.7.5 or newer for compatible attention and ConvRot INT8
+  performance improvements, including CPU INT8 matrix multiplication without
+  full INT32 input and weight copies.
 - Copies fill in parallel on every platform. Where there are no positional
   reads, which is Windows, the copies used to fill one at a time under a
   process-wide lock, because a handle has a single position and the kernel
@@ -799,7 +804,11 @@ under 0.9.0rc1, 0.9.0rc2, and 0.9.0rc3 below.
 - Python 3.14, PyTorch 2.13, TorchAO 0.18, Apache-2.0 licensing, and the Piper Offload package
   identity.
 
-[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc5...HEAD
+[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc9...HEAD
+[0.10.0rc9]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc8...v0.10.0rc9
+[0.10.0rc8]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc7...v0.10.0rc8
+[0.10.0rc7]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc6...v0.10.0rc7
+[0.10.0rc6]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc5...v0.10.0rc6
 [0.10.0rc5]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc4...v0.10.0rc5
 [0.10.0rc4]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc3...v0.10.0rc4
 [0.10.0rc3]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc2...v0.10.0rc3

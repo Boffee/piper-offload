@@ -726,6 +726,10 @@ or transfer weights. GPU residency modes do not change CPU execution; even
 `rolling` and `auto` use ordinary compilation on CPU. Lazy compiled callables
 are cached per backend, so later eligible activations can reuse their compiled graphs.
 
+CPU compilation requires a working C++ compiler. On Windows, run from a
+Visual Studio developer shell with the x64 MSVC toolchain available, as described
+in [PyTorch's Windows Inductor setup](https://docs.pytorch.org/tutorials/unstable/inductor_windows.html).
+
 Compilation is inference-only in this initial implementation. Training remains
 available without `block_compile`, but combining block compilation with
 autograd is unsupported until it has dedicated correctness coverage.
