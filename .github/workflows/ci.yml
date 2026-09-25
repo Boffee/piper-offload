@@ -119,4 +119,10 @@ jobs:
           uv run --no-sync python -c "import platform, torch; print(platform.platform()); print(f'torch={torch.__version__} cuda={torch.version.cuda} available={torch.cuda.is_available()}')"
 
       - name: Test portable backends
-        run: uv run --no-sync pytest
+        shell: pwsh
+        run: |
+          # CPU Inductor needs the MSVC compiler and its include/library paths.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          & "$vsPath\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          uv run --no-sync pytest

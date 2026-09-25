@@ -1,6 +1,6 @@
 [project]
 name = "piper-offload"
-version = "0.10.0rc8"
+version = "0.10.0rc9"
 description = "Model-agnostic GPU/CPU memory management for PyTorch — host offloading, block streaming, and LRU model caching."
 readme = "README.md"
 license = "Apache-2.0"
@@ -16,7 +16,7 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.14,<2.15",
-    "piper-kernels>=0.7.4,<0.8",
+    "piper-kernels>=0.7.5,<0.8",
 ]
 
 [project.urls]

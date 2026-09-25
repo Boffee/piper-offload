@@ -636,20 +636,20 @@ wheels = [
 
 [[package]]
 name = "piper-kernels"
-version = "0.7.4"
+version = "0.7.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "torch", version = "2.14.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torch", version = "2.14.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/01/c9/e96bfa7adead2a71f297823244b84377db9109d137cd5ae362959d74ae92/piper_kernels-0.7.4.tar.gz", hash = "sha256:e57d7de5803b34226b1a9661fbe397704fcf29c401909dd89bb144c7f323fed2", size = 309771, upload-time = "2026-09-23T00:04:07.997Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/eb/e4/c8dd27cc2d27d661bcb27e6fa1d9a54f4a49393cbd6c5c1fae1977d0de7a/piper_kernels-0.7.5.tar.gz", hash = "sha256:c6d0c60b58f4d2b445a81e08d12cd558420d7314f9027939eda3c1a84cbd87ca", size = 315501, upload-time = "2026-09-25T08:26:32.48Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8a/60/79b6ce9430b27a2e2368734a967497175b8efed16347a2da529c9b58e5f0/piper_kernels-0.7.4-py3-none-any.whl", hash = "sha256:f926fa96d9f6b38c18165e57cd8309b86f99463e9c78e1f168d0418539f473e1", size = 432745, upload-time = "2026-09-23T00:04:06.323Z" },
+    { url = "https://files.pythonhosted.org/packages/49/43/b6cd7ee5c21e6291a59fae21226aafb9f06c3b5767b3b249c021a0bfc7ee/piper_kernels-0.7.5-py3-none-any.whl", hash = "sha256:5d432ca16e8f7aef1d6df9549414ea1a7625cb119976948094d897746d9cf306", size = 437993, upload-time = "2026-09-25T08:26:31.047Z" },
 ]
 
 [[package]]
 name = "piper-offload"
-version = "0.10.0rc8"
+version = "0.10.0rc9"
 source = { editable = "." }
 dependencies = [
     { name = "piper-kernels" },
@@ -707,7 +707,7 @@ requires-dist = [
     { name = "gguf", marker = "extra == 'gguf'", specifier = ">=0.18,<0.20" },
     { name = "numpy", marker = "extra == 'torchao'", specifier = ">=2.3.2,<3" },
     { name = "optimum-quanto", marker = "extra == 'quanto'", specifier = ">=0.2.7,<0.3" },
-    { name = "piper-kernels", specifier = ">=0.7.4,<0.8" },
+    { name = "piper-kernels", specifier = ">=0.7.5,<0.8" },
     { name = "piper-offload", extras = ["bnb", "gguf", "quanto", "torchao", "triton"], marker = "extra == 'all'" },
     { name = "piper-offload", extras = ["torchao", "triton"], marker = "extra == 'gguf'" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.14,<2.15" },
