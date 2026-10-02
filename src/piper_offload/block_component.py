@@ -35,8 +35,8 @@ This is the sharp, low-level primitive. It does NOT manage:
 - Shared storage with tensors outside the block list — caller
   must choose a valid composition; use whole-model
   :class:`HostComponent` if sharing must be preserved.
-- Activation-checkpointing enforcement — required for in-block
-  trainable streaming, but checked at the composer level.
+- Activation-checkpointing enforcement — the caller must checkpoint every
+  streamed block participating in training, including with ModelOffloader.
 
 Most users want :class:`ModelOffloader` (the blessed safe API). Reach for
 :class:`BlockComponentStore` / :class:`BlockComponent` directly only
@@ -611,8 +611,8 @@ class BlockComponent:
         ``"3.weight"``.
         Trainable streaming requires activation checkpointing on every
         block (the ``.data`` swap bypasses autograd's version-counter
-        check). The component doesn't enforce that precondition itself —
-        :class:`ModelOffloader` does.
+        check). Neither the component nor :class:`ModelOffloader` enforces
+        that precondition; the caller supplies checkpointing.
     block_indices:
         True block index for each instance, used to NAME its params/buffers
         (so a sparse group addresses ``"blocks.2.weight"`` not the compact
