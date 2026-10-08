@@ -2,6 +2,7 @@
 
 import gc
 import math
+from collections.abc import Callable, Sequence
 from datetime import timedelta
 
 import pytest
@@ -21,6 +22,18 @@ from piper_offload.pin_manager import PinManager, host_pin_manager
 pytestmark = pytest.mark.skipif(not dist.is_gloo_available(), reason="CPU Gloo required")
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device required")
 DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+def _run_cases(rank: int, worker: Callable[..., None], cases: Sequence[tuple[object, ...]]) -> None:
+    """Share worker startup; each case must release its process group before returning."""
+    for args in cases:
+        try:
+            worker(rank, *args)
+            assert not dist.is_initialized()
+        except (Exception, pytest.fail.Exception) as error:
+            # pytest failures also inherit BaseException. Make mp.spawn propagate
+            # them with the case arguments and terminate peers still in a collective.
+            raise RuntimeError(f"{worker.__name__}{(rank, *args)!r} failed") from error
 
 
 def _run_relay(
@@ -599,15 +612,15 @@ def _check_chunked_values(rank, world_size, device, dtype):
     assert torch.equal(gathered.view(torch.int16).cpu(), torch.cat([bits.roll(r) for r in range(world_size)]))
 
 
-@pytest.mark.parametrize("buffers", [1, 3])
-def test_chunked_relay_on_three_cpu_ranks(tmp_path, buffers):
-    mp.spawn(_run_chunked_relay, args=(str(tmp_path / "chunked-cpu"), "cpu", 3, buffers), nprocs=3)
+def test_chunked_relay_on_three_cpu_ranks(tmp_path):
+    cases = [(str(tmp_path / f"chunked-cpu-{buffers}"), "cpu", 3, buffers) for buffers in (1, 3)]
+    mp.spawn(_run_cases, args=(_run_chunked_relay, cases), nprocs=3)
 
 
 @CUDA
-@pytest.mark.parametrize("buffers", [1, 2, 3])
-def test_chunked_relay_reuses_gpu_staging(tmp_path, buffers):
-    mp.spawn(_run_chunked_relay, args=(str(tmp_path / "chunked-cuda"), "cuda", 2, buffers), nprocs=2)
+def test_chunked_relay_reuses_gpu_staging(tmp_path):
+    cases = [(str(tmp_path / f"chunked-cuda-{buffers}"), "cuda", 2, buffers) for buffers in (1, 2, 3)]
+    mp.spawn(_run_cases, args=(_run_chunked_relay, cases), nprocs=2)
 
 
 @CUDA
@@ -629,9 +642,12 @@ def _run_mismatched_options(rank, store_path, field):
     assert not dist.is_initialized()
 
 
-@pytest.mark.parametrize("field", ["staging_bytes", "pipeline_buffers", "transport"])
-def test_reject_mismatched_rank_staging_sizes(tmp_path, field):
-    mp.spawn(_run_mismatched_options, args=(str(tmp_path / "mismatch"), field), nprocs=2)
+def test_reject_mismatched_rank_staging_sizes(tmp_path):
+    cases = [
+        (str(tmp_path / f"mismatch-{field}"), field)
+        for field in ("staging_bytes", "pipeline_buffers", "transport")
+    ]
+    mp.spawn(_run_cases, args=(_run_mismatched_options, cases), nprocs=2)
 
 
 @pytest.mark.parametrize("size", [0, -16, 17, True, 64.0])
@@ -894,24 +910,30 @@ def _check_shared_reduction_precision(rank, size, device, capacity):
         torch.testing.assert_close(backing[[0, -1]], torch.full_like(backing[:2], contributions[rank]))
 
 
-@pytest.mark.parametrize(("size", "staging_bytes"), [(2, 1024), (3, 1024), (3, 65536)])
-@pytest.mark.parametrize("pipeline_buffers", [1, 3])
-def test_shared_chunks_on_cpu(tmp_path, size, pipeline_buffers, staging_bytes):
-    mp.spawn(_run_shared_chunks,
-             args=(str(tmp_path / "shared-cpu"), "cpu", size, False, pipeline_buffers, staging_bytes), nprocs=size)
+@pytest.mark.parametrize(("size", "staging_sizes"), [(2, (1024,)), (3, (1024, 65536))],
+                         ids=["two-ranks", "three-ranks"])
+def test_shared_chunks_on_cpu(tmp_path, size, staging_sizes):
+    cases = [
+        (str(tmp_path / f"shared-cpu-{buffers}-{staging_bytes}"), "cpu", size, False, buffers, staging_bytes)
+        for buffers in (1, 3)
+        for staging_bytes in staging_sizes
+    ]
+    mp.spawn(_run_cases, args=(_run_shared_chunks, cases), nprocs=size)
 
 
 @CUDA
-@pytest.mark.parametrize(("size", "mixed_pinning", "staging_bytes", "pipeline_buffers"), [
-    (2, False, 1024, 1), (2, True, 1024, 1), (3, False, 1024, 1), (3, True, 65536, 1),
+@pytest.mark.parametrize(("size", "options"), [
     # A nondefault Gloo pipeline option still uses two shared outgoing slots.
-    (2, False, 1024, 3),
-])
-def test_shared_chunks_on_gpu(tmp_path, size, mixed_pinning, pipeline_buffers, staging_bytes):
-    mp.spawn(
-        _run_shared_chunks,
-        args=(str(tmp_path / "shared-gpu"), "cuda", size, mixed_pinning, pipeline_buffers, staging_bytes), nprocs=size,
-    )
+    (2, ((False, 1024, 1), (True, 1024, 1), (False, 1024, 3))),
+    (3, ((False, 1024, 1), (True, 65536, 1))),
+], ids=["two-ranks", "three-ranks"])
+def test_shared_chunks_on_gpu(tmp_path, size, options):
+    cases = [
+        (str(tmp_path / f"shared-gpu-{mixed_pinning}-{staging_bytes}-{buffers}"),
+         "cuda", size, mixed_pinning, buffers, staging_bytes)
+        for mixed_pinning, staging_bytes, buffers in options
+    ]
+    mp.spawn(_run_cases, args=(_run_shared_chunks, cases), nprocs=size)
 
 
 def _run_shared_registration_refusal(rank, path):
