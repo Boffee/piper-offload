@@ -57,6 +57,7 @@ resource and a tensor adapter serve different purposes.
 
 ## Validation
 
+- Follow [Writing tests](docs/development.md#writing-tests) when changing coverage.
 - Tests: `uv run pytest tests -q`. GPU tests skip without suitable hardware.
 - Lint and types: `uv run ruff check .` and `uv run pyright`.
 - Reviews should explain the failure, its impact, and where it occurs. Judge

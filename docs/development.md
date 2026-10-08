@@ -27,6 +27,51 @@ See [VERSIONING.md](../VERSIONING.md) for compatibility and release policy.
 Piper Engine consumes pinned releases, so changes to public behavior need
 matching documentation and release notes.
 
+## Writing tests
+
+Each case should protect a distinct behavior or failure. Extend existing coverage
+where possible, and remove superseded cases and helpers while preserving the
+regressions they catch.
+
+- **Test the owning contract.** Keep detailed cases with the responsible component
+  and use integration tests to verify composition. Assert results and ownership
+  invariants, including storage identity and release ordering where relevant.
+  Keep expected results independent of the implementation.
+- **Use the appropriate boundary.** Test policy on CPU with small real objects or
+  fake registration backends. Use real CUDA transfers, compilation, and processes
+  when their behavior determines correctness. Skip unavailable hardware or
+  dependencies before expensive setup.
+- **Extend shared cases deliberately.** New formats should join applicable
+  contract tests, with focused cases for distinct layouts, arithmetic, or runtime
+  behavior. Parametrize meaningful boundaries and interactions; avoid multiplying
+  unrelated dimensions. Assert expected capabilities so losing one fails a test.
+- **Keep helpers narrow.** Share repeated mechanics while keeping important inputs
+  and assertions visible. Split helpers that accumulate flags, format branches,
+  or conditional expectations. Some repeated setup is preferable to a generic
+  test framework; see Google's [test-maintainability guidance](https://abseil.io/resources/swe-book/html/ch12.html).
+- **Preserve isolation and ownership.** Create fresh mutable models, caches, and
+  managers. Share immutable inputs only where ownership permits it: captured
+  storage cannot become another test's scratch space. Pair acquisition with
+  cleanup after setup or assertion failures; see [pytest fixture guidance](https://docs.pytest.org/en/stable/how-to/fixtures.html#safe-teardowns).
+- **Minimize work without weakening the case.** Use tiny inputs that retain the
+  relevant page crossings, aliases, partial tiles, or block reuse. Use events and
+  bounded waits for concurrency. Scope garbage collection and compiler resets to
+  tests that need them. Batch related process cases only when state can be reset
+  and failures remain identifiable.
+
+Measure additions involving compilation, process startup, broad fixtures, or
+large parameter matrices, including setup and teardown:
+
+```bash
+uv run pytest tests --collect-only -q
+uv run pytest tests -q --durations=20
+```
+
+Record hardware, dependency versions, and compiler-cache conditions. Test bounded
+work through allocation, transfer, or registration counts; keep latency and
+throughput measurements in `benchmarks/`. Targeted runs help during development;
+complete the validation required by the change before finishing.
+
 ## Architecture
 
 | Part | Responsibility | Main source |
