@@ -30,8 +30,9 @@ matching documentation and release notes.
 ## Writing tests
 
 Each case should protect a distinct behavior or failure. Extend existing coverage
-where possible, and remove superseded cases and helpers while preserving the
-regressions they catch.
+where possible, and remove superseded cases and helpers. Preserve distinct
+scenarios and assertions when consolidating; matching line and branch coverage
+alone does not prove test equivalence.
 
 - **Test the owning contract.** Keep detailed cases with the responsible component
   and use integration tests to verify composition. Assert results and ownership
@@ -71,10 +72,11 @@ CI retains JUnit timings, including setup and teardown, for 14 days in the
 `test-results-linux` and `test-results-windows` artifacts, also after test failures.
 
 Record hardware, dependency versions, and compiler-cache conditions. Compare
-repeated before/after runs with matching inputs and cache state. Test bounded
-work through allocation, transfer, or registration counts; keep latency and
-throughput measurements in `benchmarks/`. Targeted runs help during development;
-complete the validation required by the change before finishing.
+repeated before/after runs with matching inputs and cache state; fewer cases alone
+do not imply a faster suite. Test bounded work through allocation, transfer, or
+registration counts; keep latency and throughput measurements in `benchmarks/`.
+Targeted runs help during development; complete the validation required by the
+change before finishing.
 
 ## Architecture
 
