@@ -358,9 +358,9 @@ class PinManager:
         succeeds, if it fits this budget and nothing outside the manager still
         views it; the least recently offered copies are freed to make room.
         Otherwise it is freed, as it is on ``clear()`` and when its owner is
-        dropped. A pinning acquisition of the same storage reclaims the copy,
-        skipping the fill if Windows kept its pages and refilling them in full
-        if not, and registers it before any transfer can read it.
+        dropped. A pinning acquisition of the same storage reclaims its spans,
+        refills only those Windows discarded, and registers the copy before
+        any transfer can read it.
 
         Offered copies keep their commitment, which is what allocations
         elsewhere run short of once Windows can no longer grow its paging
@@ -369,10 +369,10 @@ class PinManager:
         checks it before taking a copy, which it then frees instead, and
         before a new copy is allocated. A failed allocation of a new copy
         frees offered copies, least recent first, and retries once. Lowering
-        the budget frees offered copies down to it now. The copies an acquisition
-        or a budget change evicts are offered together once it has released
-        the lock, and are counted in ``offered_bytes`` from then on. On other
-        platforms the budget has no effect.
+        the budget frees offered copies down to it now. Each evicted copy starts
+        offering as soon as its unregistration succeeds. Workers are joined with
+        the lock released; completed offers then enter the tier and count toward
+        ``offered_bytes``. On other platforms the budget has no effect.
         """
         if value < 0:
             raise ValueError("max_offered_bytes must be >= 0")

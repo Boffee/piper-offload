@@ -1,9 +1,22 @@
 """Experimental, blocking host-relay process group for DTensor inference.
 
 Call ``register_relay_backend()`` in each worker before initializing a
-``piper_relay`` process group. It supports SUM all-reduce in FP32, FP16 and
-BF16, plus broadcast, scatter and all-gather of contiguous tensors. Select
-``transport="shared"`` for same-machine transfers through shared host slots
+``piper_relay`` process group. The application supplies its launcher, device
+mesh, and sharding. With ``local_rank`` provided by the launcher::
+
+    import torch
+    import torch.distributed as dist
+    from piper_offload.communication import RelayOptions, register_relay_backend
+
+    torch.cuda.set_device(local_rank)
+    register_relay_backend()
+    dist.init_process_group(
+        "piper_relay",
+        pg_options=RelayOptions(staging_bytes=8 * 1024 * 1024),
+    )
+
+Omit ``device_id``; this backend does not implement eager accelerator connection.
+Select ``transport="shared"`` for same-machine transfers through shared host slots
 and GPU-local summation; Gloo then carries only control messages and reductions
 of CPU tensors. The default ``transport="gloo"`` carries payloads through CPU
 Gloo as well. Gloo never receives an accelerator tensor.
@@ -12,6 +25,26 @@ Collectives stream through a reusable, bounded CPU buffer and complete all
 device copies before returning, including when ``async_op=True``. No offloader,
 NCCL, or compiled extension is required. Gloo pipelining is opt-in; shared
 transfers use two outgoing slots per rank. Public calls remain blocking.
+
+SUM all-reduce supports FP32, FP16 and BF16, accumulating reduced precision in
+FP32. Broadcast, scatter and equal-size all-gather also preserve FP64, bool,
+uint8, signed integers, and complex64/complex128. All-reduce and all-gather
+include coalesced variants; all-gather supports tensor-list and single-buffer
+outputs. Inputs and outputs must be contiguous plain tensors on one local
+device. Outputs must not overlap, except that an all-gather input may occupy
+its exact own-rank output slice and a scatter root may receive into its exact
+source slice. Coalesced outputs must not overwrite other inputs.
+
+``RelayOptions`` describes staging and pin budgets. If the staging allocation
+exceeds the pin budget or registration reports invalid-value, copies run
+synchronously through pageable storage. Reduce-scatter, all-to-all, non-SUM reductions,
+accelerator point-to-point transfers, offloader prefetch coordination, and CUDA
+graph capture are unsupported. Direct C++ functional all-gather ``out`` calls
+bypass the Python override and are unsupported for accelerator tensors.
+
+After a shared-exchange failure, outputs may be partial; destroy and recreate
+the process group. Windows GPU, ROCm, and distinct-GPU behavior need validation
+on their target hardware.
 """
 
 import threading
@@ -37,10 +70,12 @@ _registration_lock = threading.Lock()
 class RelayOptions:
     """Pass as ``pg_options`` to ``init_process_group`` or ``new_group``.
 
-    ``staging_bytes`` bounds this group's reusable CPU allocation, including
-    reduction accumulators, but excludes Gloo workspace and caller tensors.
-    All ranks must agree. Gloo staging is allocated lazily; shared staging is
-    mapped at group initialization. Both are released on group shutdown.
+    ``staging_bytes`` defaults to 8 MiB per rank with Gloo or per group with
+    shared transport. It bounds reusable CPU allocation, including reduction
+    accumulators, but excludes Gloo workspace, caller tensors, and allocator
+    overhead. All ranks within a group must agree on its options, including
+    when creating subgroups. Gloo staging is allocated lazily; shared staging
+    is mapped at group initialization. Both are released on group shutdown.
     Pinning remains subject to ``host_pin_manager``'s separate page-rounded budget.
     For Gloo transfers, ``pipeline_buffers=2`` or ``3`` divides the same allocation
     into chunk sets to overlap pinned CUDA/HIP copies with CPU communication.
@@ -52,9 +87,10 @@ class RelayOptions:
     per rank, reused across peer rounds. Every process registers its full
     mapping under its own pin budget; physical payload storage is shared once.
     GPU reductions use the same two slots plus at most three slot sizes of
-    reusable device scratch per rank, independent of tensor size. FP16/BF16
-    accumulate in FP32. CPU tensor reductions use Gloo and borrow this rank's
-    region. ``pipeline_buffers`` only affects the Gloo path. The default
+    reusable device scratch per rank, at most
+    ``3 * staging_bytes / (2 * world_size)``, independent of tensor size.
+    FP16/BF16 accumulate in FP32. CPU tensor reductions use Gloo and borrow
+    this rank's region. ``pipeline_buffers`` only affects the Gloo path. The default
     transport remains ``"gloo"``.
     """
 

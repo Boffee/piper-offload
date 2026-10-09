@@ -1,6 +1,11 @@
 """Experimental two-rank DTensor inference in one process on one CUDA/HIP GPU.
 
 Requires PyTorch 2.14 and the ``triton`` extra; CUDA graphs are unsupported.
+Ranks alternate on one compute stream at collective boundaries, allowing
+temporary buffers to be reused without NCCL or Gloo. Supported collectives
+are FP32/FP16/BF16 SUM, all-gather, broadcast, and scatter, including CPU tensors
+for offloaded state. Reduce-scatter, all-to-all, and non-SUM reductions are
+unsupported. Windows, ROCm, and full-model inference need further validation.
 """
 
 import queue
@@ -252,15 +257,28 @@ class SequentialExecutor:
     ``run(callback)`` returns one result per rank and schedules computation
     between matching collective calls. Use ``sequential=False`` for setup,
     compilation warmup, and cleanup that need unrestricted rank progress.
-    Use a separate model/offloader per rank and close offloaders in callbacks.
+    Use a separate model/offloader per rank; deactivate and release it in callbacks.
     Keep DTensor operations inside callbacks; return local tensors for use outside.
+
+    Enter with no existing process groups. The executor initializes each rank's
+    default group before running callbacks. The application supplies model setup,
+    forward, and cleanup::
+
+        with SequentialExecutor("cuda:0") as executor:
+            states = executor.run(setup_rank, sequential=False)
+            try:
+                executor.run(lambda rank: forward(states[rank]), sequential=False)
+                outputs = executor.run(lambda rank: forward(states[rank]))
+            finally:
+                executor.run(lambda rank: cleanup(states[rank]), sequential=False)
 
     After a rank error or collective timeout, ``run(..., sequential=False)``
     remains available for local cleanup, after both prior callbacks have exited.
     Collectives stay aborted. Close joins workers before restoring PyTorch state;
     if a callback does not exit within ``timeout``, close raises and retains
-    isolation until a later successful close. Other distributed activity must
-    not run concurrently.
+    isolation until a later successful close. Further distributed work requires
+    a new executor. Only one executor may be open, and other distributed activity
+    must not run concurrently.
     """
 
     def __init__(self, device: torch.device | str = "cuda", *, timeout: timedelta = timedelta(minutes=5)) -> None:

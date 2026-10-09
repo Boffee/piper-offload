@@ -2,6 +2,7 @@
 
 import gc
 import math
+from collections.abc import Callable, Sequence
 from datetime import timedelta
 
 import pytest
@@ -23,6 +24,18 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device
 DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
+def _run_cases(rank: int, worker: Callable[..., None], cases: Sequence[tuple[object, ...]]) -> None:
+    """Share worker startup; each case must release its process group before returning."""
+    for args in cases:
+        try:
+            worker(rank, *args)
+            assert not dist.is_initialized()
+        except (Exception, pytest.fail.Exception) as error:
+            # pytest failures also inherit BaseException. Make mp.spawn propagate
+            # them with the case arguments and terminate peers still in a collective.
+            raise RuntimeError(f"{worker.__name__}{(rank, *args)!r} failed") from error
+
+
 def _run_relay(
     rank: int, store_path: str, device_indices: tuple[int, ...] | None,
     pipeline_buffers: int = 1, transport: str = "gloo",
@@ -35,6 +48,7 @@ def _run_relay(
         torch.cuda.set_device(device)
     register_relay_backend()
     register_relay_backend()
+    original_pin_budget = host_pin_manager.max_pinned_bytes
     dist.init_process_group(
         "piper_relay",
         store=dist.FileStore(store_path, 2),
@@ -81,6 +95,7 @@ def _run_relay(
         dist.destroy_process_group()
         gc.collect()
         host_pin_manager.clear()
+        host_pin_manager.max_pinned_bytes = original_pin_budget
     assert host_pin_manager.stats.active_leases == 0
     assert host_pin_manager.stats.pinned_bytes == 0
 
@@ -270,15 +285,18 @@ def _check_streams(device: torch.device) -> None:
     torch.testing.assert_close(scattered, torch.full_like(scattered, dist.get_rank() + 1))
 
 
-@pytest.mark.parametrize("transport", ["gloo", "shared"])
-def test_two_rank_cpu_dtensor(tmp_path, transport):
-    mp.spawn(_run_relay, args=(str(tmp_path / "cpu-store"), None, 1, transport), nprocs=2)
+def test_two_rank_cpu_dtensor(tmp_path):
+    cases = [(str(tmp_path / f"cpu-{transport}"), None, 1, transport) for transport in ("gloo", "shared")]
+    mp.spawn(_run_cases, args=(_run_relay, cases), nprocs=2)
 
 
 @CUDA
-@pytest.mark.parametrize(("transport", "buffers"), [("gloo", 1), ("gloo", 3), ("shared", 1)])
-def test_two_rank_dtensor_on_one_gpu(tmp_path, buffers, transport):
-    mp.spawn(_run_relay, args=(str(tmp_path / "shared-gpu-store"), (0, 0), buffers, transport), nprocs=2)
+def test_two_rank_dtensor_on_one_gpu(tmp_path):
+    cases = [
+        (str(tmp_path / f"one-gpu-{transport}-{buffers}"), (0, 0), buffers, transport)
+        for transport, buffers in (("gloo", 1), ("gloo", 3), ("shared", 1))
+    ]
+    mp.spawn(_run_cases, args=(_run_relay, cases), nprocs=2)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two physical CUDA/HIP GPUs required")
@@ -321,9 +339,9 @@ def _run_compiled_relay(rank, store_path, transport):
 
 
 @CUDA
-@pytest.mark.parametrize("transport", ["gloo", "shared"])
-def test_compiled_dtensor_collectives_on_one_gpu(tmp_path, transport):
-    mp.spawn(_run_compiled_relay, args=(str(tmp_path / "compiled-store"), transport), nprocs=2)
+def test_compiled_dtensor_collectives_on_one_gpu(tmp_path):
+    cases = [(str(tmp_path / f"compiled-{transport}"), transport) for transport in ("gloo", "shared")]
+    mp.spawn(_run_cases, args=(_run_compiled_relay, cases), nprocs=2)
 
 
 @pytest.fixture
@@ -599,15 +617,15 @@ def _check_chunked_values(rank, world_size, device, dtype):
     assert torch.equal(gathered.view(torch.int16).cpu(), torch.cat([bits.roll(r) for r in range(world_size)]))
 
 
-@pytest.mark.parametrize("buffers", [1, 3])
-def test_chunked_relay_on_three_cpu_ranks(tmp_path, buffers):
-    mp.spawn(_run_chunked_relay, args=(str(tmp_path / "chunked-cpu"), "cpu", 3, buffers), nprocs=3)
+def test_chunked_relay_on_three_cpu_ranks(tmp_path):
+    cases = [(str(tmp_path / f"chunked-cpu-{buffers}"), "cpu", 3, buffers) for buffers in (1, 3)]
+    mp.spawn(_run_cases, args=(_run_chunked_relay, cases), nprocs=3)
 
 
 @CUDA
-@pytest.mark.parametrize("buffers", [1, 2, 3])
-def test_chunked_relay_reuses_gpu_staging(tmp_path, buffers):
-    mp.spawn(_run_chunked_relay, args=(str(tmp_path / "chunked-cuda"), "cuda", 2, buffers), nprocs=2)
+def test_chunked_relay_reuses_gpu_staging(tmp_path):
+    cases = [(str(tmp_path / f"chunked-cuda-{buffers}"), "cuda", 2, buffers) for buffers in (1, 2, 3)]
+    mp.spawn(_run_cases, args=(_run_chunked_relay, cases), nprocs=2)
 
 
 @CUDA
@@ -629,9 +647,12 @@ def _run_mismatched_options(rank, store_path, field):
     assert not dist.is_initialized()
 
 
-@pytest.mark.parametrize("field", ["staging_bytes", "pipeline_buffers", "transport"])
-def test_reject_mismatched_rank_staging_sizes(tmp_path, field):
-    mp.spawn(_run_mismatched_options, args=(str(tmp_path / "mismatch"), field), nprocs=2)
+def test_reject_mismatched_rank_staging_sizes(tmp_path):
+    cases = [
+        (str(tmp_path / f"mismatch-{field}"), field)
+        for field in ("staging_bytes", "pipeline_buffers", "transport")
+    ]
+    mp.spawn(_run_cases, args=(_run_mismatched_options, cases), nprocs=2)
 
 
 @pytest.mark.parametrize("size", [0, -16, 17, True, 64.0])
@@ -894,24 +915,30 @@ def _check_shared_reduction_precision(rank, size, device, capacity):
         torch.testing.assert_close(backing[[0, -1]], torch.full_like(backing[:2], contributions[rank]))
 
 
-@pytest.mark.parametrize(("size", "staging_bytes"), [(2, 1024), (3, 1024), (3, 65536)])
-@pytest.mark.parametrize("pipeline_buffers", [1, 3])
-def test_shared_chunks_on_cpu(tmp_path, size, pipeline_buffers, staging_bytes):
-    mp.spawn(_run_shared_chunks,
-             args=(str(tmp_path / "shared-cpu"), "cpu", size, False, pipeline_buffers, staging_bytes), nprocs=size)
+@pytest.mark.parametrize(("size", "staging_sizes"), [(2, (1024,)), (3, (1024, 65536))],
+                         ids=["two-ranks", "three-ranks"])
+def test_shared_chunks_on_cpu(tmp_path, size, staging_sizes):
+    cases = [
+        (str(tmp_path / f"shared-cpu-{buffers}-{staging_bytes}"), "cpu", size, False, buffers, staging_bytes)
+        for buffers in (1, 3)
+        for staging_bytes in staging_sizes
+    ]
+    mp.spawn(_run_cases, args=(_run_shared_chunks, cases), nprocs=size)
 
 
 @CUDA
-@pytest.mark.parametrize(("size", "mixed_pinning", "staging_bytes", "pipeline_buffers"), [
-    (2, False, 1024, 1), (2, True, 1024, 1), (3, False, 1024, 1), (3, True, 65536, 1),
+@pytest.mark.parametrize(("size", "options"), [
     # A nondefault Gloo pipeline option still uses two shared outgoing slots.
-    (2, False, 1024, 3),
-])
-def test_shared_chunks_on_gpu(tmp_path, size, mixed_pinning, pipeline_buffers, staging_bytes):
-    mp.spawn(
-        _run_shared_chunks,
-        args=(str(tmp_path / "shared-gpu"), "cuda", size, mixed_pinning, pipeline_buffers, staging_bytes), nprocs=size,
-    )
+    (2, ((False, 1024, 1), (True, 1024, 1), (False, 1024, 3))),
+    (3, ((False, 1024, 1), (True, 65536, 1))),
+], ids=["two-ranks", "three-ranks"])
+def test_shared_chunks_on_gpu(tmp_path, size, options):
+    cases = [
+        (str(tmp_path / f"shared-gpu-{mixed_pinning}-{staging_bytes}-{buffers}"),
+         "cuda", size, mixed_pinning, buffers, staging_bytes)
+        for mixed_pinning, staging_bytes, buffers in options
+    ]
+    mp.spawn(_run_cases, args=(_run_shared_chunks, cases), nprocs=size)
 
 
 def _run_shared_registration_refusal(rank, path):
@@ -1029,9 +1056,12 @@ def _run_shared_failure(rank, path, operation):
 
 
 @CUDA
-@pytest.mark.parametrize("operation", ["allgather", "allreduce"])
-def test_shared_failure_drains_copies_before_unpinning(tmp_path, operation):
-    mp.spawn(_run_shared_failure, args=(str(tmp_path / "shared-failure"), operation), nprocs=2)
+def test_shared_failure_drains_copies_before_unpinning(tmp_path):
+    cases = [
+        (str(tmp_path / f"shared-failure-{operation}"), operation)
+        for operation in ("allgather", "allreduce")
+    ]
+    mp.spawn(_run_cases, args=(_run_shared_failure, cases), nprocs=2)
 
 
 @pytest.mark.parametrize("transport", [None, "auto", "nccl", True])
@@ -1099,9 +1129,9 @@ def _run_shared_bad_mapping(rank, path, failure):
         assert not dist.is_initialized()
 
 
-@pytest.mark.parametrize("failure", ["host", "mapping"])
-def test_shared_initialization_fails_on_all_ranks(tmp_path, failure):
-    mp.spawn(_run_shared_bad_mapping, args=(str(tmp_path / "bad-map"), failure), nprocs=2)
+def test_shared_initialization_fails_on_all_ranks(tmp_path):
+    cases = [(str(tmp_path / f"bad-map-{failure}"), failure) for failure in ("host", "mapping")]
+    mp.spawn(_run_cases, args=(_run_shared_bad_mapping, cases), nprocs=2)
 
 
 def _run_shared_peer_failure(rank, path):
