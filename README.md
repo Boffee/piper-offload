@@ -20,7 +20,7 @@ pip install piper-offload
 The base dependencies are `torch` and `piper-kernels`. Optional integrations
 are available through the `bnb`, `quanto`, `gguf`, and `torchao` extras;
 `triton` adds accelerated kernels, and `all` includes every integration.
-See [supported formats](docs/formats.md) for backend requirements.
+See [supported formats](https://github.com/Boffee/piper-offload/blob/main/docs/formats.md) for backend requirements.
 
 ## Quick start
 
@@ -56,7 +56,7 @@ cache.clear()
 Each `use()` activates the model and deactivates it on exit. Place inputs on
 the compute device yourself. For a model larger than VRAM, select its block
 lists with `ModelSpec(..., block_paths=("transformer_blocks",))`; see
-[streaming](docs/streaming.md) for the required model structure.
+[streaming](https://github.com/Boffee/piper-offload/blob/main/docs/streaming.md) for the required model structure.
 
 ## Fit and limitations
 
@@ -74,20 +74,20 @@ lists with `ModelSpec(..., block_paths=("transformer_blocks",))`; see
 ## Documentation
 
 Both application developers and coding agents can start with the relevant
-topic. These documents describe the checked-out revision; use the matching
-Git tag when integrating a pinned release.
+topic. These links point to `main`; select the matching Git tag when integrating
+a pinned release.
 
 | Task | Read |
 |---|---|
-| Cache models, manage activation, inspect or release resources | [Models](docs/models.md) |
-| Run models larger than VRAM, compile blocks, or train streamed weights | [Streaming](docs/streaming.md) |
-| Apply LoRA, parameter deltas, or parameter values | [Adapters](docs/adapters.md) |
-| Configure checkpoint backing, pinning, and Windows copy retention | [Memory](docs/memory.md) |
-| Check tensor formats, optional dependencies, or DTensor support | [Formats](docs/formats.md) |
-| Understand the implementation or contribute changes | [Development](docs/development.md) |
+| Cache models, manage activation, inspect or release resources | [Models](https://github.com/Boffee/piper-offload/blob/main/docs/models.md) |
+| Run models larger than VRAM, compile blocks, or train streamed weights | [Streaming](https://github.com/Boffee/piper-offload/blob/main/docs/streaming.md) |
+| Apply LoRA, parameter deltas, or parameter values | [Adapters](https://github.com/Boffee/piper-offload/blob/main/docs/adapters.md) |
+| Configure checkpoint backing, pinning, and Windows copy retention | [Memory](https://github.com/Boffee/piper-offload/blob/main/docs/memory.md) |
+| Check tensor formats, optional dependencies, or DTensor support | [Formats](https://github.com/Boffee/piper-offload/blob/main/docs/formats.md) |
+| Understand the implementation or contribute changes | [Development](https://github.com/Boffee/piper-offload/blob/main/docs/development.md) |
 
-Contributor instructions are in [AGENTS.md](AGENTS.md). See
-[versioning and releases](VERSIONING.md) for compatibility policy and
-[the changelog](CHANGELOG.md) for release history.
+Contributor instructions are in [AGENTS.md](https://github.com/Boffee/piper-offload/blob/main/AGENTS.md). See
+[versioning and releases](https://github.com/Boffee/piper-offload/blob/main/VERSIONING.md) for compatibility policy and
+[the changelog](https://github.com/Boffee/piper-offload/blob/main/CHANGELOG.md) for release history.
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [Apache License, Version 2.0](https://github.com/Boffee/piper-offload/blob/main/LICENSE).
