@@ -48,6 +48,7 @@ def _run_relay(
         torch.cuda.set_device(device)
     register_relay_backend()
     register_relay_backend()
+    original_pin_budget = host_pin_manager.max_pinned_bytes
     dist.init_process_group(
         "piper_relay",
         store=dist.FileStore(store_path, 2),
@@ -94,6 +95,7 @@ def _run_relay(
         dist.destroy_process_group()
         gc.collect()
         host_pin_manager.clear()
+        host_pin_manager.max_pinned_bytes = original_pin_budget
     assert host_pin_manager.stats.active_leases == 0
     assert host_pin_manager.stats.pinned_bytes == 0
 
@@ -283,15 +285,18 @@ def _check_streams(device: torch.device) -> None:
     torch.testing.assert_close(scattered, torch.full_like(scattered, dist.get_rank() + 1))
 
 
-@pytest.mark.parametrize("transport", ["gloo", "shared"])
-def test_two_rank_cpu_dtensor(tmp_path, transport):
-    mp.spawn(_run_relay, args=(str(tmp_path / "cpu-store"), None, 1, transport), nprocs=2)
+def test_two_rank_cpu_dtensor(tmp_path):
+    cases = [(str(tmp_path / f"cpu-{transport}"), None, 1, transport) for transport in ("gloo", "shared")]
+    mp.spawn(_run_cases, args=(_run_relay, cases), nprocs=2)
 
 
 @CUDA
-@pytest.mark.parametrize(("transport", "buffers"), [("gloo", 1), ("gloo", 3), ("shared", 1)])
-def test_two_rank_dtensor_on_one_gpu(tmp_path, buffers, transport):
-    mp.spawn(_run_relay, args=(str(tmp_path / "shared-gpu-store"), (0, 0), buffers, transport), nprocs=2)
+def test_two_rank_dtensor_on_one_gpu(tmp_path):
+    cases = [
+        (str(tmp_path / f"one-gpu-{transport}-{buffers}"), (0, 0), buffers, transport)
+        for transport, buffers in (("gloo", 1), ("gloo", 3), ("shared", 1))
+    ]
+    mp.spawn(_run_cases, args=(_run_relay, cases), nprocs=2)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two physical CUDA/HIP GPUs required")

@@ -455,21 +455,27 @@ class TestLifecycle:
         finally:
             pw.deactivate()
 
-    def test_context_manager_protocol(self) -> None:
+    def test_cpu_reactivation_preserves_model_and_host_storage(self) -> None:
         m = _make_simple_model()
         pw = _make_model_offloader(m)
+        value = torch.randn(2, 8)
+        expected = m(value)
+        # CPU activation creates fresh wrappers over the captured host storage.
+        host_ptrs = [p.data_ptr() for p in m.parameters()]
         try:
-            # CPU activate restores frozen params to fresh wrappers over the
-            # same host storage (the materialized CPU wrapper is built on
-            # demand, not cached), so compare stable host-storage pointers.
-            host_ptrs = [p.data_ptr() for p in m.parameters()]
-            with activated_model(pw, "cpu") as model:
-                assert model is m
+            for _ in range(3):
+                pw.activate(device="cpu")
+                assert pw.value is m
+                assert [p.data_ptr() for p in m.parameters()] == host_ptrs
+                for p in m.parameters():
+                    assert p.device == torch.device("cpu")
+                    assert not p.is_pinned()
+                torch.testing.assert_close(pw.value(value), expected, rtol=0, atol=0)
+                pw.deactivate()
+                assert pw.active_device is None
                 assert [p.data_ptr() for p in m.parameters()] == host_ptrs
                 for p in m.parameters():
                     assert not p.is_pinned()
-            for p in m.parameters():
-                assert not p.is_pinned()
         finally:
             pw.deactivate()
 
@@ -487,26 +493,6 @@ class TestLifecycle:
             pw.activate("cpu")
             with pytest.raises(RuntimeError, match=r"already.*active"):
                 pw.activate("cpu")
-        finally:
-            pw.deactivate()
-
-    def test_repeated_activate_deactivate_cycle(self) -> None:
-        pw = _make_model_offloader(_make_simple_model())
-        try:
-            for _ in range(3):
-                with activated_model(pw, "cpu"):
-                    pass
-        finally:
-            pw.deactivate()
-
-    def test_activate_accepts_device_without_constructor_default(self) -> None:
-        m = _make_simple_model()
-        pw = _make_model_offloader(m)
-        try:
-            pw.activate(device="cpu")
-            for p in m.parameters():
-                assert p.device == torch.device("cpu")
-            pw.deactivate()
         finally:
             pw.deactivate()
 

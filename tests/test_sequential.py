@@ -706,27 +706,7 @@ def test_gather_allows_direct_reads_from_output_slices(executor):
         torch.testing.assert_close(value.cpu(), torch.tensor([7.0] * 4 + [9.0] * 4))
 
 
-def test_collective_timeout_and_reopen():
-    pytest.importorskip("triton")
-    release = threading.Event()
-    with SequentialExecutor(timeout=timedelta(seconds=1)) as executor:
-
-        def forward(rank):
-            if rank == 1:
-                release.wait(5)
-            else:
-                dist.all_reduce(torch.ones(2, device="cuda"))
-
-        try:
-            with pytest.raises(RuntimeError, match="timed out"):
-                executor.run(forward)
-        finally:
-            release.set()
-    with SequentialExecutor() as executor:
-        assert executor.run(lambda rank: rank) == (0, 1)
-
-
-def test_close_keeps_isolation_until_blocked_callback_exits():
+def test_collective_timeout_keeps_isolation_until_close_then_allows_reopen():
     pytest.importorskip("triton")
     original = dist.distributed_c10d._world
     release = threading.Event()
@@ -753,6 +733,8 @@ def test_close_keeps_isolation_until_blocked_callback_exits():
         release.set()
         executor.close()
     assert dist.distributed_c10d._world is original
+    with SequentialExecutor() as reopened:
+        assert reopened.run(lambda rank: rank) == (0, 1)
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo needed only to set up the pre-existing group")
