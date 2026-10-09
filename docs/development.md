@@ -67,7 +67,11 @@ uv run pytest tests --collect-only -q
 uv run pytest tests -q --durations=20
 ```
 
-Record hardware, dependency versions, and compiler-cache conditions. Test bounded
+CI retains JUnit timings, including setup and teardown, for 14 days in the
+`test-results-linux` and `test-results-windows` artifacts, also after test failures.
+
+Record hardware, dependency versions, and compiler-cache conditions. Compare
+repeated before/after runs with matching inputs and cache state. Test bounded
 work through allocation, transfer, or registration counts; keep latency and
 throughput measurements in `benchmarks/`. Targeted runs help during development;
 complete the validation required by the change before finishing.

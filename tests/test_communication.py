@@ -1056,9 +1056,12 @@ def _run_shared_failure(rank, path, operation):
 
 
 @CUDA
-@pytest.mark.parametrize("operation", ["allgather", "allreduce"])
-def test_shared_failure_drains_copies_before_unpinning(tmp_path, operation):
-    mp.spawn(_run_shared_failure, args=(str(tmp_path / "shared-failure"), operation), nprocs=2)
+def test_shared_failure_drains_copies_before_unpinning(tmp_path):
+    cases = [
+        (str(tmp_path / f"shared-failure-{operation}"), operation)
+        for operation in ("allgather", "allreduce")
+    ]
+    mp.spawn(_run_cases, args=(_run_shared_failure, cases), nprocs=2)
 
 
 @pytest.mark.parametrize("transport", [None, "auto", "nccl", True])
@@ -1126,9 +1129,9 @@ def _run_shared_bad_mapping(rank, path, failure):
         assert not dist.is_initialized()
 
 
-@pytest.mark.parametrize("failure", ["host", "mapping"])
-def test_shared_initialization_fails_on_all_ranks(tmp_path, failure):
-    mp.spawn(_run_shared_bad_mapping, args=(str(tmp_path / "bad-map"), failure), nprocs=2)
+def test_shared_initialization_fails_on_all_ranks(tmp_path):
+    cases = [(str(tmp_path / f"bad-map-{failure}"), failure) for failure in ("host", "mapping")]
+    mp.spawn(_run_cases, args=(_run_shared_bad_mapping, cases), nprocs=2)
 
 
 def _run_shared_peer_failure(rank, path):
