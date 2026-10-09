@@ -231,38 +231,27 @@ class TestHostParam:
         assert p.data.data_ptr() == host_param.host_state.data.data_ptr()
 
     @CUDA
-    def test_allocate_copy_make_gpu_param_non_quanto(self) -> None:
-        p = nn.Parameter(torch.randn(4, 8, dtype=torch.bfloat16), requires_grad=False)
-        host_param = HostParam(p)
-        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
-        host_param.copy_to_gpu(gpu_state, non_blocking=True)
-        gpu = host_param.make_gpu_param(gpu_state)
-        assert gpu.is_cuda
-        assert gpu.shape == p.shape
-        torch.cuda.synchronize()
-        assert torch.equal(gpu.cpu(), host_param.make_cpu_param().data)
-
-    @CUDA
     def test_pool_pattern_allocate_and_copy(self) -> None:
         # Mirrors how HostModuleTarget uses HostParam: allocate GPU
-        # storage once, then copy_to_gpu in place on each load.
-        p = nn.Parameter(torch.randn(16, dtype=torch.bfloat16), requires_grad=False)
+        # storage once, then load different immutable host sources into it.
+        p = nn.Parameter(torch.randn(4, 8, dtype=torch.bfloat16), requires_grad=False)
         host_param = HostParam(p)
         device = torch.device("cuda")
         gpu_state = host_param.allocate_gpu_storage(device)
+        host_param.copy_to_gpu(gpu_state, non_blocking=True)
         gpu_param = host_param.make_gpu_param(gpu_state)
         assert gpu_param.is_cuda
-        # First copy
-        host_param.copy_to_gpu(gpu_state, non_blocking=True)
+        assert gpu_param.shape == p.shape
         torch.cuda.synchronize()
         cpu_param = host_param.make_cpu_param()
         assert torch.equal(gpu_state.data.cpu(), cpu_param.data)
-        # Mutate host source and re-copy — gpu state should track.
-        new_vals = torch.randn(16, dtype=torch.bfloat16)
-        cpu_param.data.copy_(new_vals)
-        host_param.copy_to_gpu(gpu_state, non_blocking=True)
+        assert torch.equal(gpu_param.cpu(), cpu_param.data)
+        new_vals = torch.randn(4, 8, dtype=torch.bfloat16)
+        next_host = HostParam(nn.Parameter(new_vals, requires_grad=False))
+        next_host.copy_to_gpu(gpu_state, non_blocking=True)
         torch.cuda.synchronize()
         assert torch.equal(gpu_state.data.cpu(), new_vals)
+        assert torch.equal(gpu_param.cpu(), new_vals)
         # Stable storage — gpu_param wraps the same GPU bytes as gpu_state.
         # HostModuleTarget relies on this: build the Parameter wrapper once at target
         # construction, mutate underlying storage in place on each load.

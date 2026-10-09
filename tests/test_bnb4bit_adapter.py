@@ -24,19 +24,6 @@ from tests.conftest import activated_model
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _make_model_offloader(
-    model: nn.Module,
-    *,
-    block_paths: list[str] = [],
-    include_block_trainables: bool = False,
-) -> ModelOffloader:
-    return ModelOffloader.from_module(
-        model,
-        block_paths=block_paths,
-        include_block_trainables=include_block_trainables,
-    )
-
-
 def _make_nf4(
     *,
     rows: int = 64,
@@ -155,14 +142,16 @@ class TestBnb4bitAdapter:
         assert host_param.compute_dtype is torch.bfloat16
         assert torch.equal(Bnb4bitAdapter.dequantize(host), Bnb4bitAdapter.dequantize(p))
 
-    def test_tensor_id_tracks_packed_and_scales(self) -> None:
+    def test_storage_identity_is_distinct_from_target_layout(self) -> None:
         p = _make_nf4()
         key = tensor_id(p)
         assert key[0] == "bnb4bit"
         assert key[1][0] == p.data.device  # packed weight identity
         assert key[2][0] == p.quant_state.absmax.device  # absmax identity
         assert key == tensor_id(p)
-        assert key != tensor_id(_make_nf4())
+        other = _make_nf4()
+        assert key != tensor_id(other)
+        assert _param_target_layout(p) == _param_target_layout(other)
 
     @pytest.mark.parametrize("double_quant", [False, True])
     def test_storage_enumeration_includes_metadata_and_nested_offset(self, double_quant: bool) -> None:
@@ -175,12 +164,6 @@ class TestBnb4bitAdapter:
         if double_quant:
             assert any(tensor is state.offset for tensor in tensors)
         assert sum(tensor.nbytes for tensor in tensors) == host.cache_bytes
-
-    def test_target_layout_ignores_tensor_id(self) -> None:
-        p1 = _make_nf4()
-        p2 = _make_nf4()
-
-        assert _param_target_layout(p1) == _param_target_layout(p2)
 
     def test_target_layout_tracks_quant_type(self) -> None:
         nf4 = _make_nf4(quant_type="nf4")
@@ -399,7 +382,7 @@ class TestBnb4bitAdapter:
             cols=32,
             double_quant=True,
         )
-        offloader = _make_model_offloader(model)
+        offloader = ModelOffloader.from_module(model)
         generator = torch.Generator().manual_seed(321)
         lora = Adapter.from_state_dict(
             state_dict={
@@ -946,7 +929,7 @@ class TestBnb4bitAdapter:
         x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
         reference = layer(x)
 
-        strategy = _make_model_offloader(layer)
+        strategy = ModelOffloader.from_module(layer)
         try:
             with activated_model(strategy, "cuda") as active:
                 y = active(x)
@@ -991,7 +974,7 @@ class TestBnb4bitAdapter:
                 return x
 
         model = M().to("cuda")
-        offloader = _make_model_offloader(
+        offloader = ModelOffloader.from_module(
             model,
             block_paths=["blocks"],
         )
@@ -1063,7 +1046,7 @@ class TestBnb4bitAdapter:
         x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
         reference = model(x)  # 4-bit forward does not migrate state
 
-        offloader = _make_model_offloader(
+        offloader = ModelOffloader.from_module(
             model,
             block_paths=["blocks"],
         )

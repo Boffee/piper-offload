@@ -21,19 +21,6 @@ from tests.conftest import activated_model
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _make_model_offloader(
-    model: nn.Module,
-    *,
-    block_paths: list[str] = [],
-    include_block_trainables: bool = False,
-) -> ModelOffloader:
-    return ModelOffloader.from_module(
-        model,
-        block_paths=block_paths,
-        include_block_trainables=include_block_trainables,
-    )
-
-
 def _float8_modules():
     pytest.importorskip("torchao")
     try:
@@ -134,20 +121,18 @@ class TestFloat8Adapter:
         assert host_param.compute_dtype is torch.bfloat16
         assert torch.equal(host.dequantize(), f8.dequantize())
 
-    def test_tensor_id_tracks_both_buffers(self) -> None:
+    def test_storage_identity_is_distinct_from_target_layout(self) -> None:
         f8 = _make_float8()
         key = tensor_id(f8)
         assert key[0] == "torchao-float8"
         assert key[1][0] == f8.qdata.device
         assert key[2][0] == f8.scale.device
         assert key == tensor_id(f8)
-        assert key != tensor_id(_make_float8())
-
-    def test_target_layout_ignores_tensor_id(self) -> None:
-        p1 = nn.Parameter(_make_float8(), requires_grad=False)
-        p2 = nn.Parameter(_make_float8(), requires_grad=False)
-
-        assert _param_target_layout(p1) == _param_target_layout(p2)
+        other = _make_float8()
+        assert key != tensor_id(other)
+        assert _param_target_layout(
+            nn.Parameter(f8, requires_grad=False),
+        ) == _param_target_layout(nn.Parameter(other, requires_grad=False))
 
     def test_target_layout_tracks_granularity(self) -> None:
         per_row = nn.Parameter(_make_float8(per_tensor=False), requires_grad=False)
@@ -925,7 +910,7 @@ class TestFloat8Adapter:
             _make_float8(weight=weight, dynamic_activation=True),
             requires_grad=False,
         )
-        strategy = _make_model_offloader(layer)
+        strategy = ModelOffloader.from_module(layer)
 
         try:
             x = torch.randn(128, 64, dtype=torch.bfloat16, device="cuda")
@@ -989,7 +974,7 @@ class TestFloat8Adapter:
             granularity=per_row_cls(),
         )
 
-        offloader = _make_model_offloader(
+        offloader = ModelOffloader.from_module(
             model,
             block_paths=["blocks"],
         )

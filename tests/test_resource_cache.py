@@ -89,10 +89,6 @@ def _is_registered(cache: ResourceCache, key: str) -> bool:
     return True
 
 
-def _is_cached(cache: ResourceCache, key: str) -> bool:
-    return cache.info(key).cached
-
-
 class MRUEvictionPolicy:
     """Evict the most recently released candidate first."""
 
@@ -151,8 +147,8 @@ class TestConstruction:
         assert cache.max_cache_bytes is None
         assert cache.available_cache_bytes is None
         assert cache.used_cache_bytes == 200
-        assert _is_cached(cache, "a")
-        assert _is_cached(cache, "b")
+        assert cache.info("a").cached
+        assert cache.info("b").cached
 
 
 class TestResize:
@@ -166,7 +162,7 @@ class TestResize:
         assert cache.max_cache_bytes == 100
         assert cache.used_cache_bytes == 50
         assert cache.available_cache_bytes == 50
-        assert _is_cached(cache, "a")
+        assert cache.info("a").cached
 
     def test_shrink_evicts_by_configured_policy(self) -> None:
         cache = ResourceCache(100)
@@ -179,8 +175,8 @@ class TestResize:
         assert cache.max_cache_bytes == 50
         assert cache.used_cache_bytes == 50
         assert cache.available_cache_bytes == 0
-        assert not _is_cached(cache, "a")
-        assert _is_cached(cache, "b")
+        assert not cache.info("a").cached
+        assert cache.info("b").cached
 
     def test_property_assignment_resizes(self) -> None:
         cache = ResourceCache(100)
@@ -191,7 +187,7 @@ class TestResize:
 
         assert cache.max_cache_bytes == 50
         assert cache.used_cache_bytes == 0
-        assert not _is_cached(cache, "a")
+        assert not cache.info("a").cached
 
     def test_shrink_blocked_by_lease_is_atomic(self) -> None:
         cache = ResourceCache(100)
@@ -205,8 +201,8 @@ class TestResize:
             assert cache.max_cache_bytes == 100
             assert cache.used_cache_bytes == 100
             assert cache.available_cache_bytes == 0
-            assert _is_cached(cache, "inactive")
-            assert _is_cached(cache, "leased")
+            assert cache.info("inactive").cached
+            assert cache.info("leased").cached
 
     def test_negative_resize_rejected_without_changing_budget(self) -> None:
         cache = ResourceCache(100)
@@ -218,11 +214,26 @@ class TestResize:
 
 
 class TestRegistration:
-    def test_register_is_lazy(self) -> None:
+    def test_registration_is_lazy_and_info_tracks_lease(self) -> None:
         cache = ResourceCache(100)
         cache.register(_spec("a", 50))
         assert FakeStore.instances == []
-        assert not cache.info("a").cached
+        info = cache.info("a")
+        assert not info.cached
+        assert info.cache_bytes is None
+        assert info.lease_count == 0
+
+        with cache.lease("a"):
+            info = cache.info("a")
+            assert info.cached
+            assert info.cache_bytes == 50
+            assert info.lease_count == 1
+
+        assert cache.info("a").lease_count == 0
+
+    def test_unknown_info_rejected(self) -> None:
+        with pytest.raises(ResourceNotRegisteredError):
+            ResourceCache(100).info("missing")
 
     def test_duplicate_registration_rejected(self) -> None:
         cache = ResourceCache(100)
@@ -275,34 +286,22 @@ class TestRegistration:
 
 
 class TestLease:
-    def test_accepts_structural_resource_spec_without_inheritance(self) -> None:
-        @dataclass(frozen=True)
-        class IndependentSpec:
-            key: str
-            estimated_cache_bytes: int
-            factory: Callable[[], FakeStore]
-
-            def build_store(self) -> ResourceStore:
-                return self.factory()
-
-            def value(self, store: ResourceStore) -> FakeStore:
-                assert isinstance(store, FakeStore)
-                return store
-
+    def test_structural_spec_builds_once_across_nested_and_repeated_leases(self) -> None:
         cache = ResourceCache(100)
-        spec = IndependentSpec("independent", 50, _factory(50))
-        with cache.lease(spec) as store:
-            assert isinstance(store, FakeStore)
-            assert cache.info("independent").lease_count == 1
-
-    def test_spec_auto_registers_and_factory_runs_once(self) -> None:
-        cache = ResourceCache(100)
+        # FakeSpec satisfies ResourceSpec without inheriting from it.
         spec = _spec("a", 50)
         with cache.lease(spec) as first:
             assert isinstance(first, FakeStore)
             assert cache.info("a").lease_count == 1
+            with cache.lease("a") as nested:
+                assert nested is first
+                assert cache.info("a").lease_count == 2
+            assert cache.info("a").lease_count == 1
+        assert cache.info("a").lease_count == 0
+
         with cache.lease("a") as second:
             assert second is first
+            assert cache.info("a").lease_count == 1
         assert len(FakeStore.instances) == 1
         assert cache.info("a").lease_count == 0
 
@@ -311,15 +310,6 @@ class TestLease:
         with pytest.raises(ResourceNotRegisteredError, match="lease"):
             with cache.lease("missing"):
                 pass
-
-    def test_nested_same_key_counts_independent_leases(self) -> None:
-        cache = ResourceCache(100)
-        with cache.lease(_spec("a", 50)) as first:
-            with cache.lease("a") as second:
-                assert second is first
-                assert cache.info("a").lease_count == 2
-            assert cache.info("a").lease_count == 1
-        assert cache.info("a").lease_count == 0
 
     def test_value_failure_releases_lease(self) -> None:
         class RaisingSpec(FakeSpec):
@@ -374,9 +364,9 @@ class TestLeaseMany:
         with pytest.raises(ResourceTooLargeError):
             with cache.lease_many([_spec("dependency", 40), _spec("owner", 80)]):
                 pass
-        assert _is_cached(cache, "dependency")
+        assert cache.info("dependency").cached
         assert cache.info("dependency").lease_count == 0
-        assert not _is_cached(cache, "owner")
+        assert not cache.info("owner").cached
 
     def test_partial_failure_releases_earlier_leases(self) -> None:
         cache = ResourceCache(100)
@@ -396,7 +386,7 @@ class TestEviction:
         assert cache.evict_bytes(25) == 50
         assert cache.max_cache_bytes is None
         assert cache.used_cache_bytes == 0
-        assert not _is_cached(cache, "model")
+        assert not cache.info("model").cached
 
     def test_evict_bytes_uses_lru_without_bounding_cache(self) -> None:
         cache = ResourceCache(None)
@@ -408,9 +398,9 @@ class TestEviction:
 
         assert cache.max_cache_bytes is None
         assert cache.used_cache_bytes == 50
-        assert not _is_cached(cache, "a")
-        assert not _is_cached(cache, "b")
-        assert _is_cached(cache, "c")
+        assert not cache.info("a").cached
+        assert not cache.info("b").cached
+        assert cache.info("c").cached
 
     def test_evict_bytes_uses_configured_policy(self) -> None:
         cache = ResourceCache(100, eviction_policy=MRUEvictionPolicy())
@@ -420,8 +410,8 @@ class TestEviction:
 
         assert cache.evict_bytes(30) == 60
         assert cache.max_cache_bytes == 100
-        assert _is_cached(cache, "a")
-        assert not _is_cached(cache, "b")
+        assert cache.info("a").cached
+        assert not cache.info("b").cached
 
     def test_evict_bytes_returns_partial_count_when_entries_are_leased(
         self,
@@ -433,8 +423,8 @@ class TestEviction:
         with cache.lease(_spec("leased", 60)):
             assert cache.evict_bytes(80) == 40
             assert cache.used_cache_bytes == 60
-            assert not _is_cached(cache, "inactive")
-            assert _is_cached(cache, "leased")
+            assert not cache.info("inactive").cached
+            assert cache.info("leased").cached
 
     def test_evict_bytes_rejects_negative_request(self) -> None:
         cache = ResourceCache(None)
@@ -445,7 +435,7 @@ class TestEviction:
             cache.evict_bytes(-1)
 
         assert cache.used_cache_bytes == 50
-        assert _is_cached(cache, "a")
+        assert cache.info("a").cached
 
     def test_evict_bytes_validates_policy_before_eviction(self) -> None:
         class EmptyPolicy(MRUEvictionPolicy):
@@ -463,7 +453,7 @@ class TestEviction:
             cache.evict_bytes(25)
 
         assert cache.used_cache_bytes == 50
-        assert _is_cached(cache, "a")
+        assert cache.info("a").cached
 
     def test_lru_evicts_oldest_released_store(self) -> None:
         cache = ResourceCache(100)
@@ -472,9 +462,9 @@ class TestEviction:
                 pass
         with cache.lease(_spec("c", 50)):
             pass
-        assert not _is_cached(cache, "a")
-        assert _is_cached(cache, "b")
-        assert _is_cached(cache, "c")
+        assert not cache.info("a").cached
+        assert cache.info("b").cached
+        assert cache.info("c").cached
 
     def test_recent_reuse_refreshes_lru(self) -> None:
         cache = ResourceCache(100)
@@ -485,8 +475,8 @@ class TestEviction:
             pass
         with cache.lease(_spec("c", 50)):
             pass
-        assert _is_cached(cache, "a")
-        assert not _is_cached(cache, "b")
+        assert cache.info("a").cached
+        assert not cache.info("b").cached
 
     def test_custom_policy_controls_victim(self) -> None:
         cache = ResourceCache(100, eviction_policy=MRUEvictionPolicy())
@@ -495,14 +485,20 @@ class TestEviction:
                 pass
         with cache.lease(_spec("c", 50)):
             pass
-        assert _is_cached(cache, "a")
-        assert not _is_cached(cache, "b")
+        assert cache.info("a").cached
+        assert not cache.info("b").cached
 
     @pytest.mark.parametrize(
-        "victims",
-        [("unknown",), ("a", "a")],
+        ("victims", "message"),
+        [
+            pytest.param(("unknown",), "invalid", id="unknown"),
+            pytest.param(("a", "a"), "invalid", id="duplicate"),
+            pytest.param((), "insufficient", id="insufficient"),
+        ],
     )
-    def test_invalid_policy_victims_rejected(self, victims: tuple[str, ...]) -> None:
+    def test_invalid_policy_victims_rejected(
+        self, victims: tuple[str, ...], message: str
+    ) -> None:
         class InvalidPolicy(MRUEvictionPolicy):
             def choose_victims(self, context: EvictionContext) -> tuple[str, ...]:
                 return victims
@@ -510,21 +506,12 @@ class TestEviction:
         cache = ResourceCache(50, eviction_policy=InvalidPolicy())
         with cache.lease(_spec("a", 50)):
             pass
-        with pytest.raises(EvictionPolicyError, match="invalid"):
+        with pytest.raises(EvictionPolicyError, match=message):
             with cache.lease(_spec("b", 50)):
                 pass
-
-    def test_insufficient_policy_victims_rejected(self) -> None:
-        class EmptyPolicy(MRUEvictionPolicy):
-            def choose_victims(self, context: EvictionContext) -> tuple[str, ...]:
-                return ()
-
-        cache = ResourceCache(50, eviction_policy=EmptyPolicy())
-        with cache.lease(_spec("a", 50)):
-            pass
-        with pytest.raises(EvictionPolicyError, match="insufficient"):
-            with cache.lease(_spec("b", 50)):
-                pass
+        assert cache.info("a").cached
+        assert not cache.info("b").cached
+        assert cache.used_cache_bytes == 50
 
     def test_resource_larger_than_budget_rejected(self) -> None:
         cache = ResourceCache(50)
@@ -548,7 +535,7 @@ class TestFailuresAndAccounting:
             with cache.lease(spec):
                 pass
         assert _is_registered(cache, "bad")
-        assert not _is_cached(cache, "bad")
+        assert not cache.info("bad").cached
         assert cache.used_cache_bytes == 0
 
     def test_factory_failure_after_pre_eviction_keeps_eviction(self) -> None:
@@ -559,8 +546,8 @@ class TestFailuresAndAccounting:
         with pytest.raises(RuntimeError, match="boom"):
             with cache.lease(bad):
                 pass
-        assert not _is_cached(cache, "warm")
-        assert not _is_cached(cache, "bad")
+        assert not cache.info("warm").cached
+        assert not cache.info("bad").cached
 
     def test_negative_actual_size_rejected(self) -> None:
         cache = ResourceCache(100)
@@ -581,7 +568,7 @@ class TestFailuresAndAccounting:
             pass
         with cache.lease(_spec("big", 75, estimated_cache_bytes=25)):
             pass
-        assert not _is_cached(cache, "filler")
+        assert not cache.info("filler").cached
         assert cache.used_cache_bytes == 75
 
     def test_actual_larger_than_budget_is_rejected(self) -> None:
@@ -589,7 +576,7 @@ class TestFailuresAndAccounting:
         with pytest.raises(ResourceTooLargeError):
             with cache.lease(_spec("big", 125, estimated_cache_bytes=25)):
                 pass
-        assert not _is_cached(cache, "big")
+        assert not cache.info("big").cached
         assert cache.used_cache_bytes == 0
 
 
@@ -624,33 +611,13 @@ class TestThreadSafety:
         assert cache.info("a").lease_count == 0
 
 
-class TestObservabilityAndRelease:
-    def test_info_reports_unbuilt_and_built_entries(self) -> None:
-        cache = ResourceCache(100)
-        cache.register(_spec("a", 50))
-        info = cache.info("a")
-        assert not info.cached
-        assert info.cache_bytes is None
-        assert info.lease_count == 0
-
-        with cache.lease("a"):
-            info = cache.info("a")
-            assert info.cached
-            assert info.cache_bytes == 50
-            assert info.lease_count == 1
-
-    def test_unknown_info_rejected(self) -> None:
-        with pytest.raises(ResourceNotRegisteredError):
-            ResourceCache(100).info("missing")
-
-
 class FakeTokenizer:
     def __init__(self) -> None:
         self.vocab = {"hello": 0, "world": 1}
 
 
 class TestObjectSpec:
-    def test_factory_runs_once_and_leases_share_value(self) -> None:
+    def test_default_object_builds_once_and_shares_value_without_using_budget(self) -> None:
         builds = 0
 
         def factory() -> FakeTokenizer:
@@ -658,19 +625,15 @@ class TestObjectSpec:
             builds += 1
             return FakeTokenizer()
 
-        cache = ResourceCache(100)
+        cache = ResourceCache(0)
         spec = ObjectSpec(key="tok", factory=factory)
         with cache.lease(spec) as first, cache.lease("tok") as second:
             assert second is first
             assert cache.info("tok").lease_count == 2
         assert builds == 1
 
-    def test_zero_byte_default_does_not_consume_budget(self) -> None:
-        cache = ResourceCache(0)
-        with cache.lease(ObjectSpec(key="tok", factory=FakeTokenizer)):
-            pass
         assert cache.used_cache_bytes == 0
-        assert _is_cached(cache, "tok")
+        assert cache.info("tok").cached
 
     def test_positive_estimate_counts_against_budget(self) -> None:
         cache = ResourceCache(100)
@@ -684,7 +647,7 @@ class TestObjectSpec:
             pass
         with cache.lease(_spec("a", 50)):
             pass
-        assert not _is_cached(cache, "tok")
+        assert not cache.info("tok").cached
 
     def test_store_wrapper_satisfies_resource_store(self) -> None:
         spec = ObjectSpec(key="tok", factory=FakeTokenizer)

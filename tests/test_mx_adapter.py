@@ -37,19 +37,6 @@ ELEM_DTYPES = [
 ]
 
 
-def _make_model_offloader(
-    model: nn.Module,
-    *,
-    block_paths: list[str] = [],
-    include_block_trainables: bool = False,
-) -> ModelOffloader:
-    return ModelOffloader.from_module(
-        model,
-        block_paths=block_paths,
-        include_block_trainables=include_block_trainables,
-    )
-
-
 def _mx_tensor_cls():
     pytest.importorskip("numpy")
     mod = pytest.importorskip("torchao.prototype.mx_formats.mx_tensor")
@@ -222,20 +209,18 @@ class TestMxAdapter:
         assert host.scale.stride() == qt.scale.stride()
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_tensor_id_is_stable_and_keyed(self, elem_dtype: torch.dtype) -> None:
+    def test_storage_identity_is_distinct_from_target_layout(self, elem_dtype: torch.dtype) -> None:
         qt = _make_mx(elem_dtype=elem_dtype)
         key = tensor_id(qt)
         assert key[0] == "torchao-mx"
         assert key[1][0] == qt.qdata.device
         assert key[2][0] == qt.scale.device
         assert key == tensor_id(qt)
-
-    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_target_layout_ignores_tensor_id(self, elem_dtype: torch.dtype) -> None:
-        p1 = nn.Parameter(_make_mx(elem_dtype=elem_dtype), requires_grad=False)
-        p2 = nn.Parameter(_make_mx(elem_dtype=elem_dtype), requires_grad=False)
-
-        assert _param_target_layout(p1) == _param_target_layout(p2)
+        other = _make_mx(elem_dtype=elem_dtype)
+        assert key != tensor_id(other)
+        assert _param_target_layout(
+            nn.Parameter(qt, requires_grad=False),
+        ) == _param_target_layout(nn.Parameter(other, requires_grad=False))
 
     def test_target_layout_distinguishes_mxfp8_and_mxfp4(self) -> None:
         if _FP4 is None:
@@ -828,7 +813,7 @@ class TestMxAdapter:
             _quantize_mx(weight, elem_dtype=elem_dtype, dynamic_activation=True),
             requires_grad=False,
         )
-        strategy = _make_model_offloader(layer)
+        strategy = ModelOffloader.from_module(layer)
 
         try:
             x = torch.randn(128, 64, dtype=torch.bfloat16, device="cuda")
@@ -866,7 +851,7 @@ class TestMxAdapter:
                 _quantize_mx(weight, elem_dtype=elem_dtype, dynamic_activation=True),
                 requires_grad=False,
             )
-        offloader = _make_model_offloader(
+        offloader = ModelOffloader.from_module(
             model,
             block_paths=["blocks"],
         )
@@ -946,7 +931,7 @@ class TestMxAdapter:
         )
         expected = MxAdapter.requantize(expected_dense, like=mx_cuda)
 
-        offloader = _make_model_offloader(
+        offloader = ModelOffloader.from_module(
             model,
             block_paths=["blocks"],
         )

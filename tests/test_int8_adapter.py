@@ -23,19 +23,6 @@ from tests.conftest import activated_model
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _make_model_offloader(
-    model: nn.Module,
-    *,
-    block_paths: list[str] = [],
-    include_block_trainables: bool = False,
-) -> ModelOffloader:
-    return ModelOffloader.from_module(
-        model,
-        block_paths=block_paths,
-        include_block_trainables=include_block_trainables,
-    )
-
-
 def _int8_config(*, dynamic_activation: bool) -> object:
     pytest.importorskip("torchao")
     try:
@@ -232,20 +219,18 @@ class TestInt8Adapter:
         assert host_param.compute_dtype is torch.bfloat16
         assert torch.equal(host.dequantize(), qt.dequantize())
 
-    def test_tensor_id_tracks_buffers(self) -> None:
+    def test_storage_identity_is_distinct_from_target_layout(self) -> None:
         qt = _make_int8()
         key = tensor_id(qt)
         assert key[0] == "torchao-int8"
         assert key[1][0] == qt.qdata.device
         assert key[2][0] == qt.scale.device
         assert key == tensor_id(qt)
-        assert key != tensor_id(_make_int8())
-
-    def test_target_layout_ignores_tensor_id(self) -> None:
-        p1 = nn.Parameter(_make_int8(), requires_grad=False)
-        p2 = nn.Parameter(_make_int8(), requires_grad=False)
-
-        assert _param_target_layout(p1) == _param_target_layout(p2)
+        other = _make_int8()
+        assert key != tensor_id(other)
+        assert _param_target_layout(
+            nn.Parameter(qt, requires_grad=False),
+        ) == _param_target_layout(nn.Parameter(other, requires_grad=False))
 
     def test_target_layout_tracks_activation_quantization(self) -> None:
         with_activation = nn.Parameter(_make_int8(dynamic_activation=True), requires_grad=False)
@@ -1218,7 +1203,7 @@ class TestInt8Adapter:
             _make_int8(rows=128, cols=64, dynamic_activation=dynamic_activation),
             requires_grad=False,
         )
-        strategy = _make_model_offloader(layer)
+        strategy = ModelOffloader.from_module(layer)
 
         try:
             x = torch.randn(128, 64, dtype=torch.bfloat16, device="cuda")
@@ -1254,7 +1239,7 @@ class TestInt8Adapter:
                 _make_int8(rows=128, cols=128, dynamic_activation=True),
                 requires_grad=False,
             )
-        offloader = _make_model_offloader(
+        offloader = ModelOffloader.from_module(
             model,
             block_paths=["blocks"],
         )
@@ -1327,7 +1312,7 @@ class TestInt8Adapter:
         )
         expected = Int8Adapter.requantize(expected_dense, like=qt_cuda)
 
-        offloader = _make_model_offloader(
+        offloader = ModelOffloader.from_module(
             model,
             block_paths=["blocks"],
         )
