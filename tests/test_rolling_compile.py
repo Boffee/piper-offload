@@ -267,7 +267,9 @@ class TestRollingCompile:
         rolling_model, rolling_width, rolling_dtype = _rolling_quant_model(quant_kind)
         assert (rolling_width, rolling_dtype) == (width, dtype)
         torch.manual_seed(15)
-        x = torch.randn(32, width, device="cuda", dtype=dtype)
+        # Match intermediate outputs so Dynamo reuses one graph per backend.
+        with torch.inference_mode():
+            x = torch.randn(32, width, device="cuda", dtype=dtype)
         activation: dict[str, object] = {}
         if quant_kind != "torchao-int4-tile":
             activation.update(

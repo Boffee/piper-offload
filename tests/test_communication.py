@@ -339,9 +339,9 @@ def _run_compiled_relay(rank, store_path, transport):
 
 
 @CUDA
-@pytest.mark.parametrize("transport", ["gloo", "shared"])
-def test_compiled_dtensor_collectives_on_one_gpu(tmp_path, transport):
-    mp.spawn(_run_compiled_relay, args=(str(tmp_path / "compiled-store"), transport), nprocs=2)
+def test_compiled_dtensor_collectives_on_one_gpu(tmp_path):
+    cases = [(str(tmp_path / f"compiled-{transport}"), transport) for transport in ("gloo", "shared")]
+    mp.spawn(_run_cases, args=(_run_compiled_relay, cases), nprocs=2)
 
 
 @pytest.fixture
