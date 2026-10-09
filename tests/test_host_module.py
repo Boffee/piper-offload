@@ -181,26 +181,14 @@ class TestHostModuleStore:
         assert store.buffers == {}
         assert store.cache_bytes == store.params["weight"].cache_bytes
 
-    def test_can_include_params_by_name(self) -> None:
+    @pytest.mark.parametrize("shared_storage", [False, True], ids=["distinct", "shared"])
+    def test_can_include_params_by_name(self, shared_storage: bool) -> None:
         module = nn.Module()
-        module.keep = nn.Parameter(torch.randn(2, 2), requires_grad=False)
-        module.skip = nn.Parameter(torch.randn(2, 2), requires_grad=False)
-        skipped_param = module.skip
-
-        store = HostModuleStore.from_module(
-            module,
-            include_param_names={"keep"},
+        data = torch.randn(2, 2)
+        module.keep = nn.Parameter(data, requires_grad=False)
+        module.skip = nn.Parameter(
+            data if shared_storage else data.clone(), requires_grad=False
         )
-
-        assert set(store.params) == {"keep"}
-        assert module.keep.data_ptr() == store.params["keep"].make_cpu_param().data_ptr()
-        assert module.skip is skipped_param
-
-    def test_param_include_names_can_split_shared_storage(self) -> None:
-        module = nn.Module()
-        shared = torch.randn(2, 2)
-        module.keep = nn.Parameter(shared, requires_grad=False)
-        module.skip = nn.Parameter(shared, requires_grad=False)
         skipped_param = module.skip
 
         store = HostModuleStore.from_module(
@@ -240,10 +228,12 @@ class TestHostModuleStore:
                 include_param_names={"missing"},
             )
 
-    def test_can_include_buffers_by_name(self) -> None:
+    @pytest.mark.parametrize("shared_storage", [False, True], ids=["distinct", "shared"])
+    def test_can_include_buffers_by_name(self, shared_storage: bool) -> None:
         module = nn.Module()
-        skipped_buffer = torch.randn(2)
-        module.register_buffer("keep", torch.randn(2))
+        data = torch.randn(2)
+        skipped_buffer = data if shared_storage else data.clone()
+        module.register_buffer("keep", data)
         module.register_buffer("skip", skipped_buffer)
 
         store = HostModuleStore.from_module(
@@ -255,21 +245,6 @@ class TestHostModuleStore:
         assert set(store.buffers) == {"keep"}
         assert module.keep is store.buffers["keep"].tensor
         assert module.skip is skipped_buffer
-
-    def test_buffer_include_names_can_split_shared_storage(self) -> None:
-        module = nn.Module()
-        shared = torch.randn(2)
-        module.register_buffer("running", shared)
-        module.register_buffer("running_alias", shared)
-
-        store = HostModuleStore.from_module(
-            module,
-            include_buffer_names={"running"},
-        )
-
-        assert set(store.buffers) == {"running"}
-        assert module.running is store.buffers["running"].tensor
-        assert module.running_alias is shared
 
     def test_rejects_unknown_buffer_include_names(self) -> None:
         module = nn.Module()
@@ -390,19 +365,6 @@ class TestHostModuleInstance:
         assert plan.loads["weight"].source is source
         assert plan.loads["weight"].update is None
 
-    def test_load_plan_is_immutable(self) -> None:
-        instance = HostModuleInstance(
-            module=nn.Module(),
-            params={},
-            buffers={},
-        )
-        plan = instance.resolve_load_plan()
-
-        with pytest.raises(AttributeError):
-            plan.instance = instance  # type: ignore[misc]
-        with pytest.raises(TypeError):
-            plan.loads["weight"] = object()  # type: ignore[index, assignment]
-
     def test_load_to_target_copies_and_updates_once_for_aliases(self) -> None:
         module = nn.Module()
         shared = nn.Linear(2, 2, bias=False)
@@ -468,7 +430,7 @@ class TestHostModuleInstance:
         assert host.copied == 1
         assert update_calls == [target.param_targets["weight"].param]
 
-    def test_resolve_load_plan_uses_base_source_without_override(self) -> None:
+    def test_base_load_plan_is_immutable_and_loads_host_values(self) -> None:
         module = nn.Module()
         module.weight = nn.Parameter(torch.zeros(2), requires_grad=False)
         host = _FakeHostParam(torch.ones(2))
@@ -482,6 +444,11 @@ class TestHostModuleInstance:
             buffers=store.buffers,
         )
         plan = instance.resolve_load_plan()
+        with pytest.raises(AttributeError):
+            plan.instance = instance  # type: ignore[misc]
+        with pytest.raises(TypeError):
+            plan.loads["weight"] = object()  # type: ignore[index, assignment]
+
         target = plan.allocate_target(torch.device("cuda"))
         plan.load_to_target(target)
 
@@ -490,42 +457,6 @@ class TestHostModuleInstance:
         assert plan.loads["weight"].update is None
         assert module.weight is target_param
         torch.testing.assert_close(target_param, torch.ones(2))
-
-    def test_load_to_target_preserves_trainable_param_wrapper(self) -> None:
-        module = nn.Module()
-        module.weight = nn.Parameter(torch.zeros(2), requires_grad=True)
-        original = module.weight
-        host = _FakeHostParam(torch.ones(2), requires_grad=True)
-        store = HostModuleStore(
-            params={"weight": cast(HostParam, host)},
-            buffers={},
-        )
-        instance = HostModuleInstance(
-            module=module,
-            params=store.params,
-            buffers=store.buffers,
-        )
-        plan = instance.resolve_load_plan()
-        target = plan.allocate_target(torch.device("cuda"))
-
-        plan.load_to_target(target)
-
-        assert module.weight is original
-        assert module.weight.data_ptr() == target.param_targets["weight"].param.data_ptr()
-        assert host.validated == 0
-
-    def test_bind_does_not_revalidate_trainable_param_swap(self) -> None:
-        module = nn.Module()
-        module.weight = nn.Parameter(torch.zeros(2), requires_grad=True)
-        host = _FakeHostParam(torch.ones(2), requires_grad=True)
-        store = HostModuleStore(
-            params={"weight": cast(HostParam, host)},
-            buffers={},
-        )
-
-        store.bind(module)
-
-        assert host.validated == 0
 
     def test_load_to_target_copies_buffers_and_preserves_persistence(self) -> None:
         prototype = nn.Module()
@@ -537,6 +468,11 @@ class TestHostModuleInstance:
         module.register_buffer("running", torch.zeros(2), persistent=False)
         module.register_buffer("running_alias", module.running, persistent=False)
         instance = store.bind(module)
+        assert module.running is store.buffers["running"].tensor
+        assert module.running_alias is module.running
+        assert "running" in module._non_persistent_buffers_set
+        assert "running_alias" in module._non_persistent_buffers_set
+
         target_tensor = torch.empty_like(store.buffers["running"].tensor)
         buffer_target = HostBufferTarget(target_tensor)
         target = HostModuleTarget(
@@ -614,10 +550,12 @@ class TestHostModuleInstance:
         assert module.running is original
         assert "extra" not in module._buffers
 
-    def test_copy_trainables_from_target_copies_once_for_aliases(self) -> None:
+    def test_copy_trainables_from_target_dedupes_aliases_and_skips_frozen(self) -> None:
+        frozen = _FakeHostParam(torch.ones(2), requires_grad=False)
         host = _FakeHostParam(torch.ones(2), requires_grad=True)
         store = HostModuleStore(
             params={
+                "frozen": cast(HostParam, frozen),
                 "left.weight": cast(HostParam, host),
                 "right.weight": cast(HostParam, host),
             },
@@ -634,54 +572,7 @@ class TestHostModuleInstance:
 
         assert host.copied_back == 1
         assert host.copy_to_cpu_non_blocking == [True]
-
-    def test_copy_trainables_from_target_skips_frozen_params(self) -> None:
-        frozen = _FakeHostParam(torch.ones(2), requires_grad=False)
-        trainable = _FakeHostParam(torch.ones(2), requires_grad=True)
-        store = HostModuleStore(
-            params={
-                "frozen": cast(HostParam, frozen),
-                "trainable": cast(HostParam, trainable),
-            },
-            buffers={},
-        )
-        instance = HostModuleInstance(
-            module=nn.Module(),
-            params=store.params,
-            buffers=store.buffers,
-        )
-        target = instance.resolve_load_plan().allocate_target(torch.device("cuda"))
-
-        instance.copy_trainables_from_target(target)
-
         assert frozen.copied_back == 0
-        assert trainable.copied_back == 1
-
-    def test_copy_trainables_from_target_accepts_trainable_only_target(self) -> None:
-        frozen = _FakeHostParam(torch.ones(2), requires_grad=False)
-        trainable = _FakeHostParam(torch.ones(2), requires_grad=True)
-        store = HostModuleStore(
-            params={
-                "frozen": cast(HostParam, frozen),
-                "trainable": cast(HostParam, trainable),
-            },
-            buffers={},
-        )
-        instance = HostModuleInstance(
-            module=nn.Module(),
-            params=store.params,
-            buffers=store.buffers,
-        )
-        target = (
-            instance.resolve_load_plan()
-            .select_parameters({"trainable"})
-            .allocate_target(torch.device("cuda"), buffer_names=())
-        )
-
-        instance.copy_trainables_from_target(target)
-
-        assert frozen.copied_back == 0
-        assert trainable.copied_back == 1
 
     def test_copy_trainables_from_target_validates_before_copying(self) -> None:
         host = _FakeHostParam(torch.ones(2), requires_grad=True)
@@ -702,11 +593,10 @@ class TestHostModuleInstance:
 
         assert host.copied_back == 0
 
-    def test_load_to_target_loads_only_selected_entries(self) -> None:
+    def test_trainable_only_round_trip_preserves_wrappers_and_host_storage(self) -> None:
         module = nn.Module()
         module.frozen = nn.Parameter(torch.zeros(2), requires_grad=False)
         module.trainable = nn.Parameter(torch.zeros(2), requires_grad=True)
-        original_frozen = module.frozen
         original_trainable = module.trainable
         frozen = _FakeHostParam(torch.ones(2), requires_grad=False)
         trainable = _FakeHostParam(torch.full((2,), 2.0), requires_grad=True)
@@ -717,11 +607,11 @@ class TestHostModuleInstance:
             },
             buffers={},
         )
-        instance = HostModuleInstance(
-            module=module,
-            params=store.params,
-            buffers=store.buffers,
-        )
+        instance = store.bind(module)
+        original_frozen = module.frozen
+        host_data_ptr = module.trainable.data_ptr()
+        assert module.trainable is original_trainable
+        assert trainable.validated == 0
 
         plan = instance.resolve_load_plan().select_parameters(
             store.trainable_param_names
@@ -742,47 +632,19 @@ class TestHostModuleInstance:
         assert module.trainable.data_ptr() == (
             target.param_targets["trainable"].param.data_ptr()
         )
+        assert module.trainable.data_ptr() != host_data_ptr
 
-    def test_install_host_partially_loaded_trainables(self) -> None:
-        module = nn.Module()
-        module.frozen = nn.Parameter(torch.zeros(2), requires_grad=False)
-        module.trainable = nn.Parameter(torch.zeros(2), requires_grad=True)
-        frozen = _FakeHostParam(torch.ones(2), requires_grad=False)
-        trainable = _FakeHostParam(torch.full((2,), 2.0), requires_grad=True)
-        store = HostModuleStore(
-            params={
-                "frozen": cast(HostParam, frozen),
-                "trainable": cast(HostParam, trainable),
-            },
-            buffers={},
-        )
-        instance = HostModuleInstance(
-            module=module,
-            params=store.params,
-            buffers=store.buffers,
-        )
-        instance.install_host()
-        host_trainable = module.trainable
-        host_trainable_data_ptr = module.trainable.data_ptr()
-        plan = instance.resolve_load_plan().select_parameters(
-            store.trainable_param_names
-        )
-        target = plan.allocate_target(torch.device("cuda"), buffer_names=())
-        plan.load_to_target(target)
+        instance.copy_trainables_from_target(target)
+        assert frozen.copied_back == 0
+        assert trainable.copied_back == 1
+        assert trainable.copy_to_cpu_non_blocking == [False]
 
         instance.install_host()
 
-        # Frozen params are restored by registry replacement with a fresh
-        # materialized wrapper (built on demand, no cache), so identity is not
-        # preserved — but they stay frozen.
+        # Only trainable parameters preserve their wrappers across restoration.
         assert module.frozen.requires_grad is False
-        # Trainable params preserve the user's Parameter wrapper and restore
-        # only ``.data`` to the host bytes.
-        assert module.trainable is host_trainable
-        assert target.param_targets["trainable"].param.data_ptr() != (
-            host_trainable_data_ptr
-        )
-        assert module.trainable.data_ptr() == host_trainable_data_ptr
+        assert module.trainable is original_trainable
+        assert module.trainable.data_ptr() == host_data_ptr
 
     def test_binds_same_store_to_multiple_modules(self) -> None:
         prototype = nn.Module()
@@ -790,7 +652,10 @@ class TestHostModuleInstance:
         prototype.register_buffer("running", torch.randn(2))
         store = HostModuleStore.from_module(prototype)
 
-        store.bind(prototype)
+        instance = store.bind(prototype)
+        assert not hasattr(instance, "parent")
+        assert not hasattr(instance, "leaf")
+        assert not hasattr(instance, "store")
 
         second_module = nn.Module()
         second_module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
@@ -809,17 +674,6 @@ class TestHostModuleInstance:
         assert second_cpu.data_ptr() == host.make_cpu_param().data_ptr()
         assert prototype.running is store.buffers["running"].tensor
         assert second_module.running is store.buffers["running"].tensor
-
-    def test_does_not_store_parent_leaf_state(self) -> None:
-        module = nn.Module()
-        module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
-        store = HostModuleStore.from_module(module)
-
-        instance = store.bind(module)
-
-        assert not hasattr(instance, "parent")
-        assert not hasattr(instance, "leaf")
-        assert not hasattr(instance, "store")
 
     def test_restores_tied_params_with_one_cpu_wrapper(self) -> None:
         prototype = nn.Module()
@@ -863,19 +717,6 @@ class TestHostModuleInstance:
         assert target.weight.data_ptr() == (
             store.params["weight"].make_cpu_param().data_ptr()
         )
-
-    def test_preserves_target_buffer_persistence(self) -> None:
-        prototype = nn.Module()
-        prototype.register_buffer("running", torch.randn(2), persistent=True)
-        store = HostModuleStore.from_module(prototype)
-
-        target = nn.Module()
-        target.register_buffer("running", torch.randn(2), persistent=False)
-
-        store.bind(target)
-
-        assert target.running is store.buffers["running"].tensor
-        assert "running" in target._non_persistent_buffers_set
 
     def test_non_contiguous_buffer_can_bind_after_store_restore(self) -> None:
         module = nn.Module()

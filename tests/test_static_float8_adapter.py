@@ -95,19 +95,6 @@ def _replace_act_scale(t: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _make_model_offloader(
-    model: nn.Module,
-    *,
-    block_paths: list[str] = [],
-    block_compile: BlockCompileConfig | None = None,
-) -> ModelOffloader:
-    return ModelOffloader.from_module(
-        model,
-        block_paths=block_paths,
-        block_compile=block_compile,
-    )
-
-
 class TestStaticFloat8Adapter:
     def test_matches_only_calibrated_prototype_tensor(self) -> None:
         static = _make_static_float8()
@@ -656,7 +643,7 @@ class TestStaticFloat8Adapter:
             _make_static_float8(rows=128, cols=64, act_scale_shape=()),
             requires_grad=False,
         )
-        offloader = _make_model_offloader(layer)
+        offloader = ModelOffloader.from_module(layer)
 
         try:
             x = torch.randn(*input_shape, dtype=torch.bfloat16, device="cuda")
@@ -708,7 +695,7 @@ class TestStaticFloat8Adapter:
         for mode in ("merge", "routed"):
             model = make_model()
             calibrated_scale = model.blocks[0].weight.data.act_quant_scale.clone()
-            offloader = _make_model_offloader(model, block_paths=["blocks"])
+            offloader = ModelOffloader.from_module(model, block_paths=["blocks"])
             try:
                 x = torch.randn(2, 8, 64, dtype=torch.bfloat16, device="cuda")
                 with activated_model(
@@ -763,7 +750,7 @@ class TestStaticFloat8Adapter:
             torch.randn(2, 12, 64, dtype=torch.bfloat16),
         ]
         eager_model = M(weights)
-        eager_offloader = _make_model_offloader(
+        eager_offloader = ModelOffloader.from_module(
             eager_model,
             block_paths=["blocks"],
         )
@@ -775,7 +762,7 @@ class TestStaticFloat8Adapter:
             eager_offloader.deactivate()
 
         compiled_model = M(weights)
-        compiled_offloader = _make_model_offloader(
+        compiled_offloader = ModelOffloader.from_module(
             compiled_model,
             block_paths=["blocks"],
             block_compile=BlockCompileConfig(),

@@ -24,19 +24,6 @@ from tests.conftest import activated_model
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _make_model_offloader(
-    model: nn.Module,
-    *,
-    block_paths: list[str] = [],
-    include_block_trainables: bool = False,
-) -> ModelOffloader:
-    return ModelOffloader.from_module(
-        model,
-        block_paths=block_paths,
-        include_block_trainables=include_block_trainables,
-    )
-
-
 def _make_int8(
     *,
     rows: int = 64,
@@ -125,20 +112,16 @@ class TestBnb8bitAdapter:
             Bnb8bitAdapter.dequantize(host), Bnb8bitAdapter.dequantize(p)
         )
 
-    def test_tensor_id_tracks_cb_and_scb(self) -> None:
+    def test_storage_identity_is_distinct_from_target_layout(self) -> None:
         p = _make_int8()
         key = tensor_id(p)
         assert key[0] == "bnb8bit"
         assert key[1][0] == p.CB.device   # CB identity
         assert key[2][0] == p.SCB.device  # SCB identity
         assert key == tensor_id(p)
-        assert key != tensor_id(_make_int8())
-
-    def test_target_layout_ignores_tensor_id(self) -> None:
-        p1 = _make_int8()
-        p2 = _make_int8()
-
-        assert _param_target_layout(p1) == _param_target_layout(p2)
+        other = _make_int8()
+        assert key != tensor_id(other)
+        assert _param_target_layout(p) == _param_target_layout(other)
 
     def test_bind_layout_matches_real_and_placeholder(self) -> None:
         # A config-built placeholder (CB None) must bind against a store host
@@ -561,7 +544,7 @@ class TestBnb8bitAdapter:
         reference = ref_layer(x)
 
         # `layer` is still pre-forward here, so the store pins CB/SCB.
-        strategy = _make_model_offloader(layer)
+        strategy = ModelOffloader.from_module(layer)
         try:
             # Multiple activation cycles exercise the init_8bit_state re-fire:
             # each activation installs a fresh CB-bearing weight, so the
@@ -614,7 +597,7 @@ class TestBnb8bitAdapter:
         x = torch.randn(128, 128, dtype=torch.float16, device="cuda")
         reference = ref_model(x)
 
-        offloader = _make_model_offloader(
+        offloader = ModelOffloader.from_module(
             model,
             block_paths=["blocks"],
         )
