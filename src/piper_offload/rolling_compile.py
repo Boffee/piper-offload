@@ -1,4 +1,11 @@
-"""Inductor integration for experimental per-parameter block rollover."""
+"""Inductor integration for experimental per-parameter block rollover.
+
+The compiler discovers active slots through a process-local registry, but the
+resulting graph contains only parameter indices and tensor arguments. Lifecycle
+ops resolve their runtime from the current tensor storage at execution time.
+Persistent cache keys therefore describe the compiler passes and the structural
+argument-to-slot mapping, without retaining runtime owners or storage addresses.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +22,7 @@ from torch._inductor import config as inductor_config
 from torch._inductor.custom_graph_pass import (
     CustomInferenceAwareGraphPass,
     CustomSchedulerPass,
+    get_hash_for_files,
 )
 from torch._inductor.dependencies import WeakDep
 from torch._inductor.virtualized import V
@@ -304,11 +312,10 @@ class _RollingLifecyclePass(CustomInferenceAwareGraphPass):
 
     param_specs: tuple[_ParamSpec, ...]
 
-    def uuid(self) -> None:
-        # Active target discovery is process-local, so persistent Inductor
-        # code caching stays disabled. Dynamo can still reuse the compiled
-        # graph in-process because runtime lookup is keyed by slot storage.
-        return None
+    def uuid(self) -> tuple[bytes, tuple[_ParamSpec, ...]]:
+        # The same arithmetic graph can use different parameter slot indices.
+        # Include the discovered mapping as well as all pass implementation code.
+        return get_hash_for_files((__file__,)), self.param_specs
 
     def __call__(self, graph: fx.Graph, is_inference: bool) -> None:
         if not is_inference:
@@ -355,8 +362,8 @@ class _RollingLifecyclePass(CustomInferenceAwareGraphPass):
 class _RollingSchedulerPass(CustomSchedulerPass):
     """Order lifecycle effects around readers without tensor materialization."""
 
-    def uuid(self) -> None:
-        return None
+    def uuid(self) -> bytes:
+        return get_hash_for_files((__file__,))
 
     @staticmethod
     def _is_kernel(node: BaseSchedulerNode, suffix: str | tuple[str, ...]) -> bool:
