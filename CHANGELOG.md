@@ -5,12 +5,16 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.10.0rc10] - 2026-10-28
+
 ### Fixed
 
 - Rolling block compilation now supports Inductor's disk graph cache, avoiding
   repeated graph compilation after compiler resets and process restarts.
   Cache keys include the rolling pass implementation and parameter-slot mapping;
   cached graphs bind to the active runtime and weights when executed.
+- CUDA disk-cache regression inputs now use inference tensors consistently across
+  blocks, avoiding an unrelated dispatch-key variant in the cache-count assertions.
 
 ## [0.10.0rc9] - 2026-09-25
 

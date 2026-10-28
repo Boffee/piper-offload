@@ -108,9 +108,11 @@ def _run_cuda(quantized: bool) -> None:
     model = _BlockModel(blocks=blocks)
     baseline = copy.deepcopy(model)
     config = BlockCompileConfig(fullgraph=True, options=options)
-    value = torch.randn(5, 64, device="cuda", dtype=torch.bfloat16)
     streaming = _make_offloader(baseline, block_mode="streaming", block_compile=config)
     with activated_model(streaming, "cuda"), torch.inference_mode():
+        # Match later blocks' inference tensors instead of creating a second
+        # Dynamo variant for the first block's ordinary input tensor.
+        value = torch.randn(5, 64, device="cuda", dtype=torch.bfloat16)
         expected = baseline(value).clone()
 
     # Count only rolling cache lookups, excluding the reference compilation.

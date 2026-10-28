@@ -649,7 +649,7 @@ wheels = [
 
 [[package]]
 name = "piper-offload"
-version = "0.10.0rc9"
+version = "0.10.0rc10"
 source = { editable = "." }
 dependencies = [
     { name = "piper-kernels" },
