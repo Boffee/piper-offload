@@ -151,6 +151,12 @@ its storage from the next block. That block waits for each parameter immediately
 before its first reader. The shared block target, resident state, activations,
 and workspace must still fit together.
 
+Rolling graphs can reuse PyTorch's standard Inductor disk cache after a compiler
+reset or process restart. The cache identity includes the rolling compiler
+implementation and parameter-slot layout; each execution resolves the current
+runtime and weights. Other custom compiler passes must also support caching.
+PyTorch controls cache storage and lookup, including `TORCHINDUCTOR_CACHE_DIR`.
+
 Rolling is experimental. Groups require distinct block modules, identical
 parameter names/order and layouts, frozen managed parameters, no tied managed
 parameters, no streamed buffers, and no zero-sized parameter slots. Supported
