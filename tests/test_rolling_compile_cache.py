@@ -21,7 +21,8 @@ def _run_worker(tmp_path, mode, seed, *, reverse=False):
         "TORCHINDUCTOR_CACHE_DIR": str(tmp_path / "inductor"),
         "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
         "TORCHINDUCTOR_FORCE_DISABLE_CACHES": "0",
-        "TORCHINDUCTOR_COMPILE_THREADS": "2",
+        # These tiny graphs need no compile pool; its pass_fds path is POSIX-only.
+        "TORCHINDUCTOR_COMPILE_THREADS": "1",
         "OMP_NUM_THREADS": "2",
     }
     if mode.startswith("cpu"):
