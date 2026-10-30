@@ -43,6 +43,11 @@ wrappers have their own merge implementations. Routed LoRA requires no merge
 capability, so it also works with tile-packed INT4 when the owning module is a
 compatible logical `nn.Linear`.
 
+[Broadcast additive updates](adapters.md#broadcast-additive-updates) are
+supported by plain floating-point targets, excluding plain float8. Built-in
+quantized and DTensor adapters require each source update to match the full
+logical target shape and reject broadcast requests during preflight.
+
 Quantized additive merges recompute data-dependent weight scales and preserve
 activation calibration metadata. Standard CUDA layouts use format-specific
 Triton kernels where available; other supported layouts use a reference

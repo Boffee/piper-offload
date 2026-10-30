@@ -21,6 +21,7 @@ from .tensor_adapters import (
     MergeLocalityTensorAdapter,
     adapter_name,
     transfer_,
+    validate_broadcast_merge,
 )
 
 __all__ = [
@@ -75,6 +76,10 @@ class LoRAFactor:
     :meth:`from_tensors` validates the stored pair before capture; direct
     construction enforces the same invariant. The match against a concrete
     target shape is checked separately, where the target is known.
+
+    Merge targets accept a product that broadcasts to their logical shape
+    when their tensor adapter supports it. Routed targets require an exact
+    matrix shape.
 
     Two scalars meet here and they are not the same thing. ``scale`` is
     *intrinsic*: the checkpoint's own ``alpha / rank`` magnitude, a property of
@@ -193,7 +198,7 @@ class ScaledLoRAFactor:
 
     @property
     def produced_shape(self) -> tuple[int, int]:
-        """Shape of ``b @ a`` — the base-weight shape this factor targets."""
+        """Shape of ``b @ a`` before any target-side broadcasting."""
         return (self.b.shape[0], self.a.shape[1])
 
 
@@ -301,14 +306,20 @@ def _localize_materialized_weight_factors(
     out_range: tuple[int, int],
     in_range: tuple[int, int],
 ) -> list[_MaterializedWeightFactor]:
-    """Slice logical factors to one target-local output/input region."""
+    """Slice factors to a local region, retaining broadcast singleton axes."""
     out_offset, out_size = out_range
     in_offset, in_size = in_range
     return [
         _MaterializedWeightFactor(
             coefficient=factor.coefficient,
-            a=factor.a.narrow(1, in_offset, in_size),
-            b=factor.b.narrow(0, out_offset, out_size),
+            a=(
+                factor.a.expand(-1, in_size) if factor.a.shape[1] == 1
+                else factor.a.narrow(1, in_offset, in_size)
+            ),
+            b=(
+                factor.b.expand(out_size, -1) if factor.b.shape[0] == 1
+                else factor.b.narrow(0, out_offset, out_size)
+            ),
         )
         for factor in factors
     ]
@@ -318,18 +329,25 @@ def _pack_materialized_weight_factors(
     data: torch.Tensor,
     factors: Sequence[_MaterializedWeightFactor],
     *,
-    logical_shape: tuple[int, ...],
     compute_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Stage several logical LoRAs as one packed update."""
+    """Pack LoRAs at their common matrix shape, without repeating stacked heads.
+
+    Host tensors copy directly into their destination slices through transfer_;
+    singleton expansion happens during the copy. Scaling touches only the
+    staged A slices. The packed buffers die after the merge.
+    """
+    rows, cols = torch.broadcast_shapes(*[
+        (factor.b.shape[0], factor.a.shape[1]) for factor in factors
+    ])
     total_rank = sum(factor.a.shape[0] for factor in factors)
     a_packed = torch.empty(
-        (total_rank, logical_shape[1]),
+        (total_rank, cols),
         device=data.device,
         dtype=compute_dtype,
     )
     b_packed = torch.empty(
-        (logical_shape[0], total_rank),
+        (rows, total_rank),
         device=data.device,
         dtype=compute_dtype,
     )
@@ -430,6 +448,8 @@ class LoRATransform:
             self._factors,
             logical_shape,
         )
+        if any(factor.produced_shape != logical_shape for factor in self._factors):
+            validate_broadcast_merge(adapter, representation)
         factors, staging_shape = self._localize_weight_factors(
             representation,
             adapter,
@@ -558,8 +578,8 @@ class LoRATransform:
             return list(factors), logical_shape
 
         local_shape, offsets = adapter.merge_local_shape_and_offsets(data)
-        out_size, in_size = local_shape
-        out_offset, in_offset = offsets
+        out_size, in_size = local_shape[-2:]
+        out_offset, in_offset = offsets[-2:]
         localized = _localize_materialized_weight_factors(
             factors,
             out_range=(out_offset, out_size),
@@ -567,13 +587,11 @@ class LoRATransform:
         )
         return localized, (out_size, in_size)
 
-    @classmethod
+    @staticmethod
     def _stage_single_or_packed_update(
-        cls,
         data: torch.Tensor,
         factors: Sequence[_MaterializedWeightFactor],
         *,
-        logical_shape: tuple[int, ...],
         compute_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, float]:
         if len(factors) == 1:
@@ -584,10 +602,9 @@ class LoRATransform:
                 factor.coefficient,
             )
 
-        a, b = cls._pack_factors(
+        a, b = _pack_materialized_weight_factors(
             data,
             factors,
-            logical_shape=logical_shape,
             compute_dtype=compute_dtype,
         )
         return b, a, 1.0
@@ -616,7 +633,6 @@ class LoRATransform:
             cls._stage_single_or_packed_update(
                 data,
                 factors,
-                logical_shape=logical_shape,
                 compute_dtype=compute_dtype,
             ),
             False,
@@ -628,28 +644,6 @@ class LoRATransform:
     ) -> None:
         _validate_materialized_weight_factors(factors)
 
-    @staticmethod
-    def _pack_factors(
-        data: torch.Tensor,
-        factors: Sequence[_MaterializedWeightFactor],
-        *,
-        logical_shape: tuple[int, ...],
-        compute_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Stage several LoRAs as one update without per-factor device tensors.
-
-        The temporary packed buffers contain exactly the combined factors for
-        this weight and die after the merge. CPU factors copy directly into
-        their destination slices, avoiding the extra individual device
-        tensors that a target-side ``torch.cat`` would require.
-        """
-        return _pack_materialized_weight_factors(
-            data,
-            factors,
-            logical_shape=logical_shape,
-            compute_dtype=compute_dtype,
-        )
-
 
 def _validate_factor_shapes(
     factors: Sequence[ScaledLoRAFactor],
@@ -659,9 +653,10 @@ def _validate_factor_shapes(
     # ScaledLoRAFactor construction; only the match against this concrete
     # target shape is checked here.
     for factor in factors:
-        if factor.produced_shape != target_shape:
+        if torch.broadcast_shapes(factor.produced_shape, target_shape) != target_shape:
             raise ValueError(
-                f"LoRA factor shape mismatch: B@A produces {factor.produced_shape}, target shape is {target_shape}."
+                "LoRA update would expand the target: "
+                f"B@A produces {factor.produced_shape}, target shape is {target_shape}."
             )
 
 

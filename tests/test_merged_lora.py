@@ -819,14 +819,16 @@ class TestParameterDelta:
         ("dtype", "base_value"),
         [(torch.float16, 2048.0), (torch.bfloat16, 256.0)],
     )
+    @pytest.mark.parametrize("shape", [(1, 1), (2, 3, 1, 1)])
     def test_combined_delta_accumulates_before_low_precision_base_update(
         self,
         dtype: torch.dtype,
         base_value: float,
+        shape: tuple[int, ...],
     ) -> None:
         model = nn.Module()
         model.weight = nn.Parameter(
-            torch.tensor([[base_value]], dtype=dtype),
+            torch.full(shape, base_value, dtype=dtype),
             requires_grad=False,
         )
         before = model.weight.detach().clone()
@@ -1108,7 +1110,7 @@ class TestParameterDelta:
         torch.testing.assert_close(model.first, first_before)
         assert torch.equal(model.second, second_before)
 
-    def test_dense_delta_requires_matching_shape(self) -> None:
+    def test_dense_delta_requires_broadcastable_shape(self) -> None:
         model = nn.Linear(3, 2, bias=False)
         model.requires_grad_(False)
         base = model.weight.detach().clone()
@@ -1120,7 +1122,7 @@ class TestParameterDelta:
             }
         )
 
-        with pytest.raises(ValueError, match="shape mismatch"):
+        with pytest.raises(RuntimeError, match="broadcast"):
             merge_adapter(model, [(adapter, 1.0)])
         torch.testing.assert_close(model.weight, base)
 
@@ -1287,7 +1289,7 @@ class TestActivationLoraValidation:
             "transformer_blocks.0.attn.lora_B.weight": torch.randn(8, 4),
         }
         _request_loras(s, [(Adapter.from_state_dict(state_dict=sd), 1.0)])
-        with pytest.raises(ValueError, match="B@A produces"):
+        with pytest.raises(RuntimeError, match="broadcast"):
             _activate_loras_for_test(s)
         assert not _has_parameter_update(
             s,
@@ -1876,7 +1878,7 @@ class TestLoRATransform:
         b = torch.randn(3, 2)
         transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.5)])
 
-        with pytest.raises(ValueError, match="B@A produces"):
+        with pytest.raises(RuntimeError, match="broadcast"):
             transform.validate_target(param)
 
     def test_weight_application_requires_validation(self) -> None:
@@ -2013,7 +2015,7 @@ class TestLoRATransform:
         ],
     )
     @pytest.mark.parametrize("factor_count", [1, 2])
-    def test_adapter_staging_uses_logical_shape_and_compute_dtype(
+    def test_adapter_staging_uses_factor_shape_and_compute_dtype(
         self,
         device: str,
         factor_count: int,
@@ -2037,7 +2039,6 @@ class TestLoRATransform:
         staged = transform._stage_single_or_packed_update(
             packed_representation,
             transform._materialize_weight_factors(),
-            logical_shape=(rows, cols),
             compute_dtype=torch.float16,
         )
 
@@ -3776,7 +3777,7 @@ class TestPermanentMerge:
             }
         )
 
-        with pytest.raises(ValueError, match="LoRA factor shape mismatch"):
+        with pytest.raises(RuntimeError, match="broadcast"):
             merge_adapter(m, [(lora, 1.0)])
 
         torch.testing.assert_close(m.first.weight, first_before)
@@ -5250,11 +5251,12 @@ class TestLoRAResource:
 
 
 class TestMergeIntoMappedModel:
-    def test_mapped_target_is_copied_out_before_the_merge(self, tmp_path) -> None:
-        base = torch.randn(3, 4)
+    @pytest.mark.parametrize("shape", [(3, 4), (2, 3, 4)])
+    def test_mapped_target_is_copied_out_before_the_merge(self, tmp_path, shape) -> None:
+        base = torch.randn(shape)
         path = tmp_path / "weights.bin"
         path.write_bytes(base.numpy().tobytes())
-        mapped = torch.from_file(str(path), shared=False, size=12, dtype=torch.float32).reshape(3, 4)
+        mapped = torch.from_file(str(path), shared=False, size=base.numel(), dtype=torch.float32).reshape(shape)
         model = nn.Module()
         model.target = nn.Linear(4, 3, bias=False)
         model.tied = nn.Linear(4, 3, bias=False)

@@ -164,10 +164,22 @@ merge support. The [format matrix](formats.md) describes built-in capabilities.
 Merge validation distinguishes target-only constraints from constraints that
 need the staged update. Permanent merge validates requested operations before
 mutation. Composing adapters can expose local shapes and global offsets through
-`MergeLocalityTensorAdapter`. Merge and validation implementations accept
+`MergeLocalityTensorAdapter`. Plan construction prepares both dense sources and
+LoRA factors as immutable host views of that local region and records their
+common update shape. Repeated loads stage those prepared views through
+`transfer_()` without repeating localization or copying their host backing.
+Merge and validation implementations accept
 `rounding_seed: int | None = None`, even when they only support deterministic
 rounding; `None` retains deterministic behavior. `derive_seed()` provides
 reproducible substreams when needed.
+
+`BroadcastMergeTensorAdapter` explicitly opts a representation into standard
+PyTorch broadcasting for its advertised merge operations. Preflight checks that
+every source broadcasts to the existing logical target shape, then calls
+`validate_broadcast_merge()` to check the representation. Without this capability,
+sources must match the full target shape. Implementations receive compact staged
+products or dense updates and own their broadcast arithmetic; see the
+[shape and rounding contract](adapters.md#broadcast-additive-updates).
 
 ## Runtime and compilation
 

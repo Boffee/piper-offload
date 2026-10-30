@@ -42,6 +42,7 @@ from .pin_manager import transfer_
 
 __all__ = [
     "BindLayoutTensorAdapter",
+    "BroadcastMergeTensorAdapter",
     "CpuRoundTripTensorAdapter",
     "DenseMergeTargetValidationTensorAdapter",
     "DenseMergeTensorAdapter",
@@ -65,6 +66,7 @@ __all__ = [
     "optional_tensor_id",
     "tensor_layout",
     "transfer_",
+    "validate_broadcast_merge",
 ]
 
 _force_host_copy: ContextVar[bool] = ContextVar("force_host_copy", default=False)
@@ -292,6 +294,36 @@ class PermanentUpdateValidationTensorAdapter(Protocol):
     def validate_permanent_update() -> None:
         """Raise when the resting representation cannot be updated in place."""
         ...
+
+
+@runtime_checkable
+class BroadcastMergeTensorAdapter(Protocol):
+    """Opt into PyTorch broadcasting for the adapter's merge capabilities.
+
+    Without this capability each source update must match the target's full
+    logical shape. The caller validates that every source broadcasts to that
+    shape before calling this preflight once for a broadcast merge. Staged
+    LoRA products and dense updates may retain a smaller broadcastable shape;
+    merge implementations must preserve the target's shape and storage.
+    This capability does not itself provide LoRA or dense merge support.
+    """
+
+    @staticmethod
+    def validate_broadcast_merge(target: torch.Tensor) -> None:
+        """Reject target representations or layouts that cannot broadcast updates."""
+        ...
+
+
+def validate_broadcast_merge[HostStateT, GpuStateT](
+    adapter: TensorAdapter[HostStateT, GpuStateT], target: torch.Tensor,
+) -> None:
+    """Require explicit representation support after validating update shapes."""
+    if not isinstance(adapter, BroadcastMergeTensorAdapter):
+        raise ValueError(
+            f"{adapter_name(adapter)} does not support broadcast additive merges; "
+            "updates must match the target's full logical shape."
+        )
+    adapter.validate_broadcast_merge(target)
 
 
 @runtime_checkable
@@ -844,7 +876,19 @@ class RegularAdapter:
         rounding_seed: int | None = None,
     ) -> None:
         del rounding_seed
-        target.addmm_(b, a, alpha=strength)
+        if target.shape == (b.shape[0], a.shape[1]):
+            target.addmm_(b, a, alpha=strength)
+        else:
+            # Keep the shared product compact and in the staged compute dtype,
+            # even when a streamed load runs inside the caller's autocast.
+            # The product rounds before addition, unlike exact-matrix addmm_.
+            with torch.autocast(device_type=target.device.type, enabled=False):
+                target.add_(b @ a, alpha=strength)
+
+    @staticmethod
+    def validate_broadcast_merge(target: torch.Tensor) -> None:
+        if target.dtype.is_floating_point and torch.finfo(target.dtype).bits == 8:
+            raise ValueError("Broadcast merges do not support float8 targets with plain storage.")
 
     @staticmethod
     def validate_dense_merge_target(
