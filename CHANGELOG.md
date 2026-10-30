@@ -5,6 +5,16 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Additive LoRA and dense adapter updates now use standard PyTorch broadcasting
+  for plain floating-point targets (excluding float8) in activation and permanent
+  merges, including shared updates across stacked heads, singleton dimensions,
+  and scalar deltas.
+  Complete parameter values still require exact shapes. Quantized and DTensor
+  adapters reject broadcast updates during preflight; custom tensor adapters
+  can opt in through `BroadcastMergeTensorAdapter`.
+
 ## [0.10.0rc10] - 2026-10-28
 
 ### Fixed

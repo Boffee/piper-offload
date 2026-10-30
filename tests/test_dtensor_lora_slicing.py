@@ -46,6 +46,14 @@ def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
         for shard_dim in (0, 1):
             target = distribute_tensor(weight.clone(), mesh, [Shard(shard_dim)])
             param = nn.Parameter(target, requires_grad=False)
+            for broadcast_delta in (
+                ParameterDelta.from_tensors(a=a, b=b[:1].clone()),
+                ParameterDelta.from_tensors(dense=torch.ones(())),
+            ):
+                broadcast_transform = ParameterDeltaTransform([broadcast_delta.scaled(strength)])
+                with pytest.raises(ValueError, match="DTensorAdapter does not support broadcast"):
+                    broadcast_transform.validate_parameter(param)
+                torch.testing.assert_close(target.full_tensor(), weight)
             transform.validate_target(param)
             transform.apply(param)
             torch.testing.assert_close(target.full_tensor(), expected)
@@ -78,11 +86,17 @@ def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
             )
             dense_param = nn.Parameter(dense_target, requires_grad=False)
             dense_transform.validate_parameter(dense_param)
-            dense_transform.apply_parameter(dense_param)
-            torch.testing.assert_close(
-                dense_target.full_tensor(),
-                expected + strength * dense,
-            )
+            plan = dense_transform._dense_plan
+            assert plan is not None
+            local_source, _ = plan.dense_sources[0]
+            assert local_source.shape == dense_target.to_local().shape
+            assert local_source.untyped_storage().data_ptr() == dense.untyped_storage().data_ptr()
+            for merge_count in (1, 2):
+                dense_transform.apply_parameter(dense_param)
+                torch.testing.assert_close(
+                    dense_target.full_tensor(),
+                    weight + merge_count * strength * (b @ a + dense),
+                )
 
         empty_cases = (
             (torch.arange(2, dtype=torch.float32).reshape(1, 2), 0),
@@ -217,35 +231,28 @@ def test_transform_localizes_factors_before_staging(
         lambda _target: DTensorAdapter(),
     )
 
-    staged_inputs: list[tuple[list[tuple[tuple[int, ...], tuple[int, ...]]], tuple[int, ...]]] = []
-    original_stage = LoRATransform._stage_single_or_packed_update.__func__
+    staged_inputs: list[list[tuple[tuple[int, ...], tuple[int, ...]]]] = []
+    original_stage = LoRATransform._stage_single_or_packed_update
 
     def record_stage(
-        cls: type[LoRATransform],
         data: torch.Tensor,
         factors: list[lora_module._MaterializedWeightFactor],
         *,
-        logical_shape: tuple[int, ...],
         compute_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, float]:
         staged_inputs.append(
-            (
-                [(tuple(factor.a.shape), tuple(factor.b.shape)) for factor in factors],
-                logical_shape,
-            )
+            [(tuple(factor.a.shape), tuple(factor.b.shape)) for factor in factors]
         )
         return original_stage(
-            cls,
             data,
             factors,
-            logical_shape=logical_shape,
             compute_dtype=compute_dtype,
         )
 
     monkeypatch.setattr(
         LoRATransform,
         "_stage_single_or_packed_update",
-        classmethod(record_stage),
+        staticmethod(record_stage),
     )
 
     factor_inputs = [
@@ -261,10 +268,7 @@ def test_transform_localizes_factors_before_staging(
     transform.validate_target(target)
     transform.apply(target)
 
-    expected_staging = (
-        [((rank, 3), (4, rank)) for rank in range(2, 2 + factor_count)],
-        (4, 3),
-    )
+    expected_staging = [((rank, 3), (4, rank)) for rank in range(2, 2 + factor_count)]
     assert staged_inputs == [
         expected_staging,  # validation
         expected_staging,  # application

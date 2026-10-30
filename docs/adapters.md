@@ -99,6 +99,62 @@ objects. Their contracts live in [adapter.py](../src/piper_offload/adapter.py),
 [parameter_delta.py](../src/piper_offload/parameter_delta.py), and
 [parameter_value.py](../src/piper_offload/parameter_value.py).
 
+## Broadcast additive updates
+
+Activation merge and permanent `merge_adapter()` use standard PyTorch
+broadcasting for additive updates to plain floating-point parameters, excluding
+plain float8. Each dense delta and each LoRA product `B @ A` must broadcast to
+the existing target shape: `torch.broadcast_shapes(update_shape, target_shape)`
+must equal `target_shape`. Incompatible shapes propagate PyTorch's `RuntimeError`;
+broadcasts that would expand the target raise `ValueError`. Both fail during
+preflight, before any permanent merge mutates weights.
+
+Dimensions align from the right; matching sizes, singleton expansion, and
+missing leading dimensions follow PyTorch's rules. There is no extra
+restriction on matrix or feature dimensions. For example:
+
+| Update shape | Target shape | Result |
+|---|---|---|
+| `[out, in]` | `[heads, out, in]` | Shared update for every head |
+| `[1, in]` | `[heads, out, in]` | Shared update for every head and output row |
+| `[out]` | `[heads, out]` | Shared bias delta |
+| `[]` | Any shape | Scalar dense delta |
+| `[out, in]` with `out > 1` | `[1, in]` | Rejected: would expand the target |
+
+LoRA factors remain 2D with compatible rank dimensions. Different contributions
+to one target may have different broadcastable shapes, including mixed LoRA and
+dense updates. Factors and dense sources remain immutable; callers need not
+repeat or pre-scale checkpoint tensors. Shared updates are staged at their
+common shape, without repeating them across target-only dimensions.
+
+Complete parameter values require **exact full-shape matching**. Routed LoRA
+retains its exact linear-weight shape contract. Built-in quantized and DTensor
+merge paths currently require exact full-shape updates; custom tensor adapters
+can explicitly opt into broadcast merges. See [formats](formats.md).
+
+### Accumulation and rounding
+
+Sources are staged in the target's compute dtype. Plain merge arithmetic keeps
+that dtype even inside an autocast context. A single LoRA with an exact 2D
+target uses `addmm_` with its combined strength and intrinsic scale. Multiple
+LoRAs pack their factors across the rank dimension, scaling each staged `A`
+slice by its coefficient before one matrix multiplication. Singleton factor
+dimensions expand only as needed to form that common matrix.
+
+When the target shape differs from the staged product shape, the plain tensor
+adapter computes `B @ A` in the compute dtype and then adds it with broadcasting.
+The product therefore rounds before the addition, unlike the fused exact-2D
+`addmm_` path. With any dense contribution, dense terms accumulate in request
+order into a compute-dtype update, followed by the packed LoRA contribution;
+that combined update is added to the base once. PyTorch kernels determine
+internal accumulation precision; staging does not promote low-precision values
+to a higher dtype.
+
+These intermediate roundings mean broadcast merges need not be bit-identical
+to separate per-head `addmm_` calls. Merging low-precision heads before averaging
+also need not match adding a shared delta after averaging. Quantized rounding
+is described below.
+
 ## Choose merge or routed LoRA
 
 | Mode | Behavior | Supported updates |

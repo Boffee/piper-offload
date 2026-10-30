@@ -27,8 +27,10 @@ from .tensor_adapters import (
     DenseMergeValidationTensorAdapter,
     LogicalShapeTensorAdapter,
     MergeLocalityTensorAdapter,
+    RegularAdapter,
     adapter_name,
     transfer_,
+    validate_broadcast_merge,
 )
 
 __all__ = [
@@ -71,6 +73,11 @@ class ParameterDelta:
     copying its host backing. Only the factors carry an intrinsic scaling; a
     dense contribution has no magnitude of its own. Tensor payload numerical validity is
     the caller's responsibility.
+
+    Each contribution must broadcast to the existing target's logical shape
+    using PyTorch rules, without expanding the target. Broadcasting requires
+    the target tensor adapter's explicit support; complete parameter values
+    have a separate exact-shape contract.
     """
 
     lora: LoRAFactor | None = None
@@ -149,14 +156,18 @@ class ScaledParameterDelta:
 
 @dataclass(slots=True, frozen=True)
 class _DenseMergePlan:
-    """Validated logical sources and target representation for dense merge."""
+    """Prepared host views and target contract for repeated dense merges.
+
+    Dense sources and factors already describe the target-local region and
+    share immutable adapter backing. Their common ``update_shape`` can be
+    smaller than the target's ``logical_shape`` when broadcasting.
+    """
 
     adapter: DenseMergeTensorAdapter[Any, Any]
     dense_sources: tuple[tuple[torch.Tensor, float], ...]
     factors: tuple[_MaterializedWeightFactor, ...]
     logical_shape: tuple[int, ...]
-    local_shape: tuple[int, ...]
-    offsets: tuple[int, ...]
+    update_shape: tuple[int, ...]
     compute_dtype: torch.dtype
 
 
@@ -165,8 +176,9 @@ class ParameterDeltaTransform:
 
     Factor-only transforms delegate to :class:`LoRATransform`. When any dense
     term is present, every dense and low-rank contribution is staged into one
-    full-rank logical update and delegated to the target adapter's dense merge
-    capability. Quantized targets can therefore re-encode the base only once.
+    dense update at their common broadcast shape (or the local shard shape)
+    and delegated to the target adapter's dense merge capability. Quantized
+    targets can therefore re-encode the base only once.
     """
 
     __slots__ = (
@@ -239,11 +251,17 @@ class ParameterDeltaTransform:
         shape = adapter.logical_shape(target)
         dtype = adapter.compute_dtype(target)
         for source, _strength in dense_sources:
-            if tuple(source.shape) != shape:
+            if torch.broadcast_shapes(source.shape, shape) != shape:
                 raise ValueError(
-                    "Dense parameter delta shape mismatch: "
+                    "Dense parameter delta would expand the target: "
                     f"source shape is {tuple(source.shape)}, target shape is {shape}."
                 )
+
+        _validate_factor_shapes(self._lora_factors, shape)
+        source_shapes = [tuple(source.shape) for source, _strength in dense_sources]
+        source_shapes.extend(factor.produced_shape for factor in self._lora_factors)
+        if any(source_shape != shape for source_shape in source_shapes):
+            validate_broadcast_merge(adapter, target)
 
         rounding_seed = self._rounding_seed()
         requires_update_validation = isinstance(
@@ -264,29 +282,35 @@ class ParameterDeltaTransform:
                 "without implementing validate_dense_merge()."
             )
 
-        if isinstance(adapter, MergeLocalityTensorAdapter):
-            local_shape, offsets = adapter.merge_local_shape_and_offsets(target)
-        else:
-            offsets = tuple(0 for _ in shape)
-            local_shape = shape
-
-        _validate_factor_shapes(self._lora_factors, shape)
         factors = _materialize_weight_factors(self._lora_factors)
         _validate_materialized_weight_factors(factors)
-        if factors:
-            factors = _localize_materialized_weight_factors(
-                factors,
-                out_range=(offsets[0], local_shape[0]),
-                in_range=(offsets[1], local_shape[1]),
-            )
+        if isinstance(adapter, MergeLocalityTensorAdapter):
+            local_shape, offsets = adapter.merge_local_shape_and_offsets(target)
+            dense_sources = [
+                (
+                    _local_dense_view(source.expand(shape), offsets=offsets, local_shape=local_shape),
+                    strength,
+                )
+                for source, strength in dense_sources
+            ]
+            if factors:
+                factors = _localize_materialized_weight_factors(
+                    factors,
+                    out_range=(offsets[-2], local_shape[-2]),
+                    in_range=(offsets[-1], local_shape[-1]),
+                )
+
+        update_shape = tuple(torch.broadcast_shapes(
+            *(source.shape for source, _strength in dense_sources),
+            *((factor.b.shape[0], factor.a.shape[1]) for factor in factors),
+        ))
 
         plan = _DenseMergePlan(
             adapter=adapter,
             dense_sources=tuple(dense_sources),
             factors=tuple(factors),
             logical_shape=shape,
-            local_shape=local_shape,
-            offsets=offsets,
+            update_shape=update_shape,
             compute_dtype=dtype,
         )
         if requires_update_validation:
@@ -370,18 +394,13 @@ class ParameterDeltaTransform:
             )
 
         update = torch.zeros(
-            plan.local_shape,
+            plan.update_shape,
             device=target.device,
             dtype=plan.compute_dtype,
         )
         for source, strength in plan.dense_sources:
-            local_source = _local_dense_view(
-                source,
-                offsets=plan.offsets,
-                local_shape=plan.local_shape,
-            )
-            staged = torch.empty(local_source.shape, dtype=plan.compute_dtype, device=target.device)
-            transfer_(staged, local_source, non_blocking=True)
+            staged = torch.empty(source.shape, dtype=plan.compute_dtype, device=target.device)
+            transfer_(staged, source, non_blocking=True)
             update.add_(staged, alpha=strength)
         self._accumulate_lora(update, plan)
         return update
@@ -394,10 +413,9 @@ class ParameterDeltaTransform:
         packed_a, packed_b = _pack_materialized_weight_factors(
             update,
             plan.factors,
-            logical_shape=plan.local_shape,
             compute_dtype=plan.compute_dtype,
         )
-        update.addmm_(packed_b, packed_a)
+        RegularAdapter.merge_lora_(update, packed_b, packed_a, 1.0)
 
     def _rounding_seed(self) -> int | None:
         if not self._stochastic_rounding:
@@ -434,9 +452,10 @@ def _local_dense_view(
     offsets: tuple[int, ...],
     local_shape: tuple[int, ...],
 ) -> torch.Tensor:
+    """Keep a local view of the backing that transfer_ resolves under its lease."""
     local = source
     for dim, (offset, size) in enumerate(
         zip(offsets, local_shape, strict=True)
     ):
         local = local.narrow(dim, offset, size)
-    return local.contiguous()
+    return local
