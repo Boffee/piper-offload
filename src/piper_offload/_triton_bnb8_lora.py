@@ -25,11 +25,13 @@ def _merge_update_kernel(
     update_ptr,
     dense_ptr,
     row_tile_max_ptr,
-    strength,
+    alpha,
+    beta,
     M,
     N,
     K: tl.constexpr,
     DENSE_UPDATE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -73,7 +75,10 @@ def _merge_update_kernel(
     normalized = (cb / 127.0).to(tl.float16)
     base = (normalized * scb[:, None]).to(tl.float16)
 
-    merged = base.to(tl.float32) + accumulator * strength
+    if SCALE_BASE:
+        base = base.to(tl.float32) * beta
+
+    merged = base.to(tl.float32) + accumulator * alpha
     merged = tl.minimum(tl.maximum(merged, -65504.0), 65504.0)
     merged = merged.to(tl.float16)
     tl.store(dense_ptr + offsets, merged, mask=mask)
@@ -155,8 +160,9 @@ def _merge_bnb8(
     b: torch.Tensor,
     a: torch.Tensor,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     dense_update: bool,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -229,11 +235,13 @@ def _merge_bnb8(
         update,
         dense,
         row_tile_max,
-        strength,
+        alpha,
+        beta,
         M=rows,
         N=cols,
         K=rank,
         DENSE_UPDATE=dense_update,
+        SCALE_BASE=beta != 1.0,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
@@ -266,8 +274,9 @@ def merge_bnb8_lora(
     scb: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return raw ``CB`` and ``SCB`` buffers after one LoRA merge."""
@@ -277,7 +286,8 @@ def merge_bnb8_lora(
         b,
         a,
         b,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=False,
         rounding_seed=rounding_seed,
     )
@@ -287,8 +297,9 @@ def merge_bnb8_dense(
     cb: torch.Tensor,
     scb: torch.Tensor,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return raw ``CB`` and ``SCB`` buffers after one dense merge."""
@@ -298,7 +309,8 @@ def merge_bnb8_dense(
         update,
         update,
         update,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=True,
         rounding_seed=rounding_seed,
     )

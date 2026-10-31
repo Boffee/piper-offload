@@ -255,3 +255,38 @@ def test_auto_mode_falls_back_for_incompatible_value_adapter() -> None:
         remove_adapter()
     assert component._inductor_compile is not None
     assert not component._inductor_compile.installed
+
+
+@pytest.mark.parametrize("kind", ["piper-convrot-int8", "piper-convrot-nvfp4"])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
+def test_scaled_native_dense_merge_preserves_storage_calibration_and_seed(kind, device):
+    source = _make_quantized(kind).to(device)
+    source.act_per_tensor_scale = torch.tensor(0.75, device=device)
+    adapter = select_adapter(source)
+    before = adapter.dequantize(source).float()
+    update = torch.linspace(-2, 2, before.numel(), device=device).reshape(before.shape)
+    update = update.to(adapter.compute_dtype(source))
+    expected = before * -0.5 + update.float() * 0.25
+    encodings = []
+    for _ in range(2):
+        target = source.clone()
+        names = ["qdata", "scale", "act_per_tensor_scale"]
+        if hasattr(target, "per_tensor_scale") and target.per_tensor_scale is not None:
+            names.append("per_tensor_scale")
+        pointers = [getattr(target, name).data_ptr() for name in names]
+        rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state() if device == "cuda" else None
+        adapter.merge_dense_(target, update, 0.25, beta=-0.5, rounding_seed=2**64 - 1)
+        assert torch.equal(torch.get_rng_state(), rng)
+        if cuda_rng is not None:
+            assert torch.equal(torch.cuda.get_rng_state(), cuda_rng)
+        assert pointers == [getattr(target, name).data_ptr() for name in names]
+        torch.testing.assert_close(target.act_per_tensor_scale, source.act_per_tensor_scale)
+        actual = adapter.dequantize(target).float()
+        # NVFP4's coarse code grid allows larger error than INT8.
+        tolerance = 0.03 if kind == "piper-convrot-int8" else 0.2
+        assert (actual - expected).abs().mean() < expected.abs().mean() * tolerance
+        encodings.append([getattr(target, name).clone() for name in names])
+    for first, replay in zip(*encodings, strict=True):
+        assert torch.equal(first.reshape(-1).view(torch.uint8), replay.reshape(-1).view(torch.uint8))
+    torch.testing.assert_close(adapter.dequantize(source).float(), before)

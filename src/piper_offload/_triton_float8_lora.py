@@ -32,11 +32,13 @@ def _merge_update_kernel(
     update_ptr,
     dense_ptr,
     partial_max_ptr,
-    strength,
+    alpha,
+    beta,
     M,
     N,
     K: tl.constexpr,
     DENSE_UPDATE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
     PER_ROW: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -91,7 +93,10 @@ def _merge_update_kernel(
     elif COMPUTE_DTYPE == 1:
         base = base.to(tl.bfloat16)
 
-    merged = base.to(tl.float32) + accumulator * strength
+    if SCALE_BASE:
+        base = base.to(tl.float32) * beta
+
+    merged = base.to(tl.float32) + accumulator * alpha
     if COMPUTE_DTYPE == 0:
         merged = merged.to(tl.float16)
     elif COMPUTE_DTYPE == 1:
@@ -120,12 +125,14 @@ def _merge_group_kernel(
     update_ptr,
     output_qdata_ptr,
     output_scale_ptr,
-    strength,
+    alpha,
+    beta,
     rounding_seed,
     M,
     N,
     K: tl.constexpr,
     DENSE_UPDATE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     FP8_LIMIT: tl.constexpr,
@@ -183,7 +190,10 @@ def _merge_group_kernel(
     elif COMPUTE_DTYPE == 1:
         base = base.to(tl.bfloat16)
 
-    merged = base.to(tl.float32) + accumulator * strength
+    if SCALE_BASE:
+        base = base.to(tl.float32) * beta
+
+    merged = base.to(tl.float32) + accumulator * alpha
     if COMPUTE_DTYPE == 0:
         merged = merged.to(tl.float16)
     elif COMPUTE_DTYPE == 1:
@@ -409,8 +419,9 @@ def _merge_group(
     b: torch.Tensor,
     a: torch.Tensor,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rows: int,
     cols: int,
     rank: int,
@@ -435,12 +446,14 @@ def _merge_group(
         update,
         output_qdata,
         output_scale,
-        strength,
+        alpha,
+        beta,
         seed_argument(rounding_seed),
         M=rows,
         N=cols,
         K=rank,
         DENSE_UPDATE=dense_update,
+        SCALE_BASE=beta != 1.0,
         NUM_GROUPS=num_groups,
         GROUP_SIZE=group_size,
         FP8_LIMIT=torch.finfo(qdata.dtype).max,
@@ -517,8 +530,9 @@ def _merge_float8(
     b: torch.Tensor,
     a: torch.Tensor,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     dense_update: bool,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -551,7 +565,8 @@ def _merge_float8(
             b,
             a,
             update,
-            strength,
+            alpha,
+            beta=beta,
             rows=rows,
             cols=cols,
             rank=rank,
@@ -585,11 +600,13 @@ def _merge_float8(
         update,
         dense,
         partial_max,
-        strength,
+        alpha,
+        beta,
         M=rows,
         N=cols,
         K=rank,
         DENSE_UPDATE=dense_update,
+        SCALE_BASE=beta != 1.0,
         PER_ROW=per_row,
         COMPUTE_DTYPE=compute_dtype,
         BLOCK_M=block_m,
@@ -635,8 +652,9 @@ def merge_float8_lora(
     block_size: tuple[int, ...],
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return raw scaled-FP8 buffers after one supported-layout LoRA merge."""
@@ -647,7 +665,8 @@ def merge_float8_lora(
         b,
         a,
         b,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=False,
         rounding_seed=rounding_seed,
     )
@@ -658,8 +677,9 @@ def merge_float8_dense(
     scale: torch.Tensor,
     block_size: tuple[int, ...],
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return raw scaled-FP8 buffers after one supported-layout dense merge."""
@@ -670,7 +690,8 @@ def merge_float8_dense(
         update,
         update,
         update,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=True,
         rounding_seed=rounding_seed,
     )

@@ -5,7 +5,7 @@ Piper Offload owns the movement and merge integration: capture the public ``qdat
 and ``scale`` storage tensors, move those bytes, reconstruct the wrapper with
 its ``group_size`` and logical ``dtype`` metadata, and delegate staged LoRA
 and dense updates to the public in-place ``ConvRotInt8Tensor.addmm_`` and
-``ConvRotInt8Tensor.add_`` operations.
+``ConvRotInt8Tensor.add_`` operations, including both update and base scaling.
 When stochastic rounding is requested, Piper Offload forwards its stable
 per-target seed to the kernel-owned terminal INT8 code selection.
 
@@ -103,15 +103,17 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a validated staged update into ConvRot INT8 storage."""
         require_convrot_int8_matrix(target).addmm_(
             b,
             a,
-            alpha=strength,
+            beta=beta,
+            alpha=alpha,
             rounding_seed=rounding_seed,
         )
 
@@ -120,11 +122,12 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
         target: torch.Tensor,
         _b: torch.Tensor,
         _a: torch.Tensor,
-        _strength: float,
+        _alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        del rounding_seed
+        del beta, rounding_seed
         require_convrot_int8_matrix(target)
 
     @staticmethod
@@ -142,13 +145,15 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Delegate a validated dense update to Piper Kernels."""
         require_convrot_int8_matrix(target).add_(
             update,
-            alpha=strength,
+            alpha=alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )

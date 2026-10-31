@@ -128,13 +128,14 @@ def _torch_merge_quanto_lora(
     target: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> torch.Tensor:
     """Merge through the ordinary dequantize/addmm/requantize path."""
     dense = dequantize_qbytes_tensor(target)
-    dense.addmm_(b, a, alpha=strength)
+    dense.addmm_(b, a, beta=beta, alpha=alpha)
     return requantize_qbytes_tensor(
         dense,
         like=target,
@@ -377,12 +378,13 @@ class QuantoAdapter:
         target: torch.Tensor,
         _b: torch.Tensor,
         a: torch.Tensor,
-        _strength: float,
+        _alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Validate canonicalization and absmax-requantization layout."""
-        del rounding_seed
+        del beta, rounding_seed
         QuantoAdapter._validate_merge_target(target, kind="lora")
         if a.shape[0] == 0:
             raise ValueError("Quanto LoRA merge requires a positive LoRA rank.")
@@ -436,8 +438,9 @@ class QuantoAdapter:
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a validated update, except via Triton for Marlin targets."""
@@ -457,7 +460,8 @@ class QuantoAdapter:
                 qt.axis,
                 b,
                 a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             merged = create_qbytes_tensor(
@@ -476,7 +480,8 @@ class QuantoAdapter:
             qt,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
         merged = require_qbytes_tensor(merged)
@@ -486,8 +491,9 @@ class QuantoAdapter:
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a full-rank update, preferring Triton for canonical storage."""
@@ -506,7 +512,8 @@ class QuantoAdapter:
                 qt._scale,
                 qt.axis,
                 update,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             merged = create_qbytes_tensor(
@@ -524,7 +531,8 @@ class QuantoAdapter:
             QuantoAdapter,
             target,
             update,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 

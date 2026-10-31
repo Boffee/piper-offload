@@ -333,8 +333,9 @@ def test_affine_int8_factor_aware_transform_advances_rounding_seed(
         target: torch.Tensor,
         staged_b: torch.Tensor,
         staged_a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         assert rounding_seed is not None
@@ -343,7 +344,8 @@ def test_affine_int8_factor_aware_transform_advances_rounding_seed(
             target,
             staged_b,
             staged_a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 
@@ -351,8 +353,9 @@ def test_affine_int8_factor_aware_transform_advances_rounding_seed(
         target: torch.Tensor,
         staged_b: torch.Tensor,
         staged_a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         assert rounding_seed is not None
@@ -361,7 +364,8 @@ def test_affine_int8_factor_aware_transform_advances_rounding_seed(
             target,
             staged_b,
             staged_a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 

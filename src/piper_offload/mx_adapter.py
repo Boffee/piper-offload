@@ -191,13 +191,14 @@ def _torch_merge_mx_lora_(
     target: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> None:
     """Apply the established wrapper-based MX merge in place."""
     dense = dequantize_mx_tensor(target)
-    dense.addmm_(b, a, alpha=strength)
+    dense.addmm_(b, a, beta=beta, alpha=alpha)
     requantized = requantize_mx_tensor(
         dense,
         like=target,
@@ -323,11 +324,12 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
         target: torch.Tensor,
         _b: torch.Tensor,
         _a: torch.Tensor,
-        _strength: float,
+        _alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        del rounding_seed
+        del beta, rounding_seed
         MxAdapter._validate_merge_target(target, kind="lora")
 
     @staticmethod
@@ -335,8 +337,9 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a validated staged update while preserving target storage."""
@@ -353,9 +356,10 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
                 mx.orig_dtype,
                 b,
                 a,
-                strength,
+                alpha,
                 scaling_mode=scaling_mode,
                 swizzled=mx.is_swizzled_scales,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             return
@@ -363,7 +367,8 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
             target,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 
@@ -381,8 +386,9 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a full-rank update, preferring raw Triton storage."""
@@ -398,9 +404,10 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
                 mx.block_size,
                 mx.orig_dtype,
                 update,
-                strength,
+                alpha,
                 scaling_mode=scaling_mode,
                 swizzled=mx.is_swizzled_scales,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             return
@@ -408,7 +415,8 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
             MxAdapter,
             target,
             update,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 

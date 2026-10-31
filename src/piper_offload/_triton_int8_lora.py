@@ -30,11 +30,13 @@ def _merge_update_kernel(
     a_ptr,
     update_ptr,
     dense_ptr,
-    strength,
+    alpha,
+    beta,
     M,
     N,
     K: tl.constexpr,
     DENSE_UPDATE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
     BLOCK_NUMEL: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -93,7 +95,10 @@ def _merge_update_kernel(
     elif COMPUTE_DTYPE == 1:
         base = base.to(tl.bfloat16)
 
-    merged = base.to(tl.float32) + accumulator * strength
+    if SCALE_BASE:
+        base = base.to(tl.float32) * beta
+
+    merged = base.to(tl.float32) + accumulator * alpha
     if COMPUTE_DTYPE == 0:
         merged = merged.to(tl.float16)
     elif COMPUTE_DTYPE == 1:
@@ -277,8 +282,9 @@ def _merge_int8(
     b: torch.Tensor,
     a: torch.Tensor,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     dense_update: bool,
     asymmetric: bool,
     reduce_range: bool,
@@ -361,11 +367,13 @@ def _merge_int8(
         a,
         update,
         dense,
-        strength,
+        alpha,
+        beta,
         M=rows,
         N=cols,
         K=rank,
         DENSE_UPDATE=dense_update,
+        SCALE_BASE=beta != 1.0,
         BLOCK_NUMEL=block_numel,
         COMPUTE_DTYPE=compute_dtype,
         BLOCK_M=block_m,
@@ -435,8 +443,9 @@ def merge_int8_lora(
     block_size: tuple[int, int],
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     asymmetric: bool,
     reduce_range: bool,
     rounding_seed: int | None = None,
@@ -450,7 +459,8 @@ def merge_int8_lora(
         b,
         a,
         b,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=False,
         asymmetric=asymmetric,
         reduce_range=reduce_range,
@@ -464,8 +474,9 @@ def merge_int8_dense(
     zero_point: torch.Tensor | None,
     block_size: tuple[int, int],
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     asymmetric: bool,
     reduce_range: bool,
     rounding_seed: int | None = None,
@@ -479,7 +490,8 @@ def merge_int8_dense(
         update,
         update,
         update,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=True,
         asymmetric=asymmetric,
         reduce_range=reduce_range,

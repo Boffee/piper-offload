@@ -3,8 +3,8 @@
 ``piper-kernels`` owns the :class:`ConvRotInt8Tensor` representation and its
 linear, convolution, and matrix-update execution backends. Piper
 Offload uses the public wrapper constructor and storage fields to preserve the
-representation during movement; its adapter delegates LoRA and dense merges,
-including optional stochastic rounding, to those public operations.
+representation during movement. Its adapter delegates updates, including base
+scaling and stochastic terminal-code selection, to the public wrapper methods.
 
 ``piper-kernels`` is a required dependency; TorchAO is not. ``ConvRotInt8Tensor``
 subclasses ``TorchAOBaseTensor``, so this import fails without the ``torchao``

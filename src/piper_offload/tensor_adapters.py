@@ -333,10 +333,13 @@ class LoRAMergeTensorAdapter[HostStateT, GpuStateT](
 ):
     """Optional capability for an in-place staged LoRA merge.
 
-    The caller validates and stages one combined ``B @ A`` update on the
-    target device. The adapter applies it while preserving the target tensor's
-    object and storage identities. Implementations may select a format-specific
-    kernel or a regular framework-operator fallback.
+    The caller validates and stages factors for one combined ``B @ A`` update
+    on the target device. Finite coefficients follow ``addmm``: ``alpha`` scales
+    the update and ``beta`` scales the current target. ``alpha`` is the effective
+    merge coefficient, not the checkpoint's intrinsic LoRA alpha.
+    The adapter combines both terms before encoding once, preserving the target
+    tensor's object and storage identities. Implementations may select a
+    format-specific kernel or a regular framework-operator fallback.
     """
 
     @staticmethod
@@ -344,11 +347,12 @@ class LoRAMergeTensorAdapter[HostStateT, GpuStateT](
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        """Merge the staged update, optionally using stochastic rounding."""
+        """Write ``beta * target + alpha * (b @ a)`` with one encoding."""
         ...
 
 
@@ -367,8 +371,9 @@ class LoRAMergeValidationTensorAdapter(Protocol):
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Validate the staged update and optional rounding mode."""
@@ -383,20 +388,23 @@ class DenseMergeTensorAdapter[HostStateT, GpuStateT](
     """Optional capability for an in-place staged full-rank merge.
 
     ``update`` is a dense logical delta on the target device and in the
-    adapter's compute dtype. Implementations preserve the target tensor's
-    object and storage identities; structured formats may use a native kernel
-    or dequantize/add/requantize internally.
+    adapter's compute dtype. Finite coefficients follow the LoRA merge contract:
+    ``alpha`` scales the update and ``beta`` scales the current target before
+    addition, without encoding an intermediate scaled base. Implementations
+    preserve the target tensor's object and storage identities; structured
+    formats may use a native kernel or dequantize/add/requantize internally.
     """
 
     @staticmethod
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        """Merge ``strength * update``, optionally using stochastic rounding."""
+        """Write ``beta * target + alpha * update`` with one encoding."""
         ...
 
 
@@ -428,11 +436,12 @@ class DenseMergeValidationTensorAdapter(Protocol):
     def validate_dense_merge(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        """Validate the staged full-rank update and rounding mode."""
+        """Validate the affine full-rank update and rounding mode."""
         ...
 
 
@@ -871,19 +880,20 @@ class RegularAdapter:
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         del rounding_seed
         if target.shape == (b.shape[0], a.shape[1]):
-            target.addmm_(b, a, alpha=strength)
+            target.addmm_(b, a, beta=beta, alpha=alpha)
         else:
             # Keep the shared product compact and in the staged compute dtype,
             # even when a streamed load runs inside the caller's autocast.
             # The product rounds before addition, unlike exact-matrix addmm_.
             with torch.autocast(device_type=target.device.type, enabled=False):
-                target.add_(b @ a, alpha=strength)
+                RegularAdapter.merge_dense_(target, b @ a, alpha, beta=beta)
 
     @staticmethod
     def validate_broadcast_merge(target: torch.Tensor) -> None:
@@ -908,12 +918,16 @@ class RegularAdapter:
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         del rounding_seed
-        target.add_(update, alpha=strength)
+        if beta == 1.0:
+            target.add_(update, alpha=alpha)
+        else:
+            target.copy_(target.mul(beta).add_(update, alpha=alpha))
 
     @staticmethod
     def validate_parameter_data_swap_target(t: torch.Tensor) -> None:

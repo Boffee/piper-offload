@@ -7,18 +7,12 @@ from typing import Any, cast
 import torch
 from torch import nn
 
+from ._parameter_update import ParameterUpdatePlan, plan_parameter_update
 from .host_param import HostParam
-from .seeding import derive_seed
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
-    DenseMergeTargetValidationTensorAdapter,
-    DenseMergeTensorAdapter,
-    DenseMergeValidationTensorAdapter,
-    DequantizeTensorAdapter,
-    LogicalShapeTensorAdapter,
     RegularAdapter,
     TensorAdapter,
-    adapter_name,
 )
 
 __all__ = [
@@ -149,30 +143,14 @@ class ScaledParameterValue:
         return self.strength if self.value.scale_with_strength else 1.0
 
 
-@dataclass(slots=True, frozen=True)
-class _ParameterValuePlan:
-    """Validated replacement representation and optional scaling."""
-
-    effective_strength: float
-    logical_shape: tuple[int, ...]
-    compute_dtype: torch.dtype
-
-
 class ParameterValueTransform:
     """Validate a replacement and optionally scale it after loading.
 
-    Exact values have no update. Non-unit strength scaling dequantizes the
-    freshly loaded representation and merges ``(strength - 1) * value`` back
-    through the representation's dense-merge operation.
+    Replacement validation and arithmetic use the same plan as activation
+    and permanent merge. Exact values have no arithmetic update.
     """
 
-    __slots__ = (
-        "_merge_index",
-        "_plan",
-        "_stochastic_rounding",
-        "_target_key",
-        "_value",
-    )
+    __slots__ = ("_plan", "_validated")
 
     def __init__(
         self,
@@ -181,124 +159,39 @@ class ParameterValueTransform:
         stochastic_rounding: bool = False,
         target_key: str = "",
     ) -> None:
-        if (
-            stochastic_rounding
-            and value.effective_strength != 1.0
-            and not target_key
-        ):
-            raise ValueError(
-                "Stochastic ParameterValueTransform requires a non-empty target_key."
-            )
-        self._value = value
-        self._stochastic_rounding = stochastic_rounding
-        self._target_key = target_key
-        self._merge_index = 0
-        self._plan: _ParameterValuePlan | None = None
+        self._plan = plan_parameter_update(
+            (),
+            value=value,
+            stochastic_rounding=stochastic_rounding,
+            target_key=target_key,
+        )
+        self._validated = False
 
     @property
     def backing(self) -> HostParam:
         """Physical source that defines allocation and copied bytes."""
-        return self._value.value.backing
+        source = self._plan.source
+        assert source is not None
+        return source
 
     @property
     def requires_update(self) -> bool:
         """Whether the loaded replacement needs explicit strength scaling."""
-        return self._value.effective_strength != 1.0
+        return self._plan.update is not None
 
     def validate_parameter(self, param: nn.Parameter) -> None:
         """Validate the model slot and prepare optional repeated scaling."""
-        self._plan = None
-        target = param_representation(param)
-        if (
-            type(target) is not torch.Tensor
-            or not target.is_meta
-            or target.layout is not torch.strided
-        ):
-            raise ValueError(
-                "Parameter values require a plain floating-point meta target; "
-                f"got {type(target).__name__} on {target.device}."
-            )
-        if not target.is_floating_point():
-            raise ValueError(
-                "Parameter values require a floating-point meta target; "
-                f"got {target.dtype}."
-            )
-        if param.requires_grad:
-            raise ValueError(
-                "Parameter values are inference-only and require requires_grad=False."
-            )
-
-        backing = self.backing
-        source = param_representation(backing.make_cpu_param())
-        adapter = backing.adapter
-        logical_shape = backing.logical_shape
-        if logical_shape != tuple(target.shape):
-            raise ValueError(
-                "Parameter value shape mismatch: "
-                f"source shape is {logical_shape}, "
-                f"target shape is {tuple(target.shape)}."
-            )
-
-        effective_strength = self._value.effective_strength
-        self._validate_scaling(source, adapter, effective_strength)
-        self._plan = _ParameterValuePlan(
-            effective_strength=effective_strength,
-            logical_shape=logical_shape,
-            compute_dtype=adapter.compute_dtype(source),
-        )
+        self._validated = False
+        self._plan.validate_parameter(param)
+        self._validated = True
 
     def apply_parameter(self, param: nn.Parameter) -> None:
         """Apply optional scaling to an already-loaded replacement."""
-        plan = self._require_plan()
-        target = param_representation(param)
-        try:
-            adapter = select_adapter(target)
-        except NotImplementedError as exc:
-            raise RuntimeError(
-                "Parameter value target no longer has a registered tensor adapter."
-            ) from exc
-        if (
-            target.is_meta
-            or adapter.compute_dtype(target) is not plan.compute_dtype
-            or not isinstance(adapter, LogicalShapeTensorAdapter)
-            or adapter.logical_shape(target) != plan.logical_shape
-        ):
-            raise RuntimeError(
-                "Parameter value update requires physical storage matching "
-                "the validated replacement source."
-            )
-        self._scale_parameter(target)
+        self._require_plan().apply_parameter(param)
 
     def storage_tensors(self) -> tuple[torch.Tensor, ...]:
         """Return update-only storage; the load plan already owns the value."""
         return ()
-
-    def _scale_parameter(self, target: torch.Tensor) -> None:
-        """Scale one trusted physical replacement representation in place."""
-        plan = self._require_plan()
-        if plan.effective_strength == 1.0:
-            return
-        try:
-            adapter = select_adapter(target)
-        except NotImplementedError as exc:
-            raise RuntimeError(
-                "Parameter value target no longer has a registered tensor adapter."
-            ) from exc
-        if not (
-            isinstance(adapter, DenseMergeTensorAdapter)
-            and isinstance(adapter, DequantizeTensorAdapter)
-        ):
-            raise RuntimeError(
-                "Validated parameter value scaling capability disappeared."
-            )
-        dense = adapter.dequantize(target)
-        adapter.merge_dense_(
-            target,
-            dense,
-            plan.effective_strength - 1.0,
-            rounding_seed=self._rounding_seed(),
-        )
-        self._merge_index += 1
 
     def materialize(
         self,
@@ -306,7 +199,7 @@ class ParameterValueTransform:
         device: torch.device | None = None,
     ) -> nn.Parameter:
         """Clone the physical replacement and apply optional scaling."""
-        self._require_plan()
+        plan = self._require_plan()
         target_device = torch.device("cpu") if device is None else device
         backing = self.backing
         param = (
@@ -314,64 +207,13 @@ class ParameterValueTransform:
             if target_device.type == "cpu"
             else backing.materialize(target_device)
         )
-        if self.requires_update:
-            # This clone was constructed by the validated backing itself. Its
-            # representation is trusted even when an outer wrapper changes
-            # device metadata, as DTensor does for its resting CPU mesh.
-            self._scale_parameter(param_representation(param))
+        if plan.update is not None:
+            plan.update.apply_parameter(param)
         return param
 
-    def _require_plan(self) -> _ParameterValuePlan:
-        plan = self._plan
-        if plan is None:
+    def _require_plan(self) -> ParameterUpdatePlan:
+        if not self._validated:
             raise RuntimeError(
                 "Parameter value target must be validated before application."
             )
-        return plan
-
-    def _validate_scaling(
-        self,
-        source: torch.Tensor,
-        adapter: TensorAdapter[Any, Any],
-        strength: float,
-    ) -> None:
-        if strength == 1.0:
-            return
-        if not (
-            isinstance(adapter, DenseMergeTensorAdapter)
-            and isinstance(adapter, DequantizeTensorAdapter)
-        ):
-            raise ValueError(
-                f"{adapter_name(adapter)} cannot scale a parameter value: "
-                "the representation requires both dense merge and dequantize support."
-            )
-
-        rounding_seed = self._rounding_seed()
-        requires_update_validation = isinstance(
-            adapter,
-            DenseMergeValidationTensorAdapter,
-        )
-        if isinstance(adapter, DenseMergeTargetValidationTensorAdapter):
-            requires_update_validation = adapter.validate_dense_merge_target(
-                source,
-                rounding_seed=rounding_seed,
-            )
-
-        if requires_update_validation:
-            if not isinstance(adapter, DenseMergeValidationTensorAdapter):
-                raise ValueError(
-                    f"{adapter_name(adapter)} requested staged dense-update "
-                    "validation without implementing validate_dense_merge()."
-                )
-            dense = adapter.dequantize(source)
-            adapter.validate_dense_merge(
-                source,
-                dense,
-                strength - 1.0,
-                rounding_seed=rounding_seed,
-            )
-
-    def _rounding_seed(self) -> int | None:
-        if not self._stochastic_rounding:
-            return None
-        return derive_seed(self._target_key, self._merge_index)
+        return self._plan

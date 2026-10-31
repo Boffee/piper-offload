@@ -86,7 +86,7 @@ def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
             )
             dense_param = nn.Parameter(dense_target, requires_grad=False)
             dense_transform.validate_parameter(dense_param)
-            plan = dense_transform._dense_plan
+            plan = dense_transform._update._dense_plan
             assert plan is not None
             local_source, _ = plan.dense_sources[0]
             assert local_source.shape == dense_target.to_local().shape
@@ -318,8 +318,9 @@ def test_stochastic_merge_forwards_seed_to_local_adapter(
         local_target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         assert rounding_seed is not None
@@ -328,7 +329,8 @@ def test_stochastic_merge_forwards_seed_to_local_adapter(
             local_target,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 
@@ -391,11 +393,12 @@ def test_adapter_owned_merge_receives_contiguous_local_factors(
         _target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        _strength: float,
+        _alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        del rounding_seed
+        del beta, rounding_seed
         received.append(
             (
                 tuple(b.shape),

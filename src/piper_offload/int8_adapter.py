@@ -110,18 +110,18 @@ def _normalized_act_pre_scale(qt: Any) -> torch.Tensor | None:  # noqa: ANN401
 def _lora_a_in_stored_weight_coordinates(
     qt: Any,  # noqa: ANN401
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
 ) -> tuple[torch.Tensor, float]:
     """Map logical LoRA ``A`` through TorchAO's activation pre-scaling."""
     pre_scale = _normalized_act_pre_scale(qt)
     if pre_scale is None:
-        return a, strength
+        return a, alpha
 
     # Base execution is (x * p) @ W_stored.T, while routed LoRA is
-    # strength * x @ (B @ A).T. Thus delta(W_stored) is
-    # B @ ((strength * A) / p). Fold strength into A before division so both
-    # backends receive unit strength. Numerical validity is caller-owned.
-    stored_a = a.mul(strength).div(
+    # alpha * x @ (B @ A).T. Thus delta(W_stored) is
+    # B @ ((alpha * A) / p). Fold alpha into A before division so both
+    # backends receive unit alpha. Numerical validity is caller-owned.
+    stored_a = a.mul(alpha).div(
         pre_scale.to(device=a.device, dtype=a.dtype)
     )
     return stored_a.contiguous(), 1.0
@@ -130,30 +130,30 @@ def _lora_a_in_stored_weight_coordinates(
 def _prepare_lora_merge(
     target: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
 ) -> tuple[Any, torch.Tensor, float]:
     """Validate and express one update in stored-weight coordinates."""
     qt = require_int8_tensor(target)
-    stored_a, stored_strength = _lora_a_in_stored_weight_coordinates(
+    stored_a, stored_alpha = _lora_a_in_stored_weight_coordinates(
         qt,
         a,
-        strength,
+        alpha,
     )
-    return qt, stored_a, stored_strength
+    return qt, stored_a, stored_alpha
 
 
 def _prepare_dense_merge(
     target: torch.Tensor,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
 ) -> tuple[Any, torch.Tensor, float]:
     """Validate and express one logical dense update in stored coordinates."""
     qt = require_int8_tensor(target)
     pre_scale = _normalized_act_pre_scale(qt)
     if pre_scale is None:
-        return qt, update, strength
+        return qt, update, alpha
 
-    stored_update = update.mul(strength).div(
+    stored_update = update.mul(alpha).div(
         pre_scale.to(device=update.device, dtype=update.dtype)
     )
     return qt, stored_update, 1.0
@@ -375,7 +375,7 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
             # whose stored and logical weight coordinates are identical.
             return None
 
-        total_rank = sum(a.shape[0] for _strength, a, _b in factors)
+        total_rank = sum(a.shape[0] for _alpha, a, _b in factors)
         a_packed = torch.empty(
             (total_rank, logical_shape[1]),
             device=qt.device,
@@ -389,11 +389,11 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
         stored_pre_scale = pre_scale.to(device=qt.device, dtype=compute_dtype)
 
         rank_offset = 0
-        for strength, a, b in factors:
+        for alpha, a, b in factors:
             next_offset = rank_offset + a.shape[0]
             stored_a = a_packed[rank_offset:next_offset]
             transfer_(stored_a, a, non_blocking=True)
-            stored_a.mul_(strength).div_(stored_pre_scale)
+            stored_a.mul_(alpha).div_(stored_pre_scale)
             transfer_(b_packed[:, rank_offset:next_offset], b, non_blocking=True)
             rank_offset = next_offset
 
@@ -404,21 +404,23 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a staged LoRA update while preserving target storage."""
-        qt, a, strength = _prepare_lora_merge(
+        qt, a, alpha = _prepare_lora_merge(
             target,
             a,
-            strength,
+            alpha,
         )
         Int8Adapter._merge_stored_lora_(
             qt,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 
@@ -426,26 +428,28 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
     def validate_dense_merge(
         target: torch.Tensor,
         _update: torch.Tensor,
-        _strength: float,
+        _alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        del rounding_seed
+        del beta, rounding_seed
         _normalized_act_pre_scale(require_int8_tensor(target))
 
     @staticmethod
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a logical full-rank update into stored-weight coordinates."""
-        qt, stored_update, stored_strength = _prepare_dense_merge(
+        qt, stored_update, stored_alpha = _prepare_dense_merge(
             target,
             update,
-            strength,
+            alpha,
         )
         if _triton_int8_dense_layout_supported(qt, stored_update):
             assert _triton_merge_int8_dense is not None
@@ -456,9 +460,10 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
                 qt.zero_point,
                 tuple(qt.block_size),
                 stored_update,
-                stored_strength,
+                stored_alpha,
                 asymmetric=asymmetric,
                 reduce_range=bool(qt.reduce_range),
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             qt.qdata.copy_(qdata)
@@ -470,7 +475,8 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
             Int8Adapter,
             qt,
             stored_update,
-            stored_strength,
+            stored_alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 
@@ -479,8 +485,9 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
         qt: Any,  # noqa: ANN401
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge factors already expressed in stored-weight coordinates."""
@@ -494,9 +501,10 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
                 tuple(qt.block_size),
                 b,
                 a,
-                strength,
+                alpha,
                 asymmetric=asymmetric,
                 reduce_range=bool(qt.reduce_range),
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             qt.qdata.copy_(qdata)
@@ -506,7 +514,7 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
             return
 
         dense = dequantize_int8_tensor(qt)
-        dense.addmm_(b, a, alpha=strength)
+        dense.addmm_(b, a, beta=beta, alpha=alpha)
         new_data = Int8Adapter.requantize(
             dense,
             like=qt,
@@ -519,12 +527,13 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
         target: torch.Tensor,
         _b: torch.Tensor,
         _a: torch.Tensor,
-        _strength: float,
+        _alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Validate activation pre-scale structure."""
-        del rounding_seed
+        del beta, rounding_seed
         _normalized_act_pre_scale(require_int8_tensor(target))
 
     @staticmethod
@@ -532,24 +541,26 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
         target: torch.Tensor,
         _b: torch.Tensor,
         _a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Validate factor-aware staging without applying pre-scale twice."""
-        del rounding_seed
+        del beta, rounding_seed
         qt = require_int8_tensor(target)
         _normalized_act_pre_scale(qt)
-        if strength != 1.0:
-            raise ValueError(f"TorchAO INT8 prepared LoRA merge requires unit strength, got {strength}.")
+        if alpha != 1.0:
+            raise ValueError(f"TorchAO INT8 prepared LoRA merge requires unit alpha, got {alpha}.")
 
     @staticmethod
     def merge_prepared_lora_(
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge validated factor-aware data without pre-scaling twice."""
@@ -558,7 +569,8 @@ class Int8Adapter(TorchaoStructuredAdapter[_Int8Meta]):
             qt,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 

@@ -15,6 +15,30 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   adapters reject broadcast updates during preflight; custom tensor adapters
   can opt in through `BroadcastMergeTensorAdapter`.
 
+- Complete parameter values can compose with LoRA and dense deltas from separate
+  adapters during activation and permanent merge. Shared planning validates
+  updates against the supplied representation, and value scaling combines with
+  additive contributions before one terminal quantized re-encoding. Public
+  adapter entries remain either a value or a delta.
+
+### Changed
+
+- LoRA and dense tensor-adapter merge and staged validation use `alpha` for
+  the update coefficient and keyword-only `beta=1.0` for the starting weight.
+  Custom implementations must update their signatures and support both
+  coefficients. Value scaling computes the scaled base directly, avoiding
+  FP16 overflow and BF16 cancellation caused by adding `(scale - 1) * base`.
+- Scaled values retain optimized CUDA quantized merges, including fused
+  stochastic rounding, instead of forcing full-tensor reference arithmetic.
+  Source scaling and addition retain FP32 intermediates until combined,
+  avoiding premature overflow and loss of small residuals.
+  LoRA-only compositions retain factorized staging at any value scale;
+  `LoRATransform` accepts `beta=1.0` for this starting-weight coefficient.
+  Existing device and layout restrictions still select reference merges.
+- ConvRot dense merges delegate both coefficients to Piper Kernels' public
+  `add_` methods, removing Offload's private rotation and encoding paths.
+  Require Piper Kernels 0.7.9 or newer for the `beta` coefficient.
+
 ## [0.10.0rc10] - 2026-10-28
 
 ### Fixed

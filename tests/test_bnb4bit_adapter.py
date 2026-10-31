@@ -641,8 +641,9 @@ class TestBnb4bitAdapter:
             fallback_target: torch.Tensor,
             fallback_b: torch.Tensor,
             fallback_a: torch.Tensor,
-            fallback_strength: float,
+            fallback_alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> torch.Tensor | None:
             nonlocal fallback_called
@@ -651,7 +652,8 @@ class TestBnb4bitAdapter:
                 fallback_target,
                 fallback_b,
                 fallback_a,
-                fallback_strength,
+                fallback_alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -768,8 +770,9 @@ class TestBnb4bitAdapter:
             fallback_target: torch.Tensor,
             fallback_b: torch.Tensor,
             fallback_a: torch.Tensor,
-            fallback_strength: float,
+            fallback_alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> torch.Tensor | None:
             nonlocal fallback_called
@@ -778,7 +781,8 @@ class TestBnb4bitAdapter:
                 fallback_target,
                 fallback_b,
                 fallback_a,
-                fallback_strength,
+                fallback_alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 

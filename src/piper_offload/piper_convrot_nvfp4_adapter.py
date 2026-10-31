@@ -3,7 +3,7 @@
 Piper Offload owns packed-storage movement and merge integration. Piper
 Kernels owns rotation, scale recomputation, terminal-code selection, and the
 in-place updates through ``ConvRotNVFP4Tensor.addmm_`` and
-``ConvRotNVFP4Tensor.add_``.
+``ConvRotNVFP4Tensor.add_``, including both update and base scaling.
 """
 
 from dataclasses import dataclass
@@ -125,15 +125,17 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Delegate a validated staged update to Piper Kernels."""
         require_convrot_nvfp4_tensor(target).addmm_(
             b,
             a,
-            alpha=strength,
+            beta=beta,
+            alpha=alpha,
             rounding_seed=rounding_seed,
         )
 
@@ -142,11 +144,12 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
         target: torch.Tensor,
         _b: torch.Tensor,
         _a: torch.Tensor,
-        _strength: float,
+        _alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        del rounding_seed
+        del beta, rounding_seed
         require_convrot_nvfp4_tensor(target)
 
     @staticmethod
@@ -164,13 +167,15 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Delegate a validated dense update to Piper Kernels."""
         require_convrot_nvfp4_tensor(target).add_(
             update,
-            alpha=strength,
+            alpha=alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )

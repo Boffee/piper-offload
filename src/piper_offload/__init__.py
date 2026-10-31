@@ -105,7 +105,8 @@ logical Linear weight shape and compute dtype.
 ``.delta.bias`` suffixes as full-rank additive updates and every other
 non-LoRA entry as the complete value for an exact-name parameter. Parameter
 values are merge-only and populate storage-free frozen plain floating-point
-meta parameters; parameter deltas require existing physical parameters.
+meta parameters. Parameter deltas apply to existing physical parameters or to
+a complete value supplied by another active adapter.
 
 :class:`Adapter` owns immutable parameter-delta and parameter-value storage.
 Compatible complete CPU allocations and non-empty views into non-resizable

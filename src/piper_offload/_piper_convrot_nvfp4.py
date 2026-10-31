@@ -1,9 +1,9 @@
 """Internal optional-import boundary for Piper ConvRot NVFP4 support.
 
 ``piper-kernels`` owns the semantic tensor, grouped rotation, and in-place
-``addmm_`` and ``add_`` updates. Piper Offload only preserves its public packed
-storage and metadata during movement, then delegates LoRA and dense merges to
-those operations.
+``addmm_`` and ``add_`` updates. Piper Offload preserves its public packed
+storage and metadata during movement and delegates updates, including base
+scaling, to the public wrapper methods.
 
 ``piper-kernels`` is a required dependency; TorchAO is not. This import reaches
 TorchAO's NVFP4 encoder, so it fails without the ``torchao`` extra and the

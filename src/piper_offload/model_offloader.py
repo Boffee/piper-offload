@@ -14,6 +14,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
+from ._parameter_update import plan_parameter_update
 from .adapter import Adapter, AdapterMode, AdapterTargetUpdates
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent
@@ -23,9 +24,6 @@ from .host_component import HostComponent
 from .host_module import ParameterOverride
 from .lora import install_routed_residual_hook
 from .module_names import resolve_parent_leaf
-from .parameter_delta import ParameterDeltaTransform
-from .parameter_transform import ParameterTransform
-from .parameter_value import ParameterValueTransform
 from .pin_manager import PinLease, host_pin_manager
 
 type _ParameterUpdateMap = dict[str, AdapterTargetUpdates]
@@ -286,36 +284,17 @@ class ModelOffloader:
         params_by_name = dict(self._model.named_parameters(remove_duplicate=False))
         overrides: dict[str, ParameterOverride] = {}
         for param_name, contributions in updates.items():
-            transform: ParameterTransform
-            if contributions.deltas:
-                transform = ParameterDeltaTransform(
-                    contributions.deltas,
-                    stochastic_rounding=stochastic_rounding,
-                    target_key=param_name,
-                )
-            else:
-                assert contributions.value is not None
-                transform = ParameterValueTransform(
-                    contributions.value,
-                    stochastic_rounding=stochastic_rounding,
-                    target_key=param_name,
-                )
-
-            transform.validate_parameter(params_by_name[param_name])
-
-            if isinstance(transform, ParameterValueTransform):
-                overrides[param_name] = ParameterOverride(
-                    source=transform.backing,
-                    update=(
-                        transform
-                        if transform.requires_update
-                        else None
-                    ),
-                )
-            else:
-                overrides[param_name] = ParameterOverride(
-                    update=transform,
-                )
+            plan = plan_parameter_update(
+                contributions.deltas,
+                value=contributions.value,
+                stochastic_rounding=stochastic_rounding,
+                target_key=param_name,
+            )
+            plan.validate_parameter(params_by_name[param_name])
+            overrides[param_name] = ParameterOverride(
+                source=plan.source,
+                update=plan.update,
+            )
         return overrides
 
     def _register_routed_lora_hooks(
@@ -519,7 +498,9 @@ class ModelOffloader:
         Parameter values are merge-only and populate frozen floating-point
         meta parameters from registered physical representations; routed mode
         never requantizes. Such a meta target is materialized only while its
-        parameter value is active.
+        parameter value is active. Deltas from other adapters may modify the
+        supplied value, subject to its representation's merge capabilities.
+        Value scaling and deltas combine before terminal quantized encoding.
         Because the offloader owns one model runtime, a
         second activation before :meth:`deactivate` raises
         :class:`ModelRuntimeInUseError` immediately.

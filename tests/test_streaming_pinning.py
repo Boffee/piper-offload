@@ -788,7 +788,8 @@ def test_permanent_merge_leases_sources_through_validation(pins, monkeypatch) ->
     def staging_validate(op) -> None:
         # Quantized targets stage their sources while validating.
         original_validate(op)
-        for tensor in op.transform.storage_tensors():
+        assert op.plan.update is not None
+        for tensor in op.plan.update.storage_tensors():
             transfer_(torch.empty_like(tensor, device="cuda"), tensor, non_blocking=True)
 
     monkeypatch.setattr(merge_module._MergeOp, "validate", staging_validate)

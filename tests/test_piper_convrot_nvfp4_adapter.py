@@ -192,15 +192,18 @@ class TestPiperConvRotNVFP4Adapter:
             nn.Parameter(group_16, requires_grad=False)
         )
 
-    def test_lora_merge_delegates_to_kernel_addmm_in_place(self) -> None:
+    @pytest.mark.parametrize("beta", [1.0, -0.5, 0.0])
+    @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=SM120)])
+    def test_lora_merge_delegates_to_kernel_addmm_in_place(self, beta: float, device: str) -> None:
         rows, cols, rank = 16, 64, 4
         convrot, _dense = _make_convrot_nvfp4(rows=rows, cols=cols)
+        convrot = convrot.to(device)
         param = nn.Parameter(convrot, requires_grad=False)
         a = torch.randn(rank, cols, dtype=convrot.orig_dtype)
         b = torch.randn(rows, rank, dtype=convrot.orig_dtype)
-        transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.25)])
+        transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.25)], beta=beta)
         expected = convrot.clone()
-        expected.addmm_(b, a, alpha=0.25)
+        expected.addmm_(b.to(device), a.to(device), alpha=0.25, beta=beta)
         qdata_ptr = convrot.qdata.data_ptr()
         scale_ptr = convrot.scale.data_ptr()
 
@@ -269,14 +272,16 @@ class TestPiperConvRotNVFP4Adapter:
             expected.scale.view(torch.uint8),
         )
 
-    def test_dense_merge_forwards_strength_and_rounding_seed(
+    @pytest.mark.parametrize("beta", [1.0, -0.5])
+    def test_dense_merge_forwards_coefficients_and_rounding_seed(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        beta: float,
     ) -> None:
         convrot_cls = _modules()[3]
         convrot, _dense = _make_convrot_nvfp4()
         update = torch.randn(16, 64, dtype=convrot.orig_dtype)
-        calls: list[tuple[float, int | None]] = []
+        calls: list[tuple[float, float, int | None]] = []
         original_add = convrot_cls.add_
 
         def recording_add(
@@ -284,13 +289,15 @@ class TestPiperConvRotNVFP4Adapter:
             other: torch.Tensor,
             *,
             alpha: float = 1,
+            beta: float = 1,
             rounding_seed: int | None = None,
         ) -> torch.Tensor:
-            calls.append((alpha, rounding_seed))
+            calls.append((alpha, beta, rounding_seed))
             return original_add(
                 target,
                 other,
                 alpha=alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -300,10 +307,11 @@ class TestPiperConvRotNVFP4Adapter:
             convrot,
             update,
             0.125,
+            beta=beta,
             rounding_seed=456,
         )
 
-        assert calls == [(0.125, 456)]
+        assert calls == [(0.125, beta, 456)]
 
     def test_merge_forwards_rounding_seed_to_kernel_addmm(
         self,

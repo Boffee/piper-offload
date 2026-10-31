@@ -87,13 +87,14 @@ def _torch_merge_bnb4_lora(
     target: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> torch.Tensor:
     """Merge through the ordinary dequantize/addmm/requantize path."""
     dense = dequantize_params_4bit(target)
-    dense.addmm_(b, a, alpha=strength)
+    dense.addmm_(b, a, beta=beta, alpha=alpha)
     return requantize_params_4bit(
         dense,
         like=target,
@@ -434,8 +435,9 @@ class Bnb4bitAdapter:
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge into BNB4 storage, preferring the raw Triton path."""
@@ -458,7 +460,8 @@ class Bnb4bitAdapter:
                 state.quant_type,
                 b,
                 a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             qt.data.view(torch.uint8).reshape(-1).copy_(packed)
@@ -475,7 +478,8 @@ class Bnb4bitAdapter:
             target,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
         Bnb4bitAdapter.copy_into(merged, target=target)
@@ -484,13 +488,17 @@ class Bnb4bitAdapter:
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a full-rank update, preferring the raw Triton path."""
         qt = require_params_4bit(target)
-        if _can_use_triton_dense_merge(qt, update) and (rounding_seed is None or not qt.quant_state.nested):
+        if (
+            _can_use_triton_dense_merge(qt, update)
+            and (rounding_seed is None or not qt.quant_state.nested)
+        ):
             assert _triton_merge_bnb4_dense is not None
             state = qt.quant_state
             state2 = state.state2 if state.nested else None
@@ -505,7 +513,8 @@ class Bnb4bitAdapter:
                 state.blocksize,
                 state.quant_type,
                 update,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             qt.data.view(torch.uint8).reshape(-1).copy_(packed)
@@ -521,7 +530,8 @@ class Bnb4bitAdapter:
             Bnb4bitAdapter,
             target,
             update,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 

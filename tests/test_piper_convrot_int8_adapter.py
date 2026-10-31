@@ -83,6 +83,19 @@ def _make_convrot(
     )
 
 
+
+def _scaled_value_reference(source, strength):
+    """Use the native affine operation as an independent scaling reference."""
+    expected = source.clone()
+    if strength != 1.0:
+        expected.addmm_(
+            torch.zeros(source.shape[0], 1, dtype=source.dtype, device=source.device),
+            torch.zeros(1, source.shape[1], dtype=source.dtype, device=source.device),
+            beta=strength,
+        )
+    return expected
+
+
 def test_package_import_does_not_require_torchao() -> None:
     # piper-kernels is required, but its ConvRot tensors subclass
     # TorchAOBaseTensor. Without the `torchao` extra both ConvRot adapters
@@ -279,18 +292,20 @@ class TestPiperConvRotInt8Adapter:
 
         assert isinstance(select_adapter(convrot), DTensorAdapter)
 
-    def test_lora_transform_uses_piper_addmm_in_place(self) -> None:
+    @pytest.mark.parametrize("beta", [1.0, -0.5, 0.0])
+    @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
+    def test_lora_transform_uses_piper_addmm_in_place(self, beta: float, device: str) -> None:
         convrot_cls = _convrot_cls()
         rows, cols, rank = 8, 64, 4
         convrot = convrot_cls.from_hp(
-            torch.randn(rows, cols, dtype=torch.bfloat16),
+            torch.randn(rows, cols, dtype=torch.bfloat16, device=device),
             group_size=64,
         )
         param = nn.Parameter(convrot, requires_grad=False)
         a = torch.randn(rank, cols)
         b = torch.randn(rows, rank)
         transform = LoRATransform(
-            [ScaledLoRAFactor.from_tensors(a, b, 0.5)]
+            [ScaledLoRAFactor.from_tensors(a, b, 0.5)], beta=beta,
         )
         original_param = param
         qdata_ptr = param.data.qdata.data_ptr()
@@ -298,8 +313,9 @@ class TestPiperConvRotInt8Adapter:
 
         expected = convrot.clone()
         expected.addmm_(
-            b.to(expected.dtype),
-            a.to(expected.dtype),
+            b.to(device=device, dtype=expected.dtype),
+            a.to(device=device, dtype=expected.dtype),
+            beta=beta,
             alpha=0.5,
         )
 
@@ -365,9 +381,11 @@ class TestPiperConvRotInt8Adapter:
         assert torch.equal(model.lin.weight.data.qdata, expected.qdata)
         assert torch.equal(model.lin.weight.data.scale, expected.scale)
 
-    def test_dense_merge_forwards_strength_and_rounding_seed(
+    @pytest.mark.parametrize("beta", [1.0, -0.5])
+    def test_dense_merge_forwards_coefficients_and_rounding_seed(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        beta: float,
     ) -> None:
         convrot_cls = _convrot_cls()
         convrot = convrot_cls.from_hp(
@@ -375,7 +393,7 @@ class TestPiperConvRotInt8Adapter:
             group_size=64,
         )
         update = torch.randn(8, 64, dtype=torch.bfloat16)
-        calls: list[tuple[float, int | None]] = []
+        calls: list[tuple[float, float, int | None]] = []
         original_add = convrot_cls.add_
 
         def recording_add(
@@ -383,13 +401,15 @@ class TestPiperConvRotInt8Adapter:
             other: torch.Tensor,
             *,
             alpha: float = 1,
+            beta: float = 1,
             rounding_seed: int | None = None,
         ) -> torch.Tensor:
-            calls.append((alpha, rounding_seed))
+            calls.append((alpha, beta, rounding_seed))
             return original_add(
                 target,
                 other,
                 alpha=alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -399,10 +419,11 @@ class TestPiperConvRotInt8Adapter:
             convrot,
             update,
             0.125,
+            beta=beta,
             rounding_seed=456,
         )
 
-        assert calls == [(0.125, 456)]
+        assert calls == [(0.125, beta, 456)]
 
     @pytest.mark.parametrize("scale_with_strength", [False, True])
     def test_parameter_value_permanent_merge_preserves_representation(
@@ -419,9 +440,7 @@ class TestPiperConvRotInt8Adapter:
         value = adapter.targets["weight"]
         assert isinstance(value, ParameterValue)
         backing = value.backing.make_cpu_param().data
-        expected = source.clone()
-        if scale_with_strength:
-            expected.add_(source_dense, alpha=strength - 1.0)
+        expected = _scaled_value_reference(source, strength if scale_with_strength else 1.0)
         model = nn.Module()
         model.weight = nn.Parameter(
             torch.empty(source.shape, device="meta"),
@@ -453,20 +472,9 @@ class TestPiperConvRotInt8Adapter:
         seeds: list[int | None] = []
         original_add = convrot_cls.add_
 
-        def recording_add(
-            target: torch.Tensor,
-            other: torch.Tensor,
-            *,
-            alpha: float = 1,
-            rounding_seed: int | None = None,
-        ) -> torch.Tensor:
+        def recording_add(target, other, *, alpha=1, beta=1, rounding_seed=None):
             seeds.append(rounding_seed)
-            return original_add(
-                target,
-                other,
-                alpha=alpha,
-                rounding_seed=rounding_seed,
-            )
+            return original_add(target, other, alpha=alpha, beta=beta, rounding_seed=rounding_seed)
 
         monkeypatch.setattr(convrot_cls, "add_", recording_add)
         adapter = Adapter.from_state_dict(
@@ -683,12 +691,7 @@ class TestPiperConvRotInt8Adapter:
         strength: float,
     ) -> None:
         source = _make_convrot(rows=8, cols=64)
-        expected = source.clone().cuda()
-        if strength != 1.0:
-            expected.add_(
-                expected.dequantize(),
-                alpha=strength - 1.0,
-            )
+        expected = _scaled_value_reference(source.cuda(), strength)
         model = nn.Linear(
             64,
             8,
@@ -858,8 +861,7 @@ class TestPiperConvRotInt8Adapter:
         inputs = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
         expected = inputs
         for source in sources:
-            scaled = source.clone().cuda()
-            scaled.add_(scaled.dequantize(), alpha=-0.5)
+            scaled = _scaled_value_reference(source.cuda(), 0.5)
             expected = torch.nn.functional.linear(expected, scaled)
 
         with activated_model(

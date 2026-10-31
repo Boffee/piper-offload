@@ -240,8 +240,9 @@ class GgufAdapter:
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Delegate an activation-time LoRA update to ConvRot INT8."""
@@ -249,7 +250,8 @@ class GgufAdapter:
             target,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 
@@ -257,15 +259,17 @@ class GgufAdapter:
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Delegate an activation-time dense update to ConvRot INT8."""
         PiperConvRotInt8Adapter.merge_dense_(
             target,
             update,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 

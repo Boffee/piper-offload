@@ -233,8 +233,9 @@ class _FactorAwareLoRAMergeAdapter(Protocol):
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Validate a prepared update without transforming it again."""
@@ -245,8 +246,9 @@ class _FactorAwareLoRAMergeAdapter(Protocol):
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Apply a prepared update without transforming it again."""
@@ -383,11 +385,14 @@ class LoRATransform:
 
     Holds references to Adapter-owned host tensors — no cloning or capture
     happens here. Multiple ordinary factors are packed into transient buffers
-    and applied as one update. Validation builds a reusable execution plan,
+    and applied as one update with ``beta * weight`` before terminal encoding.
+    ``beta`` must be finite and defaults to preserving the starting weight.
+    Validation builds a reusable execution plan,
     keeping validation-only work out of repeated offload copy hooks.
     """
 
     __slots__ = (
+        "_beta",
         "_factors",
         "_merge_index",
         "_stochastic_rounding",
@@ -399,14 +404,18 @@ class LoRATransform:
         self,
         factors: Sequence[ScaledLoRAFactor],
         *,
+        beta: float = 1.0,
         stochastic_rounding: bool = False,
         target_key: str = "",
     ) -> None:
         if not factors:
             raise ValueError("LoRATransform requires a factor")
+        if not math.isfinite(beta):
+            raise ValueError(f"LoRA base coefficient must be finite; got {beta}.")
         if stochastic_rounding and not target_key:
             raise ValueError("Stochastic LoRATransform requires a non-empty target_key.")
         self._factors = tuple(factors)
+        self._beta = beta
         self._stochastic_rounding = stochastic_rounding
         self._target_key = target_key
         self._merge_index = 0
@@ -465,13 +474,14 @@ class LoRATransform:
                 logical_shape=staging_shape,
                 compute_dtype=compute_dtype,
             )
-            b, a, strength = staged
+            b, a, alpha = staged
             _validate_lora_merge(
                 adapter,
                 representation,
                 b,
                 a,
-                strength,
+                alpha,
+                beta=self._beta,
                 prepared=prepared,
                 rounding_seed=rounding_seed,
             )
@@ -543,14 +553,15 @@ class LoRATransform:
             logical_shape=plan.staging_shape,
             compute_dtype=plan.compute_dtype,
         )
-        b, a, strength = staged
+        b, a, alpha = staged
         if prepared:
             assert isinstance(plan.adapter, _FactorAwareLoRAMergeAdapter)
             plan.adapter.merge_prepared_lora_(
                 data,
                 b,
                 a,
-                strength,
+                alpha,
+                beta=self._beta,
                 rounding_seed=rounding_seed,
             )
         else:
@@ -558,7 +569,8 @@ class LoRATransform:
                 data,
                 b,
                 a,
-                strength,
+                alpha,
+                beta=self._beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -685,8 +697,9 @@ def _validate_lora_merge(
     target: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     prepared: bool = False,
     rounding_seed: int | None = None,
 ) -> None:
@@ -697,7 +710,8 @@ def _validate_lora_merge(
             target,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
     elif isinstance(adapter, LoRAMergeValidationTensorAdapter):
@@ -705,7 +719,8 @@ def _validate_lora_merge(
             target,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 
