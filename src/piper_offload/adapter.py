@@ -41,6 +41,7 @@ class AdapterTargetUpdates:
 
     deltas: list[ScaledParameterDelta] = field(default_factory=list)
     value: ScaledParameterValue | None = None
+    requires_base: bool = False
 
     def add(
         self,
@@ -48,15 +49,25 @@ class AdapterTargetUpdates:
         strength: float,
         *,
         target_key: str,
+        allow_partial_targets: bool,
     ) -> None:
         """Bind one contribution, allowing only one authoritative value."""
         if isinstance(target, ParameterDelta):
             self.deltas.append(target.scaled(strength))
+            self.requires_base |= not allow_partial_targets
             return
 
         if self.value is not None:
             raise ValueError(f"Adapter target {target_key!r} has multiple active parameter values.")
         self.value = target.scaled(strength)
+
+    def should_skip_merge(self, param: torch.nn.Parameter) -> bool:
+        """Skip only an unpopulated target whose deltas all allow partial targets.
+
+        Call after collecting every active contribution. A supplied value
+        makes the target available regardless of adapter ordering.
+        """
+        return param.is_meta and self.value is None and not self.requires_base
 
     @property
     def factors(self) -> list[ScaledLoRAFactor]:
@@ -114,9 +125,12 @@ class Adapter:
     responsibility.
 
     ``allow_partial_targets`` is an explicit application policy for adapters
-    that intentionally span multiple separately loaded model components.
-    When enabled, targets absent from a particular model are ignored. Present
-    targets retain the same shape and capability validation as strict mode.
+    that intentionally span separately loaded or optional model components.
+    When enabled, absent target names are ignored. Merge application also
+    skips deltas to meta parameters without an active complete value, leaving
+    them meta. Any strict delta on the same target still requires a source.
+    Physical targets and active supplied values retain normal validation.
+    Routed execution retains its existing target requirements.
     """
 
     def __init__(
@@ -196,7 +210,7 @@ class Adapter:
 
     @property
     def allow_partial_targets(self) -> bool:
-        """Whether application may ignore targets absent from a model."""
+        """Whether to skip absent names and additive merges into unpopulated meta targets."""
         return self._allow_partial_targets
 
 

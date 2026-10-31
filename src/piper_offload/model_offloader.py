@@ -14,7 +14,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from ._parameter_update import plan_parameter_update
+from ._parameter_update import plan_parameter_update, validate_merge_target_aliases
 from .adapter import Adapter, AdapterMode, AdapterTargetUpdates
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent
@@ -264,7 +264,10 @@ class ModelOffloader:
                     continue
                 managed = self._require_managed_target(target_key)
                 contributions = per_param.setdefault(managed, AdapterTargetUpdates())
-                contributions.add(target, strength, target_key=target_key)
+                contributions.add(
+                    target, strength, target_key=target_key,
+                    allow_partial_targets=adapter.allow_partial_targets,
+                )
         return per_param
 
     def _build_merge_parameter_overrides(
@@ -282,15 +285,19 @@ class ModelOffloader:
             )
 
         params_by_name = dict(self._model.named_parameters(remove_duplicate=False))
+        validate_merge_target_aliases(params_by_name, updates)
         overrides: dict[str, ParameterOverride] = {}
         for param_name, contributions in updates.items():
+            param = params_by_name[param_name]
+            if contributions.should_skip_merge(param):
+                continue
             plan = plan_parameter_update(
                 contributions.deltas,
                 value=contributions.value,
                 stochastic_rounding=stochastic_rounding,
                 target_key=param_name,
             )
-            plan.validate_parameter(params_by_name[param_name])
+            plan.validate_parameter(param)
             overrides[param_name] = ParameterOverride(
                 source=plan.source,
                 update=plan.update,
@@ -490,7 +497,9 @@ class ModelOffloader:
         ``adapters`` and their optional ``adapter_strengths`` apply only to this
         activation. Exact-zero strengths are inactive and create no updates.
         Adapters that allow partial targets apply only to parameters managed by
-        this offloader; strict adapters reject any absent target.
+        this offloader; strict adapters reject any absent target. In merge
+        mode, partial adapters also skip deltas to meta parameters without
+        an active value provider, unless another delta requires that source.
         ``adapter_mode`` selects in-place merge updates or routed LoRA
         residual hooks. Routed mode requires factor-only adapters.
         ``stochastic_rounding`` uses stochastic requantization for quantized

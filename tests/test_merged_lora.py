@@ -4241,7 +4241,7 @@ class TestPermanentMerge:
             "head.lora_B.weight": torch.randn(16, 4),
         }
 
-        with pytest.raises(ValueError, match="same tied parameter backing"):
+        with pytest.raises(ValueError, match="Tied parameter aliases"):
             merge_adapter(m, [(Adapter.from_state_dict(state_dict=sd), 1.0)])
 
         torch.testing.assert_close(m.embed.weight, before)
