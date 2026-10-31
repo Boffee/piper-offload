@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.10.0rc11] - 2026-10-30
+
 ### Added
 
 - Additive LoRA and dense adapter updates now use standard PyTorch broadcasting
