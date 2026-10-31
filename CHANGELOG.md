@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.10.0rc12] - 2026-10-30
+
 ### Changed
 
 - `allow_partial_targets=True` now also skips additive LoRA and dense updates
