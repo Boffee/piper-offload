@@ -166,13 +166,15 @@ def _merge_mx_kernel(
     b_ptr,
     a_ptr,
     update_ptr,
-    strength,
+    alpha,
+    beta,
     rounding_seed,
     M,
     N,
     NUM_SCALE_BLOCKS,
     K: tl.constexpr,
     DENSE_UPDATE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
     FORMAT: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
     SCALING_MODE: tl.constexpr,
@@ -245,13 +247,16 @@ def _merge_mx_kernel(
         mask=row_mask,
         other=127,
     )
-    base_scale = _e8m0_to_fp32(encoded_scale)
+    weight_scale = _e8m0_to_fp32(encoded_scale)
     if COMPUTE_DTYPE == 0:
-        base = (base_lp.to(tl.bfloat16) * base_scale[:, None].to(tl.bfloat16)).to(tl.bfloat16)
+        base = (base_lp.to(tl.bfloat16) * weight_scale[:, None].to(tl.bfloat16)).to(tl.bfloat16)
     else:
-        base = base_lp.to(tl.float32) * base_scale[:, None]
+        base = base_lp.to(tl.float32) * weight_scale[:, None]
 
-    merged = base.to(tl.float32) + accumulator * strength
+    if SCALE_BASE:
+        base = base.to(tl.float32) * beta
+
+    merged = base.to(tl.float32) + accumulator * alpha
     if COMPUTE_DTYPE == 0:
         merged = merged.to(tl.bfloat16)
 
@@ -349,8 +354,9 @@ def _merge_mx_(
     b: torch.Tensor,
     a: torch.Tensor,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     dense_update: bool,
     scaling_mode: int,
     swizzled: bool,
@@ -428,13 +434,15 @@ def _merge_mx_(
         b,
         a,
         update,
-        strength,
+        alpha,
+        beta,
         seed_argument(rounding_seed),
         M=rows,
         N=cols,
         NUM_SCALE_BLOCKS=cols // _MX_BLOCK_SIZE,
         K=rank,
         DENSE_UPDATE=dense_update,
+        SCALE_BASE=beta != 1.0,
         FORMAT=format_id,
         COMPUTE_DTYPE=compute_dtype,
         SCALING_MODE=scaling_mode,
@@ -457,8 +465,9 @@ def merge_mx_lora_(
     orig_dtype: torch.dtype,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     scaling_mode: int,
     swizzled: bool,
     rounding_seed: int | None = None,
@@ -473,7 +482,8 @@ def merge_mx_lora_(
         b,
         a,
         b,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=False,
         scaling_mode=scaling_mode,
         swizzled=swizzled,
@@ -488,8 +498,9 @@ def merge_mx_dense_(
     block_size: int,
     orig_dtype: torch.dtype,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     scaling_mode: int,
     swizzled: bool,
     rounding_seed: int | None = None,
@@ -504,7 +515,8 @@ def merge_mx_dense_(
         update,
         update,
         update,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=True,
         scaling_mode=scaling_mode,
         swizzled=swizzled,

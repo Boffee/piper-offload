@@ -18,7 +18,7 @@ from safetensors.torch import save_file
 from torch import nn
 
 import piper_offload.lora as lora_impl
-import piper_offload.parameter_delta as parameter_delta_impl
+import piper_offload._parameter_update as parameter_update_impl
 import piper_offload.quanto_adapter as quanto_adapter_impl
 
 from piper_offload import (
@@ -934,15 +934,17 @@ class TestParameterDelta:
         def tracked_merge(
             target: torch.Tensor,
             update: torch.Tensor,
-            strength: float,
+            alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> None:
-            calls.append((update.detach().clone(), strength, rounding_seed))
+            calls.append((update.detach().clone(), alpha, rounding_seed))
             original(
                 target,
                 update,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -1007,12 +1009,12 @@ class TestParameterDelta:
         calls = 0
         stage_calls = 0
         original_dense_merge = QuantoAdapter.merge_dense_
-        original_stage = ParameterDeltaTransform._stage_update_for_plan
+        original_stage = parameter_update_impl.ParameterUpdateTransform._stage_update_for_plan
 
         def tracked_stage(
-            transform: ParameterDeltaTransform,
+            transform: parameter_update_impl.ParameterUpdateTransform,
             param: nn.Parameter,
-            plan: parameter_delta_impl._DenseMergePlan,
+            plan: parameter_update_impl._DenseMergePlan,
         ) -> torch.Tensor:
             nonlocal stage_calls
             stage_calls += 1
@@ -1021,8 +1023,9 @@ class TestParameterDelta:
         def tracked_dense_merge(
             target: torch.Tensor,
             update: torch.Tensor,
-            staged_strength: float,
+            staged_alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> None:
             nonlocal calls
@@ -1030,7 +1033,8 @@ class TestParameterDelta:
             original_dense_merge(
                 target,
                 update,
-                staged_strength,
+                staged_alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -1048,7 +1052,7 @@ class TestParameterDelta:
             staticmethod(unexpected_lora_merge),
         )
         monkeypatch.setattr(
-            ParameterDeltaTransform,
+            parameter_update_impl.ParameterUpdateTransform,
             "_stage_update_for_plan",
             tracked_stage,
         )
@@ -1142,7 +1146,7 @@ class TestParameterDelta:
             merge_adapter(model, [(adapter, 1.0)])
         assert model.weight.is_meta
 
-    def test_value_and_delta_conflict_across_adapters_before_mutation(self) -> None:
+    def test_value_with_dense_delta_still_rejects_physical_base(self) -> None:
         model = nn.Linear(3, 2, bias=False)
         model.requires_grad_(False)
         base = model.weight.detach().clone()
@@ -1155,7 +1159,7 @@ class TestParameterDelta:
         )
         value = Adapter.from_state_dict({"weight": torch.randn_like(base)})
 
-        with pytest.raises(ValueError, match="cannot combine parameter deltas and a value"):
+        with pytest.raises(ValueError, match="plain floating-point meta target"):
             merge_adapter(model, [(delta, 1.0), (value, 1.0)])
         torch.testing.assert_close(model.weight, base)
 
@@ -1177,8 +1181,8 @@ class TestParameterDelta:
         assert offloader.active_device is None
         assert offloader._routed_hook_removers == []
 
-    def test_transform_requires_validation_before_dense_application(self) -> None:
-        target = nn.Parameter(torch.zeros(2, 3), requires_grad=False)
+    def test_delta_transform_validates_and_reapplies_to_existing_weight(self) -> None:
+        target = nn.Parameter(torch.full((2, 3), 3.0), requires_grad=False)
         delta = ParameterDelta.from_tensors(
             dense=torch.ones_like(target),
         )
@@ -1186,6 +1190,18 @@ class TestParameterDelta:
 
         with pytest.raises(RuntimeError, match="must be validated"):
             transform.apply_parameter(target)
+
+        transform.validate_parameter(target)
+        for expected in (3.5, 4.0):
+            transform.apply_parameter(target)
+            torch.testing.assert_close(target, torch.full_like(target, expected))
+        sources = transform.storage_tensors()
+        assert len(sources) == 1
+        torch.testing.assert_close(sources[0], torch.ones_like(target))
+
+    def test_delta_transform_requires_an_additive_contribution(self) -> None:
+        with pytest.raises(ValueError, match="requires a delta"):
+            ParameterDeltaTransform([])
 
 
 # ---------------------------------------------------------------------------
@@ -1851,6 +1867,12 @@ class TestMergeCorrectness:
 
 
 class TestLoRATransform:
+    @pytest.mark.parametrize("beta", [float("nan"), float("inf"), -float("inf")])
+    def test_rejects_non_finite_base_coefficient(self, beta: float) -> None:
+        factor = ScaledLoRAFactor.from_tensors(torch.ones(1, 3), torch.ones(2, 1), 1.0)
+        with pytest.raises(ValueError, match="base coefficient must be finite"):
+            LoRATransform([factor], beta=beta)
+
     def test_stochastic_rounding_requires_target_key(self) -> None:
         factor = ScaledLoRAFactor.from_tensors(
             torch.randn(2, 8),
@@ -1974,8 +1996,9 @@ class TestLoRATransform:
             target: torch.Tensor,
             b: torch.Tensor,
             a: torch.Tensor,
-            strength: float,
+            alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> None:
             nonlocal merge_calls
@@ -1984,7 +2007,8 @@ class TestLoRATransform:
                 target,
                 b,
                 a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -2145,8 +2169,9 @@ class TestLoRATransform:
             target: torch.Tensor,
             staged_b: torch.Tensor,
             staged_a: torch.Tensor,
-            strength: float,
+            alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> None:
             merge_calls.append(
@@ -2154,14 +2179,15 @@ class TestLoRATransform:
                     target.device.type,
                     tuple(staged_b.shape),
                     tuple(staged_a.shape),
-                    strength,
+                    alpha,
                 )
             )
             original_merge(
                 target,
                 staged_b,
                 staged_a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -2273,8 +2299,9 @@ class TestLoRATransform:
             target: torch.Tensor,
             staged_b: torch.Tensor,
             staged_a: torch.Tensor,
-            strength: float,
+            alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> torch.Tensor | None:
             nonlocal generic_calls
@@ -2283,7 +2310,8 @@ class TestLoRATransform:
                 target,
                 staged_b,
                 staged_a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -2454,8 +2482,9 @@ class TestLoRATransform:
             target: torch.Tensor,
             b: torch.Tensor,
             a: torch.Tensor,
-            strength: float,
+            alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> torch.Tensor | None:
             nonlocal generic_calls
@@ -2464,7 +2493,8 @@ class TestLoRATransform:
                 target,
                 b,
                 a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -3525,7 +3555,7 @@ class TestPermanentMerge:
         assert model.weight.dtype is torch.float32
         torch.testing.assert_close(model.weight, source)
 
-    def test_factor_and_parameter_value_cannot_share_target_across_adapters(self) -> None:
+    def test_value_with_lora_still_rejects_physical_base(self) -> None:
         model = nn.Module()
         model.target = nn.Linear(3, 2, bias=False)
         model.requires_grad_(False)
@@ -3540,7 +3570,7 @@ class TestPermanentMerge:
         )
         value = Adapter.from_state_dict({"target.weight": torch.randn_like(base)})
 
-        with pytest.raises(ValueError, match="cannot combine"):
+        with pytest.raises(ValueError, match="plain floating-point meta target"):
             merge_adapter(model, [(lora, 0.5), (value, 0.5)])
         torch.testing.assert_close(model.target.weight, base)
 
@@ -3867,8 +3897,9 @@ class TestPermanentMerge:
             target: torch.Tensor,
             staged_b: torch.Tensor,
             staged_a: torch.Tensor,
-            strength: float,
+            alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> None:
             rounding_seeds.append(rounding_seed)
@@ -3876,7 +3907,8 @@ class TestPermanentMerge:
                 target,
                 staged_b,
                 staged_a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 

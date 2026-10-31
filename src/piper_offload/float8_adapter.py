@@ -138,13 +138,14 @@ def _torch_merge_float8_lora_(
     target: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> None:
     """Apply the established wrapper-based Float8 merge in place."""
     dense = dequantize_float8_tensor(target)
-    dense.addmm_(b, a, alpha=strength)
+    dense.addmm_(b, a, beta=beta, alpha=alpha)
     requantized = requantize_float8_tensor(
         dense,
         like=target,
@@ -267,11 +268,12 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
         target: torch.Tensor,
         _b: torch.Tensor,
         _a: torch.Tensor,
-        _strength: float,
+        _alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        del rounding_seed
+        del beta, rounding_seed
         validate_float8_requantize_layout(target)
 
     @staticmethod
@@ -279,8 +281,9 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a validated staged update while preserving the wrapper."""
@@ -293,7 +296,8 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
                 tuple(f8.block_size),
                 b,
                 a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             f8.qdata.copy_(qdata)
@@ -303,7 +307,8 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
             target,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 
@@ -321,8 +326,9 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a full-rank update while preserving the wrapper."""
@@ -334,7 +340,8 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
                 f8.scale,
                 tuple(f8.block_size),
                 update,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             f8.qdata.copy_(qdata)
@@ -344,7 +351,8 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
             Float8Adapter,
             target,
             update,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 

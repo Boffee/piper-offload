@@ -27,13 +27,16 @@ def merge_dense_requantize_(
     adapter: type[_DenseRequantizeAdapter],
     target: torch.Tensor,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> None:
-    """Dequantize, add one full-rank update, requantize, and refill target."""
+    """Scale the dense base, add the update, and encode into target once."""
     dense = adapter.dequantize(target)
-    dense.add_(update, alpha=strength)
+    if beta != 1.0:
+        dense.mul_(beta)
+    dense.add_(update, alpha=alpha)
     requantized = adapter.requantize(
         dense,
         like=target,

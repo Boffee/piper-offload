@@ -196,8 +196,28 @@ in a CUDA merge activation to materialize the weight.
 The target must be a frozen, plain floating-point meta parameter of the same
 logical shape. It supplies the name, shape, and alias group; the value supplies
 the active dtype and representation. Values cannot replace existing physical
-model parameters, combine with deltas on the same target, or compete with
-another active value. LoRA factors alone cannot materialize a meta target.
+model parameters or compete with another active value.
+
+A value from one adapter can supply the base for LoRA and dense deltas from
+other active adapters targeting the same parameter name:
+
+```text
+active parameter = value_scale * supplied_value
+                 + sum(strength_j * (scaling_j * B_j @ A_j + dense_j))
+```
+
+Each delta keeps its own adapter strength and intrinsic LoRA scaling. Those
+strengths do not scale the supplied value. The order of adapters does not
+choose the value owner; multiple active values are an error. Continue using
+one name for a tied parameter across all adapters. Within one adapter, a
+parameter entry remains either a complete value or an additive delta; supplying
+both for that parameter is rejected.
+
+Updates are validated against the supplied representation before application.
+The same [broadcasting rules](#broadcast-additive-updates) apply to these deltas;
+the supplied value itself must still match the complete target shape.
+An active delta with no active value cannot materialize a meta parameter,
+including when the value's adapter has zero strength.
 
 An unpopulated placeholder consumes no host backing and receives no storage of
 its own. The caller must avoid executing any path that needs it. Deactivation
@@ -213,10 +233,18 @@ adapters remain inactive under either policy.
 A value can use any supported physical representation with a floating compute
 dtype and compatible logical shape, including tile-packed INT4. Exact copying
 does not require additive merge support or a dequantize/requantize pass.
-Explicit non-unit scaling additionally requires dequantization and dense merge
-capabilities and re-encodes a quantized value once. `dtype=` casts dense adapter
-inputs; prequantized values must already have that compute dtype. Requantize
-them before capture if a different compute dtype is needed.
+LoRA-only contributions retain the factorized merge path, including when the
+supplied value is scaled. When dense deltas are present, Piper stages one dense
+additive update. Both paths pass the value scale separately to the tensor adapter.
+The adapter computes the scaled base plus that update before one terminal
+encoding; it never constructs a cancelling `(value_scale - 1) * value` term.
+Value-only scaling requires dense merge support and uses a zero additive update.
+Arithmetic follows the representation's compute dtype and backend accumulation;
+adapter ordering does not promise bit-identical sums.
+
+`dtype=` casts dense adapter inputs; prequantized values must already have that
+compute dtype. Requantize them before capture if a different compute dtype is
+needed.
 
 Callers own numerical validity: Piper checks representation structure, shape,
 dtype, and capabilities, but does not scan tensor payloads for NaN or infinity.
@@ -242,8 +270,8 @@ targets are first replaced with owned copies under every tied name; Piper
 never writes into a checkpoint mapping. Meta targets become independent frozen
 CPU parameters with their aliases preserved.
 
-Permanent merge accepts the same strength, partial-target, and rounding
-policies. Quantized support follows the [format matrix](formats.md), except
+Permanent merge accepts the same cross-adapter composition, strength,
+partial-target, and rounding policies. Quantized support follows the [format matrix](formats.md), except
 that packed GGUF sources can only be merged during activation. See
 [merge.py](../src/piper_offload/merge.py) for the function contract and
 [lora.py](../src/piper_offload/lora.py) for factor and routing details.

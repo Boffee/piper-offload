@@ -49,15 +49,11 @@ class AdapterTargetUpdates:
         *,
         target_key: str,
     ) -> None:
-        """Bind one contribution, enforcing exclusive value ownership."""
+        """Bind one contribution, allowing only one authoritative value."""
         if isinstance(target, ParameterDelta):
-            if self.value is not None:
-                raise ValueError(f"Adapter target {target_key!r} cannot combine parameter deltas and a value.")
             self.deltas.append(target.scaled(strength))
             return
 
-        if self.deltas:
-            raise ValueError(f"Adapter target {target_key!r} cannot combine parameter deltas and a value.")
         if self.value is not None:
             raise ValueError(f"Adapter target {target_key!r} has multiple active parameter values.")
         self.value = target.scaled(strength)
@@ -109,7 +105,9 @@ class Adapter:
     Strength is extrinsic and supplied when the adapter is activated or
     permanently merged. It always scales parameter deltas. Complete parameter
     values remain unchanged by default and can explicitly opt into strength
-    scaling.
+    scaling. For one parameter, an adapter supplies either a value or a delta.
+    Merge application can combine one value with deltas from other adapters,
+    validating their arithmetic against the supplied representation.
 
     ``state_dict`` keys must already use model parameter paths. Any key
     remapping and removal of non-adapter metadata are the caller's

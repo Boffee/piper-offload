@@ -610,11 +610,12 @@ class TestNvfp4Adapter:
             is_swizzled_scales: bool,
             b: torch.Tensor,
             a: torch.Tensor,
-            strength: float,
+            alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-            calls.append((tuple(b.shape), tuple(a.shape), strength))
+            calls.append((tuple(b.shape), tuple(a.shape), alpha))
             return triton_merge(
                 qdata,
                 scale,
@@ -623,7 +624,8 @@ class TestNvfp4Adapter:
                 is_swizzled_scales,
                 b,
                 a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 

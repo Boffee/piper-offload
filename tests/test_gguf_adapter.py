@@ -310,7 +310,11 @@ class TestDirectConversion:
                 group_size=64,
             )
             dense = expected.dequantize()
-            expected.add_(dense, alpha=-0.5)
+            expected.addmm_(
+                torch.zeros(expected.shape[0], 1, dtype=expected.dtype, device=expected.device),
+                torch.zeros(1, expected.shape[1], dtype=expected.dtype, device=expected.device),
+                beta=0.5,
+            )
             torch.testing.assert_close(actual.qdata, expected.qdata)
             torch.testing.assert_close(actual.scale, expected.scale)
         finally:

@@ -29,11 +29,13 @@ def _merge_update_kernel(
     update_ptr,
     dense_ptr,
     tile_max_ptr,
-    strength,
+    alpha,
+    beta,
     M,
     N,
     K: tl.constexpr,
     DENSE_UPDATE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -80,7 +82,10 @@ def _merge_update_kernel(
     elif COMPUTE_DTYPE == 1:
         base = base.to(tl.bfloat16)
 
-    merged = base.to(tl.float32) + accumulator * strength
+    if SCALE_BASE:
+        base = base.to(tl.float32) * beta
+
+    merged = base.to(tl.float32) + accumulator * alpha
     if COMPUTE_DTYPE == 0:
         merged = merged.to(tl.float16)
     elif COMPUTE_DTYPE == 1:
@@ -184,8 +189,9 @@ def _merge_static_float8(
     b: torch.Tensor,
     a: torch.Tensor,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     dense_update: bool,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -252,11 +258,13 @@ def _merge_static_float8(
         update,
         dense,
         tile_max,
-        strength,
+        alpha,
+        beta,
         M=rows,
         N=cols,
         K=rank,
         DENSE_UPDATE=dense_update,
+        SCALE_BASE=beta != 1.0,
         COMPUTE_DTYPE=compute_dtype,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
@@ -316,8 +324,9 @@ def merge_static_float8_lora(
     scale: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return raw FP8 buffers after one static-per-tensor LoRA merge."""
@@ -327,7 +336,8 @@ def merge_static_float8_lora(
         b,
         a,
         b,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=False,
         rounding_seed=rounding_seed,
     )
@@ -337,8 +347,9 @@ def merge_static_float8_dense(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return raw FP8 buffers after one static-per-tensor dense merge."""
@@ -348,7 +359,8 @@ def merge_static_float8_dense(
         update,
         update,
         update,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=True,
         rounding_seed=rounding_seed,
     )

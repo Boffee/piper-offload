@@ -76,13 +76,14 @@ def _torch_merge_bnb8_lora(
     target: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge through the ordinary dequantize/addmm/requantize path."""
     dense = dequantize_int8_params(target)
-    dense.addmm_(b, a, alpha=strength)
+    dense.addmm_(b, a, beta=beta, alpha=alpha)
     merged = require_int8_params(
         requantize_int8_params(
             dense,
@@ -304,8 +305,9 @@ class Bnb8bitAdapter:
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge into BNB8 storage, preferring the raw Triton path."""
@@ -317,7 +319,8 @@ class Bnb8bitAdapter:
                 qt.SCB,
                 b,
                 a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
         else:
@@ -325,7 +328,8 @@ class Bnb8bitAdapter:
                 target,
                 b,
                 a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
         cb, scb = merged
@@ -336,8 +340,9 @@ class Bnb8bitAdapter:
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a full-rank update, preferring the raw Triton path."""
@@ -348,7 +353,8 @@ class Bnb8bitAdapter:
                 qt.CB,
                 qt.SCB,
                 update,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             qt.CB.copy_(cb)
@@ -358,7 +364,8 @@ class Bnb8bitAdapter:
             Bnb8bitAdapter,
             target,
             update,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 

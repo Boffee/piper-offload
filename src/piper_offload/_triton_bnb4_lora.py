@@ -173,12 +173,14 @@ def _merge_quantize_kernel(
     update_ptr,
     output_absmax_ptr,
     output_packed_ptr,
-    strength,
+    alpha,
+    beta,
     rounding_seed,
     M,
     N,
     K: tl.constexpr,
     DENSE_UPDATE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
     QUANT_TYPE: tl.constexpr,
     NESTED: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
@@ -261,7 +263,10 @@ def _merge_quantize_kernel(
     elif COMPUTE_DTYPE == 1:
         base = base.to(tl.bfloat16)
 
-    merged = base.to(tl.float32) + accumulator * strength
+    if SCALE_BASE:
+        base = base.to(tl.float32) * beta
+
+    merged = base.to(tl.float32) + accumulator * alpha
     if COMPUTE_DTYPE == 0:
         merged = merged.to(tl.float16)
     elif COMPUTE_DTYPE == 1:
@@ -454,8 +459,9 @@ def _merge_bnb4(
     b: torch.Tensor,
     a: torch.Tensor,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     dense_update: bool,
     rounding_seed: int | None = None,
 ) -> tuple[
@@ -584,12 +590,14 @@ def _merge_bnb4(
         update,
         raw_absmax,
         output_packed,
-        strength,
+        alpha,
+        beta,
         seed_argument(rounding_seed),
         M=rows,
         N=cols,
         K=rank,
         DENSE_UPDATE=dense_update,
+        SCALE_BASE=beta != 1.0,
         QUANT_TYPE=quant_type_id,
         NESTED=nested,
         COMPUTE_DTYPE=compute_dtype,
@@ -639,8 +647,9 @@ def merge_bnb4_lora(
     quant_type: str,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Merge each row-aligned quantization block from LoRA factors."""
@@ -657,7 +666,8 @@ def merge_bnb4_lora(
         b,
         a,
         b,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=False,
         rounding_seed=rounding_seed,
     )
@@ -674,8 +684,9 @@ def merge_bnb4_dense(
     blocksize: int,
     quant_type: str,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Merge each row-aligned quantization block from a dense update."""
@@ -692,7 +703,8 @@ def merge_bnb4_dense(
         update,
         update,
         update,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=True,
         rounding_seed=rounding_seed,
     )

@@ -7,9 +7,9 @@ Quantized adapters own their factorized and dense encoding paths and may select
 a format-specific kernel or a dequantize/requantize fallback. Mixed deltas and
 scaled quantized values encode the target once.
 
-Permanent and activation merge use the same parameter-delta and
-parameter-value transforms. Permanent merge applies them to resident model
-parameters; activation merge invokes them after individual parameter copies.
+Permanent and activation merge share source selection and arithmetic planning.
+Permanent merge applies updates to resident model parameters; activation merge
+invokes them after individual parameter copies.
 """
 
 import contextlib
@@ -21,11 +21,9 @@ from typing import Any
 import torch
 from torch import nn
 
+from ._parameter_update import ParameterUpdatePlan, plan_parameter_update
 from .adapter import Adapter, AdapterTargetUpdates
 from .module_names import resolve_parent_leaf
-from .parameter_delta import ParameterDeltaTransform
-from .parameter_transform import ParameterTransform
-from .parameter_value import ParameterValueTransform
 from .pin_manager import host_pin_manager
 from .tensor_adapter_registry import (
     param_representation,
@@ -59,30 +57,31 @@ class _TargetGroup:
 class _MergeOp:
     aliases: tuple[str, ...]
     param: nn.Parameter
-    transform: ParameterTransform
+    plan: ParameterUpdatePlan
 
     def validate(self) -> None:
-        """Preflight this operation's parameter."""
-        if isinstance(self.transform, ParameterValueTransform):
-            if self.transform.requires_update:
-                _validate_permanent_update(self.transform.backing.adapter)
-        else:
-            _validate_permanent_update(
-                select_adapter(param_representation(self.param))
+        """Preflight the effective representation before any model mutation."""
+        if self.plan.update is not None:
+            adapter = (
+                self.plan.source.adapter
+                if self.plan.source is not None
+                else select_adapter(param_representation(self.param))
             )
-        self.transform.validate_parameter(self.param)
+            _validate_permanent_update(adapter)
+        self.plan.validate_parameter(self.param)
 
     def apply(self, model: nn.Module) -> None:
-        """Apply this operation's parameter update."""
-        if isinstance(self.transform, ParameterValueTransform):
-            self._install(model, self.transform.materialize())
-            return
-        param = self.param
-        owned = _owned_copy(param)
-        if owned is not None:
-            self._install(model, owned)
-            param = owned
-        self.transform.apply_parameter(param)
+        """Apply to an owned replacement or the writable existing parameter."""
+        replacement = (
+            self.plan.source.clone_cpu_param()
+            if self.plan.source is not None
+            else _owned_copy(self.param)
+        )
+        param = self.param if replacement is None else replacement
+        if self.plan.update is not None:
+            self.plan.update.apply_parameter(param)
+        if replacement is not None:
+            self._install(model, replacement)
 
     def _install(self, model: nn.Module, replacement: nn.Parameter) -> None:
         for alias in self.aliases:
@@ -128,13 +127,16 @@ def merge_adapter(
     sub-step additive updates are not systematically rounded away; pass
     ``stochastic_rounding=False`` for deterministic rounding. Parameter values
     populate frozen floating-point meta targets according to their strength
-    policy. Every registered physical value retains its source representation;
-    explicit non-unit scaling additionally requires dequantization and dense
-    merge support. A populated meta target is replaced by one independent
-    frozen CPU parameter, preserving any tied aliases of the original
-    parameter. A target that is a view into a file mapping is likewise
-    replaced by an independent parameter under every tied name before it is
-    merged: Piper never writes into a file mapping, because the pin manager
+    policy and can compose with deltas from other adapters on the same named
+    parameter. Value scaling and all deltas combine before terminal encoding.
+    Every registered physical value retains its source representation.
+    LoRA-only compositions use factorized merge support at any value scale;
+    value-only scaling and compositions with dense deltas require dense merge
+    support. A populated meta target is replaced by one independent frozen CPU
+    parameter, preserving any tied aliases of the original parameter.
+    A target that is a view into a file mapping is likewise
+    merged into an independent copy installed under every tied name: Piper
+    never writes into a file mapping, because the pin manager
     may return a mapping's pages to the file.
     """
     # Filtering here avoids target lookup, staging, validation, and
@@ -193,7 +195,12 @@ def _merge_adapters(
     # If the synchronization itself fails the context is unusable and no
     # later call could retry it, so the lease closes with this function.
     devices = {op.param.device for op in merge_ops if op.param.device.type == "cuda"}
-    sources = (tensor for op in merge_ops for tensor in op.transform.storage_tensors())
+    sources = (
+        tensor
+        for op in merge_ops
+        if op.plan.update is not None
+        for tensor in op.plan.update.storage_tensors()
+    )
     with host_pin_manager.acquire(sources, pin=False) if devices else contextlib.nullcontext():
         try:
             for op in merge_ops:
@@ -278,26 +285,12 @@ def _build_merge_ops(
         target_key = group.target_key
         param = group.param
         aliases = tuple(names_by_tie[tensor_id])
-        transform: ParameterTransform
-        if group.updates.deltas:
-            transform = ParameterDeltaTransform(
-                group.updates.deltas,
-                stochastic_rounding=stochastic_rounding,
-                target_key=target_key,
-            )
-        else:
-            assert group.updates.value is not None
-            transform = ParameterValueTransform(
-                group.updates.value,
-                stochastic_rounding=stochastic_rounding,
-                target_key=target_key,
-            )
-        merge_ops.append(
-            _MergeOp(
-                aliases,
-                param,
-                transform,
-            )
+        plan = plan_parameter_update(
+            group.updates.deltas,
+            value=group.updates.value,
+            stochastic_rounding=stochastic_rounding,
+            target_key=target_key,
         )
+        merge_ops.append(_MergeOp(aliases, param, plan))
 
     return merge_ops

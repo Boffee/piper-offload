@@ -179,13 +179,14 @@ def _torch_merge_nvfp4_lora_(
     target: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> None:
     """Apply the established wrapper-based NVFP4 merge in place."""
     dense = dequantize_nvfp4_tensor(target)
-    dense.addmm_(b, a, alpha=strength)
+    dense.addmm_(b, a, beta=beta, alpha=alpha)
     requantized = requantize_nvfp4_tensor(
         dense,
         like=target,
@@ -325,11 +326,12 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
         target: torch.Tensor,
         _b: torch.Tensor,
         _a: torch.Tensor,
-        _strength: float,
+        _alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        del rounding_seed
+        del beta, rounding_seed
         Nvfp4Adapter._validate_merge_target(target, kind="lora")
 
     @staticmethod
@@ -337,8 +339,9 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a validated staged update while preserving target storage."""
@@ -353,7 +356,8 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
                 nv.is_swizzled_scales,
                 b,
                 a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             nv.qdata.copy_(qdata)
@@ -366,7 +370,8 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
             target,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 
@@ -384,13 +389,17 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a full-rank update while preserving target storage."""
         nv = require_nvfp4_tensor(target)
-        if not getattr(nv, "high_first", False) and _is_triton_nvfp4_dense_layout(nv, update):
+        if (
+            not getattr(nv, "high_first", False)
+            and _is_triton_nvfp4_dense_layout(nv, update)
+        ):
             assert _triton_merge_nvfp4_dense is not None
             qdata, scale, per_tensor_scale = _triton_merge_nvfp4_dense(
                 nv.qdata,
@@ -399,7 +408,8 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
                 nv.block_size,
                 nv.is_swizzled_scales,
                 update,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             nv.qdata.copy_(qdata)
@@ -412,7 +422,8 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
             Nvfp4Adapter,
             target,
             update,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 

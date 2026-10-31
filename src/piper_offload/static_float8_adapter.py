@@ -56,13 +56,14 @@ def _torch_merge_static_float8_lora(
     target: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge static FP8 through its ordinary Torch reference path."""
     dense = dequantize_static_float8_tensor(target)
-    dense.addmm_(b, a, alpha=strength)
+    dense.addmm_(b, a, beta=beta, alpha=alpha)
 
     requantized = requantize_static_float8_tensor(
         dense,
@@ -77,8 +78,9 @@ def _merge_static_float8_lora(
     target: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Prefer Triton, falling back to the wrapper-based Torch merge."""
@@ -92,14 +94,16 @@ def _merge_static_float8_lora(
             f8.scale,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
     return _torch_merge_static_float8_lora(
         target,
         b,
         a,
-        strength,
+        alpha,
+        beta=beta,
         rounding_seed=rounding_seed,
     )
 
@@ -225,8 +229,9 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Run and install the preferred static-FP8 LoRA merge."""
@@ -235,7 +240,8 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
             target,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
         qdata, scale = merged
@@ -246,8 +252,9 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a full-rank update without changing activation calibration."""
@@ -257,7 +264,8 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
                 f8.qdata,
                 f8.scale,
                 update,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
             f8.qdata.copy_(qdata)
@@ -267,7 +275,8 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
             StaticFloat8Adapter,
             target,
             update,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=rounding_seed,
         )
 

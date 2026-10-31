@@ -97,7 +97,19 @@ protects a store from eviction. A pin lease independently protects the storage
 used by a transfer.
 
 An activation is a *session*. Its *load plans* combine base weights with any
-requested adapter updates. *Host state* is the CPU representation held by a
+requested adapter updates. Activation and permanent merge share per-parameter
+planning in [_parameter_update.py](../src/piper_offload/_parameter_update.py):
+one optional replacement source and one combined arithmetic update. A supplied
+value is validated against its meta slot, and arithmetic against the effective
+physical source. The private `ParameterUpdateTransform` owns update validation,
+staging, and repeated-merge seeds. Its `source_scale` is the supplied value's
+effective strength, or `1` for an existing model weight; each delta retains its
+own strength. The public `ParameterDeltaTransform` delegates with unit source
+scaling, and `ParameterValueTransform` delegates through the source plan.
+Application paths own allocation, leases, and installation; tensor adapters
+own representation-specific arithmetic.
+
+*Host state* is the CPU representation held by a
 `HostParam` and interpreted by its *tensor adapter*. Capitalized `Adapter`
 means a model-update resource, rather than that per-format protocol.
 
@@ -180,6 +192,28 @@ every source broadcasts to the existing logical target shape, then calls
 sources must match the full target shape. Implementations receive compact staged
 products or dense updates and own their broadcast arithmetic; see the
 [shape and rounding contract](adapters.md#broadcast-additive-updates).
+
+Both merge interfaces use `alpha` for the update coefficient and keyword-only
+`beta: float = 1.0` for the current target coefficient, matching `addmm`:
+LoRA merge computes `beta * target + alpha * (b @ a)`; dense merge computes
+`beta * target + alpha * update`. Staged validation accepts the same coefficients.
+These coefficients must be finite. Merge `alpha` is the effective update
+coefficient, distinct from a checkpoint's intrinsic LoRA alpha. Packed LoRAs
+absorb their individual coefficients into the factors and use merge `alpha=1`.
+The shared parameter update passes its `source_scale` as `beta`, including through
+`LoRATransform`. Factor-only compositions retain that path at any source scale;
+dense deltas and value-only scaling use the dense path.
+
+Keep scaling separate from the staged additive update: constructing a cancelling
+base delta can overflow or lose small updates in FP16/BF16. Encode only the final
+result, preserving target storage and activation calibration. Optimized kernels
+apply the coefficient to the decoded source before adding the update, retaining
+the representation's compute precision and fused terminal rounding. Reference
+merges remain for unsupported devices or layouts.
+
+Custom merge adapters must implement `alpha` and `beta` in merge and staged
+validation methods, including prepared-factor forwarding where provided;
+dequantization and representation-copy capabilities remain separate contracts.
 
 ## Runtime and compilation
 

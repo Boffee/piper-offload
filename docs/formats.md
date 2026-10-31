@@ -51,9 +51,12 @@ logical target shape and reject broadcast requests during preflight.
 Quantized additive merges recompute data-dependent weight scales and preserve
 activation calibration metadata. Standard CUDA layouts use format-specific
 Triton kernels where available; other supported layouts use a reference
-dequantize/requantize path. Piper ConvRot delegates merges to Piper Kernels.
+dequantize/requantize path. Source scaling uses the same optimized merge paths
+and terminal rounding. Optimized merges keep source scaling and addition in
+FP32 until the terms are combined, avoiding intermediate overflow or loss of
+small residuals. Piper ConvRot uses Piper Kernels operations and encoders.
 All merge-capable built-in quantized formats support stochastic rounding.
-Nested bitsandbytes 4-bit scales use the reference path.
+Stochastic merges with nested bitsandbytes 4-bit scales use the reference path.
 
 ## Training and layout limits
 
@@ -75,7 +78,11 @@ can re-encode the layout.
 Complete [parameter values](adapters.md#populate-optional-meta-parameters)
 have a broader use than additive updates: exact representation copying works
 for supported physical values even when additive merge is unavailable.
-Non-unit strength scaling requires the additional merge capabilities.
+Deltas from other adapters must be supported by the supplied representation.
+Scaled values with LoRA-only contributions use factorized merge support;
+value-only scaling and compositions containing dense deltas require dense merge
+support. Scaling and deltas combine before one terminal re-encoding. See the
+[composition contract](adapters.md#populate-optional-meta-parameters).
 
 ## Format details
 

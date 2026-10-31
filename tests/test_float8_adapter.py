@@ -512,18 +512,20 @@ class TestFloat8Adapter:
             block_size: tuple[int, ...],
             b: torch.Tensor,
             a: torch.Tensor,
-            strength: float,
+            alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            calls.append((tuple(b.shape), tuple(a.shape), strength))
+            calls.append((tuple(b.shape), tuple(a.shape), alpha))
             return triton_merge(
                 qdata,
                 scale,
                 block_size,
                 b,
                 a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -629,8 +631,9 @@ class TestFloat8Adapter:
             target: torch.Tensor,
             staged_b: torch.Tensor,
             staged_a: torch.Tensor,
-            strength: float,
+            alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> None:
             nonlocal fallback_calls
@@ -639,7 +642,8 @@ class TestFloat8Adapter:
                 target,
                 staged_b,
                 staged_a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 

@@ -2,7 +2,7 @@
 
 # Triton JIT kernel signatures intentionally use untyped pointer parameters
 # and upper-case constexpr names.
-# ruff: noqa: ANN001, ANN202, N803, PLR0913
+# ruff: noqa: ANN001, ANN202, N803, PLR0912, PLR0913
 # pyright: reportCallIssue=false, reportIndexIssue=false
 
 import torch
@@ -32,11 +32,13 @@ def _merge_update_kernel(
     a_ptr,
     update_ptr,
     output_ptr,
-    strength,
+    alpha,
+    beta,
     M,
     N,
     K: tl.constexpr,
     DENSE_UPDATE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
     SCALE_AXIS: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -102,7 +104,10 @@ def _merge_update_kernel(
     elif COMPUTE_DTYPE == 1:
         base = base.to(tl.bfloat16)
 
-    merged = base.to(tl.float32) + accumulator * strength
+    if SCALE_BASE:
+        base = base.to(tl.float32) * beta
+
+    merged = base.to(tl.float32) + accumulator * alpha
     if COMPUTE_DTYPE == 0:
         merged = merged.to(tl.float16)
     elif COMPUTE_DTYPE == 1:
@@ -231,8 +236,9 @@ def _merge_quanto_qbytes(
     b: torch.Tensor,
     a: torch.Tensor,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     dense_update: bool,
     integer_storage: bool,
     qmin: float,
@@ -295,11 +301,13 @@ def _merge_quanto_qbytes(
         a,
         update,
         dense,
-        strength,
+        alpha,
+        beta,
         M=rows,
         N=cols,
         K=rank,
         DENSE_UPDATE=dense_update,
+        SCALE_BASE=beta != 1.0,
         SCALE_AXIS=scale_axis,
         COMPUTE_DTYPE=compute_dtype,
         BLOCK_M=block_m,
@@ -337,8 +345,9 @@ def merge_quanto_qint8_lora(
     axis: int | None,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return qint8 storage and its recomputed absmax scale."""
@@ -351,7 +360,8 @@ def merge_quanto_qint8_lora(
         b,
         a,
         b,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=False,
         integer_storage=True,
         qmin=-128.0,
@@ -367,8 +377,9 @@ def merge_quanto_qfloat8_lora(
     axis: int | None,
     b: torch.Tensor,
     a: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return qfloat8 storage and its recomputed absmax scale."""
@@ -388,7 +399,8 @@ def merge_quanto_qfloat8_lora(
         b,
         a,
         b,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=False,
         integer_storage=False,
         qmin=limits.min,
@@ -403,8 +415,9 @@ def merge_quanto_qint8_dense(
     scale: torch.Tensor,
     axis: int | None,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return qint8 storage and its recomputed scale after a dense merge."""
@@ -417,7 +430,8 @@ def merge_quanto_qint8_dense(
         update,
         update,
         update,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=True,
         integer_storage=True,
         qmin=-128.0,
@@ -432,8 +446,9 @@ def merge_quanto_qfloat8_dense(
     scale: torch.Tensor,
     axis: int | None,
     update: torch.Tensor,
-    strength: float,
+    alpha: float,
     *,
+    beta: float = 1.0,
     rounding_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return qfloat8 storage and its recomputed scale after a dense merge."""
@@ -447,7 +462,8 @@ def merge_quanto_qfloat8_dense(
         update,
         update,
         update,
-        strength,
+        alpha,
+        beta=beta,
         dense_update=True,
         integer_storage=False,
         qmin=limits.min,

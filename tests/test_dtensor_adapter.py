@@ -19,6 +19,7 @@ from piper_offload import (
     Adapter,
     LoRATransform,
     ModelOffloader,
+    ParameterDelta,
     ScaledLoRAFactor,
     merge_adapter,
 )
@@ -257,11 +258,13 @@ class TestDTensorAdapter:
                 _target: torch.Tensor,
                 b: torch.Tensor,
                 a: torch.Tensor,
-                _strength: float,
+                _alpha: float,
                 *,
+                beta: float = 1.0,
                 rounding_seed: int | None = None,
             ) -> None:
                 del rounding_seed
+                assert beta == -0.5
                 calls.append((b, a))
 
         local = torch.empty(3, 4, device="cuda")
@@ -285,6 +288,7 @@ class TestDTensorAdapter:
             global_b,
             global_a,
             0.5,
+            beta=-0.5,
         )
 
         assert len(calls) == 1
@@ -575,15 +579,20 @@ class TestDTensorAdapter:
         assert not isinstance(adapter, TensorCopyIntoAdapter)
         assert not isinstance(adapter, ParameterDataSwapTensorAdapter)
 
+    @pytest.mark.parametrize("with_delta", [False, True])
     def test_parameter_value_preserves_dtensor_and_scales_local_shard(
         self,
         tp_mesh: Any,
+        with_delta: bool,
     ) -> None:
-        dt, full = _dtensor_weight(tp_mesh)
+        dt, full = _dtensor_weight(tp_mesh, dtype=torch.float32 if with_delta else torch.bfloat16)
         adapter = Adapter.from_state_dict(
             {"weight": dt},
             scale_parameter_values=True,
         )
+        delta = Adapter({"weight": ParameterDelta.from_tensors(
+            dense=torch.full(tuple(dt.shape), 0.25),
+        )})
         model = nn.Module()
         model.weight = nn.Parameter(
             torch.empty(dt.shape, device="meta"),
@@ -594,26 +603,33 @@ class TestDTensorAdapter:
         with activated_model(
             offloader,
             "cuda",
-            adapters=[adapter],
-            adapter_strengths=[0.5],
+            adapters=[adapter, delta],
+            adapter_strengths=[0.5, 1.0 if with_delta else 0.0],
             stochastic_rounding=False,
         ):
             actual = param_representation(model.weight)
             assert _is_dtensor(actual)
             assert actual.device_mesh == tp_mesh
-            torch.testing.assert_close(actual.full_tensor(), full * 0.5)
+            torch.testing.assert_close(
+                actual.full_tensor(), full * 0.5 + (0.25 if with_delta else 0.0),
+            )
 
         assert model.weight.is_meta
 
+    @pytest.mark.parametrize("with_delta", [False, True])
     def test_permanent_parameter_value_scales_cpu_dtensor(
         self,
         tp_mesh: Any,
+        with_delta: bool,
     ) -> None:
-        dt, _ = _dtensor_weight(tp_mesh)
+        dt, _ = _dtensor_weight(tp_mesh, dtype=torch.float32 if with_delta else torch.bfloat16)
         adapter = Adapter.from_state_dict(
             {"weight": dt},
             scale_parameter_values=True,
         )
+        delta = Adapter({"weight": ParameterDelta.from_tensors(
+            dense=torch.full(tuple(dt.shape), 0.25),
+        )})
         model = nn.Module()
         model.weight = nn.Parameter(
             torch.empty(dt.shape, device="meta"),
@@ -623,7 +639,7 @@ class TestDTensorAdapter:
         assert (
             merge_adapter(
                 model,
-                [(adapter, 0.5)],
+                [(adapter, 0.5), (delta, 1.0 if with_delta else 0.0)],
                 stochastic_rounding=False,
             )
             == 1
@@ -635,7 +651,7 @@ class TestDTensorAdapter:
         assert actual.placements == dt.placements
         torch.testing.assert_close(
             actual.to_local(),
-            dt.to_local().cpu() * 0.5,
+            dt.to_local().cpu() * 0.5 + (0.25 if with_delta else 0.0),
         )
 
     def test_composes_with_quantized_local_shard(self, tp_mesh: Any) -> None:
@@ -716,9 +732,11 @@ class TestDTensorAdapter:
                 atol=0.05,
             )
 
+    @pytest.mark.parametrize("beta", [1.0, -0.5])
     def test_packed_int8_delegates_factor_aware_staging(
         self,
         tp_mesh: Any,
+        beta: float,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The outer DTensor must preserve factor boundaries for INT8 p."""
@@ -784,7 +802,7 @@ class TestDTensorAdapter:
         factors = [ScaledLoRAFactor.from_tensors(a.clone(), b.clone(), strength) for _ in range(2)]
         param = nn.Parameter(weight, requires_grad=False)
         x = torch.full((3, cols), 0.1, device="cuda")
-        routed_output = torch.nn.functional.linear(x, local)
+        routed_output = torch.nn.functional.linear(x, local) * beta
         for _ in factors:
             routed_output = routed_output + ((x @ a.to("cuda").T) * strength) @ b.to("cuda").T
 
@@ -795,8 +813,9 @@ class TestDTensorAdapter:
             target: torch.Tensor,
             packed_b: torch.Tensor,
             packed_a: torch.Tensor,
-            packed_strength: float,
+            packed_alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> None:
             prepared_targets.append(target)
@@ -812,7 +831,8 @@ class TestDTensorAdapter:
                 target,
                 packed_b,
                 packed_a,
-                packed_strength,
+                packed_alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -823,7 +843,7 @@ class TestDTensorAdapter:
         )
 
         pre_scale_ptr = local.act_pre_scale.data_ptr()
-        transform = LoRATransform(factors)
+        transform = LoRATransform(factors, beta=beta)
         transform.validate_target(param)
         transform.apply(param)
         torch.cuda.synchronize()
@@ -887,8 +907,9 @@ class TestDTensorAdapter:
             target: torch.Tensor,
             b: torch.Tensor,
             a: torch.Tensor,
-            strength: float,
+            alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> None:
             calls.append((type(target), tuple(b.shape), tuple(a.shape)))
@@ -896,7 +917,8 @@ class TestDTensorAdapter:
                 target,
                 b,
                 a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 

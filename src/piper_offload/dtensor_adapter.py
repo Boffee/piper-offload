@@ -35,7 +35,7 @@ of the original host allocation, including mmap-backed checkpoint storage.
 The adapter advertises no CPU round-trip, full dequantize/requantize,
 ``copy_into``, or trainable ``.data`` swap capability. It can expose a dense
 local shard when the inner adapter can, which lets exact-name parameter values
-reuse the same dense merge path for strength scaling. A DTensor merge is
+reuse the same dense merge path for value-only scaling. A DTensor merge is
 available only when its local shard's adapter supports the corresponding
 factorized or dense merge operation; otherwise routed LoRA remains the
 inference path.
@@ -601,8 +601,9 @@ class DTensorAdapter:
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Validate both DTensor placement and inner shard merge operation."""
@@ -613,7 +614,8 @@ class DTensorAdapter:
                 context.local,
                 local_b,
                 local_a,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=_localize_rounding_seed(
                     rounding_seed,
                     context.offsets,
@@ -624,8 +626,9 @@ class DTensorAdapter:
     def validate_dense_merge(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Validate placement and the local shard's dense merge operation."""
@@ -635,7 +638,8 @@ class DTensorAdapter:
             context.inner.validate_dense_merge(
                 context.local,
                 local_update,
-                strength,
+                alpha,
+                beta=beta,
                 rounding_seed=_localize_rounding_seed(
                     rounding_seed,
                     context.offsets,
@@ -713,8 +717,9 @@ class DTensorAdapter:
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Validate a prepared update with the local-shard adapter."""
@@ -729,7 +734,8 @@ class DTensorAdapter:
             context.local,
             b,
             a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=_localize_rounding_seed(
                 rounding_seed,
                 context.offsets,
@@ -741,8 +747,9 @@ class DTensorAdapter:
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Apply a prepared update with the local-shard adapter."""
@@ -757,7 +764,8 @@ class DTensorAdapter:
             context.local,
             b.contiguous(),
             a.contiguous(),
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=_localize_rounding_seed(
                 rounding_seed,
                 context.offsets,
@@ -769,8 +777,9 @@ class DTensorAdapter:
         target: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge local or global LoRA factors into this rank's weight shard.
@@ -787,7 +796,8 @@ class DTensorAdapter:
             context.local,
             local_b,
             local_a,
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=_localize_rounding_seed(
                 rounding_seed,
                 context.offsets,
@@ -798,8 +808,9 @@ class DTensorAdapter:
     def merge_dense_(
         target: torch.Tensor,
         update: torch.Tensor,
-        strength: float,
+        alpha: float,
         *,
+        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Merge a global or local full-rank update into this rank's shard."""
@@ -807,7 +818,8 @@ class DTensorAdapter:
         context.inner.merge_dense_(
             context.local,
             _local_dense_update(context, update),
-            strength,
+            alpha,
+            beta=beta,
             rounding_seed=_localize_rounding_seed(
                 rounding_seed,
                 context.offsets,

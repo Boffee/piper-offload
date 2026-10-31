@@ -621,10 +621,12 @@ class TestInt8Adapter:
             pytest.param("cuda", True, marks=CUDA),
         ],
     )
+    @pytest.mark.parametrize("beta", [1.0, -0.5])
     def test_packed_factors_map_act_pre_scale(
         self,
         device: str,
         expects_triton: bool,
+        beta: float,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         torch.manual_seed(125)
@@ -647,7 +649,7 @@ class TestInt8Adapter:
         factors = [ScaledLoRAFactor.from_tensors(a.clone(), b.clone(), strength) for _ in range(2)]
         x = torch.full((3, cols), x_value, device=device)
 
-        routed_output = torch.nn.functional.linear(x, qt)
+        routed_output = torch.nn.functional.linear(x, qt) * beta
         for _ in factors:
             routed_output = routed_output + ((x @ a.to(device).T) * strength) @ b.to(device).T
 
@@ -658,8 +660,9 @@ class TestInt8Adapter:
             target: torch.Tensor,
             packed_b: torch.Tensor,
             packed_a: torch.Tensor,
-            packed_strength: float,
+            packed_alpha: float,
             *,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> None:
             prepared_a.append(packed_a.detach().clone())
@@ -667,7 +670,8 @@ class TestInt8Adapter:
                 target,
                 packed_b,
                 packed_a,
-                packed_strength,
+                packed_alpha,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -694,7 +698,7 @@ class TestInt8Adapter:
             )
 
         pre_scale_ptr = qt.act_pre_scale.data_ptr()
-        transform = LoRATransform(factors)
+        transform = LoRATransform(factors, beta=beta)
         transform.validate_target(param)
         transform.apply(param)
         if device == "cuda":
@@ -912,20 +916,21 @@ class TestInt8Adapter:
         triton_merge = int8_adapter_module._triton_merge_int8_lora
         assert triton_merge is not None
 
-        def tracked_triton_merge(
+        def tracked_triton_merge(  # noqa: PLR0913
             qdata: torch.Tensor,
             scale: torch.Tensor,
             zero_point: torch.Tensor | None,
             block_size: tuple[int, int],
             b: torch.Tensor,
             a: torch.Tensor,
-            strength: float,
+            alpha: float,
             *,
             asymmetric: bool,
             reduce_range: bool,
+            beta: float = 1.0,
             rounding_seed: int | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            calls.append((tuple(b.shape), tuple(a.shape), strength))
+            calls.append((tuple(b.shape), tuple(a.shape), alpha))
             return triton_merge(
                 qdata,
                 scale,
@@ -933,9 +938,10 @@ class TestInt8Adapter:
                 block_size,
                 b,
                 a,
-                strength,
+                alpha,
                 asymmetric=asymmetric,
                 reduce_range=reduce_range,
+                beta=beta,
                 rounding_seed=rounding_seed,
             )
 

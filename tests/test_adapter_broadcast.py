@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from safetensors.torch import save_file
 from torch import nn
 
-import piper_offload.parameter_delta as parameter_delta_impl
+import piper_offload._parameter_update as parameter_update_impl
 from piper_offload import (
     Adapter,
     BlockCompileConfig,
@@ -100,9 +100,10 @@ def test_mixed_broadcast_combines_different_shapes_in_one_compact_update(monkeyp
     updates = []
     original = RegularAdapter.merge_dense_
 
-    def record_merge(target, update, strength, *, rounding_seed=None):
-        updates.append(update.shape)
-        original(target, update, strength, rounding_seed=rounding_seed)
+    def record_merge(target, update, alpha, *, beta=1.0, rounding_seed=None):
+        if target.data_ptr() == model.weight.data_ptr():
+            updates.append(update.shape)
+        original(target, update, alpha, beta=beta, rounding_seed=rounding_seed)
 
     monkeypatch.setattr(RegularAdapter, "merge_dense_", staticmethod(record_merge))
     assert merge_adapter(model, [(first, 0.5), (second, -0.75)]) == 1
@@ -250,7 +251,7 @@ def test_prepared_local_sources_reuse_mapped_views(tmp_path, monkeypatch):
             return (4, 3), (2, 5)
 
     adapter = LocalAdapter()
-    monkeypatch.setattr(parameter_delta_impl, "select_adapter", lambda _target: adapter)
+    monkeypatch.setattr(parameter_update_impl, "select_adapter", lambda _target: adapter)
     sources = {
         "dense": torch.arange(48, dtype=torch.float32).reshape(6, 8) / 8,
         "a": torch.arange(16, dtype=torch.float32).reshape(2, 8) / 16,
@@ -264,7 +265,7 @@ def test_prepared_local_sources_reuse_mapped_views(tmp_path, monkeypatch):
     transform = ParameterDeltaTransform([delta.scaled(0.25)])
     target = nn.Parameter(torch.zeros(4, 3, device="cuda"), requires_grad=False)
     transform.validate_parameter(target)
-    plan = transform._dense_plan
+    plan = transform._update._dense_plan
     assert plan is not None
     assert plan.update_shape == (4, 3)
     assert not plan.dense_sources[0][0].is_contiguous()
@@ -279,8 +280,8 @@ def test_prepared_local_sources_reuse_mapped_views(tmp_path, monkeypatch):
     def unexpected_localization(*_args, **_kwargs):
         raise AssertionError("application repeated source localization")
 
-    monkeypatch.setattr(parameter_delta_impl, "_local_dense_view", unexpected_localization)
-    monkeypatch.setattr(parameter_delta_impl, "_localize_materialized_weight_factors", unexpected_localization)
+    monkeypatch.setattr(parameter_update_impl, "_local_dense_view", unexpected_localization)
+    monkeypatch.setattr(parameter_update_impl, "_localize_materialized_weight_factors", unexpected_localization)
     expected_update = 0.25 * (sources["dense"] + sources["b"] @ sources["a"])[2:6, 5:8]
     with host_pin_manager.acquire(transform.storage_tensors()):
         try:
