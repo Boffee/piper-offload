@@ -15,13 +15,18 @@ invokes them after individual parameter copies.
 import contextlib
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch import nn
 
-from ._parameter_update import ParameterUpdatePlan, plan_parameter_update
+from ._parameter_update import (
+    ParameterUpdatePlan,
+    merge_target_id,
+    plan_parameter_update,
+    validate_merge_target_aliases,
+)
 from .adapter import Adapter, AdapterTargetUpdates
 from .module_names import resolve_parent_leaf
 from .pin_manager import host_pin_manager
@@ -44,13 +49,6 @@ __all__ = ["merge_adapter"]
 def _validate_permanent_update(adapter: object) -> None:
     if isinstance(adapter, PermanentUpdateValidationTensorAdapter):
         adapter.validate_permanent_update()
-
-
-@dataclass(slots=True)
-class _TargetGroup:
-    target_key: str
-    param: nn.Parameter
-    updates: AdapterTargetUpdates = field(default_factory=AdapterTargetUpdates)
 
 
 @dataclass(slots=True, frozen=True)
@@ -120,9 +118,12 @@ def merge_adapter(
     Returns the number of unique parameters that were modified. Exact-zero
     strengths are inactive and do not create merge operations. Merge reads
     immutable host backing, so the same adapter may also serve other
-    merge or routed uses. All active target names and merge capabilities are
+    merge or routed uses. Target names and capabilities of planned merges are
     validated before any parameter is modified. An adapter constructed with
-    ``allow_partial_targets=True`` ignores targets absent from this model.
+    ``allow_partial_targets=True`` ignores targets absent from this model
+    and skips deltas to meta parameters without an active value provider.
+    A strict delta on the same target still requires a source. Skipped
+    targets stay meta and do not count as modified parameters.
     Quantized targets use terminal-code stochastic rounding by default so
     sub-step additive updates are not systematically rounded away; pass
     ``stochastic_rounding=False`` for deterministic rounding. Parameter values
@@ -228,17 +229,6 @@ def _collect_params_by_target(model: nn.Module) -> dict[str, nn.Parameter]:
     return params_by_target
 
 
-def _tie_key(param: nn.Parameter) -> tuple[Any, ...]:
-    """Identity under which parameters sharing one backing are one merge target."""
-    try:
-        return param_tensor_id(param)
-    except NotImplementedError:
-        # Let transform validation produce the target-specific capability
-        # error. Unsupported wrappers cannot participate in tied-storage
-        # detection, so object identity is the conservative grouping key.
-        return ("__unsupported_param__", id(param))
-
-
 def _build_merge_ops(
     params_by_target: dict[str, nn.Parameter],
     adapters: Sequence[tuple[Adapter, float]],
@@ -246,48 +236,34 @@ def _build_merge_ops(
     stochastic_rounding: bool,
 ) -> list[_MergeOp]:
     """Group adapter updates and reject ambiguous parameter ties."""
-    groups_by_tensor_id: dict[tuple[Any, ...], _TargetGroup] = {}
-
-    def target_group(target_key: str) -> _TargetGroup | None:
-        param = params_by_target.get(target_key)
-        if param is None:
-            return None
-        tensor_id = _tie_key(param)
-        group = groups_by_tensor_id.get(tensor_id)
-        if group is None:
-            group = _TargetGroup(target_key, param)
-            groups_by_tensor_id[tensor_id] = group
-        elif group.target_key != target_key:
-            raise ValueError(
-                f"Adapter targets {group.target_key!r} and {target_key!r} "
-                "resolve to the same tied parameter backing. Apply only one "
-                "name for a tied parameter in a single merge_adapter() call; "
-                "otherwise the same base would receive multiple logical updates."
-            )
-        return group
-
+    updates: dict[str, AdapterTargetUpdates] = {}
     for adapter, strength in adapters:
         for target_key, target in adapter.targets.items():
-            group = target_group(target_key)
-            if group is None:
+            if target_key not in params_by_target:
                 continue
-            group.updates.add(target, strength, target_key=target_key)
+            contributions = updates.setdefault(target_key, AdapterTargetUpdates())
+            contributions.add(
+                target, strength, target_key=target_key,
+                allow_partial_targets=adapter.allow_partial_targets,
+            )
 
+    validate_merge_target_aliases(params_by_target, updates)
     # A replacement parameter must reach every name sharing the target's
     # backing, including distinct wrapper objects over the same storage.
     names_by_tie: dict[tuple[Any, ...], list[str]] = {}
-    if groups_by_tensor_id:
+    if updates:
         for name, candidate in params_by_target.items():
-            names_by_tie.setdefault(_tie_key(candidate), []).append(name)
+            names_by_tie.setdefault(merge_target_id(candidate), []).append(name)
 
     merge_ops: list[_MergeOp] = []
-    for tensor_id, group in groups_by_tensor_id.items():
-        target_key = group.target_key
-        param = group.param
-        aliases = tuple(names_by_tie[tensor_id])
+    for target_key, contributions in updates.items():
+        param = params_by_target[target_key]
+        if contributions.should_skip_merge(param):
+            continue
+        aliases = tuple(names_by_tie[merge_target_id(param)])
         plan = plan_parameter_update(
-            group.updates.deltas,
-            value=group.updates.value,
+            contributions.deltas,
+            value=contributions.value,
             stochastic_rounding=stochastic_rounding,
             target_key=target_key,
         )

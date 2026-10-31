@@ -1,6 +1,6 @@
 """Shared source selection, validation, and arithmetic for parameter updates."""
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -18,7 +18,7 @@ from .lora import (
     _validate_materialized_weight_factors,
 )
 from .seeding import derive_seed
-from .tensor_adapter_registry import param_representation, select_adapter
+from .tensor_adapter_registry import param_representation, param_tensor_id, select_adapter
 from .tensor_adapters import (
     DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
@@ -34,6 +34,37 @@ from .tensor_adapters import (
 if TYPE_CHECKING:
     from .parameter_delta import ScaledParameterDelta
     from .parameter_value import ScaledParameterValue
+
+
+def merge_target_id(param: nn.Parameter) -> tuple[Any, ...]:
+    """Opaque tensor-adapter identity used for merge validation and installation."""
+    try:
+        return param_tensor_id(param)
+    except NotImplementedError:
+        # Leave unsupported representations to arithmetic validation. They
+        # cannot participate in storage-based alias detection.
+        return ("__unsupported_param__", id(param))
+
+
+def validate_merge_target_aliases(
+    params_by_name: Mapping[str, nn.Parameter],
+    target_names: Iterable[str],
+) -> None:
+    """Require one requested name per backing across active adapter updates.
+
+    Call after resolving absent names and before skipping unpopulated targets.
+    Repeated contributions under the same name are allowed. Physical aliases
+    use tensor-adapter storage identity; meta parameters use object identity.
+    """
+    names_by_identity: dict[tuple[Any, ...], str] = {}
+    for name in target_names:
+        identity = merge_target_id(params_by_name[name])
+        previous = names_by_identity.setdefault(identity, name)
+        if previous != name:
+            raise ValueError(
+                f"Tied parameter aliases {previous!r} and {name!r} "
+                "cannot both be adapter targets; use one name per parameter."
+            )
 
 
 @dataclass(slots=True, frozen=True)

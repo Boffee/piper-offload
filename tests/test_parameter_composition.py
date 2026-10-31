@@ -92,6 +92,135 @@ def test_composition_strengths_order_aliases_and_ownership(application, kind, sc
 
 
 @pytest.mark.parametrize("application", ["permanent", "activation"])
+@pytest.mark.parametrize("kind", ["lora", "dense"])
+@pytest.mark.parametrize("base", ["absent", "disabled", "supplied", "physical"])
+def test_partial_targets_share_updates_with_optional_head(application, kind, base):
+    a = torch.tensor([[1., 2., 3.]])
+    b = torch.tensor([[1.], [-2.]])
+    dense = torch.arange(6, dtype=torch.float32).reshape(2, 3).clone()
+    delta = (
+        ParameterDelta.from_tensors(a=a, b=b, lora_alpha=2.0)
+        if kind == "lora" else ParameterDelta.from_tensors(dense=dense)
+    )
+    adapter = Adapter({
+        "weight": delta, "optional": delta, "missing": delta,
+    }, allow_partial_targets=True)
+    source = torch.full((4, 2, 3), 3.0)
+    value = Adapter.from_state_dict({"optional": source})
+    requests = [(adapter, 0.25)]
+    if base in ("disabled", "supplied"):
+        requests.append((value, 0.0 if base == "disabled" else 0.5))
+    update = 0.25 * (2.0 * b @ a if kind == "lora" else dense)
+    orders = (requests, list(reversed(requests))) if len(requests) > 1 else (requests,)
+    for ordered in orders:
+        model = nn.Module()
+        model.weight = nn.Parameter(torch.ones(2, 3), requires_grad=False)
+        model.optional = nn.Parameter(
+            source.clone() if base == "physical" else torch.empty(source.shape, device="meta"),
+            requires_grad=False,
+        )
+        model.alias = model.optional
+        with _application(model, ordered, application):
+            torch.testing.assert_close(model.weight.cpu(), 1.0 + update)
+            assert model.optional is model.alias
+            assert model.optional is not model.weight
+            if base in ("absent", "disabled"):
+                assert model.optional.is_meta
+            else:
+                torch.testing.assert_close(model.optional.cpu(), source + update)
+        if application == "activation":
+            torch.testing.assert_close(model.weight, torch.ones(2, 3))
+            if base == "physical":
+                torch.testing.assert_close(model.optional, source)
+            else:
+                assert model.optional.is_meta
+    assert adapter.targets["weight"] is adapter.targets["optional"]
+    torch.testing.assert_close(a, torch.tensor([[1., 2., 3.]]))
+    torch.testing.assert_close(b, torch.tensor([[1.], [-2.]]))
+    torch.testing.assert_close(dense, torch.arange(6, dtype=torch.float32).reshape(2, 3))
+    torch.testing.assert_close(source, torch.full((4, 2, 3), 3.0))
+
+
+@pytest.mark.parametrize("application", ["permanent", "activation"])
+@pytest.mark.parametrize("kind", ["lora", "dense"])
+def test_partial_targets_do_not_disable_strict_contributions(application, kind):
+    delta = (
+        ParameterDelta.from_tensors(a=torch.ones(1, 3), b=torch.ones(2, 1))
+        if kind == "lora" else ParameterDelta.from_tensors(dense=torch.ones(2, 3))
+    )
+    partial = Adapter({"physical": delta, "weight": delta}, allow_partial_targets=True)
+    strict = Adapter({"weight": delta})
+    error = "Meta parameters" if kind == "lora" else "existing plain floating-point target"
+    for requests in ([(partial, 1.0), (strict, 1.0)], [(strict, 1.0), (partial, 1.0)]):
+        model = nn.Module()
+        model.physical = nn.Parameter(torch.zeros(2, 3), requires_grad=False)
+        model.weight = nn.Parameter(torch.empty(2, 3, device="meta"), requires_grad=False)
+        with pytest.raises(ValueError, match=error), _application(model, requests, application):
+            pytest.fail("strict contribution was skipped")
+        assert model.weight.is_meta
+        torch.testing.assert_close(model.physical, torch.zeros(2, 3))
+    # A disabled strict contribution must not prevent partial application.
+    with _application(model, [(strict, 0.0), (partial, 1.0)], application):
+        assert model.weight.is_meta
+        torch.testing.assert_close(model.physical.cpu(), torch.ones(2, 3))
+
+
+def test_unpopulated_partial_targets_create_no_merge_work(monkeypatch):
+    from piper_offload._parameter_update import ParameterUpdateTransform
+
+    def unexpected_update(*args, **kwargs):
+        pytest.fail("skipped targets must not stage merge updates")
+
+    monkeypatch.setattr(ParameterUpdateTransform, "_stage_update_for_plan", unexpected_update)
+    model = nn.Linear(3, 2, bias=False, device="meta").requires_grad_(False)
+    # Even incompatible target shapes need no merge validation without a base.
+    adapter = Adapter({"weight": ParameterDelta.from_tensors(dense=torch.ones(5, 7))}, allow_partial_targets=True)
+    original = model.weight
+    assert merge_adapter(model, [(adapter, 1.0)]) == 0
+    assert model.weight is original
+    offloader = ModelOffloader.from_module(model)
+    updates = offloader._group_adapter_updates_by_param_name([(adapter, 1.0)])
+    assert offloader._build_merge_parameter_overrides(torch.device("cuda"), updates) == {}
+    assert offloader.cache_bytes == 0
+    assert model.weight.is_meta
+
+
+@pytest.mark.parametrize("application", ["permanent", "activation"])
+@pytest.mark.parametrize("requires_grad", [False, True])
+def test_merge_rejects_distinct_parameter_objects_sharing_storage(application, requires_grad):
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.ones(2, 3), requires_grad=requires_grad)
+    model.alias = nn.Parameter(model.weight.detach(), requires_grad=requires_grad)
+    assert model.weight is not model.alias
+    assert model.weight.data_ptr() == model.alias.data_ptr()
+    delta = ParameterDelta.from_tensors(dense=torch.ones(2, 3))
+    adapter = Adapter({"weight": delta, "alias": delta})
+    with pytest.raises(ValueError, match="Tied parameter aliases"), _application(
+        model, [(adapter, 1.0)], application,
+    ):
+        pytest.fail("distinct wrappers hid a shared parameter backing")
+    torch.testing.assert_close(model.weight, torch.ones(2, 3))
+    torch.testing.assert_close(model.alias, torch.ones(2, 3))
+
+
+@pytest.mark.parametrize("application", ["permanent", "activation"])
+@pytest.mark.parametrize("supply_value", [False, True])
+def test_partial_meta_targets_preserve_tied_name_contract(application, supply_value):
+    delta = ParameterDelta.from_tensors(dense=torch.ones(2, 3))
+    partial = Adapter({"weight": delta}, allow_partial_targets=True)
+    other = (
+        Adapter.from_state_dict({"alias": torch.ones(2, 3)})
+        if supply_value else Adapter({"alias": delta}, allow_partial_targets=True)
+    )
+    for requests in ([(partial, 1.0), (other, 1.0)], [(other, 1.0), (partial, 1.0)]):
+        model = nn.Linear(3, 2, bias=False, device="meta").requires_grad_(False)
+        model.alias = model.weight
+        with pytest.raises(ValueError, match="[Tt]ied"), _application(model, requests, application):
+            pytest.fail("different names for one tied target were accepted")
+        assert model.weight.is_meta and model.alias.is_meta
+
+
+@pytest.mark.parametrize("application", ["permanent", "activation"])
 @pytest.mark.parametrize("failure", ["value_shape", "delta_shape", "inactive_value", "two_values", "tied_names"])
 def test_composition_preflight_leaves_all_parameters_unchanged(application, failure):
     model = nn.Module()
@@ -106,7 +235,7 @@ def test_composition_preflight_leaves_all_parameters_unchanged(application, fail
         "alias" if failure == "tied_names" else "weight": ParameterDelta.from_tensors(
             dense=torch.ones((3, 2) if failure == "delta_shape" else (2, 3)),
         ),
-    })
+    }, allow_partial_targets=failure != "inactive_value")
     requests = [(delta, 1.0), (value, 0.0 if failure == "inactive_value" else 1.0)]
     if failure == "two_values":
         requests.append((value, 0.5))
@@ -115,8 +244,7 @@ def test_composition_preflight_leaves_all_parameters_unchanged(application, fail
         "delta_shape": "broadcast",
         "inactive_value": "existing plain floating-point target",
         "two_values": "multiple active parameter values",
-        # Activation validates each name before resolving shared load slots.
-        "tied_names": "[Tt]ied" if application == "permanent" else "existing plain floating-point target",
+        "tied_names": "[Tt]ied",
     }[failure]
     exception = RuntimeError if failure == "delta_shape" else ValueError
     with pytest.raises(exception, match=error), _application(model, requests, application):
@@ -249,7 +377,7 @@ def test_composed_values_reload_across_block_uses(mode):
     delta = Adapter({
         name: ParameterDelta.from_tensors(a=torch.ones(1, 4), b=torch.ones(4, 1))
         for name in values
-    })
+    }, allow_partial_targets=True)
     with torch.inference_mode():
         x = torch.ones(2, 4, device="cuda")
     for strength in (0.25, -0.5, 0.0):
@@ -264,51 +392,80 @@ def test_composed_values_reload_across_block_uses(mode):
         assert all(param.is_meta for param in model.parameters())
     with activated_model(offloader, "cuda"):
         assert all(param.is_meta for param in model.parameters())
+    with activated_model(offloader, "cuda", adapters=[delta, value], adapter_strengths=[1.0, 0.0]):
+        assert all(param.is_meta for param in model.parameters())
 
 
 @CUDA
 def test_cache_composition_preserves_mappings_through_switching_and_exception(tmp_path):
     path = tmp_path / "value.safetensors"
-    source = torch.arange(6, dtype=torch.float32).reshape(2, 3).clone()
-    save_file({"weight": source}, path)
+    source = torch.arange(6, dtype=torch.float32).reshape(2, 3).expand(4, 2, 3).clone()
+    physical = torch.ones(2, 3)
+    save_file({
+        "weight": source, "physical": physical,
+        "a": torch.ones(1, 3), "b": torch.ones(2, 1),
+    }, path)
     original_file = path.read_bytes()
     with MappedCheckpoint(path) as checkpoint:
-        mapped = checkpoint.get_tensor("weight")
+        mapped, mapped_physical, a, b = (
+            checkpoint.get_tensor(name) for name in ("weight", "physical", "a", "b")
+        )
     assert file_slice(mapped) is not None
     delta_spec = AdapterSpec(
         key="delta", factory=lambda: {
-            "head.lora_A.weight": torch.ones(1, 3),
-            "head.lora_B.weight": torch.ones(2, 1),
+            "head.lora_A.weight": a, "head.lora_B.weight": b,
+            "optional.lora_A.weight": a, "optional.lora_B.weight": b,
         },
+        allow_partial_targets=True,
     )
     # Use canonical names without changing the mapped value tensor.
-    value_spec = AdapterSpec(key="value", factory=lambda: {"head.weight": mapped}, scale_parameter_values=True)
+    value_spec = AdapterSpec(key="value", factory=lambda: {"optional.weight": mapped}, scale_parameter_values=True)
     def make_head():
         model = nn.Module()
         model.head = nn.Linear(3, 2, bias=False, device="meta").requires_grad_(False)
+        model.head.weight = nn.Parameter(mapped_physical, requires_grad=False)
+        model.optional = nn.Module()
+        model.optional.weight = nn.Parameter(torch.empty(4, 2, 3, device="meta"), requires_grad=False)
         return model
     spec = ModelSpec(key="model", factory=make_head)
     cache = ModelCache()
     try:
-        for strength in (0.25, -0.5, 0.0):
+        model_id = None
+        for strength, value_strength in ((0.25, 0.5), (0.25, 0.0), (-0.5, 0.5), (-0.5, 0.0), (0.0, 0.5)):
             with cache.use(
                 spec, device="cuda", adapter_specs=[delta_spec, value_spec],
-                adapter_strengths=[strength, 0.5],
+                adapter_strengths=[strength, value_strength],
             ) as model:
-                torch.testing.assert_close(model.head.weight.cpu(), source * 0.5 + strength)
-            assert model.head.weight.is_meta
+                if model_id is None:
+                    model_id = id(model)
+                assert id(model) == model_id
+                torch.testing.assert_close(model.head.weight.cpu(), physical + strength)
+                if value_strength:
+                    torch.testing.assert_close(model.optional.weight.cpu(), source * value_strength + strength)
+                else:
+                    assert model.optional.weight.is_meta
+            assert model.optional.weight.is_meta
+            torch.testing.assert_close(model.head.weight, physical)
+            assert model.head.weight.data_ptr() == mapped_physical.data_ptr()
+        with cache.use(spec, device="cuda", adapter_specs=[delta_spec]) as model:
+            torch.testing.assert_close(model.head.weight.cpu(), physical + 1.0)
+            assert model.optional.weight.is_meta
         with pytest.raises(RuntimeError, match="caller failed"):
             with cache.use(spec, device="cuda", adapter_specs=[value_spec, delta_spec]) as model:
                 raise RuntimeError("caller failed")
-        assert model.head.weight.is_meta
+        assert model.optional.weight.is_meta
         with cache.use(spec, device="cuda") as model:
-            assert model.head.weight.is_meta
+            assert model.optional.weight.is_meta
+            torch.testing.assert_close(model.head.weight.cpu(), physical)
         with cache.lease(value_spec) as captured:
-            assert file_slice(captured.targets["head.weight"].backing.make_cpu_param()) is not None
+            assert file_slice(captured.targets["optional.weight"].backing.make_cpu_param()) is not None
     finally:
         cache.clear()
     assert path.read_bytes() == original_file
-    torch.testing.assert_close(mapped, source)
+    for actual, expected in (
+        (mapped, source), (mapped_physical, physical), (a, torch.ones(1, 3)), (b, torch.ones(2, 1)),
+    ):
+        torch.testing.assert_close(actual, expected)
 
 
 @CUDA
@@ -322,7 +479,7 @@ def test_copy_only_value_rejects_composed_arithmetic_before_mutation(application
     delta = Adapter({
         "physical": ParameterDelta.from_tensors(dense=torch.ones(1)),
         "weight": ParameterDelta.from_tensors(a=torch.ones(1, cols), b=torch.ones(rows, 1)),
-    })
+    }, allow_partial_targets=True)
     model = nn.Module()
     model.physical = nn.Parameter(torch.zeros(1), requires_grad=False)
     model.weight = nn.Parameter(torch.empty(rows, cols, device="meta"), requires_grad=False)
@@ -391,11 +548,14 @@ def test_permanent_composition_preserves_mapped_value_and_delta(tmp_path):
         mapped_value = checkpoint.get_tensor("value")
         mapped_delta = checkpoint.get_tensor("delta")
     value = Adapter.from_state_dict({"weight": mapped_value}, scale_parameter_values=True)
-    delta = Adapter({"weight": ParameterDelta.from_tensors(dense=mapped_delta)})
+    update = ParameterDelta.from_tensors(dense=mapped_delta)
+    delta = Adapter({"weight": update, "optional": update}, allow_partial_targets=True)
     for strength in (0.5, -1.0):
         model = nn.Linear(3, 2, bias=False, device="meta").requires_grad_(False)
+        model.optional = nn.Parameter(torch.empty(4, 2, 3, device="meta"), requires_grad=False)
         assert merge_adapter(model, [(delta, strength), (value, 0.5)]) == 1
         torch.testing.assert_close(model.weight, source * 0.5 + strength * dense)
+        assert model.optional.is_meta
         assert file_slice(model.weight) is None
     assert file_slice(mapped_value) is not None
     assert file_slice(mapped_delta) is not None

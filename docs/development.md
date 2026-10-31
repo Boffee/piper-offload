@@ -109,6 +109,14 @@ scaling, and `ParameterValueTransform` delegates through the source plan.
 Application paths own allocation, leases, and installation; tensor adapters
 own representation-specific arithmetic.
 
+`AdapterTargetUpdates` collects active contributions and whether any delta
+requires a base. After aggregation, both merge paths omit an unpopulated meta
+target only when all its deltas allow partial targets. Skipped targets create
+no device override or permanent merge operation and require no staging or
+materialization. Both paths call `validate_merge_target_aliases()` before
+skipping, using tensor-adapter storage identity to enforce one target name per
+backing. Permanent installation uses the same identity to preserve every alias.
+
 *Host state* is the CPU representation held by a
 `HostParam` and interpreted by its *tensor adapter*. Capitalized `Adapter`
 means a model-update resource, rather than that per-format protocol.

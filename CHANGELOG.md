@@ -5,6 +5,15 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- `allow_partial_targets=True` now also skips additive LoRA and dense updates
+  to meta parameters without an active complete value provider during activation
+  and permanent merge. Previously these targets raised even with partial targets
+  enabled. Available targets retain normal validation and merging; strict
+  contributions still reject an unpopulated target. Skipped parameters stay meta,
+  allocate no merge storage, and do not count as permanently modified parameters.
+
 ## [0.10.0rc11] - 2026-10-30
 
 ### Added

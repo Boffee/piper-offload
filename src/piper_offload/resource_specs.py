@@ -75,8 +75,9 @@ class AdapterSpec:
     LoRA-suffixed entries form factor pairs; every other entry is an exact
     parameter-name physical value used to populate a frozen floating-point
     meta target.
-    ``allow_partial_targets`` opts the built resource into applying only the
-    intersection of its targets and a model's parameters.
+    ``allow_partial_targets`` ignores absent target names and, during merge,
+    skips deltas to meta parameters without an active complete value.
+    See :class:`Adapter` for composition with strict adapters.
     ``scale_parameter_values`` opts complete values into adapter-strength
     scaling; by default active parameter values remain unchanged.
     """

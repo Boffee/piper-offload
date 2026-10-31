@@ -84,9 +84,19 @@ intrinsic scale. Keeping alpha separate also preserves mapped factor storage
 that host-side arithmetic would replace.
 
 Unknown targets raise by default. Set `AdapterSpec(allow_partial_targets=True)`
-when one checkpoint intentionally spans separately loaded model components.
-Only matching targets apply, and an empty intersection is a valid no-op.
-Matching targets still require compatible shapes and capabilities.
+when one checkpoint intentionally spans separately loaded or optional model
+components. Missing names are ignored. In activation merge and permanent
+`merge_adapter()`, additive updates also skip existing meta parameters with no
+active complete value provider, leaving those parameters meta. If every target
+is skipped, application is a valid no-op.
+
+Availability is resolved after collecting all active adapters. A physical model
+parameter or an active complete value supplies the base; a zero-strength value
+provider does not. With a base, every additive contribution merges normally,
+regardless of adapter order. Shapes, representations, value conflicts, and
+strengths retain their normal validation. A strict additive adapter targeting
+the same unpopulated parameter still raises; partial adapters cannot suppress
+its requirement for a base. Routed LoRA retains its existing target requirements.
 
 For activation merge and permanent `merge_adapter()`, use one target name per
 tied parameter across all active adapters. The update reaches every alias;
@@ -217,7 +227,22 @@ Updates are validated against the supplied representation before application.
 The same [broadcasting rules](#broadcast-additive-updates) apply to these deltas;
 the supplied value itself must still match the complete target shape.
 An active delta with no active value cannot materialize a meta parameter,
-including when the value's adapter has zero strength.
+including when the value's adapter has zero strength. It raises by default;
+the [partial-target policy](#target-names-and-update-types) allows it to be skipped.
+
+An architecture can share one immutable update between an ordinary head and an
+optional head bank without duplicating or expanding its factors:
+
+```python
+adapter = Adapter(
+    {"proj_out.weight": head_delta, "pdd_video_proj.weight": head_delta},
+    allow_partial_targets=True,
+)
+```
+
+Here `head_delta` is a `ParameterDelta`. The optional target receives its update
+whenever the model or another active adapter supplies its base. Sharing the
+update does not tie the model parameters.
 
 An unpopulated placeholder consumes no host backing and receives no storage of
 its own. The caller must avoid executing any path that needs it. Deactivation
