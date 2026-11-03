@@ -17,8 +17,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from piper_offload._host_memory_windows import VirtualRegion
-
 _READ_CHUNK = 64 * 2**20
 
 
@@ -170,8 +168,13 @@ class Reclaims:
     """Counts what the offered tier's reclaims kept and what Windows discarded, until ``restore()``."""
 
     def __init__(self) -> None:
+        # Imported here so the loader benchmark can run this module under
+        # vLLM's and SGLang's interpreters, which have no piper_offload.
+        from piper_offload._host_memory_windows import VirtualRegion  # noqa: PLC0415
+
         self.intact_bytes = self.discarded_bytes = 0
         reclaim = VirtualRegion.reclaim
+        self._region = VirtualRegion
         self._reclaim = reclaim
 
         def counted(region: VirtualRegion) -> list[tuple[int, int]]:
@@ -184,7 +187,7 @@ class Reclaims:
         VirtualRegion.reclaim = counted
 
     def restore(self) -> None:
-        VirtualRegion.reclaim = self._reclaim
+        self._region.reclaim = self._reclaim
 
     def take(self) -> tuple[int, int]:
         """The intact and discarded bytes counted since the last take, resetting both."""
