@@ -19,9 +19,12 @@ def _describe_input_owners(value_ref):
     result = []
     for owner in gc.get_referrers(value):
         row = {"type": type(owner).__module__ + "." + type(owner).__qualname__}
-        if isinstance(owner, dict):
-            row["input_names"] = [str(key) for key, item in owner.items() if item is value]
-            row["keys"] = [str(key) for key in owner][:30]
+        if isinstance(owner, tuple):
+            row["items"] = [type(item).__module__ + "." + type(item).__qualname__ for item in owner]
+        if isinstance(owner, (dict, tuple)):
+            if isinstance(owner, dict):
+                row["input_names"] = [str(key) for key, item in owner.items() if item is value]
+                row["keys"] = [str(key) for key in owner][:30]
             paths = []
             for parent in gc.get_referrers(owner):
                 path = {"type": type(parent).__module__ + "." + type(parent).__qualname__}
@@ -29,6 +32,12 @@ def _describe_input_owners(value_ref):
                     path["frame"] = (parent.f_code.co_filename, parent.f_code.co_name, parent.f_lineno)
                 elif isinstance(parent, dict):
                     path["names"] = [str(key) for key, item in parent.items() if item is owner]
+                elif isinstance(parent, tuple):
+                    path["items"] = [type(item).__module__ + "." + type(item).__qualname__ for item in parent]
+                elif isinstance(parent, types.CellType):
+                    path["cell_owners"] = [
+                        type(item).__module__ + "." + type(item).__qualname__ for item in gc.get_referrers(parent)
+                    ]
                 paths.append(path)
             row["owners"] = paths
         elif isinstance(owner, types.FrameType):
