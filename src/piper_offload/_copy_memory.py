@@ -1,9 +1,12 @@
 """Owned checkpoint copies and their preparation, independent of the host OS.
 
-The pin manager owns all reservations and registration order. Memory owns a
+The pin manager owns leases, page accounting, reservations, registration order,
+and the shared lock. Memory owns allocation and released copies. It owns a
 copy until ``reserve`` hands it to an acquisition, and takes it back only
 after successful unregistration. Metadata uses the manager's lock; preparation
 and batch completion run outside it, since worker finalizers may need it.
+The memory component must not retain the manager; see :class:`Memory` for the
+callback ownership contract.
 """
 
 import contextlib

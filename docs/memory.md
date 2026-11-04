@@ -120,8 +120,8 @@ Pass `load_model` as the `ModelSpec` factory. The same reading interface accepts
 GGUF; its packed parameters also have the [execution requirements](formats.md#load-a-gguf-checkpoint)
 described in the format guide.
 
-Storage with this file provenance pins through an owned, page-aligned copy,
-filled by parallel file reads. Transfers use that registered copy; the model's
+Storage with this file provenance pins through an owned copy.
+Transfers use that registered copy; the model's
 CPU tensors and `state_dict()` still refer to the original mapping. Eviction
 unregisters and frees the copy, or offers it on Windows as described below.
 The mapping stays read-only page cache throughout.
@@ -147,10 +147,8 @@ Windows to discard them. The copy remains committed and charges the separate
 offered budget. Least recently offered copies are freed to admit new ones or
 reduce that budget.
 
-Offered pages are unreadable until reclaimed. A later acquisition reclaims the
-copy, reuses intact spans, and refills discarded spans before registering it.
-Spans are 16 MiB so one discarded page does not force a whole-copy refill.
-Transfers never resolve to offered memory.
+Offered pages are unreadable until reclaimed. A later acquisition reuses bytes
+Windows kept and reloads discarded bytes before transfers can read them.
 
 `clear()`, owner retirement, an oversized copy, or a surviving external view of
 the copy causes it to be freed rather than retained. A failed offer also frees
@@ -158,11 +156,9 @@ it; a failed reclaim rebuilds it. Allocation failures free offered copies in
 age order and retry allocation.
 
 Discarded pages still consume commitment. The tier frees every offered copy
-when Windows signals `MaximumCommitCondition`, watching while it retains
-copies and checking before admission and allocation. It does not estimate
-pressure from the current commit limit, which Windows can grow on demand. If
-the event cannot be opened, a warning is emitted once and only the configured
-budget limits retention. Setting the budget to zero releases offered commitment.
+when Windows signals exhausted commitment. If that signal cannot be monitored,
+a warning is emitted once; budget eviction and allocation-failure recovery
+still apply. Setting the budget to zero releases offered commitment.
 
 ## Custom transfers
 
@@ -222,46 +218,5 @@ storage pageable. Unexpected runtime errors, including foreign registrations,
 propagate as `HostRegistrationError`; errors from prior GPU work are not hidden.
 Failed unregistration retains the storage and its budget charge for a later
 retry through `clear()` or budget pressure.
-
-## Implementation notes
-
-These ordering rules keep copy ownership safe and avoid slow registration or
-needless discard under pressure:
-
-- [`pin_manager.py`](../src/piper_offload/pin_manager.py) owns leases, page
-  accounting, registration order, and the shared lock. The memory component
-  owns allocation and released copies; it must not retain the manager.
-  Ownership transfers to the manager at reservation and back only after
-  successful unregistration.
-- [`_host_memory.py`](../src/piper_offload/_host_memory.py) chooses the component
-  once at import; pinning mechanisms are not probed at runtime. Copies use
-  anonymous mappings on Linux and `VirtualAlloc` on Windows. Parallel fills
-  use positional reads where available and a file handle per worker otherwise.
-- [`_copy_memory.py`](../src/piper_offload/_copy_memory.py) touches a byte per
-  page before registration. This brings pages into the working set without
-  making `cudaHostRegister` fault them individually. The first unfilled copy
-  is filled and registered before filling the rest, to detect exhausted runtime
-  capacity before paying for all remaining reads.
-- [`_copy_memory_windows.py`](../src/piper_offload/_copy_memory_windows.py)
-  reclaims **all requested offered copies before any fill**: a fill's own
-  memory demand could otherwise discard copies the acquisition was about to
-  reuse. As reclaimed copies are yielded in request order, registration
-  processes the ready request prefix, then that intact copy, without waiting
-  for earlier fills. This preserves ready in-place requests' priority and locks
-  intact pages before fills can push them out. Reservations follow request order; intact copies
-  may obtain runtime capacity ahead of unfilled ones.
-- Each offer starts as its own unregistration succeeds, overlapping offers
-  with serial runtime cleanup. Preparation and release batches wait for and
-  join workers only outside the shared lock: worker finalizers may need it.
-  Reclaim readiness is published after its worker is joined; preparation is
-  closed before pending copies are freed.
-- Windows offers at normal offer priority. While the tier is enabled, every
-  fill reads through the file cache at the lowest memory priority, including
-  the first load before anything has been offered. Each worker first faults
-  its destination slice at its normal priority, so only the file-cache pages
-  receive the low priority. Otherwise the cache outranks offered copies, or
-  the copy's own pages become the first to be trimmed. With the tier disabled,
-  reads use normal priority to preserve warm refills. The native calls live in
-  [`_host_memory_windows.py`](../src/piper_offload/_host_memory_windows.py).
 
 [Back to the README](../README.md)

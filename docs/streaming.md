@@ -132,6 +132,9 @@ eagerly: earlier graph segments may already have executed, and retrying could
 repeat mutations. PyTorch's graph-break and recompilation behavior still
 applies. Compilation with autograd is unsupported.
 
+Compiler artifact caches and workspace are outside resource byte accounting;
+model eviction does not reset the process-wide compiler cache.
+
 ### Rolling requirements
 
 Rolling requires full-graph compilation:
@@ -146,15 +149,12 @@ spec = ModelSpec(
 )
 ```
 
-As a parameter's last compiled reader launches, a private stream can refill
-its storage from the next block. That block waits for each parameter immediately
-before its first reader. The shared block target, resident state, activations,
-and workspace must still fit together.
+Rolling overlaps computation with transfers into reusable parameter storage.
+The shared block target, resident state, activations, and workspace must still
+fit together.
 
 Rolling graphs can reuse PyTorch's standard Inductor disk cache after a compiler
-reset or process restart. The cache identity includes the rolling compiler
-implementation and parameter-slot layout; each execution resolves the current
-runtime and weights. Other custom compiler passes must also support caching.
+reset or process restart. Custom compiler passes must also support caching.
 PyTorch controls cache storage and lookup, including `TORCHINDUCTOR_CACHE_DIR`.
 
 Rolling is experimental. Groups require distinct block modules, identical
@@ -198,8 +198,7 @@ Ordinary `block_paths` retain their working sets throughout the activation;
 the same path cannot appear in both block-path lists.
 
 A successful root-model forward reacquires released components for the next
-invocation. A skipped component stays acquired. Transient streaming and
-rolling stop at the last block rather than preloading block zero before release.
+invocation. A skipped component stays acquired.
 
 Choose boundaries after which that state is no longer used in the current
 root forward. A transient block group cannot be traversed again later in that

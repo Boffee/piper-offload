@@ -1,4 +1,11 @@
-"""Shared source selection, validation, and arithmetic for parameter updates."""
+"""Shared source selection, validation, and arithmetic for parameter updates.
+
+Activation and permanent merge both use :func:`plan_parameter_update` to select
+one optional replacement source and one combined arithmetic update. A supplied
+value is validated against its meta destination; arithmetic is validated against
+the effective physical source. The application path owns allocation, leases,
+and installation, and tensor adapters own representation-specific arithmetic.
+"""
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -94,6 +101,13 @@ class ParameterUpdateTransform:
     Both paths combine source scaling and updates before one terminal encoding.
     This operation owns validation, staging, and the repeated-merge seed, while
     callers own source selection, allocation, installation, and transfer leases.
+
+    ``source_scale`` is the supplied value's effective strength, or one for an
+    existing weight. It is passed separately as merge ``beta``, including through
+    ``LoRATransform``. Constructing a cancelling ``(source_scale - 1) * source``
+    delta can overflow or lose small updates in FP16/BF16. Value-only scaling
+    uses a zero dense update. Tensor adapters combine scaling and addition in
+    their compute precision before terminal encoding.
     """
 
     __slots__ = (
@@ -146,7 +160,14 @@ class ParameterUpdateTransform:
         self._dense_plan: _DenseMergePlan | None = None
 
     def validate_parameter(self, param: nn.Parameter) -> None:
-        """Validate every contribution before preparing repeated application."""
+        """Validate every contribution before preparing repeated application.
+
+        Dense sources and LoRA factors become immutable host views of the
+        target-local region exposed by ``MergeLocalityTensorAdapter``. The plan
+        records their common update shape, which may be smaller than the target
+        under broadcasting. Repeated loads stage those views through
+        ``transfer_`` without repeating localization or copying host backing.
+        """
         self._dense_plan = None
         if not self._uses_dense_merge:
             # Factor-only application is completely owned by LoRATransform.
@@ -296,7 +317,13 @@ class ParameterUpdateTransform:
         param: nn.Parameter,
         plan: _DenseMergePlan,
     ) -> torch.Tensor:
-        """Materialize one local logical update from a validated plan."""
+        """Materialize one local logical update from a validated plan.
+
+        Dense terms accumulate in request order in the target's compute dtype,
+        followed by the packed LoRA contribution. Staging does not promote
+        low-precision sources. The combined update is added to the base once by
+        the tensor adapter, with source scaling passed separately.
+        """
         target = param_representation(param)
         try:
             current_adapter = select_adapter(target)

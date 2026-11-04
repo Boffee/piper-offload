@@ -117,7 +117,11 @@ class EvictionPolicy(Protocol):
         ...
 
     def choose_victims(self, context: EvictionContext) -> tuple[str, ...]:
-        """Return unique candidate keys totaling enough bytes to admit the entry."""
+        """Return unique candidate keys totaling at least ``context.bytes_to_free``.
+
+        Invalid or insufficient selections raise :class:`EvictionPolicyError`
+        before the cache evicts any entry.
+        """
         ...
 
 

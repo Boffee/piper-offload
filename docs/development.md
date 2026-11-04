@@ -19,9 +19,12 @@ uv run pyright
 
 GPU tests skip without suitable hardware. Run the relevant GPU tests when
 changing transfers, scheduling, compilation, or quantized operations; a CPU-only
-pass cannot validate those paths. CI checks Linux and Windows. Benchmarks under
-[`benchmarks`](../benchmarks) exercise performance-sensitive paths; report the
-hardware and configuration when using their results.
+pass cannot validate those paths. `pre-commit install` runs ruff, pyright, and
+the CPU test suite on commits that change code. CI checks Linux and Windows.
+Benchmarks under [`benchmarks`](../benchmarks) exercise performance-sensitive
+paths. The [rolling benchmark](../benchmarks/benchmark_rolling_compile.py)
+compares outputs, latency, and allocator residency. Report the hardware and
+configuration when using benchmark results.
 
 See [VERSIONING.md](../VERSIONING.md) for compatibility and release policy.
 Piper Engine consumes pinned releases, so changes to public behavior need
@@ -88,34 +91,22 @@ change before finishing.
 | Components | Own host state and device working sets for whole modules or block lists | [host_component.py](../src/piper_offload/host_component.py), [block_component.py](../src/piper_offload/block_component.py) |
 | Host parameters and tensor adapters | Capture, account for, transfer, and reconstruct each tensor representation | [host_param.py](../src/piper_offload/host_param.py), [tensor_adapters.py](../src/piper_offload/tensor_adapters.py) |
 | Model adapters | Immutable LoRA, delta, and value resources applied through load plans or hooks | [adapter.py](../src/piper_offload/adapter.py), [merge.py](../src/piper_offload/merge.py) |
-| Pin manager and memory components | Transfer leases, registration, copies, platform allocation and retention | [memory guide](memory.md#implementation-notes) |
+| Parameter updates | Shared source selection, validation, and arithmetic for activation and permanent merge | [_parameter_update.py](../src/piper_offload/_parameter_update.py), [lora.py](../src/piper_offload/lora.py) |
+| Pin manager | Transfer leases, page accounting, registration order, and the shared lock | [pin_manager.py](../src/piper_offload/pin_manager.py) |
+| Memory components | Owned checkpoint copies, platform allocation, and Windows retention | [_copy_memory.py](../src/piper_offload/_copy_memory.py), [_copy_memory_windows.py](../src/piper_offload/_copy_memory_windows.py), [_host_memory.py](../src/piper_offload/_host_memory.py) |
+| Block compilation | Compile declared block forwards and schedule rolling transfers | [block_compile.py](../src/piper_offload/block_compile.py), [rolling_compile.py](../src/piper_offload/rolling_compile.py) |
 
 A *resource* is built from a *spec* into a *store*. A *binding* adds an active
 device lifecycle. `ModelOffloader` is both a store and a binding; `Adapter` is
 immutable host backing without an activation lifecycle. A resource lease
 protects a store from eviction. A pin lease independently protects the storage
-used by a transfer.
+used by a transfer; runtimes choose whether to request registration. Host
+capture and runtime changes must preserve the [transfer pinning policy](memory.md#set-the-pin-budget).
 
 An activation is a *session*. Its *load plans* combine base weights with any
-requested adapter updates. Activation and permanent merge share per-parameter
-planning in [_parameter_update.py](../src/piper_offload/_parameter_update.py):
-one optional replacement source and one combined arithmetic update. A supplied
-value is validated against its meta slot, and arithmetic against the effective
-physical source. The private `ParameterUpdateTransform` owns update validation,
-staging, and repeated-merge seeds. Its `source_scale` is the supplied value's
-effective strength, or `1` for an existing model weight; each delta retains its
-own strength. The public `ParameterDeltaTransform` delegates with unit source
-scaling, and `ParameterValueTransform` delegates through the source plan.
-Application paths own allocation, leases, and installation; tensor adapters
-own representation-specific arithmetic.
-
-`AdapterTargetUpdates` collects active contributions and whether any delta
-requires a base. After aggregation, both merge paths omit an unpopulated meta
-target only when all its deltas allow partial targets. Skipped targets create
-no device override or permanent merge operation and require no staging or
-materialization. Both paths call `validate_merge_target_aliases()` before
-skipping, using tensor-adapter storage identity to enforce one target name per
-backing. Permanent installation uses the same identity to preserve every alias.
+requested adapter updates. Activation and permanent merge share parameter-update
+planning. Application paths own allocation, leases, and installation; tensor
+adapters own representation-specific arithmetic.
 
 *Host state* is the CPU representation held by a
 `HostParam` and interpreted by its *tensor adapter*. Capitalized `Adapter`
@@ -123,16 +114,39 @@ means a model-update resource, rather than that per-format protocol.
 
 `ModelOffloader` composes a host component for non-streamed state, host
 components for transient modules, and block components for declared block
-lists. Components have `activate()` and `deactivate()` but no model-like
-`value`. Their CUDA working sets can be released and reacquired during an
-activation. `register_forward_hook()` on the offloader installs a native
-PyTorch hook by qualified module name and returns a caller-owned remover.
+lists. Components own device working sets that can be released and reacquired
+during an activation; their docstrings state the lower-level lifecycle contracts.
 
 Capture finalizes a store's `cache_bytes`. Activation acquires device state;
 deactivation releases it while retaining captured host state. The offloader
 cleans up partial activation on failure. Lower-level component callers own
 their cleanup; see each component's docstring. Construction failures require
 discarding the partially captured model, as described in [models](models.md).
+
+## Documentation ownership
+
+Each explanation has one owner, and other places link to it rather than restate it.
+
+- **The README** is the public entry point: installation, a first working example,
+  fit and limitations, and a task-oriented map of the guides.
+- **Topic guides** in `docs/` are written for callers. They explain a subsystem's
+  concepts, invariants, and how its APIs work together. Include ownership,
+  lifetime, device, format, and numerical constraints when they change valid
+  usage or how a caller interprets a result.
+- **Module, class, and function docstrings** own per-symbol contracts and
+  everything only a contributor to that code needs: tensor layouts, algorithms,
+  scheduling, lock ordering, and internal assumptions. A topic guide has no
+  implementation-notes section. Link to the owning code for those details.
+  Public API docstrings lead with behavior and state the inputs, results, and
+  constraints needed for a valid call; reuse existing contracts rather than
+  repeat them at every wrapper.
+- **Tool docstrings and command help** own specialized procedures and benchmark
+  invocation details.
+- **This guide** owns the architecture map, extension workflow, and conventions
+  and invariants that span subsystems. `AGENTS.md` supplies concise repository
+  instructions and links here for details.
+- **VERSIONING.md** owns compatibility and release policy. `CHANGELOG.md` owns
+  release history; see [commits and pull requests](#commits-and-pull-requests).
 
 ## Extending resources
 
@@ -150,26 +164,20 @@ useful when construction or byte accounting needs different behavior. Leasing
 a binding does not activate it; the caller or a coordinating cache does that.
 
 An `EvictionPolicy` chooses victims from inactive candidates. The cache still
-owns validation, admission, accounting, and release. Policy methods run under
-the cache lock. `choose_victims()` returns unique candidate keys accounting
-for at least `context.bytes_to_free`; invalid selections raise
-`EvictionPolicyError` before eviction. See the built-in `LRUEvictionPolicy`
-in [resource_cache.py](../src/piper_offload/resource_cache.py).
+owns validation, admission, accounting, and release. The policy protocol in
+[resource_cache.py](../src/piper_offload/resource_cache.py) states the locking
+and victim-selection contracts; `LRUEvictionPolicy` is the built-in example.
 
 ## Extending tensor formats
 
 Implement the stateless [TensorAdapter](../src/piper_offload/tensor_adapters.py)
 protocol and call [`register_adapter()`](../src/piper_offload/tensor_adapter_registry.py)
 during application startup, before constructing host resources. Registration
-returns an idempotent removal callable. Dispatch checks DTensor first, external
-adapters newest-first next, then built-in adapters. DTensor delegates its local
-shard through the same registry.
+and dispatch contracts belong to the registry's docstrings.
 
 The base protocol covers capture, physical storage enumeration, device copy,
 wrapper reconstruction, byte accounting, compute dtype, identity, and block
-layout. `storage_tensors()` returns existing plain CPU tensors, including
-tensor-valued metadata, while preserving views and shared allocations. It
-does not reconstruct wrappers or make copies.
+layout. Its method docstrings define the representation and ownership contracts.
 
 Every physical host-to-device copy goes through `transfer_()` so checkpoint
 copies and leases are honored. Copying directly from captured tensors can
@@ -181,83 +189,42 @@ trainable parameter data swaps, representation-preserving copy, conversion,
 and factorized or dense merge. Advertising conversion or copy does not imply
 merge support. The [format matrix](formats.md) describes built-in capabilities.
 
-Merge validation distinguishes target-only constraints from constraints that
-need the staged update. Permanent merge validates requested operations before
-mutation. Composing adapters can expose local shapes and global offsets through
-`MergeLocalityTensorAdapter`. Plan construction prepares both dense sources and
-LoRA factors as immutable host views of that local region and records their
-common update shape. Repeated loads stage those prepared views through
-`transfer_()` without repeating localization or copying their host backing.
-Merge and validation implementations accept
-`rounding_seed: int | None = None`, even when they only support deterministic
-rounding; `None` retains deterministic behavior. `derive_seed()` provides
-reproducible substreams when needed.
+For merge support, implement the applicable merge and preflight protocols in
+[tensor_adapters.py](../src/piper_offload/tensor_adapters.py). Their docstrings
+own coefficient, rounding, broadcasting, locality, and storage-preservation
+requirements. The caller-visible [shape and rounding contract](adapters.md#broadcast-additive-updates)
+explains how applications compose updates. Add the format to the applicable
+shared contract tests and document its supported capabilities in the format matrix.
 
-`BroadcastMergeTensorAdapter` explicitly opts a representation into standard
-PyTorch broadcasting for its advertised merge operations. Preflight checks that
-every source broadcasts to the existing logical target shape, then calls
-`validate_broadcast_merge()` to check the representation. Without this capability,
-sources must match the full target shape. Implementations receive compact staged
-products or dense updates and own their broadcast arithmetic; see the
-[shape and rounding contract](adapters.md#broadcast-additive-updates).
+For experimental DTensor execution, see [formats](formats.md#dtensor-and-custom-formats)
+and the module contracts linked there.
 
-Both merge interfaces use `alpha` for the update coefficient and keyword-only
-`beta: float = 1.0` for the current target coefficient, matching `addmm`:
-LoRA merge computes `beta * target + alpha * (b @ a)`; dense merge computes
-`beta * target + alpha * update`. Staged validation accepts the same coefficients.
-These coefficients must be finite. Merge `alpha` is the effective update
-coefficient, distinct from a checkpoint's intrinsic LoRA alpha. Packed LoRAs
-absorb their individual coefficients into the factors and use merge `alpha=1`.
-The shared parameter update passes its `source_scale` as `beta`, including through
-`LoRATransform`. Factor-only compositions retain that path at any source scale;
-dense deltas and value-only scaling use the dense path.
+## Commits and pull requests
 
-Keep scaling separate from the staged additive update: constructing a cancelling
-base delta can overflow or lose small updates in FP16/BF16. Encode only the final
-result, preserving target storage and activation calibration. Optimized kernels
-apply the coefficient to the decoded source before adding the update, retaining
-the representation's compute precision and fused terminal rounding. Reference
-merges remain for unsupported devices or layouts.
+Commit messages use the standard Git format: an imperative subject of at most
+72 characters, such as "Preserve mapped weights during host capture", then a
+blank line and a body wrapped at 72 columns that explains why. Subjects take no
+type prefix such as `feat:`; the changelog classifies changes. PR titles follow
+the same subject rule and should be suitable as squash-merge commit subjects.
+Commits stay focused and include the tests and lint fixes for their change.
+Do not commit generated outputs, model caches, or local secrets.
 
-Custom merge adapters must implement `alpha` and `beta` in merge and staged
-validation methods, including prepared-factor forwarding where provided;
-dequantization and representation-copy capabilities remain separate contracts.
+A pull request description leads with the problem: what goes wrong, for whom,
+and how often. Then it covers:
 
-## Runtime and compilation
+- **Change:** what the PR does, why this design, and what it removes or supersedes.
+- **Compatibility:** whether the Python API, resource or activation lifecycle,
+  ownership and pinning behavior, supported formats or dependencies, or numerical
+  results change. State any caller migration, including effects on Piper Engine's
+  use of pinned releases; see [VERSIONING.md](../VERSIONING.md).
+- **Validation:** the commands run and their results, and what remains
+  unvalidated, such as GPU or Windows paths. Performance claims include the
+  hardware, workload, and configuration used for measurements.
 
-The streaming, rolling, and resident runtimes share host state but schedule
-different device working sets. Their user-visible boundaries are documented
-in [streaming](streaming.md). Host capture and runtime changes must preserve
-which transfers request pinning; a lease holds storage and does not itself
-choose the pinning policy.
-
-Rolling compilation tracks the first and last reader of each parameter across
-all physical inputs of structured weights. After the last reader launches,
-a CUDA event allows the copy stream to refill that storage for the next block;
-the next block waits at its first reader. The rollover pass runs after user
-post-grad passes so it sees their rewritten graph. Scheduler ordering preserves
-the ordinary compute kernels and autotuning identity without describing frozen
-parameters as graph mutations.
-
-See [block_compile.py](../src/piper_offload/block_compile.py) and
-[rolling_compile.py](../src/piper_offload/rolling_compile.py) for compiler
-boundaries, and [the rolling benchmark](../benchmarks/benchmark_rolling_compile.py)
-for output, latency, and allocator-residency comparisons. Compiler failures
-propagate: retrying a partly executed graph eagerly could repeat mutations.
-Compiler artifact caches and workspace are outside resource byte accounting;
-model eviction does not reset the process-wide compiler cache.
-
-## Experimental DTensor execution
-
-DTensor weight capture composes with tensor adapters; see [formats](formats.md).
-Two separate execution experiments sit outside ordinary model caching:
-
-- [`communication.py`](../src/piper_offload/communication.py) registers a blocking
-  host-relay process group. Gloo or shared host allocations transport payloads
-  between processes, using the pin manager for host staging.
-- [`sequential.py`](../src/piper_offload/sequential.py) runs two ranks in one
-  process on a shared GPU and compute stream, yielding between ranks at
-  collective boundaries so temporary buffers can be reused.
-
-Their module and API docstrings contain usage, supported collectives, and
-failure recovery. Neither facility coordinates ordinary offloader scheduling.
+Link related issues and PRs. Add a `CHANGELOG.md` entry under **Unreleased**
+when a caller can observe the change: in the Python API, lifecycle, memory
+behavior, supported configurations, or results. Documentation, tests, and
+internal refactors need none. Use Added, Changed, or Fixed headings as applicable,
+reusing existing headings, and prefix a breaking change with "Breaking:".
+State what changes for the caller and what they must do; implementation,
+benchmark narratives, and test details belong in the PR.

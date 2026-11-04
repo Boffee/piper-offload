@@ -191,6 +191,12 @@ class Memory(shared.Memory):
     A released copy enters only after successful unregistration. Batch workers
     own copies until joined, so neither retirement nor commitment pressure can
     free memory while an offer is running.
+
+    Commitment pressure uses ``MaximumCommitCondition``, checked before admission
+    and allocation and watched while the tier retains copies. The current commit
+    limit is not a pressure estimate: Windows can grow it on demand. See
+    :func:`piper_offload._host_memory_windows.commit_exhausted` for native signal
+    semantics and failure behavior.
     """
 
     readers = Readers
@@ -337,12 +343,22 @@ class Memory(shared.Memory):
         return self._evict_offered(0)
 
     def prepare(self, copies: list[CopyLoad]) -> Generator[CopyLoad | None]:
-        # Snapshot the fill policy while reservation still holds the lock.
+        """Snapshot fill policy under the lock and prepare copies outside it.
+
+        When retention is enabled, every fill uses low-priority file reads,
+        including the first load before any copy has been offered. Otherwise
+        its file cache could outrank copies offered later. With retention
+        disabled, normal-priority reads preserve warm refills. Each worker
+        faults its destination first at normal priority; see
+        :func:`_read_range_below_offers`.
+        """
         return self._prepare(copies, below_offers=self.max_offered_bytes > 0)
 
     def _prepare(self, copies: list[CopyLoad], *, below_offers: bool) -> Generator[CopyLoad | None]:
         """Reclaim all requested copies before any fill, handing each back as soon as its reclaim returns.
 
+        A fill's memory demand could discard copies this acquisition intends
+        to reuse, so all reclaims must finish first.
         A copy Windows kept intact is then ready, so it registers before
         anything is read, ahead of earlier copies still to be filled.
         Closing joins all reclaim workers before the manager may free any
@@ -353,7 +369,5 @@ class Memory(shared.Memory):
                 item.offered = False
                 yield item
         unfilled = [item for item in copies if item.missing and item.error is None]
-        # Apply low-priority file reads from the first load, before anything
-        # is offered, so its page cache cannot outrank copies offered later.
         read = _read_range_below_offers if below_offers else shared._read_range
         yield from self._filled(unfilled, read=read)
