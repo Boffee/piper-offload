@@ -5,6 +5,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- Compiled blocks release inputs held by discarded PyTorch tracing attempts
+  immediately, avoiding extra GPU memory retained until garbage collection.
+  Compilation results and cached execution are unchanged.
+
 ## [0.10.0rc12] - 2026-10-30
 
 ### Changed
