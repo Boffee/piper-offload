@@ -1,6 +1,7 @@
 """Discarded real traces release inputs without waiting for cyclic GC."""
 
 import gc
+import json
 import types
 from weakref import ref
 
@@ -121,7 +122,8 @@ def test_discarded_trace_releases_real_input_without_gc(monkeypatch, discard, de
             torch.testing.assert_close(block(value), expected)
             assert discarded
             del value
-            assert value_ref() is None, _describe_input_owners(value_ref)
+            if value_ref() is not None:
+                pytest.fail(json.dumps(_describe_input_owners(value_ref), indent=2))
             expected_compilations = 2 if discard == "restart" else 1
             assert compilations == expected_compilations
             # Successful guards still work, and warm calls do not compile again.
