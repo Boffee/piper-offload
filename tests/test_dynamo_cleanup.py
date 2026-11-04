@@ -1,6 +1,7 @@
 """Discarded real traces release inputs without waiting for cyclic GC."""
 
 import gc
+import types
 from weakref import ref
 
 import pytest
@@ -11,6 +12,29 @@ from torch._dynamo.output_graph import DynamoTracerOutput
 
 from piper_offload._dynamo import install_discarded_trace_cleanup
 from piper_offload.block_compile import BlockCompileConfig, _BlockCompileState
+
+
+def _describe_input_owners(value_ref):
+    value = value_ref()
+    result = []
+    for owner in gc.get_referrers(value):
+        row = {"type": type(owner).__module__ + "." + type(owner).__qualname__}
+        if isinstance(owner, dict):
+            row["input_names"] = [str(key) for key, item in owner.items() if item is value]
+            row["keys"] = [str(key) for key in owner][:30]
+            paths = []
+            for parent in gc.get_referrers(owner):
+                path = {"type": type(parent).__module__ + "." + type(parent).__qualname__}
+                if isinstance(parent, types.FrameType):
+                    path["frame"] = (parent.f_code.co_filename, parent.f_code.co_name, parent.f_lineno)
+                elif isinstance(parent, dict):
+                    path["names"] = [str(key) for key, item in parent.items() if item is owner]
+                paths.append(path)
+            row["owners"] = paths
+        elif isinstance(owner, types.FrameType):
+            row["frame"] = (owner.f_code.co_filename, owner.f_code.co_name, owner.f_lineno)
+        result.append(row)
+    return result
 
 
 class _InputBlock(nn.Module):
@@ -55,6 +79,8 @@ def test_discarded_trace_releases_real_input_without_gc(monkeypatch, discard, de
             assert graph.local_scope == {}
             assert not graph.guards
             discarded.append(graph)  # keep the trace alive to test input ownership
+        # A retained callback frame must not own the input locals itself.
+        del original_scope
 
     monkeypatch.setattr(DynamoTracerOutput, "_cleanup_output_graph", observe_cleanup)
     compilations = 0
@@ -86,7 +112,7 @@ def test_discarded_trace_releases_real_input_without_gc(monkeypatch, discard, de
             torch.testing.assert_close(block(value), expected)
             assert discarded
             del value
-            assert value_ref() is None
+            assert value_ref() is None, _describe_input_owners(value_ref)
             expected_compilations = 2 if discard == "restart" else 1
             assert compilations == expected_compilations
             # Successful guards still work, and warm calls do not compile again.
