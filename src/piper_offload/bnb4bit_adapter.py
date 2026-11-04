@@ -22,11 +22,8 @@ shape, dtype, quant type) rides in a small packed blob that bitsandbytes
 keeps host-resident; only the packed weight and the per-block scales DMA
 to the GPU.
 
-CUDA LoRA updates use a raw-storage Triton merge for standard 64-value
-blocks whose physical storage contains exactly two logical values per byte.
-This covers NF4 and FP4, ordinary and nested scales, and byte-aligned
-uint8/fp16/bf16/fp32 quant storage. Other layouts keep the precise generic
-dequantize/addmm/requantize path.
+Merge backend selection is documented by :meth:`Bnb4bitAdapter.merge_lora_`
+and :meth:`Bnb4bitAdapter.merge_dense_`.
 
 Reaches into bitsandbytes' 4-bit layout through :mod:`._bnb`; if
 bitsandbytes refactors, the capture/read paths fail with a clear validation
@@ -440,7 +437,15 @@ class Bnb4bitAdapter:
         beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        """Merge into BNB4 storage, preferring the raw Triton path."""
+        """Merge into BNB4 storage, preferring the raw Triton path.
+
+        When Triton is available, compatible CUDA NF4/FP4 layouts use the
+        raw-storage kernel: standard 64-value blocks with two logical values
+        per byte and uint8/fp16/bf16/fp32 storage. Both ordinary and nested scales
+        are supported for deterministic rounding. Nested scales with stochastic
+        rounding use the dequantize/addmm/requantize fallback, as do other
+        supported layouts or environments without Triton.
+        """
         qt = require_params_4bit(target)
         if _can_use_triton_merge(qt, b, a) and (
             rounding_seed is None or not qt.quant_state.nested
@@ -493,7 +498,11 @@ class Bnb4bitAdapter:
         beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        """Merge a full-rank update, preferring the raw Triton path."""
+        """Merge a full-rank update, preferring the raw Triton path.
+
+        Backend selection follows :meth:`merge_lora_` for compatible dense
+        updates. The dense fallback uses :func:`merge_dense_requantize_`.
+        """
         qt = require_params_4bit(target)
         if (
             _can_use_triton_dense_merge(qt, update)

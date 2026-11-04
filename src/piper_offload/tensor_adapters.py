@@ -340,6 +340,14 @@ class LoRAMergeTensorAdapter[HostStateT, GpuStateT](
     The adapter combines both terms before encoding once, preserving the target
     tensor's object and storage identities. Implementations may select a
     format-specific kernel or a regular framework-operator fallback.
+
+    Merge and staged validation must accept keyword-only ``beta=1.0`` and
+    ``rounding_seed: int | None = None``, including implementations that only
+    support deterministic rounding. ``None`` selects deterministic behavior;
+    :func:`piper_offload.seeding.derive_seed` provides reproducible substreams.
+    Apply source scaling before addition, preserving activation calibration and
+    encoding only the final result. A cancelling base delta can overflow or
+    lose low-precision updates; it is not an equivalent implementation.
     """
 
     @staticmethod
@@ -393,6 +401,8 @@ class DenseMergeTensorAdapter[HostStateT, GpuStateT](
     addition, without encoding an intermediate scaled base. Implementations
     preserve the target tensor's object and storage identities; structured
     formats may use a native kernel or dequantize/add/requantize internally.
+    Merge and staged validation follow :class:`LoRAMergeTensorAdapter`'s
+    coefficient, rounding, and calibration-preservation contract.
     """
 
     @staticmethod
@@ -447,7 +457,11 @@ class DenseMergeValidationTensorAdapter(Protocol):
 
 @runtime_checkable
 class MergeLocalityTensorAdapter(Protocol):
-    """Optional target-local region used to stage logical merge inputs."""
+    """Optional target-local region used to stage logical merge inputs.
+
+    Composing adapters expose the local shape and global offsets of the target
+    region. This capability does not itself advertise a merge operation.
+    """
 
     @staticmethod
     def merge_local_shape_and_offsets(
@@ -885,13 +899,18 @@ class RegularAdapter:
         beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
+        """Merge in the staged compute dtype, preserving plain-tensor rounding.
+
+        An exact 2D target uses fused ``addmm_``. A broadcast target first forms
+        the compact ``b @ a`` product with autocast disabled, then adds it through
+        ``merge_dense_``. That product rounds before addition, so the paths need
+        not be bit-identical. Neither path promotes staged factors; PyTorch's
+        kernels determine internal accumulation precision.
+        """
         del rounding_seed
         if target.shape == (b.shape[0], a.shape[1]):
             target.addmm_(b, a, beta=beta, alpha=alpha)
         else:
-            # Keep the shared product compact and in the staged compute dtype,
-            # even when a streamed load runs inside the caller's autocast.
-            # The product rounds before addition, unlike exact-matrix addmm_.
             with torch.autocast(device_type=target.device.type, enabled=False):
                 RegularAdapter.merge_dense_(target, b @ a, alpha, beta=beta)
 

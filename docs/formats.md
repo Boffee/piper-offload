@@ -25,8 +25,8 @@ or Visual Studio installation is not required for eager GPU execution.
 |---|---|---|---|
 | Plain floating point, excluding plain float8 | None | Native | Native |
 | Quanto qint8 / qfloat8 | `quanto` | Yes | Yes |
-| bitsandbytes NF4 / FP4 | `bnb` | Yes | Yes |
-| bitsandbytes int8 | `bnb` | Yes | Yes |
+| [bitsandbytes NF4 / FP4](../src/piper_offload/bnb4bit_adapter.py) | `bnb` | Yes | Yes |
+| [bitsandbytes int8](../src/piper_offload/bnb8bit_adapter.py) | `bnb` | Yes | Yes |
 | TorchAO scaled FP8 | `torchao` | Yes | Yes |
 | TorchAO static-activation scaled FP8 | `torchao` | Yes | Yes |
 | TorchAO INT8 | `torchao` | Yes | Yes |
@@ -49,20 +49,17 @@ quantized and DTensor adapters require each source update to match the full
 logical target shape and reject broadcast requests during preflight.
 
 Quantized additive merges recompute data-dependent weight scales and preserve
-activation calibration metadata. Standard CUDA layouts use format-specific
-Triton kernels where available; other supported layouts use a reference
-dequantize/requantize path. Source scaling uses the same optimized merge paths
-and terminal rounding. Optimized merges keep source scaling and addition in
-FP32 until the terms are combined, avoiding intermediate overflow or loss of
-small residuals. Piper ConvRot uses Piper Kernels operations and encoders.
-All merge-capable built-in quantized formats support stochastic rounding.
-Stochastic merges with nested bitsandbytes 4-bit scales use the reference path.
+activation calibration metadata. Optimized merges keep source scaling and
+addition in FP32 until the terms are combined, avoiding intermediate overflow
+or loss of small residuals. All merge-capable built-in quantized formats support
+stochastic rounding. See [adapter rounding](adapters.md#choose-merge-or-routed-lora)
+for configuration and reproducibility. Backend selection is documented with
+each format's adapter.
 
 ## Training and layout limits
 
-Quantized weights stay frozen. Only plain tensors support the `Parameter.data`
-swap needed to preserve trainable parameter identity. Quanto and both scaled
-FP8 adapters additionally support copying device state back to CPU; that
+Quantized weights stay frozen. Only plain tensors support training. Quanto and
+both scaled FP8 adapters additionally support copying device state back to CPU; that
 capability does **not** make their weights trainable. Other quantized adapters
 and DTensor provide inference movement and the merges listed above. Separate
 plain trainable parameters can coexist with a frozen quantized base; follow
@@ -72,23 +69,17 @@ Transposed MX and NVFP4 packed targets cannot be re-encoded into their existing
 storage; use routed LoRA. Scaled FP8 supports transposed per-row and per-tensor
 scales, but not transposed per-group scales. TorchAO INT8 does not support
 transposed weights; Piper ConvRot INT8 also rejects transposed matrices at
-capture. A valid nonstandard layout uses a reference merge only when that format
-can re-encode the layout.
+capture. Other layouts support merging only when the format can re-encode them.
 
 Complete [parameter values](adapters.md#populate-optional-meta-parameters)
-have a broader use than additive updates: exact representation copying works
-for supported physical values even when additive merge is unavailable.
-Deltas from other adapters must be supported by the supplied representation.
-Scaled values with LoRA-only contributions use factorized merge support;
-value-only scaling and compositions containing dense deltas require dense merge
-support. Scaling and deltas combine before one terminal re-encoding. See the
+can copy supported physical representations even when additive merge is
+unavailable. Scaling and mixed-update requirements belong to the
 [composition contract](adapters.md#populate-optional-meta-parameters).
 
 ## Format details
 
-**Quanto.** `WeightQBytesTensor` storage and scales are captured separately.
-Marlin FP8 weights are canonicalized to ordinary unpacked Quanto weights for
-offloading, so execution does not retain Marlin's packed matmul. A direct
+**Quanto.** Marlin FP8 weights are canonicalized to ordinary unpacked Quanto
+weights for offloading, so execution does not retain Marlin's packed matmul. A direct
 permanent merge into an existing Marlin weight repacks its original storage.
 See [quanto_adapter.py](../src/piper_offload/quanto_adapter.py).
 
@@ -134,11 +125,9 @@ operations create independent storage. See [memory](memory.md) for the mapped
 checkpoint loading pattern.
 
 Packed GGUF parameters require Offload activation to execute;
-`requires_activation(parameter)` lets loaders detect this. Each load transfers
-the packed source to a reusable staging buffer, then decodes, rotates, and
-requantizes directly into BF16 ConvRot INT8 storage without allocating the full
-dense weight. The logical input width must be divisible by 16. Rotation uses
-the largest compatible group size among 256, 64, and 16.
+`requires_activation(parameter)` lets loaders detect this. Host backing stays
+packed; active weights use BF16 ConvRot INT8 without allocating a full dense
+weight during conversion. The logical input width must be divisible by 16.
 
 Direct conversion supports F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
 Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS. The `gguf` extra includes
@@ -166,7 +155,7 @@ For experimental DTensor execution, [communication.py](../src/piper_offload/comm
 documents `piper_relay` collectives through host memory, and
 [sequential.py](../src/piper_offload/sequential.py) documents `SequentialExecutor`
 for two ranks sharing one process and GPU. Their docstrings cover setup and
-execution contracts.
+execution contracts. Neither facility coordinates ordinary offloader scheduling.
 
 A custom tensor format integrates through `register_adapter()`. Implement the
 capture, physical-storage enumeration, allocation, transfer, and reconstruction

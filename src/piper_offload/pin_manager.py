@@ -672,6 +672,11 @@ class PinManager:
         caller joins workers before discarding the remaining pending storage.
         Memory preparation publishes readiness after joining the worker, so
         registration never races a worker.
+
+        Reservations follow request order. Registering the ready prefix first
+        preserves in-place requests' priority, then ``early`` lets an intact
+        reclaimed copy take runtime capacity before earlier unfilled copies.
+        This locks intact pages before fill pressure can discard them.
         """
         exhausted = False
         while not exhausted and pending:

@@ -1,4 +1,11 @@
-"""Select the host memory component once at import; native calls remain lazy."""
+"""Select the host memory component once at import; native calls remain lazy.
+
+Pinning mechanisms are not probed at runtime. Linux copies use anonymous
+mappings and Windows copies use ``VirtualAlloc`` regions. File fills use
+positional reads where available, otherwise one handle per worker. Allocation
+and reader contracts live in the selected platform module; copy ownership and
+preparation are defined by :mod:`piper_offload._copy_memory`.
+"""
 
 import os
 import sys

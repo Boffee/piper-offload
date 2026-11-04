@@ -32,6 +32,9 @@ release while the package is pre-1.0.
 
 ## Release process
 
+Write release PRs and changelog entries using the
+[commits and pull requests guidance](docs/development.md#commits-and-pull-requests).
+
 1. Start from a green `main` branch and choose the next version from the policy above.
 2. Run `uv version <version>` in a release branch and move the `Unreleased` changelog entries
    under a dated heading for that version.

@@ -215,6 +215,10 @@ class _FactorAwareLoRAMergeAdapter(Protocol):
     already-low-precision ``A`` slice. Formats whose stored-weight coordinates
     require another transform can instead stage every factor atomically, before
     packing loses the original factor boundaries.
+
+    Prepared validation and merge must honor the same ``alpha``, ``beta``, and
+    ``rounding_seed`` contract as ``LoRAMergeTensorAdapter``; forwarding a
+    prepared update must preserve source scaling as well as its coefficient.
     """
 
     @staticmethod
@@ -336,8 +340,10 @@ def _pack_materialized_weight_factors(
     """Pack LoRAs at their common matrix shape, without repeating stacked heads.
 
     Host tensors copy directly into their destination slices through transfer_;
-    singleton expansion happens during the copy. Scaling touches only the
-    staged A slices. The packed buffers die after the merge.
+    singleton expansion happens during the copy. Factors pack across the rank
+    dimension in the target's compute dtype. Each coefficient scales only its
+    staged A slice, so the combined merge uses ``alpha=1``. The packed buffers
+    die after the merge.
     """
     rows, cols = torch.broadcast_shapes(*[
         (factor.b.shape[0], factor.a.shape[1]) for factor in factors

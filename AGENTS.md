@@ -28,8 +28,8 @@ explain how those APIs work together.
   boundaries and explain why they are needed.
 - Treat documentation as a coherent explanation of the current library.
   Rework the organization and examples when the concepts change, consolidate
-  overlap, and remove obsolete material. Prefer one authoritative explanation
-  with links from other contexts. Release history belongs in `CHANGELOG.md`.
+  overlap, and remove obsolete material. Each explanation has one owner;
+  [documentation ownership](docs/development.md#documentation-ownership) says which.
 
 ## Contracts to preserve
 
@@ -48,7 +48,8 @@ Read the relevant guide before changing its behavior:
 - [Memory](docs/memory.md): mappings stay read-only; writes use owned storage.
   Asynchronous transfers hold pin leases and tensor adapters copy through
   `transfer_()`. Leases protect storage; only repeated transfers request
-  pinning. The guide also covers Windows reclaim ordering and lock ownership.
+  pinning. Memory component docstrings own Windows reclaim ordering and lock
+  ownership; see the [architecture map](docs/development.md#architecture).
 
 Use the code's terminology consistently; see
 [development](docs/development.md#architecture) for vocabulary.
@@ -60,8 +61,12 @@ resource and a tensor adapter serve different purposes.
 - Follow [Writing tests](docs/development.md#writing-tests) when changing coverage.
 - Tests: `uv run pytest tests -q`. GPU tests skip without suitable hardware.
 - Lint and types: `uv run ruff check .` and `uv run pyright`.
+- Write commits, pull request descriptions, and `CHANGELOG.md` entries as
+  [commits and pull requests](docs/development.md#commits-and-pull-requests) describes.
 - Reviews should explain the failure, its impact, and where it occurs. Judge
   the resulting design, including the documentation. A finding about forbidden
   misuse calls for a clearer contract; a new capability needs a foreseeable use.
+  A finding about an omitted detail should show a caller acting wrongly because
+  of the omission.
 
 See [VERSIONING.md](VERSIONING.md) for compatibility and release policy.

@@ -1,5 +1,12 @@
 """Inductor integration for experimental per-parameter block rollover.
 
+Liveness tracks the first and last reader across every physical input of a
+structured parameter. After its last reader launches, a CUDA event permits the
+copy stream to refill that storage for the next block; that block waits before
+its first reader. The lifecycle pass follows user post-grad passes so it sees
+their rewritten graph. Scheduler ordering preserves ordinary compute kernels
+and autotuning identity without marking frozen parameters as graph mutations.
+
 The compiler discovers active slots through a process-local registry, but the
 resulting graph contains only parameter indices and tensor arguments. Lifecycle
 ops resolve their runtime from the current tensor storage at execution time.

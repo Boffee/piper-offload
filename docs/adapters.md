@@ -134,8 +134,8 @@ restriction on matrix or feature dimensions. For example:
 LoRA factors remain 2D with compatible rank dimensions. Different contributions
 to one target may have different broadcastable shapes, including mixed LoRA and
 dense updates. Factors and dense sources remain immutable; callers need not
-repeat or pre-scale checkpoint tensors. Shared updates are staged at their
-common shape, without repeating them across target-only dimensions.
+repeat or pre-scale checkpoint tensors. Broadcasting does not require a separate
+update copy for every target head.
 
 Complete parameter values require **exact full-shape matching**. Routed LoRA
 retains its exact linear-weight shape contract. Built-in quantized and DTensor
@@ -145,25 +145,18 @@ can explicitly opt into broadcast merges. See [formats](formats.md).
 ### Accumulation and rounding
 
 Sources are staged in the target's compute dtype. Plain merge arithmetic keeps
-that dtype even inside an autocast context. A single LoRA with an exact 2D
-target uses `addmm_` with its combined strength and intrinsic scale. Multiple
-LoRAs pack their factors across the rank dimension, scaling each staged `A`
-slice by its coefficient before one matrix multiplication. Singleton factor
-dimensions expand only as needed to form that common matrix.
+that dtype even inside an autocast context; low-precision sources are not
+promoted to a higher dtype for staging. PyTorch kernels determine internal
+accumulation precision.
 
-When the target shape differs from the staged product shape, the plain tensor
-adapter computes `B @ A` in the compute dtype and then adds it with broadcasting.
-The product therefore rounds before the addition, unlike the fused exact-2D
-`addmm_` path. With any dense contribution, dense terms accumulate in request
-order into a compute-dtype update, followed by the packed LoRA contribution;
-that combined update is added to the base once. PyTorch kernels determine
-internal accumulation precision; staging does not promote low-precision values
-to a higher dtype.
-
-These intermediate roundings mean broadcast merges need not be bit-identical
-to separate per-head `addmm_` calls. Merging low-precision heads before averaging
-also need not match adding a shared delta after averaging. Quantized rounding
-is described below.
+Broadcast LoRA products round before addition, so broadcast merges need not be
+bit-identical to separate per-head fused `addmm_` calls. Combining several
+updates can also round differently from applying each separately. Merging
+low-precision heads before averaging need not match adding a shared delta after
+averaging, and adapter ordering does not promise bit-identical sums. Quantized
+rounding is described below. The arithmetic and staging details belong to
+[the tensor adapters](../src/piper_offload/tensor_adapters.py) and
+[parameter updates](../src/piper_offload/_parameter_update.py).
 
 ## Choose merge or routed LoRA
 
@@ -176,8 +169,8 @@ Activation-scoped merge requires CUDA. Routed LoRA works with CPU or CUDA
 activation and leaves the base weight untouched. It requires an `nn.Linear`
 parent with a compatible logical weight shape and compute dtype. Factors are
 staged for that target's invocation and released afterwards; several LoRAs on
-one target share a hook pair and contribute independently. Tied weights are
-handled by hooking only the named parent.
+one target contribute independently. For tied weights, only the named parent
+receives the routed residual.
 
 Use `adapter_mode="routed"` in the example above when avoiding quantized
 re-encoding matters more than the extra forward work, or the format cannot
@@ -258,14 +251,11 @@ adapters remain inactive under either policy.
 A value can use any supported physical representation with a floating compute
 dtype and compatible logical shape, including tile-packed INT4. Exact copying
 does not require additive merge support or a dequantize/requantize pass.
-LoRA-only contributions retain the factorized merge path, including when the
-supplied value is scaled. When dense deltas are present, Piper stages one dense
-additive update. Both paths pass the value scale separately to the tensor adapter.
-The adapter computes the scaled base plus that update before one terminal
-encoding; it never constructs a cancelling `(value_scale - 1) * value` term.
-Value-only scaling requires dense merge support and uses a zero additive update.
-Arithmetic follows the representation's compute dtype and backend accumulation;
-adapter ordering does not promise bit-identical sums.
+LoRA-only contributions require factorized merge support, including when the
+supplied value is scaled. Value-only scaling and compositions containing dense
+deltas require dense merge support. Scaling and additive contributions combine
+before one terminal encoding. Arithmetic follows the representation's compute
+dtype and backend accumulation; see [accumulation and rounding](#accumulation-and-rounding).
 
 `dtype=` casts dense adapter inputs; prequantized values must already have that
 compute dtype. Requantize them before capture if a different compute dtype is

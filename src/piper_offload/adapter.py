@@ -65,7 +65,10 @@ class AdapterTargetUpdates:
         """Skip only an unpopulated target whose deltas all allow partial targets.
 
         Call after collecting every active contribution. A supplied value
-        makes the target available regardless of adapter ordering.
+        makes the target available regardless of adapter ordering. Both merge
+        paths validate target aliases before this check. A skipped target must
+        create no device override or permanent merge operation and requires no
+        staging or materialization; any strict delta still requires a base.
         """
         return param.is_meta and self.value is None and not self.requires_base
 

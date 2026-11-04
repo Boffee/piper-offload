@@ -79,6 +79,7 @@ def _logical_shape(tensor: torch.Tensor) -> tuple[int, int]:
 
 
 def _convrot_group_size(features: int) -> int:
+    """Choose the largest supported rotation group dividing ``features``."""
     for group_size in _CONVROT_GROUP_SIZES:
         if features % group_size == 0:
             return group_size

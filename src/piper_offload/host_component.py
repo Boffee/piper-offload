@@ -6,9 +6,11 @@ by :class:`ModelOffloader` for both non-streamed names and whole-model
 capture. It is a composable activate/deactivate lifecycle piece, not a
 top-level model runtime.
 
-Cross-cutting compatibility caveats (the narrow ``torch.compile`` scope,
-DDP/FSDP wrap-before requirement, single-thread contract) live in the
-:mod:`~piper_offload` package docstring.
+Application compatibility is covered by the
+`models <https://github.com/Boffee/piper-offload/blob/main/docs/models.md>`_ and
+`streaming <https://github.com/Boffee/piper-offload/blob/main/docs/streaming.md>`_
+guides. :class:`ModelOffloader` owns the coordinated model lifecycle and
+exclusive activation contract.
 
 Class-specific caveats
 ----------------------

@@ -180,11 +180,11 @@ class VirtualRegion:
     def offer(self) -> None:
         """Offer the pages to Windows, which may discard them; they are inaccessible until reclaimed.
 
-        Offering in spans of ``_OFFER_GRAIN`` lets a reclaim find what survived in
-        the same spans, so a discard costs one of them rather than the whole
-        region. Raises ``BufferError``, changing nothing, while an export is
-        alive. An ``OSError`` leaves the pages in an unknown state; close the
-        region.
+        Offering at normal offer priority in ``_OFFER_GRAIN`` spans
+        lets a reclaim find what survived in the same spans, so a discard costs
+        one of them rather than the whole region. Raises ``BufferError``, changing
+        nothing, while an export is alive. An ``OSError`` leaves the pages in an
+        unknown state; close the region.
         """
         if self._exports:
             raise BufferError("cannot offer a region while its buffer is exported")
