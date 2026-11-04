@@ -104,9 +104,8 @@ def test_discarded_trace_releases_real_input_without_gc(monkeypatch, discard, de
             raise SkipFrame("exercise skipped trace")
         return graph.forward
 
-    block = input_block
     state = _BlockCompileState.create(
-        [block],
+        [input_block],
         BlockCompileConfig(fullgraph=discard != "skip"),
         backend=backend,
     )
@@ -119,7 +118,7 @@ def test_discarded_trace_releases_real_input_without_gc(monkeypatch, discard, de
             value = torch.randn(2, 8, device=device)
             value_ref = ref(value)
             expected = value.sin() + 1
-            torch.testing.assert_close(block(value), expected)
+            torch.testing.assert_close(input_block(value), expected)
             assert discarded
             del value
             if value_ref() is not None:
@@ -129,7 +128,7 @@ def test_discarded_trace_releases_real_input_without_gc(monkeypatch, discard, de
             # Successful guards still work, and warm calls do not compile again.
             for rows in (2, 3):
                 value = torch.randn(rows, 8, device=device)
-                torch.testing.assert_close(block(value), value.sin() + 1)
+                torch.testing.assert_close(input_block(value), value.sin() + 1)
             assert compilations == expected_compilations
     finally:
         state.restore()
