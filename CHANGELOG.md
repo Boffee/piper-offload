@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.10.0rc13] - 2026-11-05
+
 ### Added
 
 - `TrellisParameter` wraps a trellis-coded ConvRot INT8 weight, 3 to 6 bits per
@@ -886,7 +888,11 @@ under 0.9.0rc1, 0.9.0rc2, and 0.9.0rc3 below.
 - Python 3.14, PyTorch 2.13, TorchAO 0.18, Apache-2.0 licensing, and the Piper Offload package
   identity.
 
-[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc9...HEAD
+[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc13...HEAD
+[0.10.0rc13]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc12...v0.10.0rc13
+[0.10.0rc12]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc11...v0.10.0rc12
+[0.10.0rc11]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc10...v0.10.0rc11
+[0.10.0rc10]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc9...v0.10.0rc10
 [0.10.0rc9]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc8...v0.10.0rc9
 [0.10.0rc8]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc7...v0.10.0rc8
 [0.10.0rc7]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc6...v0.10.0rc7
