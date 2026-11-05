@@ -27,6 +27,7 @@ from .piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
 from .quanto_adapter import QuantoAdapter
 from .static_float8_adapter import StaticFloat8Adapter
 from .tensor_adapters import RegularAdapter, TensorAdapter
+from .trellis_adapter import TrellisAdapter
 
 # DTensorAdapter is always checked before registered and built-in adapters: a
 # DTensor is an outer wrapper whose local shard is delegated back through this
@@ -48,6 +49,7 @@ _BUILTIN_ADAPTERS: tuple[type[TensorAdapter[Any, Any]], ...] = (
     Int8Adapter,
     Int4TilePackedAdapter,
     GgufAdapter,
+    TrellisAdapter,
     PiperConvRotInt8Adapter,
     RegularAdapter,
 )
@@ -157,10 +159,12 @@ def param_representation(param: torch.Tensor) -> torch.Tensor:
 def requires_activation(tensor: torch.Tensor) -> bool:
     """Whether a stored representation needs Offload conversion before module execution.
 
-    Packed GGUF sources execute as ConvRot targets. Other supported tensors
-    can execute in their stored representation and do not need this conversion.
+    Packed GGUF and trellis-coded sources execute as ConvRot targets. Other
+    supported tensors can execute in their stored representation and do not need
+    this conversion.
     """
-    return GgufAdapter.matches(param_representation(tensor))
+    representation = param_representation(tensor)
+    return GgufAdapter.matches(representation) or TrellisAdapter.matches(representation)
 
 
 def param_tensor_id(param: nn.Parameter) -> tuple[Any, ...]:

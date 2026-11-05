@@ -15,8 +15,8 @@ format's compatible hardware and PyTorch stack.
 
 The `torchao` extra also covers Piper ConvRot. The composable `triton` extra
 selects upstream Triton on Linux and `triton-windows` on 64-bit Windows.
-Most integrations have portable
-fallbacks without Triton; GGUF conversion requires it. Windows GPU execution
+Most integrations have portable fallbacks without Triton; GGUF conversion and
+trellis decoding require it. Windows GPU execution
 requires Windows 10 or 11, a supported NVIDIA GPU and current driver, and the
 Visual C++ Redistributable for Visual Studio 2015–2022. A separate CUDA toolkit
 or Visual Studio installation is not required for eager GPU execution.
@@ -36,6 +36,7 @@ or Visual Studio installation is not required for eager GPU execution.
 | Piper ConvRot INT8 | `torchao` | Yes, matrices only | Yes, matrices only |
 | Piper ConvRot NVFP4 | `torchao` | Yes, layout restrictions | Yes, layout restrictions |
 | Packed GGUF → ConvRot INT8 | `gguf` | Activation only | Activation only |
+| Trellis-coded → ConvRot INT8 | `torchao`, `triton` | Activation only | Activation only |
 | DTensor | Depends on local shard | Delegates to local adapter | Delegates to local adapter |
 
 Plain float8 storage can move but is not an additive merge target. Scaled FP8
@@ -139,6 +140,24 @@ Externally supplied Diffusers `GGUFParameter` objects are recognized without a
 Diffusers dependency. Their GGUF linear modules must first be normalized to
 ordinary linear behavior. See [gguf_parameter.py](../src/piper_offload/gguf_parameter.py)
 and [gguf_adapter.py](../src/piper_offload/gguf_adapter.py).
+
+## Load trellis-coded weights
+
+Trellis coding stores a ConvRot INT8 matrix at 3 to 6 bits per weight; Piper
+Kernels owns the format and its encoder, `TrellisStorage.from_hp`. Wrap each
+weight's stored tensors and block size, as `TrellisStorage` holds them, in a
+`TrellisParameter` with the ConvRot group size, the logical dtype, and any
+static activation scale. Split or regroup checkpoint storage first: the
+parameter supports only detach and clone. Assign the parameters to the model
+and freeze it before capture.
+
+Host backing stays packed, and `requires_activation(parameter)` is true. Each
+refill transfers the packed tensors and decodes them into a reusable ConvRot
+INT8 target, without allocating a dense weight; decoding requires a Triton
+accelerator that Piper Kernels supports. LoRA and dense updates apply to the
+active target; permanent merge cannot modify the packed source. See
+[trellis_parameter.py](../src/piper_offload/trellis_parameter.py) and
+[trellis_adapter.py](../src/piper_offload/trellis_adapter.py).
 
 ## DTensor and custom formats
 

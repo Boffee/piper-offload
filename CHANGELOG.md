@@ -5,6 +5,19 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- `TrellisParameter` wraps a trellis-coded ConvRot INT8 weight, 3 to 6 bits per
+  weight, as Piper Kernels' `TrellisStorage` holds it. Host memory keeps it
+  packed; activation decodes it into ConvRot INT8 without a dense weight, and LoRA
+  and dense updates apply during activation only. Decoding requires a Triton
+  accelerator that Piper Kernels supports. Unlike `GgufParameter`, it has no row
+  operations: split fused checkpoint tensors before wrapping them.
+
+### Changed
+
+- Require Piper Kernels 0.8.0rc1 or newer, below 0.9, for trellis decoding.
+
 ### Fixed
 
 - Compiled blocks release input references held by discarded PyTorch tracing

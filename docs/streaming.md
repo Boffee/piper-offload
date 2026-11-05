@@ -160,8 +160,8 @@ PyTorch controls cache storage and lookup, including `TORCHINDUCTOR_CACHE_DIR`.
 Rolling is experimental. Groups require distinct block modules, identical
 parameter names/order and layouts, frozen managed parameters, no tied managed
 parameters, no streamed buffers, and no zero-sized parameter slots. Supported
-representations include regular dense, TorchAO-family, Quanto, GGUF, and Piper
-ConvRot INT8/NVFP4. Bitsandbytes, DTensor, and unreviewed external tensor
+representations include regular dense, TorchAO-family, Quanto, GGUF, trellis-coded,
+and Piper ConvRot INT8/NVFP4. Bitsandbytes, DTensor, and unreviewed external tensor
 adapters use ordinary streaming in auto mode; explicit rolling rejects
 unsupported groups. Activation-specific parameter overrides must also be
 compatible. See [formats](formats.md) for format and merge restrictions.

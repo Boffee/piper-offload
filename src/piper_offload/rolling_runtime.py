@@ -34,6 +34,7 @@ from .rolling_compile import (
 from .static_float8_adapter import StaticFloat8Adapter
 from .target_lease import CudaTargetLease
 from .tensor_adapters import RegularAdapter
+from .trellis_adapter import TrellisAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ _ROLLING_ADAPTER_TYPES = (
     Nvfp4Adapter,
     QuantoAdapter,
     GgufAdapter,
+    TrellisAdapter,
     PiperConvRotInt8Adapter,
 )
 
@@ -336,7 +338,7 @@ def _validate_instance(
     if any(type(host.adapter) not in _ROLLING_ADAPTER_TYPES for host in params.values()):
         raise NotImplementedError(
             "rolling compilation supports only regular dense, TorchAO-family, "
-            "Quanto, GGUF, and Piper ConvRot INT8 parameters"
+            "Quanto, GGUF, trellis-coded, and Piper ConvRot INT8 parameters"
         )
     if any(host.shape.numel() == 0 for host in params.values()):
         raise NotImplementedError("rolling compilation does not support zero-sized parameter slots")
