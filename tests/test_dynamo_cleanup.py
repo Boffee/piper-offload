@@ -1,8 +1,7 @@
 """Discarded real traces release inputs without waiting for cyclic GC."""
 
 import gc
-import json
-import types
+import logging
 from weakref import ref
 
 import pytest
@@ -15,38 +14,6 @@ from piper_offload._dynamo import install_discarded_trace_cleanup
 from piper_offload.block_compile import BlockCompileConfig, _BlockCompileState
 
 
-def _describe_input_owners(value_ref):
-    value = value_ref()
-    result = []
-    for owner in gc.get_referrers(value):
-        row = {"type": type(owner).__module__ + "." + type(owner).__qualname__}
-        if isinstance(owner, tuple):
-            row["items"] = [type(item).__module__ + "." + type(item).__qualname__ for item in owner]
-        if isinstance(owner, (dict, tuple)):
-            if isinstance(owner, dict):
-                row["input_names"] = [str(key) for key, item in owner.items() if item is value]
-                row["keys"] = [str(key) for key in owner][:30]
-            paths = []
-            for parent in gc.get_referrers(owner):
-                path = {"type": type(parent).__module__ + "." + type(parent).__qualname__}
-                if isinstance(parent, types.FrameType):
-                    path["frame"] = (parent.f_code.co_filename, parent.f_code.co_name, parent.f_lineno)
-                elif isinstance(parent, dict):
-                    path["names"] = [str(key) for key, item in parent.items() if item is owner]
-                elif isinstance(parent, tuple):
-                    path["items"] = [type(item).__module__ + "." + type(item).__qualname__ for item in parent]
-                elif isinstance(parent, types.CellType):
-                    path["cell_owners"] = [
-                        type(item).__module__ + "." + type(item).__qualname__ for item in gc.get_referrers(parent)
-                    ]
-                paths.append(path)
-            row["owners"] = paths
-        elif isinstance(owner, types.FrameType):
-            row["frame"] = (owner.f_code.co_filename, owner.f_code.co_name, owner.f_lineno)
-        result.append(row)
-    return result
-
-
 class _InputBlock(nn.Module):
     def forward(self, value):
         return value.sin() + 1
@@ -56,8 +23,15 @@ class _InputBlock(nn.Module):
 def input_block():
     # SkipFrame marks code for future calls, even with another compiler backend.
     torch._dynamo.reset_code(_InputBlock.forward.__code__)
-    yield _InputBlock()
-    torch._dynamo.reset_code(_InputBlock.forward.__code__)
+    # Pytest retains compiler diagnostic records, including exception call frames.
+    # Their argument tuples are separate owners from the discarded trace under test.
+    previous_logging_disable = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        yield _InputBlock()
+    finally:
+        logging.disable(previous_logging_disable)
+        torch._dynamo.reset_code(_InputBlock.forward.__code__)
 
 
 @pytest.mark.parametrize("discard", ["restart", "skip"])
@@ -89,7 +63,6 @@ def test_discarded_trace_releases_real_input_without_gc(monkeypatch, discard, de
             assert graph.local_scope == {}
             assert not graph.guards
             discarded.append(graph)  # keep the trace alive to test input ownership
-        # A retained callback frame must not own the input locals itself.
         del original_scope
 
     monkeypatch.setattr(DynamoTracerOutput, "_cleanup_output_graph", observe_cleanup)
@@ -104,8 +77,9 @@ def test_discarded_trace_releases_real_input_without_gc(monkeypatch, discard, de
             raise SkipFrame("exercise skipped trace")
         return graph.forward
 
+    block = input_block
     state = _BlockCompileState.create(
-        [input_block],
+        [block],
         BlockCompileConfig(fullgraph=discard != "skip"),
         backend=backend,
     )
@@ -118,17 +92,16 @@ def test_discarded_trace_releases_real_input_without_gc(monkeypatch, discard, de
             value = torch.randn(2, 8, device=device)
             value_ref = ref(value)
             expected = value.sin() + 1
-            torch.testing.assert_close(input_block(value), expected)
+            torch.testing.assert_close(block(value), expected)
             assert discarded
             del value
-            if value_ref() is not None:
-                pytest.fail(json.dumps(_describe_input_owners(value_ref), indent=2))
+            assert value_ref() is None
             expected_compilations = 2 if discard == "restart" else 1
             assert compilations == expected_compilations
             # Successful guards still work, and warm calls do not compile again.
             for rows in (2, 3):
                 value = torch.randn(rows, 8, device=device)
-                torch.testing.assert_close(input_block(value), value.sin() + 1)
+                torch.testing.assert_close(block(value), value.sin() + 1)
             assert compilations == expected_compilations
     finally:
         state.restore()
