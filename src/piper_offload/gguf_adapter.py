@@ -18,9 +18,9 @@ from typing import Any, cast
 import torch
 from torch import nn
 
+from ._convrot_int8_source import ConvRotInt8SourceAdapter
 from ._piper_convrot_int8 import create_convrot_int8_tensor
 from .gguf_parameter import GGUF_COMPUTE_DTYPE
-from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from .tensor_adapters import capture_host_tensor, transfer_
 
 __all__ = ["GgufAdapter"]
@@ -104,8 +104,10 @@ class _GgufGpu:
     target: torch.Tensor
 
 
-class GgufAdapter:
+class GgufAdapter(ConvRotInt8SourceAdapter):
     """Keep GGUF bytes on the host and refill fixed ConvRot INT8 targets."""
+
+    _SOURCE_NAME = "packed GGUF"
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
@@ -159,14 +161,14 @@ class GgufAdapter:
     def storage_tensors(state: _GgufHost) -> tuple[torch.Tensor, ...]:
         return (state.data,)
 
-    @staticmethod
+    @classmethod
     def cpu_param(
+        cls,
         state: _GgufHost,
         *,
         requires_grad: bool = False,
     ) -> nn.Parameter:
-        if requires_grad:
-            raise ValueError("GGUF parameters are inference-only")
+        cls._require_frozen(requires_grad)
         parameter = cast(Any, state.parameter_type)(
             state.data,
             requires_grad=False,
@@ -190,18 +192,6 @@ class GgufAdapter:
         )
 
     @staticmethod
-    def gpu_param(
-        host: _GgufHost,
-        gpu_state: _GgufGpu,
-        *,
-        requires_grad: bool = False,
-    ) -> nn.Parameter:
-        del host
-        if requires_grad:
-            raise ValueError("GGUF parameters are inference-only")
-        return nn.Parameter(gpu_state.target, requires_grad=False)
-
-    @staticmethod
     def copy_to_gpu(
         src: _GgufHost,
         dst: _GgufGpu,
@@ -223,56 +213,6 @@ class GgufAdapter:
     def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
         _source_data(t)
         return _logical_shape(t)
-
-    @staticmethod
-    def validate_permanent_update() -> None:
-        raise ValueError(
-            "Permanent updates to packed GGUF parameters are unsupported; "
-            "use activation-time adapter merge instead."
-        )
-
-    @staticmethod
-    def dequantize(t: torch.Tensor) -> torch.Tensor:
-        """Delegate active-value dequantization to ConvRot INT8."""
-        return PiperConvRotInt8Adapter.dequantize(t)
-
-    @staticmethod
-    def merge_lora_(
-        target: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
-        alpha: float,
-        *,
-        beta: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> None:
-        """Delegate an activation-time LoRA update to ConvRot INT8."""
-        PiperConvRotInt8Adapter.merge_lora_(
-            target,
-            b,
-            a,
-            alpha,
-            beta=beta,
-            rounding_seed=rounding_seed,
-        )
-
-    @staticmethod
-    def merge_dense_(
-        target: torch.Tensor,
-        update: torch.Tensor,
-        alpha: float,
-        *,
-        beta: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> None:
-        """Delegate an activation-time dense update to ConvRot INT8."""
-        PiperConvRotInt8Adapter.merge_dense_(
-            target,
-            update,
-            alpha,
-            beta=beta,
-            rounding_seed=rounding_seed,
-        )
 
     @staticmethod
     def cache_bytes(state: _GgufHost) -> int:
