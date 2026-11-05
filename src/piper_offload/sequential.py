@@ -1,6 +1,6 @@
 """Experimental two-rank DTensor inference in one process on one CUDA/HIP GPU.
 
-Requires PyTorch 2.14 and the ``triton`` extra; CUDA graphs are unsupported.
+Requires PyTorch 2.15 and the ``triton`` extra; CUDA graphs are unsupported.
 Ranks alternate on one compute stream at collective boundaries, allowing
 temporary buffers to be reused without NCCL or Gloo. Supported collectives
 are FP32/FP16/BF16 SUM, all-gather, broadcast, and scatter, including CPU tensors
@@ -118,7 +118,7 @@ class _SequentialProcessGroup(dist.ProcessGroup):
     # Implement c10d's tensor-list/options virtual methods. Its Python
     # convenience overloads (tensor/root/timeout) are not backend entry points.
     def __init__(self, rank: int, group_id: GroupName, coordinator: _Coordinator) -> None:
-        super().__init__(rank, 2)  # type: ignore[call-arg]
+        super().__init__(rank, 2)
         self._group_id = group_id
         self._coordinator = coordinator
 

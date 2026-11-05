@@ -23,7 +23,12 @@ from piper_offload.host_param import HostParam
 from piper_offload.sequential import SequentialExecutor
 from tests.conftest import activated_model
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    # A worker that fails after its rank's work, such as in process-group
+    # teardown, raises only in its thread; fail the test instead of warning.
+    pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning"),
+]
 
 
 @pytest.fixture

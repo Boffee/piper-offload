@@ -114,8 +114,8 @@ jobs:
         run: >-
           uv run --no-sync python -c "from importlib.metadata import requires, version; import triton;
           assert any(r.startswith('triton-windows') for r in requires('piper-offload') or ());
-          assert version('triton-windows').startswith('3.8.');
-          assert triton.__version__.startswith('3.8.')"
+          assert version('triton-windows').startswith('3.9.');
+          assert triton.__version__.startswith('3.9.')"
 
       - name: Report Windows runner hardware
         shell: pwsh

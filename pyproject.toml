@@ -15,7 +15,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.14,<2.15",
+    "torch>=2.15,<2.16",
     "piper-kernels>=0.8.0rc1,<0.9",
 ]
 
@@ -38,8 +38,8 @@ gguf = [
     "piper-offload[torchao,triton]",
 ]
 triton = [
-    "triton>=3.8,<3.9; sys_platform == 'linux'",
-    "triton-windows>=3.8,<3.9; sys_platform == 'win32'",
+    "triton>=3.9,<3.10; sys_platform == 'linux'",
+    "triton-windows>=3.9,<3.10; sys_platform == 'win32'",
 ]
 all = ["piper-offload[bnb,gguf,quanto,torchao,triton]"]
 
@@ -72,14 +72,14 @@ reportPrivateImportUsage = "none"
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 torchao = [
-    { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu132", marker = "sys_platform == 'linux'" },
 ]
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
 [tool.ruff.lint]

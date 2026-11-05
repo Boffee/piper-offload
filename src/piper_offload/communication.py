@@ -153,9 +153,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
     # Implement c10d's tensor-list/options virtual methods. Its Python
     # convenience overloads (tensor/root/timeout) are not backend entry points.
     def __init__(self, store: dist.Store, rank: int, size: int, timeout: timedelta, options: RelayOptions) -> None:
-        # The rank/size overload constructs the Python trampoline. The
-        # store/rank/size overload cannot construct subclasses.
-        super().__init__(rank, size)  # type: ignore[call-arg]
+        super().__init__(rank, size)
         self._collective_lock = threading.Lock()
         self._staging_bytes = options.staging_bytes
         self._pipeline_buffers = options.pipeline_buffers
@@ -179,6 +177,10 @@ class _RelayProcessGroup(dist.ProcessGroup):
             dist.ProcessGroup.BackendType.GLOO,
             self._cpu_group,
         )
+        # Gloo is also the default backend, which PyTorch's per-group hooks
+        # resolve: 2.15 attaches its flight recorder to every group that
+        # registers a backend.
+        self._set_default_backend(dist.ProcessGroup.BackendType.GLOO)
         if options.transport == "shared":
             self._shared = SharedRelay(
                 store, self._cpu_group, rank, size, self._staging_bytes, timeout,

@@ -149,7 +149,13 @@ def _expected_int8_merge(
     b: torch.Tensor,
     a: torch.Tensor,
     strength: float,
+    *,
+    accumulate_fp32: bool = False,
 ) -> torch.Tensor:
+    """The eager merge, the generic fallback's exact result. ``accumulate_fp32``
+    instead adds the update in FP32, as the fused kernels do: with large values
+    a BF16 addmm is not a stable reference, since cuBLAS may reduce it at reduced
+    precision (2.6% on a block extremum under PyTorch 2.15)."""
     dense = Int8Adapter.dequantize(qt)
     pre_scale = qt.act_pre_scale
     if pre_scale is None:
@@ -159,6 +165,9 @@ def _expected_int8_merge(
         divisor = pre_scale.reshape(1, 1) if pre_scale.numel() == 1 else pre_scale.reshape(1, a.shape[1])
         stored_a = a.mul(strength).div(divisor.to(device=a.device, dtype=a.dtype))
         stored_strength = 1.0
+    if accumulate_fp32:
+        merged = dense.float().addmm(b.float(), stored_a.float(), alpha=stored_strength)
+        return Int8Adapter.requantize(merged.to(dense.dtype), like=qt)
     dense.addmm_(b, stored_a, alpha=stored_strength)
     return Int8Adapter.requantize(dense, like=qt)
 
@@ -1150,7 +1159,7 @@ class TestInt8Adapter:
             layout="group",
             asymmetric=asymmetric,
         )
-        expected = _expected_int8_merge(qt, b, a, 0.75)
+        expected = _expected_int8_merge(qt, b, a, 0.75, accumulate_fp32=True)
 
         Int8Adapter.merge_lora_(qt, b, a, 0.75)
         torch.cuda.synchronize()
