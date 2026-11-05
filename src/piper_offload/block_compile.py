@@ -7,6 +7,8 @@ from typing import Self, cast
 import torch
 from torch import nn
 
+from ._dynamo import install_discarded_trace_cleanup
+
 type _BlockForward = Callable[..., object]
 type CompileBackend = str | Callable[..., object]
 type _TorchCompileOption = str | int | bool | Callable[..., object]
@@ -85,6 +87,7 @@ class _BlockCompileState:
         if config is None:
             return cls(config=None, _forwards=())
 
+        install_discarded_trace_cleanup()
         forwards: list[_CompiledBlockForward] = []
         seen: set[int] = set()
         for block in blocks:
