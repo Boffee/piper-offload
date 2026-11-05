@@ -13,8 +13,8 @@ the supported dependency ranges are maintained in
 [pyproject.toml](../pyproject.toml). Native execution still requires the
 format's compatible hardware and PyTorch stack.
 
-The `torchao` extra also covers Piper ConvRot. The composable `triton` extra
-selects upstream Triton on Linux and `triton-windows` on 64-bit Windows.
+The `torchao` extra also covers Piper ConvRot. On Linux, PyTorch supplies its matching
+CUDA or ROCm Triton; the composable `triton` extra adds `triton-windows` on 64-bit Windows.
 Most integrations have portable fallbacks without Triton; GGUF conversion and
 trellis decoding require it. Windows GPU execution
 requires Windows 10 or 11, a supported NVIDIA GPU and current driver, and the

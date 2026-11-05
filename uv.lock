@@ -665,7 +665,6 @@ all = [
     { name = "optimum-quanto" },
     { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "torchao", version = "0.18.0+cu132", source = { registry = "https://download.pytorch.org/whl/cu132" }, marker = "sys_platform == 'linux'" },
-    { name = "triton", marker = "sys_platform == 'linux'" },
     { name = "triton-windows", marker = "sys_platform == 'win32'" },
 ]
 bnb = [
@@ -676,7 +675,6 @@ gguf = [
     { name = "numpy" },
     { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "torchao", version = "0.18.0+cu132", source = { registry = "https://download.pytorch.org/whl/cu132" }, marker = "sys_platform == 'linux'" },
-    { name = "triton", marker = "sys_platform == 'linux'" },
     { name = "triton-windows", marker = "sys_platform == 'win32'" },
 ]
 quanto = [
@@ -688,7 +686,6 @@ torchao = [
     { name = "torchao", version = "0.18.0+cu132", source = { registry = "https://download.pytorch.org/whl/cu132" }, marker = "sys_platform == 'linux'" },
 ]
 triton = [
-    { name = "triton", marker = "sys_platform == 'linux'" },
     { name = "triton-windows", marker = "sys_platform == 'win32'" },
 ]
 
@@ -714,7 +711,6 @@ requires-dist = [
     { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.15,<2.16", index = "https://download.pytorch.org/whl/cu132" },
     { name = "torchao", marker = "sys_platform == 'linux' and extra == 'torchao'", specifier = ">=0.18,<0.19", index = "https://download.pytorch.org/whl/cu132" },
     { name = "torchao", marker = "sys_platform != 'linux' and extra == 'torchao'", specifier = ">=0.18,<0.19" },
-    { name = "triton", marker = "sys_platform == 'linux' and extra == 'triton'", specifier = ">=3.9,<3.10" },
     { name = "triton-windows", marker = "sys_platform == 'win32' and extra == 'triton'", specifier = ">=3.9,<3.10" },
 ]
 provides-extras = ["bnb", "quanto", "torchao", "gguf", "triton", "all"]
