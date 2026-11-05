@@ -38,7 +38,10 @@ gguf = [
     "piper-offload[torchao,triton]",
 ]
 triton = [
-    "triton>=3.9,<3.10; sys_platform == 'linux'",
+    # Linux PyTorch builds declare their own matching Triton: `triton` for CUDA,
+    # `triton-rocm` for PyTorch's ROCm wheels. Naming one here would clash with the other.
+    # On Windows, triton-windows must match the Triton release PyTorch's compiler
+    # targets: 3.9 for PyTorch 2.15.
     "triton-windows>=3.9,<3.10; sys_platform == 'win32'",
 ]
 all = ["piper-offload[bnb,gguf,quanto,torchao,triton]"]

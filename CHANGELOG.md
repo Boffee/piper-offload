@@ -5,6 +5,13 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- The `triton` extra no longer requires PyPI's `triton` on Linux, where it clashed with
+  the `triton-rocm` that PyTorch's ROCm wheels depend on: both install the same `triton`
+  package. Linux PyTorch builds supply their matching Triton; Windows still requires
+  `triton-windows` 3.9.
+
 ## [0.10.0rc13] - 2026-11-05
 
 ### Added
