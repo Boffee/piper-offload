@@ -1,6 +1,6 @@
 """Release real inputs when PyTorch discards a Dynamo tracing attempt.
 
-PyTorch 2.14 clears ``OutputGraph.local_scope`` on successful compilation, but
+PyTorch, through 2.15, clears ``OutputGraph.local_scope`` on successful compilation, but
 leaves that owning reference in discarded restart/skip attempts. Their reference
 cycles can retain an entire block input until a full garbage collection. Install
 this compatibility fix only when Offload compilation is requested. It releases

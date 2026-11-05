@@ -1,4 +1,4 @@
-"""Scoped PyTorch 2.14 distributed and compiler state for sequential ranks."""
+"""Scoped PyTorch 2.15 distributed and compiler state for sequential ranks."""
 
 import sys
 import threading
@@ -31,6 +31,7 @@ class _ThreadWorld(threading.local):
         self.tags_to_pg: dict[Any, Any] = {}
         self.pg_to_tag: dict[Any, Any] = {}
         self.pg_coalesce_state: dict[Any, Any] = {}
+        self.pg_flight_recorder_hooks: dict[Any, Any] = {}
         self.comms: list[Any] = []
 
 

@@ -439,8 +439,9 @@ class DTensorAdapter:
             # Parameter-subclass locals (bitsandbytes Params4bit/Int8Params)
             # carry quant state on the object, not .data — and gpu_param
             # reconstructs via .data. Check real inheritance rather than
-            # isinstance(): PyTorch 2.13 propagates DTensor's logical
-            # ``_is_param`` marker to a plain local Tensor. Fail closed rather
+            # isinstance(): PyTorch (2.13 through at least 2.15) propagates
+            # DTensor's logical ``_is_param`` marker to a plain local Tensor.
+            # Fail closed rather
             # than silently dropping representation metadata.
             raise NotImplementedError(
                 f"DTensorAdapter cannot move a local shard that is itself an "

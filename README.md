@@ -11,7 +11,7 @@ provides direct control over one model's lifecycle.
 
 ## Installation
 
-Requires Python 3.14 or newer and PyTorch 2.14.
+Requires Python 3.14 or newer and PyTorch 2.15.
 
 ```bash
 pip install piper-offload

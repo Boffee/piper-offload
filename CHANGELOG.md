@@ -16,6 +16,11 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
+- Move the supported PyTorch line to 2.15 and Triton to 3.9, including Windows
+  (`triton-windows` 3.9). PyTorch 2.14 is no longer supported. `piper_relay`
+  process groups declare Gloo as their default backend, and `SequentialExecutor`
+  workers keep their own registry of PyTorch 2.15's per-group flight recorder
+  hooks, so both still initialize and tear down.
 - Require Piper Kernels 0.8.0rc1 or newer, below 0.9, for trellis decoding.
 
 ### Fixed
