@@ -148,6 +148,24 @@ def _rolling_quant_weight(kind: str) -> tuple[torch.Tensor, int, torch.dtype]:
             width,
             torch.bfloat16,
         )
+    if kind == "trellis":
+        from piper_offload import TrellisParameter
+
+        width = 64
+        # Arbitrary 4.5-bit storage of one 64-weight block per row: every bit
+        # pattern is a valid walk, and E4M3 codes 0x20-0x3F are finite scales.
+        codes = torch.randint(0x20, 0x40, (width, 1), dtype=torch.uint8)
+        return (
+            TrellisParameter(
+                torch.randint(0, 256, (width, 1, 35), dtype=torch.uint8),
+                codes.view(torch.float8_e4m3fn),
+                torch.rand(width, 1).mul_(1e-3).add_(1e-4),
+                block_size=width,
+                group_size=width,
+            ),
+            width,
+            torch.bfloat16,
+        )
     raise AssertionError(f"unknown rolling quant test case {kind!r}")
 
 
@@ -258,6 +276,7 @@ class TestRollingCompile:
             "quanto-qint8",
             "quanto-qfloat8",
             "gguf-q4-0",
+            "trellis",
         ],
     )
     def test_supported_quant_slots_match_compiled(self, quant_kind: str) -> None:

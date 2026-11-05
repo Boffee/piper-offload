@@ -68,6 +68,7 @@ from .tensor_adapters import (
     TensorAdapter,
     transfer_,
 )
+from .trellis_parameter import TrellisParameter
 
 __all__ = [
     "Adapter",
@@ -121,6 +122,7 @@ __all__ = [
     "ScaledParameterDelta",
     "ScaledParameterValue",
     "TensorAdapter",
+    "TrellisParameter",
     "derive_seed",
     "file_slice",
     "host_pin_manager",

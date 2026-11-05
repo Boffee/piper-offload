@@ -287,6 +287,6 @@ CPU parameters with their aliases preserved.
 
 Permanent merge accepts the same cross-adapter composition, strength,
 partial-target, and rounding policies. Quantized support follows the [format matrix](formats.md), except
-that packed GGUF sources can only be merged during activation. See
+that packed GGUF and trellis-coded sources can only be merged during activation. See
 [merge.py](../src/piper_offload/merge.py) for the function contract and
 [lora.py](../src/piper_offload/lora.py) for factor and routing details.
