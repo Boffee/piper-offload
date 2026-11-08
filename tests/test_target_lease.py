@@ -159,8 +159,7 @@ def test_failed_close_keeps_the_target_for_a_retry() -> None:
     with pytest.raises(Interrupt):
         lease.close()
     # Its work was not confirmed finished, so the lease still owns the target.
-    # Read the field: on CPU-only hosts conftest turns CUDA-worded errors into skips.
-    assert lease._target is target
+    assert lease.target is target
 
     lease.close()
 

@@ -17,13 +17,15 @@ uv run ruff check .
 uv run pyright
 ```
 
-GPU tests skip without suitable hardware. Run the relevant GPU tests when
-changing transfers, scheduling, compilation, or quantized operations; a CPU-only
-pass cannot validate those paths. `pre-commit install` runs ruff, pyright, and
-the CPU test suite on commits that change code. CI checks Linux and Windows.
-Benchmarks under [`benchmarks`](../benchmarks) exercise performance-sensitive
-paths. The [rolling benchmark](../benchmarks/benchmark_rolling_compile.py)
-compares outputs, latency, and allocator residency. Report the hardware and
+GPU tests carry skip marks for missing hardware; an unmarked test that needs
+CUDA fails on a CPU-only host instead of skipping. Run the relevant GPU tests
+when changing transfers, scheduling, compilation, or quantized operations; a
+CPU-only pass cannot validate those paths. `pre-commit install` runs ruff,
+pyright, and the CPU test suite on commits that change code. CI checks Linux
+and Windows. Benchmarks under [`benchmarks`](../benchmarks) exercise
+performance-sensitive paths. The
+[rolling benchmark](../benchmarks/benchmark_rolling_compile.py) compares
+outputs, latency, and allocator residency. Report the hardware and
 configuration when using benchmark results.
 
 See [VERSIONING.md](../VERSIONING.md) for compatibility and release policy.

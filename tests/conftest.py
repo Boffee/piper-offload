@@ -5,24 +5,20 @@ transfers are CUDA features — so most of the suite genuinely needs a GPU.
 The CPU-runnable subset (registry/dispatch, specs, caching, dequant math,
 layout signatures) is what a CPU-only gate (and CI runner) can cover.
 
-To make ``pytest`` green on a CPU-only machine without hand-marking every
-GPU test, treat PyTorch's CUDA-unavailable and missing-NVIDIA-driver runtime
-errors as "needs a GPU" and report them as skipped rather than failed. On a
-GPU box nothing is intercepted and the full suite runs. Tests that intend to
-assert a CUDA error catch it themselves, so they are unaffected.
+Each test that needs a GPU says so with a skip mark, checked before its
+setup runs. Nothing turns errors into skips: on a CPU-only host, an
+unmarked test that reaches CUDA fails, so a missing mark, or a library
+error that mentions CUDA, is reported instead of hidden.
 """
 
 import contextlib
 import sys
 from collections.abc import Callable, Generator
 
-import pytest
 import torch
 from torch import nn
 
 from piper_offload import ModelOffloader
-
-_CUDA_UNAVAILABLE_ERROR_FRAGMENTS = ("CUDA", "NVIDIA driver")
 
 
 class CallbackParameterTransform:
@@ -63,20 +59,6 @@ if sys.platform == "win32" and not torch.cuda.is_available():
     # Windows hosts. Host allocation is guarded in capture_host_tensor;
     # guard this remaining direct CUDA entry point for tests as well.
     torch.cuda.current_device = _windows_cuda_current_device_unavailable
-
-
-def pytest_configure(config: pytest.Config) -> None:
-    config.addinivalue_line("markers", "cuda: test requires a CUDA GPU")
-
-
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_call(item: pytest.Item) -> Generator[None]:
-    outcome = yield
-    if torch.cuda.is_available() or outcome.excinfo is None:
-        return
-    exc = outcome.excinfo[1]
-    if isinstance(exc, RuntimeError) and any(fragment in str(exc) for fragment in _CUDA_UNAVAILABLE_ERROR_FRAGMENTS):
-        outcome.force_exception(pytest.skip.Exception(f"needs a CUDA GPU: {exc}", _use_item_location=True))
 
 
 @contextlib.contextmanager
