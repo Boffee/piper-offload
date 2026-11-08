@@ -807,21 +807,29 @@ def install_routed_residual_hook(
 
     Returns an idempotent callable that removes both hooks. One hook pair
     covers every LoRA targeting this parent. Device copies are scoped to a
-    single invocation and released after the residual is enqueued, so routed
-    mode needs no adapter activation lifecycle or block scheduler.
+    single invocation and released after the residual is enqueued, or by the
+    next invocation if an interrupt skipped that, so routed mode needs no
+    adapter activation lifecycle or block scheduler.
     """
     if not factors:
         raise ValueError("Routed LoRA hook requires at least one factor")
 
-    staged_factors: list[tuple[_StagedLoRAFactor, ...]] = []
+    # A Linear forward does not re-enter itself, and a model serves one caller
+    # at a time, so one invocation is staged at a time.
+    staged_factors: tuple[_StagedLoRAFactor, ...] | None = None
 
     def pre_hook(
         _module: nn.Module,
         inputs: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> None:
+        nonlocal staged_factors
         x = _linear_input(inputs, kwargs)
-        staged_factors.append(_stage_routed_factors(factors, x))
+        # Drop staging left by an interrupted forward before allocating more:
+        # PyTorch skips ``always_call`` hooks for errors that are not an
+        # ``Exception``, such as KeyboardInterrupt.
+        staged_factors = None
+        staged_factors = _stage_routed_factors(factors, x)
 
     def post_hook(
         _module: nn.Module,
@@ -829,10 +837,11 @@ def install_routed_residual_hook(
         kwargs: dict[str, Any],
         output: object,
     ) -> object:
+        nonlocal staged_factors
         # ``always_call=True`` also reaches this hook when the Linear or an
         # earlier hook raises. In that case there may be no staged entry or
         # Tensor output; only discard any completed staging work.
-        staged = staged_factors.pop() if staged_factors else None
+        staged, staged_factors = staged_factors, None
         if staged is None or not isinstance(output, torch.Tensor):
             return output
         output_tensor: Any = output
@@ -856,12 +865,12 @@ def install_routed_residual_hook(
     removed = False
 
     def remove_hooks() -> None:
-        nonlocal removed
+        nonlocal removed, staged_factors
         if removed:
             return
         post_handle.remove()
         pre_handle.remove()
-        staged_factors.clear()
+        staged_factors = None
         removed = True
 
     return remove_hooks

@@ -87,7 +87,8 @@ weight copies. It can still use block compilation as described below.
 
 Resident mode creates no prefetch thread, private copy stream, or block
 scheduling hooks. Streaming handles direction changes and traversal wraparound.
-Rolling can refill in the foreground for skipped or out-of-order blocks.
+Both streaming and rolling load skipped or out-of-order blocks in the
+foreground; streaming then resumes prefetching from the block that ran.
 
 ### Compile block forwards
 
@@ -198,7 +199,9 @@ Ordinary `block_paths` retain their working sets throughout the activation;
 the same path cannot appear in both block-path lists.
 
 A successful root-model forward reacquires released components for the next
-invocation. A skipped component stays acquired.
+invocation. A skipped component stays acquired. If a forward raises after a
+component released, or a transient module is called outside the root model,
+the next root forward reacquires that component before running.
 
 Choose boundaries after which that state is no longer used in the current
 root forward. A transient block group cannot be traversed again later in that

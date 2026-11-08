@@ -991,7 +991,8 @@ class BlockComponent:
         starts. Streaming and rolling ask the lease to register that storage
         under the global pin budget, since they read it every step; a resident
         upload leases it pageable, registers nothing, and releases the lease
-        once the runtime has synchronized the upload.
+        once the runtime has synchronized the upload. A failed acquisition
+        releases its partial working set, so the session can acquire again.
         """
         active_device = self._active_device
         if active_device is None:
@@ -1008,15 +1009,21 @@ class BlockComponent:
                 "BlockComponent cannot acquire while prior pin cleanup is incomplete."
             )
         sources = (tensor for plan in self._load_plans for tensor in plan.storage_tensors())
-        if self._block_mode == "resident":
-            # A one-time upload: lease the sources pageable, for the upload
-            # only; the runtime synchronizes it before returning.
-            self._transfer.start(host_pin_manager, sources, active_device)
+        try:
+            if self._block_mode == "resident":
+                # A one-time upload: lease the sources pageable, for the upload
+                # only; the runtime synchronizes it before returning.
+                self._transfer.start(host_pin_manager, sources, active_device)
+                runtime.acquire(active_device, self._load_plans)
+                self._transfer.close()  # the runtime synchronized the upload
+                return
+            self._pin_lease = host_pin_manager.acquire(sources)
             runtime.acquire(active_device, self._load_plans)
-            self._transfer.close()  # the runtime synchronized the upload
-            return
-        self._pin_lease = host_pin_manager.acquire(sources)
-        runtime.acquire(active_device, self._load_plans)
+        except BaseException:
+            # A partially acquired runtime reports itself acquired; releasing
+            # it now keeps a later acquire from mistaking it for a working set.
+            self.release()
+            raise
 
     def _close_pin_lease(self) -> None:
         if self._pin_lease is not None:

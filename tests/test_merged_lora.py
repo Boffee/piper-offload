@@ -9,7 +9,7 @@ CUDA-only tests gate on availability.
 """
 
 from collections.abc import Sequence
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, ref
 
 import pytest
 import torch
@@ -4339,6 +4339,52 @@ class TestRoutedMode:
             torch.testing.assert_close(actual, expected)
         finally:
             offloader.deactivate()
+
+    def test_routed_interrupted_forward_staging_is_dropped_by_next_call(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class Interrupt(BaseException):
+            """Like KeyboardInterrupt, PyTorch skips ``always_call`` hooks for it."""
+
+        m = nn.Sequential(nn.Linear(3, 3, bias=False)).requires_grad_(False)
+        lora = Adapter.from_state_dict(
+            {
+                "0.lora_A.weight": torch.randn(1, 3),
+                "0.lora_B.weight": torch.randn(3, 1),
+            }
+        )
+        staged: list[ref[nn.Parameter]] = []
+        stage = lora_impl._stage_routed_factors
+
+        def recording_stage(
+            factors: Sequence[lora_impl.ScaledLoRAFactor],
+            x: torch.Tensor,
+        ) -> tuple[lora_impl._StagedLoRAFactor, ...]:
+            result = stage(factors, x)
+            staged.append(ref(result[0].a))
+            return result
+
+        def interrupt(_module: nn.Module, _args: tuple[object, ...]) -> None:
+            raise Interrupt
+
+        monkeypatch.setattr(lora_impl, "_stage_routed_factors", recording_stage)
+        offloader = ModelOffloader.from_module(m)
+        x = torch.randn(2, 3)
+        with activated_model(offloader, "cpu", adapters=[lora], adapter_mode="routed"):
+            with torch.no_grad():
+                expected = m(x)
+                handle = m[0].register_forward_pre_hook(interrupt)
+                try:
+                    with pytest.raises(Interrupt):
+                        m(x)
+                finally:
+                    handle.remove()
+                actual = m(x)
+
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert len(staged) == 3
+            assert staged[1]() is None
 
     @CUDA
     def test_routed_forward_and_teardown_match_manual_baselines(self) -> None:

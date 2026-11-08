@@ -5,6 +5,24 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- A root-model forward reacquires `transient_paths` and `transient_block_paths`
+  working sets left released by an earlier call: a forward that raised after
+  they released, or a transient module called on its own. Previously every
+  later forward in that activation failed until the model was deactivated. A
+  block group whose reacquisition fails partway is now left released, so the
+  next forward retries it.
+- Streaming block groups resume prefetching after a skipped or out-of-order
+  block, such as with skip-layer guidance. Previously every later block loaded
+  without overlap until the skipped block ran again.
+- An interrupt such as Ctrl-C while a streamed block waits for its prefetch is
+  raised once that prefetch finishes. Previously a later forward in the same
+  activation could write into the target while the prefetch still filled it.
+- A routed LoRA forward interrupted by `KeyboardInterrupt` or another
+  non-`Exception` error no longer keeps its staged factor copies until
+  deactivation; the next call of that layer frees them.
+
 ## [0.10.0rc14] - 2026-11-05
 
 ### Fixed

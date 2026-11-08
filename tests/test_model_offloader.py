@@ -8,6 +8,7 @@ over the host-backed state.
 """
 
 import copy
+import threading
 from collections.abc import Sequence
 from concurrent.futures import Future
 from pathlib import Path
@@ -29,7 +30,7 @@ from piper_offload import (
 )
 from piper_offload.composite_component import CompositeComponent
 from piper_offload.host_module import ParameterOverride
-from piper_offload.streaming_runtime import _plan_target_signature
+from piper_offload.streaming_runtime import _join, _plan_target_signature
 
 from tests.conftest import (
     CallbackParameterTransform,
@@ -896,6 +897,44 @@ class TestTransientResidency:
             offloader.deactivate()
 
     @CUDA
+    def test_failed_reacquire_is_retried_by_next_forward(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model = _make_block_model(num_blocks=3)
+        offloader = ModelOffloader.from_module(
+            model,
+            transient_block_paths=["transformer_blocks"],
+        )
+        component = block_components(offloader)[0]
+        runtime = component._runtime
+        original_register_hooks = runtime._register_hooks
+        failures = [RuntimeError("simulated reacquire failure")]
+
+        def register_hooks_after_one_failure() -> None:
+            if failures:
+                raise failures.pop()
+            original_register_hooks()
+
+        value = torch.randn(2, 8, device="cuda")
+        with activated_model(offloader, "cuda"), torch.inference_mode():
+            expected = model(value).clone()
+            monkeypatch.setattr(runtime, "_register_hooks", register_hooks_after_one_failure)
+            # The forward computes, then its post-hook fails to reacquire
+            # after staging block 0. That partial runtime must not count as
+            # acquired, or the next forward would run without its hooks.
+            with pytest.raises(RuntimeError, match="simulated reacquire failure"):
+                model(value)
+            assert not runtime.acquired
+            assert component._pin_lease is None
+
+            actual = model(value).clone()
+            torch.cuda.synchronize()
+
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert runtime.acquired
+
+    @CUDA
     def test_hook_install_failure_rolls_back_activation(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1054,6 +1093,36 @@ class TestTraversalPrefetch:
             torch.testing.assert_close(got_2, expected_2, atol=1e-5, rtol=1e-5)
         finally:
             strategy.deactivate()
+
+    @CUDA
+    def test_skipped_block_retires_its_prefetch(self) -> None:
+        # Running block 3 after block 1 skips the prefetched block 2. Its
+        # lookahead target must return to the pool so block 3 can prefetch
+        # block 0; otherwise every later block loads synchronously until
+        # block 2 runs again.
+        torch.manual_seed(0)
+        m = _make_block_model(num_blocks=4, width=8)
+        reference = copy.deepcopy(m).cuda()
+        strategy = ModelOffloader.from_module(
+            m,
+            block_paths=["transformer_blocks"],
+        )
+        streamer: BlockComponent = block_components(strategy)[0]
+        runtime = streamer._runtime
+        x = torch.randn(2, 8, device="cuda")
+
+        with activated_model(strategy, "cuda"), torch.no_grad():
+            actual = x
+            expected = x
+            for idx in (0, 1, 3):
+                actual = streamer.blocks[idx](actual)
+                expected = reference.transformer_blocks[idx](expected)
+            assert list(runtime._pending) == [0]
+            runtime._pending[0].result()
+            assert set(runtime._block_to_lease) == {0, 3}
+            torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
     @CUDA
     def test_small_n_threshold_corner(self) -> None:
@@ -1560,6 +1629,27 @@ class TestPrefetchFailureOnDeactivate:
 
         with activated_model(strategy, "cpu"):
             pass
+
+    def test_interrupted_wait_ends_after_the_worker_finishes(self) -> None:
+        # Ctrl-C can end a prefetch wait while the worker still stages into
+        # its block's target. Handing that target to another block then would
+        # let two copies write it at once, so the interrupt must surface only
+        # once the worker is done.
+        class Interrupt(BaseException):
+            pass
+
+        future: Future[None] = Future()
+        finish = threading.Timer(0.05, future.set_result, (None,))
+
+        def interrupted_result(timeout: float | None = None) -> None:
+            del timeout
+            finish.start()
+            raise Interrupt
+
+        future.result = interrupted_result  # type: ignore[method-assign]
+        with pytest.raises(Interrupt):
+            _join(future)
+        assert future.done()
 
 
 # ---------------------------------------------------------------------------

@@ -182,7 +182,9 @@ class ModelOffloader:
         Groups named by ``block_paths`` retain their
         CUDA working sets for the activation. Groups named by
         ``transient_block_paths`` release after their final blocks and
-        reacquire after the root model forward. These groups are inference-only
+        reacquire after the root model forward; a root forward also reacquires
+        any that remain released when it starts, such as after a forward
+        raised. These groups are inference-only
         and must not be traversed again later in the same root forward. Their
         block lists must contain distinct module objects because a module hook
         cannot distinguish occurrences of an aliased block.
@@ -410,12 +412,8 @@ class ModelOffloader:
 
         component_refs = tuple(weakref.ref(component) for component in components)
 
-        def reacquire_after_forward(
-            _module: nn.Module,
-            _args: tuple[object, ...],
-            _output: object,
-        ) -> None:
-            # A model post-hook inherits the caller's inference-mode context.
+        def reacquire() -> None:
+            # A model hook inherits the caller's inference-mode context.
             # Reusable targets must remain mutable because later prefetch
             # threads refill them outside that context.
             with torch.inference_mode(False):
@@ -424,6 +422,26 @@ class ModelOffloader:
                     if component is not None:
                         component.acquire()
 
+        def reacquire_before_forward(
+            _module: nn.Module,
+            _args: tuple[object, ...],
+        ) -> None:
+            # A forward that raised after a component released, or a direct
+            # call of a transient submodule, skips the post-hook below.
+            # Acquisition is idempotent, so this is a no-op after a successful
+            # forward and otherwise restores the working set before it is used.
+            reacquire()
+
+        def reacquire_after_forward(
+            _module: nn.Module,
+            _args: tuple[object, ...],
+            _output: object,
+        ) -> None:
+            reacquire()
+
+        self._transient_hook_removers.append(
+            self._model.register_forward_pre_hook(reacquire_before_forward).remove,
+        )
         self._transient_hook_removers.append(self.register_forward_hook("", reacquire_after_forward))
 
     def _clear_transient_hooks(self) -> None:
