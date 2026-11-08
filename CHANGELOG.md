@@ -23,6 +23,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - A recoverable error during deactivation, such as a prefetch failure that
   surfaces there, no longer makes every later routed-LoRA CUDA activation of
   that model fail with "Recreate the CUDA worker".
+- An interrupt such as Ctrl-C as `ModelOffloader.activate()` begins no longer
+  leaves the offloader claimed. Previously every later `activate()` raised
+  `ModelRuntimeInUseError`, and `deactivate()` did not release the claim.
 - If restoring a model to host storage, or a CUDA synchronization while
   closing its device targets, fails or is interrupted during deactivation, the
   offloader keeps those targets and reports a failed session. Previously it

@@ -132,9 +132,9 @@ back before deactivation when the optimizer runs on CUDA.
 
 If construction fails after capture begins, discard the partially captured
 model and rebuild from a fresh instance. `ModelOffloader.activate()` cleans
-up partial activation and releases its activation claim on failure, allowing
-a later corrected activation to retry. This rollback is separate from
-construction failure recovery.
+up partial activation and releases its activation claim when it fails or is
+interrupted, allowing a later corrected activation to retry. This rollback is
+separate from construction failure recovery.
 
 `deactivate()` continues past a failing component and then raises. Most such
 errors, such as a prefetch failure that surfaces during deactivation, leave

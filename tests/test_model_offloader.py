@@ -1666,6 +1666,25 @@ class TestActivateFailureCleanup:
         with activated_model(strategy, "cuda"):
             pass
 
+    def test_interrupted_claim_is_given_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Asking whether a prior session failed is the first thing activation
+        # does with its claim; an interrupt there must not keep the claim.
+        offloader = ModelOffloader.from_module(
+            _make_block_model(),
+            block_paths=["transformer_blocks"],
+        )
+
+        def interrupted(_offloader: ModelOffloader) -> bool:
+            raise Interrupt
+
+        with monkeypatch.context() as patch:
+            patch.setattr(ModelOffloader, "failed", property(interrupted))
+            with pytest.raises(Interrupt):
+                offloader.activate("cpu")
+        assert offloader.active_device is None
+        with activated_model(offloader, "cpu"):
+            pass
+
     def test_failing_components_own_deactivate_runs(self) -> None:
         # If a component's activate raises midway, its own deactivate must
         # run too, not just its siblings', or its partial state leaks. The
