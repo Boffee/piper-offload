@@ -5,7 +5,7 @@ import functools
 import logging
 import weakref
 from collections.abc import Generator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 
 import torch
 from torch import nn
@@ -24,6 +24,26 @@ logger = logging.getLogger(__name__)
 
 type BlockSignature = tuple[object, ...]
 type _LoadedTrainableBlock = tuple[HostModuleInstance, HostModuleTarget]
+
+
+def _join(future: Future[None]) -> None:
+    """Wait for a prefetch; return or raise only once its worker has finished.
+
+    The worker owns its block's target until the job ends. An interrupt such
+    as Ctrl-C can end the wait first, so it is re-raised only after the
+    worker finishes staging; otherwise the caller could hand the target to
+    another block while the worker still writes into it.
+    """
+    try:
+        future.result()
+    except BaseException:
+        while not future.done():
+            try:
+                wait((future,))
+            except BaseException:
+                # A repeated interrupt; the first one is re-raised below.
+                continue
+        raise
 
 
 def _plan_target_signature(plan: HostModuleLoadPlan) -> BlockSignature:
@@ -320,7 +340,7 @@ class StreamingBlockRuntime:
         for block_idx, future in tuple(self._pending.items()):
             del self._pending[block_idx]
             try:
-                future.result()
+                _join(future)
             finally:
                 # The block was never installed, so only its lease returns.
                 self._return_lease(block_idx)
@@ -329,7 +349,7 @@ class StreamingBlockRuntime:
         first_prefetch_exc: BaseException | None = None
         for future in list(self._pending.values()):
             try:
-                future.result()
+                _join(future)
             except BaseException as exc:
                 if first_prefetch_exc is None:
                     first_prefetch_exc = exc
@@ -356,7 +376,7 @@ class StreamingBlockRuntime:
         current_stream = torch.cuda.current_stream(self._require_device())
         future = self._pending.pop(idx, None)
         if future is not None:
-            future.result()
+            _join(future)
         else:
             self._retire_pending_prefetch()
             self._stage_block(idx, current_stream)

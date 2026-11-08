@@ -144,6 +144,9 @@ left:
   previous call would have restored it.
 - State scoped to one call is replaced by the next call, so interrupted calls
   cannot accumulate it.
+- A wait for a worker thread returns or raises only once that worker has
+  finished, even when an interrupt ends the wait, so storage the worker
+  writes never changes hands mid-copy.
 
 [test_forward_interruption.py](../tests/test_forward_interruption.py) runs each
 block mode and hook-driven feature through these interruptions; add new ones

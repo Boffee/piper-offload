@@ -8,6 +8,7 @@ over the host-backed state.
 """
 
 import copy
+import threading
 from collections.abc import Sequence
 from concurrent.futures import Future
 from pathlib import Path
@@ -29,7 +30,7 @@ from piper_offload import (
 )
 from piper_offload.composite_component import CompositeComponent
 from piper_offload.host_module import ParameterOverride
-from piper_offload.streaming_runtime import _plan_target_signature
+from piper_offload.streaming_runtime import _join, _plan_target_signature
 
 from tests.conftest import (
     CallbackParameterTransform,
@@ -1671,6 +1672,27 @@ class TestPrefetchFailureOnDeactivate:
 
         with activated_model(strategy, "cpu"):
             pass
+
+    def test_interrupted_wait_ends_after_the_worker_finishes(self) -> None:
+        # Ctrl-C can end a prefetch wait while the worker still stages into
+        # its block's target. Handing that target to another block then would
+        # let two copies write it at once, so the interrupt must surface only
+        # once the worker is done.
+        class Interrupt(BaseException):
+            pass
+
+        future: Future[None] = Future()
+        finish = threading.Timer(0.05, future.set_result, (None,))
+
+        def interrupted_result(timeout: float | None = None) -> None:
+            del timeout
+            finish.start()
+            raise Interrupt
+
+        future.result = interrupted_result  # type: ignore[method-assign]
+        with pytest.raises(Interrupt):
+            _join(future)
+        assert future.done()
 
 
 # ---------------------------------------------------------------------------
