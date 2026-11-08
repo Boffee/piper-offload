@@ -1137,6 +1137,36 @@ class TestTraversalPrefetch:
             strategy.deactivate()
 
     @CUDA
+    def test_skipped_block_retires_its_prefetch(self) -> None:
+        # Running block 3 after block 1 skips the prefetched block 2. Its
+        # lookahead target must return to the pool so block 3 can prefetch
+        # block 0; otherwise every later block loads synchronously until
+        # block 2 runs again.
+        torch.manual_seed(0)
+        m = _make_block_model(num_blocks=4, width=8)
+        reference = copy.deepcopy(m).cuda()
+        strategy = ModelOffloader.from_module(
+            m,
+            block_paths=["transformer_blocks"],
+        )
+        streamer: BlockComponent = block_components(strategy)[0]
+        runtime = streamer._runtime
+        x = torch.randn(2, 8, device="cuda")
+
+        with activated_model(strategy, "cuda"), torch.no_grad():
+            actual = x
+            expected = x
+            for idx in (0, 1, 3):
+                actual = streamer.blocks[idx](actual)
+                expected = reference.transformer_blocks[idx](expected)
+            assert list(runtime._pending) == [0]
+            runtime._pending[0].result()
+            assert set(runtime._block_to_lease) == {0, 3}
+            torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+    @CUDA
     def test_small_n_threshold_corner(self) -> None:
         # num_blocks=3 puts wrap_threshold at 1, the smallest meaningful
         # threshold (any |Δ|>1 wraps). Locks in current behavior at

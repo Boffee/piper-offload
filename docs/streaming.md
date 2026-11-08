@@ -87,7 +87,8 @@ weight copies. It can still use block compilation as described below.
 
 Resident mode creates no prefetch thread, private copy stream, or block
 scheduling hooks. Streaming handles direction changes and traversal wraparound.
-Rolling can refill in the foreground for skipped or out-of-order blocks.
+Both streaming and rolling load skipped or out-of-order blocks in the
+foreground; streaming then resumes prefetching from the block that ran.
 
 ### Compile block forwards
 

@@ -295,16 +295,35 @@ class StreamingBlockRuntime:
         self,
         block_idx: int,
     ) -> None:
-        plan = self._load_plans[block_idx]
-        plan.instance.install_host()
+        self._load_plans[block_idx].instance.install_host()
+        self._return_lease(block_idx)
+
+    def _return_lease(self, block_idx: int) -> None:
         assert self._pool is not None, "runtime is not acquired"
         lease = self._block_to_lease.pop(block_idx, None)
         if lease is not None:
             lease.release()
             self._pool.release(
-                _plan_target_signature(plan),
+                _plan_target_signature(self._load_plans[block_idx]),
                 lease,
             )
+
+    def _retire_pending_prefetch(self) -> None:
+        """Return the lookahead target of a prefetch that was not requested.
+
+        A skipped or out-of-order block leaves the lookahead target staged
+        for a block that does not run next. Until it is retired, no other
+        prefetch can start, so every later block would load synchronously.
+        Waiting for it first also keeps the worker off the pool while the
+        caller stages the requested block.
+        """
+        for block_idx, future in tuple(self._pending.items()):
+            del self._pending[block_idx]
+            try:
+                future.result()
+            finally:
+                # The block was never installed, so only its lease returns.
+                self._return_lease(block_idx)
 
     def _drain_and_evict_all(self) -> BaseException | None:
         first_prefetch_exc: BaseException | None = None
@@ -339,6 +358,7 @@ class StreamingBlockRuntime:
         if future is not None:
             future.result()
         else:
+            self._retire_pending_prefetch()
             self._stage_block(idx, current_stream)
         self._acquire_block(idx, current_stream)
         self._active_idx = idx
