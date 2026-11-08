@@ -275,6 +275,9 @@ class RollingBlockRuntime:
         assert owners is not None
         name = self._slot_names[param_idx]
         param_target = target.param_targets[name]
+        # The slot holds no known block until the refill is enqueued, so one
+        # that stopped partway is refilled instead of trusted.
+        owners[param_idx] = -1
         self._load_plans[block_idx].refill_param_target(name, param_target)
         self._ready_events[param_idx].record(prefetch_stream)
         owners[param_idx] = block_idx

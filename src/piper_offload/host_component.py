@@ -62,6 +62,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
+from ._working_set import WorkingSet
 from .host_module import (
     HostModuleInstance,
     HostModuleLoadPlan,
@@ -167,6 +168,7 @@ class HostComponent:
         self._lease: CudaTargetLease | None = None
         self._transfer = TransferLease()
         self._use_hook: torch.utils.hooks.RemovableHandle | None = None
+        self._working_set = WorkingSet.RELEASED
         self._optimizer_step_active: bool = False
 
     # ------------------------------------------------------------------
@@ -185,13 +187,13 @@ class HostComponent:
 
     @property
     def failed(self) -> bool:
-        """Whether an ended session still holds its target or transfer.
+        """Whether an ended session left its working set unreleased.
 
         Deactivation ends the session even when releasing fails, keeping
         whatever it could not release. A later :meth:`release` or
         :meth:`deactivate` retries.
         """
-        return self._active_device is None and (self._transfer.open or self._lease is not None)
+        return self._active_device is None and self._working_set is not WorkingSet.RELEASED
 
     def activate(
         self,
@@ -255,8 +257,9 @@ class HostComponent:
     def acquire(self) -> None:
         """Acquire this active session's CUDA working set.
 
-        Acquisition is idempotent. CPU sessions already use their host backing
-        and therefore have no separate working set.
+        Acquisition is idempotent. An acquire or release that an exception
+        stopped partway is finished by releasing first. CPU sessions already
+        use their host backing and therefore have no separate working set.
         """
         active_device = self._active_device
         if active_device is None:
@@ -264,13 +267,16 @@ class HostComponent:
                 "HostComponent.acquire() requires an active session; "
                 "call activate() first."
             )
-        if active_device.type == "cpu" or self._lease is not None:
+        if active_device.type == "cpu" or self._working_set is WorkingSet.ACQUIRED:
             return
+        if self._working_set is WorkingSet.CHANGING:
+            self.release()
 
         plan = self._load_plan
         if plan is None:
             raise RuntimeError("HostComponent CUDA session has no load plan.")
         current_stream = torch.cuda.current_stream(active_device)
+        self._working_set = WorkingSet.CHANGING
         # A one-time upload: lease the sources pageable, for the upload only.
         self._transfer.start(host_pin_manager, plan.storage_tensors(), active_device)
         try:
@@ -291,6 +297,7 @@ class HostComponent:
         except BaseException:
             self.release()
             raise
+        self._working_set = WorkingSet.ACQUIRED
 
     def _install_use_hook(self) -> None:
         """Track the CUDA stream that actually executes the bound module."""
@@ -342,19 +349,22 @@ class HostComponent:
 
         Each step must finish before the next releases anything: a failed
         synchronization keeps the transfer lease, and a failed host restore
-        or target close keeps the target, so :attr:`failed` reports them and
-        a later ``release()`` retries from the step that failed."""
+        or target close keeps the target. The working set stays changing
+        until every step has finished, so a later ``release()`` retries."""
+        if self._working_set is WorkingSet.RELEASED:
+            return
+        self._working_set = WorkingSet.CHANGING
         # A partial upload or copy-back may still be in flight; its lease
         # closes only once the device has synchronized.
         self._transfer.finish()
         lease = self._lease
-        if lease is None:
-            return
-        self._remove_use_hook()
-        self._instance.install_host()
-        self._instance.move_trainable_grads_to(torch.device("cpu"))
-        lease.close()
-        self._lease = None
+        if lease is not None:
+            self._remove_use_hook()
+            self._instance.install_host()
+            self._instance.move_trainable_grads_to(torch.device("cpu"))
+            lease.close()
+            self._lease = None
+        self._working_set = WorkingSet.RELEASED
 
     def deactivate(self) -> None:
         """Release working storage and end the activation session.
@@ -401,7 +411,7 @@ class HostComponent:
                 and active_device is not None
                 and active_device.type == "cuda"
             ):
-                if lease is None:
+                if lease is None or self._working_set is not WorkingSet.ACQUIRED:
                     raise RuntimeError(
                         "HostComponent optimizer-step state is inconsistent: "
                         "CUDA active without an active target."

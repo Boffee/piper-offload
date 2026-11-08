@@ -138,8 +138,13 @@ So a hook acts on the state that is actually installed instead of assuming
 the previous hook ran, and the next call repairs whatever an interrupted one
 left:
 
-- Acquisition is idempotent and leaves a failed attempt released, never
-  partly acquired.
+- A component's working set is released, acquired, or changing.
+  `acquire()` and `release()` mark it changing before their first step and
+  commit only after their last, so an exception anywhere, including an
+  interrupt, leaves it changing. A call that finds it changing releases first;
+  release steps are idempotent, so that finishes an interrupted release and
+  rolls back an interrupted acquire. Use the same pattern for any new
+  multi-step transition.
 - A working set is re-established where it is used, not only where the
   previous call would have restored it.
 - State scoped to one call is replaced by the next call, so interrupted calls
@@ -152,8 +157,9 @@ left:
   has finished, even when an interrupt ends the wait.
 
 [test_forward_interruption.py](../tests/test_forward_interruption.py) runs each
-block mode and hook-driven feature through these interruptions; add new ones
-to its configurations.
+block mode and hook-driven feature through these interruptions, and
+[test_release_failure.py](../tests/test_release_failure.py) fails each release
+step in turn; add new modes and features to their configurations.
 
 ## Documentation ownership
 

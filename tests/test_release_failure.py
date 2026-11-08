@@ -12,6 +12,7 @@ before. A release that keeps failing makes activation raise
 paths join ``_CONFIGS``.
 """
 
+import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -27,7 +28,7 @@ from piper_offload import (
     ModelOffloader,
     ModelRuntimeFailedError,
 )
-from piper_offload.host_module import HostModuleInstance
+from piper_offload.host_module import HostModuleInstance, HostModuleLoadPlan
 from tests.conftest import activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -35,7 +36,7 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 _WIDTH = 8
 _NUM_BLOCKS = 3
 
-type _Step = Literal["synchronize", "restore"]
+type _Step = Literal["synchronize", "restore", "refill"]
 
 
 class _Interrupt(BaseException):
@@ -115,10 +116,12 @@ def _fail(
     *,
     occurrence: int,
     persistent: bool = False,
+    after: bool = False,
 ) -> None:
-    """Make the ``occurrence``-th synchronization or host restore raise ``error``.
+    """Make the ``occurrence``-th synchronization, host restore, or refill raise ``error``.
 
-    With ``persistent``, every later one raises too.
+    With ``persistent``, every later one raises too. With ``after``, the step
+    completes first, as when an interrupt lands right behind it.
     """
     calls = 0
 
@@ -126,9 +129,13 @@ def _fail(
         def call(*args: P.args, **kwargs: P.kwargs) -> R:
             nonlocal calls
             calls += 1
-            if calls == occurrence or (persistent and calls > occurrence):
+            hit = calls == occurrence or (persistent and calls > occurrence)
+            if hit and not after:
                 raise error("injected release failure")
-            return original(*args, **kwargs)
+            result = original(*args, **kwargs)
+            if hit:
+                raise error("injected release failure")
+            return result
 
         return call
 
@@ -136,8 +143,10 @@ def _fail(
         patch.setattr(torch.cuda, "synchronize", failing(torch.cuda.synchronize))
         patch.setattr(torch.cuda.Stream, "synchronize", failing(torch.cuda.Stream.synchronize))
         patch.setattr(torch.cuda.Event, "synchronize", failing(torch.cuda.Event.synchronize))
-    else:
+    elif step == "restore":
         patch.setattr(HostModuleInstance, "install_host", failing(HostModuleInstance.install_host))
+    else:
+        patch.setattr(HostModuleLoadPlan, "refill_param_target", failing(HostModuleLoadPlan.refill_param_target))
 
 
 def _on_device(model: nn.Module) -> list[str]:
@@ -215,5 +224,51 @@ def test_activation_reports_a_release_that_keeps_failing() -> None:
 
     # Once synchronization works again, a retry releases everything.
     offloader.deactivate()
+    assert not offloader.failed
+    assert _on_device(model) == []
+
+
+# Transitions that run inside a forward: block switches, transient releases
+# and their reacquisition, and rolling refills.
+_FORWARD_CASES = (
+    pytest.param(_Config("streaming"), "restore", id="streaming-switch"),
+    pytest.param(_Config("streaming", transient=True), "synchronize", id="streaming-transient-sync"),
+    pytest.param(_Config("streaming", transient=True), "restore", id="streaming-transient-restore"),
+    pytest.param(_Config("resident", transient=True), "synchronize", id="resident-transient-sync"),
+    pytest.param(_Config("resident", transient=True), "restore", id="resident-transient-restore"),
+    pytest.param(_Config("rolling"), "refill", id="rolling-refill"),
+)
+
+
+@CUDA
+@pytest.mark.parametrize("after", [False, True], ids=["before-step", "after-step"])
+@pytest.mark.parametrize("occurrence", [1, 2])
+@pytest.mark.parametrize(("config", "step"), _FORWARD_CASES)
+def test_next_forward_finishes_a_transition_interrupted_mid_forward(
+    request: pytest.FixtureRequest,
+    config: _Config,
+    step: _Step,
+    occurrence: int,
+    after: bool,
+) -> None:
+    if config.block_mode == "rolling":
+        torch.compiler.reset()
+        request.addfinalizer(torch.compiler.reset)
+    torch.manual_seed(0)
+    model = _Model()
+    offloader = config.offloader(model)
+    x = torch.randn(2, _WIDTH, device="cuda")
+
+    with activated_model(offloader, "cuda"), torch.inference_mode():
+        expected = model(x).cpu()
+        with pytest.MonkeyPatch.context() as patch:
+            _fail(patch, step, _Interrupt, occurrence=occurrence, after=after)
+            with contextlib.suppress(_Interrupt):
+                model(x)
+        actual = model(x).cpu()
+        again = model(x).cpu()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(again, expected, rtol=0, atol=0)
     assert not offloader.failed
     assert _on_device(model) == []

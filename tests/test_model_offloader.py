@@ -32,6 +32,7 @@ from piper_offload import (
 )
 from piper_offload.composite_component import CompositeComponent
 from piper_offload.host_module import HostModuleInstance, ParameterOverride
+from piper_offload._working_set import WorkingSet
 from piper_offload.pin_manager import host_pin_manager
 from piper_offload.streaming_runtime import _BlockTarget, _plan_target_signature, _wait_for_prefetch
 
@@ -393,7 +394,7 @@ class TestBlockComponentBackendActivation:
         lease = Lease()
         forward_stream = object()
         runtime._device = torch.device("cuda")
-        runtime._active = _BlockTarget(0, cast(Any, lease))
+        runtime._active = _BlockTarget(0, cast(Any, lease), installed=True)
         monkeypatch.setattr(runtime, "_submit_prefetch", lambda _idx: None)
         monkeypatch.setattr(
             torch.cuda,
@@ -1548,9 +1549,10 @@ class TestFailedSession:
         streamer = block_components(offloader)[0]
         resident = host_component(offloader)
         assert resident is not None
-        # Stands in for the host leases a failed release keeps for its
-        # unfinished transfers.
+        # Stands in for a release that stopped partway, keeping the host
+        # leases its unfinished transfers read.
         streamer._pin_lease = host_pin_manager.acquire([], pin=False)
+        streamer._working_set = WorkingSet.CHANGING
         assert offloader.failed
         return offloader, streamer, resident
 

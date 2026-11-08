@@ -28,10 +28,10 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   synchronization dropped a target whose work had not been confirmed finished.
 - A root-model forward reacquires `transient_paths` and `transient_block_paths`
   working sets left released by an earlier call: a forward that raised after
-  they released, or a transient module called on its own. Previously every
-  later forward in that activation failed until the model was deactivated. A
-  block group whose reacquisition fails partway is now left released, so the
-  next forward retries it.
+  they released, a transient module called on its own, or a release that an
+  interrupt stopped partway. Previously every later forward in that activation
+  failed until the model was deactivated. A reacquisition that fails partway
+  is rolled back, so the next forward retries it.
 - Streaming block groups resume prefetching after a skipped or out-of-order
   block, such as with skip-layer guidance. Previously every later block loaded
   without overlap until the skipped block ran again.

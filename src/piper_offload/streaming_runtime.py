@@ -129,11 +129,17 @@ class _TargetPool:
 
 @dataclass(eq=False, slots=True)
 class _BlockTarget:
-    """A target leased to one block and, while the worker stages it, that prefetch."""
+    """A target leased to one block and, while the worker stages it, that prefetch.
+
+    ``installed`` turns true only after the block's module points at the
+    target, and false before its release starts, so a switch that stopped
+    partway is released before the block runs again.
+    """
 
     block_idx: int
     lease: CudaTargetLease
     prefetch: Future[None] | None = None
+    installed: bool = False
 
 
 class StreamingBlockRuntime:
@@ -349,6 +355,7 @@ class StreamingBlockRuntime:
         self._active = block_target
         instance = self._load_plans[block_target.block_idx].instance
         instance.install_target(block_target.lease.acquire(stream))
+        block_target.installed = True
 
     def _release_block(self, block_target: _BlockTarget) -> None:
         """Restore a block to host storage, then return its target to the pool.
@@ -356,6 +363,7 @@ class StreamingBlockRuntime:
         If the restore fails, some parameters may still point at the target,
         so it is not returned; the caller keeps tracking it for a retry.
         """
+        block_target.installed = False
         self._load_plans[block_target.block_idx].instance.install_host()
         self._return_target(block_target)
 
@@ -418,7 +426,7 @@ class StreamingBlockRuntime:
 
         current_stream = torch.cuda.current_stream(device)
         active = self._active
-        if active is None or active.block_idx != idx:
+        if active is None or active.block_idx != idx or not active.installed:
             if active is not None:
                 self._release_block(active)
                 self._active = None
