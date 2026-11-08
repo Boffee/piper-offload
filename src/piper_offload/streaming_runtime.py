@@ -218,16 +218,20 @@ class StreamingBlockRuntime:
         try:
             self._release_blocks()
         finally:
-            self._stream = None
-            self._move_trainable_grads_to(torch.device("cpu"))
-            # Both targets are back in the pool, which now holds every lease.
-            if self._pool is not None:
-                self._pool.close()
-            self._pool = None
-            self._last_idx = -1
-            self._device = None
-            self._load_plans = ()
-            self._signatures = ()
+            # After a failed prefetch both targets are back in the pool, so
+            # cleanup finishes before the error propagates. A block that could
+            # not return to host storage still holds its target: stay acquired,
+            # as after a failed synchronization, so nothing reuses that target.
+            if self._active is None and self._lookahead is None:
+                self._stream = None
+                self._move_trainable_grads_to(torch.device("cpu"))
+                if self._pool is not None:
+                    self._pool.close()
+                self._pool = None
+                self._last_idx = -1
+                self._device = None
+                self._load_plans = ()
+                self._signatures = ()
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Generator[None]:
@@ -314,6 +318,9 @@ class StreamingBlockRuntime:
 
     # Targets move only on the forward thread. Each step keeps every lease in
     # the pool, the active target, or the lookahead target, also when it raises.
+    # A target leaves its place only after the step that frees it returns: a
+    # block's target once the block is back on host storage, the lookahead's
+    # once its prefetch has finished.
 
     def _take_target(self, block_idx: int, stream: torch.cuda.Stream) -> _BlockTarget:
         """Take a pooled target for ``block_idx``, allocating it on ``stream`` if none fits."""
@@ -344,11 +351,13 @@ class StreamingBlockRuntime:
         instance.install_target(block_target.lease.acquire(stream))
 
     def _release_block(self, block_target: _BlockTarget) -> None:
-        """Restore a block to host storage and return its target to the pool."""
-        try:
-            self._load_plans[block_target.block_idx].instance.install_host()
-        finally:
-            self._return_target(block_target)
+        """Restore a block to host storage, then return its target to the pool.
+
+        If the restore fails, some parameters may still point at the target,
+        so it is not returned; the caller keeps tracking it for a retry.
+        """
+        self._load_plans[block_target.block_idx].instance.install_host()
+        self._return_target(block_target)
 
     def _submit_prefetch(self, block_idx: int) -> None:
         """Stage ``block_idx`` into the lookahead target on the worker, unless one is in use."""
@@ -393,15 +402,14 @@ class StreamingBlockRuntime:
         return self._stage_block(block_idx, stream)
 
     def _release_blocks(self) -> None:
-        """Return both targets to the pool, then raise any failed prefetch."""
-        try:
-            lookahead = self._take_lookahead()
-            if lookahead is not None:
-                self._return_target(lookahead)
-        finally:
-            active, self._active = self._active, None
-            if active is not None:
-                self._release_block(active)
+        """Return both targets to the pool; a failed prefetch raises after both are back."""
+        active = self._active
+        if active is not None:
+            self._release_block(active)
+            self._active = None
+        lookahead = self._take_lookahead()
+        if lookahead is not None:
+            self._return_target(lookahead)
 
     def _before_block_forward(self, idx: int) -> None:
         device = self._device
@@ -411,9 +419,9 @@ class StreamingBlockRuntime:
         current_stream = torch.cuda.current_stream(device)
         active = self._active
         if active is None or active.block_idx != idx:
-            self._active = None
             if active is not None:
                 self._release_block(active)
+                self._active = None
             active = self._take_staged(idx, current_stream)
             self._acquire_block(active, current_stream)
         active.lease.record_stream(current_stream)

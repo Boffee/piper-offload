@@ -144,9 +144,12 @@ left:
   previous call would have restored it.
 - State scoped to one call is replaced by the next call, so interrupted calls
   cannot accumulate it.
-- A wait for a worker thread returns or raises only once that worker has
-  finished, even when an interrupt ends the wait, so storage the worker
-  writes never changes hands mid-copy.
+- Storage changes hands only after the step that frees it returns: a worker
+  has finished writing it, or no module still points at it. A `finally` or
+  `except` that runs because that step failed or was interrupted keeps the
+  storage where it is, so cleanup can retry; leaking it is recoverable,
+  reusing it is not. Waiting for a worker therefore ends only once the worker
+  has finished, even when an interrupt ends the wait.
 
 [test_forward_interruption.py](../tests/test_forward_interruption.py) runs each
 block mode and hook-driven feature through these interruptions; add new ones
