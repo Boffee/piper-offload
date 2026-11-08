@@ -484,16 +484,16 @@ class TestCleanup:
         strategy.deactivate()  # no error
 
     @CUDA
-    def test_deactivate_consumes_teardown_stack(self) -> None:
+    def test_deactivate_ends_the_composite_session(self) -> None:
         m = _make_block_model()
         strategy = ModelOffloader.from_module(
             m,
             block_paths=["transformer_blocks"],
         )
         strategy.activate("cuda")
-        assert strategy._composite._teardown_stack is not None
+        assert strategy._composite._active
         strategy.deactivate()
-        assert strategy._composite._teardown_stack is None
+        assert not strategy._composite._active
 
     @CUDA
     def test_drop_strategy_without_deactivate_does_not_cycle(self) -> None:
@@ -1533,8 +1533,13 @@ class TestResourceCacheIntegration:
 # ---------------------------------------------------------------------------
 
 
+class _Interrupt(BaseException):
+    """Like ``KeyboardInterrupt``: not an ``Exception``."""
+
+
 class TestFailedSession:
-    def test_activation_refuses_a_failed_session_before_touching_components(self) -> None:
+    @staticmethod
+    def _offloader_with_leftover() -> tuple[ModelOffloader, BlockComponent, HostComponent]:
         model = _make_block_model()
         offloader = ModelOffloader.from_module(
             model,
@@ -1545,19 +1550,51 @@ class TestFailedSession:
         assert resident is not None
         # Stands in for the host leases a failed release keeps for its
         # unfinished transfers.
-        leftover = host_pin_manager.acquire([], pin=False)
-        streamer._pin_lease = leftover
-        try:
-            assert offloader.failed
-            with pytest.raises(ModelRuntimeFailedError, match="Recreate the CUDA worker"):
-                offloader.activate("cpu")
-            assert offloader.active_device is None
-            assert resident._active_device is None
-        finally:
-            streamer._pin_lease = None
-            leftover.close()
+        streamer._pin_lease = host_pin_manager.acquire([], pin=False)
+        assert offloader.failed
+        return offloader, streamer, resident
 
+    def test_activation_finishes_what_a_failed_session_kept(self) -> None:
+        offloader, streamer, _resident = self._offloader_with_leftover()
+        leftover = streamer._pin_lease
+        assert leftover is not None
+
+        with activated_model(offloader, "cpu"):
+            assert leftover.closed
+            assert not offloader.failed
+
+    @pytest.mark.parametrize(
+        ("error", "raised"),
+        [(RuntimeError, ModelRuntimeFailedError), (_Interrupt, _Interrupt)],
+        ids=["error", "interrupt"],
+    )
+    def test_activation_refuses_when_the_retry_fails_again(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        error: type[BaseException],
+        raised: type[BaseException],
+    ) -> None:
+        offloader, streamer, resident = self._offloader_with_leftover()
+
+        def still_failing(_component: BlockComponent) -> None:
+            raise error("release still failing")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(BlockComponent, "_close_pin_lease", still_failing)
+            with pytest.raises(raised) as caught:
+                offloader.activate("cpu")
+        # An interrupt during the retry propagates as itself; an ordinary
+        # error becomes the failed-session error, chained to its cause.
+        if raised is ModelRuntimeFailedError:
+            assert isinstance(caught.value.__cause__, RuntimeError)
+        assert offloader.failed
+        assert offloader.active_device is None
+        assert resident._active_device is None
+
+        # The activation claim was released, so a later retry can succeed.
+        offloader.deactivate()
         assert not offloader.failed
+        assert streamer._pin_lease is None
         with activated_model(offloader, "cpu"):
             pass
 
@@ -1602,10 +1639,9 @@ class TestFailedSession:
 class TestActivateFailureCleanup:
     @CUDA
     def test_partial_activate_failure_rolls_back_other_components(self, monkeypatch) -> None:
-        # If a streamer's activate raises, the composite's `with stack:`
-        # rolls back the already-activated components. _teardown_stack stays
-        # None because pop_all() was never reached, and the offloader releases
-        # its activation claim so the same cached runtime remains reusable.
+        # If a streamer's activate raises, the offloader's deactivation
+        # releases every component, and it releases its activation claim so
+        # the same cached runtime remains reusable.
         m = _make_block_model()
         strategy = ModelOffloader.from_module(
             m,
@@ -1624,7 +1660,7 @@ class TestActivateFailureCleanup:
         with pytest.raises(RuntimeError, match="simulated activate failure"):
             strategy.activate("cuda")
 
-        assert strategy._composite._teardown_stack is None
+        assert not strategy._composite._active
         assert strategy.active_device is None
 
         monkeypatch.setattr(runtime, "_register_hooks", original_register_hooks)
@@ -1632,12 +1668,9 @@ class TestActivateFailureCleanup:
             pass
 
     def test_failing_components_own_deactivate_runs(self) -> None:
-        # Regression: previously the composite registered each
-        # component's deactivate AFTER calling its activate. If a
-        # component's activate raised mid-way, only PRIOR siblings'
-        # deactivates ran — the failing component's own cleanup was
-        # skipped, leaking partial state. The fix registers deactivate
-        # FIRST, so the failing component is also unwound.
+        # If a component's activate raises midway, its own deactivate must
+        # run too, not just its siblings', or its partial state leaks. The
+        # offloader's deactivation unwinds every component exactly once.
         events: list[str] = []
 
         class _Recorder:
@@ -1681,9 +1714,7 @@ class TestActivateFailureCleanup:
         assert "activate:B" in events
         assert "activate:C" in events
         assert "partial_state:C" in events
-        # Critical: C's own deactivate MUST run (the regression's bug
-        # was that it didn't). Plus prior siblings' deactivates run in
-        # reverse order via ExitStack.
+        # C's own deactivate runs, and its siblings' follow in reverse order.
         assert "deactivate:C" in events
         assert "deactivate:B" in events
         assert "deactivate:A" in events
@@ -2447,7 +2478,7 @@ class TestMultiComponentCleanup:
             # were already unwound in LIFO order.
             assert not m.embed.weight.is_pinned()  # type: ignore[union-attr]
             assert not block_components(strategy)[0]._runtime._hooks
-            assert strategy._composite._teardown_stack is None
+            assert not strategy._composite._active
         finally:
             strategy.deactivate()
 

@@ -63,12 +63,10 @@ class ModelRuntimeInUseError(RuntimeError):
 
 
 class ModelRuntimeFailedError(RuntimeError):
-    """An earlier CUDA session of this model could not finish releasing.
+    """Activation could not release what an earlier CUDA session kept.
 
-    The offloader keeps whatever that session could not release, because
-    queued device work may still read host storage or model tensors may
-    still point at device memory. It cannot activate again; recreate the
-    CUDA worker.
+    Raised after a retry of that release failed too, with the retry's error
+    as the cause. Recreate the CUDA worker; see the models guide.
     """
 
 
@@ -462,8 +460,8 @@ class ModelOffloader:
         for remove_hook in reversed(remove_hooks):
             remove_hook()
         # Routed staging can still be in flight only if a component failed to
-        # finish releasing; the lease then stays, like theirs, until the
-        # worker is recreated.
+        # finish releasing; the lease then stays, like theirs, until a retry
+        # releases them.
         if self._routed_lease is not None and not self._composite.failed:
             self._routed_lease.close()
             self._routed_lease = None
@@ -490,13 +488,18 @@ class ModelOffloader:
 
     @property
     def failed(self) -> bool:
-        """Whether an earlier CUDA session could not finish releasing.
+        """Whether an earlier CUDA session still holds device work it could not release.
 
-        :meth:`deactivate` raised in that case and kept what it could not
-        release; :meth:`activate` then raises :class:`ModelRuntimeFailedError`
-        until the CUDA worker is recreated.
+        The next :meth:`deactivate` or :meth:`activate` retries the release.
         """
         return self._composite.failed
+
+    def _finish_release(self) -> None:
+        """Retry releasing what an earlier session kept; the caller holds the activation lock."""
+        try:
+            self._composite.deactivate()
+        finally:
+            self._clear_active_adapter_hooks()
 
     @property
     def param_names(self) -> frozenset[str]:
@@ -546,9 +549,10 @@ class ModelOffloader:
         Value scaling and deltas combine before terminal quantized encoding.
         Because the offloader owns one model runtime, a
         second activation before :meth:`deactivate` raises
-        :class:`ModelRuntimeInUseError` immediately. After a session that
-        could not finish releasing (see :attr:`failed`), activation raises
-        :class:`ModelRuntimeFailedError` before touching any component.
+        :class:`ModelRuntimeInUseError` immediately. If an earlier session
+        could not finish releasing (see :attr:`failed`), activation first
+        retries that release; if it fails again, activation raises
+        :class:`ModelRuntimeFailedError` before activating any component.
         """
         active_device = self._resolve_device(device)
         if not self._activation_lock.acquire(blocking=False):
@@ -556,11 +560,16 @@ class ModelOffloader:
                 "ModelOffloader already has an active use; overlapping model activations are not supported"
             )
         if self.failed:
-            self._activation_lock.release()
-            raise ModelRuntimeFailedError(
-                "ModelOffloader cannot activate: an earlier CUDA session could not "
-                "finish releasing its device work. Recreate the CUDA worker."
-            )
+            try:
+                self._finish_release()
+            except BaseException as error:
+                self._activation_lock.release()
+                if not isinstance(error, Exception):
+                    raise  # an interrupt during the retry stays an interrupt
+                raise ModelRuntimeFailedError(
+                    "ModelOffloader cannot activate: releasing what an earlier CUDA "
+                    "session kept failed again. Recreate the CUDA worker."
+                ) from error
         self._active_device = active_device
         try:
             if adapter_mode not in ("merge", "routed"):
@@ -602,12 +611,16 @@ class ModelOffloader:
     def deactivate(self) -> None:
         """End the active use and release its device working sets; idempotent.
 
-        Cleanup continues past a failing component and then raises. If that
-        leaves :attr:`failed` true, the offloader keeps what it could not
-        release and cannot activate again. Otherwise, as when a prefetch
-        failure surfaces here, it remains reusable.
+        Cleanup continues past a failing component and then raises. What it
+        could not release stays held and :attr:`failed` reports it; calling
+        this again while inactive, or :meth:`activate`, retries.
         """
         if self._active_device is None:
+            if self.failed and self._activation_lock.acquire(blocking=False):
+                try:
+                    self._finish_release()
+                finally:
+                    self._activation_lock.release()
             return
         # Scheduling hooks must stop before their components deactivate; the
         # components synchronize before routed hooks and their lease go.

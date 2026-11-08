@@ -8,10 +8,13 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 ### Added
 
 - `ModelOffloader.failed` reports a CUDA session whose deactivation could not
-  finish releasing device work, and `activate()` then raises
-  `ModelRuntimeFailedError`, a `RuntimeError` subclass, before activating any
-  component. Recreate the CUDA worker in that case. The message still says
-  "Recreate the CUDA worker".
+  finish releasing device work. The next `deactivate()` or `activate()` retries
+  that release, so a deactivation interrupted by Ctrl-C recovers on the next
+  call instead of leaving the model unusable. If `activate()`'s retry fails
+  too, it raises `ModelRuntimeFailedError`, a `RuntimeError` subclass, before
+  activating any component; recreate the CUDA worker then, and keep the
+  offloader referenced until you do. The message still says "Recreate the CUDA
+  worker".
 
 ### Fixed
 

@@ -1,16 +1,18 @@
-"""Contract: a deactivation that cannot finish releasing is reported, never hidden.
+"""Contract: a deactivation that cannot finish releasing is reported and retried.
 
 Each case activates on CUDA, runs a forward, then fails one release step once
 while deactivating: the k-th CUDA synchronization or the k-th return of a
 module to host storage, with an ordinary error or an interrupt. Afterwards
-either every managed tensor is back on the host and the model activates again,
-or ``ModelOffloader.failed`` is true and activation raises
-:class:`ModelRuntimeFailedError`. It never ends inactive with managed tensors
-still on the device. See the scheduling-hooks rules in ``docs/development.md``.
-New block modes, components, and hook-driven adapter paths join ``_CONFIGS``.
+either every managed tensor is back on the host, or ``ModelOffloader.failed``
+is true; it never ends inactive and unreported with managed tensors still on
+the device. The next activation retries what was kept and runs the model as
+before. A release that keeps failing makes activation raise
+:class:`ModelRuntimeFailedError`. See the scheduling-hooks rules in
+``docs/development.md``. New block modes, components, and hook-driven adapter
+paths join ``_CONFIGS``.
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -21,9 +23,7 @@ from torch import nn
 from piper_offload import (
     Adapter,
     BlockCompileConfig,
-    BlockComponent,
     BlockMode,
-    HostComponent,
     ModelOffloader,
     ModelRuntimeFailedError,
 )
@@ -108,15 +108,25 @@ _CONFIGS = (
 )
 
 
-def _fail_once(patch: pytest.MonkeyPatch, step: _Step, occurrence: int, error: type[BaseException]) -> None:
-    """Make the ``occurrence``-th synchronization or host restore raise ``error`` once."""
+def _fail(
+    patch: pytest.MonkeyPatch,
+    step: _Step,
+    error: type[BaseException],
+    *,
+    occurrence: int,
+    persistent: bool = False,
+) -> None:
+    """Make the ``occurrence``-th synchronization or host restore raise ``error``.
+
+    With ``persistent``, every later one raises too.
+    """
     calls = 0
 
     def failing[**P, R](original: Callable[P, R]) -> Callable[P, R]:
         def call(*args: P.args, **kwargs: P.kwargs) -> R:
             nonlocal calls
             calls += 1
-            if calls == occurrence:
+            if calls == occurrence or (persistent and calls > occurrence):
                 raise error("injected release failure")
             return original(*args, **kwargs)
 
@@ -133,26 +143,6 @@ def _fail_once(patch: pytest.MonkeyPatch, step: _Step, occurrence: int, error: t
 def _on_device(model: nn.Module) -> list[str]:
     tensors = [*model.named_parameters(remove_duplicate=False), *model.named_buffers(remove_duplicate=False)]
     return [name for name, tensor in tensors if tensor.device.type == "cuda"]
-
-
-def _components(offloader: ModelOffloader) -> Iterator[HostComponent | BlockComponent]:
-    return offloader._composite._components()
-
-
-def _release_leftovers(offloader: ModelOffloader) -> None:
-    """Finish what a failed deactivation kept, as recreating the CUDA worker would."""
-    for component in _components(offloader):
-        if isinstance(component, HostComponent):
-            component.release()
-            continue
-        for runtime in (component._runtime, component._eager_runtime):
-            if runtime.acquired:
-                runtime.release()
-        component._close_pin_lease()
-        component._transfer.finish()
-    if offloader._routed_lease is not None:
-        offloader._routed_lease.close()
-        offloader._routed_lease = None
 
 
 @CUDA
@@ -182,29 +172,48 @@ def test_failed_release_step_is_reported(
         expected = model(x).cpu()
     raised: BaseException | None = None
     with pytest.MonkeyPatch.context() as patch:
-        _fail_once(patch, step, occurrence, error)
+        _fail(patch, step, error, occurrence=occurrence)
         try:
             offloader.deactivate()
         except (RuntimeError, _Interrupt) as exc:
             raised = exc
 
-    try:
-        assert offloader.active_device is None
-        if offloader.failed:
-            assert raised is not None
-            with pytest.raises(ModelRuntimeFailedError, match="Recreate the CUDA worker"):
-                offloader.activate("cuda")
-            assert offloader.active_device is None
-        else:
-            # A reusable offloader keeps nothing: no device tensors, no lease.
-            assert _on_device(model) == []
-            assert offloader._routed_lease is None
-    finally:
-        _release_leftovers(offloader)
+    assert offloader.active_device is None
+    if offloader.failed:
+        assert raised is not None
+    else:
+        # Nothing was kept: no device tensors, no routed lease.
+        assert _on_device(model) == []
+        assert offloader._routed_lease is None
 
-    # Whatever was kept is releasable, after which the model works again.
-    assert not offloader.failed
-    assert _on_device(model) == []
+    # The next activation retries whatever was kept, then runs as before.
     with activated_model(offloader, "cuda", adapters=adapters, adapter_mode="routed"), torch.inference_mode():
         actual = model(x).cpu()
+    assert not offloader.failed
+    assert _on_device(model) == []
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@CUDA
+def test_activation_reports_a_release_that_keeps_failing() -> None:
+    model = _Model()
+    offloader = _Config("streaming").offloader(model)
+    offloader.activate("cuda")
+    with torch.inference_mode():
+        model(torch.randn(2, _WIDTH, device="cuda"))
+
+    with pytest.MonkeyPatch.context() as patch:
+        _fail(patch, "synchronize", RuntimeError, occurrence=1, persistent=True)
+        with pytest.raises(RuntimeError, match="injected release failure"):
+            offloader.deactivate()
+        assert offloader.failed
+        with pytest.raises(ModelRuntimeFailedError, match="Recreate the CUDA worker") as caught:
+            offloader.activate("cuda")
+        assert isinstance(caught.value.__cause__, RuntimeError)
+        assert offloader.active_device is None
+        assert offloader.failed
+
+    # Once synchronization works again, a retry releases everything.
+    offloader.deactivate()
+    assert not offloader.failed
+    assert _on_device(model) == []

@@ -58,9 +58,10 @@ class BlockRuntime(Protocol):
         synchronization or host restore fails, this method raises while
         leaving :attr:`acquired` true and keeping what that step could not
         release, so its owner retains host storage and reports a failed
-        session. Once ``acquired`` is false, no queued operation may still
-        read any source in the activation load plans, and no block points at
-        a released target.
+        session. Its steps are idempotent, so a later call retries from the
+        start. Once ``acquired`` is false, no queued operation may still read
+        any source in the activation load plans, and no block points at a
+        released target.
         """
         ...
 

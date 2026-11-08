@@ -31,7 +31,7 @@ class CompositeComponent:
         self._transient = tuple(transient)
         self._blocks = tuple(blocks)
         self._transient_blocks = tuple(transient_blocks)
-        self._teardown_stack: contextlib.ExitStack | None = None
+        self._active = False
 
     @property
     def resident(self) -> HostComponent | None:
@@ -76,7 +76,12 @@ class CompositeComponent:
         compile_blocks: bool = True,
         parameter_overrides: Mapping[str, ParameterOverride] | None = None,
     ) -> None:
-        if self._teardown_stack is not None:
+        """Activate every component in order.
+
+        A failure leaves the components as far as they got; the caller's
+        :meth:`deactivate` releases them, as it releases any ended session.
+        """
+        if self._active:
             raise RuntimeError("CompositeComponent.activate() called while already active; deactivate() first.")
 
         overrides = {} if parameter_overrides is None else dict(parameter_overrides)
@@ -87,29 +92,33 @@ class CompositeComponent:
                     f"Parameter overrides contain unmanaged names: {unknown!r}."
                 )
 
+        self._active = True
+        for component in self._components():
+            component.activate(
+                device,
+                compile_blocks=compile_blocks,
+                parameter_overrides=(
+                    {
+                        name: override
+                        for name, override in overrides.items()
+                        if name in component.param_names
+                    }
+                    if overrides
+                    else None
+                ),
+            )
+
+    def deactivate(self) -> None:
+        """Deactivate every component in reverse order, continuing past failures.
+
+        Component deactivation is idempotent, safe before activation, and
+        retries whatever an earlier failed release kept, so this both ends
+        a session and finishes releasing a failed one.
+        """
+        self._active = False
         with contextlib.ExitStack() as stack:
             for component in self._components():
                 stack.callback(component.deactivate)
-                component.activate(
-                    device,
-                    compile_blocks=compile_blocks,
-                    parameter_overrides=(
-                        {
-                            name: override
-                            for name, override in overrides.items()
-                            if name in component.param_names
-                        }
-                        if overrides
-                        else None
-                    ),
-                )
-            self._teardown_stack = stack.pop_all()
-
-    def deactivate(self) -> None:
-        stack = self._teardown_stack
-        self._teardown_stack = None
-        if stack is not None:
-            stack.close()
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Generator[None]:

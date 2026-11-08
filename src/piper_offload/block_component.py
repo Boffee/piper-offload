@@ -795,8 +795,8 @@ class BlockComponent:
         """Whether an ended session still holds device work it could not release.
 
         A runtime whose release failed stays acquired, keeping its targets,
-        and the component keeps the host leases its transfers read. The
-        session has ended, so nothing can retry; recreate the CUDA worker.
+        and the component keeps the host leases its transfers read. A later
+        :meth:`release` or :meth:`deactivate` retries.
         """
         return self._active_device is None and (
             self._pin_lease is not None
@@ -1050,16 +1050,18 @@ class BlockComponent:
         Host pin leases are released after the runtime confirms all copies
         have completed. Their registrations remain in the idle LRU for reuse
         until budget pressure, explicit clearing, or source disposal
-        unregisters them.
+        unregisters them. A runtime whose release fails stays acquired and
+        keeps those leases; calling this again, also after the session has
+        ended, retries it.
         """
-        runtime = self._active_runtime
-        if runtime is None:
-            return
+        runtimes = dict.fromkeys((self._runtime, self._eager_runtime))
         try:
-            runtime.release()
+            for runtime in runtimes:
+                if runtime.acquired:
+                    runtime.release()
         finally:
-            if not runtime.acquired:
-                # The runtime synchronized before releasing its targets.
+            if not any(runtime.acquired for runtime in runtimes):
+                # Every runtime synchronized before releasing its targets.
                 self._close_pin_lease()
                 self._transfer.close()
 

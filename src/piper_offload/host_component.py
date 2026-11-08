@@ -188,8 +188,8 @@ class HostComponent:
         """Whether an ended session still holds its target or transfer.
 
         Deactivation ends the session even when releasing fails, keeping
-        whatever it could not release; this component cannot activate again
-        until a ``release()`` retry frees it.
+        whatever it could not release. A later :meth:`release` or
+        :meth:`deactivate` retries.
         """
         return self._active_device is None and (self._transfer.open or self._lease is not None)
 

@@ -137,12 +137,17 @@ a later corrected activation to retry. This rollback is separate from
 construction failure recovery.
 
 `deactivate()` continues past a failing component and then raises. Most such
-errors, such as a prefetch failure that surfaces during deactivation, leave the
-offloader reusable. If a CUDA synchronization or a return to host storage
-fails or is interrupted, the offloader instead keeps what that step could not
-release, because device work may still read host memory or model tensors may
-still point at device memory. `offloader.failed` is then true and `activate()`
-raises `ModelRuntimeFailedError`; recreate the CUDA worker.
+errors, such as a prefetch failure that surfaces during deactivation, leave
+nothing behind. If a CUDA synchronization or a return to host storage fails or
+is interrupted, the offloader keeps what that step could not release, because
+device work may still read host memory or model tensors may still point at
+device memory, and `offloader.failed` is true. The next `deactivate()` or
+`activate()` retries that release; after an interrupt such as Ctrl-C it
+normally succeeds. If `activate()`'s retry fails too, as after an
+unrecoverable CUDA error, it raises `ModelRuntimeFailedError` with the retry's
+error as the cause. Recreate the CUDA worker then, and keep the offloader
+referenced until you do: dropping it lets garbage collection close the host
+leases it kept while device work may still use them.
 
 For frozen CPU models destined to stay on Apple MPS, `MpsWeights` provides a
 separate constructor-time materializer. It retains no CPU cache, does not
