@@ -16,6 +16,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - Streaming block groups resume prefetching after a skipped or out-of-order
   block, such as with skip-layer guidance. Previously every later block loaded
   without overlap until the skipped block ran again.
+- A routed LoRA forward interrupted by `KeyboardInterrupt` or another
+  non-`Exception` error no longer keeps its staged factor copies until
+  deactivation; the next call of that layer frees them.
 
 ## [0.10.0rc14] - 2026-11-05
 
