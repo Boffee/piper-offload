@@ -31,8 +31,7 @@ class BlockRuntime(Protocol):
 
     Implementations allocate accelerator resources only during
     :meth:`acquire`. Acquisition may fail after partially initializing a
-    runtime, so :meth:`release` must be safe for released and partial states
-    and release every resource it can before propagating a cleanup error.
+    runtime, so :meth:`release` must be safe for released and partial states.
     """
 
     @property
@@ -54,11 +53,14 @@ class BlockRuntime(Protocol):
     def release(self) -> None:
         """Release the CUDA working set and all host-read dependencies.
 
-        If cleanup cannot prove that queued host reads have completed, this
-        method must raise while leaving :attr:`acquired` true so its owner
-        retains host storage. That failure is terminal for the CUDA session.
-        Once ``acquired`` is false, no queued operation may still read any
-        source in the activation load plans.
+        Each target is closed or reused only after every block that used it
+        is back on host storage and its recorded work has completed. If a
+        synchronization or host restore fails, this method raises while
+        leaving :attr:`acquired` true and keeping what that step could not
+        release, so its owner retains host storage and reports a failed
+        session. Once ``acquired`` is false, no queued operation may still
+        read any source in the activation load plans, and no block points at
+        a released target.
         """
         ...
 

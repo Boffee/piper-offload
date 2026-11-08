@@ -64,6 +64,11 @@ class CompositeComponent:
     def buffer_names(self) -> frozenset[str]:
         return frozenset(name for component in self._components() for name in component.buffer_names)
 
+    @property
+    def failed(self) -> bool:
+        """Whether any component still holds device work from an ended session."""
+        return any(component.failed for component in self._components())
+
     def activate(
         self,
         device: torch.device,

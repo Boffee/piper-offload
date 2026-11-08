@@ -183,6 +183,16 @@ class HostComponent:
         """Host buffer names managed by this instance."""
         return self._buffer_names
 
+    @property
+    def failed(self) -> bool:
+        """Whether an ended session still holds its target or transfer.
+
+        Deactivation ends the session even when releasing fails, keeping
+        whatever it could not release; this component cannot activate again
+        until a ``release()`` retry frees it.
+        """
+        return self._active_device is None and (self._transfer.open or self._lease is not None)
+
     def activate(
         self,
         device: torch.device,
@@ -215,12 +225,11 @@ class HostComponent:
                 f"on {self._active_device}. Deactivate first, or check "
                 "for a leaked context manager."
             )
-        if self._transfer.open or self._lease is not None:
-            # deactivate() cleared the session, but its target and transfer
-            # are still open; a new session would silently reuse them.
+        if self.failed:
+            # A new session would silently reuse the old target and transfer.
             raise RuntimeError(
                 "HostComponent cannot activate after its prior CUDA session "
-                "failed to finish host transfers. Recreate the CUDA worker."
+                "failed to finish releasing. Recreate the CUDA worker."
             )
         active_device = canonical_device(device)
         if active_device.type == "cpu":
@@ -329,7 +338,12 @@ class HostComponent:
         This gives a uniform released resting state — ``.data`` and
         ``.grad`` both on CPU — so a context-free CPU
         ``optimizer.step()`` works the same for host and streamed
-        trainables."""
+        trainables.
+
+        Each step must finish before the next releases anything: a failed
+        synchronization keeps the transfer lease, and a failed host restore
+        or target close keeps the target, so :attr:`failed` reports them and
+        a later ``release()`` retries from the step that failed."""
         # A partial upload or copy-back may still be in flight; its lease
         # closes only once the device has synchronized.
         self._transfer.finish()
@@ -337,14 +351,10 @@ class HostComponent:
         if lease is None:
             return
         self._remove_use_hook()
-        try:
-            self._instance.install_host()
-            self._instance.move_trainable_grads_to(torch.device("cpu"))
-        finally:
-            try:
-                lease.close()
-            finally:
-                self._lease = None
+        self._instance.install_host()
+        self._instance.move_trainable_grads_to(torch.device("cpu"))
+        lease.close()
+        self._lease = None
 
     def deactivate(self) -> None:
         """Release working storage and end the activation session.

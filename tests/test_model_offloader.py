@@ -23,13 +23,16 @@ from piper_offload import (
     BlockComponent,
     BlockComponentStore,
     BlockMode,
+    Adapter,
     ModelOffloader,
+    ModelRuntimeFailedError,
     HostComponent,
     ResourceBinding,
     ResourceStore,
 )
 from piper_offload.composite_component import CompositeComponent
 from piper_offload.host_module import HostModuleInstance, ParameterOverride
+from piper_offload.pin_manager import host_pin_manager
 from piper_offload.streaming_runtime import _BlockTarget, _plan_target_signature, _wait_for_prefetch
 
 from tests.conftest import (
@@ -1530,6 +1533,72 @@ class TestResourceCacheIntegration:
 # ---------------------------------------------------------------------------
 
 
+class TestFailedSession:
+    def test_activation_refuses_a_failed_session_before_touching_components(self) -> None:
+        model = _make_block_model()
+        offloader = ModelOffloader.from_module(
+            model,
+            block_paths=["transformer_blocks"],
+        )
+        streamer = block_components(offloader)[0]
+        resident = host_component(offloader)
+        assert resident is not None
+        # Stands in for the host leases a failed release keeps for its
+        # unfinished transfers.
+        leftover = host_pin_manager.acquire([], pin=False)
+        streamer._pin_lease = leftover
+        try:
+            assert offloader.failed
+            with pytest.raises(ModelRuntimeFailedError, match="Recreate the CUDA worker"):
+                offloader.activate("cpu")
+            assert offloader.active_device is None
+            assert resident._active_device is None
+        finally:
+            streamer._pin_lease = None
+            leftover.close()
+
+        assert not offloader.failed
+        with activated_model(offloader, "cpu"):
+            pass
+
+    @CUDA
+    def test_recoverable_deactivation_error_keeps_routed_activation_available(self) -> None:
+        model = _make_block_model(num_blocks=3)
+        lora = Adapter.from_state_dict(
+            {
+                f"transformer_blocks.{idx}.{name}": torch.randn(*shape)
+                for idx in range(3)
+                for name, shape in (("lora_A.weight", (1, 8)), ("lora_B.weight", (8, 1)))
+            }
+        )
+        offloader = ModelOffloader.from_module(
+            model,
+            block_paths=["transformer_blocks"],
+        )
+        streamer = block_components(offloader)[0]
+        x = torch.randn(2, 8, device="cuda")
+
+        offloader.activate("cuda", adapters=[lora], adapter_mode="routed")
+        with torch.no_grad():
+            expected = model(x).clone()
+        lookahead = streamer._runtime._lookahead
+        assert lookahead is not None and lookahead.prefetch is not None
+        lookahead.prefetch.result()
+        bad_prefetch: Future[None] = Future()
+        bad_prefetch.set_exception(RuntimeError("simulated prefetch failure"))
+        lookahead.prefetch = bad_prefetch
+        # Every target is synchronized and back on the host before this
+        # surfaces, so the session ends cleanly despite the error.
+        with pytest.raises(RuntimeError, match="simulated prefetch failure"):
+            offloader.deactivate()
+
+        assert not offloader.failed
+        assert offloader._routed_lease is None
+        with activated_model(offloader, "cuda", adapters=[lora], adapter_mode="routed"), torch.no_grad():
+            actual = model(x).clone()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 class TestActivateFailureCleanup:
     @CUDA
     def test_partial_activate_failure_rolls_back_other_components(self, monkeypatch) -> None:
@@ -1577,6 +1646,7 @@ class TestActivateFailureCleanup:
                 self._raise = raise_on_activate
 
             cache_bytes = 0
+            failed = False
 
             def activate(self, device: torch.device | str | None = None, **kwargs: object) -> None:
                 del device, kwargs

@@ -73,31 +73,21 @@ class ResidentBlockRuntime:
         )
 
     def release(self) -> None:
-        first_error: BaseException | None = None
         if self._device is not None:
             # Leave acquired state intact on failure so the component keeps
             # its host lease while an upload or copy-back may still be live.
             torch.cuda.synchronize(self._device)
-
+        # Every block returns to host storage before any target closes. A
+        # failure keeps the remaining targets and leaves the runtime acquired,
+        # so nothing reuses storage a block may still point at; restores are
+        # idempotent, so a later release() retries from the start.
         for instance in self._instances:
-            try:
-                instance.install_host()
-                instance.move_trainable_grads_to(torch.device("cpu"))
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
-
-        for lease in self._leases:
-            try:
-                lease.close()
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
-        self._leases.clear()
+            instance.install_host()
+            instance.move_trainable_grads_to(torch.device("cpu"))
+        while self._leases:
+            self._leases[-1].close()
+            self._leases.pop()
         self._device = None
-
-        if first_error is not None:
-            raise first_error
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Generator[None]:

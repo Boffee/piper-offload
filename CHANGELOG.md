@@ -5,8 +5,24 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- `ModelOffloader.failed` reports a CUDA session whose deactivation could not
+  finish releasing device work, and `activate()` then raises
+  `ModelRuntimeFailedError`, a `RuntimeError` subclass, before activating any
+  component. Recreate the CUDA worker in that case. The message still says
+  "Recreate the CUDA worker".
+
 ### Fixed
 
+- A recoverable error during deactivation, such as a prefetch failure that
+  surfaces there, no longer makes every later routed-LoRA CUDA activation of
+  that model fail with "Recreate the CUDA worker".
+- If restoring a model to host storage, or a CUDA synchronization while
+  closing its device targets, fails or is interrupted during deactivation, the
+  offloader keeps those targets and reports a failed session. Previously it
+  could end up inactive with some parameters still on the GPU, and a failed
+  synchronization dropped a target whose work had not been confirmed finished.
 - A root-model forward reacquires `transient_paths` and `transient_block_paths`
   working sets left released by an earlier call: a forward that raised after
   they released, or a transient module called on its own. Previously every

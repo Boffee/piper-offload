@@ -122,22 +122,25 @@ class CudaTargetLease:
         self._acquired = False
 
     def close(self) -> None:
-        """Release target storage after all recorded CUDA work completes."""
+        """Release target storage after all recorded CUDA work completes.
+
+        If a synchronization fails or is interrupted, the lease keeps its
+        target and stream dependencies, so its owner still holds the storage
+        and a later ``close()`` synchronizes again.
+        """
         if self._target is None:
             return
         self.release()
-        try:
-            if self._ready_event is not None:
-                self._ready_event.synchronize()
-            streams = set(self._recorded_streams)
-            streams.add(self._allocation_stream)
-            for stream in streams:
-                stream.synchronize()
-        finally:
-            self._target = None
-            self._ready_event = None
-            self._staged = False
-            self._recorded_streams.clear()
+        if self._ready_event is not None:
+            self._ready_event.synchronize()
+        streams = set(self._recorded_streams)
+        streams.add(self._allocation_stream)
+        for stream in streams:
+            stream.synchronize()
+        self._target = None
+        self._ready_event = None
+        self._staged = False
+        self._recorded_streams.clear()
 
 
 __all__ = ["CudaTargetLease"]

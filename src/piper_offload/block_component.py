@@ -790,6 +790,21 @@ class BlockComponent:
     def has_trainables(self) -> bool:
         return any(instance.has_trainables for instance in self._block_instances)
 
+    @property
+    def failed(self) -> bool:
+        """Whether an ended session still holds device work it could not release.
+
+        A runtime whose release failed stays acquired, keeping its targets,
+        and the component keeps the host leases its transfers read. The
+        session has ended, so nothing can retry; recreate the CUDA worker.
+        """
+        return self._active_device is None and (
+            self._pin_lease is not None
+            or self._transfer.open
+            or self._runtime.acquired
+            or self._eager_runtime.acquired
+        )
+
     def _resolve_param_name(
         self,
         name: str,
@@ -872,17 +887,11 @@ class BlockComponent:
                 "active. Deactivate first, or check for a leaked "
                 "context manager."
             )
-        if (
-            self._pin_lease is not None
-            or self._transfer.open
-            or self._runtime.acquired
-            or self._eager_runtime.acquired
-        ):
-            # A runtime whose release failed to synchronize is still acquired;
-            # a new session would silently reuse its targets and load plan.
+        if self.failed:
+            # A new session would silently reuse the old targets and load plan.
             raise RuntimeError(
                 "BlockComponent cannot activate after its prior CUDA session "
-                "failed to finish host transfers. Recreate the CUDA worker."
+                "failed to finish releasing. Recreate the CUDA worker."
             )
         active_device = canonical_device(device)
         if active_device.type == "cpu":
