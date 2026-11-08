@@ -206,6 +206,8 @@ class Memory(shared.Memory):
         self._offered: OrderedDict[int, CopyOwner] = OrderedDict()
         self.offered_bytes = 0
         self._offering: _OfferBatch | None = None
+        # Set once a watcher's thread has started, and cleared by that watcher,
+        # under the lock, as it stops for an empty tier.
         self._watching_commit = False
 
     def new_copy(self, size: int) -> Copy:
@@ -283,11 +285,24 @@ class Memory(shared.Memory):
         self.offered_bytes += copy.size
         released.extend(self._relieve_commit())
         if self._offered and not self._watching_commit:
-            self._watching_commit = True
-            threading.Thread(
-                target=_watch_commit, args=(weakref.ref(self),), name="piper-offload-commit", daemon=True,
-            ).start()
+            self._start_watching_commit()
         return released
+
+    def _start_watching_commit(self) -> None:
+        """Start a commitment watcher; if its thread cannot start, the next admission tries again.
+
+        Called with the lock held, so the watcher cannot report an empty tier
+        before the flag records that it started.
+        """
+        watcher = threading.Thread(
+            target=_watch_commit, args=(weakref.ref(self),), name="piper-offload-commit", daemon=True,
+        )
+        try:
+            watcher.start()
+        except RuntimeError as error:
+            logger.warning("Could not start watching Windows commitment; the next offered copy retries: %s", error)
+            return
+        self._watching_commit = True
 
     def _relieve_commit(self) -> list[Copy]:
         """Detach offered copies for freeing if Windows reports its commitment exhausted."""

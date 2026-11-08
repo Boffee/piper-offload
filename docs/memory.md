@@ -158,7 +158,9 @@ age order and retry allocation.
 Discarded pages still consume commitment. The tier frees every offered copy
 when Windows signals exhausted commitment. If that signal cannot be monitored,
 a warning is emitted once; budget eviction and allocation-failure recovery
-still apply. Setting the budget to zero releases offered commitment.
+still apply. If the thread that watches it cannot start, a warning is emitted
+and the next offered copy tries again. Setting the budget to zero releases
+offered commitment.
 
 ## Custom transfers
 
