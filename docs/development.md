@@ -123,6 +123,32 @@ cleans up partial activation on failure. Lower-level component callers own
 their cleanup; see each component's docstring. Construction failures require
 discarding the partially captured model, as described in [models](models.md).
 
+### Scheduling hooks
+
+Transient release, block streaming and rolling refill, and routed LoRA staging
+run from module forward hooks. Those hooks do not reliably run in pairs:
+
+- A post-hook is skipped when the forward raises. `always_call` hooks still
+  run for an `Exception`, but not for `KeyboardInterrupt` or other
+  `BaseException` errors such as task cancellation.
+- Callers can invoke a submodule directly, without the root model's hooks.
+- Models skip or reorder blocks, for example for skip-layer guidance.
+
+So a hook acts on the state that is actually installed instead of assuming
+the previous hook ran, and the next call repairs whatever an interrupted one
+left:
+
+- Acquisition is idempotent and leaves a failed attempt released, never
+  partly acquired.
+- A working set is re-established where it is used, not only where the
+  previous call would have restored it.
+- State scoped to one call is replaced by the next call, so interrupted calls
+  cannot accumulate it.
+
+[test_forward_interruption.py](../tests/test_forward_interruption.py) runs each
+block mode and hook-driven feature through these interruptions; add new ones
+to its configurations.
+
 ## Documentation ownership
 
 Each explanation has one owner, and other places link to it rather than restate it.

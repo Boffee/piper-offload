@@ -42,6 +42,8 @@ Read the relevant guide before changing its behavior:
 - [Streaming](docs/streaming.md): shared storage is preserved within host
   state or one streamed block, not across their ownership boundaries.
   Training, transient lifetimes, and compilation have distinct contracts.
+  Forward hooks must recover from interrupted, skipped, and direct calls; see
+  [scheduling hooks](docs/development.md#scheduling-hooks).
 - [Adapters](docs/adapters.md) and [formats](docs/formats.md): update resources
   are immutable; merge, routed execution, and tensor-format capabilities are
   separate concepts.
