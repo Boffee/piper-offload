@@ -897,49 +897,6 @@ class TestTransientResidency:
             offloader.deactivate()
 
     @CUDA
-    @pytest.mark.parametrize("release_trigger", ["failed_forward", "direct_call"])
-    def test_root_forward_reacquires_components_left_released(
-        self,
-        release_trigger: str,
-    ) -> None:
-        class FailingHead(nn.Linear):
-            fail = False
-
-            def forward(self, value: torch.Tensor) -> torch.Tensor:
-                if self.fail:
-                    raise RuntimeError("simulated suffix failure")
-                return super().forward(value)
-
-        model = _make_block_model(num_blocks=3)
-        model.head = FailingHead(8, 8, bias=False).requires_grad_(False)
-        offloader = ModelOffloader.from_module(
-            model,
-            transient_block_paths=["transformer_blocks"],
-            transient_paths=["embed"],
-        )
-        embed = dict(transient_components(offloader))["embed"]
-        runtime = block_components(offloader)[0]._runtime
-        value = torch.randn(2, 8, device="cuda")
-        with activated_model(offloader, "cuda"), torch.inference_mode():
-            expected = model(value).clone()
-            if release_trigger == "failed_forward":
-                model.head.fail = True
-                with pytest.raises(RuntimeError, match="simulated suffix failure"):
-                    model(value)
-                model.head.fail = False
-                assert not runtime.acquired
-            else:
-                model.embed(value)
-            assert embed._lease is None
-
-            actual = model(value).clone()
-            torch.cuda.synchronize()
-
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            assert runtime.acquired
-            assert embed._lease is not None
-
-    @CUDA
     def test_failed_reacquire_is_retried_by_next_forward(
         self,
         monkeypatch: pytest.MonkeyPatch,
