@@ -797,7 +797,7 @@ class BlockComponent:
         """Whether an ended session left its working set unreleased.
 
         A runtime whose release failed stays acquired, keeping its targets,
-        and the component keeps the host leases its transfers read. A later
+        and the component keeps the pin leases its transfers read. A later
         :meth:`release` or :meth:`deactivate` retries.
         """
         return self._active_device is None and self._working_set is not WorkingSet.RELEASED
@@ -888,7 +888,8 @@ class BlockComponent:
             # A new session would silently reuse the old targets and load plan.
             raise RuntimeError(
                 "BlockComponent cannot activate after its prior CUDA session "
-                "failed to finish releasing. Recreate the CUDA worker."
+                "failed to finish releasing; deactivate() retries that "
+                "release. Recreate the CUDA worker only if the retry fails too."
             )
         active_device = canonical_device(device)
         if active_device.type == "cpu":
@@ -998,9 +999,8 @@ class BlockComponent:
         under the global pin budget, since they read it every step; a resident
         upload leases it pageable, registers nothing, and releases the lease
         once the runtime has synchronized the upload. A failed acquisition
-        releases its partial working set, and an acquire or release that an
-        exception stopped partway is finished by releasing first, so the
-        session can acquire again.
+        releases its partial working set, so the session can acquire again,
+        also after an acquire or release that an exception stopped partway.
         """
         active_device = self._active_device
         if active_device is None:
@@ -1071,9 +1071,10 @@ class BlockComponent:
     def deactivate(self) -> None:
         """Tear down active resources idempotently — safe to call
         before activate or multiple times. The selected runtime owns cleanup
-        of any partial acquisition state. A terminal CUDA synchronization
-        failure retains its pin lease but clears session metadata. Drop the
-        binding reference after deactivate to release host memory."""
+        of any partial acquisition state. A release that fails still ends the
+        session but keeps what it could not release (see :attr:`failed`);
+        calling this again retries it. Drop the binding reference after
+        deactivate to release host memory."""
         self._block_compile.restore()
         if self._inductor_compile is not None:
             self._inductor_compile.restore()

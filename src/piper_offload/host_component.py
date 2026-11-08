@@ -231,7 +231,8 @@ class HostComponent:
             # A new session would silently reuse the old target and transfer.
             raise RuntimeError(
                 "HostComponent cannot activate after its prior CUDA session "
-                "failed to finish releasing. Recreate the CUDA worker."
+                "failed to finish releasing; deactivate() retries that "
+                "release. Recreate the CUDA worker only if the retry fails too."
             )
         active_device = canonical_device(device)
         if active_device.type == "cpu":
@@ -257,9 +258,9 @@ class HostComponent:
     def acquire(self) -> None:
         """Acquire this active session's CUDA working set.
 
-        Acquisition is idempotent. An acquire or release that an exception
-        stopped partway is finished by releasing first. CPU sessions already
-        use their host backing and therefore have no separate working set.
+        Acquisition is idempotent, also after an acquire or release that an
+        exception stopped partway. CPU sessions already use their host
+        backing and therefore have no separate working set.
         """
         active_device = self._active_device
         if active_device is None:
@@ -349,8 +350,7 @@ class HostComponent:
 
         Each step must finish before the next releases anything: a failed
         synchronization keeps the transfer lease, and a failed host restore
-        or target close keeps the target. The working set stays changing
-        until every step has finished, so a later ``release()`` retries."""
+        or target close keeps the target, and a later call retries."""
         if self._working_set is WorkingSet.RELEASED:
             return
         self._working_set = WorkingSet.CHANGING

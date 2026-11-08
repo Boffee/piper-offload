@@ -2,11 +2,10 @@
 
 Each case activates on CUDA, runs a forward, then fails one release step once
 while deactivating: the k-th CUDA synchronization or the k-th return of a
-module to host storage, with an ordinary error or an interrupt. Afterwards
-either every managed tensor is back on the host, or ``ModelOffloader.failed``
-is true; it never ends inactive and unreported with managed tensors still on
-the device. The next activation retries what was kept and runs the model as
-before. A release that keeps failing makes activation raise
+module to host storage, with an ordinary error or an interrupt. Each is a
+release step, so ``ModelOffloader.failed`` is true exactly when one failed,
+and otherwise every managed tensor is back on the host. The next activation
+retries what was kept and runs the model as before. A release that keeps failing makes activation raise
 :class:`ModelRuntimeFailedError`. See the scheduling-hooks rules in
 ``docs/development.md``. New block modes, components, and hook-driven adapter
 paths join ``_CONFIGS``.
@@ -188,10 +187,11 @@ def test_failed_release_step_is_reported(
             raised = exc
 
     assert offloader.active_device is None
-    if offloader.failed:
-        assert raised is not None
-    else:
-        # Nothing was kept: no device tensors, no routed lease.
+    # Every synchronization and host restore during deactivation is a release
+    # step, so a failure must keep what that step could not free and report it.
+    assert offloader.failed == (raised is not None)
+    if raised is None:
+        # The occurrence did not exist: nothing failed, so nothing was kept.
         assert _on_device(model) == []
         assert offloader._routed_lease is None
 

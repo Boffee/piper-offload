@@ -75,7 +75,7 @@ class ResidentBlockRuntime:
     def release(self) -> None:
         if self._device is not None:
             # Leave acquired state intact on failure so the component keeps
-            # its host lease while an upload or copy-back may still be live.
+            # its pageable lease while an upload or copy-back may still be live.
             torch.cuda.synchronize(self._device)
         # Every block returns to host storage before any target closes. A
         # failure keeps the remaining targets and leaves the runtime acquired,

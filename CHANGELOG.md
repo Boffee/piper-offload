@@ -14,7 +14,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   too, it raises `ModelRuntimeFailedError`, a `RuntimeError` subclass, before
   activating any component; recreate the CUDA worker then, and keep the
   offloader referenced until you do. The message still says "Recreate the CUDA
-  worker".
+  worker". `HostComponent.failed` and `BlockComponent.failed` report the same
+  for a component used directly: its `deactivate()` retries, and its
+  `activate()` refuses until a retry succeeds.
 
 ### Fixed
 

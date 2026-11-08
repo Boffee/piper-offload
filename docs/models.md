@@ -146,7 +146,7 @@ device memory, and `offloader.failed` is true. The next `deactivate()` or
 normally succeeds. If `activate()`'s retry fails too, as after an
 unrecoverable CUDA error, it raises `ModelRuntimeFailedError` with the retry's
 error as the cause. Recreate the CUDA worker then, and keep the offloader
-referenced until you do: dropping it lets garbage collection close the host
+referenced until you do: dropping it lets garbage collection close the pin
 leases it kept while device work may still use them.
 
 For frozen CPU models destined to stay on Apple MPS, `MpsWeights` provides a
