@@ -19,6 +19,10 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - An interrupt such as Ctrl-C while a streamed block waits for its prefetch is
   raised once that prefetch finishes. Previously a later forward in the same
   activation could write into the target while the prefetch still filled it.
+- Activating streamed `block_paths` inside `torch.inference_mode()` no longer
+  fails once prefetching reuses the first block's target. Streaming targets
+  are allocated outside the caller's inference mode, so the prefetch worker
+  can refill them.
 - A routed LoRA forward interrupted by `KeyboardInterrupt` or another
   non-`Exception` error no longer keeps its staged factor copies until
   deactivation; the next call of that layer frees them.

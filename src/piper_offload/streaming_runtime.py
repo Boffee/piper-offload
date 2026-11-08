@@ -6,6 +6,7 @@ import logging
 import weakref
 from collections.abc import Generator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -26,7 +27,7 @@ type BlockSignature = tuple[object, ...]
 type _LoadedTrainableBlock = tuple[HostModuleInstance, HostModuleTarget]
 
 
-def _join(future: Future[None]) -> None:
+def _wait_for_prefetch(future: Future[None]) -> None:
     """Wait for a prefetch; return or raise only once its worker has finished.
 
     The worker owns its block's target until the job ends. An interrupt such
@@ -44,6 +45,20 @@ def _join(future: Future[None]) -> None:
                 # A repeated interrupt; the first one is re-raised below.
                 continue
         raise
+
+
+def _prefetch_direction(last_idx: int, idx: int, num_blocks: int) -> int:
+    """Guess the traversal direction from the previous block to ``idx``.
+
+    A step longer than half the list wraps around the end, so it continues
+    the other way: from the last block back to block 0 still runs forward.
+    """
+    if last_idx < 0:
+        return 1
+    step = idx - last_idx
+    if abs(step) > num_blocks // 2:
+        return -1 if step > 0 else 1
+    return 1 if step >= 0 else -1
 
 
 def _plan_target_signature(plan: HostModuleLoadPlan) -> BlockSignature:
@@ -69,8 +84,12 @@ def _plan_target_signature(plan: HostModuleLoadPlan) -> BlockSignature:
     return (param_sig, buffer_sig)
 
 
-class _MorphingTargetPool:
-    """Signature-keyed pool of reusable stream-aware GPU targets."""
+class _TargetPool:
+    """Reusable stream-aware GPU targets, keyed by block layout signature.
+
+    Only the runtime's forward thread takes targets from or returns them to
+    the pool, so it needs no lock.
+    """
 
     def __init__(self, device: torch.device) -> None:
         self._device = device
@@ -85,11 +104,14 @@ class _MorphingTargetPool:
         free = self._free.get(signature)
         if free:
             return free.pop()
-        return CudaTargetLease.allocate(
-            plan,
-            self._device,
-            allocation_stream=stream,
-        )
+        # The prefetch worker refills pooled targets outside the caller's
+        # inference mode, which cannot update inference tensors in place.
+        with torch.inference_mode(False):
+            return CudaTargetLease.allocate(
+                plan,
+                self._device,
+                allocation_stream=stream,
+            )
 
     def release(
         self,
@@ -105,8 +127,25 @@ class _MorphingTargetPool:
         self._free.clear()
 
 
+@dataclass(eq=False, slots=True)
+class _BlockTarget:
+    """A target leased to one block and, while the worker stages it, that prefetch."""
+
+    block_idx: int
+    lease: CudaTargetLease
+    prefetch: Future[None] | None = None
+
+
 class StreamingBlockRuntime:
-    """One active block plus one whole-block lookahead target."""
+    """One active block plus one whole-block lookahead target.
+
+    Every target lease is in the pool, the active target, or the lookahead
+    target. The active target's block is installed on it. The lookahead target
+    belongs to the prefetch worker until :func:`_wait_for_prefetch` returns, so
+    only then does it become active or return to the pool. Only the forward
+    thread moves targets between these places, and each step keeps every lease
+    in one of them even when it raises.
+    """
 
     def __init__(
         self,
@@ -118,13 +157,13 @@ class StreamingBlockRuntime:
         self._wraparound = wraparound
         self._device: torch.device | None = None
         self._load_plans: tuple[HostModuleLoadPlan, ...] = ()
-        self._pool: _MorphingTargetPool | None = None
-        self._block_to_lease: dict[int, CudaTargetLease] = {}
-        self._active_idx: int | None = None
+        self._signatures: tuple[BlockSignature, ...] = ()
+        self._pool: _TargetPool | None = None
+        self._active: _BlockTarget | None = None
+        self._lookahead: _BlockTarget | None = None
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._executor: ThreadPoolExecutor | None = None
         self._stream: torch.cuda.Stream | None = None
-        self._pending: dict[int, Future[None]] = {}
         self._last_idx = -1
         self._optimizer_step_active = False
         self._move_trainable_grads_to(torch.device("cpu"))
@@ -150,17 +189,15 @@ class StreamingBlockRuntime:
         num_blocks = len(self._instances)
         self._device = device
         self._load_plans = plans
+        self._signatures = tuple(_plan_target_signature(plan) for plan in plans)
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._stream = torch.cuda.Stream(device=device, priority=-1)
-        self._pending = {}
         self._last_idx = -1
-        self._pool = _MorphingTargetPool(device)
+        self._pool = _TargetPool(device)
         self._move_trainable_grads_to(device)
 
         current_stream = torch.cuda.current_stream(device)
-        self._stage_block(0, current_stream)
-        self._acquire_block(0, current_stream)
-        self._active_idx = 0
+        self._acquire_block(self._stage_block(0, current_stream), current_stream)
 
         self._register_hooks()
 
@@ -178,20 +215,19 @@ class StreamingBlockRuntime:
             self._executor.shutdown(wait=True)
             self._executor = None
 
-        first_prefetch_exc = self._drain_and_evict_all()
-        self._stream = None
-        self._move_trainable_grads_to(torch.device("cpu"))
-        if self._pool is not None:
-            self._pool.close()
-        self._pool = None
-        self._block_to_lease.clear()
-        self._active_idx = None
-        self._last_idx = -1
-        self._device = None
-        self._load_plans = ()
-
-        if first_prefetch_exc is not None:
-            raise first_prefetch_exc
+        try:
+            self._release_blocks()
+        finally:
+            self._stream = None
+            self._move_trainable_grads_to(torch.device("cpu"))
+            # Both targets are back in the pool, which now holds every lease.
+            if self._pool is not None:
+                self._pool.close()
+            self._pool = None
+            self._last_idx = -1
+            self._device = None
+            self._load_plans = ()
+            self._signatures = ()
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Generator[None]:
@@ -212,9 +248,7 @@ class StreamingBlockRuntime:
             yield
             return
 
-        first_prefetch_exc = self._drain_and_evict_all()
-        if first_prefetch_exc is not None:
-            raise first_prefetch_exc
+        self._release_blocks()
 
         device = self._require_device()
         step_stream = self._stream
@@ -278,137 +312,117 @@ class StreamingBlockRuntime:
         for instance in self._instances:
             instance.move_trainable_grads_to(device)
 
-    def _stage_block(
-        self,
-        block_idx: int,
-        stream: torch.cuda.Stream,
-        *,
-        non_blocking: bool = False,
-    ) -> None:
+    # Targets move only on the forward thread. Each step keeps every lease in
+    # the pool, the active target, or the lookahead target, also when it raises.
+
+    def _take_target(self, block_idx: int, stream: torch.cuda.Stream) -> _BlockTarget:
+        """Take a pooled target for ``block_idx``, allocating it on ``stream`` if none fits."""
         assert self._pool is not None, "runtime is not acquired"
         plan = self._load_plans[block_idx]
-        lease = self._block_to_lease.get(block_idx)
-        if lease is None:
-            lease = self._pool.acquire(
-                _plan_target_signature(plan),
-                plan,
-                stream,
-            )
-            self._block_to_lease[block_idx] = lease
-        lease.stage(
-            plan,
-            stream,
-            non_blocking=non_blocking,
-        )
+        return _BlockTarget(block_idx, self._pool.acquire(self._signatures[block_idx], plan, stream))
 
-    def _acquire_block(
-        self,
-        block_idx: int,
-        stream: torch.cuda.Stream,
-    ) -> None:
-        lease = self._block_to_lease[block_idx]
-        self._load_plans[block_idx].instance.install_target(
-            lease.acquire(stream)
-        )
-
-    def _release_block(
-        self,
-        block_idx: int,
-    ) -> None:
-        self._load_plans[block_idx].instance.install_host()
-        self._return_lease(block_idx)
-
-    def _return_lease(self, block_idx: int) -> None:
+    def _return_target(self, block_target: _BlockTarget) -> None:
+        """Return a target to the pool once its block is uninstalled and no prefetch writes it."""
         assert self._pool is not None, "runtime is not acquired"
-        lease = self._block_to_lease.pop(block_idx, None)
-        if lease is not None:
-            lease.release()
-            self._pool.release(
-                _plan_target_signature(self._load_plans[block_idx]),
-                lease,
-            )
+        block_target.lease.release()
+        self._pool.release(self._signatures[block_target.block_idx], block_target.lease)
 
-    def _retire_pending_prefetch(self) -> None:
-        """Return the lookahead target of a prefetch that was not requested.
+    def _stage_block(self, block_idx: int, stream: torch.cuda.Stream) -> _BlockTarget:
+        """Stage ``block_idx`` on ``stream`` from the forward thread."""
+        block_target = self._take_target(block_idx, stream)
+        try:
+            block_target.lease.stage(self._load_plans[block_idx], stream, non_blocking=False)
+        except BaseException:
+            self._return_target(block_target)
+            raise
+        return block_target
 
-        A skipped or out-of-order block leaves the lookahead target staged
-        for a block that does not run next. Until it is retired, no other
-        prefetch can start, so every later block would load synchronously.
-        Waiting for it first also keeps the worker off the pool while the
-        caller stages the requested block.
-        """
-        for block_idx, future in tuple(self._pending.items()):
-            del self._pending[block_idx]
-            try:
-                _join(future)
-            finally:
-                # The block was never installed, so only its lease returns.
-                self._return_lease(block_idx)
+    def _acquire_block(self, block_target: _BlockTarget, stream: torch.cuda.Stream) -> None:
+        """Install a staged target on its block and make it the active target."""
+        self._active = block_target
+        instance = self._load_plans[block_target.block_idx].instance
+        instance.install_target(block_target.lease.acquire(stream))
 
-    def _drain_and_evict_all(self) -> BaseException | None:
-        first_prefetch_exc: BaseException | None = None
-        for future in list(self._pending.values()):
-            try:
-                _join(future)
-            except BaseException as exc:
-                if first_prefetch_exc is None:
-                    first_prefetch_exc = exc
-        self._pending.clear()
+    def _release_block(self, block_target: _BlockTarget) -> None:
+        """Restore a block to host storage and return its target to the pool."""
+        try:
+            self._load_plans[block_target.block_idx].instance.install_host()
+        finally:
+            self._return_target(block_target)
 
-        for block_idx in list(self._block_to_lease):
-            self._release_block(block_idx)
-        self._active_idx = None
-        return first_prefetch_exc
-
-    def _submit_prefetch(self, idx: int) -> None:
+    def _submit_prefetch(self, block_idx: int) -> None:
+        """Stage ``block_idx`` into the lookahead target on the worker, unless one is in use."""
         assert self._executor is not None
-        assert self._stream is not None
-        if idx == self._active_idx or self._pending:
+        stream = self._stream
+        assert stream is not None
+        active = self._active
+        if self._lookahead is not None or (active is not None and active.block_idx == block_idx):
             return
-        self._pending[idx] = self._executor.submit(
-            self._stage_block,
-            idx,
-            self._stream,
+        lookahead = self._lookahead = self._take_target(block_idx, stream)
+        lookahead.prefetch = self._executor.submit(
+            lookahead.lease.stage,
+            self._load_plans[block_idx],
+            stream,
             non_blocking=True,
         )
 
-    def _ensure_on_gpu(self, idx: int) -> None:
-        current_stream = torch.cuda.current_stream(self._require_device())
-        future = self._pending.pop(idx, None)
-        if future is not None:
-            _join(future)
-        else:
-            self._retire_pending_prefetch()
-            self._stage_block(idx, current_stream)
-        self._acquire_block(idx, current_stream)
-        self._active_idx = idx
+    def _take_lookahead(self) -> _BlockTarget | None:
+        """Empty the lookahead once its prefetch finishes and return it.
 
-    def _before_block_forward(
-        self,
-        idx: int,
-    ) -> None:
-        if not self.acquired:
+        A failed prefetch returns its target to the pool and raises.
+        """
+        lookahead, self._lookahead = self._lookahead, None
+        if lookahead is not None and lookahead.prefetch is not None:
+            try:
+                _wait_for_prefetch(lookahead.prefetch)
+            except BaseException:
+                self._return_target(lookahead)
+                raise
+            lookahead.prefetch = None
+        return lookahead
+
+    def _take_staged(self, block_idx: int, stream: torch.cuda.Stream) -> _BlockTarget:
+        """Return ``block_idx`` staged: the lookahead if it holds that block, else staged on ``stream``."""
+        lookahead = self._take_lookahead()
+        if lookahead is not None:
+            if lookahead.block_idx == block_idx:
+                return lookahead
+            # A skipped or out-of-order block. Returning its target lets the
+            # next prefetch start instead of waiting until that block runs.
+            self._return_target(lookahead)
+        return self._stage_block(block_idx, stream)
+
+    def _release_blocks(self) -> None:
+        """Return both targets to the pool, then raise any failed prefetch."""
+        try:
+            lookahead = self._take_lookahead()
+            if lookahead is not None:
+                self._return_target(lookahead)
+        finally:
+            active, self._active = self._active, None
+            if active is not None:
+                self._release_block(active)
+
+    def _before_block_forward(self, idx: int) -> None:
+        device = self._device
+        if device is None:
             return
 
-        current_stream = torch.cuda.current_stream(self._require_device())
-        if idx != self._active_idx:
-            if self._active_idx is not None:
-                self._release_block(self._active_idx)
-                self._active_idx = None
-            self._ensure_on_gpu(idx)
-        self._block_to_lease[idx].record_stream(current_stream)
+        current_stream = torch.cuda.current_stream(device)
+        active = self._active
+        if active is None or active.block_idx != idx:
+            self._active = None
+            if active is not None:
+                self._release_block(active)
+            active = self._take_staged(idx, current_stream)
+            self._acquire_block(active, current_stream)
+        active.lease.record_stream(current_stream)
 
-        last = self._last_idx
-        self._last_idx = idx
+        last_idx, self._last_idx = self._last_idx, idx
         num_blocks = len(self._instances)
-        if not self._wraparound and idx == num_blocks - 1:
-            return
-        if last < 0:
-            direction = 1
-        else:
-            diff = idx - last
-            direction = (-1 if diff > 0 else 1) if abs(diff) > num_blocks // 2 else 1 if diff >= 0 else -1
-        self._submit_prefetch((idx + direction) % num_blocks)
+        if self._wraparound or idx != num_blocks - 1:
+            next_idx = (idx + _prefetch_direction(last_idx, idx, num_blocks)) % num_blocks
+            self._submit_prefetch(next_idx)
 
     def _register_hooks(self) -> None:
         runtime_ref = weakref.ref(self)

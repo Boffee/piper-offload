@@ -30,7 +30,7 @@ from piper_offload import (
 )
 from piper_offload.composite_component import CompositeComponent
 from piper_offload.host_module import ParameterOverride
-from piper_offload.streaming_runtime import _join, _plan_target_signature
+from piper_offload.streaming_runtime import _BlockTarget, _plan_target_signature, _wait_for_prefetch
 
 from tests.conftest import (
     CallbackParameterTransform,
@@ -390,8 +390,7 @@ class TestBlockComponentBackendActivation:
         lease = Lease()
         forward_stream = object()
         runtime._device = torch.device("cuda")
-        runtime._active_idx = 0
-        runtime._block_to_lease = {0: cast(Any, lease)}
+        runtime._active = _BlockTarget(0, cast(Any, lease))
         monkeypatch.setattr(runtime, "_submit_prefetch", lambda _idx: None)
         monkeypatch.setattr(
             torch.cuda,
@@ -402,8 +401,7 @@ class TestBlockComponentBackendActivation:
             runtime._before_block_forward(0)
             assert lease.used == [forward_stream]
         finally:
-            runtime._block_to_lease.clear()
-            runtime._active_idx = None
+            runtime._active = None
             runtime._device = None
             streamer.deactivate()
 
@@ -1095,7 +1093,7 @@ class TestTraversalPrefetch:
             strategy.deactivate()
 
     @CUDA
-    def test_skipped_block_retires_its_prefetch(self) -> None:
+    def test_prefetch_resumes_after_a_skipped_block(self) -> None:
         # Running block 3 after block 1 skips the prefetched block 2. Its
         # lookahead target must return to the pool so block 3 can prefetch
         # block 0; otherwise every later block loads synchronously until
@@ -1117,12 +1115,37 @@ class TestTraversalPrefetch:
             for idx in (0, 1, 3):
                 actual = streamer.blocks[idx](actual)
                 expected = reference.transformer_blocks[idx](expected)
-            assert list(runtime._pending) == [0]
-            runtime._pending[0].result()
-            assert set(runtime._block_to_lease) == {0, 3}
+            assert runtime._active is not None and runtime._active.block_idx == 3
+            lookahead = runtime._lookahead
+            assert lookahead is not None and lookahead.block_idx == 0
+            assert lookahead.prefetch is not None
+            lookahead.prefetch.result()
             torch.cuda.synchronize()
 
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+    @CUDA
+    def test_activation_inside_inference_mode_keeps_pooled_targets_mutable(self) -> None:
+        # Activation stages block 0 on the calling thread. The prefetch worker
+        # later refills that pooled target outside the caller's inference
+        # mode, which cannot update an inference tensor in place.
+        torch.manual_seed(0)
+        m = _make_block_model(num_blocks=4, width=8)
+        reference = copy.deepcopy(m).cuda()
+        strategy = ModelOffloader.from_module(
+            m,
+            block_paths=["transformer_blocks"],
+        )
+        x = torch.randn(2, 8, device="cuda")
+
+        with torch.inference_mode():
+            with activated_model(strategy, "cuda"):
+                first = m(x).clone()
+                second = m(x).clone()
+            expected = reference(x)
+
+        torch.testing.assert_close(first, expected, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(second, first, rtol=0, atol=0)
 
     @CUDA
     def test_small_n_threshold_corner(self) -> None:
@@ -1614,10 +1637,16 @@ class TestPrefetchFailureOnDeactivate:
         )
         strategy.activate("cuda")
         streamer = block_components(strategy)[0]
-        # Inject a pre-failed Future so deactivate's drain loop hits it.
+        # Running block 0 prefetches block 1; once that finishes, swap in a
+        # failed prefetch so deactivation hits it.
+        with torch.no_grad():
+            m.transformer_blocks[0](torch.randn(2, 8, device="cuda"))
+        lookahead = streamer._runtime._lookahead
+        assert lookahead is not None and lookahead.prefetch is not None
+        lookahead.prefetch.result()
         bad_future: Future[None] = Future()
         bad_future.set_exception(RuntimeError("simulated prefetch failure"))
-        streamer._runtime._pending[0] = bad_future
+        lookahead.prefetch = bad_future
 
         with pytest.raises(RuntimeError, match="simulated prefetch failure"):
             strategy.deactivate()
@@ -1648,7 +1677,7 @@ class TestPrefetchFailureOnDeactivate:
 
         future.result = interrupted_result  # type: ignore[method-assign]
         with pytest.raises(Interrupt):
-            _join(future)
+            _wait_for_prefetch(future)
         assert future.done()
 
 
