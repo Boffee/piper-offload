@@ -31,7 +31,7 @@ from .host_component import HostComponent, HostComponentStore
 from .lora import LoRAFactor, LoRATransform, ScaledLoRAFactor
 from .merge import merge_adapter
 from .model_cache import ModelCache
-from .model_offloader import ModelOffloader, ModelRuntimeInUseError
+from .model_offloader import ModelOffloader, ModelRuntimeFailedError, ModelRuntimeInUseError
 from .mps_weights import MpsWeights
 from .parameter_delta import ParameterDelta, ParameterDeltaTransform, ScaledParameterDelta
 from .parameter_transform import ParameterTransform
@@ -97,6 +97,7 @@ __all__ = [
     "MappedCheckpoint",
     "ModelCache",
     "ModelOffloader",
+    "ModelRuntimeFailedError",
     "ModelRuntimeInUseError",
     "ModelSpec",
     "MpsWeights",

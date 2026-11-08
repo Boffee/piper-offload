@@ -339,12 +339,14 @@ def test_failed_runtime_quiescence_does_not_release_host_lease(
         assert component._active_runtime is None
         assert component._pin_lease is not None
         assert manager.stats.active_leases == 1
-        with pytest.raises(RuntimeError, match="Recreate the CUDA worker"):
+        with pytest.raises(RuntimeError, match="deactivate\\(\\) retries"):
             component.activate(torch.device("cuda"))
 
-        runtime.release()
-        component._pin_lease.close()
-        component._pin_lease = None
+        # The retry the refusal names releases what the failed one kept.
+        offloader.deactivate()
+        assert not runtime.acquired
+        assert not offloader.failed
+        assert manager.stats.active_leases == 0
     finally:
         offloader.deactivate()
         if mode == "rolling":
@@ -484,7 +486,7 @@ def test_partial_upload_keeps_its_lease_until_cleanup_synchronizes(mode, fail_sy
                 assert component._active_device is None
                 # The old target and transfer are still open; a new session
                 # must not silently reuse them.
-                with pytest.raises(RuntimeError, match="Recreate the CUDA worker"):
+                with pytest.raises(RuntimeError, match="deactivate\\(\\) retries"):
                     component.activate(torch.device("cuda"))
                 assert manager.stats.active_leases == 1
 
@@ -496,14 +498,10 @@ def test_partial_upload_keeps_its_lease_until_cleanup_synchronizes(mode, fail_sy
 
         with monkeypatch.context() as patch:
             patch.setattr(torch.cuda, "synchronize", checked_sync)
-            if mode == "host" or not fail_sync:
-                component.release()
-            else:
-                # A block component has no session left to retry through; the
-                # cleanup below is what recreating the worker would do.
-                component._runtime.release()
-                component._transfer.finish()
+            # Both components retry a release that an ended session left.
+            component.release()
         assert manager.stats.active_leases == 0
+        assert not component.failed
     finally:
         component.deactivate()
 
@@ -554,10 +552,13 @@ def test_failed_deactivation_refuses_resident_reactivation(pins, monkeypatch) ->
         assert component._active_device is None
         # The runtime still holds the old targets and load plan; a new session
         # must not silently reuse them.
-        with pytest.raises(RuntimeError, match="Recreate the CUDA worker"):
+        with pytest.raises(RuntimeError, match="deactivate\\(\\) retries"):
             component.activate(torch.device("cuda"))
+        # The retry the refusal names releases what the failed one kept.
+        component.deactivate()
+        assert not runtime.acquired
+        assert not component.failed
     finally:
-        runtime.release()
         component.deactivate()
 
 
@@ -814,16 +815,17 @@ def test_failed_synchronization_keeps_the_routed_lease(pins, monkeypatch) -> Non
             patch.setattr(torch.cuda, "synchronize", failed_sync)
             with pytest.raises(RuntimeError, match="injected"):
                 offloader.deactivate()
-        # Staging may still be in flight: the routed factors stay leased, and
-        # a new session must not silently take over.
+        # Staging may still be in flight: the routed factors stay leased.
         assert manager.stats.active_leases == 1
-        with pytest.raises(RuntimeError, match="Recreate the CUDA worker"):
-            offloader.activate("cuda", adapters=[adapter], adapter_strengths=[0.5], adapter_mode="routed")
-        # The refused activation's cleanup synchronized the components for real,
-        # which is what finally lets the routed lease close.
-        assert manager.stats.active_leases == 0
+        assert offloader.failed
+        # The next activation first retries the release, which now synchronizes,
+        # so the kept lease closes before the new session takes its own.
+        offloader.activate("cuda", adapters=[adapter], adapter_strengths=[0.5], adapter_mode="routed")
+        assert not offloader.failed
+        assert manager.stats.active_leases == 1
     finally:
         offloader.deactivate()
+    assert manager.stats.active_leases == 0
 
 
 @CUDA

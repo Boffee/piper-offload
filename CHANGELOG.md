@@ -5,14 +5,35 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- `ModelOffloader.failed` reports a CUDA session whose deactivation could not
+  finish releasing device work. The next `deactivate()` or `activate()` retries
+  that release, so a deactivation interrupted by Ctrl-C recovers on the next
+  call instead of leaving the model unusable. If `activate()`'s retry fails
+  too, it raises `ModelRuntimeFailedError`, a `RuntimeError` subclass, before
+  activating any component; recreate the CUDA worker then, and keep the
+  offloader referenced until you do. The message still says "Recreate the CUDA
+  worker". `HostComponent.failed` and `BlockComponent.failed` report the same
+  for a component used directly: its `deactivate()` retries, and its
+  `activate()` refuses until a retry succeeds.
+
 ### Fixed
 
+- A recoverable error during deactivation, such as a prefetch failure that
+  surfaces there, no longer makes every later routed-LoRA CUDA activation of
+  that model fail with "Recreate the CUDA worker".
+- If restoring a model to host storage, or a CUDA synchronization while
+  closing its device targets, fails or is interrupted during deactivation, the
+  offloader keeps those targets and reports a failed session. Previously it
+  could end up inactive with some parameters still on the GPU, and a failed
+  synchronization dropped a target whose work had not been confirmed finished.
 - A root-model forward reacquires `transient_paths` and `transient_block_paths`
   working sets left released by an earlier call: a forward that raised after
-  they released, or a transient module called on its own. Previously every
-  later forward in that activation failed until the model was deactivated. A
-  block group whose reacquisition fails partway is now left released, so the
-  next forward retries it.
+  they released, a transient module called on its own, or a release that an
+  interrupt stopped partway. Previously every later forward in that activation
+  failed until the model was deactivated. A reacquisition that fails partway
+  is rolled back, so the next forward retries it.
 - Streaming block groups resume prefetching after a skipped or out-of-order
   block, such as with skip-layer guidance. Previously every later block loaded
   without overlap until the skipped block ran again.

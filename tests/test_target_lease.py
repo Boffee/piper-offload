@@ -14,6 +14,7 @@ from piper_offload.host_module import (
     HostModuleTarget,
 )
 from piper_offload.target_lease import CudaTargetLease
+from tests.conftest import Interrupt
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -132,6 +133,38 @@ def test_close_synchronizes_target_work_before_drop() -> None:
     assert allocation_stream.synchronize_calls == 1
     assert consumer_stream.synchronize_calls == 1
     assert side_stream.synchronize_calls == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = lease.target
+
+
+def test_failed_close_keeps_the_target_for_a_retry() -> None:
+    class Stream:
+        def __init__(self, failures: int = 0) -> None:
+            self.failures = failures
+            self.synchronize_calls = 0
+
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
+            if self.failures:
+                self.failures -= 1
+                raise Interrupt
+
+    allocation_stream = Stream()
+    consumer_stream = Stream(failures=1)
+    target = cast(HostModuleTarget, object())
+    lease = CudaTargetLease(target, cast(torch.cuda.Stream, allocation_stream))
+    lease._acquired = True
+    lease.record_stream(cast(torch.cuda.Stream, consumer_stream))
+
+    with pytest.raises(Interrupt):
+        lease.close()
+    # Its work was not confirmed finished, so the lease still owns the target.
+    # Read the field: on CPU-only hosts conftest turns CUDA-worded errors into skips.
+    assert lease._target is target
+
+    lease.close()
+
+    assert consumer_stream.synchronize_calls == 2
     with pytest.raises(RuntimeError, match="closed"):
         _ = lease.target
 

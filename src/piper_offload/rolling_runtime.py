@@ -275,6 +275,9 @@ class RollingBlockRuntime:
         assert owners is not None
         name = self._slot_names[param_idx]
         param_target = target.param_targets[name]
+        # The slot holds no known block until the refill is enqueued, so one
+        # that stopped partway is refilled instead of trusted.
+        owners[param_idx] = -1
         self._load_plans[block_idx].refill_param_target(name, param_target)
         self._ready_events[param_idx].record(prefetch_stream)
         owners[param_idx] = block_idx
@@ -283,29 +286,17 @@ class RollingBlockRuntime:
         for handle in self._hooks:
             handle.remove()
         self._hooks.clear()
-        first_error: BaseException | None = None
         lease = self._lease
         if lease is not None:
             unregister_rolling_target(self)
+        # Every block returns to host storage before the shared target closes.
+        # A failure keeps the target and leaves the runtime acquired, so
+        # nothing reuses storage a block may still point at.
         for instance in self._instances:
-            try:
-                instance.install_host()
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
-        target_quiesced = lease is None
+            instance.install_host()
         if lease is not None:
-            try:
-                lease.close()
-            except BaseException as exc:
-                if first_error is None:
-                    first_error = exc
-            else:
-                target_quiesced = True
-        if target_quiesced:
-            self._reset_acquired_state()
-        if first_error is not None:
-            raise first_error
+            lease.close()
+        self._reset_acquired_state()
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Generator[None]:

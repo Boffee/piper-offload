@@ -64,6 +64,7 @@ from piper_offload.tensor_adapters import (
 )
 
 from tests.conftest import (
+    Interrupt,
     activated_model,
     block_components,
     transient_components,
@@ -392,7 +393,7 @@ def _activate_loras_for_test(
         strategy._register_routed_lora_hooks(targets)
         return len(strategy._routed_hook_removers) - before
     finally:
-        strategy._clear_active_adapter_hooks(synchronized=True)
+        strategy._clear_active_adapter_hooks()
 
 
 # ---------------------------------------------------------------------------
@@ -1472,7 +1473,7 @@ class TestActivationLoraValidation:
         _activate_loras_for_test(s)
         assert _has_parameter_update(s, "transformer_blocks.0.attn.weight")
         assert s._routed_hook_removers == []
-        s._clear_active_adapter_hooks(synchronized=True)
+        s._clear_active_adapter_hooks()
         assert _has_parameter_update(s, "transformer_blocks.0.attn.weight")
 
     def test_accepts_quanto_target_in_merge_mode(self) -> None:
@@ -4344,9 +4345,6 @@ class TestRoutedMode:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        class Interrupt(BaseException):
-            """Like KeyboardInterrupt, PyTorch skips ``always_call`` hooks for it."""
-
         m = nn.Sequential(nn.Linear(3, 3, bias=False)).requires_grad_(False)
         lora = Adapter.from_state_dict(
             {
@@ -4616,7 +4614,7 @@ class TestRoutedMode:
             assert len(model.embed._forward_pre_hooks) == (1 if target == "embed" else 0)
             assert len(model.head._forward_pre_hooks) == (1 if target == "head" else 0)
         finally:
-            s._clear_active_adapter_hooks(synchronized=True)
+            s._clear_active_adapter_hooks()
 
         # Merge mode also matches by name; it mutates the copied backing,
         # so the normal shared-storage effect is preserved.
