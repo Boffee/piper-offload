@@ -198,7 +198,9 @@ Ordinary `block_paths` retain their working sets throughout the activation;
 the same path cannot appear in both block-path lists.
 
 A successful root-model forward reacquires released components for the next
-invocation. A skipped component stays acquired.
+invocation. A skipped component stays acquired. If a forward raises after a
+component released, or a transient module is called outside the root model,
+the next root forward reacquires that component before running.
 
 Choose boundaries after which that state is no longer used in the current
 root forward. A transient block group cannot be traversed again later in that

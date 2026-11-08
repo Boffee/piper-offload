@@ -5,6 +5,15 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Fixed
+
+- A root-model forward reacquires `transient_paths` and `transient_block_paths`
+  working sets left released by an earlier call: a forward that raised after
+  they released, or a transient module called on its own. Previously every
+  later forward in that activation failed until the model was deactivated. A
+  block group whose reacquisition fails partway is now left released, so the
+  next forward retries it.
+
 ## [0.10.0rc14] - 2026-11-05
 
 ### Fixed
