@@ -143,7 +143,7 @@ left:
   interrupt, leaves it marked. A call that finds it in progress releases
   first; release steps are idempotent, so that finishes an interrupted release
   and rolls back an interrupted acquire. Components record this as their
-  [`WorkingSet`](../src/piper_offload/_working_set.py), and the streaming and
+  [`WorkingSetState`](../src/piper_offload/_working_set.py), and the streaming and
   rolling runtimes mark their block switches and refills the same way. Use the
   same pattern for any new multi-step transition.
 - A working set is re-established where it is used, not only where the

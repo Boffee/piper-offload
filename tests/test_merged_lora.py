@@ -64,6 +64,7 @@ from piper_offload.tensor_adapters import (
 )
 
 from tests.conftest import (
+    Interrupt,
     activated_model,
     block_components,
     transient_components,
@@ -4344,9 +4345,6 @@ class TestRoutedMode:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        class Interrupt(BaseException):
-            """Like KeyboardInterrupt, PyTorch skips ``always_call`` hooks for it."""
-
         m = nn.Sequential(nn.Linear(3, 3, bias=False)).requires_grad_(False)
         lora = Adapter.from_state_dict(
             {

@@ -3,7 +3,7 @@
 import enum
 
 
-class WorkingSet(enum.Enum):
+class WorkingSetState(enum.Enum):
     """State of one component's device working set.
 
     ``CHANGING`` means an ``acquire()`` or ``release()`` started and has not
@@ -16,4 +16,4 @@ class WorkingSet(enum.Enum):
     CHANGING = "changing"
 
 
-__all__ = ["WorkingSet"]
+__all__ = ["WorkingSetState"]

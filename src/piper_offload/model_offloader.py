@@ -63,7 +63,7 @@ class ModelRuntimeInUseError(RuntimeError):
 
 
 class ModelRuntimeFailedError(RuntimeError):
-    """Activation could not release what an earlier CUDA session kept.
+    """Activation could not release what a prior CUDA session kept.
 
     Raised after a retry of that release failed too, with the retry's error
     as the cause. Recreate the CUDA worker; see the models guide.
@@ -488,14 +488,14 @@ class ModelOffloader:
 
     @property
     def failed(self) -> bool:
-        """Whether an earlier CUDA session still holds device work it could not release.
+        """Whether a prior CUDA session still holds device work it could not release.
 
         The next :meth:`deactivate` or :meth:`activate` retries the release.
         """
         return self._composite.failed
 
-    def _finish_release(self) -> None:
-        """Retry releasing what an earlier session kept; the caller holds the activation lock."""
+    def _retry_release(self) -> None:
+        """Retry releasing what a prior session kept; the caller holds the activation lock."""
         try:
             self._composite.deactivate()
         finally:
@@ -549,7 +549,7 @@ class ModelOffloader:
         Value scaling and deltas combine before terminal quantized encoding.
         Because the offloader owns one model runtime, a
         second activation before :meth:`deactivate` raises
-        :class:`ModelRuntimeInUseError` immediately. If an earlier session
+        :class:`ModelRuntimeInUseError` immediately. If a prior session
         could not finish releasing (see :attr:`failed`), activation first
         retries that release; if it fails again, activation raises
         :class:`ModelRuntimeFailedError` before activating any component.
@@ -561,13 +561,13 @@ class ModelOffloader:
             )
         if self.failed:
             try:
-                self._finish_release()
+                self._retry_release()
             except BaseException as error:
                 self._activation_lock.release()
                 if not isinstance(error, Exception):
                     raise  # an interrupt during the retry stays an interrupt
                 raise ModelRuntimeFailedError(
-                    "ModelOffloader cannot activate: releasing what an earlier CUDA "
+                    "ModelOffloader cannot activate: releasing what its prior CUDA "
                     "session kept failed again. Recreate the CUDA worker."
                 ) from error
         self._active_device = active_device
@@ -618,7 +618,7 @@ class ModelOffloader:
         if self._active_device is None:
             if self.failed and self._activation_lock.acquire(blocking=False):
                 try:
-                    self._finish_release()
+                    self._retry_release()
                 finally:
                     self._activation_lock.release()
             return

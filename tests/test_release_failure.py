@@ -28,7 +28,7 @@ from piper_offload import (
     ModelRuntimeFailedError,
 )
 from piper_offload.host_module import HostModuleInstance, HostModuleLoadPlan
-from tests.conftest import activated_model
+from tests.conftest import Interrupt, activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -36,10 +36,6 @@ _WIDTH = 8
 _NUM_BLOCKS = 3
 
 type _Step = Literal["synchronize", "restore", "refill"]
-
-
-class _Interrupt(BaseException):
-    """Like ``KeyboardInterrupt``: not an ``Exception``."""
 
 
 class _Block(nn.Module):
@@ -154,7 +150,7 @@ def _on_device(model: nn.Module) -> list[str]:
 
 
 @CUDA
-@pytest.mark.parametrize("error", [RuntimeError, _Interrupt], ids=["error", "interrupt"])
+@pytest.mark.parametrize("error", [RuntimeError, Interrupt], ids=["error", "interrupt"])
 @pytest.mark.parametrize("occurrence", [1, 2])
 @pytest.mark.parametrize("step", ["synchronize", "restore"])
 @pytest.mark.parametrize("config", _CONFIGS)
@@ -183,7 +179,7 @@ def test_failed_release_step_is_reported(
         _fail(patch, step, error, occurrence=occurrence)
         try:
             offloader.deactivate()
-        except (RuntimeError, _Interrupt) as exc:
+        except (RuntimeError, Interrupt) as exc:
             raised = exc
 
     assert offloader.active_device is None
@@ -262,8 +258,8 @@ def test_next_forward_finishes_a_transition_interrupted_mid_forward(
     with activated_model(offloader, "cuda"), torch.inference_mode():
         expected = model(x).cpu()
         with pytest.MonkeyPatch.context() as patch:
-            _fail(patch, step, _Interrupt, occurrence=occurrence, after=after)
-            with contextlib.suppress(_Interrupt):
+            _fail(patch, step, Interrupt, occurrence=occurrence, after=after)
+            with contextlib.suppress(Interrupt):
                 model(x)
         actual = model(x).cpu()
         again = model(x).cpu()

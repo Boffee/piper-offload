@@ -22,7 +22,7 @@ from piper_offload import (
     ModelOffloader,
     host_pin_manager,
 )
-from tests.conftest import activated_model
+from tests.conftest import Interrupt, activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -49,10 +49,6 @@ _INTERRUPTIONS: tuple[_Interruption, ...] = (
     # Run the transient path and the final block outside the root forward.
     "direct_call",
 )
-
-
-class _Interrupt(BaseException):
-    """Like ``KeyboardInterrupt``: PyTorch skips ``always_call`` hooks for it."""
 
 
 class _Block(nn.Module):
@@ -146,7 +142,7 @@ def _interrupt(model: _Model, x: torch.Tensor, interruption: _Interruption) -> N
         finally:
             model.fail_after_middle = False
     else:
-        error = _Interrupt if interruption == "interrupt_in_layer" else RuntimeError
+        error = Interrupt if interruption == "interrupt_in_layer" else RuntimeError
 
         def fail(_module: nn.Module, _args: tuple[object, ...]) -> None:
             raise error("simulated interruption")

@@ -32,12 +32,13 @@ from piper_offload import (
 )
 from piper_offload.composite_component import CompositeComponent
 from piper_offload.host_module import HostModuleInstance, ParameterOverride
-from piper_offload._working_set import WorkingSet
+from piper_offload._working_set import WorkingSetState
 from piper_offload.pin_manager import host_pin_manager
 from piper_offload.streaming_runtime import _BlockTarget, _plan_target_signature, _wait_for_prefetch
 
 from tests.conftest import (
     CallbackParameterTransform,
+    Interrupt,
     activated_model,
     host_component,
     block_components,
@@ -1534,10 +1535,6 @@ class TestResourceCacheIntegration:
 # ---------------------------------------------------------------------------
 
 
-class _Interrupt(BaseException):
-    """Like ``KeyboardInterrupt``: not an ``Exception``."""
-
-
 class TestFailedSession:
     @staticmethod
     def _offloader_with_leftover() -> tuple[ModelOffloader, BlockComponent, HostComponent]:
@@ -1552,7 +1549,7 @@ class TestFailedSession:
         # Stands in for a release that stopped partway, keeping the host
         # leases its unfinished transfers read.
         streamer._pin_lease = host_pin_manager.acquire([], pin=False)
-        streamer._working_set = WorkingSet.CHANGING
+        streamer._working_set_state = WorkingSetState.CHANGING
         assert offloader.failed
         return offloader, streamer, resident
 
@@ -1567,7 +1564,7 @@ class TestFailedSession:
 
     @pytest.mark.parametrize(
         ("error", "raised"),
-        [(RuntimeError, ModelRuntimeFailedError), (_Interrupt, _Interrupt)],
+        [(RuntimeError, ModelRuntimeFailedError), (Interrupt, Interrupt)],
         ids=["error", "interrupt"],
     )
     def test_activation_refuses_when_the_retry_fails_again(
@@ -1767,9 +1764,6 @@ class TestPrefetchFailureOnDeactivate:
         # its block's target. Handing that target to another block then would
         # let two copies write it at once, so the interrupt must surface only
         # once the worker is done.
-        class Interrupt(BaseException):
-            pass
-
         future: Future[None] = Future()
         finish = threading.Timer(0.05, future.set_result, (None,))
 
@@ -1792,9 +1786,6 @@ class TestPrefetchFailureOnDeactivate:
         # leave its parameters on the GPU target. That target must stay with
         # the block rather than return to the pool, so deactivation finishes
         # the restore instead of leaving an inactive model on the GPU.
-        class Interrupt(BaseException):
-            pass
-
         m = _make_block_model(num_blocks=3)
         strategy = ModelOffloader.from_module(
             m,

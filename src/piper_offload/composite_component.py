@@ -66,7 +66,7 @@ class CompositeComponent:
 
     @property
     def failed(self) -> bool:
-        """Whether any component still holds device work from an ended session."""
+        """Whether any component still holds device work from a prior session."""
         return any(component.failed for component in self._components())
 
     def activate(

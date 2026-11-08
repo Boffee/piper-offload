@@ -62,7 +62,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from ._working_set import WorkingSet
+from ._working_set import WorkingSetState
 from .host_module import (
     HostModuleInstance,
     HostModuleLoadPlan,
@@ -168,7 +168,7 @@ class HostComponent:
         self._lease: CudaTargetLease | None = None
         self._transfer = TransferLease()
         self._use_hook: torch.utils.hooks.RemovableHandle | None = None
-        self._working_set = WorkingSet.RELEASED
+        self._working_set_state = WorkingSetState.RELEASED
         self._optimizer_step_active: bool = False
 
     # ------------------------------------------------------------------
@@ -187,13 +187,13 @@ class HostComponent:
 
     @property
     def failed(self) -> bool:
-        """Whether an ended session left its working set unreleased.
+        """Whether a prior session left its working set unreleased.
 
         Deactivation ends the session even when releasing fails, keeping
         whatever it could not release. A later :meth:`release` or
         :meth:`deactivate` retries.
         """
-        return self._active_device is None and self._working_set is not WorkingSet.RELEASED
+        return self._active_device is None and self._working_set_state is not WorkingSetState.RELEASED
 
     def activate(
         self,
@@ -268,16 +268,16 @@ class HostComponent:
                 "HostComponent.acquire() requires an active session; "
                 "call activate() first."
             )
-        if active_device.type == "cpu" or self._working_set is WorkingSet.ACQUIRED:
+        if active_device.type == "cpu" or self._working_set_state is WorkingSetState.ACQUIRED:
             return
-        if self._working_set is WorkingSet.CHANGING:
+        if self._working_set_state is WorkingSetState.CHANGING:
             self.release()
 
         plan = self._load_plan
         if plan is None:
             raise RuntimeError("HostComponent CUDA session has no load plan.")
         current_stream = torch.cuda.current_stream(active_device)
-        self._working_set = WorkingSet.CHANGING
+        self._working_set_state = WorkingSetState.CHANGING
         # A one-time upload: lease the sources pageable, for the upload only.
         self._transfer.start(host_pin_manager, plan.storage_tensors(), active_device)
         try:
@@ -298,7 +298,7 @@ class HostComponent:
         except BaseException:
             self.release()
             raise
-        self._working_set = WorkingSet.ACQUIRED
+        self._working_set_state = WorkingSetState.ACQUIRED
 
     def _install_use_hook(self) -> None:
         """Track the CUDA stream that actually executes the bound module."""
@@ -351,9 +351,9 @@ class HostComponent:
         Each step must finish before the next releases anything: a failed
         synchronization keeps the transfer lease, and a failed host restore
         or target close keeps the target, and a later call retries."""
-        if self._working_set is WorkingSet.RELEASED:
+        if self._working_set_state is WorkingSetState.RELEASED:
             return
-        self._working_set = WorkingSet.CHANGING
+        self._working_set_state = WorkingSetState.CHANGING
         # A partial upload or copy-back may still be in flight; its lease
         # closes only once the device has synchronized.
         self._transfer.finish()
@@ -364,7 +364,7 @@ class HostComponent:
             self._instance.move_trainable_grads_to(torch.device("cpu"))
             lease.close()
             self._lease = None
-        self._working_set = WorkingSet.RELEASED
+        self._working_set_state = WorkingSetState.RELEASED
 
     def deactivate(self) -> None:
         """Release working storage and end the activation session.
@@ -411,7 +411,7 @@ class HostComponent:
                 and active_device is not None
                 and active_device.type == "cuda"
             ):
-                if lease is None or self._working_set is not WorkingSet.ACQUIRED:
+                if lease is None or self._working_set_state is not WorkingSetState.ACQUIRED:
                     raise RuntimeError(
                         "HostComponent optimizer-step state is inconsistent: "
                         "CUDA active without an active target."

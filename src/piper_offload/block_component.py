@@ -55,7 +55,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from ._working_set import WorkingSet
+from ._working_set import WorkingSetState
 from .block_compile import BlockCompileConfig, _BlockCompileState
 from .block_mode import BlockMode
 from .block_runtime import BlockRuntime
@@ -726,7 +726,7 @@ class BlockComponent:
         # Streaming and rolling hold one lease per session; resident holds
         # one per transfer. The working set's state says how far acquiring
         # or releasing them got.
-        self._pin_lease, self._transfer, self._working_set = None, TransferLease(), WorkingSet.RELEASED
+        self._pin_lease, self._transfer, self._working_set_state = None, TransferLease(), WorkingSetState.RELEASED
         self._param_name_to_block_param = _build_param_name_index(
             self._block_instances,
             name,
@@ -794,13 +794,13 @@ class BlockComponent:
 
     @property
     def failed(self) -> bool:
-        """Whether an ended session left its working set unreleased.
+        """Whether a prior session left its working set unreleased.
 
         A runtime whose release failed stays acquired, keeping its targets,
         and the component keeps the pin leases its transfers read. A later
         :meth:`release` or :meth:`deactivate` retries.
         """
-        return self._active_device is None and self._working_set is not WorkingSet.RELEASED
+        return self._active_device is None and self._working_set_state is not WorkingSetState.RELEASED
 
     def _resolve_param_name(
         self,
@@ -1010,12 +1010,12 @@ class BlockComponent:
         runtime = self._active_runtime
         if runtime is None:
             raise RuntimeError("BlockComponent CUDA session has no selected runtime.")
-        if self._working_set is WorkingSet.ACQUIRED:
+        if self._working_set_state is WorkingSetState.ACQUIRED:
             return
-        if self._working_set is WorkingSet.CHANGING:
+        if self._working_set_state is WorkingSetState.CHANGING:
             self.release()
         sources = (tensor for plan in self._load_plans for tensor in plan.storage_tensors())
-        self._working_set = WorkingSet.CHANGING
+        self._working_set_state = WorkingSetState.CHANGING
         try:
             if self._block_mode == "resident":
                 # A one-time upload: lease the sources pageable, for the upload
@@ -1029,7 +1029,7 @@ class BlockComponent:
         except BaseException:
             self.release()
             raise
-        self._working_set = WorkingSet.ACQUIRED
+        self._working_set_state = WorkingSetState.ACQUIRED
 
     def _close_pin_lease(self) -> None:
         if self._pin_lease is not None:
@@ -1051,10 +1051,10 @@ class BlockComponent:
         keeps those leases; calling this again, also after the session has
         ended, retries it.
         """
-        if self._working_set is WorkingSet.RELEASED:
+        if self._working_set_state is WorkingSetState.RELEASED:
             return
-        self._working_set = WorkingSet.CHANGING
-        runtimes = dict.fromkeys((self._runtime, self._eager_runtime))
+        self._working_set_state = WorkingSetState.CHANGING
+        runtimes = (self._runtime, self._eager_runtime)
         try:
             for runtime in runtimes:
                 if runtime.acquired:
@@ -1066,7 +1066,7 @@ class BlockComponent:
                 # Every runtime synchronized before releasing its targets.
                 self._close_pin_lease()
                 self._transfer.close()
-                self._working_set = WorkingSet.RELEASED
+                self._working_set_state = WorkingSetState.RELEASED
 
     def deactivate(self) -> None:
         """Tear down active resources idempotently — safe to call

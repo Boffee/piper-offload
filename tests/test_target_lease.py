@@ -14,6 +14,7 @@ from piper_offload.host_module import (
     HostModuleTarget,
 )
 from piper_offload.target_lease import CudaTargetLease
+from tests.conftest import Interrupt
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -137,9 +138,6 @@ def test_close_synchronizes_target_work_before_drop() -> None:
 
 
 def test_failed_close_keeps_the_target_for_a_retry() -> None:
-    class Interrupt(BaseException):
-        pass
-
     class Stream:
         def __init__(self, failures: int = 0) -> None:
             self.failures = failures

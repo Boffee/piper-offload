@@ -44,6 +44,14 @@ class CallbackParameterTransform:
         return ()
 
 
+class Interrupt(BaseException):
+    """Like ``KeyboardInterrupt``: not an ``Exception``.
+
+    ``except Exception`` does not catch it, and PyTorch skips ``always_call``
+    forward hooks for it.
+    """
+
+
 def _windows_cuda_current_device_unavailable() -> int:
     """Keep GPU-less Windows tests out of PyTorch's native CUDA initializer."""
     raise RuntimeError("CUDA is unavailable on this Windows runner.")
