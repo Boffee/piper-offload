@@ -3637,7 +3637,8 @@ class TestRevisedDataOnlyDesign:
             )
 
     @CUDA
-    def test_reentrant_gather_for_step_rejected(self) -> None:
+    @pytest.mark.parametrize("block_mode", ["streaming", "resident"])
+    def test_reentrant_gather_for_step_rejected(self, block_mode: BlockMode) -> None:
         m = _make_lora_in_block_model(num_blocks=2, width=8, rank=2)
         for block in m.transformer_blocks:
             block.gradient_checkpointing = True
@@ -3646,6 +3647,7 @@ class TestRevisedDataOnlyDesign:
             m,
             block_paths=["transformer_blocks"],
             include_block_trainables=True,
+            block_mode=block_mode,
         )
         try:
             with activated_model(offloader, "cuda") as gpu_model:
@@ -3655,6 +3657,31 @@ class TestRevisedDataOnlyDesign:
                     with pytest.raises(RuntimeError, match="reentrant"):
                         with offloader.optimizer_step():
                             pass
+                # The rejected entry left the outer step's state alone.
+                with offloader.optimizer_step():
+                    pass
+        finally:
+            offloader.deactivate()
+
+    @pytest.mark.parametrize("activation", ["inactive", "cpu"])
+    def test_step_without_cuda_is_a_guarded_no_op(self, activation: str) -> None:
+        # Trainables are already in host storage, so the step moves nothing,
+        # with or without blocks; nested entry is still rejected.
+        m = _make_lora_in_block_model(num_blocks=2, width=8, rank=2)
+        offloader = ModelOffloader.from_module(
+            m,
+            block_paths=["transformer_blocks"],
+            include_block_trainables=True,
+        )
+        try:
+            if activation == "cpu":
+                offloader.activate("cpu")
+            with offloader.optimizer_step():
+                with pytest.raises(RuntimeError, match="reentrant"):
+                    with offloader.optimizer_step():
+                        pass
+            with offloader.optimizer_step():
+                pass
         finally:
             offloader.deactivate()
 

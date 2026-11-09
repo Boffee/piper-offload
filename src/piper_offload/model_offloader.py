@@ -136,7 +136,8 @@ class ModelOffloader:
     :meth:`optimizer_step` is the optimizer boundary: it materializes
     streamed trainable ``.data`` on GPU while an arbitrary PyTorch
     optimizer updates it, then copies the updated data back to host
-    CPU. CPU activation makes :meth:`optimizer_step` a guarded no-op.
+    CPU. During CPU activation or while inactive, :meth:`optimizer_step`
+    is a guarded no-op.
     Gradients are not streamed; PyTorch owns ``param.grad`` normally.
 
     Parameters
@@ -650,7 +651,8 @@ class ModelOffloader:
         through :class:`HostComponent`, while block-component trainables
         are materialized on enter after force-evicting loaded blocks.
         On exit, updated trainable bytes are copied back to their host
-        CPU storage. On CPU activation, this is a guarded no-op.
+        CPU storage. On CPU activation, or while inactive, this is a
+        guarded no-op: nested entry still raises.
 
         ``param.grad`` is unaffected throughout. On CUDA, it lives on
         GPU during backward via PyTorch's native ``AccumulateGrad`` and

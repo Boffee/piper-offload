@@ -65,7 +65,13 @@ class BlockRuntime(Protocol):
         """
         ...
 
-    def optimizer_step(self) -> contextlib.AbstractContextManager[None]: ...
+    def optimizer_step(self) -> contextlib.AbstractContextManager[None]:
+        """Put trainables on the GPU for one optimizer step and copy them back on exit.
+
+        Requires :attr:`acquired`. The owning :class:`BlockComponent` rejects
+        nested entry, so runtimes do not check for it.
+        """
+        ...
 
 
 __all__ = ["BlockRuntime", "validate_load_plans"]

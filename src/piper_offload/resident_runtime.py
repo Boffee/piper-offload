@@ -24,7 +24,6 @@ class ResidentBlockRuntime:
         self._instances = tuple(instances)
         self._device: torch.device | None = None
         self._leases: list[CudaTargetLease] = []
-        self._optimizer_step_active = False
         self._move_trainable_grads_to(torch.device("cpu"))
 
     @property
@@ -97,23 +96,14 @@ class ResidentBlockRuntime:
                 "working set is released. Acquire the component before "
                 "entering the optimizer step."
             )
-        if self._optimizer_step_active:
-            raise RuntimeError(
-                "BlockComponent.optimizer_step() does not support "
-                "reentrant entry."
-            )
         if not any(instance.has_trainables for instance in self._instances):
             yield
             return
 
-        self._optimizer_step_active = True
         try:
             yield
         finally:
-            try:
-                self._copy_trainables_to_host()
-            finally:
-                self._optimizer_step_active = False
+            self._copy_trainables_to_host()
 
     def _copy_trainables_to_host(self) -> None:
         device = self._device

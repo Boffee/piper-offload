@@ -413,8 +413,9 @@ class HostComponent:
             ):
                 if lease is None or self._working_set_state is not WorkingSetState.ACQUIRED:
                     raise RuntimeError(
-                        "HostComponent optimizer-step state is inconsistent: "
-                        "CUDA active without an active target."
+                        "HostComponent.optimizer_step() called while its CUDA "
+                        "working set is not acquired. Acquire the component "
+                        "before entering the optimizer step."
                     )
                 self._transfer.start(
                     host_pin_manager, self._instance.trainable_storage_tensors(), active_device,
