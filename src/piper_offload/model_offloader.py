@@ -559,19 +559,18 @@ class ModelOffloader:
             raise ModelRuntimeInUseError(
                 "ModelOffloader already has an active use; overlapping model activations are not supported"
             )
-        if self.failed:
-            try:
-                self._retry_release()
-            except BaseException as error:
-                self._activation_lock.release()
-                if not isinstance(error, Exception):
-                    raise  # an interrupt during the retry stays an interrupt
-                raise ModelRuntimeFailedError(
-                    "ModelOffloader cannot activate: releasing what its prior CUDA "
-                    "session kept failed again. Recreate the CUDA worker."
-                ) from error
-        self._active_device = active_device
+        # The try starts as soon as the claim is taken, so an interrupt
+        # anywhere after it still gives the claim back.
         try:
+            if self.failed:
+                try:
+                    self._retry_release()
+                except Exception as error:  # an interrupt stays an interrupt
+                    raise ModelRuntimeFailedError(
+                        "ModelOffloader cannot activate: releasing what its prior CUDA "
+                        "session kept failed again. Recreate the CUDA worker."
+                    ) from error
+            self._active_device = active_device
             if adapter_mode not in ("merge", "routed"):
                 raise ValueError(f"adapter_mode must be 'merge' or 'routed', got {adapter_mode!r}")
             active_adapters = self._normalize_adapters(
@@ -604,8 +603,13 @@ class ModelOffloader:
             if schedule_transient:
                 self._install_transient_hooks()
         except BaseException:
-            # Deactivation is idempotent over partial component and hook state.
-            self.deactivate()
+            if self._active_device is None:
+                # Nothing was activated yet; only the claim is held.
+                self._activation_lock.release()
+            else:
+                # Deactivation is idempotent over partial component and hook
+                # state, and gives the claim back.
+                self.deactivate()
             raise
 
     def deactivate(self) -> None:
