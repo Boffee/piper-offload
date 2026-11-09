@@ -2710,6 +2710,32 @@ def test_a_watcher_frees_the_tier_as_soon_as_commitment_is_exhausted(backend, of
     manager.clear()
 
 
+def test_the_next_offer_starts_a_watcher_that_could_not_start(
+    backend, offering, tmp_path, monkeypatch, caplog,
+) -> None:
+    start = threading.Thread.start
+    failures = [RuntimeError("can't start new thread")]
+
+    def starting(thread: threading.Thread) -> None:
+        if thread.name == "piper-offload-commit" and failures:
+            raise failures.pop()
+        start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", starting)
+    with caplog.at_level(logging.WARNING, logger="piper_offload"):
+        # The first of the three offers cannot start a watcher; the release goes on, and the next offer starts one.
+        manager, _tensors = _offer_three(backend, tmp_path)
+    assert not failures
+    assert "Could not start watching Windows commitment" in caplog.text
+    assert manager._memory._watching_commit
+    offering.commit_exhausted.set()
+    deadline = time.monotonic() + 5
+    while manager.stats.offered_bytes and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager.stats.offered_bytes == 0
+    manager.clear()
+
+
 def test_offered_memory_does_not_retain_its_manager(backend, offering, tmp_path, monkeypatch) -> None:
     # Leave the real watcher waiting while the manager and its component die.
     entered, stopped = threading.Event(), threading.Event()

@@ -50,6 +50,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - A routed LoRA forward interrupted by `KeyboardInterrupt` or another
   non-`Exception` error no longer keeps its staged factor copies until
   deactivation; the next call of that layer frees them.
+- On Windows, if a `PinManager` cannot start the thread that watches for
+  exhausted commitment, the pin operation that offered a copy logs a warning
+  instead of raising `RuntimeError`, and the next offered copy starts the
+  watcher. Previously that manager never watched again, so exhausted
+  commitment freed its offered copies only when it next offered or allocated
+  one.
 
 ## [0.10.0rc14] - 2026-11-05
 
