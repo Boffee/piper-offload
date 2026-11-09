@@ -70,6 +70,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   watcher. Previously that manager never watched again, so exhausted
   commitment freed its offered copies only when it next offered or allocated
   one.
+- With the experimental shared relay (`RelayOptions(transport="shared")`), a
+  rank whose collective fails or is interrupted while the ranks agree on it,
+  or while it pins the shared buffer, now refuses later operations on the
+  group at once, as its peers do. Previously its next collective waited out
+  the process group's timeout and failed with a Gloo timeout instead of asking
+  for the group to be recreated.
 
 ## [0.10.0rc14] - 2026-11-05
 

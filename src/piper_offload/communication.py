@@ -42,7 +42,8 @@ accelerator point-to-point transfers, offloader prefetch coordination, and CUDA
 graph capture are unsupported. Direct C++ functional all-gather ``out`` calls
 bypass the Python override and are unsupported for accelerator tensors.
 
-After a shared-exchange failure, outputs may be partial; destroy and recreate
+If a shared-transport collective fails or is interrupted, its outputs may be
+partial and every later operation on the group raises; destroy and recreate
 the process group. Windows GPU, ROCm, and distinct-GPU behavior need validation
 on their target hardware.
 """

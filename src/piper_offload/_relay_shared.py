@@ -136,6 +136,8 @@ class SharedRelay:
         self.capacity = shared_slot_bytes(nbytes, world_size)
         self.group = group
         self.timeout = timeout
+        # Set once a collective fails or is interrupted after its metadata
+        # exchange began; the process group then refuses every operation.
         self.broken = False
         self.device: torch.device | None = None
         self.download: torch.cuda.Stream | None = None
@@ -293,8 +295,6 @@ class SharedRelay:
     def _collective(
         self, operation: str, tensor: torch.Tensor, detail: int, manager: PinManager,
     ) -> Generator[bool]:
-        if self.broken:
-            raise RuntimeError("shared relay failed previously; destroy and recreate the process group")
         device = tensor.device
         # Check rank agreement before any shared-slot writes. This also keeps
         # each collective separate from earlier peer rounds.
@@ -305,34 +305,40 @@ class SharedRelay:
             detail,
         ], dtype=torch.int64)
         gathered = [torch.empty_like(metadata) for _ in range(self.world_size)]
-        self.group.allgather([gathered], [metadata]).wait(self.timeout)  # type: ignore[attr-defined]
-        if any(not torch.equal(metadata, other) for other in gathered):
-            raise ValueError("shared relay collective operation, payload bytes and root/dtype must match across ranks")
-        with manager.acquire([self.buffer]) if device.type == "cuda" else nullcontext() as lease:
-            asynchronous = lease is not None and lease.pageable_bytes == 0
-            try:
-                if asynchronous:
-                    self._prepare_streams(device)
-                yield asynchronous
-            except BaseException:
-                # A failed exchange can leave unread ready/free messages. Do
-                # not reuse its slots or control tensors in a later operation.
-                self.broken = True
-                raise
-            finally:
-                # Pin leases and source/destination storage must outlive DMA,
-                # even if a peer fails after a ready message was published.
-                if asynchronous:
-                    assert self.download is not None
-                    assert self.upload is not None
+        try:
+            self.group.allgather([gathered], [metadata]).wait(self.timeout)  # type: ignore[attr-defined]
+            agreed = all(torch.equal(metadata, other) for other in gathered)
+            if agreed:
+                with manager.acquire([self.buffer]) if device.type == "cuda" else nullcontext() as lease:
+                    asynchronous = lease is not None and lease.pageable_bytes == 0
                     try:
-                        self.download.synchronize()
+                        if asynchronous:
+                            self._prepare_streams(device)
+                        yield asynchronous
                     finally:
-                        self.upload.synchronize()
-                if device.type == "cuda":
-                    # Includes the local GPU contribution, which is copied on
-                    # the caller's stream instead of passing through the relay.
-                    torch.cuda.current_stream(device).synchronize()
+                        # Pin leases and source/destination storage must outlive DMA,
+                        # even if a peer fails after a ready message was published.
+                        if asynchronous:
+                            assert self.download is not None
+                            assert self.upload is not None
+                            try:
+                                self.download.synchronize()
+                            finally:
+                                self.upload.synchronize()
+                        if device.type == "cuda":
+                            # Includes the local GPU contribution, which is copied on
+                            # the caller's stream instead of passing through the relay.
+                            torch.cuda.current_stream(device).synchronize()
+        except BaseException:
+            # Once the metadata exchange begins, a rank that stops can leave its
+            # peers waiting for its messages, or theirs unread. Do not reuse the
+            # slots or control tensors in a later operation.
+            self.broken = True
+            raise
+        if not agreed:
+            # Every rank finds the mismatch before any slot write or signal, so
+            # the relay stays usable.
+            raise ValueError("shared relay collective operation, payload bytes and root/dtype must match across ranks")
 
     def _rounds(
         self, operation: str, sources: list[torch.Tensor], outputs: list[torch.Tensor],
