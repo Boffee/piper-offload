@@ -300,7 +300,7 @@ class Memory(shared.Memory):
         try:
             watcher.start()
         except RuntimeError as error:
-            logger.warning("Could not start watching Windows commitment; the next offered copy retries: %s", error)
+            logger.warning("Could not start watching Windows commitment; the next offered copy retries: %s", str(error))
             return
         self._watching_commit = True
 
