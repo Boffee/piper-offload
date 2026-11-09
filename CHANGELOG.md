@@ -37,6 +37,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - Streaming block groups resume prefetching after a skipped or out-of-order
   block, such as with skip-layer guidance. Previously every later block loaded
   without overlap until the skipped block ran again.
+- Warnings that a pinned copy could not be allocated, or that Windows
+  commitment cannot be watched, no longer keep the tensors being pinned, or
+  the objects their callers held, alive in a logging handler that keeps
+  records, such as `logging.handlers.MemoryHandler`. Previously that memory
+  was not freed until the record was dropped, even after the model was
+  deleted.
 - An interrupt such as Ctrl-C while a streamed block waits for its prefetch is
   raised once that prefetch finishes. Previously a later forward in the same
   activation could write into the target while the prefetch still filled it.

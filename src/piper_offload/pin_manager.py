@@ -67,7 +67,7 @@ def _default_pin_budget() -> int:
         total = host_memory.available_memory()
         return total // (2 * mmap.PAGESIZE) * mmap.PAGESIZE
     except (AttributeError, OSError, ValueError) as error:
-        logger.warning("Cannot determine physical RAM; the default host pin budget is zero: %s", error)
+        logger.warning("Cannot determine physical RAM; the default host pin budget is zero: %s", str(error))
         return 0
 
 
@@ -846,7 +846,6 @@ class PinManager:
             self._backend.unregister(registration.registered)
         except Exception as error:
             self._unregistration_failures += 1
-            # Tracebacks in buffered logs can retain storage after a later retry.
             logger.warning("Host unregistration failed; retaining storage and budget reservation: %s", str(error))
             return False
         del self._registrations[registration.pointer]

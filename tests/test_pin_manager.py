@@ -1209,6 +1209,31 @@ def test_copy_allocation_failure_leaves_the_storage_pageable(
     manager.clear()
 
 
+@pytest.mark.parametrize("platform", ["linux", "windows"])
+def test_a_buffered_allocation_warning_keeps_no_storage_alive(
+    backend: FakeBackend, tmp_path, monkeypatch, caplog, request, platform,
+) -> None:
+    """caplog keeps every record, as an application that buffers warnings does."""
+    if platform == "windows":
+        request.getfixturevalue("offering")
+
+    def exhausted(_memory: object, _size: int) -> None:
+        raise MemoryError("injected allocation failure")
+
+    monkeypatch.setattr(pin_module.host_memory.Memory, "new_copy", exhausted)
+    tensor = _checkpoint(tmp_path, 2 * PAGE)
+    alive = weakref.ref(tensor)
+    manager = PinManager(4 * PAGE, backend=backend)
+    with caplog.at_level(logging.WARNING, logger="piper_offload"), manager.acquire([tensor]):
+        pass
+    del tensor
+    gc.collect()
+    assert "injected allocation failure" in caplog.text
+    # The record keeps the error's text, not the frames of the acquisition that held the tensor.
+    assert alive() is None
+    manager.clear()
+
+
 def test_a_pinning_acquisition_waits_for_a_pending_fill_while_a_pageable_one_proceeds(
     backend: FakeBackend, tmp_path, monkeypatch,
 ) -> None:
