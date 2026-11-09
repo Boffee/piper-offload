@@ -18,6 +18,7 @@ from piper_offload import communication
 from piper_offload.communication import RelayOptions, register_relay_backend
 from piper_offload._host_registration import RuntimeHostRegistration
 from piper_offload.pin_manager import PinManager, host_pin_manager
+from tests.conftest import Interrupt
 
 pytestmark = pytest.mark.skipif(not dist.is_gloo_available(), reason="CPU Gloo required")
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device required")
@@ -1163,6 +1164,61 @@ def _run_shared_peer_failure(rank, path):
 
 def test_shared_peer_failure_times_out_without_reusing_slots(tmp_path):
     mp.spawn(_run_shared_peer_failure, args=(str(tmp_path / "peer-failure"),), nprocs=2)
+
+
+class _InterruptedOnAgreement:
+    """Rank 0's Gloo group: the metadata exchange completes, then an interrupt arrives as its wait returns."""
+
+    def __init__(self, group: dist.ProcessGroup) -> None:
+        self._group = group
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._group, name)
+
+    def allgather(self, *args: object) -> object:
+        work = self._group.allgather(*args)  # type: ignore[attr-defined]
+
+        class Interrupted:
+            def wait(self, timeout: timedelta) -> None:
+                work.wait(timeout)
+                raise Interrupt
+
+        return Interrupted()
+
+
+def _run_shared_agreement_failure(rank, path, failure):
+    register_relay_backend()
+    dist.init_process_group(
+        "piper_relay", store=dist.FileStore(path, 2), rank=rank, world_size=2,
+        timeout=timedelta(seconds=2), pg_options=RelayOptions(transport="shared", staging_bytes=512),
+    )
+    shared = dist.group.WORLD._shared
+    store = dist.distributed_c10d._get_default_store()
+    local = torch.arange(257, dtype=torch.int64) + rank
+    output = torch.empty((2, 257), dtype=torch.int64)
+    if failure == "absent" and rank == 0:
+        # Never joins the collective; rank 1's metadata exchange times out.
+        store.wait(["checked"], timedelta(seconds=30))
+        dist.destroy_process_group()
+        return
+    with pytest.MonkeyPatch.context() as patch:
+        if failure == "interrupted" and rank == 0:
+            patch.setattr(shared, "group", _InterruptedOnAgreement(shared.group))
+        # An interrupted rank stops before writing anything, so its peer waits
+        # for chunks that never come. Each rank refuses the group afterward.
+        with pytest.raises(Interrupt if failure == "interrupted" and rank == 0 else RuntimeError):
+            dist.all_gather_single(output, local)
+        assert shared.broken
+        with pytest.raises(RuntimeError, match="failed previously"):
+            dist.all_gather_single(output, local)
+    if rank == 1:
+        store.set("checked", "1")
+    dist.destroy_process_group()
+
+
+def test_shared_failure_from_agreement_on_refuses_the_group(tmp_path):
+    cases = [(str(tmp_path / f"agreement-{failure}"), failure) for failure in ("interrupted", "absent")]
+    mp.spawn(_run_cases, args=(_run_shared_agreement_failure, cases), nprocs=2)
 
 
 def _run_shared_metadata_mismatch(rank, path, device_type):
