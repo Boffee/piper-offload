@@ -137,7 +137,7 @@ class CopyLoad:
     copy: Copy
     missing: list[tuple[int, int]]
     offered: bool = False
-    error: OSError | None = None
+    error: str | None = None
 
     def spans(self) -> list[tuple[int, int]]:
         """``missing`` within the storage's bytes, as start and stop offsets."""
@@ -184,7 +184,7 @@ def _fill_copies(pending: list[CopyLoad], *, readers: Readers, read: ReadRange) 
             try:
                 future.result()
             except OSError as error:
-                item.error = _detached(error)
+                item.error = str(error)
     for item in pending:
         if item.error is None:
             item.missing.clear()
@@ -217,11 +217,6 @@ def _touch_copies(pending: list[CopyLoad]) -> None:
     """
     ready = [item.copy for item in pending if item.error is None]
     _on_workers(operator.methodcaller("touch"), ready, os.process_cpu_count() or 1, "piper-offload-touch")
-
-
-def _detached(error: OSError) -> OSError:
-    """The error without its traceback, whose frames would hold a slice of the copy and keep it mapped."""
-    return error.with_traceback(None)
 
 
 # Unmapping is page-table teardown: freeing 32 GiB measured 1.79 s on one
@@ -282,7 +277,7 @@ class Memory(ABC):
         try:
             return self.new_copy(size)
         except (OSError, MemoryError) as error:
-            logger.warning("Could not allocate a pinned copy; the checkpoint storage stays pageable: %s", error)
+            logger.warning("Could not allocate a pinned copy; the checkpoint storage stays pageable: %s", str(error))
             return None
 
     def reserve(self, _pointer: int, size: int, source: FileSlice, fit: Callable[[int], bool]) -> CopyLoad | None:

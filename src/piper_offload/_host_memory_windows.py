@@ -313,7 +313,9 @@ def _maximum_commit_condition() -> Callable[[int], bool] | None:
     try:
         return _open_maximum_commit_condition()
     except OSError as error:
-        logger.warning("Cannot watch Windows commitment; offered copies are freed only by their budgets: %s", error)
+        logger.warning(
+            "Cannot watch Windows commitment; offered copies are freed only by their budgets: %s", str(error),
+        )
         return None
 
 

@@ -63,7 +63,7 @@ def _read_range_below_offers(
 
 
 def _offer_copy(copy: Copy) -> str | None:
-    """Offer one copy's pages: None, or why they could not be offered, as text that holds no traceback."""
+    """Offer one copy's pages: None, or why they could not be offered."""
     try:
         assert isinstance(copy, WindowsCopy)
         copy.offer()
@@ -131,13 +131,12 @@ def _reclaim_copy(item: CopyLoad) -> None:
         assert isinstance(item.copy, WindowsCopy)
         item.missing = item.copy.reclaim()
     except OSError as error:
-        # Tracebacks in buffered logs would hold the region this frees.
         logger.warning("Could not reclaim an offered pinned copy; rebuilding it: %s", str(error))
         item.copy.free()
         try:
             item.copy = WindowsCopy(item.copy.size)
         except (OSError, MemoryError) as failure:
-            item.error = OSError(f"could not allocate its replacement: {failure}")
+            item.error = f"could not allocate its replacement: {failure}"
 
 
 def _reclaimed(pending: list[CopyLoad]) -> Generator[CopyLoad]:
@@ -236,7 +235,9 @@ class Memory(shared.Memory):
         except (OSError, MemoryError) as error:
             copy = self._allocate_after_freeing_offered(size) if self._offered else None
             if copy is None:
-                logger.warning("Could not allocate a pinned copy; the checkpoint storage stays pageable: %s", error)
+                logger.warning(
+                    "Could not allocate a pinned copy; the checkpoint storage stays pageable: %s", str(error),
+                )
                 return None
         return copy
 

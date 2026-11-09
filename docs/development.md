@@ -125,6 +125,12 @@ cleans up partial activation on failure. Lower-level component callers own
 their cleanup; see each component's docstring. Construction failures require
 discarding the partially captured model, as described in [models](models.md).
 
+A failure kept after its `except` block ends, in a log record or on an object,
+is kept as text: pass `str(error)`, not the exception. An exception's traceback
+keeps every frame on its call stack alive, callers included, so a logging
+handler that buffers records would also keep the tensors and copies those
+frames reference.
+
 ### Scheduling hooks
 
 Transient release, block streaming and rolling refill, and routed LoRA staging
