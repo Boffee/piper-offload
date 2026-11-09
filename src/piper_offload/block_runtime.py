@@ -66,10 +66,12 @@ class BlockRuntime(Protocol):
         ...
 
     def optimizer_step(self) -> contextlib.AbstractContextManager[None]:
-        """Put trainables on the GPU for one optimizer step and copy them back on exit.
+        """Keep trainables on the GPU for one optimizer step, then copy their updated bytes to host storage.
 
-        Requires :attr:`acquired`. The owning :class:`BlockComponent` rejects
-        nested entry, so runtimes do not check for it.
+        A streaming runtime loads them for the step; a resident one already
+        holds them. Requires :attr:`acquired`. The owning
+        :class:`BlockComponent` rejects nested entry, so runtimes do not
+        check for it.
         """
         ...
 

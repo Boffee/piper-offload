@@ -136,9 +136,7 @@ class ModelOffloader:
     :meth:`optimizer_step` is the optimizer boundary: it materializes
     streamed trainable ``.data`` on GPU while an arbitrary PyTorch
     optimizer updates it, then copies the updated data back to host
-    CPU. During CPU activation or while inactive, :meth:`optimizer_step`
-    is a guarded no-op.
-    Gradients are not streamed; PyTorch owns ``param.grad`` normally.
+    CPU. Gradients are not streamed; PyTorch owns ``param.grad`` normally.
 
     Parameters
     ----------

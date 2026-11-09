@@ -1113,8 +1113,9 @@ class BlockComponent:
         guarded no-op. Nested entry raises in every case.
         """
         if self._optimizer_step_active:
-            # A nested step's copy-back would be overwritten by the outer
-            # step's stale bytes when the outer step copies back.
+            # Rejected in every mode for one contract. Streaming is where it
+            # matters: the outer step's copy-back would write its stale bytes
+            # over the nested step's update.
             raise RuntimeError("BlockComponent.optimizer_step() does not support reentrant entry.")
         self._optimizer_step_active = True
         try:

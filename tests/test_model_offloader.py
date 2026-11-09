@@ -3657,7 +3657,7 @@ class TestRevisedDataOnlyDesign:
                     with pytest.raises(RuntimeError, match="reentrant"):
                         with offloader.optimizer_step():
                             pass
-                # The rejected entry left the outer step's state alone.
+                # The rejection left no step marked active, so a later one enters.
                 with offloader.optimizer_step():
                     pass
         finally:
@@ -3665,21 +3665,26 @@ class TestRevisedDataOnlyDesign:
 
     @pytest.mark.parametrize("activation", ["inactive", "cpu"])
     def test_step_without_cuda_is_a_guarded_no_op(self, activation: str) -> None:
-        # Trainables are already in host storage, so the step moves nothing,
-        # with or without blocks; nested entry is still rejected.
+        # Streamed trainables are already in host storage, so the step leaves
+        # them there; nested entry is still rejected.
         m = _make_lora_in_block_model(num_blocks=2, width=8, rank=2)
         offloader = ModelOffloader.from_module(
             m,
             block_paths=["transformer_blocks"],
             include_block_trainables=True,
         )
+        trainables = [p for p in m.parameters() if p.requires_grad]
         try:
             if activation == "cpu":
                 offloader.activate("cpu")
+            host = [p.untyped_storage().data_ptr() for p in trainables]
             with offloader.optimizer_step():
+                assert [p.untyped_storage().data_ptr() for p in trainables] == host
                 with pytest.raises(RuntimeError, match="reentrant"):
                     with offloader.optimizer_step():
                         pass
+            assert [p.untyped_storage().data_ptr() for p in trainables] == host
+            # The rejection left no step marked active, so a later one enters.
             with offloader.optimizer_step():
                 pass
         finally:
