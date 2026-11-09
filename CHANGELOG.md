@@ -18,6 +18,14 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   for a component used directly: its `deactivate()` retries, and its
   `activate()` refuses until a retry succeeds.
 
+### Changed
+
+- `ModelOffloader.optimizer_step()` and `BlockComponent.optimizer_step()` do
+  nothing while inactive, as `HostComponent.optimizer_step()` already did.
+  Previously a model with `block_paths` raised `RuntimeError` there, so keeping
+  the context around an optimizer step after `deactivate()` worked only for
+  models without blocks.
+
 ### Fixed
 
 - A recoverable error during deactivation, such as a prefetch failure that

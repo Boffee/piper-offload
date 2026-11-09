@@ -171,7 +171,6 @@ class StreamingBlockRuntime:
         self._executor: ThreadPoolExecutor | None = None
         self._stream: torch.cuda.Stream | None = None
         self._last_idx = -1
-        self._optimizer_step_active = False
         self._move_trainable_grads_to(torch.device("cpu"))
 
     @property
@@ -247,13 +246,6 @@ class StreamingBlockRuntime:
                 "working set is released. Acquire the component before "
                 "entering the optimizer step."
             )
-        if self._optimizer_step_active:
-            raise RuntimeError(
-                "BlockComponent.optimizer_step() does not support "
-                "reentrant entry. A nested optimizer-step boundary would "
-                "scatter the outer step's stale host bytes on top of "
-                "the inner update."
-            )
         if not any(instance.has_trainables for instance in self._instances):
             yield
             return
@@ -264,16 +256,12 @@ class StreamingBlockRuntime:
         step_stream = self._stream
         assert step_stream is not None, "stream allocated in acquire()"
 
-        self._optimizer_step_active = True
-        try:
-            with contextlib.ExitStack() as stack:
-                loaded = self._load_trainables_for_step(device, step_stream, stack)
-                try:
-                    yield
-                finally:
-                    self._scatter_trainables_after_step(loaded, step_stream, device)
-        finally:
-            self._optimizer_step_active = False
+        with contextlib.ExitStack() as stack:
+            loaded = self._load_trainables_for_step(device, step_stream, stack)
+            try:
+                yield
+            finally:
+                self._scatter_trainables_after_step(loaded, step_stream, device)
 
     def _require_device(self) -> torch.device:
         device = self._device

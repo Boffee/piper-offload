@@ -741,7 +741,7 @@ class BlockComponent:
             frozenset(self._param_name_to_block_param),
             frozenset(self._buffer_name_to_block_buffer),
         )
-        self._cpu_optimizer_step_active = False
+        self._optimizer_step_active = False
 
         # Auto-flush the CUDA allocator cache when the component is GC'd,
         # so callers don't need to remember an explicit empty_cache() at
@@ -1105,54 +1105,55 @@ class BlockComponent:
 
     @contextlib.contextmanager
     def optimizer_step(self) -> Generator[None]:
-        """Materialize streamed trainables around an optimizer step."""
-        if self._active_device == torch.device("cpu"):
-            if self._cpu_optimizer_step_active:
-                raise RuntimeError("BlockComponent.optimizer_step() does not support reentrant entry.")
-            self._cpu_optimizer_step_active = True
-            try:
-                yield
-            finally:
-                self._cpu_optimizer_step_active = False
-            return
+        """Materialize streamed trainables around an optimizer step.
 
-        runtime = self._active_runtime
-        active_device = self._active_device
-        if runtime is None or active_device is None:
-            raise RuntimeError(
-                "BlockComponent.optimizer_step() called on inactive "
-                "block component. Use it inside the offloader's context "
-                "manager, between backward and the next forward."
-            )
-        if self._block_mode != "resident" or not any(
-            instance.has_trainables for instance in self._block_instances
-        ):
-            # The session lease already covers the trainables streaming copies
-            # back, and a frozen resident group copies nothing back.
-            with runtime.optimizer_step():
-                yield
-            return
-
-        # The copy-back writes host storage once per step; lease it pageable,
-        # for the copy-back only.
-        self._transfer.start(
-            host_pin_manager,
-            (
-                tensor
-                for instance in self._block_instances
-                for tensor in instance.trainable_storage_tensors()
-            ),
-            active_device,
-        )
+        On CUDA activation, trainables are on the GPU for the step and their
+        updated bytes return to host storage on exit. On CPU activation, or
+        while inactive, they are already in host storage, so this is a
+        guarded no-op. Nested entry raises in every case.
+        """
+        if self._optimizer_step_active:
+            # Rejected in every mode for one contract. Streaming is where it
+            # matters: the outer step's copy-back would write its stale bytes
+            # over the nested step's update.
+            raise RuntimeError("BlockComponent.optimizer_step() does not support reentrant entry.")
+        self._optimizer_step_active = True
         try:
-            with runtime.optimizer_step():
+            runtime = self._active_runtime
+            if runtime is None:
                 yield
-        except BaseException:
-            # The copy-back may still be in flight; a failed synchronization
-            # keeps the lease for release() to retry.
-            self._transfer.finish()
-            raise
-        self._transfer.close()  # the runtime synchronized its copy-back stream
+            elif self._block_mode != "resident" or not any(
+                instance.has_trainables for instance in self._block_instances
+            ):
+                # The session lease already covers the trainables streaming
+                # copies back, and a frozen resident group copies nothing back.
+                with runtime.optimizer_step():
+                    yield
+            else:
+                active_device = self._active_device
+                assert active_device is not None, "set with the runtime"
+                # The copy-back writes host storage once per step; lease it
+                # pageable, for the copy-back only.
+                self._transfer.start(
+                    host_pin_manager,
+                    (
+                        tensor
+                        for instance in self._block_instances
+                        for tensor in instance.trainable_storage_tensors()
+                    ),
+                    active_device,
+                )
+                try:
+                    with runtime.optimizer_step():
+                        yield
+                except BaseException:
+                    # The copy-back may still be in flight; a failed
+                    # synchronization keeps the lease for release() to retry.
+                    self._transfer.finish()
+                    raise
+                self._transfer.close()  # the runtime synchronized its copy-back stream
+        finally:
+            self._optimizer_step_active = False
 
     def gather_for_step(self) -> contextlib.AbstractContextManager[None]:
         """Backward-compatible alias for :meth:`optimizer_step`."""

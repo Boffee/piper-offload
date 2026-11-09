@@ -3637,7 +3637,8 @@ class TestRevisedDataOnlyDesign:
             )
 
     @CUDA
-    def test_reentrant_gather_for_step_rejected(self) -> None:
+    @pytest.mark.parametrize("block_mode", ["streaming", "resident"])
+    def test_reentrant_gather_for_step_rejected(self, block_mode: BlockMode) -> None:
         m = _make_lora_in_block_model(num_blocks=2, width=8, rank=2)
         for block in m.transformer_blocks:
             block.gradient_checkpointing = True
@@ -3646,6 +3647,7 @@ class TestRevisedDataOnlyDesign:
             m,
             block_paths=["transformer_blocks"],
             include_block_trainables=True,
+            block_mode=block_mode,
         )
         try:
             with activated_model(offloader, "cuda") as gpu_model:
@@ -3655,6 +3657,36 @@ class TestRevisedDataOnlyDesign:
                     with pytest.raises(RuntimeError, match="reentrant"):
                         with offloader.optimizer_step():
                             pass
+                # The rejection left no step marked active, so a later one enters.
+                with offloader.optimizer_step():
+                    pass
+        finally:
+            offloader.deactivate()
+
+    @pytest.mark.parametrize("activation", ["inactive", "cpu"])
+    def test_step_without_cuda_is_a_guarded_no_op(self, activation: str) -> None:
+        # Streamed trainables are already in host storage, so the step leaves
+        # them there; nested entry is still rejected.
+        m = _make_lora_in_block_model(num_blocks=2, width=8, rank=2)
+        offloader = ModelOffloader.from_module(
+            m,
+            block_paths=["transformer_blocks"],
+            include_block_trainables=True,
+        )
+        trainables = [p for p in m.parameters() if p.requires_grad]
+        try:
+            if activation == "cpu":
+                offloader.activate("cpu")
+            host = [p.untyped_storage().data_ptr() for p in trainables]
+            with offloader.optimizer_step():
+                assert [p.untyped_storage().data_ptr() for p in trainables] == host
+                with pytest.raises(RuntimeError, match="reentrant"):
+                    with offloader.optimizer_step():
+                        pass
+            assert [p.untyped_storage().data_ptr() for p in trainables] == host
+            # The rejection left no step marked active, so a later one enters.
+            with offloader.optimizer_step():
+                pass
         finally:
             offloader.deactivate()
 

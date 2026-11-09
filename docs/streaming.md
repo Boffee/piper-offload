@@ -268,4 +268,5 @@ For an optimizer that runs on CPU, deactivate after backward, then call
 data and gradients to CPU, so optimizer state can remain there. Use fp32
 trainables for master-weight updates. See
 [`ModelOffloader.optimizer_step`](../src/piper_offload/model_offloader.py)
-for this lifecycle. During CPU activation, the context does no data movement.
+for this lifecycle. During CPU activation, or while the offloader is inactive,
+the context moves no data.
