@@ -1,6 +1,7 @@
 """Chunk views and bounded CUDA copy ordering for the host relay.
 
-The caller owns the host allocation, its pin lease, and the collective lock.
+The caller owns the host allocation and its pin lease, and runs one pipeline
+at a time.
 CPU communication runs between generator yields. Closing a pipeline drains
 both copy streams before the caller may release the lease or reuse storage.
 """
@@ -69,7 +70,8 @@ class TransferPipeline:
 
         try:
             # Honor both source production and previous destination use on
-            # the caller's stream, including receive-only ranks.
+            # the current stream, including receive-only ranks. The relay
+            # runs on a private stream and waits for its caller's first.
             current = torch.cuda.current_stream(self.device)
             self.download.wait_stream(current)
             self.upload.wait_stream(current)

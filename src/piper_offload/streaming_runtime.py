@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from ._transfer_priority import background_transfers
 from .block_compile import CompileBackend
 from .block_runtime import validate_load_plans
 from .host_module import (
@@ -45,6 +46,12 @@ def _wait_for_prefetch(future: Future[None]) -> None:
                 # A repeated interrupt; the first one is re-raised below.
                 continue
         raise
+
+
+def _stage_lookahead(lease: CudaTargetLease, plan: HostModuleLoadPlan, stream: torch.cuda.Stream) -> None:
+    """Stage a lookahead target on the prefetch worker; its copies yield to foreground transfers."""
+    with background_transfers():
+        lease.stage(plan, stream, non_blocking=True)
 
 
 def _prefetch_direction(last_idx: int, idx: int, num_blocks: int) -> int:
@@ -365,10 +372,7 @@ class StreamingBlockRuntime:
             return
         lookahead = self._lookahead = self._take_target(block_idx, stream)
         lookahead.prefetch = self._executor.submit(
-            lookahead.lease.stage,
-            self._load_plans[block_idx],
-            stream,
-            non_blocking=True,
+            _stage_lookahead, lookahead.lease, self._load_plans[block_idx], stream,
         )
 
     def _take_lookahead(self) -> _BlockTarget | None:

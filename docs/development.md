@@ -95,6 +95,7 @@ change before finishing.
 | Model adapters | Immutable LoRA, delta, and value resources applied through load plans or hooks | [adapter.py](../src/piper_offload/adapter.py), [merge.py](../src/piper_offload/merge.py) |
 | Parameter updates | Shared source selection, validation, and arithmetic for activation and permanent merge | [_parameter_update.py](../src/piper_offload/_parameter_update.py), [lora.py](../src/piper_offload/lora.py) |
 | Pin manager | Transfer leases, page accounting, registration order, and the shared lock | [pin_manager.py](../src/piper_offload/pin_manager.py) |
+| Transfer priority | Background host-to-device copies wait while foreground transfers move data | [_transfer_priority.py](../src/piper_offload/_transfer_priority.py) |
 | Memory components | Owned checkpoint copies, platform allocation, and Windows retention | [_copy_memory.py](../src/piper_offload/_copy_memory.py), [_copy_memory_windows.py](../src/piper_offload/_copy_memory_windows.py), [_host_memory.py](../src/piper_offload/_host_memory.py) |
 | Block compilation | Compile declared block forwards and schedule rolling transfers | [block_compile.py](../src/piper_offload/block_compile.py), [rolling_compile.py](../src/piper_offload/rolling_compile.py) |
 

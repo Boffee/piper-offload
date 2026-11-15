@@ -331,7 +331,7 @@ class SharedRelay:
                         self.upload.synchronize()
                 if device.type == "cuda":
                     # Includes the local GPU contribution, which is copied on
-                    # the caller's stream instead of passing through the relay.
+                    # the current stream instead of passing through the relay.
                     torch.cuda.current_stream(device).synchronize()
 
     def _rounds(
