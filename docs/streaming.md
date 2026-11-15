@@ -90,6 +90,15 @@ scheduling hooks. Streaming handles direction changes and traversal wraparound.
 Both streaming and rolling load skipped or out-of-order blocks in the
 foreground; streaming then resumes prefetching from the block that ran.
 
+### Yield to collectives
+
+Weight copies and collectives of the experimental `piper_relay` process group
+share the host link, and running both at once slows both. Streaming copies the
+lookahead block one tensor at a time and starts no tensor while a collective
+moves data, so a collective issued inside a block waits for at most one tensor
+of the next block's weights rather than the whole block. Rolling refills cannot
+wait; use streaming for blocks that issue collectives.
+
 ### Compile block forwards
 
 Compilation is optional and inference-only. Add one `BlockCompileConfig` to

@@ -32,6 +32,7 @@ from piper_offload import (
 )
 from piper_offload.composite_component import CompositeComponent
 from piper_offload.host_module import HostModuleInstance, ParameterOverride
+from piper_offload._transfer_priority import foreground_transfer
 from piper_offload._working_set import WorkingSetState
 from piper_offload.pin_manager import host_pin_manager
 from piper_offload.streaming_runtime import _BlockTarget, _plan_target_signature, _wait_for_prefetch
@@ -1128,6 +1129,26 @@ class TestTraversalPrefetch:
             torch.cuda.synchronize()
 
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+    @CUDA
+    def test_lookahead_waits_while_a_foreground_transfer_runs(self) -> None:
+        # A collective issued inside a block, such as a context-parallel K/V
+        # exchange, would otherwise share the host link with all of the next
+        # block's weights (docs/streaming.md#yield-to-collectives).
+        m = _make_block_model(num_blocks=2, width=8)
+        strategy = ModelOffloader.from_module(m, block_paths=["transformer_blocks"])
+        streamer: BlockComponent = block_components(strategy)[0]
+        runtime = streamer._runtime
+        x = torch.randn(2, 8, device="cuda")
+
+        with activated_model(strategy, "cuda"), torch.no_grad():
+            with foreground_transfer():
+                streamer.blocks[0](x)
+                lookahead = runtime._lookahead
+                assert lookahead is not None and lookahead.prefetch is not None
+                with pytest.raises(TimeoutError):
+                    lookahead.prefetch.result(timeout=0.2)
+            lookahead.prefetch.result(timeout=30)
 
     @CUDA
     def test_activation_inside_inference_mode_keeps_pooled_targets_mutable(self) -> None:

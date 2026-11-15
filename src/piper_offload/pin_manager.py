@@ -54,6 +54,7 @@ from typing import Self
 import torch
 
 from . import _host_memory as host_memory
+from . import _transfer_priority as transfer_priority
 from ._copy_memory import Copy, CopyLoad, _free_copies
 from ._host_registration import HostRegistrationBackend, HostRegistrationRefusedError, RuntimeHostRegistration
 from .checkpoint import FileSlice, file_slice
@@ -515,7 +516,10 @@ class PinManager:
         asynchronous one, a non-blocking copy to a CUDA device, may still be
         in flight afterwards, so it must run under a lease that holds the
         source, and raises otherwise: eviction is safe only because every
-        such reader holds one. Pageable storage copies as is.
+        such reader holds one. Pageable storage copies as is. Inside
+        :func:`~piper_offload._transfer_priority.background_transfers`, an
+        asynchronous transfer first waits for foreground transfers and has
+        completed when this returns.
         """
         if source.device.type != "cpu":
             destination.copy_(source, non_blocking=non_blocking)
@@ -537,7 +541,7 @@ class PinManager:
                 destination.copy_(view, non_blocking=non_blocking)
                 return
         # The lease keeps the registration, so the copy itself needs no lock.
-        destination.copy_(view, non_blocking=True)
+        transfer_priority.copy_host_to_device(destination, view)
 
     def clear(self) -> None:
         """Unregister idle registrations and free their copies, and free every offered copy.

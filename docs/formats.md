@@ -174,7 +174,9 @@ For experimental DTensor execution, [communication.py](../src/piper_offload/comm
 documents `piper_relay` collectives through host memory, and
 [sequential.py](../src/piper_offload/sequential.py) documents `SequentialExecutor`
 for two ranks sharing one process and GPU. Their docstrings cover setup and
-execution contracts. Neither facility coordinates ordinary offloader scheduling.
+execution contracts. Block streaming yields host transfers to `piper_relay`
+collectives, as [streaming](streaming.md#yield-to-collectives) describes;
+`SequentialExecutor` does not coordinate ordinary offloader scheduling.
 
 A custom tensor format integrates through `register_adapter()`. Implement the
 capture, physical-storage enumeration, allocation, transfer, and reconstruction

@@ -1,4 +1,4 @@
-"""Experimental, blocking host-relay process group for DTensor inference.
+"""Experimental host-relay process group for DTensor inference.
 
 Call ``register_relay_backend()`` in each worker before initializing a
 ``piper_relay`` process group. The application supplies its launcher, device
@@ -21,10 +21,17 @@ and GPU-local summation; Gloo then carries only control messages and reductions
 of CPU tensors. The default ``transport="gloo"`` carries payloads through CPU
 Gloo as well. Gloo never receives an accelerator tensor.
 
-Collectives stream through a reusable, bounded CPU buffer and complete all
-device copies before returning, including when ``async_op=True``. No offloader,
-NCCL, or compiled extension is required. Gloo pipelining is opt-in; shared
-transfers use two outgoing slots per rank. Public calls remain blocking.
+Collectives stream through a reusable, bounded CPU buffer. Each group runs its
+collectives, including ``barrier``, on one worker thread in issue order. With
+``async_op=True`` a call returns at once; until ``wait()`` returns, the caller
+must not read the outputs or write the inputs or outputs, from any stream.
+Without it, the call returns once the collective has completed, and the outputs
+are then ready for every stream. A collective on accelerator tensors starts once
+the caller's current stream has produced its inputs and moves its data as a
+foreground transfer, which background copies such as block prefetch wait for
+(see ``piper_offload._transfer_priority``). No offloader, NCCL, or compiled
+extension is required. Gloo pipelining is opt-in; shared transfers use two
+outgoing slots per rank.
 
 SUM all-reduce supports FP32, FP16 and BF16, accumulating reduced precision in
 FP32. Broadcast, scatter and equal-size all-gather also preserve FP64, bool,
@@ -38,9 +45,9 @@ source slice. Coalesced outputs must not overwrite other inputs.
 ``RelayOptions`` describes staging and pin budgets. If the staging allocation
 exceeds the pin budget or registration reports invalid-value, copies run
 synchronously through pageable storage. Reduce-scatter, all-to-all, non-SUM reductions,
-accelerator point-to-point transfers, offloader prefetch coordination, and CUDA
-graph capture are unsupported. Direct C++ functional all-gather ``out`` calls
-bypass the Python override and are unsupported for accelerator tensors.
+accelerator point-to-point transfers, and CUDA graph capture are unsupported.
+Direct C++ functional all-gather ``out`` calls bypass the Python override and
+are unsupported for accelerator tensors.
 
 After a shared-exchange failure, outputs may be partial; destroy and recreate
 the process group. Windows GPU, ROCm, and distinct-GPU behavior need validation
@@ -48,7 +55,8 @@ on their target hardware.
 """
 
 import threading
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
@@ -60,6 +68,7 @@ from torch._C._distributed_c10d import AllgatherOptions, _DistributedBackendOpti
 
 from ._relay_shared import BUFFERS_PER_RANK, COPY_DTYPES, REDUCTION_DTYPES, SharedRelay, shared_slot_bytes
 from ._relay_staging import HostChunk, TransferPipeline, chunk_ranges, make_host_chunk
+from ._transfer_priority import foreground_transfer
 from .pin_manager import host_pin_manager
 
 _BACKEND_NAME = "piper_relay"
@@ -154,13 +163,17 @@ class _RelayProcessGroup(dist.ProcessGroup):
     # convenience overloads (tensor/root/timeout) are not backend entry points.
     def __init__(self, store: dist.Store, rank: int, size: int, timeout: timedelta, options: RelayOptions) -> None:
         super().__init__(rank, size)
-        self._collective_lock = threading.Lock()
         self._staging_bytes = options.staging_bytes
         self._pipeline_buffers = options.pipeline_buffers
         self._staging_buffer: torch.Tensor | None = None
         self._pipeline: TransferPipeline | None = None
         self._shared: SharedRelay | None = None
-        self._closed = False
+        self._closed = False  # shutdown() released Gloo and staging
+        # Runs every collective in issue order and refuses new ones once shut
+        # down. Only this thread touches the staging, shared slots, Gloo
+        # transport and stream.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="piper-relay")
+        self._stream: torch.cuda.Stream | None = None
         options._validate_group_size(size)
         # Different chunk sizes would issue incompatible Gloo collectives.
         settings = dist.PrefixStore("piper_relay_options", store)
@@ -190,30 +203,47 @@ class _RelayProcessGroup(dist.ProcessGroup):
         return _BACKEND_NAME
 
     def shutdown(self) -> None:
-        with self._collective_lock:
-            if self._closed:
-                return
-            self._closed = True
-            try:
-                super().shutdown()
-            finally:
-                self._staging_buffer = None
-                self._pipeline = None
-                self._shared = None
+        # Collectives already issued finish before what they use is released.
+        # An interrupted wait releases nothing, so a later call can finish.
+        self._executor.shutdown(wait=True)
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            super().shutdown()
+        finally:
+            self._staging_buffer = None
+            self._pipeline = None
+            self._shared = None
 
-    @contextmanager
-    def _collective(self, tensor: torch.Tensor) -> Generator[None]:
-        device = tensor.device
-        with self._collective_lock, torch.no_grad(), (
-            torch.cuda.device(device) if device.type == "cuda" else nullcontext()
-        ):
-            if self._closed:
-                raise RuntimeError("piper_relay process group is shut down")
-            if self._shared is not None and self._shared.broken:
-                raise RuntimeError("shared relay failed previously; destroy and recreate the process group")
-            if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("piper_relay blocking transfers do not support CUDA graph capture")
-            yield
+    def _submit(
+        self, device: torch.device, body: Callable[[], None], outputs: list[torch.Tensor], *, nested: bool = False,
+    ) -> dist.Work:
+        """Queue a validated collective over ``device`` tensors on the group's worker; return its Work."""
+        ready: torch.cuda.Event | None = None
+        if device.type == "cuda":
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("piper_relay transfers do not support CUDA graph capture")
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(device))
+
+        def job() -> None:
+            with torch.no_grad():
+                if self._shared is not None and self._shared.broken:
+                    raise RuntimeError("shared relay failed previously; destroy and recreate the process group")
+                if ready is None:
+                    body()
+                    return
+                ready.synchronize()
+                stream = self._stream
+                if stream is None or stream.device != device:
+                    # A private stream: synchronizing the worker's default
+                    # stream would also wait for the caller's work on it.
+                    stream = self._stream = torch.cuda.Stream(device=device)
+                with torch.cuda.device(device), torch.cuda.stream(stream), foreground_transfer():
+                    body()
+
+        return _PendingWork(self._executor.submit(job), outputs, nested=nested)
 
     @contextmanager
     def _buffer(self, device: torch.device) -> Generator[tuple[torch.Tensor, bool]]:
@@ -239,6 +269,15 @@ class _RelayProcessGroup(dist.ProcessGroup):
         size = self._staging_bytes if self._shared is None else self._shared.capacity * self._shared.buffer_count
         return size // (16 * slots * self._pipeline_buffers) * 16
 
+    def barrier(self, opts: dist.BarrierOptions | None = None) -> dist.Work:  # type: ignore[override]
+        options = opts if opts is not None else dist.BarrierOptions()
+        # Queued like a collective: sent to Gloo directly, it could overtake an
+        # earlier collective's control messages and pair different operations
+        # across ranks.
+        return self._submit(
+            torch.device("cpu"), lambda: self._cpu_group.barrier(options).wait(), [],  # type: ignore[attr-defined]
+        )
+
     def allreduce(  # type: ignore[override]
         self,
         tensors: list[torch.Tensor],
@@ -247,9 +286,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
         options = opts if opts is not None else dist.AllreduceOptions()
         tensor = _single_tensor(tensors)
         _validate_reduction([tensor], options)
-        with self._collective(tensor):
-            self._reduce(tensor, options)
-        return _CompletedWork([tensor])
+        return self._submit(tensor.device, lambda: self._reduce(tensor, options), [tensor])
 
     def allreduce_coalesced(
         self,
@@ -265,10 +302,11 @@ class _RelayProcessGroup(dist.ProcessGroup):
         single_options.reduceOp = options.reduceOp
         single_options.timeout = options.timeout
         single_options.asyncOp = options.asyncOp
-        with self._collective(tensors[0]):
+        def body() -> None:
             for tensor in tensors:
                 self._reduce(tensor, single_options)
-        return _CompletedWork(tensors)
+
+        return self._submit(tensors[0].device, body, tensors)
 
     def _reduce(self, tensor: torch.Tensor, options: dist.AllreduceOptions) -> None:
         if self._shared is not None and tensor.device.type == "cuda":
@@ -303,16 +341,17 @@ class _RelayProcessGroup(dist.ProcessGroup):
         if options.rootTensor != 0:
             raise ValueError("piper_relay broadcast requires rootTensor=0")
         sources = [tensor] if self.rank() == options.rootRank else []
-        with self._collective(tensor):
+        def body() -> None:
             if self._shared is not None:
                 self._shared.copy("broadcast", sources, [tensor], options.rootRank, host_pin_manager)
-            else:
-                with closing(self._copy_chunks(sources, [tensor], slots=2)) as chunks:
-                    for chunk in chunks:
-                        if chunk.inputs:
-                            chunk.outputs[0].copy_(chunk.inputs[0])
-                        self._cpu_group.broadcast(chunk.outputs, options).wait()  # type: ignore[attr-defined]
-        return _CompletedWork([tensor])
+                return
+            with closing(self._copy_chunks(sources, [tensor], slots=2)) as chunks:
+                for chunk in chunks:
+                    if chunk.inputs:
+                        chunk.outputs[0].copy_(chunk.inputs[0])
+                    self._cpu_group.broadcast(chunk.outputs, options).wait()  # type: ignore[attr-defined]
+
+        return self._submit(tensor.device, body, [tensor])
 
     def scatter(  # type: ignore[override]
         self,
@@ -340,16 +379,17 @@ class _RelayProcessGroup(dist.ProcessGroup):
                 source_rank != options.rootRank or output.data_ptr() != tensor.data_ptr()
             ):
                 raise ValueError("piper_relay scatter output must not overlap inputs except its exact root slice")
-        with self._collective(output):
+        def body() -> None:
             if self._shared is not None:
                 self._shared.copy("scatter", sources, [output], options.rootRank, host_pin_manager)
-            else:
-                with closing(self._copy_chunks(sources, [output], slots=self.size() + 1)) as chunks:
-                    for chunk in chunks:
-                        self._cpu_group.scatter(  # type: ignore[attr-defined]
-                            chunk.outputs, [chunk.inputs] if sources else [], options,
-                        ).wait()
-        return _CompletedWork([output])
+                return
+            with closing(self._copy_chunks(sources, [output], slots=self.size() + 1)) as chunks:
+                for chunk in chunks:
+                    self._cpu_group.scatter(  # type: ignore[attr-defined]
+                        chunk.outputs, [chunk.inputs] if sources else [], options,
+                    ).wait()
+
+        return self._submit(output.device, body, [output])
 
     def allgather(  # type: ignore[override]
         self,
@@ -367,9 +407,9 @@ class _RelayProcessGroup(dist.ProcessGroup):
         for output in destinations:
             _validate_pair(output, source, source.numel(), same_shape=True)
         self._validate_gather_aliases(source, destinations)
-        with self._collective(source):
-            self._gather(source, destinations, options)
-        return _CompletedWork(destinations, nested=True)
+        return self._submit(
+            source.device, lambda: self._gather(source, destinations, options), destinations, nested=True,
+        )
 
     def all_gather_single(
         self,
@@ -409,10 +449,11 @@ class _RelayProcessGroup(dist.ProcessGroup):
             views = list(output.view(self.size(), source.numel()).unbind(0))
             self._validate_gather_aliases(source, views)
             destinations.append(views)
-        with self._collective(input_list[0]):
+        def body() -> None:
             for source, outputs in zip(input_list, destinations, strict=True):
                 self._gather(source, outputs, options)
-        return _CompletedWork(output_lists)
+
+        return self._submit(input_list[0].device, body, output_lists)
 
     def _validate_gather_aliases(self, source: torch.Tensor, outputs: list[torch.Tensor]) -> None:
         for rank, output in enumerate(outputs):
@@ -465,36 +506,58 @@ class _RelayProcessGroup(dist.ProcessGroup):
             raise ValueError("piper_relay root rank is outside the process group")
 
 
-class _CompletedWork(dist.Work):
-    """Expose an already completed collective to Python and c10d callers."""
+class _PendingWork(dist.Work):
+    """A collective queued on its group's worker; waiting blocks until it has completed.
 
-    def __init__(self, tensors: list[torch.Tensor], *, nested: bool = False) -> None:
+    The job synchronizes its streams before finishing, so once ``wait`` returns the
+    outputs are ready for any stream. An interrupted ``wait`` leaves the collective
+    running; its job keeps the tensors referenced until it finishes. Nothing refers
+    back to the Work, so its tensors are freed as soon as the caller drops it and
+    the job ends, without waiting for the cyclic garbage collector.
+    """
+
+    def __init__(self, job: Future[None], tensors: list[torch.Tensor], *, nested: bool = False) -> None:
         super().__init__()
+        self._job = job
         self._tensors = tensors
-        self._future: torch.futures.Future[list[torch.Tensor] | list[list[torch.Tensor]]] = torch.futures.Future()
-        self._future.set_result([tensors] if nested else tensors)
+        future: torch.futures.Future[list[torch.Tensor] | list[list[torch.Tensor]]] = torch.futures.Future()
+        self._future = future
+        result = [tensors] if nested else tensors
 
-    def wait(self, timeout: timedelta = timedelta(0)) -> bool:
-        del timeout
-        return True
+        def finished(done: Future[None]) -> None:
+            error = done.exception()
+            if error is not None:
+                # torch's stub types the exception as the result type.
+                future.set_exception(error)  # pyright: ignore[reportArgumentType]
+            else:
+                future.set_result(result)
 
-    def is_completed(self) -> bool:
-        return True
-
-    def is_success(self) -> bool:
-        return True
+        # The callback holds the future and outputs, never this Work.
+        job.add_done_callback(finished)
 
     def get_future(self) -> torch.futures.Future[list[torch.Tensor] | list[list[torch.Tensor]]]:
         return self._future
 
+    def wait(self, timeout: timedelta = timedelta(0)) -> bool:
+        # c10d's default, zero, means no timeout.
+        self._job.result(timeout=timeout.total_seconds() or None)
+        return True
+
+    def is_completed(self) -> bool:
+        return self._job.done()
+
+    def is_success(self) -> bool:
+        return self._job.done() and self._job.exception() is None
+
     def result(self) -> list[torch.Tensor]:
+        self.wait()
         return self._tensors
 
     def synchronize(self) -> None:
-        pass
+        self.wait()
 
     def block_current_stream(self) -> None:
-        pass
+        self.wait()
 
 
 def _validate_reduction(tensors: list[torch.Tensor], options: dist.AllreduceOptions) -> None:

@@ -2,6 +2,7 @@
 
 import gc
 import math
+import threading
 from collections.abc import Callable, Sequence
 from datetime import timedelta
 
@@ -14,13 +15,14 @@ import torch.multiprocessing as mp
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distribute_tensor
 
-from piper_offload import communication
+from piper_offload import _transfer_priority, communication
 from piper_offload.communication import RelayOptions, register_relay_backend
 from piper_offload._host_registration import RuntimeHostRegistration
 from piper_offload.pin_manager import PinManager, host_pin_manager
 
 pytestmark = pytest.mark.skipif(not dist.is_gloo_available(), reason="CPU Gloo required")
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device required")
+WAIT = timedelta(seconds=30)
 DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
@@ -104,8 +106,8 @@ def _check_reduction(mesh, rank, device, dtype):
     for shape in ((), (0,), (3, 7), (257,)):
         x = torch.full(shape, float(rank + 1), device=device, dtype=dtype)
         work = dist.all_reduce(x, async_op=True)
+        assert work.wait(WAIT)
         assert work.is_completed()
-        assert work.wait(timedelta(seconds=1))
         assert work.get_future().done()
         assert work.get_future().wait()[0] is x
         torch.testing.assert_close(x, torch.full_like(x, 3))
@@ -126,19 +128,21 @@ def _check_copy_collectives(rank, device, dtype):
         payload = torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape).to(dtype=dtype, device=device)
         source = payload.clone() if rank == 1 else torch.full_like(payload, -1)
         work = dist.broadcast(source, src=1, async_op=True)
+        assert work.wait(WAIT)
         assert work.is_completed()
-        assert work.wait(timedelta(seconds=1))
         torch.testing.assert_close(source, payload, rtol=0, atol=0)
 
         received = torch.empty_like(payload)
         scatter_list = [payload, payload + 1] if rank == 1 else None
         work = dist.scatter(received, scatter_list, src=1, async_op=True)
+        assert work.wait(WAIT)
         assert work.is_completed()
         torch.testing.assert_close(received, payload + rank, rtol=0, atol=0)
 
         local = payload + rank
         gathered = [torch.empty_like(local) for _ in range(2)]
         work = dist.all_gather(gathered, local, async_op=True)
+        assert work.wait(WAIT)
         assert work.is_completed()
         assert len(work.get_future().wait()[0]) == 2
         for r, tensor in enumerate(gathered):
@@ -269,11 +273,11 @@ def _check_streams(device: torch.device) -> None:
         scattered = torch.empty_like(broadcast)
         scatter_list = [broadcast, broadcast + 1] if dist.get_rank() == 1 else None
         scatter_work = dist.scatter(scattered, scatter_list, src=1, async_op=True)
-    # The blocking backend promises completion even before work.wait().
-    assert work.is_completed()
-    assert gather_work.is_completed()
-    assert broadcast_work.is_completed()
-    assert scatter_work.is_completed()
+    # Each collective starts after the producer's earlier work, and its
+    # outputs are ready for any stream once wait() returns.
+    for pending in (work, gather_work, broadcast_work, scatter_work):
+        assert pending.wait(WAIT)
+        assert pending.is_completed()
     assert producer.query()
     with torch.cuda.stream(consumer):
         result = x + 1
@@ -359,6 +363,119 @@ def single_rank_group(tmp_path, request):
         yield dist.group.WORLD
     finally:
         dist.destroy_process_group()
+
+
+@CUDA
+def test_accelerator_collective_moves_data_as_a_foreground_transfer(single_rank_group, monkeypatch):
+    # Block prefetch waits only for foreground transfers; a collective that
+    # stopped marking itself would silently queue behind the next block's
+    # weights again.
+    seen = []
+
+    class ObservingTransport:
+        def allreduce(self, tensors, options):
+            del tensors, options
+            seen.append(_transfer_priority._foreground.count)
+            return self
+
+        def wait(self):
+            pass
+
+    monkeypatch.setattr(single_rank_group, "_cpu_group", ObservingTransport())
+    dist.all_reduce(torch.ones(256, device="cuda"))
+    assert seen == [1]
+    assert _transfer_priority._foreground.count == 0
+
+
+@CUDA
+def test_barrier_waits_for_earlier_collectives(single_rank_group, monkeypatch):
+    # A barrier that overtook a queued collective's Gloo messages would pair
+    # different operations across ranks.
+    release = threading.Event()
+    order = []
+
+    class OrderedTransport:
+        def allreduce(self, tensors, options):
+            del tensors, options
+            release.wait(WAIT.total_seconds())
+            order.append("allreduce")
+            return self
+
+        def barrier(self, options):
+            del options
+            order.append("barrier")
+            return self
+
+        def wait(self):
+            pass
+
+    monkeypatch.setattr(single_rank_group, "_cpu_group", OrderedTransport())
+    reduction = dist.all_reduce(torch.ones(256, device="cuda"), async_op=True)
+    barrier = dist.barrier(async_op=True)
+    release.set()
+    assert barrier.wait(WAIT)
+    assert reduction.is_completed()
+    assert order == ["allreduce", "barrier"]
+
+
+@CUDA
+def test_shutdown_lets_issued_collectives_finish_first(single_rank_group, monkeypatch):
+    # Releasing Gloo or staging under a running collective would hang or corrupt it.
+    release = threading.Event()
+
+    class BlockingTransport:
+        def allreduce(self, tensors, options):
+            del tensors, options
+            release.wait(WAIT.total_seconds())
+            return self
+
+        def wait(self):
+            pass
+
+    monkeypatch.setattr(single_rank_group, "_cpu_group", BlockingTransport())
+    work = dist.all_reduce(torch.ones(256, device="cuda"), async_op=True)
+    closer = threading.Thread(target=single_rank_group.shutdown)
+    closer.start()
+    closer.join(0.2)
+    assert closer.is_alive()
+    assert not work.is_completed()
+    release.set()
+    closer.join(WAIT.total_seconds())
+    assert not closer.is_alive()
+    assert work.wait(WAIT)
+
+
+@CUDA
+@pytest.mark.usefixtures("single_rank_group")
+def test_collective_writes_outputs_created_in_inference_mode():
+    # Piper Engine runs models under inference mode, so collective outputs are
+    # inference tensors, which only inference mode may write in place. The
+    # group's worker thread runs outside it; the relay writes through byte
+    # views, which PyTorch permits.
+    with torch.inference_mode():
+        x = torch.full((256,), 2.0, device="cuda")
+        dist.all_reduce(x)
+    torch.testing.assert_close(x.cpu(), torch.full((256,), 2.0))
+
+
+@CUDA
+@pytest.mark.usefixtures("single_rank_group")
+def test_waited_work_frees_its_tensors_without_garbage_collection():
+    # Callers drop each Work right after waiting on it; buffers kept until the
+    # cyclic collector runs would pile up across a forward pass of collectives.
+    gc.disable()
+    try:
+        x = torch.ones(1024, device="cuda")
+        work = dist.all_reduce(x, async_op=True)
+        assert work.wait(WAIT)
+        output = weakref.ref(x)
+        del x, work
+        # The worker drops a finished job just after waking its waiter; once it
+        # has run the next collective, nothing else may hold the tensor.
+        dist.all_reduce(torch.ones(1, device="cuda"))
+        assert output() is None
+    finally:
+        gc.enable()
 
 
 @pytest.mark.parametrize(
@@ -808,6 +925,10 @@ class _ControlOnly:
         assert tensors[0].nbytes == 8
         self.messages += 1
         return self.inner.recv(tensors, peer, tag)
+
+    def barrier(self, options):
+        # The test's own synchronization, not a relay control message.
+        return self.inner.barrier(options)
 
 
 def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_buffers, staging_bytes):  # noqa: PLR0915
