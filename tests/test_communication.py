@@ -445,6 +445,36 @@ def test_shutdown_lets_issued_collectives_finish_first(single_rank_group, monkey
     assert work.wait(WAIT)
 
 
+def test_future_callbacks_run_on_the_calling_thread(single_rank_group, monkeypatch):
+    # DDP communication hooks such as PowerSGD run a collective inside a
+    # future's callback and wait for it. Run on the group's worker, that
+    # callback would wait for a collective queued behind itself.
+    release = threading.Event()
+
+    class HeldTransport:
+        def allreduce(self, tensors, options):
+            del tensors, options
+            release.wait(WAIT.total_seconds())
+            return self
+
+        def wait(self):
+            pass
+
+    def chained(future):
+        del future
+        dist.all_reduce(torch.ones(4), async_op=True).wait(WAIT)
+        return threading.current_thread()
+
+    monkeypatch.setattr(single_rank_group, "_cpu_group", HeldTransport())
+    work = dist.all_reduce(torch.ones(4), async_op=True)
+    # The collective is still running when the callback is attached.
+    releaser = threading.Timer(0.2, release.set)
+    releaser.start()
+    chained_future = work.get_future().then(chained)
+    releaser.join()
+    assert chained_future.wait() is threading.current_thread()
+
+
 @CUDA
 @pytest.mark.usefixtures("single_rank_group")
 def test_collective_writes_outputs_created_in_inference_mode():

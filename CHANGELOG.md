@@ -24,7 +24,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   per process group, so a call with `async_op=True` now returns before the
   collective completes, for CPU tensors too. Call `wait()` on the returned work
   before reading its outputs or writing its inputs or outputs. Calls without
-  `async_op` still return once the collective has completed.
+  `async_op` still return once the collective has completed. `get_future()`
+  waits for the collective, so callbacks on its future still run on the
+  calling thread.
 - Block streaming no longer delays `piper_relay` collectives issued during a
   block behind the next block's weights: the lookahead copy waits between
   tensors while a collective moves data. Rolling refills do not wait; use

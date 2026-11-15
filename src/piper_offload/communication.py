@@ -25,6 +25,7 @@ Collectives stream through a reusable, bounded CPU buffer. Each group runs its
 collectives, including ``barrier``, on one worker thread in issue order. With
 ``async_op=True`` a call returns at once; until ``wait()`` returns, the caller
 must not read the outputs or write the inputs or outputs, from any stream.
+``get_future()`` also waits, so the future's callbacks run on the calling thread.
 Without it, the call returns once the collective has completed, and the outputs
 are then ready for every stream. A collective on accelerator tensors starts once
 the caller's current stream has produced its inputs and moves its data as a
@@ -520,23 +521,24 @@ class _PendingWork(dist.Work):
         super().__init__()
         self._job = job
         self._tensors = tensors
-        future: torch.futures.Future[list[torch.Tensor] | list[list[torch.Tensor]]] = torch.futures.Future()
-        self._future = future
-        result = [tensors] if nested else tensors
-
-        def finished(done: Future[None]) -> None:
-            error = done.exception()
-            if error is not None:
-                # torch's stub types the exception as the result type.
-                future.set_exception(error)  # pyright: ignore[reportArgumentType]
-            else:
-                future.set_result(result)
-
-        # The callback holds the future and outputs, never this Work.
-        job.add_done_callback(finished)
+        self._nested = nested
 
     def get_future(self) -> torch.futures.Future[list[torch.Tensor] | list[list[torch.Tensor]]]:
-        return self._future
+        """Wait for the collective, then return its completed future.
+
+        Callbacks then run on the calling thread, as for any completed future.
+        Run on the group's worker, a callback that waits for a later collective,
+        as DDP communication hooks such as PowerSGD do, would block the only
+        thread that can run it.
+        """
+        future: torch.futures.Future[list[torch.Tensor] | list[list[torch.Tensor]]] = torch.futures.Future()
+        error = self._job.exception()
+        if error is not None:
+            # torch's stub types the exception as the result type.
+            future.set_exception(error)  # pyright: ignore[reportArgumentType]
+        else:
+            future.set_result([self._tensors] if self._nested else self._tensors)
+        return future
 
     def wait(self, timeout: timedelta = timedelta(0)) -> bool:
         # c10d's default, zero, means no timeout.
