@@ -19,31 +19,17 @@ from tests._block_compile_helpers import _BlockModel
 from tests.test_pin_manager import FakeBackend, _transferred
 from tests.test_streaming_pinning import pins as pins  # noqa: PLC0414 — re-export a shared pytest fixture
 
-gguf = pytest.importorskip("gguf")
-np = pytest.importorskip("numpy")
-
-
-def _write(writer: gguf.GGUFWriter) -> None:
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
+_FIXTURES = Path(__file__).with_name("fixtures") / "gguf"
 
 
 @pytest.fixture
 def checkpoint(tmp_path: Path):
+    contents = (_FIXTURES / "weights.gguf").read_bytes()
     path = tmp_path / "model.gguf"
-    dense = np.random.default_rng(42).standard_normal((64, 64), dtype=np.float32)
-    packed = gguf.quantize(dense, gguf.GGMLQuantizationType.Q4_0)
-    writer = gguf.GGUFWriter(path, "test")
-    writer.add_tensor("weight", packed, raw_dtype=gguf.GGMLQuantizationType.Q4_0)
-    writer.add_tensor("weight2", packed[::-1].copy(), raw_dtype=gguf.GGMLQuantizationType.Q4_0)
-    writer.add_tensor("bias", np.arange(64, dtype=np.float32))
-    writer.add_tensor("half", np.arange(5, dtype=np.float16))
-    bf16 = torch.arange(4, dtype=torch.bfloat16)
-    writer.add_tensor("bf16", bf16.view(torch.uint8).numpy(), raw_dtype=gguf.GGMLQuantizationType.BF16)
-    _write(writer)
-    return path, torch.from_numpy(packed)
+    path.write_bytes(contents)
+    # The upstream reader reports 64 rows of two 18-byte Q4_0 blocks at offset 288.
+    packed = torch.frombuffer(bytearray(contents[288 : 288 + 2304]), dtype=torch.uint8).reshape(64, 36)
+    return path, packed
 
 
 def test_reader_describes_logical_weights_and_actual_storage(checkpoint):
@@ -72,13 +58,8 @@ def test_reader_describes_logical_weights_and_actual_storage(checkpoint):
             assert reader.get_slice(name).get_nbytes(dtype=torch.float32) == tensor.nbytes
 
 
-def test_selective_read_can_skip_an_unsupported_encoding(tmp_path):
-    path = tmp_path / "mixed.gguf"
-    writer = gguf.GGUFWriter(path, "test")
-    writer.add_tensor("supported", np.ones(4, dtype=np.float32))
-    writer.add_tensor("unsupported", np.ones(4, dtype=np.int8))
-    _write(writer)
-    with MappedCheckpoint(path) as reader:
+def test_selective_read_can_skip_an_unsupported_encoding():
+    with MappedCheckpoint(_FIXTURES / "unsupported-type.gguf") as reader:
         assert reader.keys() == ["supported", "unsupported"]
         torch.testing.assert_close(reader.get_tensor("supported"), torch.ones(4))
         with pytest.raises(CheckpointError, match="unsupported GGUF quantization type"):
@@ -87,76 +68,61 @@ def test_selective_read_can_skip_an_unsupported_encoding(tmp_path):
             reader.get_tensor("unsupported")
 
 
-def test_header_matches_reference_parser_without_importing_it(tmp_path, monkeypatch):
-    path = tmp_path / "model.gguf"
-    writer = gguf.GGUFWriter(path, "test")
-    writer.add_custom_alignment(1024)
-    # Every metadata value type: a wrong size misplaces everything after it.
-    for index, add in enumerate((
-        writer.add_uint8, writer.add_int8, writer.add_uint16, writer.add_int16, writer.add_uint32,
-        writer.add_int32, writer.add_float32, writer.add_uint64, writer.add_int64, writer.add_float64,
-    )):
-        add(f"scalar.{index}", 1)
-    writer.add_bool("flag", True)
-    writer.add_array("tokenizer.ggml.tokens", ["a", "", "\u00e9t\u00e9", "<|im_end|>"])
-    writer.add_array("tokenizer.ggml.token_type", [1, 2, 3, 4])
-    writer.add_array("nested", [["a", "bc"], ["d"]])
-    rng = np.random.default_rng(0)
-    q = gguf.GGMLQuantizationType
-    writer.add_tensor("q4_k", rng.integers(0, 256, (2, 2 * 144), dtype=np.uint8), raw_dtype=q.Q4_K)
-    writer.add_tensor("q8_0", rng.integers(0, 256, (3, 2 * 34), dtype=np.uint8), raw_dtype=q.Q8_0)
-    writer.add_tensor("iq3_s", rng.integers(0, 256, (2, 110), dtype=np.uint8), raw_dtype=q.IQ3_S)
-    writer.add_tensor("f32", rng.standard_normal((3, 5), dtype=np.float32))
-    writer.add_tensor("f16", np.arange(7, dtype=np.float16))
-    writer.add_tensor("bf16", rng.integers(0, 256, (2, 12), dtype=np.uint8), raw_dtype=q.BF16)
-    _write(writer)
-    expected = gguf.GGUFReader(path).tensors
-    # The gguf extra no longer installs the package, so reading must not import it.
+def test_header_matches_upstream_fixture_without_importing_gguf(monkeypatch):
+    path = _FIXTURES / "mixed-header.gguf"
+    contents = path.read_bytes()
+    # Logical shape, file offset, byte count, and packed type/shape from GGUFReader 0.19.0.
+    expected = [
+        ("q4_k", [2, 512], 1024, 576, (12, (2, 288))),
+        ("q8_0", [3, 64], 2048, 204, (8, (3, 68))),
+        ("f32", [3, 5], 4096, 60, None),
+        ("f16", [7], 5120, 14, None),
+        ("bf16", [2, 6], 6144, 24, None),
+    ]
     monkeypatch.setitem(sys.modules, "gguf", None)
     with MappedCheckpoint(path) as reader:
-        assert reader.keys() == sorted(tensor.name for tensor in expected)
-        for tensor in expected:
-            if tensor.tensor_type is q.IQ3_S:
-                with pytest.raises(CheckpointError, match="unsupported GGUF quantization type 21"):
-                    reader.get_slice(tensor.name)
-                continue
-            descriptor = reader.get_slice(tensor.name)
-            assert descriptor.get_shape() == [int(dim) for dim in reversed(tensor.shape)]
-            assert descriptor.get_nbytes() == tensor.n_bytes
-            stored = reader.get_tensor(tensor.name)
-            if isinstance(stored, GgufParameter):
-                assert stored.quant_type == tensor.tensor_type
+        assert reader.keys() == sorted(["iq3_s", *(name for name, *_ in expected)])
+        with pytest.raises(CheckpointError, match="unsupported GGUF quantization type 21"):
+            reader.get_slice("iq3_s")
+        for name, shape, offset, nbytes, packed in expected:
+            descriptor = reader.get_slice(name)
+            assert descriptor.get_shape() == shape
+            assert descriptor.get_nbytes() == nbytes
+            stored = reader.get_tensor(name)
+            if packed is not None:
+                assert isinstance(stored, GgufParameter)
+                quant_type, packed_shape = packed
+                assert stored.quant_type == quant_type
                 stored = stored.as_tensor()
-                assert stored.shape == tensor.data.shape
+                assert stored.shape == packed_shape
             piece = file_slice(stored)
             assert piece is not None
-            assert piece.offset == tensor.data_offset
-            assert stored.view(torch.uint8).numpy().tobytes() == tensor.data.tobytes()
+            assert piece.offset == offset
+            assert bytes(stored.view(torch.uint8).flatten().tolist()) == contents[offset : offset + nbytes]
 
 
 def _alignment(value: int) -> bytes:
     return b"general.alignment" + struct.pack("<II", 4, value)
 
 
-@pytest.mark.parametrize(("endianess", "damage", "message"), [
-    ("BIG", lambda data: data, "byte-swapped"),
-    ("LITTLE", lambda data: data[:10], "shorter than its 24-byte header"),
-    ("LITTLE", lambda data: b"GGML" + data[4:], "does not begin with 'GGUF'"),
-    ("LITTLE", lambda data: data[:4] + struct.pack("<I", 4) + data[8:], "unsupported GGUF version 4"),
-    ("LITTLE", lambda data: data.replace(_alignment(64), _alignment(48)), "alignment 48 is not a power of two"),
-    ("LITTLE", lambda data: data[:60], "malformed GGUF header"),
-    ("LITTLE", lambda data: data[:24] + struct.pack("<Q", 1 << 40) + data[32:], "string extends past the end"),
-    ("LITTLE", lambda data: data.replace(b"two", b"one"), "duplicate GGUF tensor 'one'"),
-    ("LITTLE", lambda data: data.rstrip(b"\0")[:-1], "'two' extends outside the checkpoint"),
+def test_rejects_byte_swapped_header():
+    with pytest.raises(CheckpointError, match="byte-swapped"):
+        MappedCheckpoint(_FIXTURES / "two-tensors-be.gguf")
+
+
+@pytest.mark.parametrize(("damage", "message"), [
+    (lambda data: data[:10], "shorter than its 24-byte header"),
+    (lambda data: b"GGML" + data[4:], "does not begin with 'GGUF'"),
+    (lambda data: data[:4] + struct.pack("<I", 4) + data[8:], "unsupported GGUF version 4"),
+    (lambda data: data.replace(_alignment(64), _alignment(48)), "alignment 48 is not a power of two"),
+    (lambda data: data[:60], "malformed GGUF header"),
+    (lambda data: data[:24] + struct.pack("<Q", 1 << 40) + data[32:], "string extends past the end"),
+    (lambda data: data.replace(b"two", b"one"), "duplicate GGUF tensor 'one'"),
+    (lambda data: data.rstrip(b"\0")[:-1], "'two' extends outside the checkpoint"),
 ])
-def test_rejects_unreadable_headers(tmp_path, endianess, damage, message):
+def test_rejects_unreadable_headers(tmp_path, damage, message):
     path = tmp_path / "model.gguf"
-    writer = gguf.GGUFWriter(path, "test", endianess=gguf.GGUFEndian[endianess])
-    writer.add_custom_alignment(64)
-    writer.add_tensor("one", np.ones(4, dtype=np.float32))
-    writer.add_tensor("two", np.ones(4, dtype=np.float32))
-    _write(writer)
-    path.write_bytes(damage(path.read_bytes()))
+    path.write_bytes(damage((_FIXTURES / "two-tensors.gguf").read_bytes()))
     with pytest.raises(CheckpointError, match=message):
         MappedCheckpoint(path)
 
@@ -237,7 +203,7 @@ def test_row_concatenation_preserves_encoding_and_has_owned_storage(checkpoint):
     assert swapped.quant_type == weight.quant_type
     assert file_slice(swapped.as_tensor()) is None
     torch.testing.assert_close(swapped.as_tensor(), torch.cat((packed[32:], packed[:32])))
-    different_encoding = GgufParameter(packed, quant_type=int(gguf.GGMLQuantizationType.IQ4_NL))
+    different_encoding = GgufParameter(packed, quant_type=20)  # IQ4_NL
     with pytest.raises(ValueError, match="same encoding"):
         torch.cat((weight, different_encoding))
 

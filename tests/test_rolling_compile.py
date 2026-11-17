@@ -134,17 +134,11 @@ def _rolling_quant_weight(kind: str) -> tuple[torch.Tensor, int, torch.dtype]:
             torch.bfloat16,
         )
     if kind == "gguf-q4-0":
-        gguf = pytest.importorskip("gguf")
-        np = pytest.importorskip("numpy")
-        from tests._gguf_helpers import GGUFParameter
+        from tests._gguf_helpers import GGUFParameter, packed_q4_0
 
         width = 64
-        quant_type = gguf.GGMLQuantizationType.Q4_0
-        seed = torch.randint(0, torch.iinfo(torch.int32).max, ()).item()
-        dense = np.random.default_rng(seed).standard_normal((width, width), dtype=np.float32)
-        packed = torch.from_numpy(gguf.quantize(dense, quant_type))
         return (
-            GGUFParameter(packed, quant_type=int(quant_type)),
+            GGUFParameter(packed_q4_0(width, width), quant_type=2),
             width,
             torch.bfloat16,
         )

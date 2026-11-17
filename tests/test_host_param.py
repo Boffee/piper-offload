@@ -558,16 +558,14 @@ class TestCopyToCpu:
         # representation on GPU. D2H would require a reverse conversion,
         # which isn't implemented. Surface it as NotImplementedError, not a
         # silent corruption of the host packed bytes.
-        gguf = pytest.importorskip("gguf")
         from tests._gguf_helpers import GGUFParameter
 
         # Build minimal GGUF state directly via the adapter — avoids
         # needing a real .gguf file to load. Q4_0 has the simplest
         # block layout and is broadly supported.
-        qt_value = int(gguf.GGMLQuantizationType.Q4_0)
         # Q4_0 packs 32 fp16 weights into an 18-byte block (2 scale + 16 quants).
         packed = torch.zeros((1, 36), dtype=torch.uint8)
-        gguf_t = GGUFParameter(packed, quant_type=qt_value)
+        gguf_t = GGUFParameter(packed, quant_type=2)
         host_param = HostParam(gguf_t)
         gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
         with pytest.raises(NotImplementedError, match="CPU round-trip"):
