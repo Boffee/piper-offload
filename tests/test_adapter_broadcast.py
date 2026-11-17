@@ -215,13 +215,10 @@ def test_complete_values_remain_exact_shape(source_shape):
 
 @pytest.mark.parametrize("kind", ["lora", "dense", "mixed"])
 def test_quantized_broadcast_requires_explicit_capability(kind):
-    quanto = pytest.importorskip("optimum.quanto")
-    from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+    from tests.test_int8_adapter import _make_int8
 
-    weight = WeightQBytesTensor.create(
-        quanto.qint8, 0, (3, 4), (4, 1),
-        torch.ones(3, 4, dtype=torch.int8), torch.ones(3, 1), None,
-    )
+    weight = _make_int8(rows=3, cols=4)
+    before = weight.dequantize()
     model = nn.Module()
     model.first = nn.Parameter(torch.zeros(3, 4), requires_grad=False)
     model.weight = nn.Parameter(weight, requires_grad=False)
@@ -232,10 +229,10 @@ def test_quantized_broadcast_requires_explicit_capability(kind):
     )
     adapter = Adapter({"first": ParameterDelta.from_tensors(dense=torch.ones(())), "weight": delta})
 
-    with pytest.raises(ValueError, match="QuantoAdapter does not support broadcast"):
+    with pytest.raises(ValueError, match="Int8Adapter does not support broadcast"):
         merge_adapter(model, [(adapter, 1.0)])
     assert torch.count_nonzero(model.first) == 0
-    torch.testing.assert_close(weight.dequantize(), torch.ones(3, 4))
+    torch.testing.assert_close(weight.dequantize(), before)
 
 
 @CUDA

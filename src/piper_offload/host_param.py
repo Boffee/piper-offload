@@ -6,9 +6,7 @@ Internal to the ``piper_offload`` subpackage. Shared by
 abstraction so the addition of new tensor types only requires writing
 a new :class:`TensorAdapter`, not editing the consumers.
 
-Per-parameter mechanics live in the tensor adapter
-(:mod:`tensor_adapters` for plain tensors, :mod:`quanto_adapter` for
-quanto). :class:`HostParam` is a thin holder that pairs one
+:class:`HostParam` pairs one
 :class:`nn.Parameter` with the adapter that handles its tensor type
 plus the host state that adapter produced. Optional operations
 such as D2H round-trip, trainable ``.data`` swap, and in-place updates
@@ -94,11 +92,7 @@ class HostParam:
     )
 
     def __init__(self, param: nn.Parameter) -> None:
-        # The adapter operates on the tensor that carries the parameter's
-        # representation: ``param.data`` for plain Parameters (including ones
-        # wrapping a quant subclass), but the param object itself for a
-        # Parameter subclass whose ``.data`` is lossy (bitsandbytes
-        # Params4bit). See ``param_representation``.
+        # Select the tensor that carries the parameter's representation.
         representation = param_representation(param)
         requires_grad = param.requires_grad
         is_meta = representation.is_meta
@@ -352,8 +346,8 @@ class HostParam:
 
     def make_gpu_param(self, gpu_state: object) -> nn.Parameter:
         """Build the GPU-side :class:`nn.Parameter` for this host parameter.
-        Adapter receives the paired host state so structured tensor
-        types (quanto) can reconstruct their wrappers. The wrapper's
+        The adapter receives the paired host state to reconstruct
+        structured tensor wrappers. The wrapper's
         ``requires_grad`` matches the source parameter's at capture time."""
         if self.is_meta:
             return nn.Parameter(cast(torch.Tensor, gpu_state), requires_grad=False)

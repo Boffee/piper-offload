@@ -7,10 +7,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
-- Deprecated the `bnb` and `quanto` extras and their built-in tensor adapters.
-  Offload emits a `FutureWarning` on first use of each extra's adapters. Before
-  their removal in a future minor release, migrate to another supported weight
-  format or register a custom tensor adapter.
+- Breaking: Removed the `bnb` and `quanto` extras and their built-in tensor
+  adapters. For bitsandbytes or Quanto checkpoints, use another supported
+  weight format or register a custom tensor adapter.
 
 ## [0.10.0rc15] - 2026-11-17
 

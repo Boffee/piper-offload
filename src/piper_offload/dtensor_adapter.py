@@ -12,13 +12,10 @@ adapters: a ``DTensor`` wrapping a ``Float8Tensor`` reuses ``Float8Adapter``
 for the local shard, a ``DTensor`` wrapping a plain tensor reuses
 ``RegularAdapter``, and so on — no per-quant ``DTensor`` variants.
 
-It does NOT compose with adapters whose local shard is itself an
-``nn.Parameter`` subclass carrying quant state on the object rather than
-``.data`` (bitsandbytes ``Params4bit`` / ``Int8Params``): reconstruction
-reads ``.data`` off the inner wrapper, which strips that state. ``capture_host``
-rejects such a local shard with ``NotImplementedError`` rather than silently
-corrupting it. (bitsandbytes + tensor parallelism is not a supported
-combination upstream regardless.)
+Local shards must retain their tensor representation through ``.data``
+because reconstruction reads it from the inner wrapper. ``capture_host``
+rejects local ``nn.Parameter`` subclasses, which may carry state on the
+object itself.
 
 Scope: **movement plus shard-local additive merge, for frozen-inference tensor
 parallelism.** Merge mode supports ordinary ``Replicate`` and contiguous
@@ -436,13 +433,9 @@ class DTensorAdapter:
         dt = require_dtensor(t)
         local = dt.to_local()
         if issubclass(type(local), nn.Parameter):
-            # Parameter-subclass locals (bitsandbytes Params4bit/Int8Params)
-            # carry quant state on the object, not .data — and gpu_param
-            # reconstructs via .data. Check real inheritance rather than
-            # isinstance(): PyTorch (2.13 through at least 2.15) propagates
-            # DTensor's logical ``_is_param`` marker to a plain local Tensor.
-            # Fail closed rather
-            # than silently dropping representation metadata.
+            # A Parameter subclass may carry state that gpu_param would
+            # lose through .data. Check actual inheritance because DTensor
+            # can propagate its logical _is_param marker to a plain local tensor.
             raise NotImplementedError(
                 f"DTensorAdapter cannot move a local shard that is itself an "
                 f"nn.Parameter subclass ({type(local).__name__}); its quant "

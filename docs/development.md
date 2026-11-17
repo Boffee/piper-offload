@@ -17,10 +17,6 @@ uv run ruff check .
 uv run pyright
 ```
 
-To include the deprecated bitsandbytes and Quanto adapters in a test run, use
-`uv run --extra bnb --extra quanto pytest tests -q`. CI installs both extras
-explicitly.
-
 GPU tests carry skip marks for missing hardware; an unmarked test that needs
 CUDA fails on a CPU-only host instead of skipping. Run the relevant GPU tests
 when changing transfers, scheduling, compilation, or quantized operations; a

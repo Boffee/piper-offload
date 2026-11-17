@@ -109,30 +109,6 @@ def _rolling_quant_weight(kind: str) -> tuple[torch.Tensor, int, torch.dtype]:
         return weight, 64, torch.bfloat16
     if kind.startswith("torchao-"):
         return _torchao_rolling_weight(kind)
-    if kind in ("quanto-qint8", "quanto-qfloat8"):
-        quanto = pytest.importorskip("optimum.quanto")
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
-        width = 64
-        qtype = quanto.qint8 if kind == "quanto-qint8" else quanto.qfloat8_e4m3fn
-        data = (
-            torch.randint(-127, 128, (width, width), dtype=torch.int8)
-            if qtype is quanto.qint8
-            else torch.randn(width, width).to(qtype.dtype)
-        )
-        return (
-            WeightQBytesTensor.create(
-                qtype,
-                0,
-                (width, width),
-                (width, 1),
-                data,
-                torch.rand(width, 1, dtype=torch.bfloat16).add_(0.01),
-                None,
-            ),
-            width,
-            torch.bfloat16,
-        )
     if kind == "gguf-q4-0":
         from tests._gguf_helpers import GGUFParameter, packed_q4_0
 
@@ -267,8 +243,6 @@ class TestRollingCompile:
             "torchao-mxfp4",
             "torchao-nvfp4",
             "piper-convrot-nvfp4",
-            "quanto-qint8",
-            "quanto-qfloat8",
             "gguf-q4-0",
             "trellis",
         ],

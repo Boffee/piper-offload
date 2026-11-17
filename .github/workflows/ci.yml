@@ -37,22 +37,16 @@ jobs:
         run: uv python install 3.14
 
       - name: Install development environment
-        run: uv sync --locked --dev --extra bnb --extra quanto
-
-      - name: Verify deprecated adapter backends
-        run: >-
-          uv run --no-sync python -c "from piper_offload._bnb import BNB_AVAILABLE;
-          from piper_offload._quanto import QUANTO_AVAILABLE;
-          assert BNB_AVAILABLE and QUANTO_AVAILABLE"
+        run: uv sync --locked --dev
 
       - name: Lint
-        run: uv run --no-sync ruff check .
+        run: uv run ruff check .
 
       - name: Type check
-        run: uv run --no-sync pyright
+        run: uv run pyright
 
       - name: Test portable backends
-        run: uv run --no-sync pytest --durations=20 --junitxml=test-results/junit.xml
+        run: uv run pytest --durations=20 --junitxml=test-results/junit.xml
 
       - name: Upload test results
         if: always()
@@ -114,13 +108,7 @@ jobs:
         run: uv python install 3.14
 
       - name: Install Windows development environment
-        run: uv sync --locked --dev --extra bnb --extra quanto
-
-      - name: Verify deprecated adapter backends
-        run: >-
-          uv run --no-sync python -c "from piper_offload._bnb import BNB_AVAILABLE;
-          from piper_offload._quanto import QUANTO_AVAILABLE;
-          assert BNB_AVAILABLE and QUANTO_AVAILABLE"
+        run: uv sync --locked --dev
 
       - name: Verify Windows Triton selection
         run: >-

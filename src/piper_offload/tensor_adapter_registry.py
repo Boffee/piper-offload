@@ -7,18 +7,12 @@ tensor subclasses can participate through :func:`register_adapter` without
 adding a format-specific dependency to this package.
 """
 
-import warnings
 from collections.abc import Callable
-from functools import cache
-from os import sep
-from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
 
-from .bnb4bit_adapter import Bnb4bitAdapter
-from .bnb8bit_adapter import Bnb8bitAdapter
 from .dtensor_adapter import DTensorAdapter
 from .float8_adapter import Float8Adapter
 from .gguf_adapter import GgufAdapter
@@ -28,7 +22,6 @@ from .mx_adapter import MxAdapter
 from .nvfp4_adapter import Nvfp4Adapter
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from .piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
-from .quanto_adapter import QuantoAdapter
 from .static_float8_adapter import StaticFloat8Adapter
 from .tensor_adapters import RegularAdapter, TensorAdapter
 from .trellis_adapter import TrellisAdapter
@@ -42,9 +35,6 @@ from .trellis_adapter import TrellisAdapter
 # RegularAdapter is last — it matches only exact torch.Tensor/nn.Parameter, so
 # structured subclasses reach their dedicated adapter first.
 _BUILTIN_ADAPTERS: tuple[type[TensorAdapter[Any, Any]], ...] = (
-    QuantoAdapter,
-    Bnb4bitAdapter,
-    Bnb8bitAdapter,
     PiperConvRotNVFP4Adapter,
     Nvfp4Adapter,
     MxAdapter,
@@ -57,24 +47,6 @@ _BUILTIN_ADAPTERS: tuple[type[TensorAdapter[Any, Any]], ...] = (
     PiperConvRotInt8Adapter,
     RegularAdapter,
 )
-
-_DEPRECATED_ADAPTER_EXTRAS: dict[type[TensorAdapter[Any, Any]], str] = {
-    Bnb4bitAdapter: "bnb",
-    Bnb8bitAdapter: "bnb",
-    QuantoAdapter: "quanto",
-}
-
-
-@cache
-def _warn_deprecated_extra(extra: str) -> None:
-    warnings.warn(
-        f"Piper Offload's built-in [{extra}] tensor adapters are deprecated "
-        "and will be removed in a future minor release. Migrate to a supported weight "
-        "format or provide a custom tensor adapter with register_adapter().",
-        FutureWarning,
-        skip_file_prefixes=(f"{Path(__file__).parent}{sep}",),
-    )
-
 
 # Process-global external registrations. New adapters are prepended so a later,
 # more-specific registration can override an earlier broad match. Registration
@@ -146,8 +118,6 @@ def select_adapter(t: torch.Tensor) -> TensorAdapter[Any, Any]:
             return adapter_cls()
     for adapter_cls in _BUILTIN_ADAPTERS:
         if adapter_cls.matches(t):
-            if extra := _DEPRECATED_ADAPTER_EXTRAS.get(adapter_cls):
-                _warn_deprecated_extra(extra)
             return adapter_cls()
     raise NotImplementedError(
         f"No TensorAdapter for tensor type {type(t).__name__!r}. "
@@ -165,15 +135,10 @@ def param_representation(param: torch.Tensor) -> torch.Tensor:
     """Return the tensor that carries ``param``'s adapter representation.
 
     For a plain :class:`nn.Parameter` (or bare tensor) this is ``param.data``
-    — which for a quant tensor wrapped *inside* a Parameter (TorchAO
-    ``Float8Tensor`` / ``NVFP4Tensor``, quanto ``WeightQBytesTensor``) is the
-    wrapped subclass itself, exactly what the adapter
-    needs.
-
-    A Parameter *subclass* that is itself the structured tensor — notably
-    bitsandbytes ``Params4bit`` and Diffusers ``GGUFParameter``, whose ``.data``
-    strips quantization metadata — must be adapted as the object itself, or it
-    would silently dispatch to :class:`RegularAdapter` and lose that state.
+    — which for a quantized tensor wrapped inside a Parameter is the
+    wrapped subclass itself. A Parameter subclass (for example,
+    ``GgufParameter``) is passed directly so the adapter can inspect
+    representation metadata carried by the object.
     """
     if type(param) is nn.Parameter or type(param) is torch.Tensor:
         return param.data

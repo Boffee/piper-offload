@@ -9,9 +9,6 @@ from torch import nn
 from piper_offload.host_buffer import HostBuffer
 from piper_offload.host_param import HostParam
 from piper_offload.tensor_adapters import (
-    DequantRequantTensorAdapter,
-    LoRAMergeTensorAdapter,
-    TensorCopyIntoAdapter,
     capture_host_tensor,
 )
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
@@ -209,13 +206,12 @@ class TestHostParam:
 
         assert tensor_id(t)[:2] == ("regular", t.device)
 
-    def test_non_quanto_capture_and_load(self) -> None:
+    def test_plain_capture_and_load(self) -> None:
         p = nn.Parameter(torch.randn(8, 16, dtype=torch.bfloat16), requires_grad=False)
         host_param = HostParam(p)
         cpu_param = host_param.make_cpu_param()
         other_cpu_param = host_param.make_cpu_param()
 
-        # make_cpu_param wraps a plain host tensor — no quanto subclass.
         assert type(cpu_param.data) is torch.Tensor
         assert not cpu_param.data.is_pinned()
         assert cpu_param.data.shape == p.shape
@@ -281,150 +277,6 @@ class TestHostBuffer:
         assert host.target_layout == HostBuffer.target_layout_for(
             host.tensor,
         )
-
-
-# ---------------------------------------------------------------------------
-# Quanto path — only nontrivial branch in HostParam
-# ---------------------------------------------------------------------------
-
-
-class TestHostParamQuanto:
-    def test_quanto_tensor_id_includes_inner_devices(self) -> None:
-        quanto = pytest.importorskip("optimum.quanto")
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
-        rows, cols = 4, 8
-        data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
-        scale = torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25)
-        qt = WeightQBytesTensor.create(
-            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
-        )
-
-        key = tensor_id(qt)
-        assert key[1] == qt._data.device
-        assert key[7] == qt._scale.device
-
-    def test_quanto_adapter_conversion_and_merge_capabilities(self) -> None:
-        quanto = pytest.importorskip("optimum.quanto")
-        from optimum.quanto.tensor.optimizers import AbsmaxOptimizer
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
-        rows, cols = 4, 8
-        data = torch.randint(-32, 32, (rows, cols), dtype=torch.int8)
-        scale = torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25)
-        qt = WeightQBytesTensor.create(
-            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
-        )
-
-        adapter = select_adapter(qt)
-        assert isinstance(adapter, DequantRequantTensorAdapter)
-        assert isinstance(adapter, LoRAMergeTensorAdapter)
-        assert isinstance(adapter, TensorCopyIntoAdapter)
-        dense = adapter.dequantize(qt)
-        assert type(dense) is torch.Tensor
-        assert dense.dtype == qt.dtype
-        assert dense.shape == qt.shape
-
-        expected_scale = AbsmaxOptimizer()(
-            dense,
-            qtype=quanto.qint8,
-            axis=0,
-        ).to(scale.dtype)
-        expected = WeightQBytesTensor.quantize(
-            dense,
-            quanto.qint8,
-            0,
-            expected_scale,
-            optimized=False,
-        )
-        requantized = adapter.requantize(dense, like=qt)
-        assert isinstance(requantized, WeightQBytesTensor)
-        assert requantized.qtype is quanto.qint8
-        assert requantized.axis == 0
-        assert tuple(requantized.size()) == (rows, cols)
-        torch.testing.assert_close(requantized._data, expected._data)
-        torch.testing.assert_close(requantized._scale, expected._scale)
-
-        updated = dense + 1
-        updated_scale = AbsmaxOptimizer()(
-            updated,
-            qtype=quanto.qint8,
-            axis=0,
-        ).to(scale.dtype)
-        expected_updated = WeightQBytesTensor.quantize(
-            updated,
-            quanto.qint8,
-            0,
-            updated_scale,
-            optimized=False,
-        )
-        updated_qt = adapter.requantize(updated, like=qt)
-        original_scale_ptr = qt._scale.data_ptr()
-        adapter.copy_into(updated_qt, target=qt)
-        torch.testing.assert_close(qt._data, expected_updated._data)
-        torch.testing.assert_close(qt._scale, expected_updated._scale)
-        assert qt._scale.data_ptr() == original_scale_ptr
-
-    def test_capture_decomposes_data_and_scale(self) -> None:
-        # Quanto WeightQBytesTensor must be decomposed into _data + _scale
-        # and the CPU wrapper reconstructed from the host tensors.
-        # A naive tensor.clone() would silently dequantize via the dispatch
-        # fallback — that bug is the reason host_param.py exists.
-        quanto = pytest.importorskip("optimum.quanto")
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
-        rows, cols = 4, 8
-        data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)
-        scale = torch.rand(rows, 1, dtype=torch.bfloat16)
-        qt = WeightQBytesTensor.create(
-            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
-        )
-        p = nn.Parameter(qt, requires_grad=False)
-        host_param = HostParam(p)
-
-        # make_cpu_param wraps a quanto tensor whose _data and _scale are
-        # host, contiguous, and carry the original quant metadata.
-        cpu_param = host_param.make_cpu_param()
-        assert isinstance(cpu_param.data, WeightQBytesTensor)
-        qt_host = cpu_param.data
-        assert not qt_host._data.is_pinned()
-        assert qt_host._data.is_contiguous()
-        assert qt_host._data.dtype == torch.int8
-        assert not qt_host._scale.is_pinned()
-        assert qt_host.qtype is quanto.qint8
-        assert qt_host.axis == 0
-        assert tuple(qt_host.size()) == (rows, cols)
-        assert qt_host.stride() == (cols, 1)
-        assert getattr(qt_host, "activation_qtype", None) is None
-        # Zero-copy: the wrapper's _data and _scale point at the same
-        # host buffers the adapter host, not separate clones.
-        assert qt_host._data.data_ptr() == host_param.host_state.data.data_ptr()
-        assert qt_host._scale.data_ptr() == host_param.host_state.scale.data_ptr()
-
-    @CUDA
-    def test_allocate_copy_make_gpu_param_quanto_round_trip(self) -> None:
-        quanto = pytest.importorskip("optimum.quanto")
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
-        rows, cols = 4, 8
-        data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)
-        scale = torch.rand(rows, 1, dtype=torch.bfloat16)
-        qt = WeightQBytesTensor.create(
-            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
-        )
-        p = nn.Parameter(qt, requires_grad=False)
-        host_param = HostParam(p)
-
-        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
-        host_param.copy_to_gpu(gpu_state, non_blocking=True)
-        gpu_param = host_param.make_gpu_param(gpu_state)
-        torch.cuda.synchronize()
-        assert isinstance(gpu_param.data, WeightQBytesTensor)
-        assert gpu_param.data._data.is_cuda
-        assert gpu_param.data._scale.is_cuda
-        qt_host = host_param.make_cpu_param().data
-        assert torch.equal(gpu_param.data._data.cpu(), qt_host._data)
-        assert torch.equal(gpu_param.data._scale.cpu(), qt_host._scale)
 
 
 # ---------------------------------------------------------------------------
@@ -515,42 +367,6 @@ class TestCopyToCpu:
         host_param.copy_to_cpu(gpu_state)
         torch.cuda.synchronize()
         assert host_param.host_state.data.data_ptr() == original_ptr
-
-    @CUDA
-    def test_quanto_round_trip(self) -> None:
-        # Quanto D2H must write back BOTH _data (int8) and _scale, and
-        # the quant metadata on the host wrapper must be unchanged.
-        quanto = pytest.importorskip("optimum.quanto")
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
-        rows, cols = 4, 8
-        data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)
-        scale = torch.rand(rows, 1, dtype=torch.bfloat16)
-        qt = WeightQBytesTensor.create(
-            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
-        )
-        p = nn.Parameter(qt, requires_grad=False)
-        host_param = HostParam(p)
-        device = torch.device("cuda")
-        gpu_state = host_param.allocate_gpu_storage(device)
-        host_param.copy_to_gpu(gpu_state)
-        torch.cuda.synchronize()
-
-        # Mutate GPU-side _data and _scale in place.
-        new_data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8, device=device)
-        new_scale = torch.rand(rows, 1, dtype=torch.bfloat16, device=device)
-        gpu_state.data.copy_(new_data)
-        gpu_state.scale.copy_(new_scale)
-        torch.cuda.synchronize()
-
-        host_param.copy_to_cpu(gpu_state)
-        torch.cuda.synchronize()
-        assert torch.equal(host_param.host_state.data, new_data.cpu())
-        assert torch.equal(host_param.host_state.scale, new_scale.cpu())
-        # Metadata untouched — qtype, axis, etc. live on the host
-        # state and are not part of the GPU representation.
-        assert host_param.host_state.qtype is quanto.qint8
-        assert host_param.host_state.axis == 0
 
     @CUDA
     def test_gguf_lacks_cpu_round_trip_capability(self) -> None:

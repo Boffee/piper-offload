@@ -510,9 +510,6 @@ class LoRATransform:
         plan = self._weight_plan
         if plan is None:
             raise RuntimeError("LoRA weight target must be validated before application.")
-        # Operate on the representation tensor: ``param.data`` for plain and
-        # wrapped-quant parameters, but the param itself for a Parameter
-        # subclass whose ``.data`` is lossy (bitsandbytes Params4bit).
         representation = param_representation(param)
         self._apply_plan(representation, plan)
 

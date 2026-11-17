@@ -7,11 +7,8 @@ across the CPU↔GPU boundary while preserving correctness:
   buffer; consumers either replace ``module._parameters[leaf]`` with a
   fresh :class:`nn.Parameter` wrapping it, or ``.data``-swap to preserve
   identity for trainable params.
-- Quanto ``WeightQBytesTensor``: two host tensors (``_data`` + ``_scale``)
-  plus quant metadata; the wrapper must be reconstructed on each move.
-  ``.data``-swap doesn't work for quanto — its quant state is part of
-  the Parameter's wrapped object, not its bytes — so quanto stays
-  frozen-only via registry replacement.
+- Quantized tensor subclasses: packed values, scales, and metadata.
+  The adapter reconstructs the wrapper over the active storage.
 
 Each adapter encapsulates the mechanics for one tensor type. The rest
 of the package is type-agnostic and dispatches through
@@ -195,10 +192,8 @@ class TensorAdapter[HostStateT, GpuStateT](Protocol):
         """Build a stable :class:`nn.Parameter` wrapping the GPU state.
         Reused across many :meth:`copy_to_gpu` calls.
 
-        Takes both the host state and the GPU state because
-        adapters with structured tensors (e.g. quanto) need captured metadata
-        to reconstruct the GPU-side wrapper. Plain
-        adapters ignore ``host``.
+        Structured adapters use captured metadata from ``host`` to
+        reconstruct the GPU-side wrapper.
 
         ``requires_grad`` defaults to ``False``; pass ``True`` for
         trainable use cases where the wrapper participates in autograd.
@@ -592,17 +587,10 @@ class PostLoadRearmTensorAdapter[HostStateT, GpuStateT](
     """Optional capability: re-arm the active GPU wrapper after each load.
 
     The offloader builds one GPU wrapper per pool target and reuses it
-    across loads, refilling its buffers each time. That assumes the wrapper
-    keeps describing itself across refills — true for plain tensors, 4-bit,
-    and quanto, whose reconstructed wrapper aliases the refilled buffers.
-
-    bitsandbytes int8 breaks the assumption: the first forward migrates
-    ``CB``/``SCB`` onto the owning module (``MatmulLtState``) and nulls them
-    on the wrapper, so the reused wrapper never re-initializes — and in the
-    pooled streaming path, where blocks share buffers, the stale module
-    state reads another block's bytes. Adapters that opt in re-point the
-    wrapper's migrated state at the freshly-loaded GPU storage after each
-    copy, so the next forward re-initializes from the current data.
+    across loads, refilling its buffers each time. An adapter whose
+    forward moves state from the wrapper onto the module can restore
+    the wrapper's state after each copy so the next forward uses the
+    current parameters.
     """
 
     @staticmethod
@@ -795,10 +783,7 @@ class RegularAdapter:
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
-        # Strict identity match on the base class. PEFT, FSDP, quanto,
-        # DTensor, etc. are subclasses with extra state; a silent fallback
-        # to RegularAdapter would clone-and-dequantize quanto or break
-        # distributed placement. Each subclass needs its own adapter.
+        # A subclass can carry representation metadata beyond its storage.
         return type(t) is torch.Tensor or type(t) is nn.Parameter
 
     @staticmethod
@@ -859,9 +844,6 @@ class RegularAdapter:
         requires_grad: bool = False,
     ) -> nn.Parameter:
         _ = host
-        # host unused: regular tensors carry no metadata beyond storage.
-        # Argument kept for Protocol parity with TensorAdapter — quanto
-        # and other structured tensors need it to reconstruct wrappers.
         return nn.Parameter(gpu_state.data, requires_grad=requires_grad)
 
     @staticmethod

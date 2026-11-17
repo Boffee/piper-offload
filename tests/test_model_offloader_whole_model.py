@@ -579,9 +579,7 @@ class TestTiedWeightDedup:
         return m, embed, head
 
     def _make_distinct_param_tied_model(self) -> tuple[nn.Module, nn.Parameter, nn.Parameter]:
-        """Two distinct Parameter objects sharing the same storage —
-        the rarer case that the original ModelOffloader silently broke
-        (e.g. quanto wrappers around shared inner _data)."""
+        """Two distinct Parameter objects sharing the same storage."""
         shared = torch.randn(8, 16, dtype=torch.bfloat16)
         a = nn.Parameter(shared, requires_grad=False)
         b = nn.Parameter(shared, requires_grad=False)  # distinct Parameter, same storage
@@ -814,69 +812,6 @@ class TestZeroSizedParams:
             assert _unique_host_param_count(pw) == 3
         finally:
             pw.deactivate()
-
-
-# ---------------------------------------------------------------------------
-# Quanto end-to-end — the blocker Codex caught
-# ---------------------------------------------------------------------------
-
-
-class TestQuanto:
-    def _make_quanto_model(self) -> nn.Module:
-        """Build a tiny module whose 'weight' Parameter is a quanto
-        WeightQBytesTensor. Simulates a quanto-quantized Linear without
-        actually invoking quanto's quantize() pipeline (which requires
-        hooking into nn.Linear in a way that's overkill for the test).
-        """
-        quanto = pytest.importorskip("optimum.quanto")
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
-        rows, cols = 4, 8
-        data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)
-        scale = torch.rand(rows, 1, dtype=torch.bfloat16)
-        qt = WeightQBytesTensor.create(quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None)
-
-        m = nn.Module()
-        m.weight = nn.Parameter(qt, requires_grad=False)
-        return m
-
-    def test_quanto_constructor_rebuilds_from_transferred_host_storage(self) -> None:
-        # Structured parameters still require registry replacement even when
-        # their compatible CPU inner storage is transferred without copying.
-        m = self._make_quanto_model()
-        original_data_ptr = m.weight._data.data_ptr()
-        pw = ModelOffloader.from_module(m)
-        try:
-            assert m.weight._data.data_ptr() == original_data_ptr
-            assert not m.weight._data.is_pinned()
-            assert not m.weight._scale.is_pinned()
-        finally:
-            pw.deactivate()
-
-    @CUDA
-    def test_quanto_activate_moves_inner_to_cuda(self) -> None:
-        m = self._make_quanto_model()
-        pw = ModelOffloader.from_module(m)
-        try:
-            with activated_model(pw, "cuda"):
-                assert m.weight._data.is_cuda
-                assert m.weight._scale.is_cuda
-            # Back to host after deactivate
-            assert not m.weight._data.is_pinned()
-            assert not m.weight._scale.is_pinned()
-        finally:
-            pw.deactivate()
-
-    def test_quanto_close_releases_internal_state(self) -> None:
-        # deactivate is idempotent; the model.s quanto
-        # parameter still references its CPU storage. Host
-        # memory is freed when the caller drops the model reference.
-        m = self._make_quanto_model()
-        pw = ModelOffloader.from_module(m)
-        pw.deactivate()
-        # Quanto wrapper still on CPU after deactivate.
-        assert not m.weight._data.is_pinned()
-        assert not m.weight._scale.is_pinned()
 
 
 # ---------------------------------------------------------------------------
