@@ -660,7 +660,6 @@ dependencies = [
 [package.optional-dependencies]
 all = [
     { name = "bitsandbytes" },
-    { name = "gguf" },
     { name = "numpy" },
     { name = "optimum-quanto" },
     { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
@@ -671,7 +670,6 @@ bnb = [
     { name = "bitsandbytes" },
 ]
 gguf = [
-    { name = "gguf" },
     { name = "numpy" },
     { name = "torchao", version = "0.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "torchao", version = "0.18.0+cu132", source = { registry = "https://download.pytorch.org/whl/cu132" }, marker = "sys_platform == 'linux'" },
@@ -691,6 +689,7 @@ triton = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "gguf" },
     { name = "piper-offload", extra = ["all"] },
     { name = "pre-commit" },
     { name = "pyright" },
@@ -701,7 +700,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "bitsandbytes", marker = "extra == 'bnb'", specifier = ">=0.49,<0.51" },
-    { name = "gguf", marker = "extra == 'gguf'", specifier = ">=0.18,<0.20" },
     { name = "numpy", marker = "extra == 'torchao'", specifier = ">=2.3.2,<3" },
     { name = "optimum-quanto", marker = "extra == 'quanto'", specifier = ">=0.2.7,<0.3" },
     { name = "piper-kernels", specifier = ">=0.8.0rc1,<0.9" },
@@ -717,6 +715,7 @@ provides-extras = ["bnb", "quanto", "torchao", "gguf", "triton", "all"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "gguf", specifier = ">=0.18,<0.20" },
     { name = "piper-offload", extras = ["all"] },
     { name = "pre-commit", specifier = ">=4.6.1" },
     { name = "pyright", specifier = ">=1.1.411" },

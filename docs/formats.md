@@ -112,7 +112,8 @@ and [piper_convrot_nvfp4_adapter.py](../src/piper_offload/piper_convrot_nvfp4_ad
 
 ## Load a GGUF checkpoint
 
-`MappedCheckpoint` reads safetensors and GGUF through read-only file mappings.
+`MappedCheckpoint` reads safetensors and little-endian GGUF version 2 and 3
+files through read-only file mappings; reading GGUF needs no extra.
 GGUF F32, F16, and BF16 entries are ordinary tensors. Quantized entries are
 `GgufParameter` objects with a logical matrix shape and BF16 compute dtype;
 `as_tensor()` exposes packed bytes. `get_slice()` reports logical shape and
@@ -131,10 +132,11 @@ packed; active weights use BF16 ConvRot INT8 without allocating a full dense
 weight during conversion. The logical input width must be divisible by 16.
 
 Direct conversion supports F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
-Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS. The `gguf` extra includes
-TorchAO and Triton because this conversion requires both. LoRA and dense
-updates apply to the active ConvRot target; permanent merge cannot modify the
-packed GGUF source.
+Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS. `keys()` also lists tensors
+in other encodings, and requesting one raises `CheckpointError`, so a loader
+can skip tensors it does not need. The `gguf` extra installs TorchAO and Triton
+because this conversion requires both. LoRA and dense updates apply to the
+active ConvRot target; permanent merge cannot modify the packed GGUF source.
 
 Externally supplied Diffusers `GGUFParameter` objects are recognized without a
 Diffusers dependency. Their GGUF linear modules must first be normalized to

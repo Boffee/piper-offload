@@ -32,11 +32,9 @@ quanto = ["optimum-quanto>=0.2.7,<0.3"]
 # ConvRot tensors subclass `TorchAOBaseTensor`, and the NVFP4 encoder reaches
 # TorchAO's `mx_formats` kernels, which import NumPy at module scope.
 torchao = ["numpy>=2.3.2,<3", "torchao>=0.18,<0.19"]
-# GGUF decodes through ConvRot INT8's Triton converter, which has no fallback.
-gguf = [
-    "gguf>=0.18,<0.20",
-    "piper-offload[torchao,triton]",
-]
+# Reading GGUF files needs no extra. Activating their quantized weights decodes
+# through ConvRot INT8's Triton converter, which has no fallback.
+gguf = ["piper-offload[torchao,triton]"]
 triton = [
     # Linux PyTorch builds declare their own matching Triton: `triton` for CUDA,
     # `triton-rocm` for PyTorch's ROCm wheels. Naming one here would clash with the other.
@@ -56,6 +54,9 @@ dev = [
     "pyright>=1.1.411",
     "pytest~=9.1",
     "ruff>=0.16.1",
+    # Tests compare MappedCheckpoint's GGUF reader with the reference parser
+    # and use it to write GGUF files.
+    "gguf>=0.18,<0.20",
     # Every adapter backend, so `uv sync` yields a complete test environment
     # (otherwise optional adapter suites silently skip).
     "piper-offload[all]",
