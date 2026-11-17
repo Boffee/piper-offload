@@ -39,6 +39,12 @@ or Visual Studio installation is not required for eager GPU execution.
 | Trellis-coded → ConvRot INT8 | `torchao`, `triton` | Activation only | Activation only |
 | DTensor | Depends on local shard | Delegates to local adapter | Delegates to local adapter |
 
+The `bnb` and `quanto` extras and their built-in tensor adapters are deprecated
+and will be removed in a future minor release. Offload emits a `FutureWarning`
+on first use of each deprecated extra's adapters. For future loads, use a
+checkpoint in another supported format or
+[register a custom tensor adapter](#dtensor-and-custom-formats).
+
 Plain float8 storage can move but is not an additive merge target. Scaled FP8
 wrappers have their own merge implementations. Routed LoRA requires no merge
 capability, so it also works with tile-packed INT4 when the owning module is a

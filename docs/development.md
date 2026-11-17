@@ -9,13 +9,17 @@ and [models](models.md) for the public lifecycle.
 ## Setup and validation
 
 Use the Python and PyTorch versions in [pyproject.toml](../pyproject.toml).
-`uv sync` installs development dependencies, including optional tensor backends.
+`uv sync` installs the development tools and the TorchAO and Triton extras.
 
 ```bash
 uv run pytest tests -q
 uv run ruff check .
 uv run pyright
 ```
+
+To include the deprecated bitsandbytes and Quanto adapters in a test run, use
+`uv run --extra bnb --extra quanto pytest tests -q`. CI installs both extras
+explicitly.
 
 GPU tests carry skip marks for missing hardware; an unmarked test that needs
 CUDA fails on a CPU-only host instead of skipping. Run the relevant GPU tests

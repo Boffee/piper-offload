@@ -54,9 +54,8 @@ dev = [
     "pyright>=1.1.411",
     "pytest~=9.1",
     "ruff>=0.16.1",
-    # Every adapter backend, so `uv sync` yields a complete test environment
-    # (otherwise optional adapter suites silently skip).
-    "piper-offload[all]",
+    "safetensors",
+    "piper-offload[torchao,triton]",
 ]
 
 [tool.ruff]

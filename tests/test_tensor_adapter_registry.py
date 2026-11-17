@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+import warnings
 from typing import cast
 
 import pytest
@@ -11,8 +12,11 @@ from piper_offload import (
     TensorAdapter,
     register_adapter,
 )
+from piper_offload.bnb4bit_adapter import Bnb4bitAdapter
+from piper_offload.bnb8bit_adapter import Bnb8bitAdapter
 from piper_offload.dtensor_adapter import DTensorAdapter
-from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
+from piper_offload.quanto_adapter import QuantoAdapter
+from piper_offload.tensor_adapter_registry import _warn_deprecated_extra, select_adapter, tensor_id
 from piper_offload.tensor_adapters import RegularAdapter
 
 
@@ -157,6 +161,31 @@ def test_registered_adapter_precedes_builtin_match() -> None:
         remove_adapter()
 
     assert isinstance(select_adapter(tensor), RegularAdapter)
+
+
+def test_deprecated_builtin_adapters_warn_on_use(monkeypatch: pytest.MonkeyPatch) -> None:
+    bnb4, bnb8, quanto, plain = (torch.empty(1) for _ in range(4))
+    for adapter_cls, weight in ((Bnb4bitAdapter, bnb4), (Bnb8bitAdapter, bnb8), (QuantoAdapter, quanto)):
+        monkeypatch.setattr(adapter_cls, "matches", staticmethod(lambda tensor, target=weight: tensor is target))
+
+    _warn_deprecated_extra.cache_clear()
+    try:
+        with warnings.catch_warnings(record=True) as notices:
+            warnings.simplefilter("always", FutureWarning)
+            assert isinstance(select_adapter(plain), RegularAdapter)
+            assert not notices
+            assert isinstance(select_adapter(bnb4), Bnb4bitAdapter)
+            assert isinstance(select_adapter(bnb8), Bnb8bitAdapter)
+            assert isinstance(select_adapter(quanto), QuantoAdapter)
+            assert isinstance(select_adapter(quanto), QuantoAdapter)
+
+        bnb_notice, quanto_notice = notices
+        for notice, extra in ((bnb_notice, "bnb"), (quanto_notice, "quanto")):
+            assert notice.category is FutureWarning
+            assert f"[{extra}] tensor adapters are deprecated" in str(notice.message)
+            assert notice.filename == __file__
+    finally:
+        _warn_deprecated_extra.cache_clear()
 
 
 def test_newest_registration_wins_and_removal_reveals_previous() -> None:

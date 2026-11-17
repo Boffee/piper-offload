@@ -639,11 +639,12 @@ triton = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "piper-offload", extra = ["all"] },
+    { name = "piper-offload", extra = ["torchao", "triton"] },
     { name = "pre-commit" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "safetensors" },
 ]
 
 [package.metadata]
@@ -664,11 +665,12 @@ provides-extras = ["bnb", "quanto", "torchao", "gguf", "triton", "all"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "piper-offload", extras = ["all"] },
+    { name = "piper-offload", extras = ["torchao", "triton"] },
     { name = "pre-commit", specifier = ">=4.6.1" },
     { name = "pyright", specifier = ">=1.1.411" },
     { name = "pytest", specifier = "~=9.1" },
     { name = "ruff", specifier = ">=0.16.1" },
+    { name = "safetensors" },
 ]
 
 [[package]]

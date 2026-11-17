@@ -18,9 +18,10 @@ pip install piper-offload
 ```
 
 The base dependencies are `torch` and `piper-kernels`. Optional integrations
-are available through the `bnb`, `quanto`, `gguf`, and `torchao` extras;
-`triton` adds accelerated kernels, and `all` includes every integration.
-See [supported formats](https://github.com/Boffee/piper-offload/blob/main/docs/formats.md) for backend requirements.
+are available through the `gguf` and `torchao` extras. The `triton` extra
+adds accelerated kernels, and `all` includes every integration. See
+[supported formats](https://github.com/Boffee/piper-offload/blob/main/docs/formats.md)
+for backend requirements and the deprecation of `bnb` and `quanto`.
 
 ## Quick start
 
