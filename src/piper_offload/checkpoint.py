@@ -16,16 +16,18 @@ maps it.
 import contextlib
 import io
 import json
+import math
 import mmap
 import os
 import struct
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import EllipsisType
 from typing import Any, NoReturn, Self, TypeGuard
 
 import torch
-from piper_kernels.gguf import GGUFQuantizationType
+from piper_kernels.gguf import GGUF_QUANT_SIZES, GGUFQuantizationType
 
 from ._mapped_file import FileSlice, MappedFile, file_slice
 from .gguf_parameter import GgufParameter
@@ -113,6 +115,13 @@ class _TensorEntry:
     packed_shape: tuple[int, ...] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _UnsupportedTensor:
+    """A GGUF tensor in an encoding Piper Kernels cannot convert; requesting it raises."""
+
+    quant_type: int
+
+
 class MappedCheckpoint:
     """A safetensors or GGUF file mapped read-only, with ``safe_open``'s reading surface.
 
@@ -122,11 +131,12 @@ class MappedCheckpoint:
     are deliberate. The safetensors header is validated in full before any
     tensor can be built. GGUF encoding support is checked when a tensor's
     descriptor or value is requested, allowing selective loads to skip unused
-    encodings. Tensors are views into the mapping and outlive the reader. GGUF
-    parsing uses the optional ``gguf`` package; quantized tensors are returned
-    as ``GgufParameter`` objects with logical shape and BF16 compute dtype.
-    GGUF ``metadata()`` returns None: its format metadata is handled by the
-    parser and is not safetensors' application metadata.
+    encodings. Tensors are views into the mapping and outlive the reader.
+
+    GGUF files must be little-endian, version 2 or 3. Quantized GGUF tensors
+    are returned as ``GgufParameter`` objects with logical shape and BF16
+    compute dtype. GGUF ``metadata()`` returns None: its key-value metadata is
+    not safetensors' application metadata and is not decoded.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -135,8 +145,9 @@ class MappedCheckpoint:
         try:
             size = file.seek(0, io.SEEK_END)
             file.seek(0)
+            self._entries: Mapping[str, _TensorEntry | _UnsupportedTensor]
             if self.path.suffix.lower() == ".gguf":
-                self._entries, self._metadata = _read_gguf_header(self.path, size), None
+                self._entries, self._metadata = _read_gguf_header(file, size), None
             else:
                 self._entries, self._metadata = _read_header(file, size)
             mapping = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
@@ -191,49 +202,142 @@ class MappedCheckpoint:
             entry = self._entries[name]
         except KeyError:
             raise KeyError(f"{self.path} has no tensor {name!r}") from None
-        if entry.quant_type is not None:
-            try:
-                GGUFQuantizationType(entry.quant_type)
-            except ValueError as error:
-                raise CheckpointError(
-                    f"unsupported GGUF quantization type {entry.quant_type!r} for {name!r}",
-                ) from error
-            if len(entry.shape) != 2:
-                raise CheckpointError(f"quantized GGUF tensor {name!r} must be a matrix, got {entry.shape}")
+        if isinstance(entry, _UnsupportedTensor):
+            raise CheckpointError(f"unsupported GGUF quantization type {entry.quant_type!r} for {name!r}")
+        if entry.quant_type is not None and len(entry.shape) != 2:
+            raise CheckpointError(f"quantized GGUF tensor {name!r} must be a matrix, got {entry.shape}")
         return entry
 
 
-def _read_gguf_header(path: Path, size: int) -> dict[str, _TensorEntry]:
-    from gguf import GGUFReader  # noqa: PLC0415 — optional parser, only needed for GGUF files
+# The GGUF v2 and v3 header, all little-endian: the magic "GGUF", a u32
+# version and u64 tensor and metadata counts. Then each metadata entry: a
+# string key, a u32 value type and the value. Then each tensor's info: a
+# string name, a u32 dimension count, u64 dimensions innermost first, a u32
+# encoding type and a u64 data offset from the aligned start of tensor data.
+# A string is a u64 byte length and UTF-8 bytes; an array value is a u32
+# element type, a u64 count and the elements. Value types 0-7 and 10-12 are
+# fixed-size numbers and booleans, 8 is a string and 9 an array.
+_GGUF_PREFIX = struct.Struct("<4sIQQ")
+_GGUF_U32 = struct.Struct("<I")
+_GGUF_U64 = struct.Struct("<Q")
+_GGUF_TYPE_AND_COUNT = struct.Struct("<IQ")  # an array's element type and count; a tensor's encoding and offset
+_GGUF_UINT32, _GGUF_STRING, _GGUF_ARRAY = 4, 8, 9
+_GGUF_SCALAR_BYTES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+_GGUF_PLAIN_TAGS: dict[int, str] = {
+    GGUFQuantizationType.F32: "F32",
+    GGUFQuantizationType.F16: "F16",
+    GGUFQuantizationType.BF16: "BF16",
+}
 
-    # GGUFReader owns parsing and creates only NumPy views over the payload.
-    # Retain plain descriptors, not its arrays: tensors use our mapping and
-    # the open file held by their storage, just as safetensors tensors do.
-    reader = GGUFReader(path, mode="r")
-    if reader.byte_order != "I":
+
+def _read_gguf_header(file: io.BufferedReader, size: int) -> dict[str, _TensorEntry | _UnsupportedTensor]:
+    """Tensor entries from a little-endian GGUF v2 or v3 header.
+
+    Reads the counts, the ``general.alignment`` value and each tensor's info.
+    Every other metadata value is skipped by its length, never decoded: a
+    chat model's tokenizer keeps hundreds of thousands of strings there.
+    Tensors whose encoding Piper Kernels cannot convert are listed but not
+    laid out, so a selective load can skip them.
+    """
+    if size < _GGUF_PREFIX.size:
+        raise CheckpointError(f"not a GGUF file: shorter than its {_GGUF_PREFIX.size}-byte header")
+    with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        try:
+            return _parse_gguf_header(data)
+        except (struct.error, UnicodeDecodeError) as error:
+            raise CheckpointError(f"malformed GGUF header: {error}") from None
+
+
+def _parse_gguf_header(data: mmap.mmap) -> dict[str, _TensorEntry | _UnsupportedTensor]:
+    magic, version, tensor_count, metadata_count = _GGUF_PREFIX.unpack_from(data)
+    if magic != b"GGUF":
+        raise CheckpointError("not a GGUF file: it does not begin with 'GGUF'")
+    if version & 0xFFFF == 0:  # a big-endian version number, such as 3 << 24
         raise CheckpointError("GGUF byte-swapped weights cannot be used by the native conversion kernels")
-    plain: dict[int, str] = {
-        GGUFQuantizationType.F32: "F32",
-        GGUFQuantizationType.F16: "F16",
-        GGUFQuantizationType.BF16: "BF16",
-    }
-    entries: dict[str, _TensorEntry] = {}
-    for tensor in reader.tensors:
-        quant_type = int(tensor.tensor_type)
-        shape = tuple(int(dim) for dim in reversed(tensor.shape))
-        offset, length = int(tensor.data_offset), int(tensor.n_bytes)
-        if not 0 <= offset <= offset + length <= size:
-            raise CheckpointError(f"GGUF tensor {tensor.name!r} extends outside the checkpoint")
-        if quant_type in plain:
-            tag = plain[quant_type]
-            entries[tensor.name] = _TensorEntry(_DTYPES[tag], tag, shape, offset, length)
-        else:
-            entries[tensor.name] = _TensorEntry(
-                torch.uint8, "BF16", shape, offset, length,
-                quant_type=quant_type,
-                packed_shape=tuple(int(dim) for dim in tensor.data.shape),
-            )
+    if version not in (2, 3):
+        raise CheckpointError(f"unsupported GGUF version {version}")
+    pos = _GGUF_PREFIX.size
+    alignment = 32
+    for _ in range(metadata_count):
+        key, pos = _gguf_string(data, pos)
+        (value_type,) = _GGUF_U32.unpack_from(data, pos)
+        pos += 4
+        if key == b"general.alignment":
+            if value_type != _GGUF_UINT32:
+                raise CheckpointError("GGUF general.alignment must be a UINT32")
+            (alignment,) = _GGUF_U32.unpack_from(data, pos)
+            if alignment == 0 or alignment & (alignment - 1):
+                raise CheckpointError(f"GGUF alignment {alignment} is not a power of two")
+        pos = _skip_gguf_value(data, pos, value_type)
+    infos: list[tuple[str, tuple[int, ...], int, int]] = []
+    for _ in range(tensor_count):
+        name, pos = _gguf_string(data, pos)
+        (dimension_count,) = _GGUF_U32.unpack_from(data, pos)
+        dims = struct.unpack_from(f"<{dimension_count}Q", data, pos + 4)
+        quant_type, offset = _GGUF_TYPE_AND_COUNT.unpack_from(data, pos + 4 + 8 * dimension_count)
+        pos += 4 + 8 * dimension_count + _GGUF_TYPE_AND_COUNT.size
+        infos.append((name.decode(), tuple(reversed(dims)), quant_type, offset))
+    data_start = -(-pos // alignment) * alignment
+    entries: dict[str, _TensorEntry | _UnsupportedTensor] = {}
+    for name, shape, quant_type, offset in infos:
+        if name in entries:
+            raise CheckpointError(f"duplicate GGUF tensor {name!r}")
+        entries[name] = _gguf_entry(name, shape, quant_type, data_start + offset, len(data))
     return entries
+
+
+def _gguf_string(data: mmap.mmap, pos: int) -> tuple[bytes, int]:
+    (length,) = _GGUF_U64.unpack_from(data, pos)
+    end = pos + 8 + length
+    if end > len(data):  # slicing would clamp and copy the rest of the file
+        raise CheckpointError("malformed GGUF header: a string extends past the end of the file")
+    return data[pos + 8:end], end
+
+
+def _skip_gguf_value(data: mmap.mmap, pos: int, value_type: int) -> int:
+    """The position after a metadata value, found from lengths alone."""
+    if value_type == _GGUF_STRING:
+        return pos + 8 + _GGUF_U64.unpack_from(data, pos)[0]
+    if value_type != _GGUF_ARRAY:
+        try:
+            return pos + _GGUF_SCALAR_BYTES[value_type]
+        except KeyError:
+            raise CheckpointError(f"unknown GGUF metadata value type {value_type}") from None
+    item_type, count = _GGUF_TYPE_AND_COUNT.unpack_from(data, pos)
+    pos += _GGUF_TYPE_AND_COUNT.size
+    if item_type in _GGUF_SCALAR_BYTES:
+        return pos + count * _GGUF_SCALAR_BYTES[item_type]
+    if item_type == _GGUF_STRING:
+        # Inlined: tokenizer vocabularies and merges hold most of the strings.
+        for _ in range(count):
+            pos += 8 + _GGUF_U64.unpack_from(data, pos)[0]
+        return pos
+    for _ in range(count):
+        pos = _skip_gguf_value(data, pos, item_type)
+    return pos
+
+
+def _gguf_entry(
+    name: str, shape: tuple[int, ...], quant_type: int, offset: int, size: int,
+) -> _TensorEntry | _UnsupportedTensor:
+    if quant_type in _GGUF_PLAIN_TAGS:
+        tag = _GGUF_PLAIN_TAGS[quant_type]
+        dtype = _DTYPES[tag]
+        entry = _TensorEntry(dtype, tag, shape, offset, math.prod(shape) * dtype.itemsize)
+    elif quant_type in GGUF_QUANT_SIZES:
+        block_size, type_size = GGUF_QUANT_SIZES[GGUFQuantizationType(quant_type)]
+        if not shape or shape[-1] % block_size:
+            raise CheckpointError(f"GGUF tensor {name!r} has rows that are not whole {block_size}-value blocks")
+        packed_shape = (*shape[:-1], shape[-1] // block_size * type_size)
+        entry = _TensorEntry(
+            torch.uint8, "BF16", shape, offset, math.prod(packed_shape),
+            quant_type=quant_type, packed_shape=packed_shape,
+        )
+    else:
+        return _UnsupportedTensor(quant_type)
+    if offset + entry.length > size:
+        raise CheckpointError(f"GGUF tensor {name!r} extends outside the checkpoint")
+    return entry
 
 
 def _read_header(file: io.BufferedReader, size: int) -> tuple[dict[str, _TensorEntry], dict[str, str] | None]:

@@ -36,6 +36,13 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   Previously a model with `block_paths` raised `RuntimeError` there, so keeping
   the context around an optimizer step after `deactivate()` worked only for
   models without blocks.
+- `MappedCheckpoint` reads GGUF headers itself and no longer decodes their
+  metadata, which cost seconds of CPU per open for chat models with large
+  tokenizers. Reading GGUF files needs no extra, and the `gguf` extra no longer
+  installs the `gguf` package; install it directly if you import it. Malformed
+  GGUF headers raise `CheckpointError`. Tensors in encodings the `gguf` package
+  does not know are listed and raise `CheckpointError` when requested, like
+  other unsupported encodings, instead of failing the open.
 
 ### Fixed
 
