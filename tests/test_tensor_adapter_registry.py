@@ -42,9 +42,8 @@ def test_package_import_does_not_require_triton() -> None:
 def test_package_import_does_not_require_dtensor() -> None:
     script = """
 import sys
-# Model a minimal installation; quant libraries may themselves require DTensor.
-for package in ('torchao', 'bitsandbytes', 'optimum.quanto'):
-    sys.modules[package] = None
+# Model a minimal installation. TorchAO can itself require DTensor.
+sys.modules['torchao'] = None
 sys.modules['torch.distributed.tensor'] = None
 import torch
 import piper_offload

@@ -25,7 +25,6 @@ from .mx_adapter import MxAdapter
 from .nvfp4_adapter import Nvfp4Adapter
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from .piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
-from .quanto_adapter import QuantoAdapter
 from .rolling_compile import (
     register_rolling_target,
     rolling_inductor_backend,
@@ -47,7 +46,6 @@ _ROLLING_ADAPTER_TYPES = (
     MxAdapter,
     PiperConvRotNVFP4Adapter,
     Nvfp4Adapter,
-    QuantoAdapter,
     GgufAdapter,
     TrellisAdapter,
     PiperConvRotInt8Adapter,
@@ -329,7 +327,7 @@ def _validate_instance(
     if any(type(host.adapter) not in _ROLLING_ADAPTER_TYPES for host in params.values()):
         raise NotImplementedError(
             "rolling compilation supports only regular dense, TorchAO-family, "
-            "Quanto, GGUF, trellis-coded, and Piper ConvRot INT8 parameters"
+            "GGUF, trellis-coded, and Piper ConvRot INT8/NVFP4 parameters"
         )
     if any(host.shape.numel() == 0 for host in params.values()):
         raise NotImplementedError("rolling compilation does not support zero-sized parameter slots")

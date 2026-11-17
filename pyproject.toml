@@ -26,8 +26,6 @@ Issues = "https://github.com/Boffee/piper-offload/issues"
 Changelog = "https://github.com/Boffee/piper-offload/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-bnb = ["bitsandbytes>=0.49,<0.51"]
-quanto = ["optimum-quanto>=0.2.7,<0.3"]
 # TorchAO's own formats and Piper ConvRot INT8/NVFP4 share one requirement:
 # ConvRot tensors subclass `TorchAOBaseTensor`, and the NVFP4 encoder reaches
 # TorchAO's `mx_formats` kernels, which import NumPy at module scope.
@@ -42,7 +40,7 @@ triton = [
     # targets: 3.9 for PyTorch 2.15.
     "triton-windows>=3.9,<3.10; sys_platform == 'win32'",
 ]
-all = ["piper-offload[bnb,gguf,quanto,torchao,triton]"]
+all = ["piper-offload[gguf]"]
 
 [build-system]
 requires = ["uv_build>=0.11.32,<0.12"]
@@ -54,9 +52,8 @@ dev = [
     "pyright>=1.1.411",
     "pytest~=9.1",
     "ruff>=0.16.1",
-    # Every adapter backend, so `uv sync` yields a complete test environment
-    # (otherwise optional adapter suites silently skip).
-    "piper-offload[all]",
+    "safetensors",
+    "piper-offload[torchao,triton]",
 ]
 
 [tool.ruff]

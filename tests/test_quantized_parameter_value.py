@@ -31,15 +31,12 @@ _QUANT_KINDS = (
     "torchao-mxfp8",
     "torchao-mxfp4",
     "torchao-nvfp4",
-    "quanto-qint8",
-    "bnb4",
-    "bnb8",
     "piper-convrot-int8",
     "piper-convrot-nvfp4",
 )
 
 
-def _make_quantized(kind: str) -> torch.Tensor:  # noqa: PLR0911, PLR0912
+def _make_quantized(kind: str) -> torch.Tensor:  # noqa: PLR0911
     """Build one physical representation supported by dense merge."""
     if kind == "torchao-float8":
         from tests.test_float8_adapter import _make_float8
@@ -68,28 +65,6 @@ def _make_quantized(kind: str) -> torch.Tensor:  # noqa: PLR0911, PLR0912
         from tests.test_nvfp4_adapter import _make_nvfp4
 
         return _make_nvfp4()
-    elif kind == "quanto-qint8":
-        quanto = pytest.importorskip("optimum.quanto")
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
-        rows, cols = 16, 16
-        return WeightQBytesTensor.create(
-            quanto.qint8,
-            0,
-            (rows, cols),
-            (cols, 1),
-            torch.randint(-127, 128, (rows, cols), dtype=torch.int8),
-            torch.rand(rows, 1, dtype=torch.bfloat16).add_(0.25),
-            None,
-        )
-    elif kind == "bnb4":
-        from tests.test_bnb4bit_adapter import _make_nf4
-
-        return _make_nf4()
-    elif kind == "bnb8":
-        from tests.test_bnb8bit_adapter import _make_int8
-
-        return _make_int8()
     elif kind == "piper-convrot-int8":
         from tests.test_piper_convrot_int8_adapter import _make_convrot
 

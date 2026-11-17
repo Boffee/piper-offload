@@ -9,7 +9,7 @@ and [models](models.md) for the public lifecycle.
 ## Setup and validation
 
 Use the Python and PyTorch versions in [pyproject.toml](../pyproject.toml).
-`uv sync` installs development dependencies, including optional tensor backends.
+`uv sync` installs the development tools and the TorchAO and Triton extras.
 
 ```bash
 uv run pytest tests -q

@@ -1,8 +1,7 @@
 """Stochastic terminal-code selection for quantized LoRA merges.
 
 `piper-kernels` owns the rounding itself. This module adds the 8-bit float
-codebook that TorchAO's and optimum-quanto's FP8 formats round against, which
-the kernel package has no use for because its own formats are INT8 and NVFP4.
+codebook that TorchAO's FP8 formats round against.
 """
 
 import torch

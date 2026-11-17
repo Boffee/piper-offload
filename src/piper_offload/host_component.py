@@ -19,11 +19,6 @@ Class-specific caveats
   wrapping CPU storage, trainable parameter ``.data`` points at
   CPU storage while preserving the user's Parameter objects, and
   registered buffers are replaced with host copies.
-- Registry replacement (rather than ``param.data`` swap) is required for
-  correctness with quanto ``WeightQBytesTensor``: assigning
-  ``param.data = new_quanto_tensor`` is a no-op for the inner ``_data``
-  / ``_scale`` storages, so the model would silently keep referencing
-  the original quanto wrapper.
 - Buffer mutations during forward (RNN/SSM state, KV cache,
   training-mode BatchNorm running stats) are *discarded* on
   :meth:`release` or :meth:`deactivate`. Suitable for inference of stateless
@@ -44,12 +39,8 @@ Class-specific caveats
   GC reclaims the host tensors immediately. The component releases
   what it owns (its internal name tracking); the user's model is the
   user's concern.
-- Tied weights *are* deduplicated. Two parameter names whose values
-  share underlying storage — whether the standard ``tie_weights()``
-  pattern (one ``Parameter`` under multiple names) or the rarer case
-  of distinct quanto wrappers around shared inner ``_data`` — share a
-  single :class:`HostParam` and a single target storage on
-  activation, preserving the tying invariant on GPU.
+- Tied weights share one :class:`HostParam` and one active target, including
+  distinct parameter objects that the tensor adapter identifies as aliases.
 """
 
 import contextlib
@@ -130,8 +121,8 @@ class HostComponent:
     """CPU component with bulk device transfer.
 
     Instances are created by binding a :class:`HostComponentStore` to a
-    compatible model. Every managed parameter is backed by CPU
-    storage (handling quanto decomposition and tied-weight dedup).
+    compatible model. Tensor adapters capture the CPU storage for each
+    managed parameter, sharing it across tied weights.
     :meth:`activate` starts a device session and eagerly calls
     :meth:`acquire`. Acquisition allocates GPU tensors for each unique host
     parameter and installs that active storage into the managed model registry

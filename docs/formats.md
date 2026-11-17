@@ -24,9 +24,6 @@ or Visual Studio installation is not required for eager GPU execution.
 | Weight representation | Extra | LoRA merge | Dense / mixed merge |
 |---|---|---|---|
 | Plain floating point, excluding plain float8 | None | Native | Native |
-| Quanto qint8 / qfloat8 | `quanto` | Yes | Yes |
-| [bitsandbytes NF4 / FP4](../src/piper_offload/bnb4bit_adapter.py) | `bnb` | Yes | Yes |
-| [bitsandbytes int8](../src/piper_offload/bnb8bit_adapter.py) | `bnb` | Yes | Yes |
 | TorchAO scaled FP8 | `torchao` | Yes | Yes |
 | TorchAO static-activation scaled FP8 | `torchao` | Yes | Yes |
 | TorchAO INT8 | `torchao` | Yes | Yes |
@@ -59,9 +56,8 @@ each format's adapter.
 
 ## Training and layout limits
 
-Quantized weights stay frozen. Only plain tensors support training. Quanto and
-both scaled FP8 adapters additionally support copying device state back to CPU; that
-capability does **not** make their weights trainable. Other quantized adapters
+Quantized weights stay frozen. Only plain tensors support training. Both scaled
+FP8 adapters support copying device state back to CPU. Other quantized adapters
 and DTensor provide inference movement and the merges listed above. Separate
 plain trainable parameters can coexist with a frozen quantized base; follow
 the [training guidance](streaming.md).
@@ -78,11 +74,6 @@ unavailable. Scaling and mixed-update requirements belong to the
 [composition contract](adapters.md#populate-optional-meta-parameters).
 
 ## Format details
-
-**Quanto.** Marlin FP8 weights are canonicalized to ordinary unpacked Quanto
-weights for offloading, so execution does not retain Marlin's packed matmul. A direct
-permanent merge into an existing Marlin weight repacks its original storage.
-See [quanto_adapter.py](../src/piper_offload/quanto_adapter.py).
 
 **TorchAO FP8.** The weight-only and dynamic-activation path preserves
 `Float8Tensor` metadata with per-group, per-row, or per-tensor scales. FP8
@@ -168,7 +159,8 @@ shard. It targets frozen inference with ordinary `Replicate` and contiguous
 `Shard` placements. Each rank selects its portion of plain host-backed LoRA
 factors or dense deltas before staging; merging requires no collective. Full
 adapter tensors remain in host memory. DTensor adapter factors and deltas are
-not accepted, and bitsandbytes parameter subclasses cannot be local shards.
+not accepted. Local shards must carry their tensor representation independently
+of an `nn.Parameter` wrapper.
 See [dtensor_adapter.py](../src/piper_offload/dtensor_adapter.py) for supported
 host projections and reconstruction.
 

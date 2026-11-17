@@ -460,12 +460,8 @@ def _capture_params(
 def _validate_param_storage_group_tieable(names: Sequence[str], host: HostParam) -> None:
     """Reject tied weights whose adapter migrates wrapper state on forward.
 
-    A migrate-state adapter (bitsandbytes int8) shares one reconstructed
-    wrapper across all tied leaves, but the first module's forward migrates
-    its quant state onto that module and nulls it on the wrapper — so a
-    second tied module computes against missing state (garbage or a crash).
-    The per-load rearm cannot fix this: it fires once per load, not once per
-    consuming module. ``_needs_rearm`` flags exactly these adapters.
+    The first forward can move state off a shared wrapper and leave later
+    consumers with missing state. The rearm hook runs once per load.
     """
     if len(names) > 1 and host._needs_rearm:
         raise NotImplementedError(
@@ -812,8 +808,6 @@ def _load_param_target(
             "Reallocate the target for the current activation plan."
         )
     source.copy_to_gpu(target._state, non_blocking=non_blocking)
-    # Re-arm the reused wrapper at the freshly-loaded buffers (no-op unless
-    # the adapter migrates state off the wrapper, e.g. bitsandbytes int8).
     source.rearm_after_load(target.param, target._state)
     if load.update is not None:
         load.update.apply_parameter(target.param)

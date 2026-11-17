@@ -254,7 +254,7 @@ def test_composition_preflight_leaves_all_parameters_unchanged(application, fail
 
 
 @pytest.mark.parametrize("application", ["permanent", "activation"])
-@pytest.mark.parametrize("kind", ["torchao-int8", "quanto-qint8", "torchao-float8"])
+@pytest.mark.parametrize("kind", ["torchao-int8", "torchao-float8"])
 @pytest.mark.parametrize("value_scale", [1.0, -0.5])
 def test_quantized_composition_encodes_once(application, kind, value_scale, monkeypatch):
     source = _make_quantized(kind)
