@@ -12,7 +12,7 @@ from piper_offload.lora import LoRATransform, ScaledLoRAFactor
 from piper_offload.parameter_delta import ParameterDelta, ParameterDeltaTransform
 from piper_offload.host_param import HostParam
 from piper_offload.tensor_adapter_registry import param_representation
-from tests._gguf_helpers import GGUFParameter
+from tests._gguf_helpers import GGUFParameter, packed_q4_0
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 QUANT_TYPE = 2  # Q4_0: 32 values per 18-byte block.
@@ -33,19 +33,8 @@ def _quantized_weight(
     rows: int = 64,
     features: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    gguf = pytest.importorskip("gguf")
-    np = pytest.importorskip("numpy")
-    dense = np.random.default_rng(seed).standard_normal(
-        (rows, features),
-        dtype=np.float32,
-    )
-    quant_type = int(gguf.GGMLQuantizationType.Q4_0)
-    packed = torch.from_numpy(gguf.quantize(dense, gguf.GGMLQuantizationType.Q4_0))
-    return (
-        GGUFParameter(packed, requires_grad=False, quant_type=quant_type),
-        packed,
-        quant_type,
-    )
+    packed = packed_q4_0(rows, features, generator=torch.Generator().manual_seed(seed))
+    return GGUFParameter(packed, requires_grad=False, quant_type=QUANT_TYPE), packed, QUANT_TYPE
 
 
 def _materialize(weight: torch.Tensor) -> tuple[HostParam, Any, torch.Tensor]:

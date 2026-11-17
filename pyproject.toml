@@ -54,9 +54,6 @@ dev = [
     "pyright>=1.1.411",
     "pytest~=9.1",
     "ruff>=0.16.1",
-    # Tests compare MappedCheckpoint's GGUF reader with the reference parser
-    # and use it to write GGUF files.
-    "gguf>=0.18,<0.20",
     # Every adapter backend, so `uv sync` yields a complete test environment
     # (otherwise optional adapter suites silently skip).
     "piper-offload[all]",
