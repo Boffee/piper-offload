@@ -6,13 +6,12 @@ evicted copy on Windows are separate decisions.
 
 | What is retained | Control | What it accounts for |
 |---|---|---|
-| Models and adapters | `ModelCache.evict()` / `clear()` | Cached resources; `ModelCache` is unbounded |
+| Models and adapters | [Cache budget and eviction](models.md#releasing-and-inspecting-resources) | Logical backing bytes in cached stores |
 | CUDA/HIP registrations | `host_pin_manager.max_pinned_bytes` | Pinned OS pages, including pending reservations |
 | Offered checkpoint copies on Windows | `host_pin_manager.max_offered_bytes` | Committed pages that Windows may discard |
 
 These are not limits on total process memory. In particular, unpinned mapped
-pages remain reclaimable by the OS while the model stays cached. The lower-level
-`ResourceCache` supports byte-based resource eviction; see [models](models.md).
+pages remain reclaimable by the OS while the model stays cached.
 
 ## Set the pin budget
 

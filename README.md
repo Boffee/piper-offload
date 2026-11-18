@@ -17,10 +17,9 @@ Requires Python 3.14 or newer and PyTorch 2.15.
 pip install piper-offload
 ```
 
-The base dependencies are `torch` and `piper-kernels`. Optional integrations
-are available through the `gguf` and `torchao` extras. The `triton` extra
-adds accelerated kernels, and `all` includes every integration. See
-[supported formats](https://github.com/Boffee/piper-offload/blob/main/docs/formats.md)
+The base install can read safetensors and GGUF checkpoints. To execute packed
+GGUF weights, install `piper-offload[gguf]`. For other weight representations
+and their required extras, see [supported formats](https://github.com/Boffee/piper-offload/blob/main/docs/formats.md)
 for backend requirements.
 
 ## Quick start
@@ -63,8 +62,9 @@ lists with `ModelSpec(..., block_paths=("transformer_blocks",))`; see
 
 - Each cached model has one runtime and supports sequential use. Concurrent
   replicas need separately constructed models under distinct keys.
-- `ModelCache` retains host state until explicit eviction. Pinned memory has
-  a separate budget; cache accounting is not a limit on process RAM.
+- Models and adapters stay cached by default. Set a cache budget to evict
+  inactive entries automatically. Pinning has a separate budget, and the OS
+  controls how much of a mapped file stays in RAM.
 - Factories transfer ownership of compatible CPU storage. Set `requires_grad`
   before capture and do not mutate factory-produced tensors afterwards.
 - Buffer changes made on CUDA are discarded at deactivation. Models that

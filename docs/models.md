@@ -78,14 +78,20 @@ optimizer synchronization.
 
 ## Releasing and inspecting resources
 
-`ModelCache` uses an unbounded resource cache. `used_cache_bytes` reports
-logical backing bytes, and `info(key)` reports construction and lease state.
-These are accounting values, not measurements of resident RAM or GPU usage.
-The [pin budget](memory.md) independently controls registered host memory.
+A new `ModelCache` retains every store until you evict it. To bound it, call
+`cache.resize(limit_in_bytes)`. It evicts the least recently used inactive
+stores when you lower the limit or another store needs room. A lease protects
+its store. If leased stores alone exceed the requested limit, resizing raises
+`ResourceTooLargeError` and preserves the old budget and all entries.
+
+`used_cache_bytes` counts logical backing bytes. Use `info(key)` to see whether
+a store is cached or leased. The [pin budget](memory.md#set-the-pin-budget)
+controls registered host memory separately.
 
 ```python
 info = cache.info("encoder")
 backing_bytes = cache.used_cache_bytes
+cache.resize(2 * 1024**3)  # Keep up to 2 GiB of cached backing.
 cache.evict("encoder")
 freed = cache.evict_bytes(2 * 1024**3)
 cache.clear()
@@ -130,24 +136,15 @@ matching deactivation; CUDA training also needs the
 [`optimizer_step()` context](streaming.md#train-streamed-blocks) to copy updated weights
 back before deactivation when the optimizer runs on CUDA.
 
-If construction fails after capture begins, discard the partially captured
-model and rebuild from a fresh instance. `ModelOffloader.activate()` cleans
-up partial activation and releases its activation claim when it fails or is
-interrupted, allowing a later corrected activation to retry. This rollback is
-separate from construction failure recovery.
+If construction fails during capture, discard the partially captured model
+and build a fresh one. If activation fails, the offloader rolls back the
+partial activation. Correct the cause before retrying.
 
-`deactivate()` continues past a failing component and then raises. Most such
-errors, such as a prefetch failure that surfaces during deactivation, leave
-nothing behind. If a CUDA synchronization or a return to host storage fails or
-is interrupted, the offloader keeps what that step could not release, because
-device work may still read host memory or model tensors may still point at
-device memory, and `offloader.failed` is true. The next `deactivate()` or
-`activate()` retries that release; after an interrupt such as Ctrl-C it
-normally succeeds. If `activate()`'s retry fails too, as after an
-unrecoverable CUDA error, it raises `ModelRuntimeFailedError` with the retry's
-error as the cause. Recreate the CUDA worker then, and keep the offloader
-referenced until you do: dropping it lets garbage collection close the pin
-leases it kept while device work may still use them.
+If cleanup cannot finish releasing a CUDA session, `offloader.failed` is true.
+Keep the offloader alive: device work may still use its host storage. Call
+`deactivate()` to retry cleanup, or let the next `activate()` retry it before
+starting another session. If that activation raises `ModelRuntimeFailedError`,
+keep the offloader referenced until you recreate the CUDA worker.
 
 For frozen CPU models destined to stay on Apple MPS, `MpsWeights` provides a
 separate constructor-time materializer. It retains no CPU cache, does not
@@ -169,16 +166,10 @@ with resources.lease(spec) as vocabulary:
 resources.clear()
 ```
 
-Objects account for zero bytes by default; `estimated_cache_bytes` supplies
-their accounting size. `ResourceCache` supports arbitrary specs and an optional
-finite budget. It evicts inactive stores using LRU by default; leases protect
-stores from eviction. It serializes construction and metadata changes, then
-releases its lock while callers hold leases.
-
-For a finite cache, `resize(bytes)` changes the budget. Growing preserves
-entries; shrinking evicts eligible entries. If leased entries prevent the new
-limit from being met, it raises without changing the budget or evicting stores.
-Custom specs and eviction policies are covered in [development](development.md).
+Objects count as zero bytes unless their spec supplies `estimated_cache_bytes`.
+`ResourceCache(max_cache_bytes=...)` starts with a finite budget and follows
+the same [eviction and resize rules](#releasing-and-inspecting-resources).
+For custom specs and eviction policies, see [Development](development.md#extending-resources).
 
 ## Errors and API details
 
