@@ -173,7 +173,9 @@ step in turn; add new modes and features to their configurations.
 
 ## Documentation ownership
 
-Each explanation has one owner, and other places link to it rather than restate it.
+Revise the owning passage and its examples when behavior changes. Keep a
+summary in the README only when it helps readers choose a workflow. Link to
+the guide for the full contract and remove superseded instructions.
 
 - **The README** is the public entry point: installation, a first working example,
   fit and limitations, and a task-oriented map of the guides.
@@ -274,5 +276,7 @@ when a caller can observe the change: in the Python API, lifecycle, memory
 behavior, supported configurations, or results. Documentation, tests, and
 internal refactors need none. Use Added, Changed, or Fixed headings as applicable,
 reusing existing headings, and prefix a breaking change with "Breaking:".
+When an unreleased feature changes again, update its entry to describe what
+callers will receive.
 State what changes for the caller and what they must do; implementation,
 benchmark narratives, and test details belong in the PR.

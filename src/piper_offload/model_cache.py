@@ -1,7 +1,7 @@
 """Model-aware resource cache.
 
 :class:`ResourceCache` owns resource registration, accounting, leases, and
-explicit eviction. :class:`ModelCache` specializes its unbounded mode with
+explicit eviction. :class:`ModelCache` starts unbounded and adds
 activation-scoped model use, including adapter dependency leasing and device
 activation, while keeping the generic cache machinery unaware of models and
 adapters.
@@ -26,10 +26,11 @@ class ModelCache(ResourceCache):
     Inherits the resource-agnostic registry and lease API. Each model entry owns
     one :class:`ModelOffloader` and supports sequential reuse only; overlapping
     uses of the same entry fail regardless of which caller initiates them.
-    Model and adapter stores are retained until explicit eviction. Their
-    compatible CPU tensors preserve factory-supplied file mappings, so the OS
-    controls pageable residency while the independent host-pin budget controls
-    locked pages.
+    By default, stores are retained until explicit eviction. Set a finite
+    budget with the inherited :meth:`ResourceCache.resize` to allow eviction
+    of inactive stores. Compatible CPU tensors preserve factory-supplied file
+    mappings. The OS controls pageable residency, and the independent host-pin
+    budget controls locked pages.
     """
 
     def __init__(self) -> None:

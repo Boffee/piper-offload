@@ -8,9 +8,10 @@ and the [README](../README.md) for the starting point.
 
 ## Choose a supported representation
 
-All formats below support offloading. Install the corresponding optional extra;
-the supported dependency ranges are maintained in
-[pyproject.toml](../pyproject.toml). Native execution still requires the
+The table lists the extras required to execute each representation. Reading a
+GGUF checkpoint with `MappedCheckpoint` requires only the base install.
+Install `piper-offload[all]` for every integration. The supported dependency
+ranges are maintained in [pyproject.toml](../pyproject.toml). Native execution still requires the
 format's compatible hardware and PyTorch stack.
 
 The `torchao` extra also covers Piper ConvRot. On Linux, PyTorch supplies its matching
@@ -103,13 +104,25 @@ and [piper_convrot_nvfp4_adapter.py](../src/piper_offload/piper_convrot_nvfp4_ad
 
 ## Load a GGUF checkpoint
 
-`MappedCheckpoint` reads safetensors and little-endian GGUF version 2 and 3
-files through read-only file mappings; reading GGUF needs no extra.
-GGUF F32, F16, and BF16 entries are ordinary tensors. Quantized entries are
-`GgufParameter` objects with a logical matrix shape and BF16 compute dtype;
-`as_tensor()` exposes packed bytes. `get_slice()` reports logical shape and
-dtype, and `get_nbytes()` reports stored bytes. GGUF metadata is not exposed
-as safetensors application metadata.
+`MappedCheckpoint` reads little-endian GGUF versions 2 and 3. Use `keys()` to
+list names, including entries whose encoding Offload cannot load. Request only
+the names your model needs: requesting an unsupported descriptor or tensor
+raises `CheckpointError`. GGUF `metadata()` returns `None`.
+
+To inspect a supported weight without loading it into a model:
+
+```python
+from piper_offload import MappedCheckpoint
+
+with MappedCheckpoint("model.gguf") as checkpoint:
+    weight = checkpoint.get_slice("weight")
+    print(weight.get_shape(), weight.get_dtype(), weight.get_nbytes())
+```
+
+The shape and dtype describe the logical tensor. The byte count measures its
+checkpoint storage. For a quantized entry, `get_tensor()` returns a
+`GgufParameter` with BF16 compute dtype and `as_tensor()` exposes its packed
+bytes. F32, F16, and BF16 entries return ordinary tensors.
 
 Load those entries with `model.load_state_dict(state, assign=True)` and freeze
 the model before capture. Encoded rows must remain intact when splitting or
@@ -123,10 +136,8 @@ packed; active weights use BF16 ConvRot INT8 without allocating a full dense
 weight during conversion. The logical input width must be divisible by 16.
 
 Direct conversion supports F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
-Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS. `keys()` also lists tensors
-in other encodings, and requesting one raises `CheckpointError`, so a loader
-can skip tensors it does not need. The `gguf` extra installs TorchAO and Triton
-because this conversion requires both. LoRA and dense updates apply to the
+Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS. The `gguf` extra installs
+TorchAO and Triton for this conversion. LoRA and dense updates apply to the
 active ConvRot target; permanent merge cannot modify the packed GGUF source.
 
 Externally supplied Diffusers `GGUFParameter` objects are recognized without a
