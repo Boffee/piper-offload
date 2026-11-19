@@ -4,10 +4,12 @@ import functools
 import gc
 import math
 import mmap
+import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
 from datetime import timedelta
+from itertools import pairwise
 
 import pytest
 import weakref
@@ -2038,3 +2040,200 @@ def test_shared_pack_spans_and_chunk_pieces():
     c = [torch.empty(2, dtype=torch.int32), torch.empty(2, dtype=torch.float32)]
     assert _batch_signature(a) != _batch_signature(b)
     assert _batch_signature(a) != _batch_signature(c)
+
+
+def _assert_fused_peer_lanes(buf: torch.Tensor, inputs: Sequence[torch.Tensor], rank: int) -> None:
+    buf_start = buf.data_ptr()
+    buf_end = buf_start + buf.nbytes
+    ranges = sorted(
+        (tensor.data_ptr(), tensor.data_ptr() + tensor.nbytes)
+        for peer, tensor in enumerate(inputs)
+        if peer != rank
+    )
+    assert all(buf_start <= start and end <= buf_end for start, end in ranges)
+    assert all(prev_end <= next_start for (_, prev_end), (next_start, _) in pairwise(ranges))
+
+
+def _check_chunk_reduction_mode(world_size: int, rank: int, fused: bool) -> None:
+    from piper_offload._relay_shared import SharedRelay, _bytes, _chunk_pieces, _pack_spans
+
+    relay = object.__new__(SharedRelay)
+    relay.rank = rank
+    relay.world_size = world_size
+    relay.capacity = 128
+
+    rows = {
+        torch.float16: (65504.0, 65504.0, -65504.0, 1.0),
+        torch.bfloat16: (256.0, 1.0, -256.0, 2.0),
+        torch.float32: (2.0**24, 1.0, -(2.0**24), 3.0),
+    }
+    backings = [
+        [torch.full((37,), values[r], dtype=dtype) for dtype, values in rows.items()]
+        for r in range(world_size)
+    ]
+    per_rank = [[b[1:-1] for b in rank_backings] for rank_backings in backings]
+    local_backings = [b.clone() for b in backings[rank]]
+    local = [b[1:-1] for b in local_backings]
+    assert all(tensor.storage_offset() == 1 for tensor in local)
+    byte_sources = [_bytes(t) for t in local]
+    spans, total_bytes = _pack_spans([t.numel() for t in byte_sources], align=16)
+    span_ends = [start + span_len for _, start, span_len in spans]
+
+    buf = torch.empty(3 * relay.capacity, dtype=torch.uint8)
+    calls = 0
+
+    def cpu_sum_ranks(output: torch.Tensor, inputs: Sequence[torch.Tensor]) -> None:
+        nonlocal calls
+        calls += 1
+        assert len(inputs) == world_size
+        assert inputs[rank].data_ptr() == output.data_ptr()
+        _assert_fused_peer_lanes(buf, inputs, rank)
+        total = functools.reduce(torch.add, (tensor.float() for tensor in inputs))
+        output.copy_(total)
+
+    total_pieces = 0
+    for start in range(0, total_bytes, relay.capacity):
+        width = min(relay.capacity, total_bytes - start)
+        pieces = _chunk_pieces(spans, span_ends, start, start + width)
+        total_pieces += len(pieces)
+        peer_slots: list[torch.Tensor | None] = [None] * world_size
+        for peer in range(world_size):
+            if peer != rank:
+                slot = torch.empty(width, dtype=torch.uint8)
+                for ti, slot_off, t_off, part_len in pieces:
+                    slot[slot_off:slot_off + part_len].copy_(_bytes(per_rank[peer][ti])[t_off:t_off + part_len])
+                peer_slots[peer] = slot
+        if fused:
+            relay._reduce_chunk_fused(local, byte_sources, buf, width, peer_slots, pieces, False, cpu_sum_ranks)
+        else:
+            relay._reduce_chunk_reference(local, byte_sources, buf, width, peer_slots, pieces, False)
+
+    assert total_pieces > len(local)
+    assert not fused or calls == total_pieces
+    for i, actual in enumerate(local):
+        expected = functools.reduce(torch.add, (per_rank[r][i].float() for r in range(world_size))).to(actual.dtype)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for sentinel_backing, values in zip(local_backings, rows.values(), strict=True):
+        torch.testing.assert_close(
+            sentinel_backing[[0, -1]], torch.full((2,), values[rank], dtype=sentinel_backing.dtype),
+        )
+
+
+def test_shared_allreduce_fused_and_reference_chunk_reduction(tmp_path, monkeypatch):
+    from piper_offload import _relay_shared
+
+    for world_size in (2, 3, 4):
+        for rank in (0, world_size - 1):
+            _check_chunk_reduction_mode(world_size, rank, fused=True)
+            _check_chunk_reduction_mode(world_size, rank, fused=False)
+
+    assert _relay_shared._select_fused_sum(torch.device("cpu"), 2) is None
+    assert _relay_shared._select_fused_sum(torch.device("cuda", 0), 1) is None
+    assert _relay_shared._select_fused_sum(torch.device("cuda", 0), 5) is None
+
+    def fake_sum_ranks(output: torch.Tensor, inputs: Sequence[torch.Tensor]) -> None:
+        del output, inputs
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_relay_shared, "_load_triton_sum", lambda: fake_sum_ranks)
+        for world_size in (2, 3, 4):
+            assert _relay_shared._select_fused_sum(torch.device("cuda", 0), world_size) is fake_sum_ranks
+        patch.setattr(_relay_shared, "_load_triton_sum", lambda: None)
+        for world_size in (2, 3, 4):
+            assert _relay_shared._select_fused_sum(torch.device("cuda", 0), world_size) is None
+
+    class SingleRankControl:
+        def agree(self, op, nbytes, kind, detail, timeout):
+            del op, nbytes, kind, detail, timeout
+
+        def signal(self, peers, tag, sequence, timeout):
+            del peers, tag, sequence, timeout
+
+        def skip_ready(self, peer, count):
+            del peer, count
+
+        def abort(self):
+            return
+
+    shared = _relay_shared.SharedRelay(
+        dist.FileStore(str(tmp_path / "dispatch"), 1),
+        None,
+        rank=0,
+        world_size=1,
+        nbytes=1536,
+        timeout=timedelta(seconds=5),
+    )
+    shared.world_size = 2
+    shared._control = SingleRankControl()
+    shared._peers = ((1, 1),)
+    monkeypatch.setattr(shared, "_slot", lambda peer, lane, width: torch.ones(width, dtype=torch.uint8))
+    ref_calls = 0
+
+    def spy_reference(*args):
+        nonlocal ref_calls
+        ref_calls += 1
+
+    monkeypatch.setattr(shared, "_reduce_chunk_reference", spy_reference)
+    shared.allreduce([torch.ones(8, dtype=torch.float16)], PinManager(0))
+    assert ref_calls == 1
+
+    _relay_shared._load_triton_sum.cache_clear()
+    try:
+        with monkeypatch.context() as patch:
+            patch.delitem(sys.modules, "piper_offload._triton_relay_sum", raising=False)
+            patch.setitem(sys.modules, "triton", None)
+            assert _relay_shared._load_triton_sum() is None
+        _relay_shared._load_triton_sum.cache_clear()
+        with monkeypatch.context() as patch:
+            patch.setitem(sys.modules, "piper_offload._triton_relay_sum", None)
+            with pytest.raises(ModuleNotFoundError):
+                _relay_shared._load_triton_sum()
+    finally:
+        _relay_shared._load_triton_sum.cache_clear()
+
+
+def test_triton_relay_sum_validation():
+    pytest.importorskip("triton")
+    from piper_offload._triton_relay_sum import MAX_FUSED_RANKS, sum_ranks
+
+    assert MAX_FUSED_RANKS == 4
+    sample = torch.zeros(4, dtype=torch.float32)
+    with pytest.raises(ValueError, match="2..4"):
+        sum_ranks(sample, [sample])
+    with pytest.raises(ValueError, match="2..4"):
+        sum_ranks(sample, [sample] * 5)
+    for dtype in DTYPES:
+        empty = torch.empty(0, dtype=dtype)
+        sum_ranks(empty, [empty, empty])
+
+
+@CUDA
+def test_triton_relay_sum_matches_rank_order_fp32():
+    pytest.importorskip("triton")
+    from piper_offload._triton_relay_sum import sum_ranks
+
+    rows = {
+        torch.float16: (65504.0, 65504.0, -65504.0, 1.0),
+        torch.bfloat16: (256.0, 1.0, -256.0, 2.0),
+        torch.float32: (2.0**24, 1.0, -(2.0**24), 3.0),
+    }
+    for world_size in (2, 3, 4):
+        for dtype, values in rows.items():
+            # Odd length > 2048 crosses multiple Triton tiles and keeps a non-zero offset.
+            length = 2053
+            backings = [torch.full((length + 2,), values[r], dtype=dtype, device="cuda") for r in range(world_size)]
+            stride_count = backings[0][1:-1][::7].numel()
+            varied = torch.arange(stride_count, device="cuda", dtype=torch.float32) % 19 - 9
+            for r, backing in enumerate(backings):
+                backing[1:-1][::7] = (varied + (r + 1) * 0.5).to(dtype)
+            inputs_ref = [b[1:-1].clone() for b in backings]
+            expected = functools.reduce(torch.add, (t.float() for t in inputs_ref)).to(dtype)
+            for rank in range(world_size):
+                rank_inputs = [t.clone() for t in inputs_ref]
+                backing = backings[rank].clone()
+                rank_inputs[rank] = backing[1:-1]
+                sum_ranks(rank_inputs[rank], rank_inputs)
+                torch.testing.assert_close(rank_inputs[rank], expected, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    backing[[0, -1]], torch.full((2,), values[rank], dtype=dtype, device="cuda"),
+                )
