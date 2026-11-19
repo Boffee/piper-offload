@@ -31,7 +31,7 @@ are then ready for every stream. A collective on accelerator tensors starts once
 the caller's current stream has produced its inputs and moves its data as a
 foreground transfer, which background copies such as block prefetch wait for
 (see ``piper_offload._transfer_priority``). No offloader, NCCL, or compiled
-extension is required. Gloo pipelining is opt-in; shared transfers use two
+extension is required. Gloo pipelining is opt-in; shared transfers use three
 outgoing slots per rank.
 
 SUM all-reduce supports FP32, FP16 and BF16, accumulating reduced precision in
@@ -93,12 +93,12 @@ class RelayOptions:
     and run serially.
 
     ``transport="shared"`` instead maps one ``staging_bytes`` arena across all
-    ranks on the same machine. Copy collectives always use two outgoing slots
+    ranks on the same machine. Copy collectives always use three outgoing slots
     per rank, reused across peer rounds. Every process registers its full
     mapping under its own pin budget; physical payload storage is shared once.
-    GPU reductions use the same two slots plus at most three slot sizes of
-    reusable device scratch per rank, at most
-    ``3 * staging_bytes / (2 * world_size)``, independent of tensor size.
+    GPU reductions use the same three slots plus at most three slot sizes of
+    reusable device scratch per rank, at most ``staging_bytes / world_size``,
+    independent of tensor size.
     FP16/BF16 accumulate in FP32. CPU tensor reductions use Gloo and borrow
     this rank's region. ``pipeline_buffers`` only affects the Gloo path. The default
     transport remains ``"gloo"``.

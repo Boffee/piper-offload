@@ -1,6 +1,6 @@
 """Same-machine relay: GPU -> shared host slot -> peer GPU.
 
-Each rank owns two outgoing slots in one shared mapping. Slots are reused
+Each rank owns three outgoing slots in one shared mapping. Slots are reused
 across peer rounds, bounding storage independently of the number of pairs.
 All-gather exchanges peers in cyclic rounds; broadcast and scatter visit each
 receiver in turn. SUM publishes each original chunk once for all peers, then
@@ -25,7 +25,9 @@ import torch.distributed as dist
 
 from .pin_manager import PinManager
 
-BUFFERS_PER_RANK = 2
+BUFFERS_PER_RANK = 3
+_MIN_PIPELINE_CHUNK_BYTES = 1024 * 1024
+_TARGET_PIPELINE_CHUNKS = 6
 REDUCTION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 COPY_DTYPES = (
     *REDUCTION_DTYPES,
@@ -46,6 +48,22 @@ def shared_slot_bytes(nbytes: int, world_size: int) -> int:
     capacity = nbytes // (world_size * BUFFERS_PER_RANK)
     alignment = 4096 if capacity >= 4096 else 16
     return capacity // alignment * alignment
+
+
+def _shared_chunk_bytes(length: int, capacity: int) -> int:
+    """Pick a deterministic 4 KiB-aligned chunk size up to capacity for full-duplex overlap.
+
+    Depends only on ``(length, capacity)`` so ranks with different pinning
+    outcomes choose identical chunk boundaries.
+    """
+    if length <= _MIN_PIPELINE_CHUNK_BYTES or capacity < 4096:
+        return capacity
+    min_chunks = (length + capacity - 1) // capacity
+    desired_chunks = min(_TARGET_PIPELINE_CHUNKS, length // _MIN_PIPELINE_CHUNK_BYTES)
+    chunks = max(min_chunks, desired_chunks)
+    if chunks <= 1:
+        return capacity
+    return min(capacity, ((length + chunks - 1) // chunks + 4095) // 4096 * 4096)
 
 
 def _create_mapping(size: int) -> tuple[mmap.mmap, str]:
@@ -144,7 +162,8 @@ class SharedRelay:
         self.uploaded: list[torch.cuda.Event] = []
         self._reduction_buffer: torch.Tensor | None = None
         self._send_signal = torch.empty(1, dtype=torch.int64)
-        self._recv_signal = torch.empty(1, dtype=torch.int64)
+        self._recv_signals = torch.empty(max(1, world_size - 1), dtype=torch.int64)
+        self._recv_slots = tuple(self._recv_signals[i:i + 1] for i in range(self._recv_signals.numel()))
         self._pending: list[dist.Work] = []
 
     def local_buffer(self) -> torch.Tensor:
@@ -168,19 +187,28 @@ class SharedRelay:
         self.download.wait_stream(current)
         self.upload.wait_stream(current)
 
-    def _signal(self, send: int | None, receive: int | None, tag: int, sequence: int) -> None:
-        # Post sends before waiting for receives, including cyclic peer rounds.
-        # Completion precedes reusing these persistent control tensors.
+    def _signal(
+        self, peers: Sequence[tuple[int | None, int | None]], tag: int, sequence: int,
+    ) -> None:
+        # Post all sends and receives before waiting, including across peers in
+        # cyclic rounds and multi-rank reductions. Completion precedes reusing
+        # these persistent control tensors.
         # PyTorch's Gloo stubs omit its send/recv and collective bindings.
         self._send_signal[0] = sequence
-        if send is not None:
-            self._pending.append(self.group.send([self._send_signal], send, tag))  # type: ignore[attr-defined]
-        if receive is not None:
-            self._pending.append(self.group.recv([self._recv_signal], receive, tag))  # type: ignore[attr-defined]
-        for work in reversed(self._pending):
-            work.wait(self.timeout)
-        self._pending.clear()
-        if receive is not None and self._recv_signal.item() != sequence:
+        receivers = 0
+        try:
+            for send, receive in peers:
+                if send is not None:
+                    self._pending.append(self.group.send([self._send_signal], send, tag))  # type: ignore[attr-defined]
+                if receive is not None:
+                    slot = self._recv_slots[receivers]
+                    receivers += 1
+                    self._pending.append(self.group.recv([slot], receive, tag))  # type: ignore[attr-defined]
+            for work in reversed(self._pending):
+                work.wait(self.timeout)
+        finally:
+            self._pending.clear()
+        if receivers and any(self._recv_signals[i].item() != sequence for i in range(receivers)):
             raise RuntimeError("shared relay control sequence mismatch")
 
     def _exchange(
@@ -204,14 +232,16 @@ class SharedRelay:
         peers: Sequence[tuple[int | None, int | None]], asynchronous: bool,
     ) -> Generator[tuple[int, int, int]]:
         """Yield published chunks on the upload stream; acknowledge every reader."""
-        count = max(1, (length + self.capacity - 1) // self.capacity)
+        chunk_bytes = _shared_chunk_bytes(length, self.capacity)
+        count = max(1, (length + chunk_bytes - 1) // chunk_bytes)
         receiving = any(receive is not None for _, receive in peers)
+        release_peers = [(receive, send) for send, receive in peers]
 
         def download(index: int) -> None:
             if source is None:
                 return
-            start = index * self.capacity
-            width = min(self.capacity, length - start)
+            start = index * chunk_bytes
+            width = min(chunk_bytes, length - start)
             with torch.cuda.stream(self.download) if asynchronous else nullcontext():
                 self._slot(self.rank, index % self.buffer_count, width).copy_(
                     source[start:start + width], non_blocking=asynchronous,
@@ -224,27 +254,28 @@ class SharedRelay:
                 self.uploaded[index % self.buffer_count].synchronize()
             # The receiver acknowledges only after its GPU stops reading the
             # shared slot. This is the producer's permission to overwrite it.
-            for send, receive in peers:
-                self._signal(receive, send, 1, index)
+            self._signal(release_peers, 1, index)
 
         for index in range(min(self.buffer_count, count)):
             download(index)
         for index in range(count):
-            if index >= self.buffer_count:
-                release(index - self.buffer_count)
-                download(index)
+            # Releasing chunk (index - (B - 1)) frees the exact lane (index + 1)
+            # will fill while upload(index - 1) remains in flight on another lane.
+            if index >= self.buffer_count - 1 and index + 1 < count:
+                release(index - (self.buffer_count - 1))
+                download(index + 1)
             if source is not None and asynchronous:
                 self.ready[index % self.buffer_count].synchronize()
-            for send, receive in peers:
-                self._signal(send, receive, 0, index)
-            start = index * self.capacity
-            width = min(self.capacity, length - start)
+            self._signal(peers, 0, index)
+            start = index * chunk_bytes
+            width = min(chunk_bytes, length - start)
             with torch.cuda.stream(self.upload) if asynchronous else nullcontext():
                 yield index, start, width
                 if receiving and asynchronous:
                     self.uploaded[index % self.buffer_count].record(self.upload)
-        for index in range(max(0, count - self.buffer_count), count):
-            release(index)
+        # All uploads execute in FIFO order on self.upload, so waiting for the
+        # final chunk confirms every earlier peer slot read has finished.
+        release(count - 1)
 
     def copy(
         self, operation: str, sources: list[torch.Tensor], outputs: list[torch.Tensor],
