@@ -1635,3 +1635,74 @@ def test_shared_signal_posts_all_peers_before_waiting(tmp_path):
     with pytest.raises(RuntimeError, match="control sequence mismatch"):
         shared._signal(shared._peers, tag=0, sequence=7)
     assert shared._pending == []
+
+
+def test_shared_prepare_streams_failure_propagates_original_error(tmp_path):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from piper_offload._relay_shared import SharedRelay
+
+    class MetadataWork:
+        def wait(self, timeout: timedelta) -> None:
+            del timeout
+
+    class MetadataGroup:
+        def allgather(self, gathered: list[list[torch.Tensor]], metadata: list[torch.Tensor]) -> MetadataWork:
+            gathered[0][0].copy_(metadata[0])
+            return MetadataWork()
+
+    class StubManager:
+        def __init__(self) -> None:
+            self.closed = False
+
+        @contextmanager
+        def acquire(self, tensors: list[torch.Tensor]):
+            del tensors
+            try:
+                yield SimpleNamespace(pageable_bytes=0)
+            finally:
+                self.closed = True
+
+    class DummyStream:
+        def __init__(self) -> None:
+            self.synchronized = False
+
+        def synchronize(self) -> None:
+            self.synchronized = True
+
+    shared = SharedRelay(
+        dist.FileStore(str(tmp_path / "streams"), 1),
+        MetadataGroup(),
+        rank=0,
+        world_size=1,
+        nbytes=192,
+        timeout=timedelta(seconds=5),
+    )
+    manager = StubManager()
+    current = DummyStream()
+    fake_tensor = SimpleNamespace(device=torch.device("cuda", 0), nbytes=16, dtype=torch.float32)
+    stream_calls = 0
+
+    def failing_stream(device: torch.device) -> DummyStream:
+        del device
+        nonlocal stream_calls
+        stream_calls += 1
+        if stream_calls == 2:
+            raise RuntimeError("injected stream creation failure")
+        return DummyStream()
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(torch.cuda, "Stream", failing_stream)
+        patch.setattr(torch.cuda, "current_stream", lambda _device: current)
+        with pytest.raises(RuntimeError, match="injected stream creation failure"):
+            with shared._collective("allreduce", fake_tensor, -1, manager):
+                pytest.fail("collective body ran after stream creation failure")
+
+    assert shared.broken
+    assert manager.closed
+    assert current.synchronized
+    assert shared.device is None
+    assert shared.download is None
+    assert shared.upload is None
+    assert shared.ready == []
+    assert shared.uploaded == []
