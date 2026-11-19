@@ -7,6 +7,10 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- `piper_relay` now implements `all_to_all` (`alltoall`, `all_to_all_single`,
+  `alltoall_base`, functional `all_to_all_single`, and DTensor
+  `shard_dim_alltoall`) with equal and unequal splits across all supported
+  copy dtypes on both `"gloo"` and `"shared"` transports.
 - `piper_relay` now implements SUM reduce-scatter (`reduce_scatter`,
   `reduce_scatter_single`, `reduce_scatter_tensor`, `_reduce_scatter_base`, and
   coalesced functional/process-group variants) for `FP32`, `FP16`, and `BF16`

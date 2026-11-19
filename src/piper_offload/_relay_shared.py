@@ -3,18 +3,20 @@
 Each rank owns three outgoing slots in one shared payload mapping. Slots are
 reused across peer rounds, bounding storage independently of the number of
 pairs. All-gather and broadcast publish each chunk once for all peers; scatter
-visits each receiver in turn. Reduce-scatter packs each rank's (W - 1) remote
-peer slices into subslots and skips D2H for the local rank's own slice, falling
-back to per-target rounds when slots cannot hold (W - 1) 16-byte-aligned
-subslots. Two-rank or small SUM all-reduces publish each original chunk once
-for all peers; larger SUMs with three or more ranks reduce-scatter
-16-byte-aligned partitions before all-gathering the reduced partitions, cutting
-peer reads to 2(W - 1)/W while preserving rank-ordered FP32 accumulation.
-Coalesced all-gather, SUM all-reduce, and reduce-scatter pack their tensor
-lists into one continuous chunked transfer. On x86_64/AMD64, rank agreement and
-chunk ready/free signaling run through a small unpinned shared-memory control
-mapping; other architectures fall back to Gloo control messages. No GPU IPC,
-cross-process CUDA events, or payload socket transfers are needed.
+visits each receiver in turn. Reduce-scatter and all-to-all pack each rank's
+(W - 1) remote peer slices into subslots and skip host staging for the local
+rank's own slice, falling back to per-target rounds when slots cannot hold
+(W - 1) 16-byte-aligned subslots; all-to-all first agrees on every peer pair's
+byte count before writing outputs. Two-rank or small SUM all-reduces publish each
+original chunk once for all peers; larger SUMs with three or more ranks
+reduce-scatter 16-byte-aligned partitions before all-gathering the reduced
+partitions, cutting peer reads to 2(W - 1)/W while preserving rank-ordered FP32
+accumulation. Coalesced all-gather, SUM all-reduce, and reduce-scatter pack their
+tensor lists into one continuous chunked transfer. On x86_64/AMD64, rank
+agreement and chunk ready/free signaling run through a small unpinned
+shared-memory control mapping; other architectures fall back to Gloo control
+messages. No GPU IPC, cross-process CUDA events, or payload socket transfers are
+needed.
 """
 
 import functools
@@ -53,6 +55,7 @@ _OPERATIONS = (
     "allreduce_coalesced",
     "reduce_scatter",
     "reduce_scatter_coalesced",
+    "alltoall",
 )
 REDUCTION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 COPY_DTYPES = (
@@ -885,12 +888,169 @@ class SharedRelay:
                     buffer, asynchronous, sum_ranks,
                 )
 
+    def _agree_alltoall_sizes(
+        self, outputs: Sequence[torch.Tensor], sources: Sequence[torch.Tensor],
+    ) -> list[list[int]]:
+        local_sizes = torch.tensor(
+            [*[src.nbytes for src in sources], *[out.nbytes for out in outputs]],
+            dtype=torch.int64,
+        )
+        local_bytes = _bytes(local_sizes)
+        gathered = [torch.empty_like(local_sizes) for _ in range(self.world_size)]
+        gathered[self.rank] = local_sizes
+        gathered_bytes = [_bytes(row) for row in gathered]
+        fill = _make_slice_fill(local_bytes, asynchronous=False)
+        try:
+            with closing(self._chunks(fill, local_bytes.numel(), self._peers, False)) as chunks:
+                for index, start, width in chunks:
+                    lane = index % self.buffer_count
+                    for _, receive in self._peers:
+                        gathered_bytes[receive][start:start + width].copy_(
+                            self._slot(receive, lane, width),
+                        )
+        except BaseException:
+            self.broken = True
+            self._control.abort()
+            raise
+        # Raise split mismatches only after _chunks finishes so control counters
+        # stay synchronized and the relay remains usable for later collectives.
+        matrix: list[list[int]] = [row.tolist() for row in gathered]
+        for src_rank in range(self.world_size):
+            for dst_rank in range(self.world_size):
+                if matrix[src_rank][dst_rank] != matrix[dst_rank][self.world_size + src_rank]:
+                    raise ValueError("piper_relay all-to-all input and output split sizes must match across ranks")
+        return matrix
+
+    def _alltoall_packed(
+        self,
+        byte_outputs: Sequence[torch.Tensor],
+        byte_sources: Sequence[torch.Tensor],
+        max_pair_bytes: int,
+        sub_cap: int,
+        asynchronous: bool,
+    ) -> None:
+        peers_count = self.world_size - 1
+        other_ranks = tuple(peer for peer in range(self.world_size) if peer != self.rank)
+        sub_bytes = _shared_chunk_bytes(max_pair_bytes, sub_cap)
+
+        def fill_alltoall(slot: torch.Tensor, slot_start: int, width: int) -> None:
+            stride = width // peers_count
+            part_off = slot_start // peers_count
+            for pos, target in enumerate(other_ranks):
+                src = byte_sources[target]
+                hi = min(src.numel(), part_off + stride)
+                if part_off < hi:
+                    slot[pos * stride:pos * stride + (hi - part_off)].copy_(
+                        src[part_off:hi], non_blocking=asynchronous,
+                    )
+
+        with closing(
+            self._chunks(
+                fill_alltoall, peers_count * max_pair_bytes, self._peers, asynchronous,
+                chunk_bytes=peers_count * sub_bytes,
+            ),
+        ) as chunks:
+            for index, slot_start, width in chunks:
+                stride = width // peers_count
+                part_off = slot_start // peers_count
+                lane = index % self.buffer_count
+                for _, peer in self._peers:
+                    dst = byte_outputs[peer]
+                    hi = min(dst.numel(), part_off + stride)
+                    if part_off >= hi:
+                        continue
+                    slot_off = (self.rank - int(self.rank > peer)) * stride
+                    dst[part_off:hi].copy_(
+                        self._slot(peer, lane, width)[slot_off:slot_off + (hi - part_off)],
+                        non_blocking=asynchronous,
+                    )
+
+    def _alltoall_serial(
+        self,
+        byte_outputs: Sequence[torch.Tensor],
+        byte_sources: Sequence[torch.Tensor],
+        matrix: Sequence[Sequence[int]],
+        asynchronous: bool,
+    ) -> None:
+        sent_chunks = [0] * self.world_size
+        for target in range(self.world_size):
+            active = [peer for peer in range(self.world_size) if peer != target and matrix[peer][target] > 0]
+            if not active:
+                continue
+            target_max = max(matrix[peer][target] for peer in active)
+            chunk_size = _shared_chunk_bytes(target_max, self.capacity)
+            count = max(1, (target_max + chunk_size - 1) // chunk_size)
+            if self.rank == target:
+                for peer in active:
+                    if sent_chunks[peer]:
+                        self._control.skip_ready(peer, sent_chunks[peer])
+                recv_peers: list[tuple[int | None, int | None]] = [(None, peer) for peer in active]
+                with closing(self._chunks(None, target_max, recv_peers, asynchronous)) as chunks:
+                    for index, start, width in chunks:
+                        lane = index % self.buffer_count
+                        for peer in active:
+                            dst = byte_outputs[peer]
+                            hi = min(dst.numel(), start + width)
+                            if start < hi:
+                                dst[start:hi].copy_(
+                                    self._slot(peer, lane, width)[:hi - start], non_blocking=asynchronous,
+                                )
+            elif self.rank in active:
+                src = byte_sources[target]
+
+                def fill_target(
+                    slot: torch.Tensor, start: int, width: int, *, source: torch.Tensor = src,
+                ) -> None:
+                    hi = min(source.numel(), start + width)
+                    if start < hi:
+                        slot[:hi - start].copy_(source[start:hi], non_blocking=asynchronous)
+
+                with closing(self._chunks(fill_target, target_max, [(target, None)], asynchronous)) as chunks:
+                    for _ in chunks:
+                        pass
+            for peer in active:
+                sent_chunks[peer] += count
+
+    def alltoall(
+        self, outputs: Sequence[torch.Tensor], sources: Sequence[torch.Tensor], manager: PinManager,
+    ) -> None:
+        matrix: list[list[int]] = []
+
+        def validate_sizes() -> None:
+            matrix[:] = self._agree_alltoall_sizes(outputs, sources)
+
+        with self._collective(
+            "alltoall", outputs, -1, manager, pre_acquire=validate_sizes if self.world_size > 1 else None,
+        ) as asynchronous:
+            byte_outputs = [_bytes(t) for t in outputs]
+            byte_sources = [_bytes(t) for t in sources]
+            self._local_copy(byte_outputs[self.rank], byte_sources[self.rank], asynchronous=asynchronous)
+            if self.world_size == 1:
+                return
+            max_pair_bytes = max(
+                matrix[src][dst]
+                for src in range(self.world_size)
+                for dst in range(self.world_size)
+                if src != dst
+            )
+            if max_pair_bytes == 0:
+                return
+            sub_cap = _reduce_scatter_sub_cap(self.capacity, self.world_size)
+            if sub_cap > 0:
+                self._alltoall_packed(byte_outputs, byte_sources, max_pair_bytes, sub_cap, asynchronous)
+            else:
+                self._alltoall_serial(byte_outputs, byte_sources, matrix, asynchronous)
+
     def _agree_operation(self, operation: str, tensors: Sequence[torch.Tensor], detail: int) -> None:
         op_index = _OPERATIONS.index(operation)
         if operation in ("allgather_coalesced", "allreduce_coalesced", "reduce_scatter_coalesced"):
             nbytes = sum(t.nbytes for t in tensors)
             kind = len(tensors)
             meta_detail = _batch_signature(tensors)
+        elif operation == "alltoall":
+            nbytes = 0
+            kind = COPY_DTYPES.index(tensors[0].dtype)
+            meta_detail = detail
         else:
             nbytes = tensors[0].nbytes
             kind = COPY_DTYPES.index(tensors[0].dtype)
@@ -907,6 +1067,7 @@ class SharedRelay:
     @contextmanager
     def _collective(
         self, operation: str, tensors: Sequence[torch.Tensor], detail: int, manager: PinManager,
+        *, pre_acquire: Callable[[], None] | None = None,
     ) -> Generator[bool]:
         if self.broken:
             raise RuntimeError("shared relay failed previously; destroy and recreate the process group")
@@ -914,6 +1075,8 @@ class SharedRelay:
         # Check rank agreement before any shared-slot writes. This also keeps
         # each collective separate from earlier peer rounds.
         self._agree_operation(operation, tensors, detail)
+        if pre_acquire is not None:
+            pre_acquire()
         with manager.acquire([self.buffer]) if device.type == "cuda" else nullcontext() as lease:
             asynchronous = lease is not None and lease.pageable_bytes == 0
             failed = False
@@ -947,7 +1110,7 @@ class SharedRelay:
 
     def _local_copy(self, destination: torch.Tensor, source: torch.Tensor, *, asynchronous: bool) -> None:
         # The local contribution never needs a trip through host memory.
-        if destination.data_ptr() != source.data_ptr():
+        if destination.numel() and destination.data_ptr() != source.data_ptr():
             if asynchronous:
                 assert self.upload is not None
                 with torch.cuda.stream(self.upload):
