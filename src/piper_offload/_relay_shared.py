@@ -176,11 +176,15 @@ class SharedRelay:
 
     def _prepare_streams(self, device: torch.device) -> None:
         if self.device != device:
+            download = torch.cuda.Stream(device=device)
+            upload = torch.cuda.Stream(device=device)
+            ready = [torch.cuda.Event() for _ in range(self.buffer_count)]
+            uploaded = [torch.cuda.Event() for _ in range(self.buffer_count)]
+            self.download = download
+            self.upload = upload
+            self.ready = ready
+            self.uploaded = uploaded
             self.device = device
-            self.download = torch.cuda.Stream(device=device)
-            self.upload = torch.cuda.Stream(device=device)
-            self.ready = [torch.cuda.Event() for _ in range(self.buffer_count)]
-            self.uploaded = [torch.cuda.Event() for _ in range(self.buffer_count)]
         assert self.download is not None
         assert self.upload is not None
         current = torch.cuda.current_stream(device)
@@ -354,12 +358,12 @@ class SharedRelay:
                 # Pin leases and source/destination storage must outlive DMA,
                 # even if a peer fails after a ready message was published.
                 if asynchronous:
-                    assert self.download is not None
-                    assert self.upload is not None
                     try:
-                        self.download.synchronize()
+                        if self.download is not None:
+                            self.download.synchronize()
                     finally:
-                        self.upload.synchronize()
+                        if self.upload is not None:
+                            self.upload.synchronize()
                 if device.type == "cuda":
                     # Includes the local GPU contribution, which is copied on
                     # the current stream instead of passing through the relay.
