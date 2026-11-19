@@ -6,9 +6,10 @@ waits. A transfer that queued GPU work waits for while background copies could
 run, such as a collective whose output a queued kernel reads, runs inside
 :func:`foreground_transfer`. Background work, such as prefetching the next block
 while this one runs, runs inside :func:`background_transfers`. There each copy
-through :func:`copy_host_to_device` starts only while no foreground transfer is
-in progress and completes before the call returns, so a foreground transfer
-shares the host link with at most one background tensor.
+through :func:`copy_host_to_device` checks for active foreground transfers and
+synchronizes before moving on; large contiguous copies split into 4 MiB chunks
+so a collective waits for at most one chunk rather than an entire tensor or
+block.
 
 The signal is process-wide. With one rank per process, the measured setup, both
 kinds share one GPU's host link; a process driving several GPUs would also hold
@@ -21,6 +22,8 @@ from collections.abc import Generator
 from contextlib import contextmanager
 
 import torch
+
+_BACKGROUND_CHUNK_BYTES = 4 * 1024 * 1024
 
 
 class _Foreground:
@@ -35,6 +38,23 @@ class _Local(threading.local):
 
 _foreground = _Foreground()
 _local = _Local()
+
+
+def _wait_for_foreground() -> None:
+    with _foreground.condition:
+        _foreground.condition.wait_for(lambda: not _foreground.count)
+
+
+def _can_chunk(destination: torch.Tensor, source: torch.Tensor) -> bool:
+    return (
+        type(destination) is torch.Tensor
+        and type(source) is torch.Tensor
+        and not destination.requires_grad
+        and destination.shape == source.shape
+        and destination.is_contiguous()
+        and source.is_contiguous()
+        and source.nbytes > _BACKGROUND_CHUNK_BYTES
+    )
 
 
 @contextmanager
@@ -72,14 +92,26 @@ def background_transfers() -> Generator[None]:
 def copy_host_to_device(destination: torch.Tensor, source: torch.Tensor) -> None:
     """Asynchronously copy host ``source`` into GPU ``destination`` on the current stream.
 
-    Inside :func:`background_transfers` the copy first waits for foreground
-    transfers to end and has completed when this returns: a copy left queued
-    could start on the GPU after a foreground transfer begins.
+    Inside :func:`background_transfers` the copy waits for foreground transfers
+    to end before copying and has completed when this returns: a copy left
+    queued could start on the GPU after a foreground transfer begins. Contiguous
+    copies larger than 4 MiB chunk in 4 MiB slices so foreground transfers can
+    interleave between chunks.
     """
     if not _local.background:
         destination.copy_(source, non_blocking=True)
         return
-    with _foreground.condition:
-        _foreground.condition.wait_for(lambda: not _foreground.count)
-    destination.copy_(source, non_blocking=True)
-    torch.cuda.current_stream(destination.device).synchronize()
+    stream = torch.cuda.current_stream(destination.device)
+    if not _can_chunk(destination, source):
+        _wait_for_foreground()
+        destination.copy_(source, non_blocking=True)
+        stream.synchronize()
+        return
+    dst_flat = destination.view(-1)
+    src_flat = source.view(-1)
+    chunk_elements = max(1, _BACKGROUND_CHUNK_BYTES // source.element_size())
+    for start in range(0, src_flat.numel(), chunk_elements):
+        end = start + chunk_elements
+        _wait_for_foreground()
+        dst_flat[start:end].copy_(src_flat[start:end], non_blocking=True)
+        stream.synchronize()

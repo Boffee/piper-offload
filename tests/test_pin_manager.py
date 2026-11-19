@@ -1288,6 +1288,88 @@ def test_an_alias_of_pending_storage_is_rejected_during_the_fill(backend: FakeBa
     manager.clear()
 
 
+def test_a_pinning_acquisition_of_registered_storage_does_not_wait_for_pending_fill(
+    backend: FakeBackend, tmp_path, monkeypatch,
+) -> None:
+    pending_tensor = _checkpoint(tmp_path, 2 * PAGE)
+    (cached,) = _tensors((0, PAGE))
+    manager = PinManager(8 * PAGE, backend=backend)
+    with manager.acquire([cached]):
+        pass
+
+    original = copy_memory._fill_copies
+    cached_leases: list[PinLease] = []
+    blocker = threading.Thread(target=lambda: cached_leases.append(manager.acquire([cached])))
+    alive_during_fill: list[bool] = []
+
+    def fill_while_cached_acquires(pending, **options):
+        blocker.start()
+        blocker.join(2.0)
+        alive_during_fill.append(blocker.is_alive())
+        original(pending, **options)
+
+    monkeypatch.setattr(copy_memory, "_fill_copies", fill_while_cached_acquires)
+    with manager.acquire([pending_tensor]):
+        blocker.join()
+        assert alive_during_fill == [False]
+        assert len(cached_leases) == 1
+        assert cached_leases[0].registered_bytes == PAGE
+        assert cached_leases[0].pageable_bytes == 0
+    for lease in cached_leases:
+        lease.close()
+    manager.clear()
+    assert manager.stats.active_leases == 0 and manager.stats.pinned_bytes == 0
+
+
+def test_a_mixed_pinning_acquisition_waits_without_holding_cached_storage_early(
+    backend: FakeBackend, tmp_path, monkeypatch,
+) -> None:
+    pending_tensor = _checkpoint(tmp_path, 2 * PAGE)
+    cached, uncached = _tensors((0, PAGE), (PAGE, PAGE))
+    manager = PinManager(8 * PAGE, backend=backend)
+    with manager.acquire([cached]):
+        pass
+
+    original = copy_memory._fill_copies
+    mixed_leases: list[PinLease] = []
+    mixed_thread = threading.Thread(target=lambda: mixed_leases.append(manager.acquire([cached, uncached])))
+    observed: list[tuple[bool, int]] = []
+
+    def fill_while_mixed_waits(pending, **options):
+        mixed_thread.start()
+        mixed_thread.join(0.2)
+        cached_reg = manager._registrations[cached.data_ptr()]
+        observed.append((mixed_thread.is_alive(), cached_reg.leases))
+        original(pending, **options)
+
+    monkeypatch.setattr(copy_memory, "_fill_copies", fill_while_mixed_waits)
+    with manager.acquire([pending_tensor]):
+        mixed_thread.join(2.0)
+        assert not mixed_thread.is_alive()
+        assert observed == [(True, 0)]
+        assert mixed_leases[0].registered_bytes == 2 * PAGE
+    for lease in mixed_leases:
+        lease.close()
+    manager.clear()
+    assert manager.stats.active_leases == 0 and manager.stats.pinned_bytes == 0
+
+
+def test_registered_fast_path_rejects_different_size_alias(
+    manager: PinManager, backend: FakeBackend,
+) -> None:
+    cached, big, same_start_smaller = _tensors((0, PAGE), (PAGE, 2 * PAGE), (PAGE, PAGE))
+    with manager.acquire([cached, big]):
+        pass
+    assert len(backend.register_calls) == 2
+
+    with pytest.raises(ValueError, match="Overlapping"):
+        manager.acquire([cached, same_start_smaller])
+    assert manager._registrations[cached.data_ptr()].leases == 0
+    assert cached.data_ptr() in manager._idle
+    assert manager._registrations[big.data_ptr()].leases == 0
+    assert manager.stats.active_leases == 0
+
+
 def test_copy_registration_failure_frees_the_copy(backend: FakeBackend, tmp_path) -> None:
     tensor = _checkpoint(tmp_path, 2 * PAGE)
     backend.capacity = PAGE

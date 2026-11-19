@@ -2206,6 +2206,203 @@ def test_shared_prepare_streams_failure_propagates_original_error(tmp_path):
     assert shared.uploaded == []
 
 
+def _make_fake_collective_relay(tmp_path):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from piper_offload._relay_shared import SharedRelay
+
+    class StubControl:
+        def __init__(self) -> None:
+            self.fail_on_signal = False
+
+        def agree(self, operation: int, nbytes: int, kind: int, detail: int, timeout: timedelta) -> None:
+            del operation, nbytes, kind, detail, timeout
+
+        def signal(self, peers: object, tag: int, sequence: int, timeout: timedelta) -> None:
+            del peers, tag, sequence, timeout
+            if self.fail_on_signal:
+                raise RuntimeError("injected signal failure")
+
+        def skip_ready(self, peer: int, count: int) -> None:
+            del peer, count
+
+        def abort(self) -> None:
+            pass
+
+    class StubManager:
+        def __init__(self) -> None:
+            self.pageable_bytes = 0
+
+        @contextmanager
+        def acquire(self, tensors: list[torch.Tensor]):
+            del tensors
+            yield SimpleNamespace(pageable_bytes=self.pageable_bytes)
+
+    class DummyStream:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.device = torch.device("cuda", 0)
+            self.sync_count = 0
+
+        def wait_stream(self, other: object) -> None:
+            del other
+
+        def synchronize(self) -> None:
+            self.sync_count += 1
+
+    class DummyEvent:
+        def record(self, stream: object) -> None:
+            del stream
+
+        def synchronize(self) -> None:
+            pass
+
+    class FakeCudaTensor:
+        device = torch.device("cuda", 0)
+
+        def __init__(self, data: torch.Tensor) -> None:
+            self.data = data
+            self.dtype = data.dtype
+            self.nbytes = data.nbytes
+
+        def numel(self) -> int:
+            return self.data.numel()
+
+        def reshape(self, *shape: int) -> torch.Tensor:
+            return self.data.reshape(*shape)
+
+    download_stream = DummyStream("download")
+    upload_stream = DummyStream("upload")
+    current = DummyStream("current")
+    stream_entries: list[str] = []
+
+    @contextmanager
+    def track_stream(stream: DummyStream):
+        stream_entries.append(stream.name)
+        yield
+
+    shared = SharedRelay(
+        dist.FileStore(str(tmp_path / "syncs"), 1),
+        None,
+        rank=0,
+        world_size=1,
+        nbytes=2 * 3 * 64,
+        timeout=timedelta(seconds=5),
+    )
+    control = StubControl()
+    manager = StubManager()
+    shared._control = control
+    shared.capacity = 64
+    return (
+        shared, control, manager, download_stream, upload_stream,
+        current, stream_entries, track_stream, DummyEvent, FakeCudaTensor,
+    )
+
+
+def _check_async_stream_syncs(
+    shared, manager, fake_cuda_tensor, syncs, reset_counts, copy_streams,
+) -> None:
+    # Async allgather (world_size=2): _local_copy on upload, 0 final stream syncs.
+    shared.world_size = 2
+    shared._peers = ((1, 1),)
+    ag_src = torch.arange(8, dtype=torch.float32)
+    ag_outs = [torch.zeros(8, dtype=torch.float32), torch.zeros(8, dtype=torch.float32)]
+    shared._slot(1, 0, 32).copy_(torch.full((8,), 9.0, dtype=torch.float32).view(torch.uint8))
+    shared.allgather([fake_cuda_tensor(ag_src)], [[fake_cuda_tensor(t) for t in ag_outs]], manager)
+    assert syncs() == (0, 0, 0)
+    assert copy_streams[-1] == (True, ["upload"])
+    assert torch.equal(ag_outs[0], ag_src)
+    assert torch.equal(ag_outs[1], torch.full((8,), 9.0, dtype=torch.float32))
+
+    # Async broadcast root & non-root (world_size=2): 0 final stream syncs.
+    reset_counts()
+    bc = torch.arange(8, dtype=torch.float32)
+    shared.broadcast(fake_cuda_tensor(bc), root=0, manager=manager)
+    assert syncs() == (0, 0, 0)
+    reset_counts()
+    bc_recv = torch.zeros(8, dtype=torch.float32)
+    shared._slot(1, 0, 32).copy_(torch.full((8,), 4.0, dtype=torch.float32).view(torch.uint8))
+    shared.broadcast(fake_cuda_tensor(bc_recv), root=1, manager=manager)
+    assert syncs() == (0, 0, 0)
+    assert torch.equal(bc_recv, torch.full((8,), 4.0, dtype=torch.float32))
+
+    # Async scatter root non-alias -> only upload synced; self-alias -> 0 stream syncs.
+    reset_counts()
+    sc_srcs = [torch.arange(8, dtype=torch.float32), torch.arange(8, dtype=torch.float32) + 1]
+    sc_out = torch.zeros(8, dtype=torch.float32)
+    shared.scatter([fake_cuda_tensor(t) for t in sc_srcs], fake_cuda_tensor(sc_out), root=0, manager=manager)
+    assert syncs() == (0, 1, 0)
+    assert copy_streams[-1] == (True, ["upload"])
+    assert torch.equal(sc_out, sc_srcs[0])
+    reset_counts()
+    shared.scatter([fake_cuda_tensor(t) for t in sc_srcs], fake_cuda_tensor(sc_srcs[0]), root=0, manager=manager)
+    assert syncs() == (0, 0, 0)
+
+    # Async reduce_scatter (world_size=1, non-alias): _local_copy on upload; only upload synced.
+    reset_counts()
+    shared.world_size = 1
+    shared._peers = ()
+    rs_src = torch.arange(8, dtype=torch.float32) + 3
+    rs_out = torch.zeros(8, dtype=torch.float32)
+    shared.reduce_scatter([fake_cuda_tensor(rs_out)], [[fake_cuda_tensor(rs_src)]], manager)
+    assert syncs() == (0, 1, 0)
+    assert copy_streams[-1] == (True, ["upload"])
+    assert torch.equal(rs_out, rs_src)
+
+
+def test_shared_collective_synchronizes_only_dirty_or_failed_streams(tmp_path):
+    (
+        shared, control, manager, download_stream, upload_stream,
+        current, stream_entries, track_stream, dummy_event, fake_cuda_tensor,
+    ) = _make_fake_collective_relay(tmp_path)
+
+    def syncs() -> tuple[int, int, int]:
+        return (download_stream.sync_count, upload_stream.sync_count, current.sync_count)
+
+    def reset_counts() -> None:
+        download_stream.sync_count = upload_stream.sync_count = current.sync_count = 0
+        stream_entries.clear()
+
+    stream_iter = iter((download_stream, upload_stream))
+    copy_streams: list[tuple[bool, list[str]]] = []
+    orig_local_copy = shared._local_copy
+
+    def tracked_local_copy(destination: torch.Tensor, source: torch.Tensor, *, asynchronous: bool) -> None:
+        start_idx = len(stream_entries)
+        orig_local_copy(destination, source, asynchronous=asynchronous)
+        copy_streams.append((asynchronous, stream_entries[start_idx:]))
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(torch.cuda, "Stream", lambda device: next(stream_iter))
+        patch.setattr(torch.cuda, "Event", dummy_event)
+        patch.setattr(torch.cuda, "current_stream", lambda _device: current)
+        patch.setattr(torch.cuda, "stream", track_stream)
+        patch.setattr(shared, "_local_copy", tracked_local_copy)
+
+        _check_async_stream_syncs(shared, manager, fake_cuda_tensor, syncs, reset_counts, copy_streams)
+
+        # Pageable fallback (asynchronous=False): _local_copy on current; only current synced.
+        reset_counts()
+        manager.pageable_bytes = 64
+        pg_src = torch.arange(8, dtype=torch.float32) + 5
+        pg_out = torch.zeros(8, dtype=torch.float32)
+        shared.reduce_scatter([fake_cuda_tensor(pg_out)], [[fake_cuda_tensor(pg_src)]], manager)
+        assert syncs() == (0, 0, 1)
+        assert copy_streams[-1] == (False, [])
+        assert torch.equal(pg_out, pg_src)
+
+        # Exception mid-collective: download, upload, AND current are all synchronized.
+        reset_counts()
+        manager.pageable_bytes = 0
+        shared.world_size = 2
+        shared._peers = ((1, 1),)
+        control.fail_on_signal = True
+        with pytest.raises(RuntimeError, match="injected signal failure"):
+            shared.broadcast(fake_cuda_tensor(torch.arange(8, dtype=torch.float32)), root=0, manager=manager)
+        assert syncs() == (1, 1, 1)
+        assert shared.broken
+
+
 def test_shared_pack_spans_and_chunk_pieces():
     from piper_offload._relay_shared import _batch_signature, _chunk_pieces, _pack_spans
 

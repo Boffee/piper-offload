@@ -393,6 +393,8 @@ class SharedRelay:
         self.ready: list[torch.cuda.Event] = []
         self.uploaded: list[torch.cuda.Event] = []
         self._reduction_buffer: torch.Tensor | None = None
+        self._download_dirty = False
+        self._upload_dirty = False
 
     def local_buffer(self) -> torch.Tensor:
         start = self.rank * self.buffer_count * self.capacity
@@ -456,6 +458,8 @@ class SharedRelay:
             start = index * chunk_size
             width = min(chunk_size, length - start)
             with torch.cuda.stream(self.download) if asynchronous else nullcontext():
+                if asynchronous:
+                    self._download_dirty = True
                 fill(self._slot(self.rank, index % self.buffer_count, width), start, width)
                 if asynchronous:
                     self.ready[index % self.buffer_count].record(self.download)
@@ -481,12 +485,18 @@ class SharedRelay:
             start = index * chunk_size
             width = min(chunk_size, length - start)
             with torch.cuda.stream(self.upload) if asynchronous else nullcontext():
+                if receiving and asynchronous:
+                    self._upload_dirty = True
                 yield index, start, width
                 if receiving and asynchronous:
                     self.uploaded[index % self.buffer_count].record(self.upload)
+        if fill is not None and asynchronous:
+            self._download_dirty = False
         # All uploads execute in FIFO order on self.upload, so waiting for the
         # final chunk confirms every earlier peer slot read has finished.
         release(count - 1)
+        if receiving and asynchronous:
+            self._upload_dirty = False
 
     def broadcast(self, tensor: torch.Tensor, root: int, manager: PinManager) -> None:
         with self._collective("broadcast", [tensor], root, manager) as asynchronous:
@@ -507,7 +517,7 @@ class SharedRelay:
         with self._collective("scatter", [output], root, manager) as asynchronous:
             destination = _bytes(output)
             if self.rank == root:
-                self._local_copy(destination, _bytes(sources[root]))
+                self._local_copy(destination, _bytes(sources[root]), asynchronous=asynchronous)
             if self.world_size == 1 or destination.numel() == 0:
                 return
             if self.rank == root:
@@ -529,7 +539,7 @@ class SharedRelay:
             byte_sources = [_bytes(t) for t in sources]
             byte_outputs = [[_bytes(out) for out in outs] for outs in outputs_list]
             for src, outs in zip(byte_sources, byte_outputs, strict=True):
-                self._local_copy(outs[self.rank], src)
+                self._local_copy(outs[self.rank], src, asynchronous=asynchronous)
             spans, total_bytes = _pack_spans([t.numel() for t in byte_sources])
             if self.world_size == 1 or total_bytes == 0:
                 return
@@ -855,7 +865,7 @@ class SharedRelay:
             owner_sources = [[_bytes(srcs[owner]) for srcs in sources_list] for owner in range(self.world_size)]
             if self.world_size == 1:
                 for dst, src in zip(byte_outputs, owner_sources[self.rank], strict=True):
-                    self._local_copy(dst, src)
+                    self._local_copy(dst, src, asynchronous=asynchronous)
                 return
             spans, total_bytes = _pack_spans([t.numel() for t in byte_outputs], align=16)
             if total_bytes == 0:
@@ -906,11 +916,15 @@ class SharedRelay:
         self._agree_operation(operation, tensors, detail)
         with manager.acquire([self.buffer]) if device.type == "cuda" else nullcontext() as lease:
             asynchronous = lease is not None and lease.pageable_bytes == 0
+            failed = False
+            self._download_dirty = False
+            self._upload_dirty = False
             try:
                 if asynchronous:
                     self._prepare_streams(device)
                 yield asynchronous
             except BaseException:
+                failed = True
                 # A failed exchange can leave unread ready/free signals. Do
                 # not reuse its slots or control state in a later operation.
                 self.broken = True
@@ -921,18 +935,23 @@ class SharedRelay:
                 # even if a peer fails after a ready signal was published.
                 if asynchronous:
                     try:
-                        if self.download is not None:
+                        if self.download is not None and (failed or self._download_dirty):
                             self.download.synchronize()
                     finally:
-                        if self.upload is not None:
+                        if self.upload is not None and (failed or self._upload_dirty):
                             self.upload.synchronize()
-                if device.type == "cuda":
-                    # Includes the local GPU contribution, which is copied on
-                    # the current stream instead of passing through the relay.
+                if device.type == "cuda" and (failed or not asynchronous):
+                    # Includes pageable local copies on the current stream and
+                    # fallback cleanup after an error.
                     torch.cuda.current_stream(device).synchronize()
 
-    @staticmethod
-    def _local_copy(destination: torch.Tensor, source: torch.Tensor) -> None:
+    def _local_copy(self, destination: torch.Tensor, source: torch.Tensor, *, asynchronous: bool) -> None:
         # The local contribution never needs a trip through host memory.
         if destination.data_ptr() != source.data_ptr():
-            destination.copy_(source)
+            if asynchronous:
+                assert self.upload is not None
+                with torch.cuda.stream(self.upload):
+                    destination.copy_(source, non_blocking=True)
+                self._upload_dirty = True
+            else:
+                destination.copy_(source)
