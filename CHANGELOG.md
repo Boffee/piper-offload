@@ -5,6 +5,15 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- `piper_relay` now implements SUM reduce-scatter (`reduce_scatter`,
+  `reduce_scatter_single`, `reduce_scatter_tensor`, `_reduce_scatter_base`, and
+  coalesced functional/process-group variants) for `FP32`, `FP16`, and `BF16`
+  (accumulating reduced precision in `FP32`) across both `"gloo"` and `"shared"`
+  transports, enabling standard `DTensor` `Partial` to `Shard` redistributions
+  and `RowwiseParallel(output_layouts=Shard(...))`.
+
 ### Changed
 
 - Breaking: Removed the `bnb` and `quanto` extras and their built-in tensor

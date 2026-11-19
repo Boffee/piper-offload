@@ -52,7 +52,8 @@ class TransferPipeline:
         buffer: torch.Tensor, capacity: int, slots: int, inplace: bool,
     ) -> Generator[HostChunk]:
         pending: deque[tuple[int, int, int, HostChunk]] = deque()
-        ranges = iter(chunk_ranges(destinations[0].numel(), capacity))
+        primary = destinations[0] if destinations else sources[0]
+        ranges = iter(chunk_ranges(primary.numel(), capacity))
         region_bytes = slots * capacity
 
         def download(lane: int, start: int, end: int, *, reuse: bool) -> None:

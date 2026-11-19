@@ -35,18 +35,20 @@ foreground transfer, which background copies such as block prefetch wait for
 extension is required. Gloo pipelining is opt-in; shared transfers use three
 outgoing slots per rank.
 
-SUM all-reduce supports FP32, FP16 and BF16, accumulating reduced precision in
-FP32. Broadcast, scatter and equal-size all-gather also preserve FP64, bool,
-uint8, signed integers, and complex64/complex128. All-reduce and all-gather
-include coalesced variants; all-gather supports tensor-list and single-buffer
-outputs. Inputs and outputs must be contiguous plain tensors on one local
-device. Outputs must not overlap, except that an all-gather input may occupy
-its exact own-rank output slice and a scatter root may receive into its exact
-source slice. Coalesced outputs must not overwrite other inputs.
+SUM all-reduce and reduce-scatter support FP32, FP16 and BF16, accumulating
+reduced precision in FP32. Broadcast, scatter and equal-size all-gather also
+preserve FP64, bool, uint8, signed integers, and complex64/complex128.
+All-reduce, reduce-scatter and all-gather include coalesced variants; all-gather
+and reduce-scatter support tensor-list and single-buffer forms. Inputs and
+outputs must be contiguous plain tensors on one local device. Outputs must not
+overlap, except that an all-gather input may occupy its exact own-rank output
+slice, a reduce-scatter output may occupy its exact own-rank input slice, and a
+scatter root may receive into its exact source slice. Coalesced outputs must not
+overwrite other inputs.
 
 ``RelayOptions`` describes staging and pin budgets. If the staging allocation
 exceeds the pin budget or registration reports invalid-value, copies run
-synchronously through pageable storage. Reduce-scatter, all-to-all, non-SUM reductions,
+synchronously through pageable storage. All-to-all, non-SUM reductions,
 accelerator point-to-point transfers, and CUDA graph capture are unsupported.
 Direct C++ functional all-gather ``out`` calls bypass the Python override and
 are unsupported for accelerator tensors.
@@ -66,7 +68,12 @@ from itertools import pairwise
 
 import torch
 import torch.distributed as dist
-from torch._C._distributed_c10d import AllgatherOptions, _DistributedBackendOptions
+from torch._C._distributed_c10d import (
+    AllgatherOptions,
+    ReduceOptions,
+    ReduceScatterOptions,
+    _DistributedBackendOptions,
+)
 
 from ._relay_shared import BUFFERS_PER_RANK, COPY_DTYPES, REDUCTION_DTYPES, SharedRelay, shared_slot_bytes
 from ._relay_staging import HostChunk, TransferPipeline, chunk_ranges, make_host_chunk
@@ -412,7 +419,9 @@ class _RelayProcessGroup(dist.ProcessGroup):
         _validate_disjoint(destinations)
         for output in destinations:
             _validate_pair(output, source, source.numel(), same_shape=True)
-        self._validate_gather_aliases(source, destinations)
+        self._validate_own_slice_aliases(
+            source, destinations, "piper_relay all-gather input may overlap only its exact local output slice",
+        )
         return self._submit(
             source.device, lambda: self._gather(source, destinations, options), destinations, nested=True,
         )
@@ -443,17 +452,15 @@ class _RelayProcessGroup(dist.ProcessGroup):
         if len(output_lists) != len(input_list) or not input_list:
             raise ValueError("piper_relay all-gather requires matching nonempty input/output lists")
         _validate_tensors([*input_list, *output_lists])
-        _validate_disjoint(output_lists)
-        for i, output in enumerate(output_lists):
-            for j, source in enumerate(input_list):
-                if i != j and _overlap(output, source):
-                    raise ValueError("piper_relay batched outputs must not overlap another input")
+        _validate_batched_outputs(output_lists, input_list)
         # Validate the whole batch before starting communication or mutation.
         destinations: list[list[torch.Tensor]] = []
         for output, source in zip(output_lists, input_list, strict=True):
             _validate_pair(output, source, source.numel() * self.size())
             views = list(output.view(self.size(), source.numel()).unbind(0))
-            self._validate_gather_aliases(source, views)
+            self._validate_own_slice_aliases(
+                source, views, "piper_relay all-gather input may overlap only its exact local output slice",
+            )
             destinations.append(views)
         def body() -> None:
             if self._shared is not None:
@@ -464,10 +471,119 @@ class _RelayProcessGroup(dist.ProcessGroup):
 
         return self._submit(input_list[0].device, body, output_lists)
 
-    def _validate_gather_aliases(self, source: torch.Tensor, outputs: list[torch.Tensor]) -> None:
-        for rank, output in enumerate(outputs):
-            if _overlap(output, source) and (rank != self.rank() or output.data_ptr() != source.data_ptr()):
-                raise ValueError("piper_relay all-gather input may overlap only its exact local output slice")
+    def _validate_own_slice_aliases(
+        self, single: torch.Tensor, per_rank: Sequence[torch.Tensor], message: str,
+    ) -> None:
+        for rank, slice_tensor in enumerate(per_rank):
+            if _overlap(slice_tensor, single) and (
+                rank != self.rank() or slice_tensor.data_ptr() != single.data_ptr()
+            ):
+                raise ValueError(message)
+
+    def reduce_scatter(  # type: ignore[override]
+        self,
+        output_tensors: list[torch.Tensor],
+        input_tensors: list[list[torch.Tensor]],
+        opts: ReduceScatterOptions | None = None,
+    ) -> dist.Work:
+        options = opts if opts is not None else ReduceScatterOptions()
+        output = _single_tensor(output_tensors)
+        if len(input_tensors) != 1 or len(input_tensors[0]) != self.size():
+            raise ValueError("piper_relay reduce-scatter requires one input tensor per rank")
+        sources = input_tensors[0]
+        _validate_reduction([output, *sources], options)
+        for source in sources:
+            _validate_pair(output, source, source.numel(), same_shape=True)
+        self._validate_own_slice_aliases(
+            output, sources, "piper_relay reduce-scatter output may overlap only its exact local input slice",
+        )
+
+        def body() -> None:
+            if self._shared is not None and output.device.type == "cuda":
+                self._shared.reduce_scatter([output], [sources], host_pin_manager)
+                return
+            self._reduce_scatter_gloo(output, sources, options)
+
+        return self._submit(output.device, body, [output])
+
+    def reduce_scatter_single(  # type: ignore[override]
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,  # noqa: A002 -- PyTorch parameter name
+        opts: ReduceScatterOptions | None = None,
+    ) -> dist.Work:
+        return self.reduce_scatter_single_coalesced([output], [input], opts)
+
+    def _reduce_scatter_base(  # type: ignore[override]
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,  # noqa: A002 -- PyTorch parameter name
+        opts: ReduceScatterOptions | None = None,
+    ) -> dist.Work:
+        return self.reduce_scatter_single(output, input, opts)
+
+    def reduce_scatter_single_coalesced(  # type: ignore[override]
+        self,
+        output_tensors: list[torch.Tensor],
+        input_tensors: list[torch.Tensor],
+        opts: ReduceScatterOptions | None = None,
+    ) -> dist.Work:
+        options = opts if opts is not None else ReduceScatterOptions()
+        if len(output_tensors) != len(input_tensors) or not output_tensors:
+            raise ValueError("piper_relay reduce-scatter requires matching nonempty output/input lists")
+        _validate_reduction([*output_tensors, *input_tensors], options)
+        _validate_batched_outputs(output_tensors, input_tensors)
+        # Validate the whole batch before starting communication or mutation.
+        sources_list: list[list[torch.Tensor]] = []
+        for output, source in zip(output_tensors, input_tensors, strict=True):
+            _validate_pair(source, output, output.numel() * self.size())
+            views = list(source.view(self.size(), output.numel()).unbind(0))
+            self._validate_own_slice_aliases(
+                output, views, "piper_relay reduce-scatter output may overlap only its exact local input slice",
+            )
+            sources_list.append(views)
+
+        def body() -> None:
+            if self._shared is not None and output_tensors[0].device.type == "cuda":
+                self._shared.reduce_scatter(output_tensors, sources_list, host_pin_manager)
+                return
+            for output, sources in zip(output_tensors, sources_list, strict=True):
+                self._reduce_scatter_gloo(output, sources, options)
+
+        return self._submit(output_tensors[0].device, body, output_tensors)
+
+    def _reduce_scatter_gloo(
+        self, output: torch.Tensor, sources: list[torch.Tensor], options: ReduceScatterOptions,
+    ) -> None:
+        if output.dtype == torch.float32:
+            with closing(self._copy_chunks(sources, [output], slots=self.size() + 1)) as chunks:
+                for chunk in chunks:
+                    # PyTorch's Gloo stubs omit the collective bindings.
+                    self._cpu_group.reduce_scatter(  # type: ignore[attr-defined]
+                        [chunk.outputs[0].view(torch.float32)],
+                        [[t.view(torch.float32) for t in chunk.inputs]],
+                        options,
+                    ).wait()
+            return
+        reduce_options = ReduceOptions()
+        reduce_options.reduceOp = options.reduceOp
+        reduce_options.timeout = options.timeout
+        reduce_options.asyncOp = options.asyncOp
+        rank = self.rank()
+        for target in range(self.size()):
+            reduce_options.rootRank = target
+            with closing(self._copy_chunks(
+                [sources[target]], [output] if rank == target else [], slots=3, inplace=True, stage_cpu=True,
+            )) as chunks:
+                for chunk in chunks:
+                    host = chunk.inputs[0].view(output.dtype)
+                    assert chunk.scratch is not None
+                    accumulator = chunk.scratch[:host.numel() * 4].view(torch.float32)
+                    accumulator.copy_(host)
+                    # PyTorch's Gloo stubs omit the collective bindings.
+                    self._cpu_group.reduce([accumulator], reduce_options).wait()  # type: ignore[attr-defined]
+                    if rank == target:
+                        host.copy_(accumulator)
 
     def _gather(self, source: torch.Tensor, outputs: list[torch.Tensor], options: AllgatherOptions) -> None:
         if self._shared is not None:
@@ -485,13 +601,14 @@ class _RelayProcessGroup(dist.ProcessGroup):
         # The root/non-root scatter plans must use identical chunk sizes.
         slots = slots if slots is not None else len(inputs) + len(outputs)
         capacity = self._slot_bytes(slots)
-        device = outputs[0].device
+        primary = destinations[0] if destinations else sources[0]
+        device = (outputs or inputs)[0].device
         if device.type == "cpu" and not stage_cpu:
-            for start, end in chunk_ranges(destinations[0].numel(), capacity):
+            for start, end in chunk_ranges(primary.numel(), capacity):
                 yield HostChunk([t[start:end] for t in sources], [t[start:end] for t in destinations])
             return
         with self._buffer(device) as (buffer, pinned):
-            if pinned and self._pipeline_buffers > 1 and destinations[0].numel() > capacity:
+            if pinned and self._pipeline_buffers > 1 and primary.numel() > capacity:
                 if self._pipeline is None or self._pipeline.device != device:
                     self._pipeline = TransferPipeline(device, self._pipeline_buffers)
                 # Closing the inner generator drains DMA before _buffer releases
@@ -502,7 +619,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
             # CPU and pageable fallback retain the configured chunk size so
             # ranks with different registration outcomes issue matching calls.
             region = buffer[:slots * capacity]
-            for start, end in chunk_ranges(destinations[0].numel(), capacity):
+            for start, end in chunk_ranges(primary.numel(), capacity):
                 chunk = make_host_chunk(region, capacity, end - start, len(inputs), len(outputs), inplace)
                 for source, host in zip(sources, chunk.inputs, strict=True):
                     host.copy_(source[start:end], non_blocking=False)
@@ -570,13 +687,15 @@ class _PendingWork(dist.Work):
         self.wait()
 
 
-def _validate_reduction(tensors: list[torch.Tensor], options: dist.AllreduceOptions) -> None:
+def _validate_reduction(
+    tensors: list[torch.Tensor], options: dist.AllreduceOptions | ReduceScatterOptions,
+) -> None:
     if options.reduceOp != dist.ReduceOp.SUM:
-        raise NotImplementedError("piper_relay currently supports only SUM all-reduce")
+        raise NotImplementedError("piper_relay currently supports only SUM reductions")
     _validate_tensors(tensors)
     for tensor in tensors:
         if tensor.dtype not in REDUCTION_DTYPES:
-            raise NotImplementedError("piper_relay SUM all-reduce supports FP32, FP16 and BF16")
+            raise NotImplementedError("piper_relay SUM reduction supports FP32, FP16 and BF16")
 
 
 def _single_tensor(tensors: list[torch.Tensor]) -> torch.Tensor:
@@ -626,6 +745,14 @@ def _validate_disjoint(tensors: Sequence[torch.Tensor]) -> None:
     for left, right in pairwise(ordered):
         if _overlap(left, right):
             raise ValueError("piper_relay collective outputs must not overlap")
+
+
+def _validate_batched_outputs(outputs: Sequence[torch.Tensor], inputs: Sequence[torch.Tensor]) -> None:
+    _validate_disjoint(outputs)
+    for i, output in enumerate(outputs):
+        for j, source in enumerate(inputs):
+            if i != j and _overlap(output, source):
+                raise ValueError("piper_relay batched outputs must not overlap another input")
 
 
 def _bytes(tensor: torch.Tensor) -> torch.Tensor:
