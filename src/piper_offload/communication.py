@@ -94,11 +94,12 @@ class RelayOptions:
 
     ``transport="shared"`` instead maps one ``staging_bytes`` arena across all
     ranks on the same machine. Copy collectives always use three outgoing slots
-    per rank, reused across peer rounds. Every process registers its full
-    mapping under its own pin budget; physical payload storage is shared once.
-    GPU reductions use the same three slots plus at most three slot sizes of
-    reusable device scratch per rank, at most ``staging_bytes / world_size``,
-    independent of tensor size.
+    per rank, reused across peer rounds; all-gather and broadcast publish each
+    chunk once for all peers, and coalesced shared batches pack into one transfer.
+    Every process registers its full mapping under its own pin budget; physical
+    payload storage is shared once. GPU reductions use the same three slots plus
+    at most three slot sizes of reusable device scratch per rank, at most
+    ``staging_bytes / world_size``, independent of tensor size.
     FP16/BF16 accumulate in FP32. CPU tensor reductions use Gloo and borrow
     this rank's region. ``pipeline_buffers`` only affects the Gloo path. The default
     transport remains ``"gloo"``.
@@ -304,6 +305,9 @@ class _RelayProcessGroup(dist.ProcessGroup):
         single_options.timeout = options.timeout
         single_options.asyncOp = options.asyncOp
         def body() -> None:
+            if self._shared is not None and tensors[0].device.type == "cuda":
+                self._shared.allreduce(tensors, host_pin_manager)
+                return
             for tensor in tensors:
                 self._reduce(tensor, single_options)
 
@@ -311,7 +315,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
 
     def _reduce(self, tensor: torch.Tensor, options: dist.AllreduceOptions) -> None:
         if self._shared is not None and tensor.device.type == "cuda":
-            self._shared.reduce(tensor, host_pin_manager)
+            self._shared.allreduce([tensor], host_pin_manager)
             return
         low_precision = tensor.dtype != torch.float32
         with closing(self._copy_chunks(
@@ -341,11 +345,11 @@ class _RelayProcessGroup(dist.ProcessGroup):
         self._validate_root(options.rootRank)
         if options.rootTensor != 0:
             raise ValueError("piper_relay broadcast requires rootTensor=0")
-        sources = [tensor] if self.rank() == options.rootRank else []
         def body() -> None:
             if self._shared is not None:
-                self._shared.copy("broadcast", sources, [tensor], options.rootRank, host_pin_manager)
+                self._shared.broadcast(tensor, options.rootRank, host_pin_manager)
                 return
+            sources = [tensor] if self.rank() == options.rootRank else []
             with closing(self._copy_chunks(sources, [tensor], slots=2)) as chunks:
                 for chunk in chunks:
                     if chunk.inputs:
@@ -382,7 +386,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
                 raise ValueError("piper_relay scatter output must not overlap inputs except its exact root slice")
         def body() -> None:
             if self._shared is not None:
-                self._shared.copy("scatter", sources, [output], options.rootRank, host_pin_manager)
+                self._shared.scatter(sources, output, options.rootRank, host_pin_manager)
                 return
             with closing(self._copy_chunks(sources, [output], slots=self.size() + 1)) as chunks:
                 for chunk in chunks:
@@ -451,6 +455,9 @@ class _RelayProcessGroup(dist.ProcessGroup):
             self._validate_gather_aliases(source, views)
             destinations.append(views)
         def body() -> None:
+            if self._shared is not None:
+                self._shared.allgather(input_list, destinations, host_pin_manager)
+                return
             for source, outputs in zip(input_list, destinations, strict=True):
                 self._gather(source, outputs, options)
 
@@ -463,7 +470,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
 
     def _gather(self, source: torch.Tensor, outputs: list[torch.Tensor], options: AllgatherOptions) -> None:
         if self._shared is not None:
-            self._shared.copy("allgather", [source], outputs, -1, host_pin_manager)
+            self._shared.allgather([source], [outputs], host_pin_manager)
             return
         with closing(self._copy_chunks([source], outputs)) as chunks:
             for chunk in chunks:

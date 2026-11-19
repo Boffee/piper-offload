@@ -1,5 +1,6 @@
 """Exercise the registered relay through c10d and real DTensor operations."""
 
+import functools
 import gc
 import math
 import threading
@@ -1015,9 +1016,16 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
         output = torch.empty((size, local.numel()), device=device)
         dist.all_gather_single(output, local)
         assert lanes == {0, 1, 2}
-        assert counts == [(size - 1) * local.nbytes] * 2
+        assert counts == [local.nbytes, (size - 1) * local.nbytes]
         for peer in range(size):
             torch.testing.assert_close(output[peer], local - rank + peer)
+
+        counts[:] = [0, 0]
+        bcast = torch.arange(shared.capacity + 1, dtype=torch.float32, device=device)
+        bcast_buf = bcast.clone() if rank == 0 else torch.empty_like(bcast)
+        dist.broadcast(bcast_buf, src=0)
+        torch.testing.assert_close(bcast_buf, bcast)
+        assert counts == ([bcast.nbytes, 0] if rank == 0 else [0, bcast.nbytes])
         # Both processes see the same physical host pages (distinct virtual
         # mappings). Each rank only owns its own region for Gloo reductions.
         shared.local_buffer().fill_(rank)
@@ -1032,6 +1040,9 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
             assert scratch.device == local.device
             assert scratch.nbytes == 3 * shared.capacity
             _check_shared_reduction_precision(rank, size, device, shared.capacity)
+            assert shared._reduction_buffer is scratch
+        _check_shared_coalesced(group, shared, control, manager, counts, rank, size, device)
+        if device_type == "cuda":
             assert shared._reduction_buffer is scratch
         assert control.messages > 20
         assert group._staging_buffer is None
@@ -1075,6 +1086,83 @@ def _check_shared_reduction_precision(rank, size, device, capacity):
         dist.all_reduce(local)
         torch.testing.assert_close(local, torch.full_like(local, total.to(dtype).item()), rtol=0, atol=0)
         torch.testing.assert_close(backing[[0, -1]], torch.full_like(backing[:2], contributions[rank]))
+
+
+def _check_shared_coalesced(group, shared, control, manager, counts, rank, size, device):
+    before_messages = control.messages
+    small_inputs = [
+        torch.arange(3, dtype=torch.bfloat16, device=device) + rank,
+        torch.arange(8, dtype=torch.float32, device=device).reshape(2, 4) + rank,
+        torch.empty((0,), dtype=torch.int64, device=device),
+        torch.arange(5, dtype=torch.int64, device=device) + rank,
+    ]
+    small_outputs = [
+        torch.empty((size * tensor.shape[0], *tensor.shape[1:]), dtype=tensor.dtype, device=device)
+        for tensor in small_inputs
+    ]
+    group.allgather_into_tensor_coalesced(small_outputs, small_inputs).wait()
+    for src, out in zip(small_inputs, small_outputs, strict=True):
+        views = out.view(size, *src.shape)
+        for peer in range(size):
+            torch.testing.assert_close(views[peer], src - rank + peer, rtol=0, atol=0)
+    assert control.messages - before_messages == 1 + 4 * (size - 1)
+
+    large_inputs = [
+        (torch.arange(shared.capacity // 2 + 3, dtype=torch.float16, device=device) % 17) + rank,
+        torch.arange(shared.capacity // 4 + 5, dtype=torch.int32, device=device) + rank,
+    ]
+    counts[:] = [0, 0]
+    gathered_large = funcol.all_gather_single_coalesced(large_inputs, group)
+    for src, out in zip(large_inputs, gathered_large, strict=True):
+        views = funcol.wait_tensor(out).view(size, *src.shape)
+        for peer in range(size):
+            torch.testing.assert_close(views[peer], src - rank + peer, rtol=0, atol=0)
+    total_large_bytes = sum(tensor.nbytes for tensor in large_inputs)
+    assert counts == [total_large_bytes, (size - 1) * total_large_bytes]
+
+    empty_inputs = [
+        torch.empty(0, dtype=torch.float32, device=device),
+        torch.empty(0, dtype=torch.bfloat16, device=device),
+    ]
+    empty_outputs = [torch.empty(0, dtype=tensor.dtype, device=device) for tensor in empty_inputs]
+    counts[:] = [0, 0]
+    group.allgather_into_tensor_coalesced(empty_outputs, empty_inputs).wait()
+    assert counts == [0, 0]
+    if device.type == "cuda":
+        group.allreduce_coalesced(empty_inputs).wait()
+    else:
+        shared.allreduce(empty_inputs, manager)
+    assert counts == [0, 0]
+
+    def make_reduce_batch(r: int) -> list[torch.Tensor]:
+        bf16_rows = (
+            torch.tensor([256.0, 1.0, -256.0], dtype=torch.bfloat16),
+            torch.tensor([1.0, 2.0, 1.0], dtype=torch.bfloat16),
+            torch.tensor([-256.0, 4.0, 256.0], dtype=torch.bfloat16),
+        )
+        n1 = shared.capacity // 2 + 3
+        n2 = shared.capacity * 3 // 4 + 5
+        return [
+            bf16_rows[r].clone(),
+            torch.empty((0,), dtype=torch.float32),
+            (torch.arange(n1, dtype=torch.float32) % 13 - 4 + r * 0.5).to(torch.float16),
+            (torch.arange(n2, dtype=torch.float32) % 29) * 0.25 + r,
+        ]
+
+    per_rank_cpu = [make_reduce_batch(r) for r in range(size)]
+    reduce_inputs = [tensor.to(device) for tensor in per_rank_cpu[rank]]
+    expected_outputs = [
+        functools.reduce(torch.add, (per_rank_cpu[r][i].float() for r in range(size))).to(
+            per_rank_cpu[0][i].dtype,
+        )
+        for i in range(len(reduce_inputs))
+    ]
+    if device.type == "cuda":
+        group.allreduce_coalesced(reduce_inputs).wait()
+    else:
+        shared.allreduce(reduce_inputs, manager)
+    for actual, expected in zip(reduce_inputs, expected_outputs, strict=True):
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
 def _run_shared_adaptive_cpu(rank: int, path: str) -> None:
@@ -1406,7 +1494,51 @@ def _run_shared_metadata_mismatch(rank, path, device_type):
         assert torch.all(output == -1)
         dist.all_reduce(value)
         torch.testing.assert_close(value, torch.full_like(value, 3))
+
+    _check_shared_coalesced_mismatch(dist.group.WORLD, local, rank, device_type)
     dist.destroy_process_group()
+
+
+def _check_shared_coalesced_mismatch(group, local, rank, device_type):
+    # Coalesced collectives validate tensor count and per-tensor split/dtype before writes.
+    count_inputs = [local[:1]] if rank == 0 else [local[:1], local[:1]]
+    count_outputs = [torch.full((2,), -1, dtype=torch.int64, device=device_type) for _ in count_inputs]
+    with pytest.raises(ValueError, match="must match across ranks"):
+        group.allgather_into_tensor_coalesced(count_outputs, count_inputs).wait()
+    assert all(torch.all(out == -1) for out in count_outputs)
+
+    split_shapes = (2, 2) if rank == 0 else (1, 3)
+    split_inputs = [torch.full((n,), rank, dtype=torch.int32, device=device_type) for n in split_shapes]
+    split_outputs = [torch.full((2 * n,), -1, dtype=torch.int32, device=device_type) for n in split_shapes]
+    with pytest.raises(ValueError, match="must match across ranks"):
+        group.allgather_into_tensor_coalesced(split_outputs, split_inputs).wait()
+    assert all(torch.all(out == -1) for out in split_outputs)
+
+    second_dtype = torch.float32 if rank == 0 else torch.int32
+    dtype_inputs = [
+        torch.full((2,), rank, dtype=torch.float32, device=device_type),
+        torch.full((2,), rank, dtype=second_dtype, device=device_type),
+    ]
+    dtype_outputs = [torch.full((4,), -1, dtype=t.dtype, device=device_type) for t in dtype_inputs]
+    with pytest.raises(ValueError, match="must match across ranks"):
+        group.allgather_into_tensor_coalesced(dtype_outputs, dtype_inputs).wait()
+    assert all(torch.all(out == -1) for out in dtype_outputs)
+
+    if device_type == "cuda":
+        reduce_pair = [
+            torch.full((2,), float(rank + 1), dtype=torch.float32, device=device_type),
+            torch.full((2,), float(rank + 1), dtype=DTYPES[rank + 1], device=device_type),
+        ]
+        with pytest.raises(ValueError, match="must match across ranks"):
+            group.allreduce_coalesced(reduce_pair).wait()
+        for tensor in reduce_pair:
+            torch.testing.assert_close(tensor, torch.full_like(tensor, float(rank + 1)))
+
+    valid_inputs = [local[:1], local[:1].to(torch.float32)]
+    valid_outputs = [torch.empty((2,), dtype=t.dtype, device=device_type) for t in valid_inputs]
+    group.allgather_into_tensor_coalesced(valid_outputs, valid_inputs).wait()
+    torch.testing.assert_close(valid_outputs[0].cpu(), torch.arange(2, dtype=torch.int64))
+    torch.testing.assert_close(valid_outputs[1].cpu(), torch.arange(2, dtype=torch.float32))
 
 
 @pytest.mark.parametrize("device_type", ["cpu", pytest.param("cuda", marks=CUDA)])
@@ -1522,20 +1654,28 @@ def _make_fake_shared_relay(tmp_path, name: str = "chunks", capacity: int = 64):
         shared.ready = [FakeEvent(events, f"ready[{lane}]") for lane in range(3)]
         shared.uploaded = [FakeEvent(events, f"uploaded[{lane}]") for lane in range(3)]
 
+    def make_fill(src: torch.Tensor):
+        def fill(slot: torch.Tensor, start: int, width: int) -> None:
+            slot.copy_(src[start:start + width], non_blocking=True)
+
+        return fill
+
     shared._slot = tracked_slot
-    return shared, events, reset, nullcontext
+    return shared, events, reset, make_fill, nullcontext
 
 
 def test_shared_chunks_prefetches_ahead_and_releases_once(tmp_path):
     capacity = 64
-    shared, events, reset, nullcontext = _make_fake_shared_relay(tmp_path, capacity=capacity)
+    shared, events, reset, make_fill, nullcontext = _make_fake_shared_relay(tmp_path, capacity=capacity)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
         for count in (1, 2, 3, 4, 5):
             reset()
             source = torch.arange(count * capacity, dtype=torch.uint8)
             received = torch.empty_like(source)
-            for index, start, width in shared._chunks(source, source.numel(), [(1, 1)], asynchronous=True):
+            for index, start, width in shared._chunks(
+                make_fill(source), source.numel(), [(1, 1)], asynchronous=True,
+            ):
                 events.append(("yield", index, start, width))
                 lane_start = (index % 3) * capacity
                 received[start:start + width].copy_(shared.buffer[lane_start:lane_start + width])
@@ -1562,7 +1702,7 @@ def test_shared_chunks_prefetches_ahead_and_releases_once(tmp_path):
 
 def test_shared_chunks_skips_unused_direction_events(tmp_path):
     capacity = 64
-    shared, events, reset, nullcontext = _make_fake_shared_relay(tmp_path, name="unidir", capacity=capacity)
+    shared, events, reset, make_fill, nullcontext = _make_fake_shared_relay(tmp_path, name="unidir", capacity=capacity)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
 
@@ -1580,7 +1720,7 @@ def test_shared_chunks_skips_unused_direction_events(tmp_path):
         reset({1: [0, 3]})
         source = torch.arange(4 * capacity, dtype=torch.uint8)
         received = torch.empty_like(source)
-        for index, start, width in shared._chunks(source, source.numel(), [(1, None)], asynchronous=True):
+        for index, start, width in shared._chunks(make_fill(source), source.numel(), [(1, None)], asynchronous=True):
             lane_start = (index % 3) * capacity
             received[start:start + width].copy_(shared.buffer[lane_start:lane_start + width])
         assert torch.equal(received, source)
@@ -1695,7 +1835,7 @@ def test_shared_prepare_streams_failure_propagates_original_error(tmp_path):
         patch.setattr(torch.cuda, "Stream", failing_stream)
         patch.setattr(torch.cuda, "current_stream", lambda _device: current)
         with pytest.raises(RuntimeError, match="injected stream creation failure"):
-            with shared._collective("allreduce", fake_tensor, -1, manager):
+            with shared._collective("allreduce", [fake_tensor], -1, manager):
                 pytest.fail("collective body ran after stream creation failure")
 
     assert shared.broken
@@ -1706,3 +1846,24 @@ def test_shared_prepare_streams_failure_propagates_original_error(tmp_path):
     assert shared.upload is None
     assert shared.ready == []
     assert shared.uploaded == []
+
+
+def test_shared_pack_spans_and_chunk_pieces():
+    from piper_offload._relay_shared import _batch_signature, _chunk_pieces, _pack_spans
+
+    assert _pack_spans([0, 0]) == ([], 0)
+    assert _pack_spans([6, 0, 32], align=1) == ([(0, 0, 6), (2, 6, 32)], 38)
+
+    spans, total = _pack_spans([6, 0, 32], align=16)
+    assert (spans, total) == ([(0, 0, 6), (2, 16, 32)], 48)
+    ends = [start + length for _, start, length in spans]
+    assert _chunk_pieces(spans, ends, 0, 16) == [(0, 0, 0, 6)]
+    assert _chunk_pieces(spans, ends, 16, 48) == [(2, 0, 0, 32)]
+    assert _chunk_pieces(spans, ends, 0, 32) == [(0, 0, 0, 6), (2, 16, 0, 16)]
+    assert _chunk_pieces(spans, ends, 32, 48) == [(2, 0, 16, 16)]
+
+    a = [torch.empty(2, dtype=torch.int32), torch.empty(2, dtype=torch.int32)]
+    b = [torch.empty(1, dtype=torch.int32), torch.empty(3, dtype=torch.int32)]
+    c = [torch.empty(2, dtype=torch.int32), torch.empty(2, dtype=torch.float32)]
+    assert _batch_signature(a) != _batch_signature(b)
+    assert _batch_signature(a) != _batch_signature(c)
