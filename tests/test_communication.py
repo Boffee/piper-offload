@@ -19,6 +19,7 @@ import torch.distributed._functional_collectives as funcol
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distribute_tensor
+from torch.distributed.tensor.parallel import RowwiseParallel, parallelize_module
 
 from piper_offload import _transfer_priority, communication
 from piper_offload.communication import RelayOptions, register_relay_backend
@@ -107,6 +108,41 @@ def _run_relay(
     assert host_pin_manager.stats.pinned_bytes == 0
 
 
+def _check_reduce_scatter_ops(mesh, rank, device, dtype):
+    for shape in ((), (0,), (3, 7), (257,)):
+        in_list = [torch.full(shape, float(rank + 1 + r), device=device, dtype=dtype) for r in range(2)]
+        backups = [t.clone() for t in in_list]
+        out = torch.empty(shape, device=device, dtype=dtype)
+        work = dist.reduce_scatter(out, in_list, async_op=True)
+        assert work.wait(WAIT)
+        assert work.is_completed()
+        assert work.get_future().done()
+        assert work.get_future().wait()[0] is out
+        expected = torch.full_like(out, float(3 + 2 * rank))
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        for src, backup in zip(in_list, backups, strict=True):
+            torch.testing.assert_close(src, backup, rtol=0, atol=0)
+
+        stacked = torch.stack(in_list)
+        out_single = torch.empty_like(out)
+        dist.reduce_scatter_single(out_single, stacked)
+        torch.testing.assert_close(out_single, expected, rtol=0, atol=0)
+        out_tensor = torch.empty_like(out)
+        dist.reduce_scatter_tensor(out_tensor, stacked)
+        torch.testing.assert_close(out_tensor, expected, rtol=0, atol=0)
+
+    contributions = [torch.linspace(-5 + r, 7 + r, 12).to(dtype).reshape(2, 6) for r in range(2)]
+    expected_2d = (contributions[0].float() + contributions[1].float()).to(dtype).to(device)
+    local_partial = contributions[rank].to(device).clone()
+    partial = DTensor.from_local(local_partial, mesh, [Partial()], run_check=False)
+    for placement in (Shard(0), Shard(1)):
+        expected_shard = torch.chunk(expected_2d, 2, dim=placement.dim)[rank]
+        for asynchronous in (False, True):
+            sharded = partial.redistribute(placements=[placement], async_op=asynchronous).to_local()
+            torch.testing.assert_close(sharded, expected_shard, rtol=0, atol=0)
+    torch.testing.assert_close(partial.to_local().cpu(), contributions[rank], rtol=0, atol=0)
+
+
 def _check_reduction(mesh, rank, device, dtype):
     for shape in ((), (0,), (3, 7), (257,)):
         x = torch.full(shape, float(rank + 1), device=device, dtype=dtype)
@@ -126,6 +162,7 @@ def _check_reduction(mesh, rank, device, dtype):
         reduced = partial.redistribute(placements=[Replicate()], async_op=asynchronous).to_local()
         torch.testing.assert_close(reduced, expected, rtol=0, atol=0)
     torch.testing.assert_close(partial.to_local().cpu(), contributions[rank])
+    _check_reduce_scatter_ops(mesh, rank, device, dtype)
 
 
 def _check_copy_collectives(rank, device, dtype):
@@ -229,6 +266,25 @@ def _check_coalesced(device):
     for output, expected in zip(outputs, gathered, strict=True):
         torch.testing.assert_close(output, expected)
 
+    rs_inputs = [torch.cat([inputs[0] + 1, inputs[0] + 3]), torch.cat([inputs[1] + 1, inputs[1] + 3])]
+    rs_backups = [t.clone() for t in rs_inputs]
+    rs_single = funcol.wait_tensor(funcol.reduce_scatter_single(rs_inputs[0], "sum", 0, dist.group.WORLD))
+    torch.testing.assert_close(rs_single, torch.full_like(inputs[0], 5 + 4 * rank))
+    rs_coal = [
+        funcol.wait_tensor(t)
+        for t in funcol.reduce_scatter_single_coalesced(rs_inputs, "sum", [0, 0], dist.group.WORLD)
+    ]
+    for i, tensor in enumerate(rs_coal):
+        torch.testing.assert_close(tensor, torch.full_like(inputs[i], 3 + 2 * i + 2 + 4 * rank))
+        torch.testing.assert_close(rs_inputs[i], rs_backups[i])
+    pg_rs = [torch.empty_like(t) for t in rs_coal]
+    dist.group.WORLD.reduce_scatter_tensor_coalesced(pg_rs, rs_inputs).wait()
+    for actual, expected in zip(pg_rs, rs_coal, strict=True):
+        torch.testing.assert_close(actual, expected)
+    base_rs = torch.empty_like(rs_coal[0])
+    dist.group.WORLD._reduce_scatter_base(base_rs, rs_inputs[0]).wait()
+    torch.testing.assert_close(base_rs, rs_coal[0])
+
 
 def _check_payload_bits(rank, device, dtype):
     # Preserve signed zero, subnormals, infinity and a NaN payload without
@@ -262,6 +318,20 @@ def _check_mlp(mesh: DeviceMesh, rank: int, device: torch.device, dtype: torch.d
     rtol, atol = tolerances[dtype]
     torch.testing.assert_close(result.cpu(), expected, rtol=rtol, atol=atol)
 
+    x_seq = (torch.arange(32, dtype=torch.float32).reshape(2, 4, 4) / 32 - 0.3).to(dtype)
+    w_row = (torch.arange(24, dtype=torch.float32).reshape(6, 4) / 32 - 0.4).to(dtype)
+    bias_row = (torch.arange(6, dtype=torch.float32) / 16 - 0.1).to(dtype)
+    expected_sp = torch.nn.functional.linear(x_seq, w_row, bias_row).chunk(2, dim=1)[rank]
+    layer = torch.nn.Linear(4, 6, bias=True).to(device=device, dtype=dtype)
+    with torch.no_grad():
+        layer.weight.copy_(w_row)
+        layer.bias.copy_(bias_row)
+    parallelize_module(layer, mesh, RowwiseParallel(output_layouts=Shard(1)))
+    x_local = x_seq.chunk(2, dim=2)[rank].to(device)
+    with torch.inference_mode():
+        sp_out = layer(x_local)
+    torch.testing.assert_close(sp_out.cpu(), expected_sp, rtol=rtol, atol=atol)
+
 
 def _check_streams(device: torch.device) -> None:
     producer = torch.cuda.Stream(device=device)
@@ -278,17 +348,23 @@ def _check_streams(device: torch.device) -> None:
         scattered = torch.empty_like(broadcast)
         scatter_list = [broadcast, broadcast + 1] if dist.get_rank() == 1 else None
         scatter_work = dist.scatter(scattered, scatter_list, src=1, async_op=True)
+        rs_in = torch.arange(2 * 1024 * 1024, device=device, dtype=torch.float32).reshape(2, -1).mul_(0.25)
+        rs_out = torch.empty(1024 * 1024, device=device, dtype=torch.float32)
+        rs_work = dist.reduce_scatter_single(rs_out, rs_in, async_op=True)
     # Each collective starts after the producer's earlier work, and its
     # outputs are ready for any stream once wait() returns.
-    for pending in (work, gather_work, broadcast_work, scatter_work):
+    for pending in (work, gather_work, broadcast_work, scatter_work, rs_work):
         assert pending.wait(WAIT)
         assert pending.is_completed()
     assert producer.query()
     with torch.cuda.stream(consumer):
         result = x + 1
+        rs_checked = rs_out + 1
     consumer.synchronize()
     expected = torch.arange(x.numel(), dtype=torch.float32) * 0.5 + 1
+    rs_expected = rs_in[dist.get_rank()].cpu().mul(2).add(1)
     torch.testing.assert_close(result.cpu(), expected)
+    torch.testing.assert_close(rs_checked.cpu(), rs_expected)
     torch.testing.assert_close(gathered.cpu(), torch.cat([expected - 1, expected - 1]))
     torch.testing.assert_close(broadcast, torch.ones_like(broadcast))
     torch.testing.assert_close(scattered, torch.full_like(scattered, dist.get_rank() + 1))
@@ -565,6 +641,62 @@ def test_broadcast_rejects_invalid_root(single_rank_group):
         single_rank_group.broadcast([torch.ones(1)], options)
 
 
+def test_reject_unsupported_reduce_scatter(single_rank_group, monkeypatch):
+    manager = PinManager(1024 * 1024)
+    monkeypatch.setattr(communication, "host_pin_manager", manager)
+    out = torch.empty(2)
+    for op in (dist.ReduceOp.MAX, dist.ReduceOp.PRODUCT):
+        with pytest.raises(NotImplementedError, match="only SUM"):
+            dist.reduce_scatter(out, [torch.ones(2)], op=op)
+        with pytest.raises(NotImplementedError, match="only SUM"):
+            dist.reduce_scatter_single(out, torch.ones(2), op=op)
+    for bad in (
+        torch.ones(2, dtype=torch.int64),
+        torch.ones(2, dtype=torch.float64),
+        torch.ones(2, dtype=torch.bool),
+    ):
+        with pytest.raises(NotImplementedError, match="supports FP32, FP16 and BF16"):
+            dist.reduce_scatter_single(torch.empty(2, dtype=bad.dtype), bad)
+    with pytest.raises(NotImplementedError, match="contiguous strided"):
+        dist.reduce_scatter_single(out, torch.ones(2, 2).T.reshape(1, 4)[:, ::2])
+    class TensorSubclass(torch.Tensor):
+        pass
+    with pytest.raises(TypeError, match="plain local tensor"):
+        single_rank_group.reduce_scatter([out], [[TensorSubclass(torch.ones(2))]])
+    with pytest.raises(ValueError, match="one input tensor per rank"):
+        single_rank_group.reduce_scatter([out], [[torch.ones(2), torch.ones(2)]])
+    with pytest.raises(ValueError, match="equal tensor shapes"):
+        single_rank_group.reduce_scatter([torch.empty(1, 2)], [[torch.ones(2)]])
+    with pytest.raises(ValueError, match="expected element count"):
+        dist.reduce_scatter_single(torch.empty(3), torch.ones(2))
+    with pytest.raises(ValueError, match="input dtype"):
+        dist.reduce_scatter_single(torch.empty(2, dtype=torch.float16), torch.ones(2))
+
+    backing = torch.arange(5, dtype=torch.float32)
+    with pytest.raises(ValueError, match="exact local input slice"):
+        dist.reduce_scatter_single(backing[1:3], backing[:2])
+    with pytest.raises(ValueError, match="must not overlap"):
+        single_rank_group.reduce_scatter_single_coalesced([backing[:3], backing[2:4]], [torch.ones(3), torch.ones(2)])
+    pair = [torch.ones(2), torch.ones(2)]
+    with pytest.raises(ValueError, match="overlap another input"):
+        single_rank_group.reduce_scatter_single_coalesced(pair[::-1], pair)
+    bad_outputs = [torch.full((2,), -1.0), torch.empty(4)]
+    bad_inputs = [torch.ones(2), torch.ones(3)]
+    with pytest.raises(ValueError, match="expected element count"):
+        single_rank_group.reduce_scatter_single_coalesced(bad_outputs, bad_inputs)
+    torch.testing.assert_close(bad_outputs[0], torch.full((2,), -1.0))
+
+    # Valid 1-rank calls (including exact own-slice alias and 0-element tensors) work cleanly.
+    alias = torch.arange(4, dtype=torch.float16)
+    dist.reduce_scatter_single(alias, alias)
+    torch.testing.assert_close(alias, torch.arange(4, dtype=torch.float16))
+    for dtype in DTYPES:
+        empty = torch.empty(0, dtype=dtype)
+        dist.reduce_scatter_single(empty, empty)
+        dist.reduce_scatter(empty, [empty])
+    assert manager.stats.active_leases == 0
+
+
 @CUDA
 def test_failed_reduction_releases_staging(single_rank_group, monkeypatch):
     manager = PinManager(1024 * 1024)
@@ -637,7 +769,7 @@ class _MeasuredTransport:
         self.inner = inner
         self.staging_bytes = staging_bytes
         self.accelerator = accelerator
-        self.calls = dict.fromkeys(("allreduce", "allgather", "broadcast", "scatter"), 0)
+        self.calls = dict.fromkeys(("allreduce", "allgather", "broadcast", "scatter", "reduce_scatter", "reduce"), 0)
         self.storage_pointers = set()
 
     def __getattr__(self, name):
@@ -759,6 +891,20 @@ def _check_chunked_values(rank, world_size, device, dtype):
     pieces[rank].copy_(payload + rank)
     dist.all_gather(pieces, pieces[rank])
     torch.testing.assert_close(torch.stack(pieces), expected, rtol=0, atol=0)
+
+    rs_backing = torch.stack([payload + (rank + owner) for owner in range(world_size)])
+    rs_out = torch.empty_like(payload)
+    dist.reduce_scatter_single(rs_out, rs_backing)
+    rs_expected = sum((payload + (r + rank)).float() for r in range(world_size)).to(dtype)
+    torch.testing.assert_close(rs_out, rs_expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="exact local input slice"):
+        dist.reduce_scatter_single(rs_backing[(rank + 1) % world_size], rs_backing)
+    rs_list = [t.clone() for t in rs_backing.unbind(0)]
+    dist.reduce_scatter(rs_list[rank], rs_list)
+    torch.testing.assert_close(rs_list[rank], rs_expected, rtol=0, atol=0)
+    for owner, orig in enumerate(rs_backing.unbind(0)):
+        if owner != rank:
+            torch.testing.assert_close(rs_list[owner], orig, rtol=0, atol=0)
 
     # Copy collectives preserve NaN payloads, signed zero and subnormals even
     # when raw bits cross many chunk boundaries.
@@ -961,6 +1107,18 @@ class _GlooGuard:
         self.gloo_calls += 1
         return self.inner.allreduce(*args)
 
+    def reduce_scatter(self, *args):
+        if not self.allow_allreduce:
+            pytest.fail("shared GPU reduction forwarded its payload to CPU Gloo")
+        self.gloo_calls += 1
+        return self.inner.reduce_scatter(*args)
+
+    def reduce(self, *args):
+        if not self.allow_allreduce:
+            pytest.fail("shared GPU reduction forwarded its payload to CPU Gloo")
+        self.gloo_calls += 1
+        return self.inner.reduce(*args)
+
     def allgather(self, outputs, inputs):
         if not self.allow_control:
             pytest.fail("shared relay forwarded metadata or payload to Gloo allgather")
@@ -1132,6 +1290,21 @@ def _check_shared_reduction_precision(rank, size, device, capacity):
         dist.all_reduce(local)
         torch.testing.assert_close(local, expected, rtol=0, atol=0)
         torch.testing.assert_close(backing[[0, -1]], torch.full_like(backing[:2], contributions[rank]))
+
+    for dtype, contributions in values.items():
+        count = capacity * 3 // dtype.itemsize + 1
+        flat_backing = torch.full((size * count + 2,), contributions[rank], dtype=dtype, device=device)
+        rs_in = flat_backing[1:-1]
+        out_backing = torch.full((count + 2,), contributions[rank], dtype=dtype, device=device)
+        rs_out = out_backing[1:-1]
+        expected_vals = torch.tensor(contributions[:size], dtype=dtype).float()
+        total = expected_vals[0]
+        for value in expected_vals[1:]:
+            total = total + value
+        dist.reduce_scatter_single(rs_out, rs_in)
+        torch.testing.assert_close(rs_out, torch.full_like(rs_out, total.to(dtype).item()), rtol=0, atol=0)
+        torch.testing.assert_close(flat_backing[[0, -1]], torch.full_like(flat_backing[:2], contributions[rank]))
+        torch.testing.assert_close(out_backing[[0, -1]], torch.full_like(out_backing[:2], contributions[rank]))
 
 
 def _check_shared_coalesced(group, shared, control_counts, manager, counts, rank, size, device):
@@ -2181,7 +2354,8 @@ def test_shared_allreduce_fused_and_reference_chunk_reduction(tmp_path, monkeypa
     monkeypatch.setattr(shared, "_slot", lambda peer, lane, width: torch.ones(width, dtype=torch.uint8))
     ref_calls = 0
 
-    def spy_reference(*args):
+    def spy_reference(*args, **kwargs):
+        del args, kwargs
         nonlocal ref_calls
         ref_calls += 1
 
@@ -2336,11 +2510,11 @@ def _check_rs_volume_accounting(shared, rank: int, manager: PinManager) -> None:
     orig_slot = shared._slot
     in_allgather = False
 
-    def tracked_reduce_ref(tensors, byte_sources, buffer, width, peer_slots, pieces, asynchronous):
+    def tracked_reduce_ref(tensors, byte_outputs, buffer, width, peer_slots, pieces, asynchronous, local_sources=None):
         nonlocal reduced_bytes, phase1_peer_bytes
         reduced_bytes += width
         phase1_peer_bytes += sum(slot.numel() for slot in peer_slots if slot is not None)
-        orig_reduce_ref(tensors, byte_sources, buffer, width, peer_slots, pieces, asynchronous)
+        orig_reduce_ref(tensors, byte_outputs, buffer, width, peer_slots, pieces, asynchronous, local_sources)
 
     def tracked_allgather(*args):
         nonlocal in_allgather
@@ -2481,3 +2655,271 @@ def _run_shared_allreduce_reduce_scatter(rank: int, path: str) -> None:
 
 def test_shared_allreduce_reduce_scatter(tmp_path):
     mp.spawn(_run_shared_allreduce_reduce_scatter, args=(str(tmp_path / "rs"),), nprocs=4)
+
+
+def _check_shared_rs_precision_and_alias(shared, rank: int, manager: PinManager) -> None:
+    rows = {
+        torch.float16: (65504.0, 65504.0, -65504.0, 1.0),
+        torch.bfloat16: (256.0, 1.0, -256.0, 2.0),
+        torch.float32: (2.0**24, 1.0, -(2.0**24), 3.0),
+    }
+    for dtype, contributions in rows.items():
+        count = 4096 // dtype.itemsize + 13
+        src_backings = [torch.full((count + 2,), contributions[rank], dtype=dtype) for _ in range(shared.world_size)]
+        varied = torch.arange(torch.empty(count)[::137].numel(), dtype=torch.float32) % 19 - 9
+        for owner, sb in enumerate(src_backings):
+            sb[1:-1][::137] = (varied + (rank + owner) * 0.5).to(dtype)
+        sources = [sb[1:-1] for sb in src_backings]
+        src_backups = [s.clone() for s in sources]
+
+        out_backing = torch.full((count + 2,), contributions[rank], dtype=dtype)
+        output = out_backing[1:-1]
+        assert output.storage_offset() == 1
+        shared.reduce_scatter([output], [sources], manager)
+
+        const_total = functools.reduce(
+            torch.add, (torch.tensor(v, dtype=dtype).float() for v in contributions),
+        ).to(dtype)
+        expected_full = torch.full((count,), const_total.item(), dtype=dtype)
+        expected_full[::137] = functools.reduce(
+            torch.add, ((varied + (r + rank) * 0.5).to(dtype).float() for r in range(shared.world_size)),
+        ).to(dtype)
+        torch.testing.assert_close(output, expected_full, rtol=0, atol=0)
+        torch.testing.assert_close(out_backing[[0, -1]], torch.full((2,), contributions[rank], dtype=dtype))
+        for src, backup in zip(sources, src_backups, strict=True):
+            torch.testing.assert_close(src, backup, rtol=0, atol=0)
+
+    # Exact own-rank input slice alias preserves all non-own slices.
+    alias_sources = [t.clone() for t in sources]
+    shared.reduce_scatter([alias_sources[rank]], [alias_sources], manager)
+    torch.testing.assert_close(alias_sources[rank], expected_full, rtol=0, atol=0)
+    for owner, backup in enumerate(src_backups):
+        if owner != rank:
+            torch.testing.assert_close(alias_sources[owner], backup, rtol=0, atol=0)
+
+
+def _check_shared_rs_volume(shared, rank: int, manager: PinManager) -> None:
+    from piper_offload import _relay_shared
+
+    count = 32 * 1024  # 64 KiB per owner
+    sources = [torch.full((count,), float(rank + owner + 1), dtype=torch.float16) for owner in range(shared.world_size)]
+    output = torch.empty_like(sources[0])
+    reduced_bytes = 0
+    peer_read_bytes = 0
+    copied_bytes = 0
+    orig_reduce_ref = shared._reduce_chunk_reference
+    orig_copy = _relay_shared._copy_packed_to_slot
+
+    def tracked_reduce_ref(tensors, byte_sources, buffer, width, peer_slots, pieces, asynchronous, local_sources=None):
+        nonlocal reduced_bytes, peer_read_bytes
+        reduced_bytes += width
+        peer_read_bytes += sum(slot.numel() for slot in peer_slots if slot is not None)
+        orig_reduce_ref(tensors, byte_sources, buffer, width, peer_slots, pieces, asynchronous, local_sources)
+
+    def tracked_copy(slot, srcs, spans, span_ends, start, end, asynchronous):
+        nonlocal copied_bytes
+        copied_bytes += sum(part[3] for part in _relay_shared._chunk_pieces(spans, span_ends, start, end))
+        orig_copy(slot, srcs, spans, span_ends, start, end, asynchronous)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(shared, "_reduce_chunk_reference", tracked_reduce_ref)
+        patch.setattr(_relay_shared, "_copy_packed_to_slot", tracked_copy)
+        shared.reduce_scatter([output], [sources], manager)
+
+    assert reduced_bytes == output.nbytes
+    assert peer_read_bytes == (shared.world_size - 1) * output.nbytes
+    assert copied_bytes == (shared.world_size - 1) * output.nbytes
+    expected_val = float(sum(r + rank + 1 for r in range(shared.world_size)))
+    torch.testing.assert_close(output, torch.full_like(output, expected_val), rtol=0, atol=0)
+
+
+def _check_shared_rs_coalesced_and_fused(shared, rank: int, manager: PinManager) -> None:
+    from piper_offload import _relay_shared
+
+    def make_batch(src_rank: int, owner: int) -> list[torch.Tensor]:
+        bf16_vec = (
+            torch.tensor([256.0, 1.0, -256.0], dtype=torch.bfloat16)
+            if src_rank == 0
+            else torch.full((3,), float(owner + src_rank), dtype=torch.bfloat16)
+        )
+        return [
+            torch.empty((0,), dtype=torch.float32),
+            bf16_vec,
+            ((torch.arange(2503, dtype=torch.float32) % 13) - 4 + src_rank + owner * 0.5).to(torch.float16),
+            (torch.arange(1505, dtype=torch.float32) % 29) * 0.25 + src_rank + owner,
+        ]
+
+    per_src = [[make_batch(r, owner) for owner in range(shared.world_size)] for r in range(shared.world_size)]
+    sources_list = [[per_src[rank][owner][ti] for owner in range(shared.world_size)] for ti in range(4)]
+    expected = [
+        functools.reduce(torch.add, (per_src[r][rank][ti].float() for r in range(shared.world_size))).to(
+            per_src[0][0][ti].dtype,
+        )
+        for ti in range(4)
+    ]
+    ref_outputs = [torch.empty_like(expected[ti]) for ti in range(4)]
+    shared.reduce_scatter(ref_outputs, sources_list, manager)
+    for actual, exp in zip(ref_outputs, expected, strict=True):
+        torch.testing.assert_close(actual, exp, rtol=0, atol=0)
+
+    fused_outputs = [torch.empty_like(expected[ti]) for ti in range(4)]
+    fused_calls = 0
+    local_ranges = [
+        (src_list[rank].data_ptr(), src_list[rank].data_ptr() + src_list[rank].nbytes)
+        for src_list in sources_list
+    ]
+
+    def cpu_sum_ranks(output: torch.Tensor, inputs: Sequence[torch.Tensor]) -> None:
+        nonlocal fused_calls
+        fused_calls += 1
+        assert len(inputs) == shared.world_size
+        local_ptr = inputs[rank].data_ptr()
+        assert local_ptr != output.data_ptr()
+        assert any(lo <= local_ptr < hi for lo, hi in local_ranges if lo < hi)
+        assert shared._reduction_buffer is not None
+        _assert_fused_peer_lanes(shared._reduction_buffer, inputs, rank)
+        output.copy_(functools.reduce(torch.add, (tensor.float() for tensor in inputs)))
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(_relay_shared, "_select_fused_sum", lambda _device, _world_size: cpu_sum_ranks)
+        shared.reduce_scatter(fused_outputs, sources_list, manager)
+
+    assert fused_calls > 0
+    for actual, exp in zip(fused_outputs, expected, strict=True):
+        torch.testing.assert_close(actual, exp, rtol=0, atol=0)
+
+
+def _check_serial_subgroup(sub_shared, rank: int, force_gloo: bool, manager: PinManager) -> None:
+    from piper_offload import _relay_shared
+
+    assert isinstance(sub_shared._control, _relay_shared._GlooControl) == (
+        force_gloo or not _relay_shared.shared_control_supported()
+    )
+    serial_calls = 0
+    orig_serial = sub_shared._reduce_scatter_serial
+
+    def tracked_serial(*args):
+        nonlocal serial_calls
+        serial_calls += 1
+        orig_serial(*args)
+
+    cases = (
+        (torch.bfloat16, (256.0, 1.0, -256.0, 2.0)),
+        (torch.float32, (2.0**24, 1.0, -(2.0**24), 3.0)),
+    )
+    for dtype, vals in cases:
+        count = 257
+        varied = torch.arange(torch.empty(count)[::19].numel(), dtype=torch.float32) % 17 - 8
+        sources = []
+        for owner in range(4):
+            t = torch.full((count,), vals[rank], dtype=dtype)
+            t[::19] = (varied + (rank + owner) * 0.5).to(dtype)
+            sources.append(t)
+        out = torch.empty_like(sources[0])
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(sub_shared, "_reduce_scatter_serial", tracked_serial)
+            sub_shared.reduce_scatter([out], [sources], manager)
+        const_val = functools.reduce(torch.add, (torch.tensor(v, dtype=dtype).float() for v in vals)).to(dtype)
+        exp = torch.full((count,), const_val.item(), dtype=dtype)
+        exp[::19] = functools.reduce(
+            torch.add, ((varied + (r + rank) * 0.5).to(dtype).float() for r in range(4)),
+        ).to(dtype)
+        torch.testing.assert_close(out, exp, rtol=0, atol=0)
+    assert serial_calls == 2
+
+
+def _check_shared_rs_mismatch_and_serial(rank: int, shared, manager: PinManager) -> None:
+    from piper_offload import _relay_shared
+
+    bad_out = torch.empty(4, dtype=torch.float32 if rank == 0 else torch.float16)
+    bad_srcs = [torch.ones(4, dtype=bad_out.dtype) for _ in range(shared.world_size)]
+    with pytest.raises(ValueError, match="must match across ranks"):
+        shared.reduce_scatter([bad_out], [bad_srcs], manager)
+    assert not shared.broken
+    ok_out = torch.empty(4, dtype=torch.float16)
+    ok_srcs = [torch.full((4,), float(rank + owner + 1), dtype=torch.float16) for owner in range(shared.world_size)]
+    shared.reduce_scatter([ok_out], [ok_srcs], manager)
+    ok_val = float(sum(r + rank + 1 for r in range(shared.world_size)))
+    torch.testing.assert_close(ok_out, torch.full_like(ok_out, ok_val), rtol=0, atol=0)
+
+    for force_gloo in (False, True):
+        with pytest.MonkeyPatch.context() as patch:
+            if force_gloo:
+                patch.setattr(_relay_shared, "shared_control_supported", lambda: False)
+            subgroup = dist.new_group(
+                ranks=[0, 1, 2, 3], pg_options=RelayOptions(transport="shared", staging_bytes=384),
+            )
+        try:
+            _check_serial_subgroup(subgroup._shared, rank, force_gloo, manager)
+        finally:
+            dist.destroy_process_group(subgroup)
+
+
+def _check_shared_rs_two_rank_subgroup(rank: int, manager: PinManager) -> None:
+    from piper_offload import _relay_shared
+
+    subgroup = dist.new_group(ranks=[0, 1], pg_options=RelayOptions(transport="shared", staging_bytes=4096))
+    if rank in (0, 1):
+        try:
+            sub_shared = subgroup._shared
+            packed_calls = 0
+            copied_bytes = 0
+            orig_packed = sub_shared._reduce_scatter_partitions
+            orig_copy = _relay_shared._copy_packed_to_slot
+
+            def tracked_packed(*args):
+                nonlocal packed_calls
+                packed_calls += 1
+                orig_packed(*args)
+
+            def tracked_copy(slot, srcs, spans, span_ends, start, end, asynchronous):
+                nonlocal copied_bytes
+                copied_bytes += sum(part[3] for part in _relay_shared._chunk_pieces(spans, span_ends, start, end))
+                orig_copy(slot, srcs, spans, span_ends, start, end, asynchronous)
+
+            count = 1025
+            varied = torch.arange(torch.empty(count)[::31].numel(), dtype=torch.float32) % 19 - 9
+            vals = (256.0, -256.0)
+            sources = []
+            for owner in range(2):
+                t = torch.full((count,), vals[rank], dtype=torch.bfloat16)
+                t[::31] = (varied + (rank + owner) * 0.5).to(torch.bfloat16)
+                sources.append(t)
+            out = torch.empty(count, dtype=torch.bfloat16)
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(sub_shared, "_reduce_scatter_partitions", tracked_packed)
+                patch.setattr(_relay_shared, "_copy_packed_to_slot", tracked_copy)
+                sub_shared.reduce_scatter([out], [sources], manager)
+            assert packed_calls == 1
+            assert copied_bytes == out.nbytes
+            exp = torch.zeros(count, dtype=torch.bfloat16)
+            exp[::31] = functools.reduce(
+                torch.add, ((varied + (r + rank) * 0.5).to(torch.bfloat16).float() for r in range(2)),
+            ).to(torch.bfloat16)
+            torch.testing.assert_close(out, exp, rtol=0, atol=0)
+        finally:
+            dist.destroy_process_group(subgroup)
+
+
+def _run_shared_reduce_scatter_suite(rank: int, path: str) -> None:
+    torch.set_num_threads(1)
+    register_relay_backend()
+    dist.init_process_group(
+        "piper_relay", store=dist.FileStore(path, 4), rank=rank, world_size=4,
+        timeout=timedelta(seconds=20),
+        pg_options=RelayOptions(transport="shared", staging_bytes=192 * 1024),
+    )
+    manager = PinManager(0)
+    try:
+        shared = dist.group.WORLD._shared
+        _check_shared_rs_precision_and_alias(shared, rank, manager)
+        _check_shared_rs_volume(shared, rank, manager)
+        _check_shared_rs_coalesced_and_fused(shared, rank, manager)
+        _check_shared_rs_mismatch_and_serial(rank, shared, manager)
+        _check_shared_rs_two_rank_subgroup(rank, manager)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_shared_reduce_scatter_direct_and_serial(tmp_path):
+    mp.spawn(_run_shared_reduce_scatter_suite, args=(str(tmp_path / "shared-rs"),), nprocs=4)

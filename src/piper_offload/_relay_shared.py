@@ -3,15 +3,18 @@
 Each rank owns three outgoing slots in one shared payload mapping. Slots are
 reused across peer rounds, bounding storage independently of the number of
 pairs. All-gather and broadcast publish each chunk once for all peers; scatter
-visits each receiver in turn. Two-rank or small SUMs publish each original chunk
-once for all peers; larger SUMs with three or more ranks reduce-scatter
+visits each receiver in turn. Reduce-scatter packs each rank's (W - 1) remote
+peer slices into subslots and skips D2H for the local rank's own slice, falling
+back to per-target rounds when slots cannot hold (W - 1) 16-byte-aligned
+subslots. Two-rank or small SUM all-reduces publish each original chunk once
+for all peers; larger SUMs with three or more ranks reduce-scatter
 16-byte-aligned partitions before all-gathering the reduced partitions, cutting
 peer reads to 2(W - 1)/W while preserving rank-ordered FP32 accumulation.
-Coalesced all-gather and SUM pack their tensor lists into one continuous
-chunked transfer. On x86_64/AMD64, rank agreement and chunk ready/free signaling
-run through a small unpinned shared-memory control mapping; other architectures
-fall back to Gloo control messages. No GPU IPC, cross-process CUDA events, or
-payload socket transfers are needed.
+Coalesced all-gather, SUM all-reduce, and reduce-scatter pack their tensor
+lists into one continuous chunked transfer. On x86_64/AMD64, rank agreement and
+chunk ready/free signaling run through a small unpinned shared-memory control
+mapping; other architectures fall back to Gloo control messages. No GPU IPC,
+cross-process CUDA events, or payload socket transfers are needed.
 """
 
 import functools
@@ -48,6 +51,8 @@ _OPERATIONS = (
     "allreduce",
     "allgather_coalesced",
     "allreduce_coalesced",
+    "reduce_scatter",
+    "reduce_scatter_coalesced",
 )
 REDUCTION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 COPY_DTYPES = (
@@ -544,14 +549,16 @@ class SharedRelay:
     def _reduce_chunk_fused(
         self,
         tensors: Sequence[torch.Tensor],
-        byte_sources: Sequence[torch.Tensor],
+        byte_outputs: Sequence[torch.Tensor],
         buffer: torch.Tensor,
         width: int,
         peer_slots: Sequence[torch.Tensor | None],
         pieces: Sequence[tuple[int, int, int, int]],
         asynchronous: bool,
         sum_ranks: Callable[[torch.Tensor, Sequence[torch.Tensor]], None],
+        local_sources: Sequence[torch.Tensor] | None = None,
     ) -> None:
+        local_bytes = byte_outputs if local_sources is None else local_sources
         staged: list[torch.Tensor | None] = [None] * self.world_size
         lane_idx = 0
         for peer, peer_slot in enumerate(peer_slots):
@@ -562,9 +569,10 @@ class SharedRelay:
                 lane_idx += 1
         for ti, slot_off, t_off, part_len in pieces:
             dtype = tensors[ti].dtype
-            output = byte_sources[ti][t_off:t_off + part_len].view(dtype)
+            output = byte_outputs[ti][t_off:t_off + part_len].view(dtype)
+            local = local_bytes[ti][t_off:t_off + part_len].view(dtype)
             inputs = [
-                output if stage is None else stage[slot_off:slot_off + part_len].view(dtype)
+                local if stage is None else stage[slot_off:slot_off + part_len].view(dtype)
                 for stage in staged
             ]
             sum_ranks(output, inputs)
@@ -572,52 +580,72 @@ class SharedRelay:
     def _reduce_chunk_reference(
         self,
         tensors: Sequence[torch.Tensor],
-        byte_sources: Sequence[torch.Tensor],
+        byte_outputs: Sequence[torch.Tensor],
         buffer: torch.Tensor,
         width: int,
         peer_slots: Sequence[torch.Tensor | None],
         pieces: Sequence[tuple[int, int, int, int]],
         asynchronous: bool,
+        local_sources: Sequence[torch.Tensor] | None = None,
     ) -> None:
+        local_bytes = byte_outputs if local_sources is None else local_sources
         incoming_chunk = buffer[:width]
-        views: list[tuple[torch.Tensor, int, int, torch.dtype, torch.Tensor]] = []
+        views: list[tuple[torch.Tensor, torch.Tensor, int, int, torch.dtype, torch.Tensor]] = []
         for ti, slot_off, t_off, part_len in pieces:
             dtype = tensors[ti].dtype
-            output = byte_sources[ti][t_off:t_off + part_len].view(dtype)
+            output = byte_outputs[ti][t_off:t_off + part_len].view(dtype)
+            local = local_bytes[ti][t_off:t_off + part_len].view(dtype)
             # REDUCTION_DTYPES are >= 2 bytes/element, so FP32 expansion is
             # <= 2x and keeps all accumulators disjoint inside [capacity, 3 * capacity).
             acc_start = self.capacity + 2 * slot_off
             accumulator = buffer[acc_start:acc_start + output.numel() * 4].view(torch.float32)
-            views.append((output, slot_off, part_len, dtype, accumulator))
+            views.append((output, local, slot_off, part_len, dtype, accumulator))
         # All peers have published the original chunk. Stage each peer's chunk
         # once, accumulate in rank order, and cast back once per piece.
         for peer, peer_slot in enumerate(peer_slots):
             if peer_slot is not None:
                 incoming_chunk.copy_(peer_slot, non_blocking=asynchronous)
-            for output, slot_off, part_len, dtype, accumulator in views:
-                value = output if peer_slot is None else incoming_chunk[slot_off:slot_off + part_len].view(dtype)
+            for _, local, slot_off, part_len, dtype, accumulator in views:
+                value = local if peer_slot is None else incoming_chunk[slot_off:slot_off + part_len].view(dtype)
                 if peer == 0:
                     accumulator.copy_(value)
                 else:
                     accumulator.add_(value)
-        for output, _, _, _, accumulator in views:
+        for output, _, _, _, _, accumulator in views:
             output.copy_(accumulator)
 
     def _reduce_chunk(
         self,
         tensors: Sequence[torch.Tensor],
-        byte_sources: Sequence[torch.Tensor],
+        byte_outputs: Sequence[torch.Tensor],
         buffer: torch.Tensor,
         width: int,
         peer_slots: Sequence[torch.Tensor | None],
         pieces: Sequence[tuple[int, int, int, int]],
         asynchronous: bool,
         sum_ranks: Callable[[torch.Tensor, Sequence[torch.Tensor]], None] | None,
+        local_sources: Sequence[torch.Tensor] | None = None,
     ) -> None:
         if sum_ranks is not None:
-            self._reduce_chunk_fused(tensors, byte_sources, buffer, width, peer_slots, pieces, asynchronous, sum_ranks)
+            self._reduce_chunk_fused(
+                tensors, byte_outputs, buffer, width, peer_slots, pieces,
+                asynchronous, sum_ranks, local_sources=local_sources,
+            )
         else:
-            self._reduce_chunk_reference(tensors, byte_sources, buffer, width, peer_slots, pieces, asynchronous)
+            self._reduce_chunk_reference(
+                tensors, byte_outputs, buffer, width, peer_slots, pieces,
+                asynchronous, local_sources=local_sources,
+            )
+
+    def _ensure_reduction_buffer(self, device: torch.device) -> torch.Tensor:
+        buffer = self._reduction_buffer
+        if buffer is None or buffer.device != device:
+            # Three capacity-sized lanes hold either up to three incoming peer
+            # chunks (fused Triton SUM) or one chunk plus 2x FP32 accumulators.
+            buffer = self._reduction_buffer = torch.empty(
+                _REDUCTION_LANES * self.capacity, dtype=torch.uint8, device=device,
+            )
+        return buffer
 
     def _allreduce_direct(
         self,
@@ -643,8 +671,9 @@ class SharedRelay:
 
     def _reduce_scatter_partitions(
         self,
-        tensors: Sequence[torch.Tensor],
-        byte_sources: Sequence[torch.Tensor],
+        outputs: Sequence[torch.Tensor],
+        byte_outputs: Sequence[torch.Tensor],
+        owner_sources: Sequence[Sequence[torch.Tensor]],
         spans: Sequence[tuple[int, int, int]],
         span_ends: Sequence[int],
         partitions: Sequence[tuple[int, int]],
@@ -669,7 +698,7 @@ class SharedRelay:
                 if lo < hi:
                     _copy_packed_to_slot(
                         slot[pos * stride:pos * stride + (hi - lo)],
-                        byte_sources, spans, span_ends, lo, hi, asynchronous,
+                        owner_sources[owner], spans, span_ends, lo, hi, asynchronous,
                     )
 
         with closing(
@@ -696,7 +725,10 @@ class SharedRelay:
                         continue
                     slot_off = (self.rank - int(self.rank > peer)) * stride
                     peer_slots[peer] = self._slot(peer, lane, width)[slot_off:slot_off + my_width]
-                self._reduce_chunk(tensors, byte_sources, buffer, my_width, peer_slots, pieces, asynchronous, sum_ranks)
+                self._reduce_chunk(
+                    outputs, byte_outputs, buffer, my_width, peer_slots, pieces,
+                    asynchronous, sum_ranks, owner_sources[self.rank],
+                )
 
     def _allgather_partitions(
         self,
@@ -743,7 +775,8 @@ class SharedRelay:
     ) -> None:
         partitions = _partition_bytes(total_bytes, self.world_size)
         self._reduce_scatter_partitions(
-            tensors, byte_sources, spans, span_ends, partitions, buffer, asynchronous, sum_ranks,
+            tensors, byte_sources, [byte_sources] * self.world_size, spans, span_ends,
+            partitions, buffer, asynchronous, sum_ranks,
         )
         # Phase 1 synchronized uploaded[(count - 1) % 3] and the trailing peer
         # release handshake, so rank-owned partitions and all lanes are ready.
@@ -758,13 +791,7 @@ class SharedRelay:
             spans, total_bytes = _pack_spans([t.numel() for t in byte_sources], align=16)
             if self.world_size == 1 or total_bytes == 0:
                 return
-            buffer = self._reduction_buffer
-            if buffer is None or buffer.device != tensors[0].device:
-                # Three capacity-sized lanes hold either up to three incoming peer
-                # chunks (fused Triton SUM) or one chunk plus 2x FP32 accumulators.
-                buffer = self._reduction_buffer = torch.empty(
-                    _REDUCTION_LANES * self.capacity, dtype=torch.uint8, device=tensors[0].device,
-                )
+            buffer = self._ensure_reduction_buffer(tensors[0].device)
             sum_ranks = _select_fused_sum(tensors[0].device, self.world_size)
             span_ends = [start + length for _, start, length in spans]
             method = (
@@ -774,9 +801,83 @@ class SharedRelay:
             )
             method(tensors, byte_sources, spans, span_ends, total_bytes, buffer, asynchronous, sum_ranks)
 
+    def _reduce_scatter_serial(
+        self,
+        outputs: Sequence[torch.Tensor],
+        byte_outputs: Sequence[torch.Tensor],
+        owner_sources: Sequence[Sequence[torch.Tensor]],
+        spans: Sequence[tuple[int, int, int]],
+        span_ends: Sequence[int],
+        total_bytes: int,
+        buffer: torch.Tensor,
+        asynchronous: bool,
+        sum_ranks: Callable[[torch.Tensor, Sequence[torch.Tensor]], None] | None,
+    ) -> None:
+        chunk_size = _shared_chunk_bytes(total_bytes, self.capacity)
+        count = max(1, (total_bytes + chunk_size - 1) // chunk_size)
+        for target in range(self.world_size):
+            if self.rank == target:
+                for peer in range(self.world_size):
+                    if peer != self.rank:
+                        prior_sends = self.rank - int(peer < self.rank)
+                        if prior_sends:
+                            self._control.skip_ready(peer, prior_sends * count)
+                recv_peers: list[tuple[int | None, int | None]] = [
+                    (None, peer) for peer in range(self.world_size) if peer != self.rank
+                ]
+                with closing(self._chunks(None, total_bytes, recv_peers, asynchronous)) as chunks:
+                    for index, start, width in chunks:
+                        lane = index % self.buffer_count
+                        peer_slots = [
+                            None if peer == self.rank else self._slot(peer, lane, width)
+                            for peer in range(self.world_size)
+                        ]
+                        pieces = _chunk_pieces(spans, span_ends, start, start + width)
+                        self._reduce_chunk(
+                            outputs, byte_outputs, buffer, width, peer_slots, pieces,
+                            asynchronous, sum_ranks, owner_sources[self.rank],
+                        )
+            else:
+                fill = _make_packed_fill(owner_sources[target], spans, span_ends, asynchronous)
+                with closing(self._chunks(fill, total_bytes, [(target, None)], asynchronous)) as chunks:
+                    for _ in chunks:
+                        pass
+
+    def reduce_scatter(
+        self,
+        outputs: Sequence[torch.Tensor],
+        sources_list: Sequence[Sequence[torch.Tensor]],
+        manager: PinManager,
+    ) -> None:
+        op = "reduce_scatter" if len(outputs) == 1 else "reduce_scatter_coalesced"
+        with self._collective(op, outputs, -1, manager) as asynchronous:
+            byte_outputs = [_bytes(t) for t in outputs]
+            owner_sources = [[_bytes(srcs[owner]) for srcs in sources_list] for owner in range(self.world_size)]
+            if self.world_size == 1:
+                for dst, src in zip(byte_outputs, owner_sources[self.rank], strict=True):
+                    self._local_copy(dst, src)
+                return
+            spans, total_bytes = _pack_spans([t.numel() for t in byte_outputs], align=16)
+            if total_bytes == 0:
+                return
+            buffer = self._ensure_reduction_buffer(outputs[0].device)
+            sum_ranks = _select_fused_sum(outputs[0].device, self.world_size)
+            span_ends = [start + length for _, start, length in spans]
+            if _reduce_scatter_sub_cap(self.capacity, self.world_size) > 0:
+                partitions = [(0, total_bytes)] * self.world_size
+                self._reduce_scatter_partitions(
+                    outputs, byte_outputs, owner_sources, spans, span_ends,
+                    partitions, buffer, asynchronous, sum_ranks,
+                )
+            else:
+                self._reduce_scatter_serial(
+                    outputs, byte_outputs, owner_sources, spans, span_ends, total_bytes,
+                    buffer, asynchronous, sum_ranks,
+                )
+
     def _agree_operation(self, operation: str, tensors: Sequence[torch.Tensor], detail: int) -> None:
         op_index = _OPERATIONS.index(operation)
-        if operation in ("allgather_coalesced", "allreduce_coalesced"):
+        if operation in ("allgather_coalesced", "allreduce_coalesced", "reduce_scatter_coalesced"):
             nbytes = sum(t.nbytes for t in tensors)
             kind = len(tensors)
             meta_detail = _batch_signature(tensors)
