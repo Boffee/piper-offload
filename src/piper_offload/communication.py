@@ -17,9 +17,10 @@ mesh, and sharding. With ``local_rank`` provided by the launcher::
 
 Omit ``device_id``; this backend does not implement eager accelerator connection.
 Select ``transport="shared"`` for same-machine transfers through shared host slots
-and GPU-local summation; Gloo then carries only control messages and reductions
-of CPU tensors. The default ``transport="gloo"`` carries payloads through CPU
-Gloo as well. Gloo never receives an accelerator tensor.
+and GPU-local summation; on x86_64/AMD64, Gloo then carries only barriers and
+reductions of CPU tensors (other architectures also use Gloo for control
+messages). The default ``transport="gloo"`` carries payloads through CPU Gloo as
+well. Gloo never receives an accelerator tensor.
 
 Collectives stream through a reusable, bounded CPU buffer. Each group runs its
 collectives, including ``barrier``, on one worker thread in issue order. With
@@ -96,12 +97,14 @@ class RelayOptions:
     ranks on the same machine. Copy collectives always use three outgoing slots
     per rank, reused across peer rounds; all-gather and broadcast publish each
     chunk once for all peers, and coalesced shared batches pack into one transfer.
-    Every process registers its full mapping under its own pin budget; physical
-    payload storage is shared once. GPU reductions use the same three slots plus
-    at most three slot sizes of reusable device scratch per rank, at most
-    ``staging_bytes / world_size``, independent of tensor size.
-    FP16/BF16 accumulate in FP32. CPU tensor reductions use Gloo and borrow
-    this rank's region. ``pipeline_buffers`` only affects the Gloo path. The default
+    Every process registers its full payload mapping under its own pin budget;
+    physical payload storage is shared once. On x86_64/AMD64, rank agreement and
+    chunk signaling use a separate small unpinned shared-memory control mapping;
+    other architectures use Gloo control messages. GPU reductions use the same
+    three slots plus at most three slot sizes of reusable device scratch per
+    rank, at most ``staging_bytes / world_size``, independent of tensor size.
+    FP16/BF16 accumulate in FP32. CPU tensor reductions use Gloo and borrow this
+    rank's region. ``pipeline_buffers`` only affects the Gloo path. The default
     transport remains ``"gloo"``.
     """
 
@@ -197,9 +200,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
         # registers a backend.
         self._set_default_backend(dist.ProcessGroup.BackendType.GLOO)
         if options.transport == "shared":
-            self._shared = SharedRelay(
-                store, self._cpu_group, rank, size, self._staging_bytes, timeout,
-            )
+            self._shared = SharedRelay(store, self._cpu_group, rank, size, self._staging_bytes, timeout)
 
     def getBackendName(self) -> str:  # noqa: N802 -- PyTorch trampoline name
         return _BACKEND_NAME

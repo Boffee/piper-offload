@@ -13,6 +13,11 @@ explain how those APIs work together.
 - Lead with the problem: what goes wrong, for whom, how often, and how badly.
   Design for production needs and foreseeable uses. Hypothetical problems
   usually need a note or a contract before they need a mechanism.
+- Prioritize security, memory safety, and maintainability over raw speed.
+  When a design can be simplified significantly, prefer the simpler and safer
+  implementation when the performance cost is negligible; reach for low-level
+  FFI, raw pointers, or platform-specific syscalls only when measured workloads
+  justify the added complexity.
 - Minimize how much a reader must understand to make a correct change.
   Make ownership and invariants clear, and hide implementation details behind
   useful interfaces. Consider the whole design: broader changes, including

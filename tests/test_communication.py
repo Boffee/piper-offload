@@ -3,7 +3,9 @@
 import functools
 import gc
 import math
+import mmap
 import threading
+import time
 from collections.abc import Callable, Sequence
 from datetime import timedelta
 
@@ -944,32 +946,39 @@ def test_reject_invalid_pipeline_buffers(buffers):
         RelayOptions(pipeline_buffers=buffers)
 
 
-class _ControlOnly:
-    def __init__(self, inner):
+class _GlooGuard:
+    def __init__(self, inner, *, allow_allreduce: bool, allow_control: bool) -> None:
         self.inner = inner
-        self.messages = 0
+        self.allow_allreduce = allow_allreduce
+        self.allow_control = allow_control
+        self.gloo_calls = 0
 
     def allreduce(self, *args):
-        pytest.fail("shared GPU reduction forwarded its payload to CPU Gloo")
+        if not self.allow_allreduce:
+            pytest.fail("shared GPU reduction forwarded its payload to CPU Gloo")
+        self.gloo_calls += 1
+        return self.inner.allreduce(*args)
 
     def allgather(self, outputs, inputs):
-        assert inputs[0].dtype == torch.int64
-        assert inputs[0].nbytes == 32
-        self.messages += 1
+        if not self.allow_control:
+            pytest.fail("shared relay forwarded metadata or payload to Gloo allgather")
+        assert inputs[0].dtype == torch.int64 and inputs[0].nbytes == 32
         return self.inner.allgather(outputs, inputs)
 
     def send(self, tensors, peer, tag):
+        if not self.allow_control:
+            pytest.fail("shared relay sent control or payload over Gloo")
         assert tensors[0].nbytes == 8
-        self.messages += 1
         return self.inner.send(tensors, peer, tag)
 
     def recv(self, tensors, peer, tag):
+        if not self.allow_control:
+            pytest.fail("shared relay received control or payload over Gloo")
         assert tensors[0].nbytes == 8
-        self.messages += 1
         return self.inner.recv(tensors, peer, tag)
 
     def barrier(self, options):
-        # The test's own synchronization, not a relay control message.
+        # The test's own synchronization, not a relay collective.
         return self.inner.barrier(options)
 
 
@@ -987,16 +996,21 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
     group = dist.group.WORLD
     shared = group._shared
     assert shared.buffer_count == 3
-    control = _ControlOnly(shared.group)
-    shared.group = control
+    guard = _GlooGuard(
+        group._cpu_group,
+        allow_allreduce=(device_type != "cuda"),
+        allow_control=(shared._control is None),
+    )
     registration = _CountingRegistration()
     pin_budget = max(16384, staging_bytes * 2)
     manager = PinManager(0 if mixed_pinning and rank == 0 else pin_budget, backend=registration)
     initial = int(device_type == "cuda" and manager.max_pinned_bytes != 0)
     pointer = shared.buffer.data_ptr()
     counts = [0, 0]
+    control_counts = [0, 0]
     lanes = set()
     original_slot = shared._slot
+    original_signal = shared._signal
 
     def slot(sender, lane, width):
         lanes.add(lane)
@@ -1006,11 +1020,22 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
         assert view.untyped_storage().nbytes() == staging_bytes
         return view
 
+    def tracked_agree(op, nbytes, kind, detail, timeout):
+        control_counts[0] += 1
+        return original_agree(op, nbytes, kind, detail, timeout)
+
+    def tracked_signal(peers, tag, sequence):
+        control_counts[1] += 1
+        original_signal(peers, tag, sequence)
+
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(communication, "host_pin_manager", manager)
+        patch.setattr(group, "_cpu_group", guard)
         patch.setattr(shared, "_slot", slot)
-        if device_type == "cuda":
-            patch.setattr(group, "_cpu_group", control)
+        if shared._control is not None:
+            original_agree = shared._control.agree
+            patch.setattr(shared._control, "agree", tracked_agree)
+        patch.setattr(shared, "_signal", tracked_signal)
         # Exercise slot reuse and a partial last chunk at either alignment.
         local = torch.arange(shared.capacity + 1, dtype=torch.float32, device=device) + rank
         output = torch.empty((size, local.numel()), device=device)
@@ -1026,6 +1051,11 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
         dist.broadcast(bcast_buf, src=0)
         torch.testing.assert_close(bcast_buf, bcast)
         assert counts == ([bcast.nbytes, 0] if rank == 0 else [0, bcast.nbytes])
+        if size == 3:
+            scatter_sources = [local - rank + peer for peer in range(size)]
+            scatter_out = scatter_sources[1] if rank == 1 else torch.empty_like(local)
+            dist.scatter(scatter_out, scatter_sources if rank == 1 else None, src=1)
+            torch.testing.assert_close(scatter_out, local)
         # Both processes see the same physical host pages (distinct virtual
         # mappings). Each rank only owns its own region for Gloo reductions.
         shared.local_buffer().fill_(rank)
@@ -1041,10 +1071,13 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
             assert scratch.nbytes == 3 * shared.capacity
             _check_shared_reduction_precision(rank, size, device, shared.capacity)
             assert shared._reduction_buffer is scratch
-        _check_shared_coalesced(group, shared, control, manager, counts, rank, size, device)
+        _check_shared_coalesced(group, shared, control_counts, manager, counts, rank, size, device)
         if device_type == "cuda":
             assert shared._reduction_buffer is scratch
-        assert control.messages > 20
+            assert guard.gloo_calls == 0
+        if shared._control is not None:
+            assert control_counts[0] > 10
+        assert control_counts[1] > 20
         assert group._staging_buffer is None
         assert shared.buffer.data_ptr() == pointer
         assert manager.stats.active_leases == 0
@@ -1088,8 +1121,8 @@ def _check_shared_reduction_precision(rank, size, device, capacity):
         torch.testing.assert_close(backing[[0, -1]], torch.full_like(backing[:2], contributions[rank]))
 
 
-def _check_shared_coalesced(group, shared, control, manager, counts, rank, size, device):
-    before_messages = control.messages
+def _check_shared_coalesced(group, shared, control_counts, manager, counts, rank, size, device):
+    before_agree, before_signal = control_counts
     small_inputs = [
         torch.arange(3, dtype=torch.bfloat16, device=device) + rank,
         torch.arange(8, dtype=torch.float32, device=device).reshape(2, 4) + rank,
@@ -1105,7 +1138,9 @@ def _check_shared_coalesced(group, shared, control, manager, counts, rank, size,
         views = out.view(size, *src.shape)
         for peer in range(size):
             torch.testing.assert_close(views[peer], src - rank + peer, rtol=0, atol=0)
-    assert control.messages - before_messages == 1 + 4 * (size - 1)
+    if shared._control is not None:
+        assert control_counts[0] - before_agree == 1
+    assert control_counts[1] - before_signal == 2
 
     large_inputs = [
         (torch.arange(shared.capacity // 2 + 3, dtype=torch.float16, device=device) % 17) + rank,
@@ -1601,39 +1636,10 @@ def _make_fake_shared_relay(tmp_path, name: str = "chunks", capacity: int = 64):
         def synchronize(self) -> None:
             self.events.append(("sync", self.label, self.token))
 
-    class SignalWork:
-        def __init__(self, target: torch.Tensor | None, value: int) -> None:
-            self.target = target
-            self.value = value
-
-        def wait(self, timeout: timedelta) -> None:
-            del timeout
-            if self.target is not None:
-                self.target.fill_(self.value)
-
-    class SignalGroup:
-        def __init__(self, events: list[tuple[object, ...]]) -> None:
-            self.events = events
-            self.last_send = 0
-            self.recv_values: dict[int, list[int]] | None = None
-
-        def send(self, tensors: list[torch.Tensor], peer: int, tag: int) -> SignalWork:
-            del peer
-            seq = int(tensors[0].item())
-            self.last_send = seq
-            self.events.append(("ready_signal" if tag == 0 else "free_signal", seq))
-            return SignalWork(None, seq)
-
-        def recv(self, tensors: list[torch.Tensor], peer: int, tag: int) -> SignalWork:
-            del peer
-            value = self.recv_values[tag].pop(0) if self.recv_values is not None else self.last_send
-            return SignalWork(tensors[0], value)
-
     events: list[tuple[object, ...]] = []
-    group = SignalGroup(events)
     shared = SharedRelay(
         dist.FileStore(str(tmp_path / name), 1),
-        group,
+        None,
         rank=0,
         world_size=1,
         nbytes=3 * capacity,
@@ -1647,10 +1653,12 @@ def _make_fake_shared_relay(tmp_path, name: str = "chunks", capacity: int = 64):
         events.append(("download", lane, width))
         return original_slot(sender, lane, width)
 
-    def reset(recv_values: dict[int, list[int]] | None = None) -> None:
+    def fake_signal(peers, tag, sequence) -> None:
+        if any(send is not None for send, _ in peers):
+            events.append(("ready_signal" if tag == 0 else "free_signal", sequence))
+
+    def reset() -> None:
         events.clear()
-        group.last_send = 0
-        group.recv_values = recv_values
         shared.ready = [FakeEvent(events, f"ready[{lane}]") for lane in range(3)]
         shared.uploaded = [FakeEvent(events, f"uploaded[{lane}]") for lane in range(3)]
 
@@ -1661,6 +1669,7 @@ def _make_fake_shared_relay(tmp_path, name: str = "chunks", capacity: int = 64):
         return fill
 
     shared._slot = tracked_slot
+    shared._signal = fake_signal
     return shared, events, reset, make_fill, nullcontext
 
 
@@ -1697,7 +1706,12 @@ def test_shared_chunks_prefetches_ahead_and_releases_once(tmp_path):
             if count == 5:
                 downloads = [idx for idx, ev in enumerate(events) if ev[0] == "download"]
                 ready2_sync = events.index(("sync", "ready[2]", ("ready[2]", 1, "download")))
-                assert events.index(("free_signal", 0)) < downloads[3] < ready2_sync < events.index(("ready_signal", 2))
+                assert (
+                    events.index(("free_signal", 0))
+                    < downloads[3]
+                    < ready2_sync
+                    < events.index(("ready_signal", 2))
+                )
 
 
 def test_shared_chunks_skips_unused_direction_events(tmp_path):
@@ -1707,7 +1721,7 @@ def test_shared_chunks_skips_unused_direction_events(tmp_path):
         patch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
 
         # Receive-only: skips downloads and ready events, still syncs uploads before freeing.
-        reset({0: [0, 1, 2, 3]})
+        reset()
         for index, start, width in shared._chunks(None, 4 * capacity, [(None, 0)], asynchronous=True):
             events.append(("yield", index, start, width))
         assert not any(ev[0] == "download" or str(ev[1]).startswith("ready[") for ev in events)
@@ -1717,10 +1731,12 @@ def test_shared_chunks_skips_unused_direction_events(tmp_path):
             assert events.index(sync_uploaded) < events.index(("free_signal", old))
 
         # Send-only: skips upload events, still prefetches ahead and syncs ready before sending.
-        reset({1: [0, 3]})
+        reset()
         source = torch.arange(4 * capacity, dtype=torch.uint8)
         received = torch.empty_like(source)
-        for index, start, width in shared._chunks(make_fill(source), source.numel(), [(1, None)], asynchronous=True):
+        for index, start, width in shared._chunks(
+            make_fill(source), source.numel(), [(1, None)], asynchronous=True,
+        ):
             lane_start = (index % 3) * capacity
             received[start:start + width].copy_(shared.buffer[lane_start:lane_start + width])
         assert torch.equal(received, source)
@@ -1730,10 +1746,143 @@ def test_shared_chunks_skips_unused_direction_events(tmp_path):
         assert downloads[3] < events.index(("sync", "ready[2]", ("ready[2]", 1, "download")))
 
 
-def test_shared_signal_posts_all_peers_before_waiting(tmp_path):
-    from piper_offload._relay_shared import SharedRelay
+def test_shared_control_agreement_and_abort():
+    from piper_offload._relay_signal import SharedControl, control_bytes
 
-    store = dist.FileStore(str(tmp_path / "signal"), 1)
+    assert control_bytes(2) >= 4096
+    assert control_bytes(2) % 4096 == 0
+    assert control_bytes(64) % 4096 == 0
+
+    mapping = mmap.mmap(-1, control_bytes(2))
+    c0 = SharedControl(mapping, 0, 2)
+    c1 = SharedControl(mapping, 1, 2)
+    for seq in range(4):
+        results: list[tuple[list[int], list[int]]] = [([], []), ([], [])]
+        errors: list[BaseException] = []
+
+        def worker(
+            ctl: SharedControl, idx: int, s: int,
+            out: list[tuple[list[int], list[int]]], errs: list[BaseException],
+        ) -> None:
+            try:
+                out[idx] = ctl.agree(1, 64, 0, s, timedelta(seconds=2))
+                ctl.publish_ready()
+                ctl.wait_ready([(1 - idx, out[idx][0][1 - idx] + 1)], timedelta(seconds=2))
+                ctl.publish_free()
+                ctl.wait_free([(1 - idx, out[idx][1][1 - idx] + 1)], timedelta(seconds=2))
+            except BaseException as exc:
+                errs.append(exc)
+
+        t0 = threading.Thread(target=worker, args=(c0, 0, seq, results, errors))
+        t1 = threading.Thread(target=worker, args=(c1, 1, seq, results, errors))
+        t0.start()
+        t1.start()
+        t0.join()
+        t1.join()
+        assert not errors
+        assert results[0] == ([seq, seq], [seq, seq])
+        assert results[1] == ([seq, seq], [seq, seq])
+
+    mismatch_errors: list[BaseException] = []
+
+    def agree_detail(ctl: SharedControl, detail: int, errs: list[BaseException]) -> None:
+        try:
+            ctl.agree(1, 64, 0, detail, timedelta(seconds=2))
+        except BaseException as exc:
+            errs.append(exc)
+
+    for details in ((10, 20), (30, 30)):
+        mismatch_errors.clear()
+        t0 = threading.Thread(target=agree_detail, args=(c0, details[0], mismatch_errors))
+        t1 = threading.Thread(target=agree_detail, args=(c1, details[1], mismatch_errors))
+        t0.start()
+        t1.start()
+        t0.join()
+        t1.join()
+        if details[0] != details[1]:
+            assert len(mismatch_errors) == 2
+            assert all(isinstance(err, ValueError) for err in mismatch_errors)
+        else:
+            assert not mismatch_errors
+
+    c0.abort()
+    with pytest.raises(RuntimeError, match="aborted by peer"):
+        c1.wait_ready([(0, c0._local_ready + 1)], timedelta(seconds=1))
+
+
+def test_shared_control_timeout_without_abort():
+    from piper_offload._relay_signal import SharedControl, control_bytes
+
+    mapping = mmap.mmap(-1, control_bytes(2))
+    ctl = SharedControl(mapping, 0, 2)
+    with pytest.raises(RuntimeError, match="timed out waiting for peer"):
+        ctl.agree(0, 64, 0, 0, timedelta(milliseconds=50))
+    with pytest.raises(RuntimeError, match="timed out waiting for peer"):
+        ctl.wait_ready([(1, 1)], timedelta(milliseconds=50))
+
+
+def _run_shared_wakeup(rank: int, path: str) -> None:
+    torch.set_num_threads(1)
+    register_relay_backend()
+    dist.init_process_group(
+        "piper_relay", store=dist.FileStore(path, 2), rank=rank, world_size=2,
+        timeout=timedelta(seconds=15),
+        pg_options=RelayOptions(transport="shared", staging_bytes=4096),
+    )
+    shared = dist.group.WORLD._shared
+    try:
+        if shared._control is None:
+            return
+        # 1. Delayed metadata agreement wakes peer sleeping past the spin window.
+        if rank == 0:
+            time.sleep(0.02)
+        bcast = torch.full((4,), 7 if rank == 0 else 0, dtype=torch.int64)
+        dist.broadcast(bcast, src=0)
+        assert torch.all(bcast == 7)
+
+        # 2. Delayed chunk ready signal wakes sleeping peer.
+        original_publish = shared._control.publish_ready
+
+        def delayed_publish() -> None:
+            time.sleep(0.02)
+            original_publish()
+
+        with pytest.MonkeyPatch.context() as patch:
+            if rank == 0:
+                patch.setattr(shared._control, "publish_ready", delayed_publish)
+            local = torch.full((4,), rank + 1, dtype=torch.int64)
+            gathered = torch.empty((2, 4), dtype=torch.int64)
+            dist.all_gather_single(gathered, local)
+            assert torch.equal(gathered, torch.tensor([[1] * 4, [2] * 4], dtype=torch.int64))
+
+        # 3. Mid-collective abort wakes sleeping peer well before the 15 s timeout.
+        with pytest.MonkeyPatch.context() as patch:
+            if rank == 0:
+                def fail_signal(peers, tag, sequence):
+                    del peers, tag, sequence
+                    time.sleep(0.02)
+                    raise RuntimeError("injected wakeup abort")
+
+                patch.setattr(shared, "_signal", fail_signal)
+            start = time.monotonic()
+            with pytest.raises(RuntimeError):
+                dist.all_gather_single(gathered, local)
+            elapsed = time.monotonic() - start
+            assert shared.broken
+            if rank == 1:
+                assert elapsed < 5.0
+    finally:
+        dist.destroy_process_group()
+
+
+def test_shared_control_wakes_sleeping_peer(tmp_path):
+    mp.spawn(_run_shared_wakeup, args=(str(tmp_path / "wakeup"),), nprocs=2)
+
+
+def test_shared_relay_gloo_control_fallback(tmp_path, monkeypatch):
+    from piper_offload import _relay_shared
+
+    store = dist.FileStore(str(tmp_path / "fallback"), 1)
     prefix = dist.PrefixStore("piper_relay_shared", store)
     for peer in range(1, 4):
         prefix.set(str(peer), "")
@@ -1764,7 +1913,11 @@ def test_shared_signal_posts_all_peers_before_waiting(tmp_path):
             events.append(("post", "recv", peer, tag))
             return RecordingWork("recv", peer, tag, tensors[0])
 
-    shared = SharedRelay(store, RecordingGroup(), rank=0, world_size=4, nbytes=192, timeout=timedelta(seconds=5))
+    monkeypatch.setattr(_relay_shared, "shared_control_supported", lambda: False)
+    shared = _relay_shared.SharedRelay(
+        store, RecordingGroup(), rank=0, world_size=4, nbytes=192, timeout=timedelta(seconds=5),
+    )
+    assert shared._control is None
     shared._signal(shared._peers, tag=0, sequence=7)
     assert len(events) == 12
     assert all(ev[0] == "post" for ev in events[:6])
