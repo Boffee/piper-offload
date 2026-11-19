@@ -17,42 +17,50 @@ mesh, and sharding. With ``local_rank`` provided by the launcher::
 
 Omit ``device_id``; this backend does not implement eager accelerator connection.
 Select ``transport="shared"`` for same-machine transfers through shared host slots
-and GPU-local summation; on x86_64/AMD64, Gloo then carries only barriers and
-reductions of CPU tensors (other architectures also use Gloo for control
-messages). The default ``transport="gloo"`` carries payloads through CPU Gloo as
-well. Gloo never receives an accelerator tensor.
+and GPU-local summation; on x86_64/AMD64, Gloo then carries barriers, CPU
+tensor reductions, and point-to-point transfers (other architectures also use
+Gloo for control messages). The default ``transport="gloo"`` carries collective
+payloads through CPU Gloo as well. Gloo never receives an accelerator tensor.
 
-Collectives stream through a reusable, bounded CPU buffer. Each group runs its
-collectives, including ``barrier``, on one worker thread in issue order. With
-``async_op=True`` a call returns at once; until ``wait()`` returns, the caller
-must not read the outputs or write the inputs or outputs, from any stream.
-``get_future()`` also waits, so the future's callbacks run on the calling thread.
-Without it, the call returns once the collective has completed, and the outputs
-are then ready for every stream. A collective on accelerator tensors starts once
-the caller's current stream has produced its inputs and moves its data as a
-foreground transfer, which background copies such as block prefetch wait for
-(see ``piper_offload._transfer_priority``). No offloader, NCCL, or compiled
-extension is required. Gloo transfers default to two pipeline buffers; shared
-transfers use three outgoing slots per rank.
+Collectives run on one worker thread per process group in issue order; point-to-point
+operations (``send``, ``recv``, ``isend``, ``irecv``, ``recv_anysource``, and
+``batch_isend_irecv``) run concurrently per ``(direction, peer, tag)`` lane so
+bidirectional transfers and ring exchanges make progress without deadlocking on
+collectives or each other. With ``async_op=True`` or async P2P calls
+(``isend``, ``irecv``, ``batch_isend_irecv``), a call returns at once; until
+``wait()`` returns, the caller must not read the outputs or write the inputs or
+outputs, from any stream. ``get_future()`` on collectives and P2P work waits, so
+the future's callbacks run on the calling thread. Without ``async_op``, the call
+returns once the transfer has completed, and the outputs are then ready for
+every stream.
+Transfers on accelerator tensors start once the caller's current stream has
+produced its inputs and move their data as foreground transfers, which
+background copies such as block prefetch wait for (see
+``piper_offload._transfer_priority``). No offloader, NCCL, or compiled extension
+is required. Gloo collectives default to two pipeline buffers; shared
+collectives use three outgoing slots per rank.
 
 SUM all-reduce and reduce-scatter support FP32, FP16 and BF16, accumulating
-reduced precision in FP32. Broadcast, scatter, equal-size all-gather, and
-all-to-all (equal and unequal splits) also preserve FP64, bool, uint8, signed
-integers, and complex64/complex128. All-reduce, reduce-scatter, and all-gather
-coalesced variants; all-gather, reduce-scatter, and all-to-all support
-tensor-list and single-buffer forms. Inputs and outputs must be contiguous plain
-tensors on one local device. Outputs must not overlap, except that an
-all-gather input may occupy its exact own-rank output slice, a reduce-scatter
-output may occupy its exact own-rank input slice, a scatter root may receive
-into its exact source slice, and an all-to-all output may occupy its exact
-own-rank input slice. Coalesced outputs must not overwrite other inputs.
+reduced precision in FP32. Broadcast, scatter, equal-size all-gather,
+all-to-all (equal and unequal splits), and point-to-point transfers also
+preserve FP64, bool, uint8, signed integers, and complex64/complex128.
+All-reduce, reduce-scatter, and all-gather include coalesced variants;
+all-gather, reduce-scatter, and all-to-all support tensor-list and
+single-buffer forms. Inputs and outputs must be contiguous plain tensors on one
+local device. Outputs must not overlap, except that an all-gather input may
+occupy its exact own-rank output slice, a reduce-scatter output may occupy its
+exact own-rank input slice, a scatter root may receive into its exact source
+slice, and an all-to-all output may occupy its exact own-rank input slice.
+Coalesced outputs must not overwrite other inputs. Point-to-point transfers
+require non-negative integer tags up to ``(1 << 31) - 1 - 8``, distinct peer
+ranks (no self-rank ``isend``/``irecv``), and must not overlap ``recv_anysource``
+with explicit ``recv`` on the same tag concurrently.
 
 ``RelayOptions`` describes staging and pin budgets. If the staging allocation
 exceeds the pin budget or registration reports invalid-value, copies run
-synchronously through pageable storage. Non-SUM reductions, accelerator
-point-to-point transfers, and CUDA graph capture are unsupported. Direct C++
-functional all-gather ``out`` calls bypass the Python override and are
-unsupported for accelerator tensors.
+synchronously through pageable storage. Non-SUM reductions and CUDA graph
+capture are unsupported. Direct C++ functional all-gather ``out`` calls bypass
+the Python override and are unsupported for accelerator tensors.
 
 After a shared-exchange failure, outputs may be partial; destroy and recreate
 the process group. Windows GPU, ROCm, and distinct-GPU behavior need validation
@@ -72,6 +80,7 @@ import torch.distributed as dist
 from torch._C._distributed_c10d import (
     AllgatherOptions,
     AllToAllOptions,
+    Backend,
     ReduceOptions,
     ReduceScatterOptions,
     _DistributedBackendOptions,
@@ -84,6 +93,8 @@ from .pin_manager import host_pin_manager
 
 _BACKEND_NAME = "piper_relay"
 _GLOO_EXCHANGE_TAG = 2
+_P2P_TAG_BASE = 8
+_MAX_P2P_TAG = (1 << 31) - 1 - _P2P_TAG_BASE
 _registration_lock = threading.Lock()
 
 
@@ -129,8 +140,12 @@ class RelayOptions:
     rank, at most ``staging_bytes / world_size``, independent of tensor size.
     FP16/BF16 accumulate in FP32. CPU tensor reductions use Gloo and borrow this
     rank's region. ``pipeline_buffers`` affects only the Gloo path and does not
-    affect shared slot sizing or minimum ``staging_bytes``. The default
-    transport remains ``"gloo"``.
+    affect shared slot sizing or minimum ``staging_bytes``. On CUDA, P2P ops
+    lazily cache up to two host staging buffers (sized up to
+    ``staging_bytes / 2`` with Gloo or ``staging_bytes / (2 * world_size)`` with
+    shared transport), allocating transient overflow chunks only while more than
+    two CUDA P2P transfers run concurrently, and release cached buffers on
+    group shutdown. The default transport remains ``"gloo"``.
     """
 
     staging_bytes: int = 8 * 1024 * 1024
@@ -205,6 +220,11 @@ class _RelayProcessGroup(dist.ProcessGroup):
         # transport and stream.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="piper-relay")
         self._stream: torch.cuda.Stream | None = None
+        self._p2p_lock = threading.Lock()
+        self._p2p_tails: dict[tuple[str, int, int], threading.Event] = {}
+        self._p2p_inflight: set[threading.Thread] = set()
+        self._p2p_pool: list[tuple[torch.Tensor, torch.cuda.Stream]] = []
+        self._shutting_down = False
         options._validate_group_size(size)
         # Different chunk sizes would issue incompatible Gloo collectives.
         settings = dist.PrefixStore("piper_relay_options", store)
@@ -231,10 +251,24 @@ class _RelayProcessGroup(dist.ProcessGroup):
     def getBackendName(self) -> str:  # noqa: N802 -- PyTorch trampoline name
         return _BACKEND_NAME
 
+    def _get_backend(self, device: torch.device) -> Backend | _RelayProcessGroup:  # type: ignore[override]
+        # dist.batch_isend_irecv queries the device backend for supports_coalescing.
+        # Returning self keeps CUDA batched P2P on the per-op path without
+        # registering Gloo for CUDA (so unsupported CUDA collectives still fail).
+        if device.type == "cuda":
+            return self
+        return super()._get_backend(device)
+
     def shutdown(self) -> None:
-        # Collectives already issued finish before what they use is released.
-        # An interrupted wait releases nothing, so a later call can finish.
+        # Collectives and P2P transfers already issued finish before what they
+        # use is released. An interrupted wait releases nothing, so a later call
+        # can finish.
+        with self._p2p_lock:
+            self._shutting_down = True
+            inflight = list(self._p2p_inflight)
         self._executor.shutdown(wait=True)
+        for thread in inflight:
+            thread.join()
         if self._closed:
             return
         self._closed = True
@@ -244,6 +278,8 @@ class _RelayProcessGroup(dist.ProcessGroup):
             self._staging_buffer = None
             self._pipeline = None
             self._shared = None
+            with self._p2p_lock:
+                self._p2p_pool.clear()
 
     def _submit(
         self, device: torch.device, body: Callable[[], None], outputs: list[torch.Tensor], *, nested: bool = False,
@@ -256,13 +292,13 @@ class _RelayProcessGroup(dist.ProcessGroup):
             ready = torch.cuda.Event()
             ready.record(torch.cuda.current_stream(device))
 
-        def job() -> None:
+        def job() -> int | None:
             with torch.no_grad():
                 if self._shared is not None and self._shared.broken:
                     raise RuntimeError("shared relay failed previously; destroy and recreate the process group")
                 if ready is None:
                     body()
-                    return
+                    return None
                 ready.synchronize()
                 stream = self._stream
                 if stream is None or stream.device != device:
@@ -271,8 +307,216 @@ class _RelayProcessGroup(dist.ProcessGroup):
                     stream = self._stream = torch.cuda.Stream(device=device)
                 with torch.cuda.device(device), torch.cuda.stream(stream), foreground_transfer():
                     body()
+            return None
 
         return _PendingWork(self._executor.submit(job), outputs, nested=nested)
+
+    def _validate_p2p_peer(self, peer: int) -> None:
+        if type(peer) is not int or not 0 <= peer < self.size():
+            raise ValueError("piper_relay point-to-point peer rank is outside the process group")
+        if peer == self.rank():
+            raise ValueError("piper_relay point-to-point transfers do not support the local rank")
+
+    def _acquire_p2p_slot(self, device: torch.device, chunk_bytes: int) -> tuple[torch.Tensor, torch.cuda.Stream]:
+        with self._p2p_lock:
+            for index, (buf, stream) in enumerate(self._p2p_pool):
+                if stream.device == device and buf.numel() == chunk_bytes:
+                    return self._p2p_pool.pop(index)
+        return (
+            torch.empty(chunk_bytes, dtype=torch.uint8, device="cpu"),
+            torch.cuda.Stream(device=device),
+        )
+
+    def _release_p2p_slot(self, slot: tuple[torch.Tensor, torch.cuda.Stream]) -> None:
+        with self._p2p_lock:
+            if not self._shutting_down and not self._closed and len(self._p2p_pool) < 2:
+                self._p2p_pool.append(slot)
+
+    def _run_p2p_device(
+        self,
+        device: torch.device,
+        chunk_bytes: int,
+        transfer: Callable[[torch.Tensor | None], int | None] | None,
+    ) -> int | None:
+        assert transfer is not None
+        if device.type == "cpu":
+            return transfer(None)
+        slot: tuple[torch.Tensor, torch.cuda.Stream] | None = self._acquire_p2p_slot(device, chunk_bytes)
+        buf: torch.Tensor | None
+        stream: torch.cuda.Stream | None
+        buf, stream = slot
+        synced = False
+        try:
+            with (
+                torch.cuda.device(device),
+                torch.cuda.stream(stream),
+                foreground_transfer(),
+                host_pin_manager.acquire([buf]),
+            ):
+                try:
+                    return transfer(buf.detach())
+                finally:
+                    stream.synchronize()
+                    synced = True
+        finally:
+            if synced and slot is not None:
+                self._release_p2p_slot(slot)
+            # Clear local references before unwinding so an exception traceback
+            # never retains a staging buffer past lease release or shutdown.
+            buf = None
+            stream = None
+            slot = None
+            transfer = None
+
+    @staticmethod
+    def _run_p2p_lane(
+        prev: threading.Event | None,
+        ready: torch.cuda.Event | None,
+        future: Future[int | None] | None,
+        body: Callable[[], int | None] | None,
+        finish: Callable[[], None] | None,
+    ) -> None:
+        assert future is not None
+        assert body is not None
+        assert finish is not None
+        try:
+            if prev is not None:
+                prev.wait()
+            prev = None
+            with torch.no_grad():
+                if ready is not None:
+                    ready.synchronize()
+                ready = None
+                future.set_result(body())
+        except BaseException as error:
+            future.set_exception(error)
+        finally:
+            # Break any error -> traceback -> frame -> future/body cycle so
+            # worker buffers and caller tensors release without cyclic GC.
+            body = None
+            future = None
+            try:
+                finish()
+            finally:
+                finish = None
+
+    def _submit_p2p(
+        self,
+        key: tuple[str, int, int],
+        device: torch.device,
+        body: Callable[[], int | None],
+        outputs: list[torch.Tensor],
+    ) -> dist.Work:
+        ready: torch.cuda.Event | None = None
+        if device.type == "cuda":
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("piper_relay transfers do not support CUDA graph capture")
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(device))
+        future: Future[int | None] = Future()
+        done = threading.Event()
+
+        def finish() -> None:
+            current = threading.current_thread()
+            with self._p2p_lock:
+                if self._p2p_tails.get(key) is done:
+                    del self._p2p_tails[key]
+                self._p2p_inflight.discard(current)
+            done.set()
+
+        with self._p2p_lock:
+            if self._shutting_down:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            prev = self._p2p_tails.get(key)
+            thread = threading.Thread(
+                target=self._run_p2p_lane,
+                args=(prev, ready, future, body, finish),
+                name="piper-relay-p2p",
+                daemon=True,
+            )
+            thread.start()
+            self._p2p_tails[key] = done
+            self._p2p_inflight.add(thread)
+        return _PendingWork(future, outputs)
+
+    def send(self, tensors: list[torch.Tensor], dstRank: int, tag: int) -> dist.Work:  # noqa: N803 -- PyTorch API
+        tensor = _single_tensor(tensors)
+        _validate_tensors([tensor])
+        self._validate_p2p_peer(dstRank)
+        wire_tag = _wire_p2p_tag(tag)
+        chunk_bytes = self._slot_bytes(2)
+
+        def transfer(stage_buf: torch.Tensor | None) -> int | None:
+            slice_buf: torch.Tensor | None = None
+            try:
+                data = _bytes(tensor)
+                for start, end in chunk_ranges(data.numel(), chunk_bytes):
+                    if stage_buf is None:
+                        slice_buf = data[start:end]
+                    else:
+                        slice_buf = stage_buf[:end - start]
+                        if end > start:
+                            slice_buf.copy_(data[start:end], non_blocking=False)
+                    self._cpu_group.send([slice_buf], dstRank, wire_tag).wait()  # type: ignore[attr-defined]
+                return None
+            finally:
+                slice_buf = None
+                stage_buf = None
+
+        return self._submit_p2p(
+            ("send", dstRank, wire_tag),
+            tensor.device,
+            lambda: self._run_p2p_device(tensor.device, chunk_bytes, transfer),
+            [tensor],
+        )
+
+    def _recv_p2p(self, tensors: list[torch.Tensor], src: int | None, tag: int) -> dist.Work:
+        tensor = _single_tensor(tensors)
+        _validate_tensors([tensor])
+        wire_tag = _wire_p2p_tag(tag)
+        if src is None:
+            if self.size() < 2:
+                raise ValueError("piper_relay recv_anysource requires at least two ranks")
+            key = ("recv", -1, wire_tag)
+        else:
+            self._validate_p2p_peer(src)
+            key = ("recv", src, wire_tag)
+        chunk_bytes = self._slot_bytes(2)
+
+        def transfer(stage_buf: torch.Tensor | None) -> int:
+            slice_buf: torch.Tensor | None = None
+            try:
+                data = _bytes(tensor)
+                resolved_src = src
+                for index, (start, end) in enumerate(chunk_ranges(data.numel(), chunk_bytes)):
+                    slice_buf = data[start:end] if stage_buf is None else stage_buf[:end - start]
+                    if resolved_src is None and index == 0:
+                        work = self._cpu_group.recv_anysource([slice_buf], wire_tag)  # type: ignore[attr-defined]
+                        work.wait()
+                        resolved_src = int(work._source_rank())
+                    else:
+                        assert resolved_src is not None
+                        self._cpu_group.recv([slice_buf], resolved_src, wire_tag).wait()  # type: ignore[attr-defined]
+                    if stage_buf is not None and end > start:
+                        data[start:end].copy_(slice_buf, non_blocking=False)
+                assert resolved_src is not None
+                return resolved_src
+            finally:
+                slice_buf = None
+                stage_buf = None
+
+        return self._submit_p2p(
+            key,
+            tensor.device,
+            lambda: self._run_p2p_device(tensor.device, chunk_bytes, transfer),
+            [tensor],
+        )
+
+    def recv(self, tensors: list[torch.Tensor], srcRank: int, tag: int) -> dist.Work:  # noqa: N803 -- PyTorch API
+        return self._recv_p2p(tensors, srcRank, tag)
+
+    def recv_anysource(self, tensors: list[torch.Tensor], tag: int) -> dist.Work:
+        return self._recv_p2p(tensors, None, tag)
 
     @contextmanager
     def _buffer(self, device: torch.device) -> Generator[tuple[torch.Tensor, bool]]:
@@ -954,11 +1198,20 @@ class _PendingWork(dist.Work):
     the job ends, without waiting for the cyclic garbage collector.
     """
 
-    def __init__(self, job: Future[None], tensors: list[torch.Tensor], *, nested: bool = False) -> None:
+    def __init__(self, job: Future[int | None], tensors: list[torch.Tensor], *, nested: bool = False) -> None:
         super().__init__()
         self._job = job
         self._tensors = tensors
         self._nested = nested
+
+    def source_rank(self) -> int:
+        source = self._job.result()
+        if source is None:
+            raise RuntimeError("source_rank is only available on point-to-point receive work")
+        return source
+
+    def _source_rank(self) -> int:
+        return self.source_rank()
 
     def get_future(self) -> torch.futures.Future[list[torch.Tensor] | list[list[torch.Tensor]]]:
         """Wait for the collective, then return its completed future.
@@ -1065,6 +1318,12 @@ def _validate_batched_outputs(outputs: Sequence[torch.Tensor], inputs: Sequence[
         for j, source in enumerate(inputs):
             if i != j and _overlap(output, source):
                 raise ValueError("piper_relay batched outputs must not overlap another input")
+
+
+def _wire_p2p_tag(tag: int) -> int:
+    if type(tag) is not int or not 0 <= tag <= _MAX_P2P_TAG:
+        raise ValueError(f"piper_relay point-to-point tag must be an integer in [0, {_MAX_P2P_TAG}]")
+    return _P2P_TAG_BASE + tag
 
 
 def _resolve_alltoall_splits(

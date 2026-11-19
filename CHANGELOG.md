@@ -7,6 +7,10 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- `piper_relay` now implements point-to-point transfers (`send`, `recv`,
+  `isend`, `irecv`, `recv_anysource`, and `batch_isend_irecv`) for CPU and
+  CUDA/HIP tensors across both `"gloo"` and `"shared"` transports, supporting
+  non-negative integer tags and all copy dtypes.
 - `piper_relay` now implements `all_to_all` (`alltoall`, `all_to_all_single`,
   `alltoall_base`, functional `all_to_all_single`, and DTensor
   `shard_dim_alltoall`) with equal and unequal splits across all supported

@@ -395,9 +395,16 @@ def _check_streams(device: torch.device) -> None:
         a2a_in = torch.arange(2 * 1024, device=device, dtype=torch.float32).reshape(2, -1) + dist.get_rank() * 10000
         a2a_out = torch.empty_like(a2a_in)
         a2a_work = dist.all_to_all_single(a2a_out, a2a_in, async_op=True)
+        peer = 1 - dist.get_rank()
+        p2p_src = torch.arange(257, device=device, dtype=torch.float16) + dist.get_rank() * 100
+        p2p_dst = torch.empty_like(p2p_src)
+        p2p_works = dist.batch_isend_irecv([
+            dist.P2POp(dist.isend, p2p_src, peer, tag=7),
+            dist.P2POp(dist.irecv, p2p_dst, peer, tag=7),
+        ])
     # Each collective starts after the producer's earlier work, and its
     # outputs are ready for any stream once wait() returns.
-    for pending in (work, gather_work, broadcast_work, scatter_work, rs_work, a2a_work):
+    for pending in (work, gather_work, broadcast_work, scatter_work, rs_work, a2a_work, *p2p_works):
         assert pending.wait(WAIT)
         assert pending.is_completed()
     assert producer.query()
@@ -405,6 +412,7 @@ def _check_streams(device: torch.device) -> None:
         result = x + 1
         rs_checked = rs_out + 1
         a2a_checked = a2a_out + 1
+        p2p_checked = p2p_dst + 1
     consumer.synchronize()
     expected = torch.arange(x.numel(), dtype=torch.float32) * 0.5 + 1
     rs_expected = rs_in[dist.get_rank()].cpu().mul(2).add(1)
@@ -414,9 +422,11 @@ def _check_streams(device: torch.device) -> None:
         + rank * 1024
         + torch.tensor([[0.0], [10000.0]])
     )
+    p2p_expected = torch.arange(257, dtype=torch.float16) + (1 - rank) * 100 + 1
     torch.testing.assert_close(result.cpu(), expected)
     torch.testing.assert_close(rs_checked.cpu(), rs_expected)
     torch.testing.assert_close(a2a_checked.cpu(), a2a_expected + 1)
+    torch.testing.assert_close(p2p_checked.cpu(), p2p_expected)
     torch.testing.assert_close(gathered.cpu(), torch.cat([expected - 1, expected - 1]))
     torch.testing.assert_close(broadcast, torch.ones_like(broadcast))
     torch.testing.assert_close(scattered, torch.full_like(scattered, dist.get_rank() + 1))
@@ -3785,3 +3795,384 @@ def test_alltoall_shared_cuda_mock_stream_syncs(tmp_path):
             )
         assert (download_stream.sync_count, upload_stream.sync_count, current_s.sync_count) == (0, 0, 0)
         assert shared.broken
+
+
+def test_reject_invalid_p2p(single_rank_group):
+    group = single_rank_group
+    t = torch.ones(4)
+
+    class TensorSubclass(torch.Tensor):
+        pass
+
+    with pytest.raises(NotImplementedError, match="exactly one local tensor"):
+        group.send([t, t], 0, 0)
+    with pytest.raises(TypeError, match="plain local tensor"):
+        group.send([TensorSubclass(t)], 0, 0)
+    with pytest.raises(NotImplementedError, match="contiguous strided"):
+        dist.isend(torch.ones(4, 2)[::2], dst=0)
+    with pytest.raises(NotImplementedError, match="does not support dtype"):
+        dist.irecv(torch.empty(2, dtype=torch.bfloat16).view(torch.uint16), src=0)
+    with pytest.raises(ValueError, match="do not support the local rank"):
+        dist.isend(t, dst=0)
+    with pytest.raises(ValueError, match="do not support the local rank"):
+        dist.irecv(t, src=0)
+    with pytest.raises(ValueError, match="at least two ranks"):
+        group.recv_anysource([t], 0)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(group, "size", lambda: 2)
+        with pytest.raises(ValueError, match="outside the process group"):
+            group.send([t], 2, 0)
+        with pytest.raises(ValueError, match="outside the process group"):
+            group.recv([t], -1, 0)
+        for bad_tag in (-1, True, communication._MAX_P2P_TAG + 1):
+            with pytest.raises(ValueError, match="point-to-point tag must be"):
+                group.send([t], 1, bad_tag)  # type: ignore[arg-type]
+
+    ar_work = dist.all_reduce(t, async_op=True)
+    assert ar_work.wait()
+    with pytest.raises(RuntimeError, match="only available on point-to-point receive"):
+        ar_work.source_rank()
+
+    group.shutdown()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(group, "size", lambda: 2)
+        with pytest.raises(RuntimeError, match="shutdown"):
+            group.send([t], 1, 0)
+
+
+def _p2p_sample(dtype: torch.dtype, idx: int, side: int) -> torch.Tensor:
+    if dtype is torch.bool:
+        return torch.tensor([side == 0, side == 1, True])
+    if dtype in (torch.complex64, torch.complex128):
+        real = torch.arange(3, dtype=torch.float32) + side * 10
+        return torch.complex(real, real + 1).to(dtype)
+    return (torch.arange(5, dtype=torch.float32) + side * 10 + idx).to(dtype)
+
+
+def _check_p2p_two_rank_dtypes(rank: int, group, global_ranks: tuple[int, int]) -> None:
+    local_idx = global_ranks.index(rank)
+    peer_global = global_ranks[1 - local_idx]
+
+    dtypes = (
+        torch.float32, torch.float16, torch.bfloat16, torch.float64,
+        torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
+        torch.complex64, torch.complex128,
+    )
+    for idx, dtype in enumerate(dtypes):
+        src = _p2p_sample(dtype, idx, local_idx)
+        dst = torch.empty_like(src)
+        for req in dist.batch_isend_irecv([
+            dist.P2POp(dist.isend, src, peer_global, group=group, tag=idx),
+            dist.P2POp(dist.irecv, dst, peer_global, group=group, tag=idx),
+        ]):
+            req.wait()
+        assert torch.equal(dst, _p2p_sample(dtype, idx, 1 - local_idx))
+
+    empty_out = torch.empty(0, dtype=torch.uint8)
+    for empty_req in dist.batch_isend_irecv([
+        dist.P2POp(dist.isend, torch.empty(0, dtype=torch.uint8), peer_global, group=group, tag=0),
+        dist.P2POp(dist.irecv, empty_out, peer_global, group=group, tag=0),
+    ]):
+        empty_req.wait()
+
+    bits = torch.tensor([0, -32768, 1, 0x7E01, 0x7FC1], dtype=torch.int16).repeat(60)
+    bit_src = bits.roll(local_idx).view(torch.float16)
+    bit_dst = torch.empty_like(bit_src)
+    if local_idx == 0:
+        dist.send(bit_src, dst=peer_global, group=group, tag=2)
+        assert dist.recv(bit_dst, src=None, group=group, tag=1) == peer_global
+    else:
+        assert dist.recv(bit_dst, src=None, group=group, tag=2) == peer_global
+        dist.send(bit_src, dst=peer_global, group=group, tag=1)
+    assert torch.equal(bit_dst.view(torch.int16), bits.roll(1 - local_idx))
+
+
+def _check_p2p_two_rank_ordering(rank: int, group, global_ranks: tuple[int, int]) -> None:
+    local_idx = global_ranks.index(rank)
+    peer_global = global_ranks[1 - local_idx]
+
+    a_send = torch.arange(400, dtype=torch.float32) + local_idx * 1000
+    b_send = torch.arange(400, dtype=torch.float32) + local_idx * 2000 + 500
+    a_recv, b_recv = torch.empty_like(a_send), torch.empty_like(b_send)
+    for req in [
+        dist.isend(a_send, dst=peer_global, group=group, tag=0),
+        dist.isend(b_send, dst=peer_global, group=group, tag=0),
+        dist.irecv(a_recv, src=peer_global, group=group, tag=0),
+        dist.irecv(b_recv, src=peer_global, group=group, tag=0),
+    ]:
+        req.wait()
+    torch.testing.assert_close(a_recv, torch.arange(400, dtype=torch.float32) + (1 - local_idx) * 1000)
+    torch.testing.assert_close(b_recv, torch.arange(400, dtype=torch.float32) + (1 - local_idx) * 2000 + 500)
+
+    r1, r2 = torch.empty(300, dtype=torch.int64), torch.empty(300, dtype=torch.int64)
+    s1 = torch.arange(300, dtype=torch.int64) + local_idx * 10 + 1
+    s2 = torch.arange(300, dtype=torch.int64) + local_idx * 10 + 2
+    ops = [
+        dist.P2POp(dist.isend, s1, peer_global, group=group, tag=1),
+        dist.P2POp(dist.isend, s2, peer_global, group=group, tag=2),
+        dist.P2POp(dist.irecv, r1, peer_global, group=group, tag=1),
+        dist.P2POp(dist.irecv, r2, peer_global, group=group, tag=2),
+    ]
+    for w in dist.batch_isend_irecv(ops if local_idx == 0 else list(reversed(ops))):
+        w.wait()
+    assert torch.equal(r1, torch.arange(300, dtype=torch.int64) + (1 - local_idx) * 10 + 1)
+    assert torch.equal(r2, torch.arange(300, dtype=torch.int64) + (1 - local_idx) * 10 + 2)
+
+
+def _check_p2p_ring_and_anysource(rank: int, group) -> None:
+    # 4-rank Ring Attention exchange interleaved with collectives using tags 0, 1, 2.
+    send_buf = torch.arange(300, dtype=torch.float32) + rank * 1000
+    for step in range(3):
+        recv_buf = torch.empty_like(send_buf)
+        for req in dist.batch_isend_irecv([
+            dist.P2POp(dist.isend, send_buf, (rank + 1) % 4, group=group, tag=step % 3),
+            dist.P2POp(dist.irecv, recv_buf, (rank - 1) % 4, group=group, tag=step % 3),
+        ]):
+            req.wait()
+        src_rank = (rank - 1 - step) % 4
+        torch.testing.assert_close(recv_buf, torch.arange(300, dtype=torch.float32) + src_rank * 1000)
+        send_buf = recv_buf
+    probe = torch.full((4,), float(rank + 1))
+    dist.all_reduce(probe, group=group)
+    torch.testing.assert_close(probe, torch.full((4,), 10.0))
+    a2a_in = torch.arange(4, dtype=torch.int32) + rank * 10
+    a2a_out = torch.empty_like(a2a_in)
+    dist.all_to_all_single(a2a_out, a2a_in, group=group)
+    assert torch.equal(a2a_out, torch.arange(4, dtype=torch.int32) * 10 + rank)
+
+    # Multi-chunk recv_anysource from three senders completes un-interleaved with exact sender ranks.
+    if rank == 0:
+        works = [
+            dist.irecv(torch.empty(260, dtype=torch.int64), src=None, group=group, tag=9)
+            for _ in range(3)
+        ]
+        got_by_src = {w.source_rank(): w.result()[0] for w in works}
+        assert set(got_by_src) == {1, 2, 3}
+        for sender, out_t in got_by_src.items():
+            assert torch.equal(out_t, torch.arange(260, dtype=torch.int64) + sender * 500)
+    else:
+        dist.send(torch.arange(260, dtype=torch.int64) + rank * 500, dst=0, group=group, tag=9)
+
+
+def _run_p2p_worker(rank: int, path: str) -> None:
+    from piper_offload import _relay_shared
+
+    torch.set_num_threads(1)
+    register_relay_backend()
+    dist.init_process_group(
+        "piper_relay", store=dist.FileStore(path, 4), rank=rank, world_size=4,
+        timeout=timedelta(seconds=20), pg_options=RelayOptions(transport="gloo", staging_bytes=512),
+    )
+    try:
+        for opts in (
+            RelayOptions(transport="gloo", staging_bytes=512),
+            RelayOptions(transport="shared", staging_bytes=4096),
+        ):
+            sub = dist.new_group(ranks=[0, 1, 2, 3], pg_options=opts)
+            try:
+                _check_p2p_ring_and_anysource(rank, sub)
+            finally:
+                dist.destroy_process_group(sub)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(_relay_shared, "shared_control_supported", lambda: False)
+            ctrl_sub = dist.new_group(ranks=[1, 2], pg_options=RelayOptions(transport="shared", staging_bytes=512))
+        try:
+            if rank in (1, 2):
+                _check_p2p_two_rank_dtypes(rank, ctrl_sub, (1, 2))
+                _check_p2p_two_rank_ordering(rank, ctrl_sub, (1, 2))
+                # Verify tag isolation between P2P (tag >= 8) and _GlooControl (0/1) + _GLOO_EXCHANGE_TAG (2).
+                idx = (1, 2).index(rank)
+                ctrl_probe = torch.full((2,), float(idx + 1))
+                dist.all_reduce(ctrl_probe, group=ctrl_sub)
+                torch.testing.assert_close(ctrl_probe, torch.full((2,), 3.0))
+                ctrl_a2a_in = torch.arange(2, dtype=torch.int32) + idx * 10
+                ctrl_a2a_out = torch.empty_like(ctrl_a2a_in)
+                dist.all_to_all_single(ctrl_a2a_out, ctrl_a2a_in, group=ctrl_sub)
+                assert torch.equal(ctrl_a2a_out, torch.arange(2, dtype=torch.int32) * 10 + idx)
+        finally:
+            dist.destroy_process_group(ctrl_sub)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_p2p_gloo_and_shared(tmp_path):
+    mp.spawn(_run_p2p_worker, args=(str(tmp_path / "p2p-4"),), nprocs=4)
+
+
+def _make_mock_cuda_p2p_env(group, patch):
+    from contextlib import nullcontext
+
+    recorded_events: list[object] = []
+    stream_syncs: list[int] = []
+    streams: list[object] = []
+    p2p_log: list[tuple[str, int, int, int]] = []
+    state: dict[str, object] = {"fail_send": False, "fail_sync": False, "block_gate": None, "entered": 0, "target": 1}
+    gate_lock = threading.Lock()
+    entered_event = threading.Event()
+
+    class DummyEvent:
+        def __init__(self) -> None:
+            self.synced = False
+
+        def record(self, _stream: object) -> None:
+            recorded_events.append(self)
+
+        def synchronize(self) -> None:
+            self.synced = True
+
+    class DummyStream:
+        def __init__(self, device: torch.device) -> None:
+            self.device = device
+
+        def synchronize(self) -> None:
+            stream_syncs.append(1)
+            if state["fail_sync"]:
+                raise RuntimeError("injected stream synchronize failure")
+
+    class MockWork(dist.Work):
+        def __init__(self, fn: Callable[[], None], src: int = -1) -> None:
+            super().__init__()
+            self._fn = fn
+            self._src = src
+
+        def wait(self, *_args: object) -> bool:
+            self._fn()
+            return True
+
+        def _source_rank(self) -> int:
+            return self._src
+
+    class FakeP2PGloo:
+        def send(self, tensors: list[torch.Tensor], dst: int, tag: int) -> MockWork:
+            def run() -> None:
+                gate = state["block_gate"]
+                if isinstance(gate, threading.Event):
+                    with gate_lock:
+                        state["entered"] = int(state["entered"]) + 1  # type: ignore[arg-type]
+                        if int(state["entered"]) >= int(state["target"]):  # type: ignore[arg-type]
+                            entered_event.set()
+                    gate.wait(timeout=5)
+                if state["fail_send"]:
+                    raise RuntimeError("injected p2p send failure")
+                p2p_log.append(("send", dst, tag, tensors[0].untyped_storage().data_ptr()))
+            return MockWork(run)
+
+        def recv(self, tensors: list[torch.Tensor], src: int, tag: int) -> MockWork:
+            def run() -> None:
+                p2p_log.append(("recv", src, tag, tensors[0].untyped_storage().data_ptr()))
+                if tensors[0].numel():
+                    tensors[0].fill_(42)
+            return MockWork(run)
+
+        def recv_anysource(self, tensors: list[torch.Tensor], tag: int) -> MockWork:
+            def run() -> None:
+                p2p_log.append(("any", -1, tag, tensors[0].untyped_storage().data_ptr()))
+                tensors[0].fill_(7)
+            return MockWork(run, src=1)
+
+    def make_stream(device: torch.device) -> DummyStream:
+        s = DummyStream(device)
+        streams.append(s)
+        return s
+
+    class FakePinBackend:
+        def __init__(self) -> None:
+            self.register_calls = 0
+            self.unregister_calls = 0
+
+        def register(self, _pointer: int, _size: int) -> bool:
+            self.register_calls += 1
+            return True
+
+        def unregister(self, _pointer: int) -> None:
+            self.unregister_calls += 1
+
+    reg = FakePinBackend()
+    manager = PinManager(16 * 1024, backend=reg)
+    patch.setattr(communication, "host_pin_manager", manager)
+    patch.setattr(communication, "_validate_tensor", lambda _t: None)
+    patch.setattr(group, "size", lambda: 2)
+    patch.setattr(group, "rank", lambda: 0)
+    patch.setattr(group, "_staging_bytes", 256)
+    patch.setattr(group, "_cpu_group", FakeP2PGloo())
+    patch.setattr(torch.cuda, "Event", DummyEvent)
+    patch.setattr(torch.cuda, "Stream", make_stream)
+    patch.setattr(torch.cuda, "device", lambda _d: nullcontext())
+    patch.setattr(torch.cuda, "stream", lambda _s: nullcontext())
+    patch.setattr(torch.cuda, "current_stream", DummyStream)
+    return reg, manager, recorded_events, stream_syncs, streams, p2p_log, state, entered_event
+
+
+def _check_p2p_pool_cap_and_shutdown(group, send_t, state, entered_event, streams, manager, reg) -> None:
+    cap_gate = threading.Event()
+    state.update({"block_gate": cap_gate, "entered": 0, "target": 3})
+    cap_works = [group.send([send_t], 1, tag) for tag in (3, 4, 5)]
+    assert entered_event.wait(timeout=5)
+    cap_gate.set()
+    for work in cap_works:
+        assert work.wait()
+    assert len(streams) == 4 and len(group._p2p_pool) == 2
+
+    entered_event.clear()
+    shut_gate = threading.Event()
+    state.update({"block_gate": shut_gate, "entered": 0, "target": 1})
+    pending = group.send([send_t], 1, 6)
+    assert entered_event.wait(timeout=5)
+    shut = threading.Thread(target=group.shutdown)
+    shut.start()
+    shut_gate.set()
+    shut.join(timeout=5)
+    assert not shut.is_alive() and pending.wait()
+    assert group._p2p_pool == []
+    assert manager.stats.pinned_bytes == 0 and reg.unregister_calls == reg.register_calls
+
+
+def test_p2p_cuda_mock_batch_pinning_and_shutdown(single_rank_group):
+    group = single_rank_group
+    _, _, fake_cuda_tensor, _, _, _ = _make_fake_gloo_copy_env(group)[:6]
+    assert group._get_backend(torch.device("cpu")) is group._cpu_group
+    assert group._get_backend(torch.device("cuda", 0)) is group
+    assert not getattr(group._get_backend(torch.device("cuda", 0)), "supports_coalescing", False)
+
+    with pytest.MonkeyPatch.context() as patch:
+        reg, manager, recorded_events, stream_syncs, streams, p2p_log, state, entered_event = _make_mock_cuda_p2p_env(
+            group, patch,
+        )
+        patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        with pytest.raises(RuntimeError, match="CUDA graph capture"):
+            group.send([fake_cuda_tensor(torch.ones(4))], 1, 0)
+        patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+        # Inference-mode FakeCudaTensor across multi-chunk send + recv + anysource reuses pooled slot.
+        send_t = fake_cuda_tensor(torch.arange(20, dtype=torch.float32))
+        recv_t = fake_cuda_tensor(torch.zeros(20, dtype=torch.float32))
+        any_t = fake_cuda_tensor(torch.zeros(20, dtype=torch.float32))
+        group.send([send_t], 1, 0).wait()
+        group.recv([recv_t], 1, 1).wait()
+        w_any = group.recv_anysource([any_t], 2)
+        assert w_any.get_future().wait() == [any_t]
+        assert w_any.source_rank() == 1
+        assert len(streams) == 1 and len(group._p2p_pool) == 1
+        assert len({entry[3] for entry in p2p_log}) == 1
+        assert manager.stats.active_leases == 0 and reg.register_calls == 1
+        assert len(stream_syncs) == 3 and all(ev.synced for ev in recorded_events)
+        assert torch.all(recv_t.data.view(torch.uint8) == 42)
+        any_bytes = any_t.data.view(torch.uint8)
+        assert torch.all(any_bytes[:64] == 7) and torch.all(any_bytes[64:] == 42)
+
+        # Transfer error synchronizes stream and returns pooled slot; sync error discards slot instead.
+        state["fail_send"] = True
+        with pytest.raises(RuntimeError, match="injected p2p send failure"):
+            group.send([send_t], 1, 0).wait()
+        assert len(stream_syncs) == 4 and manager.stats.active_leases == 0 and len(group._p2p_pool) == 1
+        state["fail_send"] = False
+        state["fail_sync"] = True
+        with pytest.raises(RuntimeError, match="injected stream synchronize failure"):
+            group.send([send_t], 1, 0).wait()
+        assert len(group._p2p_pool) == 0 and manager.stats.active_leases == 0
+        assert manager.stats.pinned_bytes == 0 and reg.unregister_calls == 1
+        state["fail_sync"] = False
+
+        _check_p2p_pool_cap_and_shutdown(group, send_t, state, entered_event, streams, manager, reg)
