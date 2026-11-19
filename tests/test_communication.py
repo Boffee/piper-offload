@@ -765,11 +765,17 @@ class _CountingRegistration(RuntimeHostRegistration):
 
 
 class _MeasuredTransport:
-    def __init__(self, inner, staging_bytes, accelerator):
+    def __init__(self, inner, staging_bytes, accelerator, *, world_size: int = 3):
         self.inner = inner
         self.staging_bytes = staging_bytes
         self.accelerator = accelerator
-        self.calls = dict.fromkeys(("allreduce", "allgather", "broadcast", "scatter", "reduce_scatter", "reduce"), 0)
+        ops = (
+            ("allreduce", "allgather", "broadcast", "scatter", "reduce_scatter", "send", "recv")
+            if world_size == 2
+            else ("allreduce", "allgather", "broadcast", "scatter", "reduce_scatter", "reduce")
+        )
+        self.calls = dict.fromkeys(ops, 0)
+        self.wire_bytes = dict.fromkeys(ops, 0)
         self.storage_pointers = set()
 
     def __getattr__(self, name):
@@ -783,6 +789,7 @@ class _MeasuredTransport:
                 elif isinstance(item, torch.Tensor):
                     assert item.device.type == "cpu"
                     assert item.nbytes <= self.staging_bytes
+                    self.wire_bytes[name] += item.nbytes
                     if self.accelerator:
                         storage = item.untyped_storage()
                         assert storage.nbytes() == self.staging_bytes
@@ -806,7 +813,7 @@ def _run_chunked_relay(rank, store_path, device_type, world_size, buffers=1, mix
     registration = _CountingRegistration()
     initial_registrations = int(not mixed_pinning or rank != 0)
     manager = PinManager(16 * 1024 if initial_registrations else 0, backend=registration)
-    measured = _MeasuredTransport(group._cpu_group, 512, device_type == "cuda")
+    measured = _MeasuredTransport(group._cpu_group, 512, device_type == "cuda", world_size=world_size)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(communication, "host_pin_manager", manager)
         patch.setattr(group, "_cpu_group", measured)
@@ -823,7 +830,7 @@ def _run_chunked_relay(rank, store_path, device_type, world_size, buffers=1, mix
                     pointer = current
                 assert manager.stats.active_leases == 0
 
-            assert all(count > 3 for count in measured.calls.values())
+            assert all(count >= 3 for count in measured.calls.values())
             if device_type == "cuda":
                 assert measured.storage_pointers == {pointer}
                 assert registration.register_calls == initial_registrations
@@ -961,7 +968,7 @@ def test_reject_invalid_staging_size(size):
 
 @pytest.mark.parametrize(("size", "buffers", "transport"), [
     (16, 1, "gloo"), (32, 1, "gloo"), (80, 2, "gloo"), (128, 3, "gloo"),
-    (32, 1, "shared"), (128, 3, "shared"),
+    (32, 1, "shared"), (32, 3, "shared"),
 ])
 def test_reject_insufficient_staging_slots(tmp_path, size, buffers, transport):
     register_relay_backend()
@@ -974,15 +981,18 @@ def test_reject_insufficient_staging_slots(tmp_path, size, buffers, transport):
         )
 
 
-@pytest.mark.parametrize(("size", "buffers"), [(80, 1), (144, 2)])
+@pytest.mark.parametrize(("size", "buffers"), [(80, 1), (80, 3)])
 def test_reject_insufficient_shared_rank_slots(size, buffers):
     with pytest.raises(ValueError, match="16 bytes per staging slot in each rank region"):
         RelayOptions(staging_bytes=size, pipeline_buffers=buffers, transport="shared")._validate_group_size(2)
 
 
 def test_accept_minimum_shared_rank_slots():
+    assert RelayOptions().pipeline_buffers == 2
     RelayOptions(staging_bytes=48, pipeline_buffers=1, transport="shared")._validate_group_size(1)
+    RelayOptions(staging_bytes=48, pipeline_buffers=3, transport="shared")._validate_group_size(1)
     RelayOptions(staging_bytes=96, pipeline_buffers=1, transport="shared")._validate_group_size(2)
+    RelayOptions(staging_bytes=96, pipeline_buffers=3, transport="shared")._validate_group_size(2)
 
 
 def test_staging_buffer_dies_with_the_group_while_chunk_views_linger(single_rank_group):
@@ -1072,7 +1082,7 @@ def test_late_chunk_failure_releases_lease(single_rank_group, monkeypatch, opera
     expected = torch.ones_like(tensor, device="cpu")
     if operation == "allreduce":
         expected[:single_rank_group._slot_bytes(3) // 2].fill_(9)
-    else:
+    elif operation != "broadcast":
         expected.view(torch.uint8)[:single_rank_group._slot_bytes(2)].fill_(9)
     assert torch.equal(tensor.view(torch.int16).cpu(), expected.view(torch.int16))
     pointer = single_rank_group._staging_buffer.data_ptr()
@@ -1126,12 +1136,18 @@ class _GlooGuard:
         return self.inner.allgather(outputs, inputs)
 
     def send(self, tensors, peer, tag):
+        if self.allow_allreduce and tag == communication._GLOO_EXCHANGE_TAG:
+            self.gloo_calls += 1
+            return self.inner.send(tensors, peer, tag)
         if not self.allow_control:
             pytest.fail("shared relay sent control or payload over Gloo")
         assert tensors[0].nbytes == 8
         return self.inner.send(tensors, peer, tag)
 
     def recv(self, tensors, peer, tag):
+        if self.allow_allreduce and tag == communication._GLOO_EXCHANGE_TAG:
+            self.gloo_calls += 1
+            return self.inner.recv(tensors, peer, tag)
         if not self.allow_control:
             pytest.fail("shared relay received control or payload over Gloo")
         assert tensors[0].nbytes == 8
@@ -3120,3 +3136,226 @@ def _run_shared_reduce_scatter_suite(rank: int, path: str) -> None:
 
 def test_shared_reduce_scatter_direct_and_serial(tmp_path):
     mp.spawn(_run_shared_reduce_scatter_suite, args=(str(tmp_path / "shared-rs"),), nprocs=4)
+
+
+def _run_gloo_two_rank_wire_and_broadcast(rank: int, path: str) -> None:
+    torch.set_num_threads(1)
+    register_relay_backend()
+    dist.init_process_group(
+        "piper_relay", store=dist.FileStore(path, 2), rank=rank, world_size=2,
+        timeout=timedelta(seconds=20), pg_options=RelayOptions(staging_bytes=512, pipeline_buffers=2),
+    )
+    group = dist.group.WORLD
+    measured = _MeasuredTransport(group._cpu_group, 512, False, world_size=2)
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(group, "_cpu_group", measured)
+            # 1. Exact raw 2-byte wire volume on W=2 low-precision all_reduce + reduce_scatter_single.
+            for dtype in (torch.float16, torch.bfloat16):
+                measured.calls = dict.fromkeys(measured.calls, 0)
+                measured.wire_bytes = dict.fromkeys(measured.wire_bytes, 0)
+                # 41 elements = 82 bytes -> 80B chunk + 2B (1-element) tail chunk at capacity=80.
+                values = (torch.arange(41, dtype=torch.float32) / 16 - 1.5 + rank * 0.25).to(dtype)
+                reduced = values.clone()
+                dist.all_reduce(reduced)
+                peer_values = (torch.arange(41, dtype=torch.float32) / 16 - 1.5 + (1 - rank) * 0.25).to(dtype)
+                exp_ar = (values.float() + peer_values.float()).to(dtype)
+                torch.testing.assert_close(reduced, exp_ar, rtol=0, atol=0)
+
+                rs_in = torch.stack([values + 0.5, values + 1.0])
+                rs_out = torch.empty(41, dtype=dtype)
+                dist.reduce_scatter_single(rs_out, rs_in)
+                exp_rs = ((values + (rank + 1) * 0.5).float() + (peer_values + (rank + 1) * 0.5).float()).to(dtype)
+                torch.testing.assert_close(rs_out, exp_rs, rtol=0, atol=0)
+
+                assert measured.calls["allreduce"] == 0
+                assert measured.calls["reduce_scatter"] == 0
+                assert measured.calls["send"] == measured.calls["recv"] == 4
+                assert measured.wire_bytes["send"] == measured.wire_bytes["recv"] == 2 * values.nbytes
+
+            # 2. Broadcast uses slots=1 (capacity = 512 // (1 * 1 * 2) = 256 bytes) cleanly.
+            measured.calls["broadcast"] = 0
+            bc_payload = torch.arange(64, dtype=torch.float32) + 7.0  # 256 bytes == 1 chunk
+            bc = bc_payload.clone() if rank == 0 else torch.zeros_like(bc_payload)
+            dist.broadcast(bc, src=0)
+            assert measured.calls["broadcast"] == 1
+            torch.testing.assert_close(bc, bc_payload, rtol=0, atol=0)
+
+            # 3. Full chunked matrix across all 3 dtypes on W=2.
+            for dtype in DTYPES:
+                _check_chunked_values(rank, 2, torch.device("cpu"), dtype)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_chunked_gloo_two_rank_wire_bytes_and_broadcast(tmp_path):
+    mp.spawn(_run_gloo_two_rank_wire_and_broadcast, args=(str(tmp_path / "gloo-w2"),), nprocs=2)
+
+
+def _make_fake_gloo_copy_env(group):
+    from piper_offload._relay_staging import HostChunk
+
+    class StubWork:
+        def wait(self) -> None:
+            pass
+
+    class DummyCurrentStream:
+        def __init__(self) -> None:
+            self.syncs = 0
+
+        def synchronize(self) -> None:
+            self.syncs += 1
+
+    class FakeCudaTensor:
+        device = torch.device("cuda", 0)
+
+        def __init__(self, data: torch.Tensor) -> None:
+            with torch.inference_mode():
+                self.data = data.clone()
+
+        def data_ptr(self) -> int:
+            return self.data.data_ptr()
+
+        def numel(self) -> int:
+            return self.data.numel()
+
+        def reshape(self, *shape: int) -> torch.Tensor:
+            return self.data.reshape(*shape)
+
+    chunk_calls: list[tuple[int, int, int]] = []
+    gloo_calls: list[tuple[str, list[torch.Tensor], list[torch.Tensor]]] = []
+    state = {"fail_on_close": False}
+
+    class FakeGlooGroup:
+        def broadcast(self, tensors: list[torch.Tensor], options: object) -> StubWork:
+            del options
+            gloo_calls.append(("broadcast", [], tensors))
+            return StubWork()
+
+        def scatter(self, outputs: list[torch.Tensor], inputs: list[list[torch.Tensor]], options: object) -> StubWork:
+            del options
+            gloo_calls.append(("scatter", outputs, inputs[0]))
+            return StubWork()
+
+        def allgather(self, outputs: list[list[torch.Tensor]], inputs: list[torch.Tensor], options: object) -> StubWork:
+            del options
+            gloo_calls.append(("allgather", outputs[0], inputs))
+            return StubWork()
+
+    def gen_chunks(inputs: list[torch.Tensor], outputs: list[torch.Tensor], *, slots: int | None = None):
+        slot_count = slots if slots is not None else len(inputs) + len(outputs)
+        chunk_calls.append((len(inputs), len(outputs), slot_count))
+        ref = outputs[0] if outputs else inputs[0]
+        width = min(16, ref.numel() * 4)
+        capacity = group._slot_bytes(slot_count)
+        backing = torch.zeros(slot_count * capacity, dtype=torch.uint8)
+        in_views = [backing[i * capacity:i * capacity + width] for i in range(len(inputs))]
+        base = len(inputs)
+        out_views = [backing[(base + i) * capacity:(base + i) * capacity + width] for i in range(len(outputs))]
+        scratch = backing[(base + len(outputs)) * capacity:]
+        yield HostChunk(in_views, out_views, scratch)
+        if state["fail_on_close"]:
+            raise RuntimeError("injected chunk teardown failure")
+
+    return FakeGlooGroup(), DummyCurrentStream(), FakeCudaTensor, gen_chunks, chunk_calls, gloo_calls, state
+
+
+def test_gloo_cuda_local_copy_paths_avoid_aliasing_and_roundtrips(single_rank_group):
+    group = single_rank_group
+    fake_gloo, current, fake_cuda_tensor, gen_chunks, chunk_calls, gloo_calls, state = _make_fake_gloo_copy_env(group)
+    with pytest.MonkeyPatch.context() as patch, torch.no_grad():
+        patch.setattr(group, "size", lambda: 2)
+        patch.setattr(group, "rank", lambda: 0)
+        patch.setattr(group, "_cpu_group", fake_gloo)
+        patch.setattr(group, "_copy_chunks", gen_chunks)
+        patch.setattr(torch.cuda, "current_stream", lambda _device: current)
+
+        bc_tensor = torch.arange(4, dtype=torch.float32)
+        opts_bc = dist.BroadcastOptions()
+        opts_bc.rootRank = 0
+        group.broadcast([bc_tensor], opts_bc).wait()
+        assert chunk_calls[-1] == (1, 0, 1)
+        opts_bc.rootRank = 1
+        group.broadcast([bc_tensor], opts_bc).wait()
+        assert chunk_calls[-1] == (0, 1, 1)
+
+        sc_srcs = [fake_cuda_tensor(torch.full((4,), 11.0)), fake_cuda_tensor(torch.full((4,), 22.0))]
+        sc_out = fake_cuda_tensor(torch.zeros(4))
+        opts_sc = dist.ScatterOptions()
+        opts_sc.rootRank = 0
+        group._scatter_gloo(sc_out, sc_srcs, opts_sc)  # type: ignore[arg-type]
+        assert chunk_calls[-1] == (1, 0, 3) and current.syncs == 1
+        assert torch.equal(sc_out.data, sc_srcs[0].data)
+        op, out_list, in_list = gloo_calls[-1]
+        assert op == "scatter" and len(out_list) == 1 and len(in_list) == 2
+        assert out_list[0].data_ptr() not in {t.data_ptr() for t in in_list}
+        group._scatter_gloo(sc_srcs[0], sc_srcs, opts_sc)  # type: ignore[arg-type]
+        empty_sc = [fake_cuda_tensor(torch.empty(0)), fake_cuda_tensor(torch.empty(0))]
+        group._scatter_gloo(fake_cuda_tensor(torch.empty(0)), empty_sc, opts_sc)  # type: ignore[arg-type]
+        assert current.syncs == 1
+
+        ag_src = fake_cuda_tensor(torch.full((4,), 33.0))
+        ag_outs = [fake_cuda_tensor(torch.zeros(4)), fake_cuda_tensor(torch.zeros(4))]
+        group._gather(ag_src, ag_outs, communication.AllgatherOptions())  # type: ignore[arg-type]
+        assert chunk_calls[-1] == (1, 1, 3) and current.syncs == 2
+        assert torch.equal(ag_outs[0].data, ag_src.data)
+        op, out_list, in_list = gloo_calls[-1]
+        assert op == "allgather" and len(out_list) == 2 and len(in_list) == 1
+        assert out_list[0].data_ptr() not in (in_list[0].data_ptr(), out_list[1].data_ptr())
+        ag_alias = [ag_src, fake_cuda_tensor(torch.zeros(4))]
+        group._gather(ag_src, ag_alias, communication.AllgatherOptions())  # type: ignore[arg-type]
+        empty_ag = [fake_cuda_tensor(torch.empty(0)), fake_cuda_tensor(torch.empty(0))]
+        group._gather(fake_cuda_tensor(torch.empty(0)), empty_ag, communication.AllgatherOptions())  # type: ignore[arg-type]
+        assert current.syncs == 2
+
+        state["fail_on_close"] = True
+        with pytest.raises(RuntimeError, match="injected chunk teardown failure"):
+            group._scatter_gloo(fake_cuda_tensor(torch.zeros(4)), sc_srcs, opts_sc)  # type: ignore[arg-type]
+        fail_outs = [fake_cuda_tensor(torch.zeros(4)), fake_cuda_tensor(torch.zeros(4))]
+        with pytest.raises(RuntimeError, match="injected chunk teardown failure"):
+            group._gather(ag_src, fail_outs, communication.AllgatherOptions())  # type: ignore[arg-type]
+        assert current.syncs == 4
+
+
+def test_gloo_exchange_pair_drains_recv_on_send_failure(single_rank_group):
+    group = single_rank_group
+
+    class FailingWork:
+        def __init__(self, name: str, log: list[str], error: BaseException) -> None:
+            self.name = name
+            self.log = log
+            self.error = error
+
+        def wait(self, *_args: object) -> bool:
+            self.log.append(self.name)
+            raise self.error
+
+    class FakeGroup:
+        def __init__(self, log: list[str], *, fail_send_post: bool = False) -> None:
+            self.log = log
+            self.fail_send_post = fail_send_post
+
+        def recv(self, *_args: object) -> FailingWork:
+            return FailingWork("recv", self.log, RuntimeError("recv failed"))
+
+        def send(self, *_args: object) -> FailingWork:
+            if self.fail_send_post:
+                raise RuntimeError("send post failed")
+            return FailingWork("send", self.log, RuntimeError("send failed"))
+
+    buf = torch.empty(4, dtype=torch.uint8)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(group, "size", lambda: 2)
+        patch.setattr(group, "rank", lambda: 0)
+
+        wait_log: list[str] = []
+        patch.setattr(group, "_cpu_group", FakeGroup(wait_log))
+        with pytest.raises(RuntimeError, match="send failed"):
+            group._exchange_pair(buf, buf, timedelta(0))
+        assert wait_log == ["send", "recv"]
+
+        post_log: list[str] = []
+        patch.setattr(group, "_cpu_group", FakeGroup(post_log, fail_send_post=True))
+        with pytest.raises(RuntimeError, match="send post failed"):
+            group._exchange_pair(buf, buf, timedelta(seconds=1))
+        assert post_log == ["recv"]
