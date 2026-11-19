@@ -10,6 +10,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - Breaking: Removed the `bnb` and `quanto` extras and their built-in tensor
   adapters. For bitsandbytes or Quanto checkpoints, use another supported
   weight format or register a custom tensor adapter.
+- `piper_relay` with `transport="shared"` now uses three outgoing slots per
+  rank, bounding GPU reduction scratch to at most `staging_bytes / world_size`
+  and updating the minimum accepted `staging_bytes` for small budgets.
 
 ## [0.10.0rc15] - 2026-11-17
 
