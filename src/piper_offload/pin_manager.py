@@ -55,7 +55,7 @@ import torch
 
 from . import _host_memory as host_memory
 from . import _transfer_priority as transfer_priority
-from ._copy_memory import Copy, CopyLoad, _free_copies
+from ._copy_memory import Copy, CopyLoad, ReleaseBatch, _free_copies
 from ._host_registration import HostRegistrationBackend, HostRegistrationRefusedError, RuntimeHostRegistration
 from .checkpoint import FileSlice, file_slice
 
@@ -398,6 +398,20 @@ class PinManager:
                 self._memory.offered_bytes,
             )
 
+    def _try_hold_registered(
+        self, requests: dict[int, _Request], held: dict[int, _Registration],
+    ) -> bool:
+        """Hold every requested storage when all are already registered with matching sizes."""
+        pairs: list[tuple[_Registration, _Request]] = []
+        for pointer, request in requests.items():
+            registration = self._registrations.get(pointer)
+            if registration is None or registration.size != request.storage.nbytes():
+                return False
+            pairs.append((registration, request))
+        for registration, request in pairs:
+            self._hold(registration, request, held)
+        return True
+
     def acquire(self, tensors: Iterable[torch.Tensor], *, pin: bool = True) -> PinLease:
         """Lease whole storages for a transfer, registering them only if ``pin``.
 
@@ -408,32 +422,37 @@ class PinManager:
         transfer that runs once, so leasing never changes which storage is
         pinned.
 
-        A pinning acquisition waits while another has pending storage, and a
-        pageable one waits only for its own storage, so pinning acquisitions
-        run in turn as they did under the lock while pageable leases and
-        transfers proceed. All input validation happens before registration
-        or eviction. Existing registrations anywhere in the request are held
-        before new storage is reserved, so reserving cannot evict what this
-        same lease will use. New storage is reserved under the budget in
-        request order, with a copy allocated for checkpoint storage, or taken
-        from the offered tier when the storage has one there; the copies are
-        reclaimed and fill with the lock released, the first alone and the
-        rest together once it has registered, and a reclaimed copy whose pages
-        Windows kept intact registers after the ready prefix, without waiting
-        for earlier fills, while the rest are still being reclaimed;
-        everything else registers in request order. A runtime capacity failure
-        evicts unrelated idle registrations and retries; if capacity remains unavailable, the
-        storage this acquisition has not registered yet skips registration. A
-        rejected range alone stays pageable, without evicting other
-        registrations or skipping later storage.
+        A pinning acquisition whose requested storages are all already
+        registered holds them immediately without waiting for unrelated pending
+        storage; a pinning acquisition that needs new storage waits while
+        another has pending storage, and a pageable one waits only for its own
+        storage, so pinning acquisitions that register new storage run in turn as they did
+        under the lock while cached acquisitions and pageable transfers proceed.
+        All input validation happens before registration or eviction. Existing
+        registrations anywhere in the request are held before new storage is
+        reserved, so reserving cannot evict what this same lease will use. New
+        storage is reserved under the budget in request order, with a copy
+        allocated for checkpoint storage, or taken from the offered tier when
+        the storage has one there; the copies are reclaimed and fill with the
+        lock released, the first alone and the rest together once it has
+        registered, and a reclaimed copy whose pages Windows kept intact
+        registers after the ready prefix, without waiting for earlier fills,
+        while the rest are still being reclaimed; everything else registers in
+        request order. A runtime capacity failure evicts unrelated idle
+        registrations and retries; if capacity remains unavailable, the storage
+        this acquisition has not registered yet skips registration. A rejected
+        range alone stays pageable, without evicting other registrations or
+        skipping later storage.
         """
         requests = self._requests(tensors)
         held: dict[int, _Registration] = {}
         created: list[_Registration] = []
         pending: list[_Pending] = []
-        releases = self._memory.release_batch()
+        releases: ReleaseBatch | None = None
         try:
             with self._lock:
+                if self._try_hold_registered(requests, held):
+                    return self._open_lease(requests, held)
                 while self._pending and (pin or not self._pending.keys().isdisjoint(requests)):
                     self._pending_changed.wait()
                 self._validate_ranges(requests)
@@ -441,9 +460,11 @@ class PinManager:
                     registration = self._registrations.get(pointer)
                     if registration is not None:
                         self._hold(registration, request, held)
-                if pin:
-                    with releases:
-                        self._reserve(requests, held, pending)
+                if not pin:
+                    return self._open_lease(requests, held)
+                releases = self._memory.release_batch()
+                with releases:
+                    self._reserve(requests, held, pending)
                 prepared = self._memory.prepare([item.load for item in pending if isinstance(item, _PendingCopy)])
             # What was evicted to make room is offered before anything is read.
             releases.finish()
@@ -459,7 +480,8 @@ class PinManager:
                 for registration in created:
                     registration.retired = True
                 self._release(tuple(held.values()))
-            releases.finish()
+            if releases is not None:
+                releases.finish()
             raise
 
     def _prepare_copies(
@@ -490,7 +512,9 @@ class PinManager:
     def _open_lease(self, requests: dict[int, _Request], held: dict[int, _Registration]) -> PinLease:
         key = self._next_lease
         self._next_lease += 1
-        pageable_pointers = tuple(pointer for pointer in requests if pointer not in held)
+        pageable_pointers = () if len(held) == len(requests) else tuple(
+            pointer for pointer in requests if pointer not in held
+        )
         for pointer in pageable_pointers:
             pageable = self._pageable.get(pointer)
             if pageable is None:
@@ -505,8 +529,10 @@ class PinManager:
         )
         _live_managers.add(self)
         registered = sum(registration.size for registration in held.values())
-        total = sum(request.storage.nbytes() for request in requests.values())
-        return PinLease(self, key, registered, total - registered)
+        pageable_bytes = (
+            sum(requests[pointer].storage.nbytes() for pointer in pageable_pointers) if pageable_pointers else 0
+        )
+        return PinLease(self, key, registered, pageable_bytes)
 
     def transfer(self, destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool) -> None:
         """Copy ``source`` into ``destination``, reading ``source``'s pinned copy when one exists.
@@ -682,6 +708,8 @@ class PinManager:
         reclaimed copy take runtime capacity before earlier unfilled copies.
         This locks intact pages before fill pressure can discard them.
         """
+        if not pending:
+            return False
         exhausted = False
         while not exhausted and pending:
             item = pending[0]
@@ -720,6 +748,8 @@ class PinManager:
 
     def _discard_pending(self, pending: list[_Pending]) -> None:
         """Release remaining reservations once all acquisition workers have stopped."""
+        if not pending:
+            return
         for item in pending:
             self._evict_pending(item)
             del self._pending[item.pointer]
@@ -810,17 +840,21 @@ class PinManager:
 
         These evictions make room, so their copies go to the offered tier when it admits them.
         """
+        if until():
+            return
         for candidate in tuple(self._idle):
-            if until():
-                return
             registration = self._registrations.get(candidate)
             if registration is not None:
                 self._unregister(registration, demote=True)
+                if until():
+                    return
 
     def _hold(self, registration: _Registration, request: _Request, held: dict[int, _Registration]) -> None:
         registration.leases += 1
         held[registration.pointer] = registration
         self._idle.pop(registration.pointer, None)
+        if all(id(tensor) in registration.owners for tensor in request.tensors):
+            return
         manager_ref, registration_ref = weakref.ref(self), weakref.ref(registration)
 
         def owner_gone(_ref: weakref.ReferenceType[torch.Tensor]) -> None:
@@ -877,7 +911,8 @@ class PinManager:
                 self._idle[registration.pointer] = None
                 if registration.retired:
                     self._unregister(registration)
-        self._fit(lambda: 0)
+        if self._max_pinned_bytes is not None and self._pinned_bytes > self._max_pinned_bytes:
+            self._fit(lambda: 0)
 
     def _close_lease(self, key: int) -> None:
         with self._lock:
