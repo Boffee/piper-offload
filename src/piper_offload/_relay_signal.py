@@ -15,6 +15,7 @@ import platform
 import time
 from collections.abc import Callable, Sequence
 from datetime import timedelta
+from typing import Protocol
 
 _WORD_BYTES = 8
 _HEADER_WORDS = 8
@@ -48,6 +49,20 @@ def control_bytes(world_size: int) -> int:
     return max(4096, (size + 4095) // 4096 * 4096)
 
 
+class RelayControl(Protocol):
+    """Protocol for shared-memory and Gloo collective agreement/signaling backends."""
+
+    def agree(self, op: int, nbytes: int, kind: int, detail: int, timeout: timedelta) -> None: ...
+
+    def signal(
+        self, peers: Sequence[tuple[int | None, int | None]], tag: int, sequence: int, timeout: timedelta,
+    ) -> None: ...
+
+    def skip_ready(self, peer: int, count: int) -> None: ...
+
+    def abort(self) -> None: ...
+
+
 class SharedControl:
     """Shared-memory metadata agreement and chunk ready/free signaling across ranks.
 
@@ -73,6 +88,8 @@ class SharedControl:
         self._epoch = 0
         self._local_ready = 0
         self._local_free = 0
+        self._expected_ready: list[int] = [0] * world_size
+        self._expected_free: list[int] = [0] * world_size
 
     def _poll(self, indices: Sequence[int], pending: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
         words = self._words
@@ -124,9 +141,7 @@ class SharedControl:
                 sleep_s = min(_SLEEP_MAX, sleep_s * 2.0)
             now = time.monotonic()
 
-    def agree(
-        self, op: int, nbytes: int, kind: int, detail: int, timeout: timedelta,
-    ) -> tuple[list[int], list[int]]:
+    def agree(self, op: int, nbytes: int, kind: int, detail: int, timeout: timedelta) -> None:
         """Exchange collective metadata and snapshot every rank's ready/free counters."""
         words = self._words
         self._epoch += 1
@@ -156,7 +171,8 @@ class SharedControl:
             free_bases[peer] = int(words[peer_slot + 5])
         if mismatched:
             raise ValueError("shared relay collective operation, payload bytes and root/dtype must match across ranks")
-        return ready_bases, free_bases
+        self._expected_ready = ready_bases
+        self._expected_free = free_bases
 
     def publish_ready(self) -> None:
         self._local_ready += 1
@@ -173,6 +189,30 @@ class SharedControl:
     def wait_free(self, targets: Sequence[tuple[int, int]], timeout: timedelta) -> None:
         if targets:
             self._wait(self._free_idx, targets, timeout)
+
+    def signal(
+        self, peers: Sequence[tuple[int | None, int | None]], tag: int, sequence: int, timeout: timedelta,
+    ) -> None:
+        del sequence
+        send_ready = any(send is not None for send, _ in peers)
+        recv_peers = [receive for _, receive in peers if receive is not None]
+        if tag == 0:
+            publish, expected, wait = self.publish_ready, self._expected_ready, self.wait_ready
+        else:
+            publish, expected, wait = self.publish_free, self._expected_free, self.wait_free
+        # Publish before waiting so cyclic multi-peer exchanges never deadlock.
+        if send_ready:
+            publish()
+        if recv_peers:
+            targets: list[tuple[int, int]] = []
+            for peer in recv_peers:
+                target = expected[peer] + 1
+                expected[peer] = target
+                targets.append((peer, target))
+            wait(targets, timeout)
+
+    def skip_ready(self, peer: int, count: int) -> None:
+        self._expected_ready[peer] += count
 
     def abort(self) -> None:
         """Signal failure across the shared control region so waiting peers exit quickly."""

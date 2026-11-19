@@ -983,6 +983,8 @@ class _GlooGuard:
 
 
 def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_buffers, staging_bytes):  # noqa: PLR0915
+    from piper_offload._relay_signal import SharedControl
+
     torch.set_num_threads(1)
     device = torch.device(device_type)
     if device_type == "cuda":
@@ -999,7 +1001,7 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
     guard = _GlooGuard(
         group._cpu_group,
         allow_allreduce=(device_type != "cuda"),
-        allow_control=(shared._control is None),
+        allow_control=(not isinstance(shared._control, SharedControl)),
     )
     registration = _CountingRegistration()
     pin_budget = max(16384, staging_bytes * 2)
@@ -1010,6 +1012,7 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
     control_counts = [0, 0]
     lanes = set()
     original_slot = shared._slot
+    original_agree = shared._control.agree
     original_signal = shared._signal
 
     def slot(sender, lane, width):
@@ -1032,9 +1035,7 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
         patch.setattr(communication, "host_pin_manager", manager)
         patch.setattr(group, "_cpu_group", guard)
         patch.setattr(shared, "_slot", slot)
-        if shared._control is not None:
-            original_agree = shared._control.agree
-            patch.setattr(shared._control, "agree", tracked_agree)
+        patch.setattr(shared._control, "agree", tracked_agree)
         patch.setattr(shared, "_signal", tracked_signal)
         # Exercise slot reuse and a partial last chunk at either alignment.
         local = torch.arange(shared.capacity + 1, dtype=torch.float32, device=device) + rank
@@ -1075,9 +1076,7 @@ def _run_shared_chunks(rank, path, device_type, size, mixed_pinning, pipeline_bu
         if device_type == "cuda":
             assert shared._reduction_buffer is scratch
             assert guard.gloo_calls == 0
-        if shared._control is not None:
-            assert control_counts[0] > 10
-        assert control_counts[1] > 20
+        assert control_counts[0] > 10 and control_counts[1] > 20
         assert group._staging_buffer is None
         assert shared.buffer.data_ptr() == pointer
         assert manager.stats.active_leases == 0
@@ -1138,8 +1137,7 @@ def _check_shared_coalesced(group, shared, control_counts, manager, counts, rank
         views = out.view(size, *src.shape)
         for peer in range(size):
             torch.testing.assert_close(views[peer], src - rank + peer, rtol=0, atol=0)
-    if shared._control is not None:
-        assert control_counts[0] - before_agree == 1
+    assert control_counts[0] - before_agree == 1
     assert control_counts[1] - before_signal == 2
 
     large_inputs = [
@@ -1757,31 +1755,25 @@ def test_shared_control_agreement_and_abort():
     c0 = SharedControl(mapping, 0, 2)
     c1 = SharedControl(mapping, 1, 2)
     for seq in range(4):
-        results: list[tuple[list[int], list[int]]] = [([], []), ([], [])]
         errors: list[BaseException] = []
 
-        def worker(
-            ctl: SharedControl, idx: int, s: int,
-            out: list[tuple[list[int], list[int]]], errs: list[BaseException],
-        ) -> None:
+        def worker(ctl: SharedControl, idx: int, s: int, errs: list[BaseException]) -> None:
             try:
-                out[idx] = ctl.agree(1, 64, 0, s, timedelta(seconds=2))
-                ctl.publish_ready()
-                ctl.wait_ready([(1 - idx, out[idx][0][1 - idx] + 1)], timedelta(seconds=2))
-                ctl.publish_free()
-                ctl.wait_free([(1 - idx, out[idx][1][1 - idx] + 1)], timedelta(seconds=2))
+                ctl.agree(1, 64, 0, s, timedelta(seconds=2))
+                ctl.signal([(1 - idx, 1 - idx)], 0, s, timedelta(seconds=2))
+                ctl.signal([(1 - idx, 1 - idx)], 1, s, timedelta(seconds=2))
             except BaseException as exc:
                 errs.append(exc)
 
-        t0 = threading.Thread(target=worker, args=(c0, 0, seq, results, errors))
-        t1 = threading.Thread(target=worker, args=(c1, 1, seq, results, errors))
+        t0 = threading.Thread(target=worker, args=(c0, 0, seq, errors))
+        t1 = threading.Thread(target=worker, args=(c1, 1, seq, errors))
         t0.start()
         t1.start()
         t0.join()
         t1.join()
         assert not errors
-        assert results[0] == ([seq, seq], [seq, seq])
-        assert results[1] == ([seq, seq], [seq, seq])
+        assert c0._expected_ready[1] == seq + 1 and c1._expected_ready[0] == seq + 1
+        assert c0._expected_free[1] == seq + 1 and c1._expected_free[0] == seq + 1
 
     mismatch_errors: list[BaseException] = []
 
@@ -1822,6 +1814,8 @@ def test_shared_control_timeout_without_abort():
 
 
 def _run_shared_wakeup(rank: int, path: str) -> None:
+    from piper_offload._relay_signal import SharedControl
+
     torch.set_num_threads(1)
     register_relay_backend()
     dist.init_process_group(
@@ -1831,7 +1825,7 @@ def _run_shared_wakeup(rank: int, path: str) -> None:
     )
     shared = dist.group.WORLD._shared
     try:
-        if shared._control is None:
+        if not isinstance(shared._control, SharedControl):
             return
         # 1. Delayed metadata agreement wakes peer sleeping past the spin window.
         if rank == 0:
@@ -1889,6 +1883,8 @@ def test_shared_relay_gloo_control_fallback(tmp_path, monkeypatch):
 
     events: list[tuple[str, str, int, int]] = []
     replies: dict[int, int] = {1: 7, 2: 7, 3: 7}
+    peer_detail: int | None = None
+    agree_error: BaseException | None = None
 
     class RecordingWork:
         def __init__(self, kind: str, peer: int, tag: int, target: torch.Tensor | None = None) -> None:
@@ -1899,6 +1895,8 @@ def test_shared_relay_gloo_control_fallback(tmp_path, monkeypatch):
 
         def wait(self, timeout: timedelta) -> None:
             del timeout
+            if self.kind == "allgather" and agree_error is not None:
+                raise agree_error
             events.append(("wait", self.kind, self.peer, self.tag))
             if self.target is not None:
                 self.target.fill_(replies[self.peer])
@@ -1913,21 +1911,41 @@ def test_shared_relay_gloo_control_fallback(tmp_path, monkeypatch):
             events.append(("post", "recv", peer, tag))
             return RecordingWork("recv", peer, tag, tensors[0])
 
+        def allgather(self, gathered: list[list[torch.Tensor]], metadata: list[torch.Tensor]) -> RecordingWork:
+            for item in gathered[0]:
+                item.copy_(metadata[0])
+            if peer_detail is not None:
+                gathered[0][1][3] = peer_detail
+            return RecordingWork("allgather", 0, 0)
+
     monkeypatch.setattr(_relay_shared, "shared_control_supported", lambda: False)
     shared = _relay_shared.SharedRelay(
         store, RecordingGroup(), rank=0, world_size=4, nbytes=192, timeout=timedelta(seconds=5),
     )
-    assert shared._control is None
+    assert isinstance(shared._control, _relay_shared._GlooControl)
     shared._signal(shared._peers, tag=0, sequence=7)
     assert len(events) == 12
     assert all(ev[0] == "post" for ev in events[:6])
     assert all(ev[0] == "wait" for ev in events[6:])
-    assert shared._pending == []
+    assert shared._control._pending == []
 
     replies[2] = 6
     with pytest.raises(RuntimeError, match="control sequence mismatch"):
         shared._signal(shared._peers, tag=0, sequence=7)
-    assert shared._pending == []
+    assert shared._control._pending == []
+
+    sample = torch.empty(4, dtype=torch.float32)
+    shared._agree_operation("allreduce", [sample], -1)
+    assert not shared.broken
+    peer_detail = 99
+    with pytest.raises(ValueError, match="must match across ranks"):
+        shared._agree_operation("allreduce", [sample], -1)
+    assert not shared.broken
+    peer_detail = None
+    agree_error = RuntimeError("injected gloo agree failure")
+    with pytest.raises(RuntimeError, match="injected gloo agree failure"):
+        shared._agree_operation("allreduce", [sample], -1)
+    assert shared.broken
 
 
 def test_shared_prepare_streams_failure_propagates_original_error(tmp_path):

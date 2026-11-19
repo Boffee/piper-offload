@@ -29,7 +29,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from ._relay_signal import SharedControl, control_bytes, shared_control_supported
+from ._relay_signal import RelayControl, SharedControl, control_bytes, shared_control_supported
 from .pin_manager import PinManager
 
 BUFFERS_PER_RANK = 3
@@ -196,18 +196,18 @@ def _create_shared_mappings(
     store = dist.PrefixStore("piper_relay_shared", store)
     mappings: list[mmap.mmap] = []
     names: list[str] = []
-    if rank == 0:
-        try:
-            for size in sizes:
-                mapping, name = _create_mapping(size)
-                mappings.append(mapping)
-                names.append(name)
-            descriptor = {"names": names, "host": socket.gethostname(), "error": ""}
-        except Exception as error:
-            _close_mappings(mappings)
-            descriptor = {"error": str(error)}
-        store.set("mapping", json.dumps(descriptor))
     try:
+        if rank == 0:
+            try:
+                for size in sizes:
+                    mapping, name = _create_mapping(size)
+                    mappings.append(mapping)
+                    names.append(name)
+                descriptor = {"names": names, "host": socket.gethostname(), "error": ""}
+            except Exception as error:
+                _close_mappings(mappings)
+                descriptor = {"error": str(error)}
+            store.set("mapping", json.dumps(descriptor))
         descriptor = json.loads(store.get("mapping"))
         error_message = descriptor["error"]
         if not error_message:
@@ -225,9 +225,11 @@ def _create_shared_mappings(
         store.wait(keys, timeout)
         errors = [store.get(key).decode() for key in keys]
         if any(errors):
-            _close_mappings(mappings)
             raise RuntimeError(f"Could not initialize shared relay: {next(e for e in errors if e)}")
         return mappings
+    except BaseException:
+        _close_mappings(mappings)
+        raise
     finally:
         if rank == 0:
             _unlink_paths(names)
@@ -245,6 +247,55 @@ def create_shared_buffer(
     return torch.frombuffer(_create_shared_mappings(store, rank, world_size, (nbytes,), timeout)[0], dtype=torch.uint8)
 
 
+class _GlooControl:
+    """Fallback collective metadata and chunk signaling over CPU Gloo."""
+
+    def __init__(self, group: dist.ProcessGroupGloo, world_size: int) -> None:
+        self._group = group
+        self._world_size = world_size
+        self._send_signal = torch.empty(1, dtype=torch.int64)
+        self._recv_signals = torch.empty(max(1, world_size - 1), dtype=torch.int64)
+        self._recv_slots = tuple(self._recv_signals[i:i + 1] for i in range(self._recv_signals.numel()))
+        self._pending: list[dist.Work] = []
+
+    def agree(self, op: int, nbytes: int, kind: int, detail: int, timeout: timedelta) -> None:
+        metadata = torch.tensor([op, nbytes, kind, detail], dtype=torch.int64)
+        gathered = [torch.empty_like(metadata) for _ in range(self._world_size)]
+        self._group.allgather([gathered], [metadata]).wait(timeout)  # type: ignore[attr-defined]
+        if any(not torch.equal(metadata, other) for other in gathered):
+            raise ValueError("shared relay collective operation, payload bytes and root/dtype must match across ranks")
+
+    def signal(
+        self, peers: Sequence[tuple[int | None, int | None]], tag: int, sequence: int, timeout: timedelta,
+    ) -> None:
+        # Post all sends and receives before waiting, including across peers in
+        # cyclic rounds and multi-rank reductions. Completion precedes reusing
+        # these persistent control tensors.
+        # PyTorch's Gloo stubs omit its send/recv and collective bindings.
+        self._send_signal[0] = sequence
+        receivers = 0
+        try:
+            for send, receive in peers:
+                if send is not None:
+                    self._pending.append(self._group.send([self._send_signal], send, tag))  # type: ignore[attr-defined]
+                if receive is not None:
+                    slot = self._recv_slots[receivers]
+                    receivers += 1
+                    self._pending.append(self._group.recv([slot], receive, tag))  # type: ignore[attr-defined]
+            for work in reversed(self._pending):
+                work.wait(timeout)
+        finally:
+            self._pending.clear()
+        if receivers and any(self._recv_signals[i].item() != sequence for i in range(receivers)):
+            raise RuntimeError("shared relay control sequence mismatch")
+
+    def skip_ready(self, peer: int, count: int) -> None:
+        del peer, count
+
+    def abort(self) -> None:
+        return
+
+
 class SharedRelay:
     buffer_count = BUFFERS_PER_RANK
 
@@ -252,15 +303,16 @@ class SharedRelay:
         self, store: dist.Store, group: dist.ProcessGroupGloo, rank: int, world_size: int,
         nbytes: int, timeout: timedelta,
     ) -> None:
+        self._control: RelayControl
         if shared_control_supported():
             payload_mapping, control_mapping = _create_shared_mappings(
                 store, rank, world_size, (nbytes, control_bytes(world_size)), timeout,
             )
             self.buffer = torch.frombuffer(payload_mapping, dtype=torch.uint8)
-            self._control: SharedControl | None = SharedControl(control_mapping, rank, world_size)
+            self._control = SharedControl(control_mapping, rank, world_size)
         else:
             self.buffer = create_shared_buffer(store, rank, world_size, nbytes, timeout)
-            self._control = None
+            self._control = _GlooControl(group, world_size)
         self.rank = rank
         self.world_size = world_size
         self._peers: tuple[tuple[int, int], ...] = tuple(
@@ -268,7 +320,6 @@ class SharedRelay:
             for step in range(1, world_size)
         )
         self.capacity = shared_slot_bytes(nbytes, world_size)
-        self.group = group
         self.timeout = timeout
         self.broken = False
         self.device: torch.device | None = None
@@ -277,12 +328,6 @@ class SharedRelay:
         self.ready: list[torch.cuda.Event] = []
         self.uploaded: list[torch.cuda.Event] = []
         self._reduction_buffer: torch.Tensor | None = None
-        self._expected_ready: list[int] = [0] * world_size
-        self._expected_free: list[int] = [0] * world_size
-        self._send_signal = torch.empty(1, dtype=torch.int64)
-        self._recv_signals = torch.empty(max(1, world_size - 1), dtype=torch.int64)
-        self._recv_slots = tuple(self._recv_signals[i:i + 1] for i in range(self._recv_signals.numel()))
-        self._pending: list[dist.Work] = []
 
     def local_buffer(self) -> torch.Tensor:
         start = self.rank * self.buffer_count * self.capacity
@@ -312,50 +357,7 @@ class SharedRelay:
     def _signal(
         self, peers: Sequence[tuple[int | None, int | None]], tag: int, sequence: int,
     ) -> None:
-        control = self._control
-        if control is None:
-            self._signal_gloo(peers, tag, sequence)
-            return
-        send_ready = any(send is not None for send, _ in peers)
-        recv_peers = [receive for _, receive in peers if receive is not None]
-        if tag == 0:
-            publish, expected, wait = control.publish_ready, self._expected_ready, control.wait_ready
-        else:
-            publish, expected, wait = control.publish_free, self._expected_free, control.wait_free
-        # Publish before waiting so cyclic multi-peer exchanges never deadlock.
-        if send_ready:
-            publish()
-        if recv_peers:
-            targets: list[tuple[int, int]] = []
-            for peer in recv_peers:
-                target = expected[peer] + 1
-                expected[peer] = target
-                targets.append((peer, target))
-            wait(targets, self.timeout)
-
-    def _signal_gloo(
-        self, peers: Sequence[tuple[int | None, int | None]], tag: int, sequence: int,
-    ) -> None:
-        # Post all sends and receives before waiting, including across peers in
-        # cyclic rounds and multi-rank reductions. Completion precedes reusing
-        # these persistent control tensors.
-        # PyTorch's Gloo stubs omit its send/recv and collective bindings.
-        self._send_signal[0] = sequence
-        receivers = 0
-        try:
-            for send, receive in peers:
-                if send is not None:
-                    self._pending.append(self.group.send([self._send_signal], send, tag))  # type: ignore[attr-defined]
-                if receive is not None:
-                    slot = self._recv_slots[receivers]
-                    receivers += 1
-                    self._pending.append(self.group.recv([slot], receive, tag))  # type: ignore[attr-defined]
-            for work in reversed(self._pending):
-                work.wait(self.timeout)
-        finally:
-            self._pending.clear()
-        if receivers and any(self._recv_signals[i].item() != sequence for i in range(receivers)):
-            raise RuntimeError("shared relay control sequence mismatch")
+        self._control.signal(peers, tag, sequence, self.timeout)
 
     def _transfer_single(
         self, source: torch.Tensor | None, destination: torch.Tensor | None,
@@ -447,11 +449,10 @@ class SharedRelay:
                     if peer != root:
                         self._transfer_single(_bytes(sources[peer]), None, [(peer, None)], None, asynchronous)
                 return
-            if self._control is not None:
-                chunk_bytes = _shared_chunk_bytes(destination.numel(), self.capacity)
-                count = max(1, (destination.numel() + chunk_bytes - 1) // chunk_bytes)
-                step = self.rank - int(self.rank > root)
-                self._expected_ready[root] += step * count
+            chunk_bytes = _shared_chunk_bytes(destination.numel(), self.capacity)
+            count = max(1, (destination.numel() + chunk_bytes - 1) // chunk_bytes)
+            step = self.rank - int(self.rank > root)
+            self._control.skip_ready(root, step * count)
             self._transfer_single(None, destination, [(None, root)], root, asynchronous)
 
     def allgather(
@@ -537,25 +538,13 @@ class SharedRelay:
             nbytes = tensors[0].nbytes
             kind = COPY_DTYPES.index(tensors[0].dtype)
             meta_detail = detail
-        control = self._control
-        if control is None:
-            metadata = torch.tensor([op_index, nbytes, kind, meta_detail], dtype=torch.int64)
-            gathered = [torch.empty_like(metadata) for _ in range(self.world_size)]
-            self.group.allgather([gathered], [metadata]).wait(self.timeout)  # type: ignore[attr-defined]
-            if any(not torch.equal(metadata, other) for other in gathered):
-                raise ValueError(
-                    "shared relay collective operation, payload bytes and root/dtype must match across ranks",
-                )
-            return
         try:
-            self._expected_ready, self._expected_free = control.agree(
-                op_index, nbytes, kind, meta_detail, self.timeout,
-            )
+            self._control.agree(op_index, nbytes, kind, meta_detail, self.timeout)
         except ValueError:
             raise
         except BaseException:
             self.broken = True
-            control.abort()
+            self._control.abort()
             raise
 
     @contextmanager
@@ -578,8 +567,7 @@ class SharedRelay:
                 # A failed exchange can leave unread ready/free signals. Do
                 # not reuse its slots or control state in a later operation.
                 self.broken = True
-                if self._control is not None:
-                    self._control.abort()
+                self._control.abort()
                 raise
             finally:
                 # Pin leases and source/destination storage must outlive DMA,
