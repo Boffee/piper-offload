@@ -165,6 +165,29 @@ def _check_reduction(mesh, rank, device, dtype):
     _check_reduce_scatter_ops(mesh, rank, device, dtype)
 
 
+def _check_alltoall_copy_ops(rank, device, dtype):
+    single_in = torch.arange(12, dtype=torch.float32).reshape(4, 3).to(dtype=dtype, device=device) + rank * 10
+    other_in = single_in - rank * 10 + (1 - rank) * 10
+    single_out = torch.empty_like(single_in)
+    dist.all_to_all_single(single_out, single_in)
+    exp_equal = torch.cat([single_in[:2], other_in[:2]] if rank == 0 else [other_in[2:], single_in[2:]], dim=0)
+    torch.testing.assert_close(single_out, exp_equal, rtol=0, atol=0)
+
+    in_splits = [1, 3] if rank == 0 else [2, 2]
+    out_splits = [1, 2] if rank == 0 else [3, 2]
+    unequal_out = torch.empty((sum(out_splits), 3), dtype=dtype, device=device)
+    dist.group.WORLD.alltoall_base(unequal_out, single_in, out_splits, in_splits).wait()
+    exp_unequal = torch.cat([single_in[:1], other_in[:2]] if rank == 0 else [other_in[1:4], single_in[2:4]], dim=0)
+    torch.testing.assert_close(unequal_out, exp_unequal, rtol=0, atol=0)
+    fn_out = funcol.wait_tensor(funcol.all_to_all_single(single_in, out_splits, in_splits, dist.group.WORLD))
+    torch.testing.assert_close(fn_out, exp_unequal, rtol=0, atol=0)
+
+    global_grid = torch.arange(24, dtype=torch.float32).reshape(4, 6).to(dtype=dtype, device=device)
+    shard0 = global_grid.chunk(2, dim=0)[rank].contiguous()
+    shard1 = torch.ops._dtensor.shard_dim_alltoall(shard0, 0, 1, dist.group.WORLD.group_name)
+    torch.testing.assert_close(shard1, global_grid.chunk(2, dim=1)[rank], rtol=0, atol=0)
+
+
 def _check_copy_collectives(rank, device, dtype):
     for shape in ((), (0,), (2, 3)):
         payload = torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape).to(dtype=dtype, device=device)
@@ -199,6 +222,17 @@ def _check_copy_collectives(rank, device, dtype):
         dist.all_gather_into_tensor(stacked, flat)
         torch.testing.assert_close(stacked.reshape(-1), expected, rtol=0, atol=0)
         torch.testing.assert_close(local, payload + rank, rtol=0, atol=0)
+
+        a2a_in = [payload + (rank * 2 + peer) for peer in range(2)]
+        a2a_out = [torch.empty_like(payload) for _ in range(2)]
+        a2a_work = dist.all_to_all(a2a_out, a2a_in, async_op=True)
+        assert a2a_work.wait(WAIT)
+        assert a2a_work.is_completed()
+        assert len(a2a_work.get_future().wait()) == 2
+        for peer, tensor in enumerate(a2a_out):
+            torch.testing.assert_close(tensor, payload + (peer * 2 + rank), rtol=0, atol=0)
+
+    _check_alltoall_copy_ops(rank, device, dtype)
 
 
 def _check_scatter_aliases(rank, device):
@@ -298,6 +332,13 @@ def _check_payload_bits(rank, device, dtype):
     output = torch.empty(local.numel() * 2, dtype=dtype, device=device)
     dist.all_gather_single(output, local)
     assert torch.equal(output.view(torch.int16).cpu(), torch.cat([bits, bits.roll(1)]))
+    a2a_in = torch.cat([bits, bits.roll(1) + 2]).view(dtype).to(device)
+    a2a_out = torch.empty_like(a2a_in)
+    dist.all_to_all_single(a2a_out, a2a_in)
+    exp_a2a = (
+        torch.cat([bits, bits]) if rank == 0 else torch.cat([bits.roll(1) + 2, bits.roll(1) + 2])
+    )
+    assert torch.equal(a2a_out.view(torch.int16).cpu(), exp_a2a)
 
 
 def _check_mlp(mesh: DeviceMesh, rank: int, device: torch.device, dtype: torch.dtype) -> None:
@@ -351,20 +392,31 @@ def _check_streams(device: torch.device) -> None:
         rs_in = torch.arange(2 * 1024 * 1024, device=device, dtype=torch.float32).reshape(2, -1).mul_(0.25)
         rs_out = torch.empty(1024 * 1024, device=device, dtype=torch.float32)
         rs_work = dist.reduce_scatter_single(rs_out, rs_in, async_op=True)
+        a2a_in = torch.arange(2 * 1024, device=device, dtype=torch.float32).reshape(2, -1) + dist.get_rank() * 10000
+        a2a_out = torch.empty_like(a2a_in)
+        a2a_work = dist.all_to_all_single(a2a_out, a2a_in, async_op=True)
     # Each collective starts after the producer's earlier work, and its
     # outputs are ready for any stream once wait() returns.
-    for pending in (work, gather_work, broadcast_work, scatter_work, rs_work):
+    for pending in (work, gather_work, broadcast_work, scatter_work, rs_work, a2a_work):
         assert pending.wait(WAIT)
         assert pending.is_completed()
     assert producer.query()
     with torch.cuda.stream(consumer):
         result = x + 1
         rs_checked = rs_out + 1
+        a2a_checked = a2a_out + 1
     consumer.synchronize()
     expected = torch.arange(x.numel(), dtype=torch.float32) * 0.5 + 1
     rs_expected = rs_in[dist.get_rank()].cpu().mul(2).add(1)
+    rank = dist.get_rank()
+    a2a_expected = (
+        torch.arange(1024, dtype=torch.float32).repeat(2, 1)
+        + rank * 1024
+        + torch.tensor([[0.0], [10000.0]])
+    )
     torch.testing.assert_close(result.cpu(), expected)
     torch.testing.assert_close(rs_checked.cpu(), rs_expected)
+    torch.testing.assert_close(a2a_checked.cpu(), a2a_expected + 1)
     torch.testing.assert_close(gathered.cpu(), torch.cat([expected - 1, expected - 1]))
     torch.testing.assert_close(broadcast, torch.ones_like(broadcast))
     torch.testing.assert_close(scattered, torch.full_like(scattered, dist.get_rank() + 1))
@@ -769,11 +821,10 @@ class _MeasuredTransport:
         self.inner = inner
         self.staging_bytes = staging_bytes
         self.accelerator = accelerator
-        ops = (
-            ("allreduce", "allgather", "broadcast", "scatter", "reduce_scatter", "send", "recv")
-            if world_size == 2
-            else ("allreduce", "allgather", "broadcast", "scatter", "reduce_scatter", "reduce")
-        )
+        self.world_size = world_size
+        ops = ("allreduce", "allgather", "broadcast", "scatter", "reduce_scatter", "send", "recv")
+        if world_size != 2:
+            ops = (*ops, "reduce")
         self.calls = dict.fromkeys(ops, 0)
         self.wire_bytes = dict.fromkeys(ops, 0)
         self.storage_pointers = set()
@@ -782,6 +833,7 @@ class _MeasuredTransport:
         def call(*args):
             self.calls[name] += 1
             pending = list(args)
+            meta_bytes = (2 * self.world_size + 1) * 8
             while pending:
                 item = pending.pop()
                 if isinstance(item, list):
@@ -790,7 +842,8 @@ class _MeasuredTransport:
                     assert item.device.type == "cpu"
                     assert item.nbytes <= self.staging_bytes
                     self.wire_bytes[name] += item.nbytes
-                    if self.accelerator:
+                    is_a2a_meta = name == "allgather" and item.dtype == torch.int64 and item.nbytes == meta_bytes
+                    if self.accelerator and not is_a2a_meta:
                         storage = item.untyped_storage()
                         assert storage.nbytes() == self.staging_bytes
                         self.storage_pointers.add(storage.data_ptr())
@@ -868,6 +921,23 @@ def _check_chunked_subgroup(rank):
         assert subgroup._staging_buffer is None
 
 
+def _check_chunked_alltoall(rank, world_size, device, dtype, payload):
+    a2a_sources = [(payload + rank * 10 + peer).to(dtype) for peer in range(world_size)]
+    a2a_outputs = [torch.empty_like(a2a_sources[0]) for _ in range(world_size)]
+    a2a_outputs[rank] = a2a_sources[rank]
+    dist.all_to_all(a2a_outputs, a2a_sources)
+    for peer in range(world_size):
+        torch.testing.assert_close(a2a_outputs[peer], (payload + peer * 10 + rank).to(dtype), rtol=0, atol=0)
+    with pytest.raises(ValueError, match="exact local slice"):
+        dist.all_to_all_single(payload[:world_size], payload[:world_size])
+    if rank == 0:
+        a2a_backing = torch.arange(6, dtype=dtype, device=device)
+        with pytest.raises(ValueError, match="exact local slice"):
+            dist.all_to_all(
+                [a2a_backing[1:5], *a2a_outputs[1:]], [a2a_backing[2:6], *a2a_sources[1:]],
+            )
+
+
 def _check_chunked_values(rank, world_size, device, dtype):
     # Odd length, a nonzero storage offset, and a payload larger than the pool.
     payload = (torch.arange(259, device=device, dtype=torch.float32) / 32).to(dtype)[1:-1]
@@ -920,6 +990,7 @@ def _check_chunked_values(rank, world_size, device, dtype):
     gathered = torch.empty(local.numel() * world_size, device=device, dtype=torch.float16)
     dist.all_gather_single(gathered, local)
     assert torch.equal(gathered.view(torch.int16).cpu(), torch.cat([bits.roll(r) for r in range(world_size)]))
+    _check_chunked_alltoall(rank, world_size, device, dtype, payload)
 
 
 def test_chunked_relay_on_three_cpu_ranks(tmp_path):
@@ -3212,6 +3283,8 @@ def _make_fake_gloo_copy_env(group):
         def __init__(self, data: torch.Tensor) -> None:
             with torch.inference_mode():
                 self.data = data.clone()
+            self.dtype = self.data.dtype
+            self.nbytes = self.data.nbytes
 
         def data_ptr(self) -> int:
             return self.data.data_ptr()
@@ -3240,6 +3313,21 @@ def _make_fake_gloo_copy_env(group):
         def allgather(self, outputs: list[list[torch.Tensor]], inputs: list[torch.Tensor], options: object) -> StubWork:
             del options
             gloo_calls.append(("allgather", outputs[0], inputs))
+            if inputs and inputs[0].dtype == torch.int64 and len(outputs[0]) == 2:
+                meta = inputs[0].tolist()
+                # Transpose rank 0's (send, recv) entries into rank 1's row for asymmetric exchange tests.
+                outputs[0][0].copy_(inputs[0])
+                outputs[0][1].copy_(torch.tensor([meta[3], meta[2], meta[1], meta[0], meta[4]], dtype=torch.int64))
+            return StubWork()
+
+        def send(self, tensors: list[torch.Tensor], peer: int, tag: int) -> StubWork:
+            del peer, tag
+            gloo_calls.append(("send", [], tensors))
+            return StubWork()
+
+        def recv(self, tensors: list[torch.Tensor], peer: int, tag: int) -> StubWork:
+            del peer, tag
+            gloo_calls.append(("recv", tensors, []))
             return StubWork()
 
     def gen_chunks(inputs: list[torch.Tensor], outputs: list[torch.Tensor], *, slots: int | None = None):
@@ -3359,3 +3447,341 @@ def test_gloo_exchange_pair_drains_recv_on_send_failure(single_rank_group):
         with pytest.raises(RuntimeError, match="send post failed"):
             group._exchange_pair(buf, buf, timedelta(seconds=1))
         assert post_log == ["recv"]
+
+
+def _check_single_rank_alltoall_valid(group) -> None:
+    alias = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    single_work = group.all_to_all_single(alias, alias, None, None)
+    assert single_work.wait()
+    assert single_work.get_future().wait() == [alias]
+    torch.testing.assert_close(alias, torch.arange(6, dtype=torch.float32).reshape(2, 3))
+
+    empty_rows = torch.empty(0, 4, dtype=torch.int64)
+    empty_out = torch.empty(0, 4, dtype=torch.int64)
+    dist.all_to_all_single(empty_out, empty_rows)
+
+    real = torch.arange(4, dtype=torch.float32)
+    imag = torch.arange(4, 8, dtype=torch.float32)
+    for dtype in (torch.float64, torch.bool, torch.uint8, torch.complex64, torch.complex128):
+        if dtype is torch.bool:
+            src_dt = torch.tensor([[True, False], [False, True]])
+        elif dtype in (torch.complex64, torch.complex128):
+            src_dt = torch.complex(real, imag).to(dtype)
+        else:
+            src_dt = torch.arange(4, dtype=dtype)
+        dst_dt = torch.empty_like(src_dt)
+        list_work = group.alltoall([dst_dt], [src_dt])
+        fut = list_work.get_future().wait()
+        assert len(fut) == 1 and fut[0] is dst_dt
+        assert torch.equal(dst_dt, src_dt)
+
+
+def test_reject_unsupported_and_invalid_alltoall(single_rank_group):
+    group = single_rank_group
+    out = torch.empty(2, 2)
+    src = torch.ones(2, 2)
+
+    class TensorSubclass(torch.Tensor):
+        pass
+
+    with pytest.raises(TypeError, match="plain local tensor"):
+        group.alltoall([out], [TensorSubclass(src)])
+    with pytest.raises(NotImplementedError, match="contiguous strided"):
+        dist.all_to_all_single(out, torch.ones(4, 2)[::2])
+    with pytest.raises(NotImplementedError, match="does not support dtype"):
+        dist.all_to_all_single(
+            torch.empty(2, dtype=torch.bfloat16).view(torch.uint16),
+            torch.ones(2, dtype=torch.int16).view(torch.uint16),
+        )
+    with pytest.raises(ValueError, match="one input and one output tensor per rank"):
+        group.alltoall([out, out], [src])
+    with pytest.raises(ValueError, match="one dtype across"):
+        group.alltoall([out], [src.to(torch.float16)])
+    with pytest.raises(ValueError, match="input and output dtypes must match"):
+        group.all_to_all_single(torch.empty(4, dtype=torch.float16), torch.ones(4, dtype=torch.float32))
+    with pytest.raises(ValueError, match="at least one dimension"):
+        dist.all_to_all_single(torch.empty(()), torch.tensor(1.0))
+    with pytest.raises(ValueError, match="trailing dimensions must match"):
+        dist.all_to_all_single(torch.empty(2, 3), torch.ones(2, 4))
+    with pytest.raises(ValueError, match="non-negative integer split sizes"):
+        dist.all_to_all_single(torch.empty(2), torch.ones(2), [True], [2])  # type: ignore[list-item]
+    with pytest.raises(ValueError, match="non-negative integer split sizes"):
+        dist.all_to_all_single(torch.empty(2), torch.ones(2), [-1], [2])
+    with pytest.raises(ValueError, match="must sum to dim 0"):
+        dist.all_to_all_single(torch.empty(3), torch.ones(3), [2], [3])
+    with pytest.raises(ValueError, match="own-rank input and output byte sizes must match"):
+        group.alltoall([torch.empty(2)], [torch.ones(3)])
+
+    backing = torch.arange(6, dtype=torch.float32)
+    with pytest.raises(ValueError, match="exact local slice"):
+        group.alltoall([backing[1:5]], [backing[:4]])
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(group, "size", lambda: 2)
+        with pytest.raises(ValueError, match="divisible by world size"):
+            dist.all_to_all_single(torch.empty(3, 2), torch.ones(3, 2))
+        with pytest.raises(ValueError, match="outputs must not overlap"):
+            group.alltoall([backing[:2], backing[1:3]], [torch.ones(2), torch.ones(2)])
+
+    _check_single_rank_alltoall_valid(group)
+
+
+def _check_alltoall_mismatch_and_shard_dim(rank: int, subgroup) -> None:
+    sentinel = torch.full((4,), -9.0)
+    bad_outputs = [sentinel.clone() for _ in range(4)]
+    bad_inputs = [
+        torch.ones(5 if (rank == 0 and dst == 1) else 4) for dst in range(4)
+    ]
+    with pytest.raises(ValueError, match="split sizes must match across ranks"):
+        subgroup.alltoall(bad_outputs, bad_inputs).wait()
+    for got in bad_outputs:
+        torch.testing.assert_close(got, sentinel, rtol=0, atol=0)
+    if subgroup._shared is not None:
+        assert not subgroup._shared.broken
+
+    bad_dtype_out = torch.empty(4, dtype=torch.float16 if rank == 1 else torch.float32)
+    bad_dtype_in = torch.ones(4, dtype=bad_dtype_out.dtype)
+    with pytest.raises(ValueError, match="must match"):
+        dist.all_to_all_single(bad_dtype_out, bad_dtype_in, group=subgroup)
+    if subgroup._shared is not None:
+        assert not subgroup._shared.broken
+
+    # Group remains healthy immediately after both error cases (with GlooGuard still active on shared).
+    recovery_in = torch.arange(4, dtype=torch.int32) + rank * 10
+    recovery_out = torch.empty_like(recovery_in)
+    dist.all_to_all_single(recovery_out, recovery_in, group=subgroup)
+    assert torch.equal(recovery_out, torch.arange(4, dtype=torch.int32) * 10 + rank)
+
+    # Ulysses-style Shard(0) -> Shard(1) via shard_dim_alltoall across 4 ranks.
+    global_grid = torch.arange(8 * 12, dtype=torch.float16).reshape(8, 12)
+    shard0 = global_grid.chunk(4, dim=0)[rank].contiguous()
+    shard1 = torch.ops._dtensor.shard_dim_alltoall(shard0, 0, 1, subgroup.group_name)
+    torch.testing.assert_close(shard1, global_grid.chunk(4, dim=1)[rank], rtol=0, atol=0)
+
+
+def _check_alltoall_four_rank_group(rank: int, transport: str, force_gloo_control: bool) -> None:
+    from piper_offload import _relay_shared
+
+    staging = 384 if transport == "shared" and force_gloo_control else (
+        192 * 1024 if transport == "shared" else 512
+    )
+    opts = RelayOptions(transport=transport, staging_bytes=staging, pipeline_buffers=2 if transport == "gloo" else 1)
+    with pytest.MonkeyPatch.context() as patch:
+        if force_gloo_control:
+            patch.setattr(_relay_shared, "shared_control_supported", lambda: False)
+        subgroup = dist.new_group(ranks=[0, 1, 2, 3], pg_options=opts)
+    try:
+        rows_matrix = [
+            [2, 0, 5, 1],
+            [0, 3, 2, 0],
+            [4, 1, 0, 7],
+            [1, 6, 3, 2],
+        ]
+        width = 3
+        in_splits = rows_matrix[rank]
+        out_splits = [rows_matrix[src][rank] for src in range(4)]
+
+        def make_chunk(src: int, dst: int) -> torch.Tensor:
+            rows = rows_matrix[src][dst]
+            base = torch.arange(rows * width, dtype=torch.float32).reshape(rows, width)
+            return (base + src * 100 + dst * 10).to(torch.bfloat16)
+
+        src_tensor = torch.cat([make_chunk(rank, dst) for dst in range(4)], dim=0)
+        expected_out = torch.cat([make_chunk(src, rank) for src in range(4)], dim=0)
+
+        if transport == "shared":
+            subgroup._cpu_group = _GlooGuard(
+                subgroup._cpu_group, allow_allreduce=False, allow_control=force_gloo_control,
+            )
+        out_tensor = torch.empty((sum(out_splits), width), dtype=torch.bfloat16)
+        dist.all_to_all_single(out_tensor, src_tensor, out_splits, in_splits, group=subgroup)
+        torch.testing.assert_close(out_tensor, expected_out, rtol=0, atol=0)
+
+        # Multi-chunk transfer exceeding serial (32B) and Gloo (128B) staging with sparse/zero pairs.
+        large_matrix = [
+            [0, 65, 0, 17],
+            [33, 0, 71, 0],
+            [0, 0, 0, 99],
+            [45, 19, 0, 0],
+        ]
+        l_in_splits = large_matrix[rank]
+        l_out_splits = [large_matrix[src][rank] for src in range(4)]
+        l_src_list = [
+            torch.arange(rows, dtype=torch.int64) + (rank * 1000 + dst * 100) for dst, rows in enumerate(l_in_splits)
+        ]
+        l_out_list = [torch.empty(rows, dtype=torch.int64) for rows in l_out_splits]
+        subgroup.alltoall(l_out_list, l_src_list).wait()
+        for src_r, got in enumerate(l_out_list):
+            exp = torch.arange(l_out_splits[src_r], dtype=torch.int64) + (src_r * 1000 + rank * 100)
+            assert torch.equal(got, exp)
+
+        _check_alltoall_mismatch_and_shard_dim(rank, subgroup)
+    finally:
+        dist.destroy_process_group(subgroup)
+
+
+def _check_shared_alltoall_path(rank: int, staging_bytes: int, expect_serial: bool) -> None:
+    from piper_offload import _relay_shared
+
+    sub = dist.new_group(
+        ranks=[0, 1, 2, 3], pg_options=RelayOptions(transport="shared", staging_bytes=staging_bytes),
+    )
+    try:
+        shared = sub._shared
+        assert (_relay_shared._reduce_scatter_sub_cap(shared.capacity, 4) == 0) is expect_serial
+        serial_calls = 0
+        packed_calls = 0
+        orig_serial = shared._alltoall_serial
+        orig_packed = shared._alltoall_packed
+
+        def tracked_serial(*args):
+            nonlocal serial_calls
+            serial_calls += 1
+            orig_serial(*args)
+
+        def tracked_packed(*args):
+            nonlocal packed_calls
+            packed_calls += 1
+            orig_packed(*args)
+
+        srcs = [torch.full((25,), float(rank * 10 + dst + 1)) for dst in range(4)]
+        outs = [torch.empty_like(srcs[0]) for _ in range(4)]
+        outs[rank] = srcs[rank]
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(shared, "_alltoall_serial", tracked_serial)
+            patch.setattr(shared, "_alltoall_packed", tracked_packed)
+            sub.alltoall(outs, srcs).wait()
+        for peer in range(4):
+            torch.testing.assert_close(outs[peer], torch.full((25,), float(peer * 10 + rank + 1)))
+        assert serial_calls == (1 if expect_serial else 0)
+        assert packed_calls == (0 if expect_serial else 1)
+    finally:
+        dist.destroy_process_group(sub)
+
+
+def _run_alltoall_four_rank_worker(rank: int, path: str) -> None:
+    torch.set_num_threads(1)
+    register_relay_backend()
+    dist.init_process_group(
+        "piper_relay", store=dist.FileStore(path, 4), rank=rank, world_size=4,
+        timeout=timedelta(seconds=20), pg_options=RelayOptions(transport="gloo", staging_bytes=4096),
+    )
+    try:
+        for transport, force_gloo_control in (("gloo", False), ("shared", False), ("shared", True)):
+            _check_alltoall_four_rank_group(rank, transport, force_gloo_control)
+        for staging_bytes, expect_serial in ((384, True), (192 * 1024, False)):
+            _check_shared_alltoall_path(rank, staging_bytes, expect_serial)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_shared_and_gloo_alltoall_unequal_mismatch_and_serial(tmp_path):
+    mp.spawn(_run_alltoall_four_rank_worker, args=(str(tmp_path / "a2a-4"),), nprocs=4)
+
+
+def test_alltoall_gloo_cuda_mock_inference_and_sync(single_rank_group):
+    group = single_rank_group
+    fake_gloo, current, fake_cuda_tensor, gen_chunks, chunk_calls, gloo_calls, state = _make_fake_gloo_copy_env(group)
+    opts = communication.AllToAllOptions()
+    manager = PinManager(0)
+    with pytest.MonkeyPatch.context() as patch, torch.no_grad():
+        patch.setattr(communication, "host_pin_manager", manager)
+        patch.setattr(group, "_cpu_group", fake_gloo)
+        patch.setattr(group, "_copy_chunks", gen_chunks)
+        patch.setattr(group, "_staging_bytes", 512)
+        patch.setattr(torch.cuda, "current_stream", lambda _device: current)
+
+        w1_src = fake_cuda_tensor(torch.arange(4, dtype=torch.float32) + 3.0)
+        w1_out = fake_cuda_tensor(torch.zeros(4))
+        group._alltoall_gloo([w1_out], [w1_src], opts)  # type: ignore[arg-type]
+        assert current.syncs == 1
+        assert torch.equal(w1_out.data, w1_src.data)
+        group._alltoall_gloo([w1_src], [w1_src], opts)  # type: ignore[arg-type]
+        assert current.syncs == 1
+
+        patch.setattr(group, "size", lambda: 2)
+        patch.setattr(group, "rank", lambda: 0)
+        srcs = [fake_cuda_tensor(torch.full((4,), 7.0)), fake_cuda_tensor(torch.full((4,), 8.0))]
+        outs = [fake_cuda_tensor(torch.zeros(4)), fake_cuda_tensor(torch.zeros(4))]
+        group._alltoall_gloo(outs, srcs, opts)  # type: ignore[arg-type]
+        assert current.syncs == 2 and chunk_calls[-1] == (1, 1, 2)
+        assert torch.equal(outs[0].data, srcs[0].data)
+        assert gloo_calls[-1][0] == "send" and gloo_calls[-2][0] == "recv"
+
+        # Multi-chunk unequal send/recv (160B vs 40B, slot capacity 128B) with an exact local alias:
+        # exercises both asymmetric chunk counts and _exchange_unequal_gloo's unconditional CUDA sync.
+        alias_t = fake_cuda_tensor(torch.full((4,), 9.0))
+        unequal_srcs = [alias_t, fake_cuda_tensor(torch.arange(40, dtype=torch.float32))]
+        unequal_outs = [alias_t, fake_cuda_tensor(torch.zeros(10, dtype=torch.float32))]
+        calls_before = len(gloo_calls)
+        group._alltoall_gloo(unequal_outs, unequal_srcs, opts)  # type: ignore[arg-type]
+        new_calls = [name for name, _, _ in gloo_calls[calls_before:]]
+        assert new_calls == ["allgather", "recv", "send", "send"]
+        assert current.syncs == 3 and group._staging_buffer is not None
+        group._staging_buffer = None
+
+        state["fail_on_close"] = True
+        with pytest.raises(RuntimeError, match="injected chunk teardown failure"):
+            group._alltoall_gloo([fake_cuda_tensor(torch.zeros(4)), outs[1]], srcs, opts)  # type: ignore[arg-type]
+        assert current.syncs == 4
+
+
+def test_alltoall_shared_cuda_mock_stream_syncs(tmp_path):
+    (
+        shared, control, manager, download_stream, upload_stream,
+        current_s, stream_entries, track_stream, dummy_event, shared_fake_cuda,
+    ) = _make_fake_collective_relay(tmp_path)
+    stream_iter = iter((download_stream, upload_stream))
+    with pytest.MonkeyPatch.context() as patch, torch.no_grad():
+        patch.setattr(torch.cuda, "Stream", lambda device: next(stream_iter))
+        patch.setattr(torch.cuda, "Event", dummy_event)
+        patch.setattr(torch.cuda, "current_stream", lambda _device: current_s)
+        patch.setattr(torch.cuda, "stream", track_stream)
+
+        a2a_src = torch.arange(8, dtype=torch.float32) + 2.0
+        a2a_out = torch.zeros(8, dtype=torch.float32)
+        shared.alltoall([shared_fake_cuda(a2a_out)], [shared_fake_cuda(a2a_src)], manager)
+        assert (download_stream.sync_count, upload_stream.sync_count, current_s.sync_count) == (0, 1, 0)
+        assert stream_entries == ["upload"]
+        assert torch.equal(a2a_out, a2a_src)
+
+        # W=1 exact alias and 0-element non-alias skip _local_copy and sync nothing.
+        download_stream.sync_count = upload_stream.sync_count = current_s.sync_count = 0
+        shared.alltoall([shared_fake_cuda(a2a_src)], [shared_fake_cuda(a2a_src)], manager)
+        shared.alltoall([shared_fake_cuda(torch.empty(0))], [shared_fake_cuda(torch.empty(0))], manager)
+        assert (download_stream.sync_count, upload_stream.sync_count, current_s.sync_count) == (0, 0, 0)
+
+        # W=2 max_pair_bytes == 0 with non-alias local copy synchronizes only upload.
+        shared.world_size = 2
+        shared._peers = ((1, 1),)
+        shared._slot(1, 0, 32).zero_()
+        w2_local_out = torch.zeros(8, dtype=torch.float32)
+        shared.alltoall(
+            [shared_fake_cuda(w2_local_out), shared_fake_cuda(torch.empty(0))],
+            [shared_fake_cuda(a2a_src), shared_fake_cuda(torch.empty(0))],
+            manager,
+        )
+        assert (download_stream.sync_count, upload_stream.sync_count, current_s.sync_count) == (0, 1, 0)
+        assert torch.equal(w2_local_out, a2a_src)
+        shared.world_size = 1
+        shared._peers = ()
+
+        download_stream.sync_count = upload_stream.sync_count = current_s.sync_count = 0
+        manager.pageable_bytes = 64
+        pg_out = torch.zeros(8, dtype=torch.float32)
+        shared.alltoall([shared_fake_cuda(pg_out)], [shared_fake_cuda(a2a_src)], manager)
+        assert (download_stream.sync_count, upload_stream.sync_count, current_s.sync_count) == (0, 0, 1)
+        assert torch.equal(pg_out, a2a_src)
+
+        download_stream.sync_count = upload_stream.sync_count = current_s.sync_count = 0
+        shared.world_size = 2
+        shared._peers = ((1, 1),)
+        control.fail_on_signal = True
+        with pytest.raises(RuntimeError, match="injected signal failure"):
+            shared.alltoall(
+                [shared_fake_cuda(torch.zeros(4)), shared_fake_cuda(torch.zeros(4))],
+                [shared_fake_cuda(torch.ones(4)), shared_fake_cuda(torch.ones(4))],
+                manager,
+            )
+        assert (download_stream.sync_count, upload_stream.sync_count, current_s.sync_count) == (0, 0, 0)
+        assert shared.broken

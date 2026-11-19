@@ -36,22 +36,23 @@ extension is required. Gloo transfers default to two pipeline buffers; shared
 transfers use three outgoing slots per rank.
 
 SUM all-reduce and reduce-scatter support FP32, FP16 and BF16, accumulating
-reduced precision in FP32. Broadcast, scatter and equal-size all-gather also
-preserve FP64, bool, uint8, signed integers, and complex64/complex128.
-All-reduce, reduce-scatter and all-gather include coalesced variants; all-gather
-and reduce-scatter support tensor-list and single-buffer forms. Inputs and
-outputs must be contiguous plain tensors on one local device. Outputs must not
-overlap, except that an all-gather input may occupy its exact own-rank output
-slice, a reduce-scatter output may occupy its exact own-rank input slice, and a
-scatter root may receive into its exact source slice. Coalesced outputs must not
-overwrite other inputs.
+reduced precision in FP32. Broadcast, scatter, equal-size all-gather, and
+all-to-all (equal and unequal splits) also preserve FP64, bool, uint8, signed
+integers, and complex64/complex128. All-reduce, reduce-scatter, and all-gather
+coalesced variants; all-gather, reduce-scatter, and all-to-all support
+tensor-list and single-buffer forms. Inputs and outputs must be contiguous plain
+tensors on one local device. Outputs must not overlap, except that an
+all-gather input may occupy its exact own-rank output slice, a reduce-scatter
+output may occupy its exact own-rank input slice, a scatter root may receive
+into its exact source slice, and an all-to-all output may occupy its exact
+own-rank input slice. Coalesced outputs must not overwrite other inputs.
 
 ``RelayOptions`` describes staging and pin budgets. If the staging allocation
 exceeds the pin budget or registration reports invalid-value, copies run
-synchronously through pageable storage. All-to-all, non-SUM reductions,
-accelerator point-to-point transfers, and CUDA graph capture are unsupported.
-Direct C++ functional all-gather ``out`` calls bypass the Python override and
-are unsupported for accelerator tensors.
+synchronously through pageable storage. Non-SUM reductions, accelerator
+point-to-point transfers, and CUDA graph capture are unsupported. Direct C++
+functional all-gather ``out`` calls bypass the Python override and are
+unsupported for accelerator tensors.
 
 After a shared-exchange failure, outputs may be partial; destroy and recreate
 the process group. Windows GPU, ROCm, and distinct-GPU behavior need validation
@@ -70,6 +71,7 @@ import torch
 import torch.distributed as dist
 from torch._C._distributed_c10d import (
     AllgatherOptions,
+    AllToAllOptions,
     ReduceOptions,
     ReduceScatterOptions,
     _DistributedBackendOptions,
@@ -298,15 +300,22 @@ class _RelayProcessGroup(dist.ProcessGroup):
             return size // (16 * slots) * 16
         return self._staging_bytes // (16 * slots * self._pipeline_buffers) * 16
 
-    def _exchange_pair(self, send_buf: torch.Tensor, recv_buf: torch.Tensor, timeout: timedelta) -> None:
-        peer = 1 - self.rank()
+    def _exchange_peers(
+        self,
+        send_peer: int,
+        send_buf: torch.Tensor | None,
+        recv_peer: int,
+        recv_buf: torch.Tensor | None,
+        timeout: timedelta,
+    ) -> None:
         # Post receive before send and wait in order so both ranks make concurrent progress.
-        works: list[dist.Work] = [
-            self._cpu_group.recv([recv_buf], peer, _GLOO_EXCHANGE_TAG),  # type: ignore[attr-defined]
-        ]
+        works: list[dist.Work] = []
+        if recv_buf is not None:
+            works.append(self._cpu_group.recv([recv_buf], recv_peer, _GLOO_EXCHANGE_TAG))  # type: ignore[attr-defined]
         first_error: BaseException | None = None
         try:
-            works.insert(0, self._cpu_group.send([send_buf], peer, _GLOO_EXCHANGE_TAG))  # type: ignore[attr-defined]
+            if send_buf is not None:
+                works.insert(0, self._cpu_group.send([send_buf], send_peer, _GLOO_EXCHANGE_TAG))  # type: ignore[attr-defined]
         except BaseException as error:
             first_error = error
         finally:
@@ -321,6 +330,10 @@ class _RelayProcessGroup(dist.ProcessGroup):
                         first_error = error
         if first_error is not None:
             raise first_error
+
+    def _exchange_pair(self, send_buf: torch.Tensor, recv_buf: torch.Tensor, timeout: timedelta) -> None:
+        peer = 1 - self.rank()
+        self._exchange_peers(peer, send_buf, peer, recv_buf, timeout)
 
     def barrier(self, opts: dist.BarrierOptions | None = None) -> dist.Work:  # type: ignore[override]
         options = opts if opts is not None else dist.BarrierOptions()
@@ -718,6 +731,180 @@ class _RelayProcessGroup(dist.ProcessGroup):
             for chunk in chunks:
                 self._cpu_group.allgather([chunk.outputs], chunk.inputs, options).wait()  # type: ignore[attr-defined]
 
+    def _validate_alltoall_aliases(self, outputs: Sequence[torch.Tensor], sources: Sequence[torch.Tensor]) -> None:
+        rank = self.rank()
+        if outputs[rank].nbytes != sources[rank].nbytes:
+            raise ValueError("piper_relay all-to-all own-rank input and output byte sizes must match")
+        for out_rank, output in enumerate(outputs):
+            for in_rank, source in enumerate(sources):
+                if _overlap(output, source) and not (
+                    out_rank == in_rank == rank
+                    and output.data_ptr() == source.data_ptr()
+                    and output.nbytes == source.nbytes
+                ):
+                    raise ValueError(
+                        "piper_relay all-to-all output may overlap inputs only at its exact local slice",
+                    )
+
+    def alltoall(  # type: ignore[override]
+        self,
+        output_tensors: list[torch.Tensor],
+        input_tensors: list[torch.Tensor],
+        opts: AllToAllOptions | None = None,
+    ) -> dist.Work:
+        options = opts if opts is not None else AllToAllOptions()
+        outputs = list(output_tensors)
+        sources = list(input_tensors)
+        if len(outputs) != self.size() or len(sources) != self.size():
+            raise ValueError("piper_relay all-to-all requires one input and one output tensor per rank")
+        _validate_tensors([*outputs, *sources])
+        dtype = outputs[0].dtype
+        if any(tensor.dtype != dtype for tensor in (*outputs, *sources)):
+            raise ValueError("piper_relay all-to-all requires one dtype across all input and output tensors")
+        _validate_disjoint(outputs)
+        self._validate_alltoall_aliases(outputs, sources)
+        return self._submit(outputs[0].device, lambda: self._alltoall(outputs, sources, options), outputs)
+
+    def all_to_all_single(  # type: ignore[override]
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,  # noqa: A002 -- PyTorch parameter name
+        output_split_sizes: Sequence[int] | None = None,
+        input_split_sizes: Sequence[int] | None = None,
+        opts: AllToAllOptions | None = None,
+    ) -> dist.Work:
+        options = opts if opts is not None else AllToAllOptions()
+        _validate_tensors([output, input])
+        if output.dtype != input.dtype:
+            raise ValueError("piper_relay all-to-all input and output dtypes must match")
+        if output.ndim < 1 or input.ndim < 1:
+            raise ValueError("piper_relay all_to_all_single requires tensors with at least one dimension")
+        if output.shape[1:] != input.shape[1:]:
+            raise ValueError("piper_relay all_to_all_single input and output trailing dimensions must match")
+        out_splits = _resolve_alltoall_splits(output, output_split_sizes, self.size())
+        in_splits = _resolve_alltoall_splits(input, input_split_sizes, self.size())
+        out_views = list(output.split(out_splits, dim=0))
+        in_views = list(input.split(in_splits, dim=0))
+        self._validate_alltoall_aliases(out_views, in_views)
+        return self._submit(output.device, lambda: self._alltoall(out_views, in_views, options), [output])
+
+    def alltoall_base(  # type: ignore[override]
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,  # noqa: A002 -- PyTorch parameter name
+        output_split_sizes: Sequence[int] | None = None,
+        input_split_sizes: Sequence[int] | None = None,
+        opts: AllToAllOptions | None = None,
+    ) -> dist.Work:
+        return self.all_to_all_single(output, input, output_split_sizes, input_split_sizes, opts)
+
+    def _alltoall(
+        self, outputs: Sequence[torch.Tensor], sources: Sequence[torch.Tensor], options: AllToAllOptions,
+    ) -> None:
+        if self._shared is not None:
+            self._shared.alltoall(outputs, sources, host_pin_manager)
+            return
+        self._alltoall_gloo(outputs, sources, options)
+
+    def _exchange_unequal_gloo(
+        self,
+        send_peer: int,
+        source: torch.Tensor,
+        recv_peer: int,
+        destination: torch.Tensor,
+        timeout: timedelta,
+    ) -> None:
+        capacity = self._slot_bytes(2)
+        src_bytes = _bytes(source)
+        dst_bytes = _bytes(destination)
+        send_len = src_bytes.numel()
+        recv_len = dst_bytes.numel()
+        total = max(send_len, recv_len)
+        if source.device.type == "cpu":
+            for start in range(0, total, capacity):
+                send_slice = src_bytes[start:min(send_len, start + capacity)] if start < send_len else None
+                recv_slice = dst_bytes[start:min(recv_len, start + capacity)] if start < recv_len else None
+                self._exchange_peers(send_peer, send_slice, recv_peer, recv_slice, timeout)
+            return
+        with self._buffer(source.device) as (buffer, _):
+            send_stage = buffer[:capacity]
+            recv_stage = buffer[capacity:2 * capacity]
+            try:
+                for start in range(0, total, capacity):
+                    send_end = min(send_len, start + capacity)
+                    recv_end = min(recv_len, start + capacity)
+                    send_slice = send_stage[:send_end - start] if start < send_len else None
+                    recv_slice = recv_stage[:recv_end - start] if start < recv_len else None
+                    if send_slice is not None:
+                        send_slice.copy_(src_bytes[start:send_end], non_blocking=False)
+                    self._exchange_peers(send_peer, send_slice, recv_peer, recv_slice, timeout)
+                    if recv_slice is not None:
+                        dst_bytes[start:recv_end].copy_(recv_slice, non_blocking=False)
+            finally:
+                torch.cuda.current_stream(source.device).synchronize()
+
+    def _agree_alltoall_gloo(
+        self, outputs: Sequence[torch.Tensor], sources: Sequence[torch.Tensor], timeout: timedelta,
+    ) -> None:
+        world_size = self.size()
+        rank = self.rank()
+        local_meta = torch.tensor(
+            [*[src.nbytes for src in sources], *[out.nbytes for out in outputs], COPY_DTYPES.index(outputs[0].dtype)],
+            dtype=torch.int64,
+        )
+        gathered = [torch.empty_like(local_meta) for _ in range(world_size)]
+        gather_opts = AllgatherOptions()
+        if timeout > timedelta(0):
+            gather_opts.timeout = timeout
+        self._cpu_group.allgather([gathered], [local_meta], gather_opts).wait()  # type: ignore[attr-defined]
+        matrix: list[list[int]] = [row.tolist() for row in gathered]
+        expected_dtype = matrix[rank][-1]
+        if any(row[-1] != expected_dtype for row in matrix) or any(
+            matrix[src][dst] != matrix[dst][world_size + src]
+            for src in range(world_size)
+            for dst in range(world_size)
+        ):
+            raise ValueError("piper_relay all-to-all input and output dtypes and split sizes must match across ranks")
+
+    def _alltoall_gloo(
+        self, outputs: Sequence[torch.Tensor], sources: Sequence[torch.Tensor], options: AllToAllOptions,
+    ) -> None:
+        device = outputs[0].device
+        world_size = self.size()
+        rank = self.rank()
+        if world_size > 1:
+            self._agree_alltoall_gloo(outputs, sources, options.timeout)
+        need_local_copy = bool(sources[rank].numel()) and outputs[rank].data_ptr() != sources[rank].data_ptr()
+        try:
+            if need_local_copy:
+                _bytes(outputs[rank]).copy_(_bytes(sources[rank]), non_blocking=device.type == "cuda")
+            for step in range(1, world_size):
+                send_peer = (rank + step) % world_size
+                recv_peer = (rank - step) % world_size
+                src = sources[send_peer]
+                dst = outputs[recv_peer]
+                send_len = src.nbytes
+                recv_len = dst.nbytes
+                if send_len == 0 and recv_len == 0:
+                    continue
+                if send_len != recv_len and send_len and recv_len:
+                    self._exchange_unequal_gloo(send_peer, src, recv_peer, dst, options.timeout)
+                else:
+                    chunk_inputs = [src] if send_len else []
+                    chunk_outputs = [dst] if recv_len else []
+                    with closing(self._copy_chunks(chunk_inputs, chunk_outputs, slots=2)) as chunks:
+                        for chunk in chunks:
+                            self._exchange_peers(
+                                send_peer,
+                                chunk.inputs[0] if chunk.inputs else None,
+                                recv_peer,
+                                chunk.outputs[0] if chunk.outputs else None,
+                                options.timeout,
+                            )
+        finally:
+            if need_local_copy and device.type == "cuda":
+                torch.cuda.current_stream(device).synchronize()
+
     def _copy_chunks(
         self, inputs: list[torch.Tensor], outputs: list[torch.Tensor], *, slots: int | None = None,
         inplace: bool = False, stage_cpu: bool = False,
@@ -878,6 +1065,23 @@ def _validate_batched_outputs(outputs: Sequence[torch.Tensor], inputs: Sequence[
         for j, source in enumerate(inputs):
             if i != j and _overlap(output, source):
                 raise ValueError("piper_relay batched outputs must not overlap another input")
+
+
+def _resolve_alltoall_splits(
+    tensor: torch.Tensor, split_sizes: Sequence[int] | None, world_size: int,
+) -> list[int]:
+    if not split_sizes:
+        if tensor.shape[0] % world_size:
+            raise ValueError(
+                "piper_relay all_to_all_single dim 0 must be divisible by world size when splits are omitted",
+            )
+        return [tensor.shape[0] // world_size] * world_size
+    if len(split_sizes) != world_size or any(type(size) is not int or size < 0 for size in split_sizes):
+        raise ValueError("piper_relay all_to_all_single requires world_size non-negative integer split sizes")
+    splits = list(split_sizes)
+    if sum(splits) != tensor.shape[0]:
+        raise ValueError("piper_relay all_to_all_single split sizes must sum to dim 0")
+    return splits
 
 
 def _bytes(tensor: torch.Tensor) -> torch.Tensor:
