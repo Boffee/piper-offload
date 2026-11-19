@@ -27,6 +27,15 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   waiting for an entire large weight tensor.
 - `PinManager.acquire` now holds already-registered storages immediately
   without waiting for unrelated concurrent checkpoint fills.
+- `RelayOptions.pipeline_buffers` now defaults to `2` for Gloo transfers,
+  updating the default minimum `staging_bytes` for small custom Gloo budgets;
+  pass `pipeline_buffers=1` for serial staging, while `transport="shared"` no
+  longer factors `pipeline_buffers` into slot sizing or minimum
+  `staging_bytes`.
+- `piper_relay` with `transport="gloo"` eliminates redundant root/local copies
+  on `broadcast`, `scatter`, and `allgather`, and exchanges raw `FP16`/`BF16`
+  payloads on two-rank SUM `allreduce` and `reduce_scatter` before
+  accumulating in `FP32`.
 
 ## [0.10.0rc15] - 2026-11-17
 

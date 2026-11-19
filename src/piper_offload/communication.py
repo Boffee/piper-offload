@@ -32,8 +32,8 @@ are then ready for every stream. A collective on accelerator tensors starts once
 the caller's current stream has produced its inputs and moves its data as a
 foreground transfer, which background copies such as block prefetch wait for
 (see ``piper_offload._transfer_priority``). No offloader, NCCL, or compiled
-extension is required. Gloo pipelining is opt-in; shared transfers use three
-outgoing slots per rank.
+extension is required. Gloo transfers default to two pipeline buffers; shared
+transfers use three outgoing slots per rank.
 
 SUM all-reduce and reduce-scatter support FP32, FP16 and BF16, accumulating
 reduced precision in FP32. Broadcast, scatter and equal-size all-gather also
@@ -81,7 +81,22 @@ from ._transfer_priority import foreground_transfer
 from .pin_manager import host_pin_manager
 
 _BACKEND_NAME = "piper_relay"
+_GLOO_EXCHANGE_TAG = 2
 _registration_lock = threading.Lock()
+
+
+def _sum_pair_in_fp32(
+    output: torch.Tensor, local: torch.Tensor, peer: torch.Tensor, scratch_f32: torch.Tensor, rank: int,
+) -> None:
+    """Sum ``local`` and ``peer`` in rank order through ``scratch_f32``."""
+    first, second = (local, peer) if rank == 0 else (peer, local)
+    step = scratch_f32.numel()
+    for start in range(0, output.numel(), step):
+        end = min(start + step, output.numel())
+        acc = scratch_f32[:end - start]
+        acc.copy_(first[start:end])
+        acc.add_(second[start:end])
+        output[start:end].copy_(acc)
 
 
 @dataclass(frozen=True)
@@ -95,10 +110,10 @@ class RelayOptions:
     when creating subgroups. Gloo staging is allocated lazily; shared staging
     is mapped at group initialization. Both are released on group shutdown.
     Pinning remains subject to ``host_pin_manager``'s separate page-rounded budget.
-    For Gloo transfers, ``pipeline_buffers=2`` or ``3`` divides the same allocation
-    into chunk sets to overlap pinned CUDA/HIP copies with CPU communication.
-    The default, 1, is serial. CPU and pageable copies keep the same chunk size
-    and run serially.
+    For Gloo transfers, ``pipeline_buffers=2`` (the default) or ``3`` divides
+    the same allocation into chunk sets to overlap pinned CUDA/HIP copies with
+    CPU communication; ``1`` runs chunks serially. CPU and pageable copies keep
+    the same chunk size and run serially.
 
     ``transport="shared"`` instead maps one ``staging_bytes`` arena across all
     ranks on the same machine. Copy collectives always use three outgoing slots
@@ -111,12 +126,13 @@ class RelayOptions:
     three slots plus at most three slot sizes of reusable device scratch per
     rank, at most ``staging_bytes / world_size``, independent of tensor size.
     FP16/BF16 accumulate in FP32. CPU tensor reductions use Gloo and borrow this
-    rank's region. ``pipeline_buffers`` only affects the Gloo path. The default
+    rank's region. ``pipeline_buffers`` affects only the Gloo path and does not
+    affect shared slot sizing or minimum ``staging_bytes``. The default
     transport remains ``"gloo"``.
     """
 
     staging_bytes: int = 8 * 1024 * 1024
-    pipeline_buffers: int = 1
+    pipeline_buffers: int = 2
     transport: str = "gloo"
 
     def __post_init__(self) -> None:
@@ -128,7 +144,8 @@ class RelayOptions:
             raise ValueError("piper_relay transport must be 'gloo' or 'shared'")
 
     def _validate_group_size(self, size: int) -> None:
-        minimum = 16 * max(3, size + 1) * self.pipeline_buffers
+        buffers = 1 if self.transport == "shared" else self.pipeline_buffers
+        minimum = 16 * max(3, size + 1) * buffers
         if self.staging_bytes < minimum:
             raise ValueError("piper_relay staging_bytes must allow 16 bytes per staging slot")
         if self.transport == "shared" and shared_slot_bytes(self.staging_bytes, size) * BUFFERS_PER_RANK < minimum:
@@ -276,8 +293,34 @@ class _RelayProcessGroup(dist.ProcessGroup):
             yield region.detach(), lease is not None and lease.pageable_bytes == 0
 
     def _slot_bytes(self, slots: int) -> int:
-        size = self._staging_bytes if self._shared is None else self._shared.capacity * self._shared.buffer_count
-        return size // (16 * slots * self._pipeline_buffers) * 16
+        if self._shared is not None:
+            size = self._shared.capacity * self._shared.buffer_count
+            return size // (16 * slots) * 16
+        return self._staging_bytes // (16 * slots * self._pipeline_buffers) * 16
+
+    def _exchange_pair(self, send_buf: torch.Tensor, recv_buf: torch.Tensor, timeout: timedelta) -> None:
+        peer = 1 - self.rank()
+        # Post receive before send and wait in order so both ranks make concurrent progress.
+        works: list[dist.Work] = [
+            self._cpu_group.recv([recv_buf], peer, _GLOO_EXCHANGE_TAG),  # type: ignore[attr-defined]
+        ]
+        first_error: BaseException | None = None
+        try:
+            works.insert(0, self._cpu_group.send([send_buf], peer, _GLOO_EXCHANGE_TAG))  # type: ignore[attr-defined]
+        except BaseException as error:
+            first_error = error
+        finally:
+            for work in works:
+                try:
+                    if timeout > timedelta(0):
+                        work.wait(timeout)
+                    else:
+                        work.wait()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+        if first_error is not None:
+            raise first_error
 
     def barrier(self, opts: dist.BarrierOptions | None = None) -> dist.Work:  # type: ignore[override]
         options = opts if opts is not None else dist.BarrierOptions()
@@ -326,6 +369,19 @@ class _RelayProcessGroup(dist.ProcessGroup):
             self._shared.allreduce([tensor], host_pin_manager)
             return
         low_precision = tensor.dtype != torch.float32
+        if low_precision and self.size() == 2:
+            capacity = self._slot_bytes(3)
+            rank = self.rank()
+            with closing(self._copy_chunks([tensor], [tensor], slots=3, inplace=True, stage_cpu=True)) as chunks:
+                for chunk in chunks:
+                    raw = chunk.inputs[0]
+                    assert chunk.scratch is not None
+                    peer_raw = chunk.scratch[:raw.numel()]
+                    scratch_f32 = chunk.scratch[capacity:].view(torch.float32)
+                    self._exchange_pair(raw, peer_raw, options.timeout)
+                    host = raw.view(tensor.dtype)
+                    _sum_pair_in_fp32(host, host, peer_raw.view(tensor.dtype), scratch_f32, rank)
+            return
         with closing(self._copy_chunks(
             [tensor], [tensor], slots=3 if low_precision else 1, inplace=True, stage_cpu=low_precision,
         )) as chunks:
@@ -353,16 +409,18 @@ class _RelayProcessGroup(dist.ProcessGroup):
         self._validate_root(options.rootRank)
         if options.rootTensor != 0:
             raise ValueError("piper_relay broadcast requires rootTensor=0")
+
         def body() -> None:
             if self._shared is not None:
                 self._shared.broadcast(tensor, options.rootRank, host_pin_manager)
                 return
-            sources = [tensor] if self.rank() == options.rootRank else []
-            with closing(self._copy_chunks(sources, [tensor], slots=2)) as chunks:
+            is_root = self.rank() == options.rootRank
+            sources = [tensor] if is_root else []
+            destinations = [] if is_root else [tensor]
+            with closing(self._copy_chunks(sources, destinations, slots=1)) as chunks:
                 for chunk in chunks:
-                    if chunk.inputs:
-                        chunk.outputs[0].copy_(chunk.inputs[0])
-                    self._cpu_group.broadcast(chunk.outputs, options).wait()  # type: ignore[attr-defined]
+                    payload = chunk.inputs if is_root else chunk.outputs
+                    self._cpu_group.broadcast(payload, options).wait()  # type: ignore[attr-defined]
 
         return self._submit(tensor.device, body, [tensor])
 
@@ -392,17 +450,47 @@ class _RelayProcessGroup(dist.ProcessGroup):
                 source_rank != options.rootRank or output.data_ptr() != tensor.data_ptr()
             ):
                 raise ValueError("piper_relay scatter output must not overlap inputs except its exact root slice")
+
         def body() -> None:
             if self._shared is not None:
                 self._shared.scatter(sources, output, options.rootRank, host_pin_manager)
                 return
-            with closing(self._copy_chunks(sources, [output], slots=self.size() + 1)) as chunks:
-                for chunk in chunks:
-                    self._cpu_group.scatter(  # type: ignore[attr-defined]
-                        chunk.outputs, [chunk.inputs] if sources else [], options,
-                    ).wait()
+            self._scatter_gloo(output, sources, options)
 
         return self._submit(output.device, body, [output])
+
+    def _scatter_gloo(
+        self, output: torch.Tensor, sources: list[torch.Tensor], options: dist.ScatterOptions,
+    ) -> None:
+        rank = self.rank()
+        slots = self.size() + 1
+        if output.device.type == "cuda" and self.size() > 1 and rank == options.rootRank:
+            remote_sources = [tensor for source_rank, tensor in enumerate(sources) if source_rank != rank]
+            capacity = self._slot_bytes(slots)
+            need_local_copy = bool(output.numel()) and output.data_ptr() != sources[rank].data_ptr()
+            if need_local_copy:
+                _bytes(output).copy_(_bytes(sources[rank]), non_blocking=True)
+            try:
+                with closing(self._copy_chunks(remote_sources, [], slots=slots)) as chunks:
+                    for chunk in chunks:
+                        width = chunk.inputs[0].numel()
+                        assert chunk.scratch is not None
+                        dummy_in = chunk.scratch[:width]
+                        dummy_out = chunk.scratch[capacity:capacity + width]
+                        gloo_inputs = list(chunk.inputs)
+                        gloo_inputs.insert(rank, dummy_in)
+                        self._cpu_group.scatter(  # type: ignore[attr-defined]
+                            [dummy_out], [gloo_inputs], options,
+                        ).wait()
+            finally:
+                if need_local_copy:
+                    torch.cuda.current_stream(output.device).synchronize()
+            return
+        with closing(self._copy_chunks(sources, [output], slots=slots)) as chunks:
+            for chunk in chunks:
+                self._cpu_group.scatter(  # type: ignore[attr-defined]
+                    chunk.outputs, [chunk.inputs] if sources else [], options,
+                ).wait()
 
     def allgather(  # type: ignore[override]
         self,
@@ -555,6 +643,26 @@ class _RelayProcessGroup(dist.ProcessGroup):
     def _reduce_scatter_gloo(
         self, output: torch.Tensor, sources: list[torch.Tensor], options: ReduceScatterOptions,
     ) -> None:
+        if output.dtype != torch.float32 and self.size() == 2:
+            rank = self.rank()
+            peer = 1 - rank
+            with closing(self._copy_chunks(
+                [sources[rank], sources[peer]], [output], slots=3, inplace=True, stage_cpu=True,
+            )) as chunks:
+                for chunk in chunks:
+                    width = chunk.inputs[0].numel()
+                    assert chunk.scratch is not None
+                    peer_raw = chunk.scratch[:width]
+                    self._exchange_pair(chunk.inputs[1], peer_raw, options.timeout)
+                    chunk.inputs[1].copy_(peer_raw)
+                    _sum_pair_in_fp32(
+                        chunk.outputs[0].view(output.dtype),
+                        chunk.inputs[0].view(output.dtype),
+                        chunk.inputs[1].view(output.dtype),
+                        chunk.scratch.view(torch.float32),
+                        rank,
+                    )
+            return
         if output.dtype == torch.float32:
             with closing(self._copy_chunks(sources, [output], slots=self.size() + 1)) as chunks:
                 for chunk in chunks:
@@ -588,6 +696,23 @@ class _RelayProcessGroup(dist.ProcessGroup):
     def _gather(self, source: torch.Tensor, outputs: list[torch.Tensor], options: AllgatherOptions) -> None:
         if self._shared is not None:
             self._shared.allgather([source], [outputs], host_pin_manager)
+            return
+        rank = self.rank()
+        if source.device.type == "cuda" and self.size() > 1:
+            remote_outputs = [out for r, out in enumerate(outputs) if r != rank]
+            need_local_copy = bool(source.numel()) and outputs[rank].data_ptr() != source.data_ptr()
+            if need_local_copy:
+                _bytes(outputs[rank]).copy_(_bytes(source), non_blocking=True)
+            try:
+                with closing(self._copy_chunks([source], remote_outputs, slots=self.size() + 1)) as chunks:
+                    for chunk in chunks:
+                        assert chunk.scratch is not None
+                        gloo_outputs = list(chunk.outputs)
+                        gloo_outputs.insert(rank, chunk.scratch[:chunk.inputs[0].numel()])
+                        self._cpu_group.allgather([gloo_outputs], chunk.inputs, options).wait()  # type: ignore[attr-defined]
+            finally:
+                if need_local_copy:
+                    torch.cuda.current_stream(source.device).synchronize()
             return
         with closing(self._copy_chunks([source], outputs)) as chunks:
             for chunk in chunks:
