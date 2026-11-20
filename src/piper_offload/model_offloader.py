@@ -493,6 +493,11 @@ class ModelOffloader:
         """
         return self._composite.failed
 
+    @property
+    def _retains_cache_lease(self) -> bool:
+        """Keep the cached runtime alive until failed cleanup has finished."""
+        return self.failed
+
     def _retry_release(self) -> None:
         """Retry releasing what a prior session kept; the caller holds the activation lock."""
         try:

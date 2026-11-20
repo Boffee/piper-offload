@@ -45,7 +45,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Generator, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from .protocols import ResourceSpec, ResourceStore
 
@@ -56,7 +56,10 @@ from .protocols import ResourceSpec, ResourceStore
 
 @dataclass(frozen=True, slots=True)
 class ResourceInfo:
-    """Per-key state returned by :meth:`ResourceCache.info`."""
+    """Per-key state returned by :meth:`ResourceCache.info`.
+
+    A model with unfinished device cleanup retains a lease after its callers leave.
+    """
 
     key: str
     estimated_cache_bytes: int
@@ -222,12 +225,27 @@ class LRUEvictionPolicy:
 # ---------------------------------------------------------------------------
 
 
+@runtime_checkable
+class _RetainsCacheLease(Protocol):
+    @property
+    def _retains_cache_lease(self) -> bool:
+        """Whether unfinished work still needs the store after caller leases end."""
+        ...
+
+
 @dataclass
 class _Entry:
     spec: ResourceSpec[Any]
     store: ResourceStore | None = None
     cache_bytes: int = 0  # actual, post-build
-    lease_count: int = 0
+    caller_leases: int = 0
+
+    @property
+    def lease_count(self) -> int:
+        if self.caller_leases:
+            return self.caller_leases
+        store = self.store
+        return int(isinstance(store, _RetainsCacheLease) and store._retains_cache_lease)
 
     @property
     def in_use(self) -> bool:
@@ -390,13 +408,13 @@ class ResourceCache:
             self._ensure_store(entry)
             store = entry.store
             assert store is not None
-            entry.lease_count += 1
+            entry.caller_leases += 1
             self._eviction.mark_active(entry.spec.key)
         try:
             yield entry.spec.value(store)
         finally:
             with self._lock:
-                entry.lease_count -= 1
+                entry.caller_leases -= 1
                 self._mark_inactive_if_unleased(entry)
 
     @contextlib.contextmanager

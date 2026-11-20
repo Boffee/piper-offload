@@ -194,7 +194,7 @@ class HostModuleInstance:
     def install_target(self, target: HostModuleTarget) -> None:
         """Install already-filled active storage without copying into it."""
         _validate_target_names_known(self.params, self.buffers, target)
-        _set_params(
+        install_parameters(
             self.module,
             {name: param_target.param for name, param_target in target.param_targets.items()},
         )
@@ -449,7 +449,7 @@ def _capture_params(
         params.keys(),
         lambda name: param_tensor_id(params[name]),
     ):
-        _validate_param_storage_group_requires_grad(names, params)
+        validate_tied_parameter_trainability(names, params)
         host = HostParam(params[names[0]])
         _validate_param_storage_group_tieable(names, host)
         for name in names:
@@ -613,15 +613,16 @@ def _validate_target_names_known(
     raise ValueError(f"HostModuleTarget contains entries outside the store: {'; '.join(details)}.")
 
 
-def _validate_param_storage_group_requires_grad(
+def validate_tied_parameter_trainability(
     names: Iterable[str],
     params: Mapping[str, nn.Parameter],
 ) -> None:
+    """A shared replacement parameter can carry only one requires_grad flag."""
     names = list(names)
     requires_grad = {params[name].requires_grad for name in names}
     if len(requires_grad) <= 1:
         return
-    raise ValueError(f"HostModuleStore cannot group params with mixed requires_grad: {_format_names(names)}.")
+    raise ValueError(f"Cannot replace tied parameters with mixed requires_grad: {_format_names(names)}.")
 
 
 def _validate_trainable_param_data_swaps(
@@ -862,16 +863,14 @@ def _install_host_params(
             cpu_param = host.make_cpu_param()
             by_host[id(host)] = cpu_param
         materialized[name] = cpu_param
-    _set_params(module, materialized)
+    install_parameters(module, materialized)
 
 
-def _set_params(
+def install_parameters(
     module: nn.Module,
     materialized_params: Mapping[str, nn.Parameter],
 ) -> None:
-    # Both materialized sources carry the correct ``requires_grad`` (GPU
-    # param via ``make_gpu_param``, CPU wrapper via ``make_cpu_param``), so
-    # the swap-vs-replace decision reads off the materialized param itself.
+    """Install prepared storage, preserving trainable Parameters already validated for data swaps."""
     for name, materialized in materialized_params.items():
         parent, leaf = resolve_parent_leaf(module, name)
         if materialized.requires_grad:

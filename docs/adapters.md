@@ -279,11 +279,14 @@ modified = merge_adapter(model, [(adapter, 0.8)])
 ```
 
 The return value counts unique modified parameters. The operation validates
-active names, shapes, and capabilities before mutation, but it is not
-reversible. Plain floating-point weights use in-place arithmetic. Mapped
-targets are first replaced with owned copies under every tied name; Piper
-never writes into a checkpoint mapping. Meta targets become independent frozen
-CPU parameters with their aliases preserved.
+active names, shapes, and capabilities and prepares any replacement weights
+before the first write. When the tensor adapter exposes the target's writable
+storage, Piper updates it in place. A mapped target gets owned backing under
+every tied name. A trainable target keeps its parameter object and optimizer
+references. If its storage must be replaced, a tensor-subclass adapter must
+support a parameter data swap. Tied parameters that need replacement must
+agree on `requires_grad`. Meta targets become independent frozen CPU
+parameters with their aliases preserved.
 
 Permanent merge accepts the same cross-adapter composition, strength,
 partial-target, and rounding policies. Quantized support follows the [format matrix](formats.md), except

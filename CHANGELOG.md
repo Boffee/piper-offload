@@ -45,6 +45,18 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   payloads on two-rank SUM `allreduce` and `reduce_scatter` before
   accumulating in `FP32`.
 
+### Fixed
+
+- Permanent adapter merges into a noncontiguous checkpoint view now update an
+  owned copy shared by the target's tied names. Previously a merge could write
+  into the mapping when host capture normalized the view. Custom tensor
+  adapters that return borrowed or shared storage for an independent parameter
+  value now raise before any target is updated.
+- Storage left pageable by the pin budget now stays pageable through the
+  transfer, even if another thread raises the budget and requests pinning.
+- A cached model whose CUDA cleanup failed stays protected from eviction until
+  cleanup succeeds. A subsequent use retries cleanup on the same runtime.
+
 ## [0.10.0rc15] - 2026-11-17
 
 ### Added

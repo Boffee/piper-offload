@@ -1574,6 +1574,49 @@ class TestFailedSession:
         assert offloader.failed
         return offloader, streamer, resident
 
+    def test_cache_retains_model_until_cleanup_succeeds(self, monkeypatch, request) -> None:
+        from piper_offload import ModelCache, ModelSpec, ResourceLeasedError, ResourceTooLargeError
+
+        cache = ModelCache()
+        spec = ModelSpec(key="model", factory=_make_block_model, block_paths=("transformer_blocks",))
+        with cache.lease(spec) as offloader:
+            streamer = block_components(offloader)[0]
+        request.addfinalizer(offloader.deactivate)
+
+        def fail_close(_component):
+            raise RuntimeError("incomplete release")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(BlockComponent, "_close_pin_lease", fail_close)
+            with pytest.raises(RuntimeError, match="incomplete release"), cache.use(spec, device="cpu"):
+                # Stand in for unfinished CUDA work. A retry must close its pin lease.
+                pin = streamer._pin_lease = host_pin_manager.acquire([], pin=False)
+                streamer._working_set_state = WorkingSetState.CHANGING
+
+            assert offloader.failed
+            assert not pin.closed
+            assert cache.info(spec.key).lease_count == 1
+            assert cache.evict_bytes(cache.used_cache_bytes) == 0
+            with pytest.raises(ResourceTooLargeError):
+                cache.resize(0)
+            with pytest.raises(ResourceLeasedError):
+                cache.evict(spec.key)
+            with pytest.raises(ResourceLeasedError):
+                cache.unregister(spec.key)
+            with pytest.raises(ResourceLeasedError):
+                cache.register(spec, replace=True)
+            with pytest.raises(ResourceLeasedError):
+                cache.clear()
+            with pytest.raises(ModelRuntimeFailedError), cache.use(spec, device="cpu"):
+                pytest.fail("activation continued after failed cleanup")
+
+        with cache.use(spec, device="cpu") as model:
+            assert model is offloader.value
+            assert pin.closed
+            assert cache.info(spec.key).lease_count == 1
+        cache.resize(0)
+        assert not cache.info(spec.key).cached
+
     def test_activation_finishes_what_a_failed_session_kept(self) -> None:
         offloader, streamer, _resident = self._offloader_with_leftover()
         leftover = streamer._pin_lease

@@ -88,6 +88,13 @@ its store. If leased stores alone exceed the requested limit, resizing raises
 a store is cached or leased. The [pin budget](memory.md#set-the-pin-budget)
 controls registered host memory separately.
 
+If model cleanup fails with device work outstanding, the cache retains the
+model and reports a lease after the usage context exits. Keep the cache alive.
+The next `cache.use()` of that model retries cleanup. To retry cleanup alone,
+call `offloader.deactivate()` inside `with cache.lease(model_spec) as offloader:`.
+Successful cleanup makes the model eligible for eviction when the caller releases
+its lease.
+
 ```python
 info = cache.info("encoder")
 backing_bytes = cache.used_cache_bytes

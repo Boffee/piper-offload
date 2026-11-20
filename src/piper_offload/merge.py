@@ -14,7 +14,7 @@ invokes them after individual parameter copies.
 
 import contextlib
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,7 +28,7 @@ from ._parameter_update import (
     validate_merge_target_aliases,
 )
 from .adapter import Adapter, AdapterTargetUpdates
-from .module_names import resolve_parent_leaf
+from .host_module import install_parameters, validate_tied_parameter_trainability
 from .pin_manager import host_pin_manager
 from .tensor_adapter_registry import (
     param_representation,
@@ -36,9 +36,11 @@ from .tensor_adapter_registry import (
     select_adapter,
 )
 from .tensor_adapters import (
+    ParameterDataSwapTensorAdapter,
     PermanentUpdateValidationTensorAdapter,
+    clone_host_state,
     host_state_is_owned,
-    independent_host_capture,
+    view_host_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,8 +59,8 @@ class _MergeOp:
     param: nn.Parameter
     plan: ParameterUpdatePlan
 
-    def validate(self) -> None:
-        """Preflight the effective representation before any model mutation."""
+    def prepare(self, params_by_name: Mapping[str, nn.Parameter]) -> nn.Parameter:
+        """Validate the update and resolve its writable target before any model mutation."""
         if self.plan.update is not None:
             adapter = (
                 self.plan.source.adapter
@@ -68,43 +70,38 @@ class _MergeOp:
             _validate_permanent_update(adapter)
         self.plan.validate_parameter(self.param)
 
-    def apply(self, model: nn.Module) -> None:
-        """Apply to an owned replacement or the writable existing parameter."""
-        replacement = (
-            self.plan.source.clone_cpu_param()
-            if self.plan.source is not None
-            else _owned_copy(self.param)
-        )
-        param = self.param if replacement is None else replacement
+        target = self.plan.source.clone_cpu_param() if self.plan.source is not None else _writable_parameter(self.param)
+        if target is not self.param:
+            validate_tied_parameter_trainability(self.aliases, params_by_name)
+        return target
+
+    def apply(self, model: nn.Module, param: nn.Parameter) -> None:
+        """Apply to the prepared target and install a replacement under all tied names."""
         if self.plan.update is not None:
             self.plan.update.apply_parameter(param)
-        if replacement is not None:
-            self._install(model, replacement)
-
-    def _install(self, model: nn.Module, replacement: nn.Parameter) -> None:
-        for alias in self.aliases:
-            parent, leaf = resolve_parent_leaf(model, alias)
-            if leaf not in parent._parameters:
-                raise RuntimeError(f"Parameter {alias!r} disappeared during permanent merge.")
-            parent._parameters[leaf] = replacement
+        if param is not self.param:
+            install_parameters(model, dict.fromkeys(self.aliases, param))
 
 
-def _owned_copy(param: nn.Parameter) -> nn.Parameter | None:
-    """An independent copy of ``param`` if it lives in storage Piper must not write, else None.
-
-    Merging writes the parameter in place. Piper never writes into a file
-    mapping, because the pin manager may return its pages to the file, so a
-    target that is a view into one is replaced by a copy the process owns.
-    """
-    if param.is_meta:
-        return None
-    representation = param_representation(param)
-    adapter = select_adapter(representation)
-    if host_state_is_owned(adapter, adapter.capture_host(representation)):
-        return None
-    with independent_host_capture():
-        state = adapter.capture_host(representation)
-    return adapter.cpu_param(state, requires_grad=param.requires_grad)
+def _writable_parameter(param: nn.Parameter) -> nn.Parameter:
+    """Keep an owned target in place; copy a borrowed representation before writing."""
+    if param.device.type != "cpu":
+        return param
+    tensor = param_representation(param)
+    adapter = select_adapter(tensor)
+    state = view_host_state(adapter, tensor)
+    if not host_state_is_owned(adapter, state):
+        state = clone_host_state(adapter, tensor, state)
+    target = adapter.cpu_param(state, requires_grad=param.requires_grad)
+    if adapter.tensor_id(tensor) == adapter.tensor_id(param_representation(target)):
+        return param
+    if param.requires_grad and type(tensor) is not torch.Tensor:
+        if not isinstance(adapter, ParameterDataSwapTensorAdapter):
+            raise ValueError(
+                "Replacing trainable tensor-subclass storage requires a Parameter.data-swap-capable adapter."
+            )
+        adapter.validate_parameter_data_swap_target(tensor)
+    return target
 
 
 def merge_adapter(
@@ -204,10 +201,9 @@ def _merge_adapters(
     )
     with host_pin_manager.acquire(sources, pin=False) if devices else contextlib.nullcontext():
         try:
-            for op in merge_ops:
-                op.validate()
-            for op in merge_ops:
-                op.apply(model)
+            targets = [op.prepare(params_by_target) for op in merge_ops]
+            for op, target in zip(merge_ops, targets, strict=True):
+                op.apply(model, target)
         finally:
             for device in devices:
                 torch.cuda.synchronize(device)

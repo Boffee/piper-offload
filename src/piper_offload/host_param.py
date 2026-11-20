@@ -28,8 +28,8 @@ from .tensor_adapters import (
     PostLoadRearmTensorAdapter,
     TensorAdapter,
     adapter_name,
+    clone_host_state,
     host_state_is_owned,
-    independent_host_capture,
 )
 
 
@@ -126,8 +126,7 @@ class HostParam:
         if requires_grad and not is_meta and not host_state_is_owned(adapter, host_state):
             # Optimizer steps write trainable host bytes back, and the pin
             # manager may return a mapping's pages to the file.
-            with independent_host_capture():
-                host_state = adapter.capture_host(representation)
+            host_state = clone_host_state(adapter, representation, host_state)
         self._init_from_host_state(
             representation,
             requires_grad=requires_grad,
@@ -449,8 +448,7 @@ class HostParam:
                 "parameter value."
             )
         representation = param_representation(self.make_cpu_param())
-        with independent_host_capture():
-            cloned_state = self.adapter.capture_host(representation)
+        cloned_state = clone_host_state(self.adapter, representation, self.host_state)
         return self.adapter.cpu_param(cloned_state, requires_grad=False)
 
     @property
