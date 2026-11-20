@@ -20,6 +20,7 @@ from piper_offload import (
     file_slice,
     merge_adapter,
 )
+from piper_offload.adapter import group_adapter_updates
 from piper_offload.tensor_adapter_registry import param_representation, select_adapter
 from piper_offload.tensor_adapters import RegularAdapter
 from tests._block_compile_helpers import _BlockModel
@@ -179,7 +180,7 @@ def test_unpopulated_partial_targets_create_no_merge_work(monkeypatch):
     assert merge_adapter(model, [(adapter, 1.0)]) == 0
     assert model.weight is original
     offloader = ModelOffloader.from_module(model)
-    updates = offloader._group_adapter_updates_by_param_name([(adapter, 1.0)])
+    updates = group_adapter_updates([(adapter, 1.0)], offloader.param_names)
     assert offloader._build_merge_parameter_overrides(torch.device("cuda"), updates) == {}
     assert offloader.cache_bytes == 0
     assert model.weight.is_meta

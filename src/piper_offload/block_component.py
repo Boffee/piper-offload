@@ -121,159 +121,6 @@ def _param_target_layout(p: nn.Parameter) -> tuple[object, object]:
     return HostParam.target_layout_for(p)
 
 
-def _collect_block_schemas(
-    blocks: list[nn.Module],
-    managed_param_names: set[str] | None,
-    managed_buffer_names: set[str] | None,
-) -> tuple[list[dict[str, bool]], list[set[str]]]:
-    """Snapshot the cross-block contract without retaining tensor objects.
-
-    Host construction replaces each completed block's source wrappers so
-    their pageable/file-backed storage can be released before the next block
-    is copied. Keeping ``Parameter`` or buffer objects in this pre-validation
-    snapshot would extend every source storage's lifetime until the complete
-    block list finished capture, producing an approximately 2x model-sized
-    peak for structured tensor adapters.
-    """
-    block_param_schemas: list[dict[str, bool]] = []
-    block_buffer_schemas: list[set[str]] = []
-
-    for block in blocks:
-        params, buffers = _select_block_schema(
-            block,
-            managed_param_names,
-            managed_buffer_names,
-        )
-        block_param_schemas.append(params)
-        block_buffer_schemas.append(buffers)
-
-    return block_param_schemas, block_buffer_schemas
-
-
-def _select_block_schema(
-    block: nn.Module,
-    managed_param_names: set[str] | None,
-    managed_buffer_names: set[str] | None,
-) -> tuple[dict[str, bool], set[str]]:
-    params: dict[str, bool] = {}
-    all_param_names: set[str] = set()
-    for name, param in block.named_parameters(remove_duplicate=False):
-        all_param_names.add(name)
-        if managed_param_names is not None and name not in managed_param_names:
-            continue
-        params[name] = param.requires_grad
-    _validate_block_names_known(managed_param_names, all_param_names)
-
-    buffers: set[str] = set()
-    all_buffer_names: set[str] = set()
-    for name, _buffer in block.named_buffers(remove_duplicate=False):
-        all_buffer_names.add(name)
-        if managed_buffer_names is not None and name not in managed_buffer_names:
-            continue
-        buffers.add(name)
-    _validate_block_names_known(managed_buffer_names, all_buffer_names)
-
-    return params, buffers
-
-
-def _validate_block_names_known(
-    names: set[str] | None,
-    known_names: set[str],
-) -> None:
-    if names is None:
-        return
-    missing = sorted(names - known_names)
-    if missing:
-        raise ValueError(f"BlockComponent cannot select unknown block-local names: {_format_names(missing)}.")
-
-
-def _format_names(names: Sequence[str]) -> str:
-    return ", ".join(repr(name) for name in names)
-
-
-def _check_block_requires_grad_consistent(
-    block_param_schemas: Sequence[dict[str, bool]],
-) -> None:
-    """Reject blocks that disagree on ``requires_grad`` for a shared name.
-
-    Per-block tensor *layouts* (shape, dtype, quant format, tying) may
-    differ — the morphing target pool keys targets by layout signature.
-    But mixing a trainable and a frozen weight under the same selected
-    name in one block group is unsupported: trainable streaming swaps
-    ``.data`` under an activation-checkpointing guard, so a half-trainable
-    group has no coherent optimizer-step / checkpointing contract.
-    Validated before capture so a mismatch leaves the model unmutated.
-    """
-    if len(block_param_schemas) <= 1:
-        return
-    ref = block_param_schemas[0]
-    for i in range(1, len(block_param_schemas)):
-        for name, requires_grad in block_param_schemas[i].items():
-            ref_requires_grad = ref.get(name)
-            if ref_requires_grad is not None and requires_grad != ref_requires_grad:
-                raise ValueError(
-                    f"Block {i} param {name!r} requires_grad="
-                    f"{requires_grad} differs from block 0 "
-                    f"(requires_grad={ref_requires_grad}). All blocks "
-                    "in a BlockComponent group must agree on requires_grad "
-                    "per parameter; quantization formats, shapes, and dtypes "
-                    "may differ, but trainable and frozen weights cannot be "
-                    "mixed in one block group."
-                )
-
-
-def _capture_block_module_stores(
-    blocks: Sequence[nn.Module],
-    *,
-    managed_param_names: set[str] | None = None,
-    managed_buffer_names: set[str] | None = None,
-) -> list[HostModuleStore]:
-    """Collect, validate, and capture one :class:`HostModuleStore` per block.
-
-    Validation failures before capture do not mutate module parameters or
-    buffers. Once capture starts, :class:`HostParam` may use its
-    low-peak ``Parameter.data`` repointing optimization; recovery from
-    a capture-time failure is unsupported, matching :class:`HostComponent`.
-    """
-    # Walk each block to snapshot selected names and requires_grad flags
-    # WITHOUT retaining the Parameter/buffer objects or capturing anything.
-    # Cross-block name consistency is enforced upstream
-    # (``_block_param_names_for_blocks`` / ``_block_buffer_names_for_blocks``);
-    # per-block tensor *layouts* may differ (heterogeneous quantization),
-    # since the component's morphing target pool keys reusable GPU targets
-    # by per-block layout signature so blocks of different formats never
-    # share a target.
-    block_param_schemas, block_buffer_schemas = _collect_block_schemas(
-        list(blocks),
-        managed_param_names,
-        managed_buffer_names,
-    )
-    _check_block_requires_grad_consistent(block_param_schemas)
-
-    # Only lightweight name collections cross into capture. Capture and install
-    # each block before resolving the next block's live tensors so structured
-    # source wrappers from completed blocks can be reclaimed immediately.
-    param_names_by_block = [set(schema) for schema in block_param_schemas]
-    buffer_names_by_block = block_buffer_schemas
-    del block_param_schemas, block_buffer_schemas
-
-    stores: list[HostModuleStore] = []
-    for block, param_names, buffer_names in zip(
-        blocks,
-        param_names_by_block,
-        buffer_names_by_block,
-        strict=True,
-    ):
-        stores.append(
-            HostModuleStore.from_module(
-                block,
-                include_param_names=param_names,
-                include_buffer_names=buffer_names,
-            )
-        )
-    return stores
-
-
 def _build_param_name_index(
     instances: Sequence[HostModuleInstance],
     prefix: str | None,
@@ -328,54 +175,6 @@ def _resolve_blocks(module: nn.Module, blocks_path: str) -> list[nn.Module]:
     return blocks
 
 
-def _block_param_names_for_blocks(
-    blocks: Sequence[nn.Module],
-    *,
-    include_trainables: bool,
-) -> set[str]:
-    param_names = _block_param_names(blocks[0], include_trainables=include_trainables)
-    for i, block in enumerate(blocks[1:], start=1):
-        if _block_param_names(block, include_trainables=include_trainables) != param_names:
-            raise ValueError(
-                f"Block {i} selected parameter names differ from block 0. "
-                "All blocks in a BlockComponent group must select the "
-                "same parameter names (their shapes, dtypes, and quant "
-                "formats may differ). Split structurally different block "
-                "kinds across separate block-path groups."
-            )
-    return param_names
-
-
-def _block_buffer_names_for_blocks(blocks: Sequence[nn.Module]) -> set[str]:
-    buffer_names = _block_buffer_names(blocks[0])
-    for i, block in enumerate(blocks[1:], start=1):
-        if _block_buffer_names(block) != buffer_names:
-            raise ValueError(
-                f"Block {i} selected buffer names differ from block 0. "
-                "All blocks in a BlockComponent group must select the "
-                "same buffer names (their shapes, dtypes, and layouts may "
-                "differ). Split structurally different block kinds across "
-                "separate block-path groups."
-            )
-    return buffer_names
-
-
-def _block_param_names(
-    block: nn.Module,
-    *,
-    include_trainables: bool,
-) -> set[str]:
-    return {
-        name
-        for name, param in block.named_parameters(remove_duplicate=False)
-        if include_trainables or not param.requires_grad
-    }
-
-
-def _block_buffer_names(block: nn.Module) -> set[str]:
-    return {name for name, _buffer in block.named_buffers(remove_duplicate=False)}
-
-
 def _block_is_empty(block: nn.Module) -> bool:
     """A block with no parameters or buffers at any depth.
 
@@ -414,33 +213,57 @@ class BlockComponentStore:
         """Resolve ``blocks_path`` on ``model`` and capture its managed blocks.
 
         Structurally-empty positions (no parameters or buffers) are skipped and
-        dropped from :attr:`block_indices`. The surviving blocks must still
-        agree on selected names (see
-        :func:`_block_param_names_for_blocks`).
+        dropped from :attr:`block_indices`. Surviving blocks must agree on
+        managed parameter names and trainability, and on buffer names.
         """
-        all_blocks = _resolve_blocks(model, blocks_path)
-        kept = [(idx, block) for idx, block in enumerate(all_blocks) if not _block_is_empty(block)]
-        if not kept:
+        store, _ = cls._capture(
+            model, blocks_path=blocks_path, include_block_trainables=include_block_trainables,
+        )
+        return store
+
+    @classmethod
+    def _capture(
+        cls, model: nn.Module, *, blocks_path: str, include_block_trainables: bool,
+    ) -> tuple[Self, tuple[HostModuleInstance, ...]]:
+        # Validate every block before capture mutates the first. The schema
+        # holds names and booleans only, so each block's original tensors can
+        # be reclaimed as soon as its host backing is installed.
+        blocks = _resolve_blocks(model, blocks_path)
+        indices: list[int] = []
+        params: dict[str, bool] = {}
+        buffers: set[str] = set()
+        for idx, block in enumerate(blocks):
+            all_params = {name: p.requires_grad for name, p in block.named_parameters(remove_duplicate=False)}
+            block_buffers = {name for name, _ in block.named_buffers(remove_duplicate=False)}
+            if not all_params and not block_buffers:
+                continue
+            selected = {name: grad for name, grad in all_params.items() if include_block_trainables or not grad}
+            if indices:
+                if selected.keys() != params.keys():
+                    difference = sorted(selected.keys() ^ params.keys())
+                    raise ValueError(
+                        f"Block {idx} selected parameter names differ from block {indices[0]}: {difference}."
+                    )
+                if block_buffers != buffers:
+                    difference = sorted(block_buffers ^ buffers)
+                    raise ValueError(f"Block {idx} selected buffer names differ from block {indices[0]}: {difference}.")
+                if selected != params:
+                    difference = [name for name in params if selected[name] != params[name]]
+                    raise ValueError(f"Block {idx} requires_grad differs from block {indices[0]} for {difference}.")
+            else:
+                params, buffers = selected, block_buffers
+            indices.append(idx)
+        if not indices:
             raise ValueError(
                 f"Block path {blocks_path!r} has no streamable blocks (every block is structurally empty)."
             )
-        block_indices = tuple(idx for idx, _ in kept)
-        blocks = [block for _, block in kept]
-        managed_param_names = _block_param_names_for_blocks(
-            blocks,
-            include_trainables=include_block_trainables,
-        )
-        managed_buffer_names = _block_buffer_names_for_blocks(blocks)
-        block_stores = _capture_block_module_stores(
-            blocks,
-            managed_param_names=managed_param_names,
-            managed_buffer_names=managed_buffer_names,
-        )
-        return cls(
-            _block_stores=tuple(block_stores),
-            blocks_path=blocks_path,
-            block_indices=block_indices,
-        )
+
+        captured = [
+            HostModuleStore.capture(blocks[idx], include_param_names=params, include_buffer_names=buffers)
+            for idx in indices
+        ]
+        store = cls(tuple(store for store, _ in captured), blocks_path, tuple(indices))
+        return store, tuple(instance for _, instance in captured)
 
     @property
     def managed_param_names_by_block(self) -> list[list[str]]:
@@ -535,6 +358,16 @@ class BlockComponentStore:
         instances = [
             store.bind(bind_blocks[idx]) for store, idx in zip(self._block_stores, self.block_indices, strict=True)
         ]
+        return self._component(instances, block_compile=block_compile, wraparound=wraparound, block_mode=block_mode)
+
+    def _component(
+        self,
+        instances: Sequence[HostModuleInstance],
+        *,
+        block_compile: BlockCompileConfig | None,
+        wraparound: bool,
+        block_mode: BlockMode,
+    ) -> BlockComponent:
         return BlockComponent(
             instances,
             name=self.blocks_path,

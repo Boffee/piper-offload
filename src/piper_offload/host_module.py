@@ -103,7 +103,21 @@ class HostModuleStore:
         include_param_names: Iterable[str] | None = None,
         include_buffer_names: Iterable[str] | None = None,
     ) -> Self:
-        """Capture and install owned CPU copies keyed by module names."""
+        """Capture host backing and install it on the source module."""
+        store, _ = cls.capture(
+            module, include_param_names=include_param_names, include_buffer_names=include_buffer_names,
+        )
+        return store
+
+    @classmethod
+    def capture(
+        cls,
+        module: nn.Module,
+        *,
+        include_param_names: Iterable[str] | None = None,
+        include_buffer_names: Iterable[str] | None = None,
+    ) -> tuple[Self, HostModuleInstance]:
+        """Capture host backing and return its first installed binding."""
         all_params = _named_parameters(module)
         params = _select_known_names(
             all_params,
@@ -121,9 +135,7 @@ class HostModuleStore:
             buffers=_capture_buffers(buffers),
         )
         _validate_trainable_param_data_swaps(store.params)
-        _install_host_params(module, store.params)
-        _install_host_buffers(module, store.buffers)
-        return store
+        return store, store._install(module)
 
     @property
     def cache_bytes(self) -> int:
@@ -138,15 +150,11 @@ class HostModuleStore:
         return tuple(name for name, host in self.params.items() if host.requires_grad)
 
     def bind(self, module: nn.Module) -> HostModuleInstance:
-        """Validate ``module`` and bind this store's backing bytes to it.
-
-        The sole instance factory: layout-checks ``module`` against this
-        store, constructs a :class:`HostModuleInstance` that owns
-        ``module`` and shares this store's host bytes, then installs
-        those host bytes onto ``module`` via
-        :meth:`HostModuleInstance.install_host`.
-        """
+        """Validate a compatible module and install this store's backing on it."""
         _validate_module_matches(self.params, self.buffers, module)
+        return self._install(module)
+
+    def _install(self, module: nn.Module) -> HostModuleInstance:
         instance = HostModuleInstance(
             module=module,
             params=self.params,

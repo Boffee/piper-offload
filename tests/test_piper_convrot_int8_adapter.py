@@ -23,10 +23,7 @@ from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from piper_offload.dtensor_adapter import DTensorAdapter
 from piper_offload.host_module import HostModuleStore
 from piper_offload.host_param import HostParam
-from piper_offload.block_component import (
-    _param_target_layout,
-    _capture_block_module_stores,
-)
+from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
     CpuRoundTripTensorAdapter,
@@ -195,33 +192,21 @@ class TestPiperConvRotInt8Adapter:
 
         blocks = [Block(), Block()]
         first_source_ref = weakref.ref(blocks[0].weight)
-        original_from_module = HostModuleStore.from_module
+        original_capture = HostModuleStore.capture
         calls = 0
 
-        @classmethod
-        def tracked_from_module(
-            cls: type[HostModuleStore],
-            module: nn.Module,
-            **kwargs: object,
-        ) -> HostModuleStore:
+        def tracked_capture(module, **kwargs):
             nonlocal calls
             if calls == 1:
-                # The first block has already installed its host wrapper.
-                # Pre-validation must not keep the replaced source wrapper
-                # (and therefore its original qdata/scale storage) alive.
+                # Preflight and the first bound instance keep only captured state.
                 assert first_source_ref() is None
             calls += 1
-            return original_from_module(module, **kwargs)
+            return original_capture(module, **kwargs)
 
-        monkeypatch.setattr(
-            HostModuleStore,
-            "from_module",
-            tracked_from_module,
-        )
-
-        stores = _capture_block_module_stores(blocks)
-
-        assert len(stores) == 2
+        monkeypatch.setattr(HostModuleStore, "capture", staticmethod(tracked_capture))
+        model = nn.Module()
+        model.blocks = nn.ModuleList(blocks)
+        ModelOffloader.from_module(model, block_paths=("blocks",))
         assert calls == 2
         assert first_source_ref() is None
 

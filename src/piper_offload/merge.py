@@ -27,12 +27,11 @@ from ._parameter_update import (
     plan_parameter_update,
     validate_merge_target_aliases,
 )
-from .adapter import Adapter, AdapterTargetUpdates
+from .adapter import Adapter, AdapterTargetUpdates, group_adapter_updates
 from .host_module import install_parameters, validate_tied_parameter_trainability
 from .pin_manager import host_pin_manager
 from .tensor_adapter_registry import (
     param_representation,
-    param_tensor_id,
     select_adapter,
 )
 from .tensor_adapters import (
@@ -157,32 +156,9 @@ def _merge_adapters(
     *,
     stochastic_rounding: bool,
 ) -> int:
-    params_by_target = _collect_params_by_target(model)
-
-    missing_targets = sorted(
-        {
-            target_key
-            for adapter, _strength in adapters
-            for target_key in adapter.targets
-            if target_key not in params_by_target and not adapter.allow_partial_targets
-        }
-    )
-    if missing_targets:
-        sample = sorted(params_by_target)[:3]
-        raise ValueError(
-            f"Adapter targets are not parameters in the model: {missing_targets}. "
-            "Adapter target keys must match the model's parameter names exactly. "
-            f"Sample model parameter keys: {sample} ..."
-        )
-
-    merge_ops = _build_merge_ops(
-        params_by_target,
-        adapters,
-        stochastic_rounding=stochastic_rounding,
-    )
-    applied_target_count = sum(
-        target_key in params_by_target for adapter, _strength in adapters for target_key in adapter.targets
-    )
+    params_by_target = dict(model.named_parameters(remove_duplicate=False))
+    updates = group_adapter_updates(adapters, params_by_target.keys())
+    merge_ops = _build_merge_ops(params_by_target, updates, stochastic_rounding=stochastic_rounding)
 
     # Preflight every operation before applying any of them. This catches all
     # expected name, shape, and adapter-capability errors without leaving a
@@ -208,41 +184,17 @@ def _merge_adapters(
             for device in devices:
                 torch.cuda.synchronize(device)
 
-    modified_tensor_ids = {param_tensor_id(op.param) for op in merge_ops}
-
-    logger.info(
-        "merge_adapter: merged %d unique parameters from %d adapter targets",
-        len(modified_tensor_ids),
-        applied_target_count,
-    )
-    return len(modified_tensor_ids)
-
-
-def _collect_params_by_target(model: nn.Module) -> dict[str, nn.Parameter]:
-    params_by_target: dict[str, nn.Parameter] = {}
-    for name, param in model.named_parameters(remove_duplicate=False):
-        params_by_target[name] = param
-    return params_by_target
+    logger.info("merge_adapter: merged %d unique parameters", len(merge_ops))
+    return len(merge_ops)
 
 
 def _build_merge_ops(
     params_by_target: dict[str, nn.Parameter],
-    adapters: Sequence[tuple[Adapter, float]],
+    updates: dict[str, AdapterTargetUpdates],
     *,
     stochastic_rounding: bool,
 ) -> list[_MergeOp]:
-    """Group adapter updates and reject ambiguous parameter ties."""
-    updates: dict[str, AdapterTargetUpdates] = {}
-    for adapter, strength in adapters:
-        for target_key, target in adapter.targets.items():
-            if target_key not in params_by_target:
-                continue
-            contributions = updates.setdefault(target_key, AdapterTargetUpdates())
-            contributions.add(
-                target, strength, target_key=target_key,
-                allow_partial_targets=adapter.allow_partial_targets,
-            )
-
+    """Plan one operation per updated backing, preserving all its aliases."""
     validate_merge_target_aliases(params_by_target, updates)
     # A replacement parameter must reach every name sharing the target's
     # backing, including distinct wrapper objects over the same storage.
