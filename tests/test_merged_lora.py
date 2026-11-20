@@ -47,6 +47,7 @@ from piper_offload import (
     merge_adapter,
     register_adapter,
 )
+from piper_offload.adapter import group_adapter_updates
 from piper_offload.int4_tile_adapter import Int4TilePackedAdapter
 from piper_offload.host_module import ParameterOverride, HostModuleInstance
 from piper_offload.host_param import HostParam
@@ -338,7 +339,7 @@ def _activate_loras_for_test(
 ) -> int:
     loras, mode = _LORA_REQUESTS.pop(strategy, ([], "merge"))
     if mode == "merge":
-        targets = strategy._group_adapter_updates_by_param_name(loras)
+        targets = group_adapter_updates(loras, strategy.param_names)
         try:
             overrides = strategy._build_merge_parameter_overrides(
                 torch.device("cuda"), targets
@@ -359,7 +360,7 @@ def _activate_loras_for_test(
         _MERGE_OVERRIDES[strategy] = overrides
         return len(targets)
     _MERGE_OVERRIDES.pop(strategy, None)
-    targets = strategy._group_adapter_updates_by_param_name(loras)
+    targets = group_adapter_updates(loras, strategy.param_names)
     before = len(strategy._routed_hook_removers)
     try:
         strategy._register_routed_lora_hooks(targets)
@@ -1348,7 +1349,7 @@ class TestActivationLoraValidation:
         s = _make_strategy(m)
         lora = _make_lora(4, 16, prefix="diffusion_model.")
         _request_loras(s, [(lora, 1.0)])
-        with pytest.raises(ValueError, match="Adapter target .* is not managed"):
+        with pytest.raises(ValueError, match="not parameters in the model"):
             _activate_loras_for_test(s)
         assert not _has_parameter_update(s, "transformer_blocks.0.attn.weight")
 
@@ -1395,7 +1396,7 @@ class TestActivationLoraValidation:
         }
         _request_loras(s, [(Adapter.from_state_dict(state_dict=sd), 1.0)])
 
-        with pytest.raises(ValueError, match="Adapter target .* is not managed"):
+        with pytest.raises(ValueError, match="not parameters in the model"):
             _activate_loras_for_test(s)
         assert not _has_parameter_update(s, "transformer_blocks.0.attn.weight")
         assert not _has_parameter_update(
@@ -3190,7 +3191,7 @@ class TestRoutedMode:
         lora = Adapter.from_state_dict(state_dict=sd)
         _request_loras(s, [(lora, 1.0)], mode="routed")
         active_loras, _mode = _LORA_REQUESTS.pop(s)
-        targets = s._group_adapter_updates_by_param_name(active_loras)
+        targets = group_adapter_updates(active_loras, s.param_names)
         s._register_routed_lora_hooks(targets)
         try:
             assert len(model.embed._forward_hooks) == (1 if target == "embed" else 0)
@@ -3485,7 +3486,7 @@ class TestRoutedStaging:
         s = ModelOffloader.from_module(m, block_paths=["transformer_blocks"])
         _request_loras(s, [(bad, 1.0)], mode="routed")
 
-        with pytest.raises(ValueError, match="not managed"):
+        with pytest.raises(ValueError, match="not parameters in the model"):
             _activate(s, torch.device("cpu"))
 
         assert s.active_device is None

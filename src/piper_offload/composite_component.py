@@ -3,6 +3,7 @@
 import contextlib
 from collections.abc import Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Self
 
 import torch
@@ -12,7 +13,7 @@ from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent, BlockComponentStore
 from .block_mode import BlockMode
 from .host_component import HostComponent, HostComponentStore
-from .host_module import ParameterOverride
+from .host_module import HostModuleInstance, HostModuleStore, ParameterOverride
 from .module_names import buffer_names, parameter_names
 
 
@@ -56,7 +57,7 @@ class CompositeComponent:
             yield component
         yield from self._blocks
 
-    @property
+    @cached_property
     def param_names(self) -> frozenset[str]:
         return frozenset(name for component in self._components() for name in component.param_names)
 
@@ -86,7 +87,7 @@ class CompositeComponent:
 
         overrides = {} if parameter_overrides is None else dict(parameter_overrides)
         if overrides:
-            unknown = sorted(set(overrides) - set(self.param_names))
+            unknown = sorted(overrides.keys() - self.param_names)
             if unknown:
                 raise ValueError(
                     f"Parameter overrides contain unmanaged names: {unknown!r}."
@@ -166,70 +167,13 @@ class CompositeComponentStore:
         transient_paths: Sequence[str] = (),
         include_block_trainables: bool = False,
     ) -> Self:
-        persistent_paths = tuple(block_paths)
-        transient_paths_with_blocks = tuple(transient_block_paths)
-        overlap = set(persistent_paths) & set(transient_paths_with_blocks)
-        if overlap:
-            raise ValueError(
-                f"block_paths and transient_block_paths must be disjoint; both contain {sorted(overlap)!r}."
-            )
-        for path in transient_paths_with_blocks:
-            blocks = model.get_submodule(path)
-            if isinstance(blocks, nn.ModuleList) and len({id(block) for block in blocks}) != len(blocks):
-                raise ValueError(
-                    "transient_block_paths does not support aliased block "
-                    f"modules; {path!r} contains repeated module objects."
-                )
-
-        def make_block_store(blocks_path: str) -> BlockComponentStore:
-            return BlockComponentStore.from_module(
-                model,
-                blocks_path=blocks_path,
-                include_block_trainables=include_block_trainables,
-            )
-
-        block_stores = tuple(make_block_store(blocks_path) for blocks_path in persistent_paths)
-        transient_block_stores = tuple(make_block_store(blocks_path) for blocks_path in transient_paths_with_blocks)
-        all_block_stores = (*block_stores, *transient_block_stores)
-        block_params = {name for store in all_block_stores for name in store.param_names}
-        block_buffers = {name for store in all_block_stores for name in store.buffer_names}
-        resident_params = parameter_names(model) - block_params
-        resident_buffers = buffer_names(model) - block_buffers
-        transient_stores: list[tuple[str, HostComponentStore]] = []
-        for path in transient_paths:
-            module = model.get_submodule(path)
-            prefix = f"{path}." if path else ""
-            selected_params = {f"{prefix}{name}" for name in parameter_names(module)} & resident_params
-            selected_buffers = {f"{prefix}{name}" for name in buffer_names(module)} & resident_buffers
-            if not selected_params and not selected_buffers:
-                continue
-            transient_stores.append(
-                (
-                    path,
-                    HostComponentStore.from_module(
-                        model,
-                        include_param_names=selected_params,
-                        include_buffer_names=selected_buffers,
-                    ),
-                )
-            )
-            resident_params -= selected_params
-            resident_buffers -= selected_buffers
-        resident_store = (
-            HostComponentStore.from_module(
-                model,
-                include_param_names=resident_params,
-                include_buffer_names=resident_buffers,
-            )
-            if resident_params or resident_buffers
-            else None
-        )
-        return cls(
-            resident_store=resident_store,
-            block_stores=block_stores,
-            transient_block_stores=transient_block_stores,
-            transient_stores=tuple(transient_stores),
-        )
+        return _capture_model(
+            model,
+            block_paths=block_paths,
+            transient_block_paths=transient_block_paths,
+            transient_paths=transient_paths,
+            include_block_trainables=include_block_trainables,
+        ).as_store(cls)
 
     @property
     def cache_bytes(self) -> int:
@@ -272,6 +216,97 @@ class CompositeComponentStore:
             transient=transient,
             transient_blocks=transient_blocks,
         )
+
+
+type _CapturedHost = tuple[HostComponentStore, HostModuleInstance]
+type _CapturedBlocks = tuple[BlockComponentStore, tuple[HostModuleInstance, ...]]
+
+
+@dataclass(slots=True)
+class _ModelCapture:
+    """Each store paired with the binding already installed on its source."""
+
+    resident: _CapturedHost | None
+    transient: list[tuple[str, _CapturedHost]]
+    blocks: tuple[_CapturedBlocks, ...]
+    transient_blocks: tuple[_CapturedBlocks, ...]
+
+    def as_store[S: CompositeComponentStore](self, store_type: type[S]) -> S:
+        return store_type(
+            resident_store=self.resident[0] if self.resident else None,
+            transient_stores=tuple((path, store) for path, (store, _) in self.transient),
+            block_stores=tuple(store for store, _ in self.blocks),
+            transient_block_stores=tuple(store for store, _ in self.transient_blocks),
+        )
+
+    def component(self, *, block_compile: BlockCompileConfig | None, block_mode: BlockMode) -> CompositeComponent:
+        def block_component(group: _CapturedBlocks, *, wraparound: bool) -> BlockComponent:
+            store, instances = group
+            return store._component(
+                instances, block_compile=block_compile, block_mode=block_mode, wraparound=wraparound,
+            )
+
+        blocks = tuple(block_component(group, wraparound=True) for group in self.blocks)
+        transient_blocks = tuple(block_component(group, wraparound=False) for group in self.transient_blocks)
+        return CompositeComponent(
+            resident=HostComponent(self.resident[1]) if self.resident else None,
+            blocks=(*blocks, *transient_blocks),
+            transient=tuple((path, HostComponent(instance)) for path, (_, instance) in self.transient),
+            transient_blocks=transient_blocks,
+        )
+
+
+def _capture_model(
+    model: nn.Module,
+    *,
+    block_paths: Sequence[str],
+    transient_block_paths: Sequence[str],
+    transient_paths: Sequence[str],
+    include_block_trainables: bool,
+) -> _ModelCapture:
+    overlap = set(block_paths) & set(transient_block_paths)
+    if overlap:
+        raise ValueError(
+            f"block_paths and transient_block_paths must be disjoint; both contain {sorted(overlap)!r}."
+        )
+    for path in transient_block_paths:
+        blocks = model.get_submodule(path)
+        if isinstance(blocks, nn.ModuleList) and len({id(block) for block in blocks}) != len(blocks):
+            raise ValueError(
+                "transient_block_paths does not support aliased block "
+                f"modules; {path!r} contains repeated module objects."
+            )
+
+    def capture_blocks(path: str) -> _CapturedBlocks:
+        return BlockComponentStore._capture(
+            model, blocks_path=path, include_block_trainables=include_block_trainables,
+        )
+
+    def capture_host(params: set[str], buffers: set[str]) -> _CapturedHost:
+        store, instance = HostModuleStore.capture(model, include_param_names=params, include_buffer_names=buffers)
+        return HostComponentStore(store), instance
+
+    permanent = tuple(capture_blocks(path) for path in block_paths)
+    transient_blocks = tuple(capture_blocks(path) for path in transient_block_paths)
+    resident_params = parameter_names(model)
+    resident_buffers = buffer_names(model)
+    for store, _ in (*permanent, *transient_blocks):
+        resident_params -= store.param_names
+        resident_buffers -= store.buffer_names
+    transient: list[tuple[str, _CapturedHost]] = []
+    for path in transient_paths:
+        module = model.get_submodule(path)
+        prefix = f"{path}." if path else ""
+        selected_params = {f"{prefix}{name}" for name in parameter_names(module)} & resident_params
+        selected_buffers = {f"{prefix}{name}" for name in buffer_names(module)} & resident_buffers
+        if not selected_params and not selected_buffers:
+            continue
+        transient.append((path, capture_host(selected_params, selected_buffers)))
+        resident_params -= selected_params
+        resident_buffers -= selected_buffers
+    resident = capture_host(resident_params, resident_buffers) if resident_params or resident_buffers else None
+    return _ModelCapture(resident, transient, permanent, transient_blocks)
+
 
 
 __all__ = ["CompositeComponent", "CompositeComponentStore"]

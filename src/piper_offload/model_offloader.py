@@ -15,11 +15,11 @@ from torch import nn
 
 from ._devices import canonical_device
 from ._parameter_update import plan_parameter_update, validate_merge_target_aliases
-from .adapter import Adapter, AdapterMode, AdapterTargetUpdates
+from .adapter import Adapter, AdapterMode, AdapterTargetUpdates, group_adapter_updates
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent
 from .block_mode import BlockMode
-from .composite_component import CompositeComponent, CompositeComponentStore
+from .composite_component import CompositeComponent, CompositeComponentStore, _capture_model
 from .host_component import HostComponent
 from .host_module import ParameterOverride
 from .lora import install_routed_residual_hook
@@ -177,11 +177,10 @@ class ModelOffloader:
         block_compile: BlockCompileConfig | None = None,
         transient_paths: Sequence[str] = (),
     ) -> Self:
-        """Clone and bind ``model`` as one reusable cached runtime.
+        """Capture ``model`` as one reusable cached runtime.
 
-        The intermediate component store exists only during construction.
-        Bound component instances retain the host state afterward, so the
-        model is never rebound on subsequent uses.
+        Capture installs each component's host backing on its source module.
+        The runtime retains those bindings across activations.
         ``block_compile`` applies one forward-only compile policy to every
         block group and is unused when no block group is declared. By default,
         ``block_mode`` selects how every declared block group becomes resident:
@@ -203,24 +202,16 @@ class ModelOffloader:
         preserving mappings and each adapter's physical representation. Other
         devices and incompatible views are normalized into CPU storage.
         """
-        composite_store = CompositeComponentStore.from_module(
+        captured = _capture_model(
             model,
             block_paths=block_paths,
             transient_block_paths=transient_block_paths,
             transient_paths=transient_paths,
             include_block_trainables=include_block_trainables,
         )
-        cache_bytes = composite_store.cache_bytes
-        composite = composite_store.bind(
-            model,
-            block_compile=block_compile,
-            block_mode=block_mode,
-        )
-        return cls(
-            model,
-            composite=composite,
-            cache_bytes=cache_bytes,
-        )
+        cache_bytes = captured.as_store(CompositeComponentStore).cache_bytes
+        composite = captured.component(block_compile=block_compile, block_mode=block_mode)
+        return cls(model, composite=composite, cache_bytes=cache_bytes)
 
     # ------------------------------------------------------------------ API
 
@@ -244,41 +235,6 @@ class ModelOffloader:
             )
             if strength != 0.0
         ]
-
-    def _require_managed_target(self, target_key: str) -> str:
-        """Validate that ``target_key`` names a parameter this offloader
-        manages, returning it unchanged.
-
-        Adapter target keys must match the model's own parameter paths
-        exactly. Any key remapping (stripping a ``diffusion_model.``
-        prefix, inserting a PEFT ``.base_layer.`` segment, …) is the
-        caller's responsibility when building the adapter state dict.
-        """
-        if target_key not in self.param_names:
-            sample = sorted(self.param_names)[:3]
-            raise ValueError(
-                f"Adapter target {target_key!r} is not managed by this "
-                "ModelOffloader. Adapter target keys must match the model's "
-                f"parameter names exactly. Sample managed keys: {sample} ..."
-            )
-        return target_key
-
-    def _group_adapter_updates_by_param_name(
-        self,
-        adapters: Sequence[tuple[Adapter, float]],
-    ) -> _ParameterUpdateMap:
-        per_param: _ParameterUpdateMap = {}
-        for adapter, strength in adapters:
-            for target_key, target in adapter.targets.items():
-                if adapter.allow_partial_targets and target_key not in self.param_names:
-                    continue
-                managed = self._require_managed_target(target_key)
-                contributions = per_param.setdefault(managed, AdapterTargetUpdates())
-                contributions.add(
-                    target, strength, target_key=target_key,
-                    allow_partial_targets=adapter.allow_partial_targets,
-                )
-        return per_param
 
     def _build_merge_parameter_overrides(
         self,
@@ -581,7 +537,7 @@ class ModelOffloader:
                 adapters,
                 adapter_strengths=adapter_strengths,
             )
-            updates = self._group_adapter_updates_by_param_name(active_adapters) if active_adapters else {}
+            updates = group_adapter_updates(active_adapters, self.param_names) if active_adapters else {}
             parameter_overrides: dict[str, ParameterOverride] | None = None
             if updates:
                 if adapter_mode == "merge":

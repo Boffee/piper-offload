@@ -7,7 +7,7 @@ storage and target metadata only; merge and routed execution live in their
 respective transform modules.
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Literal, Self
@@ -215,6 +215,29 @@ class Adapter:
     def allow_partial_targets(self) -> bool:
         """Whether to skip absent names and additive merges into unpopulated meta targets."""
         return self._allow_partial_targets
+
+
+def group_adapter_updates(
+    adapters: Sequence[tuple[Adapter, float]],
+    param_names: Set[str],
+) -> dict[str, AdapterTargetUpdates]:
+    """Collect contributions by exact name, omitting absent partial targets."""
+    updates: dict[str, AdapterTargetUpdates] = {}
+    missing: set[str] = set()
+    for adapter, strength in adapters:
+        for name, target in adapter.targets.items():
+            if name not in param_names:
+                if not adapter.allow_partial_targets:
+                    missing.add(name)
+                continue
+            contributions = updates.setdefault(name, AdapterTargetUpdates())
+            contributions.add(target, strength, target_key=name, allow_partial_targets=adapter.allow_partial_targets)
+    if missing:
+        raise ValueError(
+            f"Adapter targets are not parameters in the model: {sorted(missing)}. "
+            f"Target keys must match exactly. Sample model parameter keys: {sorted(param_names)[:3]}."
+        )
+    return updates
 
 
 def _parse_adapter_state_dict(
