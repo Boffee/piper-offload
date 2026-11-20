@@ -12,6 +12,7 @@ paths join ``_CONFIGS``.
 """
 
 import contextlib
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -118,11 +119,17 @@ def _fail(
     With ``persistent``, every later one raises too. With ``after``, the step
     completes first, as when an interrupt lands right behind it.
     """
+    # A lookahead may still synchronize on its worker during deactivation.
+    # Its failure can surface after cleanup succeeds. Inject into the caller's
+    # release or forward transition, whose unfinished work this test observes.
+    caller = threading.get_ident()
     calls = 0
 
     def failing[**P, R](original: Callable[P, R]) -> Callable[P, R]:
         def call(*args: P.args, **kwargs: P.kwargs) -> R:
             nonlocal calls
+            if threading.get_ident() != caller:
+                return original(*args, **kwargs)
             calls += 1
             hit = calls == occurrence or (persistent and calls > occurrence)
             if hit and not after:

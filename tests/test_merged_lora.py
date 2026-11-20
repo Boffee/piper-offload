@@ -9,6 +9,7 @@ CUDA-only tests gate on availability.
 """
 
 from collections.abc import Sequence
+from typing import get_protocol_members
 from weakref import WeakKeyDictionary, ref
 
 import pytest
@@ -44,6 +45,7 @@ from piper_offload import (
     BlockComponent,
     derive_seed,
     merge_adapter,
+    register_adapter,
 )
 from piper_offload.int4_tile_adapter import Int4TilePackedAdapter
 from piper_offload.host_module import ParameterOverride, HostModuleInstance
@@ -3934,18 +3936,21 @@ class TestMergeIntoMappedModel:
         # The mapping itself was never written.
         torch.testing.assert_close(mapped, base)
 
-    def test_distinct_parameter_objects_over_one_mapped_view_stay_tied(self, tmp_path) -> None:
+    @pytest.mark.parametrize("transpose", [False, True])
+    def test_distinct_parameter_objects_over_one_mapped_view_stay_tied(self, tmp_path, transpose) -> None:
         base = torch.randn(3, 4)
         path = tmp_path / "weights.bin"
         path.write_bytes(base.numpy().tobytes())
         mapped = torch.from_file(str(path), shared=False, size=12, dtype=torch.float32).reshape(3, 4)
+        if transpose:
+            mapped, base = mapped.T, base.T
         model = nn.Module()
-        model.target = nn.Linear(4, 3, bias=False)
-        model.tied = nn.Linear(4, 3, bias=False)
+        model.target = nn.Linear(base.shape[1], base.shape[0], bias=False)
+        model.tied = nn.Linear(base.shape[1], base.shape[0], bias=False)
         model.target.weight = nn.Parameter(mapped, requires_grad=False)
         model.tied.weight = nn.Parameter(mapped, requires_grad=False)
         assert model.tied.weight is not model.target.weight
-        dense = torch.randn(3, 4)
+        dense = torch.randn_like(base)
         adapter = Adapter.from_state_dict({"target.delta.weight": dense})
 
         assert merge_adapter(model, [(adapter, 0.5)]) == 1
@@ -3954,6 +3959,117 @@ class TestMergeIntoMappedModel:
         assert model.target.weight.untyped_storage().resizable()
         torch.testing.assert_close(model.target.weight, base + 0.5 * dense)
         torch.testing.assert_close(mapped, base)
+
+    def test_replacing_mixed_trainability_aliases_leaves_optimizer_attached(self) -> None:
+        mapped = torch.frombuffer(bytearray(24), dtype=torch.float32).reshape(2, 3)
+        model = nn.Sequential(nn.Linear(3, 2, bias=False), nn.Linear(3, 2, bias=False))
+        model[0].weight = nn.Parameter(mapped, requires_grad=False)
+        trainable = model[1].weight = nn.Parameter(mapped)
+        optimizer = torch.optim.SGD([trainable], lr=0.25)
+        delta = Adapter.from_state_dict({"0.delta.weight": torch.ones_like(mapped)})
+
+        with pytest.raises(ValueError, match="mixed requires_grad"):
+            merge_adapter(model, [(delta, 1.0)])
+        assert model[1].weight is optimizer.param_groups[0]["params"][0]
+        assert not model[0].weight.requires_grad
+        torch.testing.assert_close(mapped, torch.zeros_like(mapped))
+
+    def test_external_adapter_copy_failure_precedes_all_writes(self, request) -> None:
+        class ViewOnlyAdapter(RegularAdapter):
+            capture_host = staticmethod(RegularAdapter.capture_host_view)
+
+        model = nn.Sequential(nn.Linear(3, 2, bias=False), nn.Linear(3, 2, bias=False)).requires_grad_(False)
+        first = model[0].weight.detach().clone()
+        borrowed = torch.frombuffer(bytearray(24), dtype=torch.float32).reshape(2, 3)
+        model[1].weight = nn.Parameter(borrowed, requires_grad=False)
+        delta = Adapter.from_state_dict({f"{i}.delta.weight": torch.ones(2, 3) for i in range(2)})
+        request.addfinalizer(register_adapter(ViewOnlyAdapter))
+
+        with pytest.raises(ValueError, match="owned CPU storage"):
+            merge_adapter(model, [(delta, 1.0)])
+        torch.testing.assert_close(model[0].weight, first)
+        torch.testing.assert_close(borrowed, torch.zeros_like(borrowed))
+
+    @pytest.mark.parametrize("external_buffer", [True, False], ids=["borrowed", "owned"])
+    def test_custom_value_copy_must_be_independent(self, request, external_buffer) -> None:
+        class ViewOnlyAdapter(RegularAdapter):
+            capture_host = staticmethod(RegularAdapter.capture_host_view)
+
+        request.addfinalizer(register_adapter(ViewOnlyAdapter))
+        source = torch.frombuffer(bytearray(24), dtype=torch.float32) if external_buffer else torch.empty(6)
+        source = source.reshape(2, 3).fill_(2.0)
+        model = nn.Linear(3, 2, bias=False, device="meta").requires_grad_(False)
+        value = Adapter.from_state_dict({"weight": source}, scale_parameter_values=True)
+
+        with pytest.raises(ValueError, match="independent, owned CPU storage"):
+            merge_adapter(model, [(value, 2.0)])
+        assert model.weight.is_meta
+        torch.testing.assert_close(source, torch.full_like(source, 2.0))
+
+    @pytest.mark.parametrize("always_copy", [False, True], ids=["view", "copy"])
+    def test_registered_dense_adapter_preserves_optimizer_parameter(self, request, always_copy) -> None:
+        # Implement the public dense-merge protocol by delegation, as a third-party adapter can.
+        dense_methods = {
+            name: staticmethod(getattr(RegularAdapter, name)) for name in get_protocol_members(DenseMergeTensorAdapter)
+        }
+        if always_copy:
+            dense_methods["capture_host"] = staticmethod(lambda t: RegularAdapter.capture_host(t.clone()))
+        request.addfinalizer(register_adapter(type("ExternalDenseAdapter", (), dense_methods)))
+        model = nn.Sequential(nn.Linear(2, 3, bias=False))
+        weight = model[0].weight = nn.Parameter(torch.zeros(2, 3).T)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.25)
+        delta = Adapter.from_state_dict({"0.delta.weight": torch.ones_like(weight)})
+
+        merge_adapter(model, [(delta, 1.0)])
+        assert model[0].weight is weight
+        weight.grad = torch.ones_like(weight)
+        optimizer.step()
+        torch.testing.assert_close(model[0].weight, torch.full_like(weight, 0.75))
+
+    @pytest.mark.parametrize("mapped", [True, False], ids=["mapped", "owned"])
+    def test_wrapper_merge_uses_physical_payload(self, request, tmp_path, mapped) -> None:
+        class Packed(nn.Parameter):
+            def __new__(cls, payload, requires_grad=False):
+                wrapper = super().__new__(cls, torch.zeros_like(payload), requires_grad)
+                wrapper.payload = payload
+                return wrapper
+
+        class PackedAdapter(RegularAdapter):
+            @staticmethod
+            def matches(t):
+                return isinstance(t, Packed)
+
+            @staticmethod
+            def tensor_id(t):
+                return RegularAdapter.tensor_id(t.payload)
+
+            @staticmethod
+            def capture_host(t):
+                return RegularAdapter.capture_host(t.payload)
+
+            @staticmethod
+            def cpu_param(state, *, requires_grad=False):
+                return Packed(state.data, requires_grad)
+
+            @staticmethod
+            def merge_dense_(target, *args, **kwargs):
+                RegularAdapter.merge_dense_(target.payload, *args, **kwargs)
+
+        path = tmp_path / "packed"
+        path.write_bytes(bytes(24))
+        data = torch.from_file(str(path), shared=True, size=6) if mapped else torch.zeros(6)
+        # Normal capture would make the transposed payload contiguous in both cases.
+        weight = Packed(data.reshape(2, 3).T)
+        model = nn.Sequential(nn.Linear(2, 3, bias=False))
+        model[0].weight = weight
+        delta = Adapter.from_state_dict({"0.delta.weight": torch.ones(3, 2)})
+        request.addfinalizer(register_adapter(PackedAdapter))
+
+        merge_adapter(model, [(delta, 1.0)])
+        assert (model[0].weight is weight) == (not mapped)
+        torch.testing.assert_close(model[0].weight.payload, torch.ones(3, 2))
+        if mapped:
+            assert path.read_bytes() == bytes(24)
 
 
 class TestIntrinsicLoRAScale:

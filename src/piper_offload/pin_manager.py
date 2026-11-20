@@ -447,6 +447,7 @@ class PinManager:
         requests = self._requests(tensors)
         held: dict[int, _Registration] = {}
         created: list[_Registration] = []
+        pageable: list[int] = []
         pending: list[_Pending] = []
         releases: ReleaseBatch | None = None
         try:
@@ -460,6 +461,9 @@ class PinManager:
                     registration = self._registrations.get(pointer)
                     if registration is not None:
                         self._hold(registration, request, held)
+                    else:
+                        self._hold_pageable(pointer, request)
+                        pageable.append(pointer)
                 if not pin:
                     return self._open_lease(requests, held)
                 releases = self._memory.release_batch()
@@ -479,6 +483,7 @@ class PinManager:
                 self._discard_pending(pending)
                 for registration in created:
                     registration.retired = True
+                self._release_pageable(pointer for pointer in pageable if pointer not in held)
                 self._release(tuple(held.values()))
             if releases is not None:
                 releases.finish()
@@ -509,19 +514,21 @@ class PinManager:
                         return True
         return False
 
+    def _hold_pageable(self, pointer: int, request: _Request) -> None:
+        """Claim the range before releasing the lock to prepare any copies."""
+        pageable = self._pageable.get(pointer)
+        if pageable is None:
+            pageable = _Pageable(request.storage.nbytes())
+            self._pageable[pointer] = pageable
+            self._starts.insert(bisect_left(self._starts, pointer), pointer)
+        pageable.leases += 1
+
     def _open_lease(self, requests: dict[int, _Request], held: dict[int, _Registration]) -> PinLease:
         key = self._next_lease
         self._next_lease += 1
         pageable_pointers = () if len(held) == len(requests) else tuple(
             pointer for pointer in requests if pointer not in held
         )
-        for pointer in pageable_pointers:
-            pageable = self._pageable.get(pointer)
-            if pageable is None:
-                pageable = _Pageable(requests[pointer].storage.nbytes())
-                self._pageable[pointer] = pageable
-                self._starts.insert(bisect_left(self._starts, pointer), pointer)
-            pageable.leases += 1
         self._leases[key] = _LeaseState(
             tuple(held.values()),
             pageable_pointers,
@@ -634,10 +641,7 @@ class PinManager:
         registration = self._registrations.get(pointer)
         if registration is not None:
             return registration.size
-        pageable = self._pageable.get(pointer)
-        if pageable is not None:
-            return pageable.size
-        return self._pending[pointer].request.storage.nbytes()
+        return self._pageable[pointer].size
 
     @staticmethod
     def _boundaries(pointer: int, size: int) -> tuple[int, ...]:
@@ -656,11 +660,11 @@ class PinManager:
         """Reserve every unheld storage the budget allows, in request order, into ``pending``.
 
         In-place storage reserves its pages; checkpoint storage gets a
-        reserved copy. Each stays in ``self._pending``, and its range in
-        ``self._starts``, until it registers or is evicted.
+        reserved copy. Only the sole pageable holder can promote a range.
+        Other acquisitions of that range wait while registration is pending.
         """
         for pointer, request in requests.items():
-            if pointer in held or pointer in self._pageable:
+            if pointer in held or self._pageable[pointer].leases > 1:
                 continue
             source = file_slice(request.storage)
             if source is None:
@@ -670,7 +674,6 @@ class PinManager:
             if item is not None:
                 pending.append(item)
                 self._pending[pointer] = item
-                self._starts.insert(bisect_left(self._starts, pointer), pointer)
 
     def _reserve_in_place(self, pointer: int, request: _Request) -> _InPlace | None:
         size = request.storage.nbytes()
@@ -740,6 +743,7 @@ class PinManager:
             self._registrations[item.pointer] = outcome
             created.append(outcome)
             self._hold(outcome, item.request, held)
+            del self._pageable[item.pointer]  # its range is now held by the registration
         else:
             self._evict_pending(item)
         del self._pending[item.pointer]
@@ -771,8 +775,7 @@ class PinManager:
         return _Registration(item.pointer, size, item.request.storage, item.load.copy)
 
     def _evict_pending(self, item: _Pending) -> None:
-        """Take back pending storage's reservation and range, freeing its copy."""
-        self._starts.pop(bisect_left(self._starts, item.pointer))
+        """Release the pin reservation. The acquisition still holds the pageable range."""
         if isinstance(item, _InPlace):
             self._unreserve_range(item.pointer, item.request.storage.nbytes())
         else:
@@ -914,18 +917,21 @@ class PinManager:
         if self._max_pinned_bytes is not None and self._pinned_bytes > self._max_pinned_bytes:
             self._fit(lambda: 0)
 
+    def _release_pageable(self, pointers: Iterable[int]) -> None:
+        for pointer in pointers:
+            pageable = self._pageable[pointer]
+            pageable.leases -= 1
+            if pageable.leases == 0:
+                del self._pageable[pointer]
+                self._starts.pop(bisect_left(self._starts, pointer))
+
     def _close_lease(self, key: int) -> None:
         with self._lock:
             state = self._leases.get(key)
             if state is None:
                 return
             self._release(state.registrations)
-            for pointer in state.pageable:
-                pageable = self._pageable[pointer]
-                pageable.leases -= 1
-                if pageable.leases == 0:
-                    del self._pageable[pointer]
-                    self._starts.pop(bisect_left(self._starts, pointer))
+            self._release_pageable(state.pageable)
             del self._leases[key]
             self._drop_lifetime_root_if_empty()
 

@@ -916,6 +916,41 @@ def test_pageable_lease_registers_nothing_and_holds_its_storage(backend: FakeBac
     manager.clear()
 
 
+@pytest.mark.parametrize("pin", [False, True], ids=["pageable", "over-budget"])
+def test_pageable_acquisition_claims_storage_before_unlocking(backend, monkeypatch, request, pin) -> None:
+    manager = PinManager(0 if pin else 2 * PAGE, backend=backend)
+    request.addfinalizer(manager.clear)
+    (tensor,) = _tensors((0, PAGE))
+    unlocked = threading.Event()
+    competing_acquire_done = threading.Event()
+    lock = manager._lock
+
+    class PauseAtFirstUnlock:
+        def __enter__(self):
+            lock.acquire()
+
+        def __exit__(self, *_exc):
+            lock.release()
+            if not unlocked.is_set():
+                unlocked.set()
+                assert competing_acquire_done.wait(5)
+
+    monkeypatch.setattr(manager, "_lock", PauseAtFirstUnlock())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(manager.acquire, [tensor], pin=pin)
+        try:
+            assert unlocked.wait(5)
+            manager.max_pinned_bytes = 2 * PAGE
+            with manager.acquire([tensor]) as competing:
+                assert competing.pageable_bytes == PAGE
+                assert backend.register_calls == []
+        finally:
+            competing_acquire_done.set()
+            first.result(timeout=5).close()
+    with manager.acquire([tensor]) as later:
+        assert later.registered_bytes == PAGE
+
+
 def test_pageable_lease_holds_existing_registrations_out_of_eviction(backend: FakeBackend) -> None:
     manager = PinManager(2 * PAGE, backend=backend)
     held, fresh, extra = _tensors((0, PAGE), (PAGE, PAGE), (2 * PAGE, PAGE))

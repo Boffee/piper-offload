@@ -26,11 +26,10 @@ capability protocols, and plain tensor implementation live here; built-in and
 external adapter selection lives in :mod:`tensor_adapter_registry`.
 """
 
-import contextlib
-from collections.abc import Generator, Mapping
+from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import torch
 from torch import nn
@@ -66,7 +65,9 @@ __all__ = [
     "validate_broadcast_merge",
 ]
 
-_force_host_copy: ContextVar[bool] = ContextVar("force_host_copy", default=False)
+_host_capture_mode: ContextVar[Literal["transfer", "view", "copy"]] = ContextVar(
+    "host_capture_mode", default="transfer",
+)
 
 
 def host_state_is_owned[HostStateT](
@@ -82,19 +83,23 @@ def host_state_is_owned[HostStateT](
     return all(tensor.untyped_storage().resizable() for tensor in adapter.storage_tensors(state))
 
 
-@contextlib.contextmanager
-def independent_host_capture() -> Generator[None]:
-    """Force adapter capture to make independent physical CPU storage.
+def view_host_state[S](adapter: TensorAdapter[S, Any], tensor: torch.Tensor) -> S:
+    """Request the live physical CPU views. An adapter with its own copy logic may still return a copy."""
+    with _host_capture_mode.set("view"):
+        return adapter.capture_host(tensor)
 
-    Ordinary store construction transfers compatible CPU backing. Permanent
-    parameter values need a distinct representation because later scaling may
-    mutate it; this scope makes every nested structured-storage capture copy.
-    """
-    token = _force_host_copy.set(True)
-    try:
-        yield
-    finally:
-        _force_host_copy.reset(token)
+
+def clone_host_state[S](adapter: TensorAdapter[S, Any], tensor: torch.Tensor, source: S) -> S:
+    """Capture writable CPU storage disjoint from the source's physical tensors."""
+    with _host_capture_mode.set("copy"):
+        clone = adapter.capture_host(tensor)
+    source_pointers = {t.untyped_storage().data_ptr() for t in adapter.storage_tensors(source) if t.numel()}
+    for part in adapter.storage_tensors(clone):
+        storage = part.untyped_storage()
+        if not storage.resizable() or (part.numel() and storage.data_ptr() in source_pointers):
+            raise ValueError(f"{adapter_name(adapter)} did not produce independent, owned CPU storage.")
+    return clone
+
 
 @runtime_checkable
 class TensorAdapter[HostStateT, GpuStateT](Protocol):
@@ -145,6 +150,8 @@ class TensorAdapter[HostStateT, GpuStateT](Protocol):
 
         Implementations may retain compatible complete CPU allocations and
         views into non-resizable storage so file mappings survive capture.
+        Pass physical tensors to :func:`capture_host_tensor` so a permanent merge
+        can inspect their original views or request independent, writable storage.
         Preserve the encoded data and metadata required by this adapter's
         movement and reconstruction operations.
         """
@@ -620,6 +627,9 @@ def capture_host_tensor(
     normalized into a new CPU allocation.
     """
     source = t.detach()
+    mode = _host_capture_mode.get()
+    if mode == "view":
+        return source
     source_storage = (
         source.untyped_storage() if source.layout is torch.strided else None
     )
@@ -644,7 +654,7 @@ def capture_host_tensor(
         and not source_storage.resizable()
     )
     if (
-        not _force_host_copy.get()
+        mode == "transfer"
         and source.device.type == "cpu"
         and not source.is_pinned()
         and transferable_storage
