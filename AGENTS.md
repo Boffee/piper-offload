@@ -1,79 +1,73 @@
-# piper-offload
+# Piper Offload
 
-Piper Offload caches PyTorch model and adapter state in host memory and manages
-whole-model uploads or block streaming. Piper Engine consumes pinned releases.
-
-Start with [README.md](README.md) for the public entry point and topic map.
-[Development](docs/development.md) covers architecture, extension points, and
-validation. API docstrings describe per-symbol contracts; the topic guides
-explain how those APIs work together.
+Piper Offload caches PyTorch models and adapters in host memory and moves weights
+to a device for execution. Start with the [README](README.md) for supported
+workflows and the [architecture map](docs/development.md#architecture) to find
+the code that owns a behavior.
 
 ## Engineering
 
-- Lead with the problem: what goes wrong, for whom, how often, and how badly.
-  Design for production needs and foreseeable uses. Hypothetical problems
-  usually need a note or a contract before they need a mechanism.
-- Prioritize security, memory safety, and maintainability over raw speed.
-  When a design can be simplified significantly, prefer the simpler and safer
-  implementation when the performance cost is negligible; reach for low-level
-  FFI, raw pointers, or platform-specific syscalls only when measured workloads
-  justify the added complexity.
-- Minimize how much a reader must understand to make a correct change.
-  Make ownership and invariants clear, and hide implementation details behind
-  useful interfaces. Consider the whole design: broader changes, including
-  to internal contracts, are welcome when they reduce special cases, coupling,
-  or duplicated knowledge. Remove what they supersede. Preserve unrelated
-  behavior, including which weights are pinned; make intended behavior changes
-  explicit.
-- State caller contracts in docs and docstrings. Runtime checks belong at
-  boundaries where violations would be silent or unsafe. Avoid checking the
-  same contract redundantly or adding defensive machinery for misuse the
-  contract already forbids.
-- Use strong types and let pyright prove what it can. Contain loose types at
-  boundaries and explain why they are needed.
-- Treat documentation as a coherent explanation of the current library.
-  Rework the organization and examples when the concepts change, consolidate
-  overlap, and remove obsolete material. Each explanation has one owner;
-  [documentation ownership](docs/development.md#documentation-ownership) says which.
+- Start with the caller's problem. Choose the simplest design that meets a
+  concrete need. Before adding a guard, flag, fallback, or dependency, ask
+  whether removing a path, reading less data, or narrowing an interface would
+  solve the problem.
+- Give each invariant one owner. Validate untrusted data at the boundary that
+  interprets it. Check caller preconditions where a violation would be silent
+  or unsafe. Pass validated values inward using types Pyright can check.
+  Explain loose types needed at library boundaries.
+- Before changing a parser or a resource lifetime, state what must remain true
+  on success and failure. For an asynchronous copy, identify who owns the
+  storage and what proves the last reader or writer has finished.
+- Judge simplicity across the implementation and its callers. Consolidate
+  paths when that removes duplicated decisions. Preserve unrelated behavior,
+  including which weights get pinned. If narrowing a contract would exclude a
+  documented use, follow the [versioning policy](VERSIONING.md). Piper Engine
+  consumes pinned releases.
+- Prioritize security, memory safety, and maintainability. Use low-level FFI,
+  raw pointers, or platform-specific syscalls only when measured workloads
+  justify their complexity.
+- Update the owning explanation and its examples when behavior changes. See
+  [documentation ownership](docs/development.md#documentation-ownership).
+
+## Fixing bugs
+
+1. Reproduce the reported failure through a supported call. Identify who is
+   affected and under what conditions. If it does not reproduce, report what
+   you tried and what you observed.
+2. Trace the failure to the component that owns the contract. Check sibling
+   paths and earlier fixes for the same mistake. Fix an isolated error there.
+   If the design lets it recur, change the design so one owner enforces the rule.
+3. Verify that the regression test fails for the reported reason before the
+   fix and passes afterward. Describe the cause and the caller-visible result
+   in the pull request.
 
 ## Contracts to preserve
 
-Read the relevant guide before changing its behavior:
+- [Models](docs/models.md). Factories transfer compatible host storage. Set
+  `requires_grad` before capture and keep frozen bytes immutable. Activation
+  is exclusive. Construction and activation failures have different recovery paths.
+- [Streaming](docs/streaming.md). Preserve aliases within each ownership
+  boundary (host state or one streamed block). Consult the guide for training,
+  compilation, and transient lifetimes. [Scheduling hooks](docs/development.md#scheduling-hooks)
+  must recover from interrupted, skipped, and direct calls.
+- [Adapters](docs/adapters.md) and [formats](docs/formats.md). Model-update
+  resources are immutable. Merge, routed execution, and tensor-format
+  capabilities have separate contracts.
+- [Memory](docs/memory.md). Keep mappings read-only and write to owned storage.
+  Asynchronous transfers hold pin leases. Tensor adapters copy through
+  `transfer_()`. Only repeated transfers request pinning. Memory component
+  docstrings specify Windows reclaim and lock ordering.
+- [Relay communication](src/piper_offload/communication.py). Preserve collective
+  issue order, point-to-point progress, and buffer lifetimes through completion.
+  A failed shared exchange can leave partial outputs and requires a new process group.
 
-- [Models](docs/models.md): factories transfer compatible host storage;
-  frozen bytes remain immutable; set `requires_grad` before capture. Runtime
-  activation is exclusive, and construction and activation failures have
-  different recovery paths.
-- [Streaming](docs/streaming.md): shared storage is preserved within host
-  state or one streamed block, not across their ownership boundaries.
-  Training, transient lifetimes, and compilation have distinct contracts.
-  Forward hooks must recover from interrupted, skipped, and direct calls; see
-  [scheduling hooks](docs/development.md#scheduling-hooks).
-- [Adapters](docs/adapters.md) and [formats](docs/formats.md): update resources
-  are immutable; merge, routed execution, and tensor-format capabilities are
-  separate concepts.
-- [Memory](docs/memory.md): mappings stay read-only; writes use owned storage.
-  Asynchronous transfers hold pin leases and tensor adapters copy through
-  `transfer_()`. Leases protect storage; only repeated transfers request
-  pinning. Memory component docstrings own Windows reclaim ordering and lock
-  ownership; see the [architecture map](docs/development.md#architecture).
+## Validation and review
 
-Use the code's terminology consistently; see
-[development](docs/development.md#architecture) for vocabulary.
-A resource lease and a pin lease protect different things; an `Adapter`
-resource and a tensor adapter serve different purposes.
+Use [setup and validation](docs/development.md#setup-and-validation) for the
+checks that apply to code or documentation. Report any affected hardware paths
+you could not exercise. Follow [writing tests](docs/development.md#writing-tests)
+when changing coverage.
 
-## Validation
-
-- Follow [Writing tests](docs/development.md#writing-tests) when changing coverage.
-- Tests: `uv run pytest tests -q`. GPU tests skip without suitable hardware.
-- Lint and types: `uv run ruff check .` and `uv run pyright`.
-- Write commits, pull request descriptions, and `CHANGELOG.md` entries as
-  [commits and pull requests](docs/development.md#commits-and-pull-requests) describes.
-- Reviews should explain the failure, its impact, and where it occurs. Judge
-  the resulting design, including the documentation. A finding about forbidden
-  misuse calls for a clearer contract; a new capability needs a foreseeable use.
-  A finding about an omitted detail should show a caller acting wrongly because
-  of the omission.
-
-See [VERSIONING.md](VERSIONING.md) for compatibility and release policy.
+Give substantial changes an [independent review](docs/development.md#reviews)
+focused on the contracts at risk. Follow the
+[commit, pull request, and changelog conventions](docs/development.md#commits-and-pull-requests).
