@@ -62,7 +62,8 @@ synchronously through pageable storage. Non-SUM reductions and CUDA graph
 capture are unsupported. Direct C++ functional all-gather ``out`` calls bypass
 the Python override and are unsupported for accelerator tensors.
 
-After a shared-exchange failure, outputs may be partial; destroy and recreate
+If a shared-transport collective fails or is interrupted, its outputs may be
+partial and every later operation on the group raises; destroy and recreate
 the process group. Windows GPU, ROCm, and distinct-GPU behavior need validation
 on their target hardware.
 """
@@ -92,6 +93,7 @@ from ._transfer_priority import foreground_transfer
 from .pin_manager import host_pin_manager
 
 _BACKEND_NAME = "piper_relay"
+_SHARED_BROKEN_ERROR = "shared relay failed previously; destroy and recreate the process group"
 _GLOO_EXCHANGE_TAG = 2
 _P2P_TAG_BASE = 8
 _MAX_P2P_TAG = (1 << 31) - 1 - _P2P_TAG_BASE
@@ -295,7 +297,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
         def job() -> int | None:
             with torch.no_grad():
                 if self._shared is not None and self._shared.broken:
-                    raise RuntimeError("shared relay failed previously; destroy and recreate the process group")
+                    raise RuntimeError(_SHARED_BROKEN_ERROR)
                 if ready is None:
                     body()
                     return None
@@ -375,6 +377,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
         future: Future[int | None] | None,
         body: Callable[[], int | None] | None,
         finish: Callable[[], None] | None,
+        shared: SharedRelay | None = None,
     ) -> None:
         assert future is not None
         assert body is not None
@@ -384,6 +387,8 @@ class _RelayProcessGroup(dist.ProcessGroup):
                 prev.wait()
             prev = None
             with torch.no_grad():
+                if shared is not None and shared.broken:
+                    raise RuntimeError(_SHARED_BROKEN_ERROR)
                 if ready is not None:
                     ready.synchronize()
                 ready = None
@@ -391,10 +396,11 @@ class _RelayProcessGroup(dist.ProcessGroup):
         except BaseException as error:
             future.set_exception(error)
         finally:
-            # Break any error -> traceback -> frame -> future/body cycle so
+            # Break any error -> traceback -> frame -> future/body/shared cycle so
             # worker buffers and caller tensors release without cyclic GC.
             body = None
             future = None
+            shared = None
             try:
                 finish()
             finally:
@@ -430,7 +436,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
             prev = self._p2p_tails.get(key)
             thread = threading.Thread(
                 target=self._run_p2p_lane,
-                args=(prev, ready, future, body, finish),
+                args=(prev, ready, future, body, finish, self._shared),
                 name="piper-relay-p2p",
                 daemon=True,
             )

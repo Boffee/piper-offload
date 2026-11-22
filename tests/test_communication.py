@@ -25,6 +25,7 @@ from piper_offload import _transfer_priority, communication
 from piper_offload.communication import RelayOptions, register_relay_backend
 from piper_offload._host_registration import RuntimeHostRegistration
 from piper_offload.pin_manager import PinManager, host_pin_manager
+from tests.conftest import Interrupt
 
 pytestmark = pytest.mark.skipif(not dist.is_gloo_available(), reason="CPU Gloo required")
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device required")
@@ -1772,6 +1773,60 @@ def test_shared_peer_failure_times_out_without_reusing_slots(tmp_path):
     mp.spawn(_run_shared_peer_failure, args=(str(tmp_path / "peer-failure"),), nprocs=2)
 
 
+def _run_shared_agreement_failure(rank: int, path: str, failure: str) -> None:
+    from piper_offload._relay_signal import SharedControl, shared_control_supported
+
+    torch.set_num_threads(1)
+    register_relay_backend()
+    dist.init_process_group(
+        "piper_relay", store=dist.FileStore(path, 2), rank=rank, world_size=2,
+        timeout=timedelta(seconds=15 if failure == "interrupted" and shared_control_supported() else 2),
+        pg_options=RelayOptions(transport="shared", staging_bytes=512),
+    )
+    shared = dist.group.WORLD._shared
+    store = dist.distributed_c10d._get_default_store()
+    local = torch.arange(257, dtype=torch.int64) + rank
+    output = torch.empty((2, 257), dtype=torch.int64)
+    p2p_buf = torch.empty(8, dtype=torch.int64)
+    try:
+        if failure == "absent" and rank == 0:
+            # Never joins the collective; rank 1's metadata exchange times out.
+            store.wait(["checked"], timedelta(seconds=30))
+            return
+        with pytest.MonkeyPatch.context() as patch:
+            if failure == "interrupted" and rank == 0:
+                orig_agree = shared._control.agree
+
+                def interrupted_agree(*args: object) -> None:
+                    orig_agree(*args)
+                    raise Interrupt
+
+                patch.setattr(shared._control, "agree", interrupted_agree)
+            start = time.monotonic()
+            with pytest.raises(Interrupt if failure == "interrupted" and rank == 0 else RuntimeError):
+                dist.all_gather_single(output, local)
+            elapsed = time.monotonic() - start
+            if failure == "interrupted" and rank == 1 and isinstance(shared._control, SharedControl):
+                assert elapsed < 5.0
+            assert shared.broken
+            with pytest.raises(RuntimeError, match="failed previously"):
+                dist.all_gather_single(output, local)
+            with pytest.raises(RuntimeError, match="failed previously"):
+                if rank == 0:
+                    dist.send(p2p_buf, dst=1)
+                else:
+                    dist.recv(p2p_buf, src=0)
+        if failure == "absent" and rank == 1:
+            store.set("checked", "1")
+    finally:
+        dist.destroy_process_group()
+
+
+def test_shared_failure_from_agreement_on_refuses_the_group(tmp_path):
+    cases = [(str(tmp_path / f"agreement-{failure}"), failure) for failure in ("interrupted", "absent")]
+    mp.spawn(_run_cases, args=(_run_shared_agreement_failure, cases), nprocs=2)
+
+
 def _run_shared_metadata_mismatch(rank, path, device_type):
     if device_type == "cuda":
         torch.cuda.set_device(0)
@@ -2226,6 +2281,11 @@ def test_shared_relay_gloo_control_fallback(tmp_path, monkeypatch):
         shared._agree_operation("allreduce", [sample], -1)
     assert not shared.broken
     peer_detail = None
+    agree_error = Interrupt()
+    with pytest.raises(Interrupt):
+        shared._agree_operation("allreduce", [sample], -1)
+    assert shared.broken
+    shared.broken = False
     agree_error = RuntimeError("injected gloo agree failure")
     with pytest.raises(RuntimeError, match="injected gloo agree failure"):
         shared._agree_operation("allreduce", [sample], -1)
@@ -2311,6 +2371,7 @@ def _make_fake_collective_relay(tmp_path):
     class StubControl:
         def __init__(self) -> None:
             self.fail_on_signal = False
+            self.abort_count = 0
 
         def agree(self, operation: int, nbytes: int, kind: int, detail: int, timeout: timedelta) -> None:
             del operation, nbytes, kind, detail, timeout
@@ -2324,7 +2385,7 @@ def _make_fake_collective_relay(tmp_path):
             del peer, count
 
         def abort(self) -> None:
-            pass
+            self.abort_count += 1
 
     class StubManager:
         def __init__(self) -> None:
@@ -2498,6 +2559,157 @@ def test_shared_collective_synchronizes_only_dirty_or_failed_streams(tmp_path):
             shared.broadcast(fake_cuda_tensor(torch.arange(8, dtype=torch.float32)), root=0, manager=manager)
         assert syncs() == (1, 1, 1)
         assert shared.broken
+
+
+def _raise_after(error: BaseException, before: Callable[[], None] | None = None) -> Callable[[], None]:
+    def raise_error() -> None:
+        if before is not None:
+            before()
+        raise error
+
+    return raise_error
+
+
+def _patched_fake_collective_relay(tmp_path, monkeypatch):
+    (
+        shared, control, manager, download_stream, upload_stream,
+        current, _stream_entries, track_stream, dummy_event, fake_cuda_tensor,
+    ) = _make_fake_collective_relay(tmp_path)
+    orig = (manager.acquire, download_stream.synchronize, upload_stream.synchronize, current.synchronize)
+    stream_iter = iter((download_stream, upload_stream))
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device: next(stream_iter))
+    monkeypatch.setattr(torch.cuda, "Event", dummy_event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: current)
+    monkeypatch.setattr(torch.cuda, "stream", track_stream)
+
+    def reset() -> None:
+        shared.broken = False
+        control.abort_count = 0
+        control.fail_on_signal = False
+        shared.world_size = 1
+        shared._peers = ()
+        manager.pageable_bytes = 0
+        monkeypatch.setattr(manager, "acquire", orig[0])
+        monkeypatch.setattr(download_stream, "synchronize", orig[1])
+        monkeypatch.setattr(upload_stream, "synchronize", orig[2])
+        monkeypatch.setattr(current, "synchronize", orig[3])
+        download_stream.sync_count = upload_stream.sync_count = current.sync_count = 0
+
+    return shared, control, manager, download_stream, upload_stream, current, fake_cuda_tensor, reset, orig
+
+
+def test_shared_collective_marks_broken_on_acquire_and_pre_acquire_failures(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    shared, control, manager, _dl, _ul, _cur, fake_cuda_tensor, reset, orig = (
+        _patched_fake_collective_relay(tmp_path, monkeypatch)
+    )
+    sample = fake_cuda_tensor(torch.arange(8, dtype=torch.float32))
+
+    @contextmanager
+    def failing_enter(_tensors: list[torch.Tensor]):
+        raise Interrupt
+        yield  # pragma: no cover
+
+    @contextmanager
+    def failing_exit(tensors: list[torch.Tensor]):
+        with orig[0](tensors) as lease:
+            yield lease
+            raise RuntimeError("injected release failure")
+
+    # 1. Interrupt during manager.acquire.__enter__ after agreement.
+    monkeypatch.setattr(manager, "acquire", failing_enter)
+    with pytest.raises(Interrupt):
+        with shared._collective("broadcast", [sample], 0, manager):
+            pytest.fail("collective body ran after acquire failure")
+    assert shared.broken
+    assert control.abort_count == 1
+
+    # 2. Failure during manager.acquire.__exit__ after body completes.
+    reset()
+    monkeypatch.setattr(manager, "acquire", failing_exit)
+    with pytest.raises(RuntimeError, match="injected release failure"):
+        shared.broadcast(sample, root=0, manager=manager)
+    assert shared.broken
+    assert control.abort_count == 1
+
+    # 3. pre_acquire ValueError stays usable.
+    reset()
+    with pytest.raises(ValueError, match="mismatched splits"):
+        with shared._collective(
+            "alltoall", [sample], -1, manager, pre_acquire=_raise_after(ValueError("mismatched splits")),
+        ):
+            pytest.fail("collective body ran after pre_acquire ValueError")
+    assert not shared.broken
+    assert control.abort_count == 0
+
+    # 4. pre_acquire Interrupt marks broken and aborts once.
+    with pytest.raises(Interrupt):
+        with shared._collective("alltoall", [sample], -1, manager, pre_acquire=_raise_after(Interrupt())):
+            pytest.fail("collective body ran after pre_acquire Interrupt")
+    assert shared.broken
+    assert control.abort_count == 1
+
+
+def test_shared_collective_marks_broken_on_sync_and_body_failures(tmp_path, monkeypatch):
+    shared, control, manager, download_stream, upload_stream, current, fake_cuda_tensor, reset, orig = (
+        _patched_fake_collective_relay(tmp_path, monkeypatch)
+    )
+    sample = fake_cuda_tensor(torch.arange(8, dtype=torch.float32))
+    rs_src = fake_cuda_tensor(torch.arange(8, dtype=torch.float32))
+    rs_out = fake_cuda_tensor(torch.zeros(8, dtype=torch.float32))
+
+    # 1. Interrupt during finally upload.synchronize() after clean async body.
+    monkeypatch.setattr(upload_stream, "synchronize", _raise_after(Interrupt(), before=orig[2]))
+    with pytest.raises(Interrupt):
+        shared.reduce_scatter([rs_out], [[rs_src]], manager)
+    assert upload_stream.sync_count == 1
+    assert shared.broken
+    assert control.abort_count == 1
+
+    # 2. download.synchronize() fails when both dirty; upload still syncs and relay aborts once.
+    reset()
+    monkeypatch.setattr(
+        download_stream, "synchronize",
+        _raise_after(RuntimeError("injected download sync failure"), before=orig[1]),
+    )
+    with pytest.raises(RuntimeError, match="injected download sync failure"):
+        with shared._collective("allreduce", [sample], -1, manager) as asynchronous:
+            assert asynchronous
+            shared._download_dirty = True
+            shared._upload_dirty = True
+    assert (download_stream.sync_count, upload_stream.sync_count) == (1, 1)
+    assert shared.broken
+    assert control.abort_count == 1
+
+    # 3. current_stream.synchronize() interrupt on pageable fallback.
+    reset()
+    manager.pageable_bytes = 64
+    monkeypatch.setattr(current, "synchronize", _raise_after(Interrupt(), before=orig[3]))
+    with pytest.raises(Interrupt):
+        shared.reduce_scatter([rs_out], [[rs_src]], manager)
+    assert current.sync_count == 1
+    assert shared.broken
+    assert control.abort_count == 1
+
+    # 4. Body failure calls abort() once *before* draining DMA streams.
+    reset()
+    sync_states: list[tuple[str, bool, int]] = []
+    monkeypatch.setattr(
+        download_stream, "synchronize",
+        lambda: sync_states.append(("download", shared.broken, control.abort_count)),
+    )
+    monkeypatch.setattr(
+        upload_stream, "synchronize",
+        lambda: sync_states.append(("upload", shared.broken, control.abort_count)),
+    )
+    shared.world_size = 2
+    shared._peers = ((1, 1),)
+    control.fail_on_signal = True
+    with pytest.raises(RuntimeError, match="injected signal failure"):
+        shared.broadcast(sample, root=0, manager=manager)
+    assert sync_states == [("download", True, 1), ("upload", True, 1)]
+    assert control.abort_count == 1
 
 
 def test_shared_pack_spans_and_chunk_pieces():
