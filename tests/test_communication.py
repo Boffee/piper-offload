@@ -1678,6 +1678,61 @@ def test_reject_invalid_relay_transport(transport):
         RelayOptions(transport=transport)
 
 
+def _run_ipc_option_mismatch(rank: int, path: str) -> None:
+    torch.set_num_threads(1)
+    register_relay_backend()
+    with pytest.raises(ValueError, match="must match across all ranks"):
+        dist.init_process_group(
+            "piper_relay",
+            store=dist.FileStore(path, 2),
+            rank=rank,
+            world_size=2,
+            timeout=timedelta(seconds=5),
+            pg_options=RelayOptions(transport="ipc" if rank == 0 else "shared", staging_bytes=512),
+        )
+
+
+def test_ipc_options_validation_and_mismatch(tmp_path):
+    assert RelayOptions(transport="ipc").transport == "ipc"
+    with pytest.raises(ValueError, match="staging slot"):
+        RelayOptions(staging_bytes=16, transport="ipc")._validate_group_size(2)
+
+    mp.spawn(_run_cases, args=(_run_ipc_option_mismatch, [(str(tmp_path / "ipc-opt-mismatch"),)]), nprocs=2)
+
+
+def _run_ipc_cpu_collectives(rank: int, path: str) -> None:
+    torch.set_num_threads(1)
+    register_relay_backend()
+    dist.init_process_group(
+        "piper_relay",
+        store=dist.FileStore(path, 2),
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=5),
+        pg_options=RelayOptions(transport="ipc", staging_bytes=4096),
+    )
+    try:
+        shared = dist.group.WORLD._shared
+        x = torch.full((8,), float(rank + 1))
+        dist.all_reduce(x)
+        torch.testing.assert_close(x, torch.full((8,), 3.0))
+        b = torch.full((8,), 5.0 if rank == 0 else 0.0)
+        dist.broadcast(b, src=0)
+        torch.testing.assert_close(b, torch.full((8,), 5.0))
+        local = torch.full((4,), float(rank + 1))
+        gathered = torch.empty((2, 4))
+        dist.all_gather_single(gathered, local)
+        torch.testing.assert_close(gathered, torch.tensor([[1.0] * 4, [2.0] * 4]))
+        assert not shared.ipc_active
+        assert not shared._ipc_checked
+    finally:
+        dist.destroy_process_group()
+
+
+def test_ipc_transport_cpu_collectives_leave_ipc_inactive(tmp_path):
+    mp.spawn(_run_cases, args=(_run_ipc_cpu_collectives, [(str(tmp_path / "ipc-cpu"),)]), nprocs=2)
+
+
 def test_shared_mapping_survives_failed_unregistration(monkeypatch, tmp_path):
     import weakref
     from piper_offload import _relay_shared
@@ -4388,3 +4443,924 @@ def test_p2p_cuda_mock_batch_pinning_and_shutdown(single_rank_group):
         state["fail_sync"] = False
 
         _check_p2p_pool_cap_and_shutdown(group, send_t, state, entered_event, streams, manager, reg)
+
+
+class _FakeIpcRuntime:
+    """In-memory multi-rank fake implementing IpcRuntime over CPU uint8 tensors."""
+
+    def __init__(self, *, world_size: int = 2) -> None:
+        self.lock = threading.Lock()
+        self.next_ptr = 0x1000_0000
+        self.allocs: dict[int, torch.Tensor] = {}
+        self.handles: dict[bytes, tuple[int, int]] = {}
+        self.opened: dict[int, tuple[int, int, int]] = {}
+        self.events: list[tuple[int, str, int]] = []
+        self.can_access_calls: list[tuple[int, int]] = []
+        self.bus_ids: dict[int, str] = {r: f"0000:0{r + 1}:00.0" for r in range(world_size)}
+        self.bus_to_dev: dict[str, int | None] = {f"0000:0{r + 1}:00.0": r for r in range(world_size)}
+        self.can_access: dict[tuple[int, int], bool] = {
+            (a, b): True for a in range(world_size) for b in range(world_size) if a != b
+        }
+        self.prior_error: int = 0
+        self.prior_errors: dict[int, int] = {}
+        self.fail_malloc: set[int] = set()
+        self.fail_get_handle: set[int] = set()
+        self.fail_open: set[int] = set()
+        self.raise_open: dict[int, Exception] = {}
+        self.local_rank = threading.local()
+
+    def rank(self) -> int:
+        return int(getattr(self.local_rank, "rank", 0))
+
+    def bind_rank(self, rank: int) -> None:
+        self.local_rank.rank = rank
+
+    def check_prior_error(self) -> None:
+        err = self.prior_errors.get(self.rank(), self.prior_error)
+        if err:
+            raise RuntimeError(f"Prior CUDA/HIP runtime work failed with error {err}")
+
+    def device_get_pci_bus_id(self, device_index: int) -> str | None:
+        del device_index
+        self.check_prior_error()
+        return self.bus_ids.get(self.rank(), "0000:01:00.0")
+
+    def device_get_by_pci_bus_id(self, bus_id: str) -> int | None:
+        self.check_prior_error()
+        return self.bus_to_dev.get(bus_id)
+
+    def device_can_access_peer(self, device_index: int, peer_device_index: int) -> bool:
+        self.check_prior_error()
+        with self.lock:
+            self.can_access_calls.append((device_index, peer_device_index))
+        return self.can_access.get((device_index, peer_device_index), False)
+
+    def malloc(self, nbytes: int) -> int | None:
+        self.check_prior_error()
+        r = self.rank()
+        if r in self.fail_malloc:
+            return None
+        buf = torch.zeros(nbytes, dtype=torch.uint8)
+        with self.lock:
+            self.allocs[buf.data_ptr()] = buf
+            self.events.append((r, "malloc", buf.data_ptr()))
+            return buf.data_ptr()
+
+    def free(self, ptr: int) -> None:
+        r = self.rank()
+        with self.lock:
+            self.events.append((r, "free", ptr))
+            self.allocs.pop(ptr, None)
+
+    def ipc_get_mem_handle(self, ptr: int) -> bytes | None:
+        self.check_prior_error()
+        r = self.rank()
+        if r in self.fail_get_handle:
+            return None
+        # Embed NUL bytes in the 64-byte handle so NUL preservation is always exercised.
+        raw = bytes([0, r + 1, 0, 0xFF]) + (ptr & 0xFFFF_FFFF_FFFF_FFFF).to_bytes(8, "little") + bytes(52)
+        with self.lock:
+            size = self.allocs[ptr].numel()
+            self.handles[raw] = (ptr, size)
+            self.events.append((r, "get_handle", ptr))
+        return raw
+
+    def ipc_open_mem_handle(self, handle: bytes) -> int | None:
+        self.check_prior_error()
+        r = self.rank()
+        if r in self.raise_open:
+            raise self.raise_open[r]
+        if r in self.fail_open or len(handle) != 64:
+            return None
+        with self.lock:
+            entry = self.handles.get(handle)
+            if entry is None:
+                return None
+            target, size = entry
+            alias = self.next_ptr
+            self.next_ptr += ((size + 4095) // 4096) * 4096 + 4096
+            self.opened[alias] = (r, target, size)
+            self.events.append((r, "open", alias))
+            return alias
+
+    def ipc_close_mem_handle(self, ptr: int) -> None:
+        r = self.rank()
+        with self.lock:
+            self.events.append((r, "close", ptr))
+            self.opened.pop(ptr, None)
+
+    def memcpy_async(self, dst_ptr: int, src_ptr: int, nbytes: int, stream_ptr: int) -> None:
+        import ctypes
+
+        assert stream_ptr != 0
+        if nbytes == 0:
+            return
+        with self.lock:
+            real_dst = self._resolve(dst_ptr)
+            real_src = self._resolve(src_ptr)
+            self.events.append((self.rank(), "memcpy", nbytes))
+        ctypes.memmove(real_dst, real_src, nbytes)
+
+    def _resolve(self, ptr: int) -> int:
+        for alias, (_r, target, size) in self.opened.items():
+            if alias <= ptr < alias + size:
+                return target + (ptr - alias)
+        return ptr
+
+
+class _FakeIpcTensor:
+    """CPU-backed CUDA tensor stand-in supporting _relay_shared and IpcArena slice copies."""
+
+    def __init__(self, data: torch.Tensor, device: torch.device) -> None:
+        self.data = data
+        self.device = device
+        self.dtype = data.dtype
+        self.nbytes = data.nbytes
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        del types
+        unwrapped = [a.data if isinstance(a, _FakeIpcTensor) else a for a in args]
+        kw = {k: (v.data if isinstance(v, _FakeIpcTensor) else v) for k, v in (kwargs or {}).items()}
+        return func(*unwrapped, **kw)
+
+    def numel(self) -> int:
+        return self.data.numel()
+
+    def data_ptr(self) -> int:
+        return self.data.data_ptr()
+
+    def is_contiguous(self) -> bool:
+        return self.data.is_contiguous()
+
+    def reshape(self, *shape: int) -> _FakeIpcTensor:
+        return _FakeIpcTensor(self.data.reshape(*shape), self.device)
+
+    def view(self, dtype: torch.dtype) -> _FakeIpcTensor:
+        return _FakeIpcTensor(self.data.view(dtype), self.device)
+
+    def __getitem__(self, key: object) -> _FakeIpcTensor:
+        return _FakeIpcTensor(self.data[key], self.device)  # type: ignore[index]
+
+    def copy_(self, src: object, non_blocking: bool = False) -> _FakeIpcTensor:
+        del non_blocking
+        raw = src.data if isinstance(src, _FakeIpcTensor) else src
+        self.data.copy_(raw)  # type: ignore[arg-type]
+        return self
+
+    def add_(self, src: object) -> _FakeIpcTensor:
+        raw = src.data if isinstance(src, _FakeIpcTensor) else src
+        self.data.add_(raw)  # type: ignore[arg-type]
+        return self
+
+
+def _run_threaded(world_size: int, worker: Callable[[int], None]) -> None:
+    errors: list[BaseException] = []
+
+    def target(rank: int) -> None:
+        try:
+            worker(rank)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=target, args=(r,)) for r in range(world_size)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert not any(t.is_alive() for t in threads)
+    if errors:
+        raise errors[0]
+
+
+class _FakeExchange:
+    """In-memory multi-rank byte exchange matching ProcessGroupGloo.allgather."""
+
+    def __init__(self, world_size: int) -> None:
+        self.world_size = world_size
+        self.cond = threading.Condition()
+        self.rank_round = [0] * world_size
+        self.slots: dict[int, dict[int, bytes]] = {}
+
+    @property
+    def rounds_completed(self) -> int:
+        return min(self.rank_round)
+
+    def make_exchange(self, rank: int):
+        def exchange(payload: bytes, timeout: timedelta) -> list[bytes]:
+            deadline = time.monotonic() + timeout.total_seconds()
+            with self.cond:
+                rid = self.rank_round[rank]
+                self.rank_round[rank] = rid + 1
+                bucket = self.slots.setdefault(rid, {})
+                bucket[rank] = payload
+                self.cond.notify_all()
+                while len(bucket) < self.world_size:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0 or not self.cond.wait(rem):
+                        raise RuntimeError("fake ipc exchange timed out")
+                return [bucket[r] for r in range(self.world_size)]
+
+        return exchange
+
+
+class _FakeCloseBarrier:
+    """Bounded thread barrier simulating SharedControl close rendezvous."""
+
+    def __init__(self, world_size: int) -> None:
+        self.world_size = world_size
+        self.cond = threading.Condition()
+        self.arrived = 0
+
+    def wait(self, timeout: timedelta) -> None:
+        deadline = time.monotonic() + timeout.total_seconds()
+        with self.cond:
+            self.arrived += 1
+            self.cond.notify_all()
+            while self.arrived < self.world_size:
+                rem = deadline - time.monotonic()
+                if rem <= 0 or not self.cond.wait(rem):
+                    raise RuntimeError("fake ipc close barrier timed out")
+
+
+class _FakeGlooGroup:
+    def __init__(self, rank: int, exchange: _FakeExchange) -> None:
+        self._exchange = exchange.make_exchange(rank)
+
+    def allgather(self, gathered: list[list[torch.Tensor]], local: list[torch.Tensor]):
+        payload = bytes(local[0].tolist())
+        exchange = self._exchange
+
+        class Work:
+            def wait(self, timeout: timedelta = timedelta(seconds=5)) -> bool:
+                replies = exchange(payload, timeout)
+                for dst, raw in zip(gathered[0], replies, strict=True):
+                    dst.copy_(torch.frombuffer(bytearray(raw), dtype=torch.uint8))
+                return True
+
+        return Work()
+
+
+class _FakeIpcControl:
+    """In-memory per-peer monotonic signal and agreement controller matching SharedControl."""
+
+    def __init__(self, rank: int, ws: int, cond: threading.Condition, shared_state: dict[str, object]) -> None:
+        self.rank = rank
+        self.ws = ws
+        self.cond = cond
+        self.shared_state = shared_state
+        self.epoch = 0
+        self.expected_ready = [0] * ws
+        self.expected_free = [0] * ws
+
+    def agree(self, op: int, nbytes: int, kind: int, detail: int, timeout: timedelta) -> None:
+        deadline = time.monotonic() + timeout.total_seconds()
+        agree_slots: dict[int, dict[int, tuple[tuple[int, int, int, int], int, int]]] = (
+            self.shared_state["agree"]  # type: ignore[assignment]
+        )
+        ready_seq: list[int] = self.shared_state["ready"]  # type: ignore[assignment]
+        free_seq: list[int] = self.shared_state["free"]  # type: ignore[assignment]
+        with self.cond:
+            self.epoch += 1
+            ep = agree_slots.setdefault(self.epoch, {})
+            ep[self.rank] = ((op, nbytes, kind, detail), ready_seq[self.rank], free_seq[self.rank])
+            self.cond.notify_all()
+            while len(ep) < self.ws:
+                rem = deadline - time.monotonic()
+                if rem <= 0 or not self.cond.wait(rem):
+                    raise RuntimeError("fake control agree timed out")
+            if any(meta != (op, nbytes, kind, detail) for meta, _, _ in ep.values()):
+                raise ValueError(
+                    "shared relay collective operation, device, payload bytes and root/dtype must match across ranks",
+                )
+            self.expected_ready = [ep[r][1] for r in range(self.ws)]
+            self.expected_free = [ep[r][2] for r in range(self.ws)]
+
+    def signal(
+        self, peers: Sequence[tuple[int | None, int | None]], tag: int, sequence: int, timeout: timedelta,
+    ) -> None:
+        del sequence
+        deadline = time.monotonic() + timeout.total_seconds()
+        seq_key = "ready" if tag == 0 else "free"
+        seq: list[int] = self.shared_state[seq_key]  # type: ignore[assignment]
+        expected = self.expected_ready if tag == 0 else self.expected_free
+        send = any(s is not None for s, _ in peers)
+        recvs = [r for _, r in peers if r is not None]
+        with self.cond:
+            if send:
+                seq[self.rank] += 1
+                self.cond.notify_all()
+            targets = [(p, expected[p] + 1) for p in recvs]
+            for p, tgt in targets:
+                expected[p] = tgt
+            while any(seq[p] < tgt for p, tgt in targets):
+                rem = deadline - time.monotonic()
+                if rem <= 0 or not self.cond.wait(rem):
+                    raise RuntimeError("fake control signal timed out")
+
+    def skip_ready(self, peer: int, count: int) -> None:
+        self.expected_ready[peer] += count
+
+    def abort(self) -> None:
+        with self.cond:
+            self.cond.notify_all()
+
+
+def _make_ipc_collective_env(world_size: int, staging_bytes: int, rt: _FakeIpcRuntime, tmp_path, patch):
+    from contextlib import contextmanager
+    from piper_offload import _relay_ipc, _relay_shared
+
+    cond = threading.Condition()
+    ctl_state: dict[str, object] = {"agree": {}, "ready": [0] * world_size, "free": [0] * world_size}
+
+    class FakeStream:
+        def __init__(self, device: torch.device, sid: int) -> None:
+            self.device = device
+            self.cuda_stream = sid
+
+        def wait_stream(self, other: object) -> None:
+            del other
+
+        def synchronize(self) -> None:
+            pass
+
+    class FakeEvent:
+        def record(self, stream: object) -> None:
+            del stream
+
+        def synchronize(self) -> None:
+            pass
+
+    rank_local = threading.local()
+    stream_counter = threading.local()
+
+    orig_empty = torch.empty
+
+    def fake_empty(*args: object, **kwargs: object):
+        dev = kwargs.get("device")
+        if isinstance(dev, torch.device) and dev.type == "cuda":
+            cpu_kw = {k: v for k, v in kwargs.items() if k != "device"}
+            return _FakeIpcTensor(orig_empty(*args, **cpu_kw), dev)  # type: ignore[call-overload]
+        return orig_empty(*args, **kwargs)  # type: ignore[call-overload]
+
+    def fake_stream(device: torch.device) -> FakeStream:
+        idx = getattr(stream_counter, "idx", 0) + 1
+        stream_counter.idx = idx
+        return FakeStream(device, 1000 + rank_local.rank * 10 + idx)
+
+    @contextmanager
+    def fake_ctx(obj: object):
+        del obj
+        yield
+
+    patch.setattr(_relay_ipc.os, "getpid", lambda: 10_000 + getattr(rank_local, "rank", 0))
+    patch.setattr(_relay_ipc, "load_ipc_runtime", lambda: rt)
+    patch.setattr(_relay_shared, "_load_triton_sum", lambda: None)
+    patch.setattr(torch, "empty", fake_empty)
+    patch.setattr(torch.cuda, "Stream", fake_stream)
+    patch.setattr(torch.cuda, "Event", FakeEvent)
+    patch.setattr(torch.cuda, "current_stream", lambda device: FakeStream(device, 1))
+    patch.setattr(torch.cuda, "stream", fake_ctx)
+    patch.setattr(torch.cuda, "device", fake_ctx)
+
+    store = dist.FileStore(str(tmp_path / "ipc-harness"), 1)
+    patch.setattr(_relay_shared, "shared_control_supported", lambda: False)
+
+    relays: dict[int, _relay_shared.SharedRelay] = {}
+    exch = _FakeExchange(world_size)
+
+    def create_relay(r: int) -> None:
+        rank_local.rank = r
+        relay = _relay_shared.SharedRelay(
+            store,
+            _FakeGlooGroup(r, exch),  # type: ignore[arg-type]
+            rank=r,
+            world_size=world_size,
+            nbytes=staging_bytes,
+            timeout=timedelta(seconds=5),
+            ipc=True,
+        )
+        relay._control = _FakeIpcControl(r, world_size, cond, ctl_state)
+        relays[r] = relay
+
+    _run_threaded(world_size, create_relay)
+    return relays, rank_local
+
+
+def _check_ipc_collectives_on_rank(
+    rank: int,
+    world_size: int,
+    relay,
+    rank_local: threading.local,
+    rt: _FakeIpcRuntime,
+    manager: object,
+    acquire_calls_ref: list[int],
+) -> None:
+    rt.bind_rank(rank)
+    rank_local.rank = rank
+    dev = torch.device("cuda", rank)
+
+    def wrap(t: torch.Tensor) -> _FakeIpcTensor:
+        return _FakeIpcTensor(t, dev)
+
+    # 1. broadcast & scatter
+    bcast = wrap(torch.arange(64, dtype=torch.int64) if rank == 0 else torch.zeros(64, dtype=torch.int64))
+    relay.broadcast(bcast, root=0, manager=manager)
+    assert torch.equal(bcast.data, torch.arange(64, dtype=torch.int64))
+
+    sc_srcs = [wrap(torch.full((16,), float(r + 10))) for r in range(world_size)]
+    sc_out = wrap(torch.zeros(16))
+    relay.scatter(sc_srcs, sc_out, root=0, manager=manager)
+    torch.testing.assert_close(sc_out.data, torch.full((16,), float(rank + 10)))
+
+    # 2. allgather & coalesced allgather
+    ag_in = [wrap(torch.full((16,), rank + 1, dtype=torch.float32)), wrap(torch.full((8,), rank + 2.0))]
+    ag_outs = [
+        [wrap(torch.zeros(16)) for _ in range(world_size)],
+        [wrap(torch.zeros(8)) for _ in range(world_size)],
+    ]
+    relay.allgather(ag_in[:1], ag_outs[:1], manager)
+    relay.allgather(ag_in, ag_outs, manager)
+    for r in range(world_size):
+        torch.testing.assert_close(ag_outs[0][r].data, torch.full((16,), float(r + 1)))
+        torch.testing.assert_close(ag_outs[1][r].data, torch.full((8,), float(r + 2)))
+
+    # 3. allreduce: direct (< 256 KiB), RS+AG (>= 256 KiB when W >= 3), and coalesced
+    rs_calls = 0
+    orig_rs = relay._allreduce_reduce_scatter
+
+    def spy_rs(*args, **kwargs):
+        nonlocal rs_calls
+        rs_calls += 1
+        return orig_rs(*args, **kwargs)
+
+    relay._allreduce_reduce_scatter = spy_rs
+    for numel in (32, 132 * 1024):
+        ar = wrap(torch.full((numel,), float(rank + 1), dtype=torch.bfloat16))
+        relay.allreduce([ar], manager)
+        expected_sum = float(sum(r + 1 for r in range(world_size)))
+        torch.testing.assert_close(ar.data, torch.full((numel,), expected_sum, dtype=torch.bfloat16))
+    assert rs_calls == (1 if world_size == 4 else 0)
+
+    ar_c = [wrap(torch.full((12,), float(rank + 1))), wrap(torch.full((6,), float(rank + 2)))]
+    relay.allreduce(ar_c, manager)
+    torch.testing.assert_close(ar_c[0].data, torch.full((12,), float(sum(r + 1 for r in range(world_size)))))
+    torch.testing.assert_close(ar_c[1].data, torch.full((6,), float(sum(r + 2 for r in range(world_size)))))
+
+    # 4. reduce_scatter single & coalesced
+    rs_srcs = [
+        wrap(torch.full((32,), float((rank + 1) * (o + 1)), dtype=torch.float16)) for o in range(world_size)
+    ]
+    rs_srcs2 = [wrap(torch.full((16,), float(rank + o + 1))) for o in range(world_size)]
+    rs_outs = [wrap(torch.zeros(32, dtype=torch.float16)), wrap(torch.zeros(16))]
+    relay.reduce_scatter(rs_outs[:1], [rs_srcs], manager)
+    rs_expected = float(sum((r + 1) * (rank + 1) for r in range(world_size)))
+    torch.testing.assert_close(rs_outs[0].data, torch.full((32,), rs_expected, dtype=torch.float16))
+    relay.reduce_scatter(rs_outs, [rs_srcs, rs_srcs2], manager)
+    torch.testing.assert_close(
+        rs_outs[1].data, torch.full((16,), float(sum(r + rank + 1 for r in range(world_size)))),
+    )
+    assert torch.all(relay.buffer == 0)
+
+    # 5. alltoall (equal + unequal splits): size exchange touches host buffer while payload uses IPC.
+    _check_ipc_alltoall_on_rank(rank, world_size, relay, manager, wrap)
+    assert relay.ipc_active and acquire_calls_ref[0] == 0
+    relay.close()
+
+
+def _check_ipc_alltoall_on_rank(
+    rank: int, world_size: int, relay, manager: object, wrap: Callable[[torch.Tensor], _FakeIpcTensor],
+) -> None:
+    eq_ins = [wrap(torch.full((8,), float(rank * 10 + dst))) for dst in range(world_size)]
+    eq_outs = [wrap(torch.zeros(8)) for _ in range(world_size)]
+    relay.alltoall(eq_outs, eq_ins, manager)
+    for src in range(world_size):
+        torch.testing.assert_close(eq_outs[src].data, torch.full((8,), float(src * 10 + rank)))
+
+    un_ins = [
+        wrap(torch.full((rank + dst + 1,), rank * 10 + dst, dtype=torch.int64)) for dst in range(world_size)
+    ]
+    un_outs = [wrap(torch.zeros(src + rank + 1, dtype=torch.int64)) for src in range(world_size)]
+    relay.alltoall(un_outs, un_ins, manager)
+    for src in range(world_size):
+        assert torch.equal(un_outs[src].data, torch.full((src + rank + 1,), src * 10 + rank, dtype=torch.int64))
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_ipc_collectives_mocked_multi_rank(tmp_path, world_size):
+    from contextlib import contextmanager
+
+    rt = _FakeIpcRuntime(world_size=world_size)
+    acquire_calls = [0]
+
+    class CountingManager:
+        @contextmanager
+        def acquire(self, _tensors: object):
+            acquire_calls[0] += 1
+            yield
+
+    manager = CountingManager()
+    with pytest.MonkeyPatch.context() as patch:
+        relays, rank_local = _make_ipc_collective_env(world_size, world_size * 3 * 128 * 1024, rt, tmp_path, patch)
+        _run_threaded(
+            world_size,
+            lambda rank: _check_ipc_collectives_on_rank(
+                rank, world_size, relays[rank], rank_local, rt, manager, acquire_calls,
+            ),
+        )
+        assert acquire_calls[0] == 0
+        for r in range(world_size):
+            r_events = [op for rr, op, _ in rt.events if rr == r]
+            close_positions = [i for i, op in enumerate(r_events) if op == "close"]
+            free_pos = r_events.index("free")
+            assert len(close_positions) == world_size - 1 and max(close_positions) < free_pos
+        assert not rt.allocs and not rt.opened
+
+
+def _make_fake_ipc_library(
+    prefix: str, state: dict[str, int], opened_handles: list[bytes], closed_ptrs: list[int], freed_ptrs: list[int],
+):
+    import ctypes
+    from types import SimpleNamespace
+
+    def get_last_error() -> int:
+        err = state["last_error"]
+        state["last_error"] = 0
+        return err
+
+    def get_bus_id(buf_ptr: int, buf_len: int, dev: int) -> int:
+        del dev
+        text = b"0000:AB:00.0\x00"
+        ctypes.memmove(buf_ptr, text, min(buf_len, len(text)))
+        return 0
+
+    def get_by_bus_id(out_ptr: object, _bus_id: bytes) -> int:
+        ctypes.cast(out_ptr, ctypes.POINTER(ctypes.c_int))[0] = 1
+        return 0
+
+    def can_access_peer(out_ptr: object, d0: int, d1: int) -> int:
+        del d0, d1
+        ctypes.cast(out_ptr, ctypes.POINTER(ctypes.c_int))[0] = 1
+        return 0
+
+    def malloc(out_ptr: object, _nbytes: int) -> int:
+        ctypes.cast(out_ptr, ctypes.POINTER(ctypes.c_void_p))[0] = 0xCAFE_0000
+        return 0
+
+    def free(ptr: int) -> int:
+        freed_ptrs.append(ptr)
+        return 0
+
+    def get_mem_handle(handle_ptr: object, _dev_ptr: int) -> int:
+        ctypes.memmove(handle_ptr, bytes([0, 0xAA, 0, 0xBB]) * 16, 64)
+        return 0
+
+    def open_mem_handle(out_ptr: object, handle: object, flags: int) -> int:
+        assert flags == 0x01
+        if state["open_rc"]:
+            state["last_error"] = state["open_rc"]
+            return state["open_rc"]
+        opened_handles.append(bytes(handle.reserved))  # type: ignore[attr-defined]
+        ctypes.cast(out_ptr, ctypes.POINTER(ctypes.c_void_p))[0] = 0xBEEF_0000
+        return 0
+
+    def close_mem_handle(ptr: int) -> int:
+        closed_ptrs.append(ptr)
+        return 0
+
+    def memcpy_async(_dst: int, _src: int, _nbytes: int, kind: int, _stream: int) -> int:
+        assert kind == 4
+        if state["memcpy_rc"]:
+            state["last_error"] = state["memcpy_rc"]
+            return state["memcpy_rc"]
+        return 0
+
+    return SimpleNamespace(**{
+        f"{prefix}GetLastError": get_last_error,
+        f"{prefix}DeviceGetPCIBusId": get_bus_id,
+        f"{prefix}DeviceGetByPCIBusId": get_by_bus_id,
+        f"{prefix}DeviceCanAccessPeer": can_access_peer,
+        f"{prefix}Malloc": malloc,
+        f"{prefix}Free": free,
+        f"{prefix}IpcGetMemHandle": get_mem_handle,
+        f"{prefix}IpcOpenMemHandle": open_mem_handle,
+        f"{prefix}IpcCloseMemHandle": close_mem_handle,
+        f"{prefix}MemcpyAsync": memcpy_async,
+    })
+
+
+@pytest.mark.parametrize("prefix", ["cuda", "hip"])
+def test_ipc_runtime_handles_nul_bytes_and_errors(monkeypatch, prefix):
+    from piper_offload import _relay_ipc
+
+    state = {"last_error": 0, "open_rc": 0, "memcpy_rc": 0}
+    opened_handles: list[bytes] = []
+    closed_ptrs: list[int] = []
+    freed_ptrs: list[int] = []
+    fake_lib = _make_fake_ipc_library(prefix, state, opened_handles, closed_ptrs, freed_ptrs)
+    rt = _relay_ipc.DeviceIpcRuntime(fake_lib, prefix)  # type: ignore[arg-type]
+    assert rt.device_get_pci_bus_id(0) == "0000:ab:00.0"
+    raw_handle = rt.ipc_get_mem_handle(0xCAFE_0000)
+    assert raw_handle == bytes([0, 0xAA, 0, 0xBB]) * 16
+    assert rt.ipc_open_mem_handle(raw_handle) == 0xBEEF_0000
+    assert opened_handles == [raw_handle]
+
+    state["open_rc"] = 101
+    assert rt.ipc_open_mem_handle(raw_handle) is None
+    assert state["last_error"] == 0
+    state["open_rc"] = 0
+
+    state["memcpy_rc"] = 202
+    with pytest.raises(RuntimeError, match="memcpyAsync failed with error 202"):
+        rt.memcpy_async(0xBEEF_0000, 0xCAFE_0000, 64, 1)
+    assert state["last_error"] == 0
+    state["memcpy_rc"] = 0
+
+    state["last_error"] = 77
+    with pytest.raises(RuntimeError, match="Prior CUDA/HIP runtime work failed with error 77"):
+        rt.malloc(64)
+    rt.ipc_close_mem_handle(0xBEEF_0000)
+    rt.free(0xCAFE_0000)
+    assert closed_ptrs == [0xBEEF_0000] and freed_ptrs == [0xCAFE_0000]
+
+    monkeypatch.setattr(_relay_ipc.sys, "platform", "win32")
+    assert _relay_ipc.load_ipc_runtime() is None
+
+
+def _open_two_ipc_arenas(
+    rt: _FakeIpcRuntime, pid_fn: Callable[[int], int], *, slot_bytes: int = 64,
+    errors_by_rank: dict[int, BaseException] | None = None,
+):
+    from piper_offload import _relay_ipc
+
+    exch = _FakeExchange(2)
+    barrier = _FakeCloseBarrier(2)
+    out: list[_relay_ipc.IpcArena | None] = [None, None]
+    tl = threading.local()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(_relay_ipc.os, "getpid", lambda: pid_fn(getattr(tl, "rank", 0)))
+
+        def worker(rank: int) -> None:
+            tl.rank = rank
+            rt.bind_rank(rank)
+            try:
+                out[rank] = _relay_ipc.open_ipc_arena(
+                    exch.make_exchange(rank),
+                    barrier.wait,
+                    rank,
+                    2,
+                    torch.device("cuda", rank),
+                    slot_bytes,
+                    3,
+                    timedelta(seconds=2),
+                    runtime=rt,
+                )
+            except BaseException as exc:
+                if errors_by_rank is None:
+                    raise
+                errors_by_rank[rank] = exc
+
+        _run_threaded(2, worker)
+    return out, exch
+
+
+def test_ipc_arena_fallbacks_and_close_semantics():
+    # 1. Same PID fallback returns None cleanly in one exchange round.
+    rt_same_pid = _FakeIpcRuntime()
+    same_pid_arenas, same_pid_exch = _open_two_ipc_arenas(rt_same_pid, lambda _r: 4242)
+    assert same_pid_arenas == [None, None] and same_pid_exch.rounds_completed == 1
+    assert not rt_same_pid.allocs
+
+    # 2. Same PCI bus ID across distinct PIDs skips device_can_access_peer and succeeds.
+    rt_same_bus = _FakeIpcRuntime()
+    rt_same_bus.bus_ids = {0: "0000:01:00.0", 1: "0000:01:00.0"}
+    arenas, _ = _open_two_ipc_arenas(rt_same_bus, lambda r: 100 + r)
+    assert all(a is not None for a in arenas) and rt_same_bus.can_access_calls == []
+    _run_threaded(2, lambda r: (rt_same_bus.bind_rank(r), arenas[r].close()))  # type: ignore[union-attr]
+    assert not rt_same_bus.allocs and not rt_same_bus.opened
+
+    # 3. device_get_by_pci_bus_id returning None (VISIBLE_DEVICES isolation) opens handle directly.
+    rt_hidden = _FakeIpcRuntime()
+    rt_hidden.bus_to_dev = {"0000:01:00.0": None, "0000:02:00.0": None}
+    arenas_hidden, _ = _open_two_ipc_arenas(rt_hidden, lambda r: 200 + r)
+    assert all(a is not None for a in arenas_hidden) and rt_hidden.can_access_calls == []
+    _run_threaded(2, lambda r: (rt_hidden.bind_rank(r), arenas_hidden[r].close()))  # type: ignore[union-attr]
+
+    # 4. Asymmetric open failure & peer-access denial close imported handles before rollback & free.
+    rt_asym = _FakeIpcRuntime()
+    rt_asym.fail_open.add(1)
+    assert _open_two_ipc_arenas(rt_asym, lambda r: 300 + r)[0] == [None, None]
+    r0_ops = [op for rr, op, _ in rt_asym.events if rr == 0]
+    assert r0_ops.index("close") < r0_ops.index("free") and not rt_asym.allocs and not rt_asym.opened
+
+    rt_no_p2p = _FakeIpcRuntime()
+    rt_no_p2p.can_access = {(0, 1): False, (1, 0): False}
+    assert _open_two_ipc_arenas(rt_no_p2p, lambda r: 400 + r)[0] == [None, None]
+    assert not rt_no_p2p.allocs and not rt_no_p2p.opened
+
+    # 5. Phase 1 single-rank error propagates to both ranks immediately and frees healthy allocations.
+    rt_p1_err = _FakeIpcRuntime()
+    rt_p1_err.prior_errors[0] = 9
+    p1_errors: dict[int, BaseException] = {}
+    _open_two_ipc_arenas(rt_p1_err, lambda r: 450 + r, errors_by_rank=p1_errors)
+    assert "Prior CUDA/HIP runtime work failed with error 9" in str(p1_errors[0])
+    assert "failed on a peer rank" in str(p1_errors[1])
+    assert not rt_p1_err.allocs
+
+    # 6. Phase 2 single-rank exception wakes peer, closes imported handles before free, and propagates.
+    rt_p2_err = _FakeIpcRuntime()
+    rt_p2_err.raise_open[0] = RuntimeError("injected open crash")
+    p2_errors: dict[int, BaseException] = {}
+    _open_two_ipc_arenas(rt_p2_err, lambda r: 460 + r, errors_by_rank=p2_errors)
+    assert "injected open crash" in str(p2_errors[0])
+    assert "failed on a peer rank" in str(p2_errors[1])
+    r1_ops = [op for rr, op, _ in rt_p2_err.events if rr == 1]
+    assert r1_ops.index("close") < r1_ops.index("free") and not rt_p2_err.allocs and not rt_p2_err.opened
+
+    # 7. close(broken=True) and close-rendezvous timeout close peer handles and skip local free.
+    rt_close = _FakeIpcRuntime()
+    arenas_close, _ = _open_two_ipc_arenas(rt_close, lambda r: 500 + r)
+    rt_close.bind_rank(0)
+    arenas_close[0].close(broken=True)  # type: ignore[union-attr]
+    rt_close.bind_rank(1)
+    arenas_close[1].close(timeout=timedelta(milliseconds=20))  # type: ignore[union-attr]
+    assert not rt_close.opened and len(rt_close.allocs) == 2
+    assert not any(op == "free" for _, op, _ in rt_close.events)
+
+
+def test_ipc_slot_view_validation():
+    from piper_offload import _relay_ipc
+
+    rt = _FakeIpcRuntime()
+    arenas, _ = _open_two_ipc_arenas(rt, lambda r: 600 + r, slot_bytes=16)
+    arena = arenas[0]
+    assert arena is not None
+    dev = torch.device("cuda", 0)
+    stream = type("S", (), {"cuda_stream": 77})()
+    local_slot = _relay_ipc.IpcSlotView(arena, 0, 0, 0, 8, stream)  # type: ignore[arg-type]
+    peer_slot = _relay_ipc.IpcSlotView(arena, 1, 0, 0, 8, stream)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="unit-stride slice"):
+        _ = local_slot[::2]
+    with pytest.raises(ValueError, match="Cannot write to a peer IPC slot"):
+        peer_slot.copy_(_FakeIpcTensor(torch.zeros(8, dtype=torch.uint8), dev))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Cannot read local IPC slot"):
+        local_slot.copy_to(_FakeIpcTensor(torch.zeros(8, dtype=torch.uint8), dev))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Expected 8 bytes"):
+        local_slot.copy_(_FakeIpcTensor(torch.zeros(12, dtype=torch.uint8), dev))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Expected 8 bytes"):
+        local_slot.copy_(_FakeIpcTensor(torch.zeros(8, dtype=torch.float32), dev))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Expected 8 bytes"):
+        peer_slot.copy_to(_FakeIpcTensor(torch.zeros(8, dtype=torch.float32), dev))  # type: ignore[arg-type]
+    with pytest.raises(IndexError, match="exceeds 16"):
+        arena.copy_to_slot(0, 12, _FakeIpcTensor(torch.zeros(8, dtype=torch.uint8), dev), stream)  # type: ignore[arg-type]
+    assert not any(op == "memcpy" for _, op, _ in rt.events)
+    rt.bind_rank(0)
+    arena.close(broken=True)
+    rt.bind_rank(1)
+    arenas[1].close(broken=True)  # type: ignore[union-attr]
+
+
+def test_ipc_device_mismatch_and_switch(tmp_path):
+    from contextlib import nullcontext
+
+    class NoPinManager:
+        def acquire(self, _tensors: object):
+            return nullcontext()
+
+    rt = _FakeIpcRuntime()
+    rt.bus_ids = {0: "0000:01:00.0", 1: "0000:01:00.0"}
+    with pytest.MonkeyPatch.context() as patch:
+        relays, rank_local = _make_ipc_collective_env(2, 4096, rt, tmp_path, patch)
+
+        def dev_worker(rank: int) -> None:
+            rank_local.rank = rank
+            rt.bind_rank(rank)
+            # 1. CPU collective does not initialize IPC.
+            relays[rank].broadcast(torch.full((4,), float(rank + 1)), root=0, manager=NoPinManager())  # type: ignore[arg-type]
+            assert not relays[rank]._ipc_checked
+            # 2. Rank 0 passes cuda:0 while rank 1 passes CPU -> ValueError mismatch without breaking.
+            t = _FakeIpcTensor(torch.ones(4), torch.device("cuda", 0)) if rank == 0 else torch.ones(4)
+            with pytest.raises(ValueError, match="must match across ranks"):
+                relays[rank].broadcast(t, root=0, manager=NoPinManager())  # type: ignore[arg-type]
+            assert not relays[rank].broken and not relays[rank]._ipc_checked
+            # 3. Both open IPC on cuda:0.
+            c0 = _FakeIpcTensor(torch.full((4,), float(rank + 1)), torch.device("cuda", 0))
+            relays[rank].broadcast(c0, root=0, manager=NoPinManager())  # type: ignore[arg-type]
+            assert relays[rank].ipc_active
+            # 4. Single-rank switch (rank 0 cuda:1 vs rank 1 cuda:0) raises ValueError cleanly.
+            sw = _FakeIpcTensor(torch.full((4,), float(rank + 5)), torch.device("cuda", 1 if rank == 0 else 0))
+            with pytest.raises(ValueError, match="must match across ranks"):
+                relays[rank].broadcast(sw, root=0, manager=NoPinManager())  # type: ignore[arg-type]
+            assert not relays[rank].broken
+            # 5. Both ranks switching together to cuda:1 agree cleanly and fall back to host.
+            c1 = _FakeIpcTensor(torch.full((4,), float(rank + 5)), torch.device("cuda", 1))
+            relays[rank].broadcast(c1, root=0, manager=NoPinManager())  # type: ignore[arg-type]
+            assert torch.equal(c1.data, torch.full((4,), 5.0))
+            relays[rank].close()
+
+        _run_threaded(2, dev_worker)
+
+
+def _exercise_ipc_cuda_collectives(rank: int, device: torch.device, shared, registration) -> None:
+    # Multi-chunk broadcast & allreduce wrap all 3 ring lanes (staging_bytes=8192 -> 1360 B/slot).
+    bc = (
+        torch.arange(2048, device=device, dtype=torch.float32)
+        if rank == 0
+        else torch.zeros(2048, device=device)
+    )
+    dist.broadcast(bc, src=0)
+    torch.testing.assert_close(bc, torch.arange(2048, device=device, dtype=torch.float32))
+
+    if sys.platform == "linux" and (torch.cuda.device_count() == 1 or torch.cuda.can_device_access_peer(0, 1)):
+        assert shared.ipc_active
+    if shared.ipc_active:
+        assert registration.register_calls == 0
+
+    reduced_large = torch.full((2048,), float(rank + 1), device=device, dtype=torch.float32)
+    dist.all_reduce(reduced_large)
+    torch.testing.assert_close(reduced_large, torch.full((2048,), 3.0, device=device))
+
+    local = torch.full((64,), float(rank + 1), device=device, dtype=torch.bfloat16)
+    gathered = torch.empty((2, 64), device=device, dtype=torch.bfloat16)
+    dist.all_gather_single(gathered, local)
+    torch.testing.assert_close(
+        gathered, torch.tensor([[1.0] * 64, [2.0] * 64], device=device, dtype=torch.bfloat16),
+    )
+
+    rs_in = torch.arange(64, device=device, dtype=torch.float32) + rank * 10
+    rs_out = torch.empty(32, device=device, dtype=torch.float32)
+    dist.reduce_scatter_tensor(rs_out, rs_in)
+    expected_rs = (torch.arange(32, device=device, dtype=torch.float32) + rank * 32) * 2 + 10
+    torch.testing.assert_close(rs_out, expected_rs)
+
+    a2a_in = torch.full((2, 8), float(rank + 1), device=device)
+    a2a_out = torch.empty((2, 8), device=device)
+    dist.all_to_all_single(a2a_out, a2a_in)
+    torch.testing.assert_close(a2a_out[0], torch.full((8,), 1.0, device=device))
+    torch.testing.assert_close(a2a_out[1], torch.full((8,), 2.0, device=device))
+
+    if shared.ipc_active:
+        assert registration.register_calls == 0
+
+
+def _run_ipc_collectives_cuda(rank: int, path: str, tcp_port: int | None) -> None:
+    import logging
+    from piper_offload import _relay_ipc
+
+    torch.set_num_threads(1)
+    device_count = torch.cuda.device_count()
+    device = torch.device("cuda", rank % device_count)
+    torch.cuda.set_device(device)
+    register_relay_backend()
+    registration = _CountingRegistration()
+    manager = PinManager(16 * 1024 * 1024, backend=registration)
+    pg_kwargs: dict[str, object] = (
+        {"init_method": f"tcp://127.0.0.1:{tcp_port}"}
+        if tcp_port is not None
+        else {"store": dist.FileStore(path, 2)}
+    )
+    dist.init_process_group(
+        "piper_relay",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=20),
+        pg_options=RelayOptions(transport="ipc", staging_bytes=8192),
+        **pg_kwargs,  # type: ignore[arg-type]
+    )
+    shared = dist.group.WORLD._shared
+    warnings: list[str] = []
+
+    class CaptureHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            warnings.append(record.getMessage())
+
+    handler = CaptureHandler(level=logging.WARNING)
+    _relay_ipc.logger.addHandler(handler)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(communication, "host_pin_manager", manager)
+        try:
+            _exercise_ipc_cuda_collectives(rank, device, shared, registration)
+            if tcp_port is not None and rank == 1:
+                time.sleep(0.05)  # Force rank 0 TCPStore teardown before rank 1 destroys group.
+        finally:
+            try:
+                dist.destroy_process_group()
+            finally:
+                _relay_ipc.logger.removeHandler(handler)
+            manager.clear()
+    assert not any("Skipping CUDA/HIP IPC buffer free" in msg for msg in warnings)
+
+
+@CUDA
+def test_ipc_transport_collectives_cuda(tmp_path):
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        tcp_port = sock.getsockname()[1]
+    mp.spawn(
+        _run_cases,
+        args=(_run_ipc_collectives_cuda, [(str(tmp_path / "ipc-cuda"), None), ("", tcp_port)]),
+        nprocs=2,
+    )

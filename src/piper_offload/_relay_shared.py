@@ -15,8 +15,8 @@ accumulation. Coalesced all-gather, SUM all-reduce, and reduce-scatter pack thei
 tensor lists into one continuous chunked transfer. On x86_64/AMD64, rank
 agreement and chunk ready/free signaling run through a small unpinned
 shared-memory control mapping; other architectures fall back to Gloo control
-messages. No GPU IPC, cross-process CUDA events, or payload socket transfers are
-needed.
+messages. Optional Linux GPU IPC staging replaces host slots with a per-rank
+device staging ring without requiring NCCL, RCCL, or cross-process GPU events.
 """
 
 import functools
@@ -37,8 +37,11 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+from ._relay_ipc import IpcArena, IpcSlotView, open_ipc_arena
 from ._relay_signal import RelayControl, SharedControl, control_bytes, shared_control_supported
 from .pin_manager import PinManager
+
+type _Slot = torch.Tensor | IpcSlotView
 
 BUFFERS_PER_RANK = 3
 _REDUCTION_LANES = 3
@@ -46,6 +49,7 @@ _MAX_FUSED_REDUCE_RANKS = _REDUCTION_LANES + 1
 _MIN_PIPELINE_CHUNK_BYTES = 1024 * 1024
 _REDUCE_SCATTER_MIN_BYTES = 256 * 1024
 _TARGET_PIPELINE_CHUNKS = 6
+_IPC_CLOSE_OP = -1
 _OPERATIONS = (
     "broadcast",
     "scatter",
@@ -180,7 +184,7 @@ def _use_reduce_scatter(world_size: int, total_bytes: int, capacity: int) -> boo
 
 
 def _copy_packed_to_slot(
-    slot: torch.Tensor,
+    slot: _Slot,
     sources: Sequence[torch.Tensor],
     spans: Sequence[tuple[int, int, int]],
     span_ends: Sequence[int],
@@ -194,11 +198,18 @@ def _copy_packed_to_slot(
         )
 
 
+def _copy_from_slot(dst: torch.Tensor, src: _Slot, *, non_blocking: bool) -> None:
+    if isinstance(src, IpcSlotView):
+        src.copy_to(dst)
+    else:
+        dst.copy_(src, non_blocking=non_blocking)
+
+
 def _make_slice_fill(
     source: torch.Tensor,
     asynchronous: bool,
-) -> Callable[[torch.Tensor, int, int], None]:
-    def fill(slot: torch.Tensor, start: int, width: int) -> None:
+) -> Callable[[_Slot, int, int], None]:
+    def fill(slot: _Slot, start: int, width: int) -> None:
         slot.copy_(source[start:start + width], non_blocking=asynchronous)
 
     return fill
@@ -209,8 +220,8 @@ def _make_packed_fill(
     spans: Sequence[tuple[int, int, int]],
     span_ends: Sequence[int],
     asynchronous: bool,
-) -> Callable[[torch.Tensor, int, int], None]:
-    def fill(slot: torch.Tensor, start: int, width: int) -> None:
+) -> Callable[[_Slot, int, int], None]:
+    def fill(slot: _Slot, start: int, width: int) -> None:
         _copy_packed_to_slot(slot, sources, spans, span_ends, start, start + width, asynchronous)
 
     return fill
@@ -331,7 +342,9 @@ class _GlooControl:
         gathered = [torch.empty_like(metadata) for _ in range(self._world_size)]
         self._group.allgather([gathered], [metadata]).wait(timeout)  # type: ignore[attr-defined]
         if any(not torch.equal(metadata, other) for other in gathered):
-            raise ValueError("shared relay collective operation, payload bytes and root/dtype must match across ranks")
+            raise ValueError(
+                "shared relay collective operation, device, payload bytes and root/dtype must match across ranks",
+            )
 
     def signal(
         self, peers: Sequence[tuple[int | None, int | None]], tag: int, sequence: int, timeout: timedelta,
@@ -369,8 +382,9 @@ class SharedRelay:
 
     def __init__(
         self, store: dist.Store, group: dist.ProcessGroupGloo, rank: int, world_size: int,
-        nbytes: int, timeout: timedelta,
+        nbytes: int, timeout: timedelta, *, ipc: bool = False,
     ) -> None:
+        self._group = group
         self._control: RelayControl
         if shared_control_supported():
             payload_mapping, control_mapping = _create_shared_mappings(
@@ -400,12 +414,54 @@ class SharedRelay:
         self._reduction_buffer: torch.Tensor | None = None
         self._download_dirty = False
         self._upload_dirty = False
+        self._ipc_enabled = ipc and world_size > 1
+        self._ipc_checked = False
+        self._ipc: IpcArena | None = None
+        self._active_ipc: IpcArena | None = None
+
+    @property
+    def ipc_active(self) -> bool:
+        return self._ipc is not None
+
+    def _ipc_mode(self, device: torch.device) -> int:
+        if not self._ipc_enabled or device.type != "cuda":
+            return 0
+        if not self._ipc_checked:
+            return 1
+        return 1 if self._ipc is not None and device == self._ipc.device else 0
+
+    def _ipc_exchange(self, payload: bytes, timeout: timedelta) -> list[bytes]:
+        local = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+        gathered = [torch.empty_like(local) for _ in range(self.world_size)]
+        self._group.allgather([gathered], [local]).wait(timeout)  # type: ignore[attr-defined]
+        return [bytes(buf.tolist()) for buf in gathered]
+
+    def _ipc_close_barrier(self, timeout: timedelta) -> None:
+        self._control.agree(_IPC_CLOSE_OP, 0, 0, 0, timeout)
+
+    def _ensure_ipc(self, device: torch.device) -> None:
+        self._ipc_checked = True
+        self._ipc = open_ipc_arena(
+            self._ipc_exchange, self._ipc_close_barrier, self.rank, self.world_size, device,
+            self.capacity, self.buffer_count, self.timeout,
+        )
+
+    def close(self) -> None:
+        ipc = self._ipc
+        self._ipc = None
+        self._active_ipc = None
+        if ipc is not None:
+            ipc.close(broken=self.broken, timeout=self.timeout)
 
     def local_buffer(self) -> torch.Tensor:
         start = self.rank * self.buffer_count * self.capacity
         return self.buffer[start:start + self.buffer_count * self.capacity]
 
-    def _slot(self, rank: int, lane: int, width: int) -> torch.Tensor:
+    def _slot(self, rank: int, lane: int, width: int) -> _Slot:
+        if self._active_ipc is not None:
+            stream = self.download if rank == self.rank else self.upload
+            assert stream is not None
+            return IpcSlotView(self._active_ipc, rank, lane, 0, width, stream)
         start = (rank * self.buffer_count + lane) * self.capacity
         return self.buffer[start:start + width]
 
@@ -442,12 +498,14 @@ class SharedRelay:
             for index, start, width in chunks:
                 if destination is not None:
                     assert sender is not None
-                    destination[start:start + width].copy_(
-                        self._slot(sender, index % self.buffer_count, width), non_blocking=asynchronous,
+                    _copy_from_slot(
+                        destination[start:start + width],
+                        self._slot(sender, index % self.buffer_count, width),
+                        non_blocking=asynchronous,
                     )
 
     def _chunks(
-        self, fill: Callable[[torch.Tensor, int, int], None] | None, length: int,
+        self, fill: Callable[[_Slot, int, int], None] | None, length: int,
         peers: Sequence[tuple[int | None, int | None]], asynchronous: bool,
         *, chunk_bytes: int | None = None,
     ) -> Generator[tuple[int, int, int]]:
@@ -557,8 +615,10 @@ class SharedRelay:
                     for _, receive in self._peers:
                         peer_slot = self._slot(receive, lane, width)
                         for ti, slot_off, t_off, part_len in pieces:
-                            byte_outputs[ti][receive][t_off:t_off + part_len].copy_(
-                                peer_slot[slot_off:slot_off + part_len], non_blocking=asynchronous,
+                            _copy_from_slot(
+                                byte_outputs[ti][receive][t_off:t_off + part_len],
+                                peer_slot[slot_off:slot_off + part_len],
+                                non_blocking=asynchronous,
                             )
 
     def _reduce_chunk_fused(
@@ -567,7 +627,7 @@ class SharedRelay:
         byte_outputs: Sequence[torch.Tensor],
         buffer: torch.Tensor,
         width: int,
-        peer_slots: Sequence[torch.Tensor | None],
+        peer_slots: Sequence[_Slot | None],
         pieces: Sequence[tuple[int, int, int, int]],
         asynchronous: bool,
         sum_ranks: Callable[[torch.Tensor, Sequence[torch.Tensor]], None],
@@ -579,7 +639,7 @@ class SharedRelay:
         for peer, peer_slot in enumerate(peer_slots):
             if peer_slot is not None:
                 stage = buffer[lane_idx * self.capacity:lane_idx * self.capacity + width]
-                stage.copy_(peer_slot, non_blocking=asynchronous)
+                _copy_from_slot(stage, peer_slot, non_blocking=asynchronous)
                 staged[peer] = stage
                 lane_idx += 1
         for ti, slot_off, t_off, part_len in pieces:
@@ -598,7 +658,7 @@ class SharedRelay:
         byte_outputs: Sequence[torch.Tensor],
         buffer: torch.Tensor,
         width: int,
-        peer_slots: Sequence[torch.Tensor | None],
+        peer_slots: Sequence[_Slot | None],
         pieces: Sequence[tuple[int, int, int, int]],
         asynchronous: bool,
         local_sources: Sequence[torch.Tensor] | None = None,
@@ -619,7 +679,7 @@ class SharedRelay:
         # once, accumulate in rank order, and cast back once per piece.
         for peer, peer_slot in enumerate(peer_slots):
             if peer_slot is not None:
-                incoming_chunk.copy_(peer_slot, non_blocking=asynchronous)
+                _copy_from_slot(incoming_chunk, peer_slot, non_blocking=asynchronous)
             for _, local, slot_off, part_len, dtype, accumulator in views:
                 value = local if peer_slot is None else incoming_chunk[slot_off:slot_off + part_len].view(dtype)
                 if peer == 0:
@@ -635,7 +695,7 @@ class SharedRelay:
         byte_outputs: Sequence[torch.Tensor],
         buffer: torch.Tensor,
         width: int,
-        peer_slots: Sequence[torch.Tensor | None],
+        peer_slots: Sequence[_Slot | None],
         pieces: Sequence[tuple[int, int, int, int]],
         asynchronous: bool,
         sum_ranks: Callable[[torch.Tensor, Sequence[torch.Tensor]], None] | None,
@@ -677,7 +737,7 @@ class SharedRelay:
         with closing(self._chunks(fill, total_bytes, self._peers, asynchronous)) as chunks:
             for index, start, width in chunks:
                 lane = index % self.buffer_count
-                peer_slots = [
+                peer_slots: list[_Slot | None] = [
                     None if peer == self.rank else self._slot(peer, lane, width)
                     for peer in range(self.world_size)
                 ]
@@ -703,7 +763,7 @@ class SharedRelay:
         sub_bytes = _shared_chunk_bytes(aligned_max_part, _reduce_scatter_sub_cap(self.capacity, self.world_size))
         other_ranks = tuple(peer for peer in range(self.world_size) if peer != self.rank)
 
-        def fill_scatter(slot: torch.Tensor, slot_start: int, width: int) -> None:
+        def fill_scatter(slot: _Slot, slot_start: int, width: int) -> None:
             stride = width // peers_count
             part_off = slot_start // peers_count
             for pos, owner in enumerate(other_ranks):
@@ -734,7 +794,7 @@ class SharedRelay:
                     continue
                 lane = index % self.buffer_count
                 my_width = hi - lo
-                peer_slots: list[torch.Tensor | None] = [None] * self.world_size
+                peer_slots: list[_Slot | None] = [None] * self.world_size
                 for peer in range(self.world_size):
                     if peer == self.rank:
                         continue
@@ -756,7 +816,7 @@ class SharedRelay:
         my_start, my_end = partitions[self.rank]
         max_part = max(end - start for start, end in partitions)
 
-        def fill_gather(slot: torch.Tensor, start: int, width: int) -> None:
+        def fill_gather(slot: _Slot, start: int, width: int) -> None:
             lo = my_start + start
             hi = min(my_end, lo + width)
             if lo < hi:
@@ -773,8 +833,10 @@ class SharedRelay:
                         continue
                     peer_slot = self._slot(receive, lane, hi - lo)
                     for ti, slot_off, t_off, part_len in _chunk_pieces(spans, span_ends, lo, hi):
-                        byte_sources[ti][t_off:t_off + part_len].copy_(
-                            peer_slot[slot_off:slot_off + part_len], non_blocking=asynchronous,
+                        _copy_from_slot(
+                            byte_sources[ti][t_off:t_off + part_len],
+                            peer_slot[slot_off:slot_off + part_len],
+                            non_blocking=asynchronous,
                         )
 
     def _allreduce_reduce_scatter(
@@ -843,7 +905,7 @@ class SharedRelay:
                 with closing(self._chunks(None, total_bytes, recv_peers, asynchronous)) as chunks:
                     for index, start, width in chunks:
                         lane = index % self.buffer_count
-                        peer_slots = [
+                        peer_slots: list[_Slot | None] = [
                             None if peer == self.rank else self._slot(peer, lane, width)
                             for peer in range(self.world_size)
                         ]
@@ -907,8 +969,10 @@ class SharedRelay:
                 for index, start, width in chunks:
                     lane = index % self.buffer_count
                     for _, receive in self._peers:
-                        gathered_bytes[receive][start:start + width].copy_(
+                        _copy_from_slot(
+                            gathered_bytes[receive][start:start + width],
                             self._slot(receive, lane, width),
+                            non_blocking=False,
                         )
         except BaseException:
             self._mark_broken()
@@ -934,7 +998,7 @@ class SharedRelay:
         other_ranks = tuple(peer for peer in range(self.world_size) if peer != self.rank)
         sub_bytes = _shared_chunk_bytes(max_pair_bytes, sub_cap)
 
-        def fill_alltoall(slot: torch.Tensor, slot_start: int, width: int) -> None:
+        def fill_alltoall(slot: _Slot, slot_start: int, width: int) -> None:
             stride = width // peers_count
             part_off = slot_start // peers_count
             for pos, target in enumerate(other_ranks):
@@ -961,7 +1025,8 @@ class SharedRelay:
                     if part_off >= hi:
                         continue
                     slot_off = (self.rank - int(self.rank > peer)) * stride
-                    dst[part_off:hi].copy_(
+                    _copy_from_slot(
+                        dst[part_off:hi],
                         self._slot(peer, lane, width)[slot_off:slot_off + (hi - part_off)],
                         non_blocking=asynchronous,
                     )
@@ -993,14 +1058,16 @@ class SharedRelay:
                             dst = byte_outputs[peer]
                             hi = min(dst.numel(), start + width)
                             if start < hi:
-                                dst[start:hi].copy_(
-                                    self._slot(peer, lane, width)[:hi - start], non_blocking=asynchronous,
+                                _copy_from_slot(
+                                    dst[start:hi],
+                                    self._slot(peer, lane, width)[:hi - start],
+                                    non_blocking=asynchronous,
                                 )
             elif self.rank in active:
                 src = byte_sources[target]
 
                 def fill_target(
-                    slot: torch.Tensor, start: int, width: int, *, source: torch.Tensor = src,
+                    slot: _Slot, start: int, width: int, *, source: torch.Tensor = src,
                 ) -> None:
                     hi = min(source.numel(), start + width)
                     if start < hi:
@@ -1047,8 +1114,10 @@ class SharedRelay:
             self.broken = True
             self._control.abort()
 
-    def _agree_operation(self, operation: str, tensors: Sequence[torch.Tensor], detail: int) -> None:
-        op_index = _OPERATIONS.index(operation)
+    def _agree_operation(
+        self, operation: str, tensors: Sequence[torch.Tensor], detail: int, *, ipc_mode: int = 0,
+    ) -> None:
+        op_index = _OPERATIONS.index(operation) + (ipc_mode << 8)
         if operation in ("allgather_coalesced", "allreduce_coalesced", "reduce_scatter_coalesced"):
             nbytes = sum(t.nbytes for t in tensors)
             kind = len(tensors)
@@ -1069,15 +1138,37 @@ class SharedRelay:
             self._mark_broken()
             raise
 
+    def _active_ipc_for(self, device: torch.device, ipc_mode: int) -> IpcArena | None:
+        if not ipc_mode:
+            return None
+        if not self._ipc_checked:
+            self._ensure_ipc(device)
+        if self._ipc is not None and device == self._ipc.device:
+            return self._ipc
+        return None
+
+    def _drain_streams(self, device: torch.device, *, asynchronous: bool, failed: bool) -> None:
+        if asynchronous:
+            try:
+                if self.download is not None and (failed or self._download_dirty):
+                    self.download.synchronize()
+            finally:
+                if self.upload is not None and (failed or self._upload_dirty):
+                    self.upload.synchronize()
+        if device.type == "cuda" and (failed or not asynchronous):
+            # Includes pageable local copies on the current stream and fallback cleanup after an error.
+            torch.cuda.current_stream(device).synchronize()
+
     @contextmanager
     def _collective(
         self, operation: str, tensors: Sequence[torch.Tensor], detail: int, manager: PinManager,
         *, pre_acquire: Callable[[], None] | None = None,
     ) -> Generator[bool]:
         device = tensors[0].device
+        ipc_mode = self._ipc_mode(device)
         # Check rank agreement before any shared-slot writes. This also keeps
         # each collective separate from earlier peer rounds.
-        self._agree_operation(operation, tensors, detail)
+        self._agree_operation(operation, tensors, detail, ipc_mode=ipc_mode)
         if pre_acquire is not None:
             try:
                 pre_acquire()
@@ -1087,11 +1178,17 @@ class SharedRelay:
                 self._mark_broken()
                 raise
         try:
-            with manager.acquire([self.buffer]) if device.type == "cuda" else nullcontext() as lease:
-                asynchronous = lease is not None and lease.pageable_bytes == 0
+            ipc = self._active_ipc_for(device, ipc_mode)
+            with (
+                nullcontext()
+                if ipc is not None or device.type != "cuda"
+                else manager.acquire([self.buffer])
+            ) as lease:
+                asynchronous = True if ipc is not None else (lease is not None and lease.pageable_bytes == 0)
                 failed = False
                 self._download_dirty = False
                 self._upload_dirty = False
+                self._active_ipc = ipc
                 try:
                     if asynchronous:
                         self._prepare_streams(device)
@@ -1103,19 +1200,10 @@ class SharedRelay:
                     self._mark_broken()
                     raise
                 finally:
+                    self._active_ipc = None
                     # Pin leases and source/destination storage must outlive DMA,
                     # even if a peer fails after a ready signal was published.
-                    if asynchronous:
-                        try:
-                            if self.download is not None and (failed or self._download_dirty):
-                                self.download.synchronize()
-                        finally:
-                            if self.upload is not None and (failed or self._upload_dirty):
-                                self.upload.synchronize()
-                    if device.type == "cuda" and (failed or not asynchronous):
-                        # Includes pageable local copies on the current stream and
-                        # fallback cleanup after an error.
-                        torch.cuda.current_stream(device).synchronize()
+                    self._drain_streams(device, asynchronous=asynchronous, failed=failed)
         except BaseException:
             self._mark_broken()
             raise

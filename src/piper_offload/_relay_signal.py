@@ -170,7 +170,9 @@ class SharedControl:
             ready_bases[peer] = int(words[peer_slot + 4])
             free_bases[peer] = int(words[peer_slot + 5])
         if mismatched:
-            raise ValueError("shared relay collective operation, payload bytes and root/dtype must match across ranks")
+            raise ValueError(
+                "shared relay collective operation, device, payload bytes and root/dtype must match across ranks",
+            )
         self._expected_ready = ready_bases
         self._expected_free = free_bases
 

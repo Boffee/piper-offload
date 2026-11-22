@@ -17,10 +17,13 @@ mesh, and sharding. With ``local_rank`` provided by the launcher::
 
 Omit ``device_id``; this backend does not implement eager accelerator connection.
 Select ``transport="shared"`` for same-machine transfers through shared host slots
-and GPU-local summation; on x86_64/AMD64, Gloo then carries barriers, CPU
-tensor reductions, and point-to-point transfers (other architectures also use
-Gloo for control messages). The default ``transport="gloo"`` carries collective
-payloads through CPU Gloo as well. Gloo never receives an accelerator tensor.
+and GPU-local summation, or ``transport="ipc"`` on Linux to add peer GPU-to-GPU
+IPC staging slots (CUDA/HIP) with automatic fallback to shared host memory on
+Windows, CPU collectives, or unsupported P2P topologies; on x86_64/AMD64, Gloo
+then carries barriers, CPU tensor reductions, and point-to-point transfers
+(other architectures also use Gloo for control messages). The default
+``transport="gloo"`` carries collective payloads through CPU Gloo as well. Gloo
+never receives an accelerator tensor.
 
 Collectives run on one worker thread per process group in issue order; point-to-point
 operations (``send``, ``recv``, ``isend``, ``irecv``, ``recv_anysource``, and
@@ -62,10 +65,10 @@ synchronously through pageable storage. Non-SUM reductions and CUDA graph
 capture are unsupported. Direct C++ functional all-gather ``out`` calls bypass
 the Python override and are unsupported for accelerator tensors.
 
-If a shared-transport collective fails or is interrupted, its outputs may be
-partial and every later operation on the group raises; destroy and recreate
-the process group. Windows GPU, ROCm, and distinct-GPU behavior need validation
-on their target hardware.
+If a shared- or IPC-transport collective fails or is interrupted, its outputs may
+be partial and every later operation on the group raises; destroy and recreate
+the process group. Linux ROCm distinct-GPU IPC has been validated; NVIDIA
+distinct-GPU and Windows GPU behavior need validation on their target hardware.
 """
 
 import threading
@@ -147,7 +150,25 @@ class RelayOptions:
     ``staging_bytes / 2`` with Gloo or ``staging_bytes / (2 * world_size)`` with
     shared transport), allocating transient overflow chunks only while more than
     two CUDA P2P transfers run concurrently, and release cached buffers on
-    group shutdown. The default transport remains ``"gloo"``.
+    group shutdown.
+
+    ``transport="ipc"`` builds on ``transport="shared"`` by mapping the shared host
+    staging arena at group initialization (for CPU collectives, all-to-all size
+    headers, and fallback calls, kept unpinned while IPC is active) and lazily
+    allocating a per-rank CUDA/HIP device staging ring (``staging_bytes /
+    world_size``, three slots per rank) plus up to ``staging_bytes / world_size``
+    of reduction scratch during GPU reductions (up to ``2 * staging_bytes /
+    world_size`` peak device memory per rank) on the first GPU collective,
+    opening peer IPC handles on Linux. Each rank binds its IPC arena once to
+    the device of its first GPU collective; later collectives where all ranks
+    switch to another device fall back to shared host memory, while single-rank
+    device switches or mixed CPU/GPU calls raise ``ValueError`` without breaking
+    the group. GPU collective payloads then move GPU-to-GPU through device IPC
+    slots without host copies or pin-budget usage, while still releasing on
+    group shutdown. CPU collectives, all-to-all size headers, barriers, P2P ops,
+    and ranks or topologies without IPC/P2P support (including Windows,
+    same-process ranks, or fallback calls) automatically use shared host memory
+    and Gloo as applicable. The default transport remains ``"gloo"``.
     """
 
     staging_bytes: int = 8 * 1024 * 1024
@@ -159,15 +180,16 @@ class RelayOptions:
             raise ValueError("piper_relay staging_bytes must be a positive integer multiple of 16")
         if type(self.pipeline_buffers) is not int or self.pipeline_buffers not in (1, 2, 3):
             raise ValueError("piper_relay pipeline_buffers must be 1, 2, or 3")
-        if self.transport not in ("gloo", "shared"):
-            raise ValueError("piper_relay transport must be 'gloo' or 'shared'")
+        if self.transport not in ("gloo", "shared", "ipc"):
+            raise ValueError("piper_relay transport must be 'gloo', 'shared', or 'ipc'")
 
     def _validate_group_size(self, size: int) -> None:
-        buffers = 1 if self.transport == "shared" else self.pipeline_buffers
+        shared_like = self.transport in ("shared", "ipc")
+        buffers = 1 if shared_like else self.pipeline_buffers
         minimum = 16 * max(3, size + 1) * buffers
         if self.staging_bytes < minimum:
             raise ValueError("piper_relay staging_bytes must allow 16 bytes per staging slot")
-        if self.transport == "shared" and shared_slot_bytes(self.staging_bytes, size) * BUFFERS_PER_RANK < minimum:
+        if shared_like and shared_slot_bytes(self.staging_bytes, size) * BUFFERS_PER_RANK < minimum:
             raise ValueError(
                 "piper_relay shared staging_bytes must allow 16 bytes per staging slot in each rank region",
             )
@@ -247,8 +269,10 @@ class _RelayProcessGroup(dist.ProcessGroup):
         # resolve: 2.15 attaches its flight recorder to every group that
         # registers a backend.
         self._set_default_backend(dist.ProcessGroup.BackendType.GLOO)
-        if options.transport == "shared":
-            self._shared = SharedRelay(store, self._cpu_group, rank, size, self._staging_bytes, timeout)
+        if options.transport in ("shared", "ipc"):
+            self._shared = SharedRelay(
+                store, self._cpu_group, rank, size, self._staging_bytes, timeout, ipc=options.transport == "ipc",
+            )
 
     def getBackendName(self) -> str:  # noqa: N802 -- PyTorch trampoline name
         return _BACKEND_NAME
@@ -275,7 +299,11 @@ class _RelayProcessGroup(dist.ProcessGroup):
             return
         self._closed = True
         try:
-            super().shutdown()
+            try:
+                if self._shared is not None:
+                    self._shared.close()
+            finally:
+                super().shutdown()
         finally:
             self._staging_buffer = None
             self._pipeline = None
