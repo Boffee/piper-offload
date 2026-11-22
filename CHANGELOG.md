@@ -56,6 +56,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   transfer, even if another thread raises the budget and requests pinning.
 - A cached model whose CUDA cleanup failed stays protected from eviction until
   cleanup succeeds. A subsequent use retries cleanup on the same runtime.
+- With the experimental shared relay (`RelayOptions(transport="shared")`), any
+  failure or interrupt from metadata agreement through pin acquisition, lease
+  release, and final stream synchronization now marks the relay broken and
+  aborts waiting peers, so every later operation on the process group fails at
+  once instead of hanging until timeout. Metadata and split-size mismatches
+  still leave the group usable.
 
 ## [0.10.0rc15] - 2026-11-17
 

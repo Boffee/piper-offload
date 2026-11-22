@@ -389,6 +389,8 @@ class SharedRelay:
         )
         self.capacity = shared_slot_bytes(nbytes, world_size)
         self.timeout = timeout
+        # Set once a collective fails or is interrupted after its metadata
+        # exchange begins; the process group then refuses every later operation.
         self.broken = False
         self.device: torch.device | None = None
         self.download: torch.cuda.Stream | None = None
@@ -909,8 +911,7 @@ class SharedRelay:
                             self._slot(receive, lane, width),
                         )
         except BaseException:
-            self.broken = True
-            self._control.abort()
+            self._mark_broken()
             raise
         # Raise split mismatches only after _chunks finishes so control counters
         # stay synchronized and the relay remains usable for later collectives.
@@ -1041,6 +1042,11 @@ class SharedRelay:
             else:
                 self._alltoall_serial(byte_outputs, byte_sources, matrix, asynchronous)
 
+    def _mark_broken(self) -> None:
+        if not self.broken:
+            self.broken = True
+            self._control.abort()
+
     def _agree_operation(self, operation: str, tensors: Sequence[torch.Tensor], detail: int) -> None:
         op_index = _OPERATIONS.index(operation)
         if operation in ("allgather_coalesced", "allreduce_coalesced", "reduce_scatter_coalesced"):
@@ -1060,8 +1066,7 @@ class SharedRelay:
         except ValueError:
             raise
         except BaseException:
-            self.broken = True
-            self._control.abort()
+            self._mark_broken()
             raise
 
     @contextmanager
@@ -1069,44 +1074,51 @@ class SharedRelay:
         self, operation: str, tensors: Sequence[torch.Tensor], detail: int, manager: PinManager,
         *, pre_acquire: Callable[[], None] | None = None,
     ) -> Generator[bool]:
-        if self.broken:
-            raise RuntimeError("shared relay failed previously; destroy and recreate the process group")
         device = tensors[0].device
         # Check rank agreement before any shared-slot writes. This also keeps
         # each collective separate from earlier peer rounds.
         self._agree_operation(operation, tensors, detail)
         if pre_acquire is not None:
-            pre_acquire()
-        with manager.acquire([self.buffer]) if device.type == "cuda" else nullcontext() as lease:
-            asynchronous = lease is not None and lease.pageable_bytes == 0
-            failed = False
-            self._download_dirty = False
-            self._upload_dirty = False
             try:
-                if asynchronous:
-                    self._prepare_streams(device)
-                yield asynchronous
-            except BaseException:
-                failed = True
-                # A failed exchange can leave unread ready/free signals. Do
-                # not reuse its slots or control state in a later operation.
-                self.broken = True
-                self._control.abort()
+                pre_acquire()
+            except ValueError:
                 raise
-            finally:
-                # Pin leases and source/destination storage must outlive DMA,
-                # even if a peer fails after a ready signal was published.
-                if asynchronous:
-                    try:
-                        if self.download is not None and (failed or self._download_dirty):
-                            self.download.synchronize()
-                    finally:
-                        if self.upload is not None and (failed or self._upload_dirty):
-                            self.upload.synchronize()
-                if device.type == "cuda" and (failed or not asynchronous):
-                    # Includes pageable local copies on the current stream and
-                    # fallback cleanup after an error.
-                    torch.cuda.current_stream(device).synchronize()
+            except BaseException:
+                self._mark_broken()
+                raise
+        try:
+            with manager.acquire([self.buffer]) if device.type == "cuda" else nullcontext() as lease:
+                asynchronous = lease is not None and lease.pageable_bytes == 0
+                failed = False
+                self._download_dirty = False
+                self._upload_dirty = False
+                try:
+                    if asynchronous:
+                        self._prepare_streams(device)
+                    yield asynchronous
+                except BaseException:
+                    failed = True
+                    # A failed exchange can leave unread ready/free signals. Do
+                    # not reuse its slots or control state in a later operation.
+                    self._mark_broken()
+                    raise
+                finally:
+                    # Pin leases and source/destination storage must outlive DMA,
+                    # even if a peer fails after a ready signal was published.
+                    if asynchronous:
+                        try:
+                            if self.download is not None and (failed or self._download_dirty):
+                                self.download.synchronize()
+                        finally:
+                            if self.upload is not None and (failed or self._upload_dirty):
+                                self.upload.synchronize()
+                    if device.type == "cuda" and (failed or not asynchronous):
+                        # Includes pageable local copies on the current stream and
+                        # fallback cleanup after an error.
+                        torch.cuda.current_stream(device).synchronize()
+        except BaseException:
+            self._mark_broken()
+            raise
 
     def _local_copy(self, destination: torch.Tensor, source: torch.Tensor, *, asynchronous: bool) -> None:
         # The local contribution never needs a trip through host memory.
