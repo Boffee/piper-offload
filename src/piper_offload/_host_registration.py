@@ -56,7 +56,8 @@ class _Runtime:
     get_last_error: Callable[[], int]
 
 
-def _load_runtime() -> _Runtime | None:
+def load_device_runtime_library() -> tuple[ctypes.CDLL, str] | None:
+    """Return PyTorch's loaded CUDA/HIP runtime library and symbol prefix, or None."""
     if not torch.cuda.is_available():
         return None
     torch.cuda.init()
@@ -71,9 +72,16 @@ def _load_runtime() -> _Runtime | None:
     if len(libraries) != 1:
         raise RuntimeError(
             f"Expected one loaded {prefix} runtime library, found {len(libraries)}; "
-            "cannot safely select the runtime that owns PyTorch's registrations"
+            "cannot safely select PyTorch's runtime library"
         )
-    library = ctypes.CDLL(libraries[0])
+    return ctypes.CDLL(libraries[0]), prefix
+
+
+def _load_runtime() -> _Runtime | None:
+    loaded = load_device_runtime_library()
+    if loaded is None:
+        return None
+    library, prefix = loaded
     register = getattr(library, f"{prefix}HostRegister")
     register.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
     register.restype = ctypes.c_int
