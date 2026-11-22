@@ -6,26 +6,27 @@ Start with [AGENTS.md](../AGENTS.md) for design and bug-fix decisions. Use the
 
 ## Setup and validation
 
-Install the locked development environment, including the TorchAO and Triton
-extras. Use a focused pytest target while developing. Run the full checks for
-code changes before finishing.
+For documentation-only changes, check the edited examples, symbols, local
+links, and heading anchors. Run any example whose executable steps changed.
+
+For code changes, install the locked development environment with
+`uv sync --locked --dev`. Use a focused pytest target while developing, then
+run the full checks before finishing.
 
 ```bash
-uv sync --locked --dev
 uv run pytest tests -q
 uv run ruff check .
 uv run pyright
 ```
 
-`pre-commit install` enables local Ruff, Pyright, and CPU test hooks.
+To enable the optional local Ruff, Pyright, and CPU test hooks, run
+`uv run pre-commit install`.
 [CI](../.github/workflows/ci.yml) runs the portable suite on Linux and Windows
 with CUDA hidden. Tests that need a GPU must mark that requirement explicitly.
 Run relevant tests on the affected hardware for transfers, scheduling,
 compilation, or quantized operations. For relay changes that depend on rank
 coordination, exercise the affected transport with multiple processes.
 
-For documentation-only changes, verify the edited examples, symbols, local
-links, and heading anchors. Run an example if its executable steps change.
 For performance claims, compare the same workload and configuration on the
 same hardware. The [rolling benchmark](../benchmarks/benchmark_rolling_compile.py)
 checks outputs before comparing latency and allocator residency.
@@ -67,7 +68,8 @@ CI retains JUnit timings for 14 days in `test-results-linux` and
 `test-results-windows`, including after test failures. Compare repeated runs
 with matching hardware, dependencies, inputs, and compiler-cache state.
 Batch process cases only if each starts from known state and failures remain
-identifiable. Assert allocation, transfer, or registration counts in tests.
+identifiable. When testing a bound on work, assert the relevant allocation,
+transfer, or registration count.
 Keep latency and throughput measurements in [benchmarks](../benchmarks).
 
 ## Architecture
@@ -194,10 +196,11 @@ implementation in [resource_cache.py](../src/piper_offload/resource_cache.py).
    docstrings specify rounding, coefficients, broadcasting, locality, and
    storage preservation. See the [caller contract](adapters.md#broadcast-additive-updates)
    for how updates compose.
-3. Register the adapter at application startup, before constructing host resources.
-   [`register_adapter()`](../src/piper_offload/tensor_adapter_registry.py) documents
-   dispatch. Add the format to the shared tests for its capabilities and update
-   the [format matrix](formats.md).
+3. For a built-in format, add the adapter class to `_BUILTIN_ADAPTERS` in the
+   [registry](../src/piper_offload/tensor_adapter_registry.py). Add the format
+   to the shared tests for its capabilities and update the [format matrix](formats.md).
+   For an external format, call `register_adapter()` with the adapter class at
+   application startup, before constructing host resources.
 
 For experimental DTensor execution, see [formats](formats.md#dtensor-and-custom-formats)
 and the module contracts linked there.
@@ -221,11 +224,9 @@ apply.
   the rule once. Check any restriction on supported use against the
   [compatibility policy](../VERSIONING.md#compatibility-policy).
 
-For each finding, describe the failing call, its impact, and the code
-responsible. Verify it using the [bug-fix workflow](../AGENTS.md#bugs-and-review-findings).
-For a documentation omission, show the decision a reader could get wrong.
-When the reported use violates an existing contract, check whether that
-contract is clear at the point of use.
+For a behavior bug, follow the [bug-fix workflow](../AGENTS.md#fixing-bugs).
+For a documentation finding, show where the guidance could lead a reader to
+make the wrong decision and what they should do there.
 
 ## Commits and pull requests
 

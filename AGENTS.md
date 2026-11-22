@@ -29,7 +29,7 @@ the code that owns a behavior.
 - Update the owning explanation and its examples when behavior changes. See
   [documentation ownership](docs/development.md#documentation-ownership).
 
-## Bugs and review findings
+## Fixing bugs
 
 1. Reproduce the reported failure through a supported call. Identify who is
    affected and under what conditions. If it does not reproduce, report what
