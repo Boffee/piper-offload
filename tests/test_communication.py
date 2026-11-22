@@ -4465,6 +4465,7 @@ class _FakeIpcRuntime:
         self.prior_errors: dict[int, int] = {}
         self.fail_malloc: set[int] = set()
         self.fail_get_handle: set[int] = set()
+        self.raise_get_handle: dict[int, BaseException] = {}
         self.fail_open: set[int] = set()
         self.raise_open: dict[int, Exception] = {}
         self.local_rank = threading.local()
@@ -4515,6 +4516,8 @@ class _FakeIpcRuntime:
     def ipc_get_mem_handle(self, ptr: int) -> bytes | None:
         self.check_prior_error()
         r = self.rank()
+        if r in self.raise_get_handle:
+            raise self.raise_get_handle[r]
         if r in self.fail_get_handle:
             return None
         # Embed NUL bytes in the 64-byte handle so NUL preservation is always exercised.
@@ -5166,6 +5169,7 @@ def test_ipc_arena_fallbacks_and_close_semantics():
     assert "Prior CUDA/HIP runtime work failed with error 9" in str(p1_errors[0])
     assert "failed on a peer rank" in str(p1_errors[1])
     assert not rt_p1_err.allocs
+    _check_ipc_handle_export_errors()
 
     # 6. Phase 2 single-rank exception wakes peer, closes imported handles before free, and propagates.
     rt_p2_err = _FakeIpcRuntime()
@@ -5186,6 +5190,25 @@ def test_ipc_arena_fallbacks_and_close_semantics():
     arenas_close[1].close(timeout=timedelta(milliseconds=20))  # type: ignore[union-attr]
     assert not rt_close.opened and len(rt_close.allocs) == 2
     assert not any(op == "free" for _, op, _ in rt_close.events)
+
+
+def _check_ipc_handle_export_errors() -> None:
+    from piper_offload import _relay_ipc
+
+    rt_export_err = _FakeIpcRuntime()
+    rt_export_err.raise_get_handle[0] = RuntimeError("injected export failure")
+    export_errors: dict[int, BaseException] = {}
+    _open_two_ipc_arenas(rt_export_err, lambda r: 455 + r, errors_by_rank=export_errors)
+    assert "injected export failure" in str(export_errors[0])
+    assert "failed on a peer rank" in str(export_errors[1])
+    assert not rt_export_err.allocs
+
+    rt_interrupt = _FakeIpcRuntime()
+    rt_interrupt.raise_get_handle[0] = Interrupt("injected export interrupt")
+    rt_interrupt.bind_rank(0)
+    with pytest.raises(Interrupt, match="injected export interrupt"):
+        _relay_ipc._prepare_local_handle(rt_interrupt, torch.device("cuda", 0), 0, 192)
+    assert not rt_interrupt.allocs
 
 
 def test_ipc_slot_view_validation():

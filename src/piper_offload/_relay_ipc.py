@@ -398,11 +398,12 @@ def _prepare_local_handle(
                 if 0 < len(raw_bus) <= _BUS_ID_SIZE:
                     ptr = rt.malloc(nbytes)
                     if ptr is not None:
+                        local_ptr = ptr
                         handle = rt.ipc_get_mem_handle(ptr)
                         if handle is not None and len(handle) == _IPC_HANDLE_SIZE:
-                            local_ptr = ptr
                             payload = _HANDLE_STRUCT.pack(_STATUS_OK, os.getpid(), raw_bus, handle)
                             return rt, local_ptr, payload, None
+                        local_ptr = 0
                         rt.free(ptr)
         return rt, 0, _HANDLE_STRUCT.pack(_STATUS_FALLBACK, os.getpid(), b"", b""), None
     except Exception as error:
