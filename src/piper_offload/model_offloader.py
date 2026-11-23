@@ -22,7 +22,7 @@ from .block_mode import BlockMode
 from .composite_component import CompositeComponent, _capture_model
 from .host_component import HostComponent
 from .host_module import ParameterOverride
-from .lora import install_routed_residual_hook
+from .lora import ScaledLoRAFactor, install_routed_residual_hook
 from .module_names import resolve_parent_leaf
 from .pin_manager import PinLease, host_pin_manager
 
@@ -241,7 +241,7 @@ class ModelOffloader:
         self,
         updates: _ParameterUpdateMap,
     ) -> None:
-        """Install one staged PRE/POST routed hook per target Linear.
+        """Resolve every routed target before leasing factors or installing hooks.
 
         The PRE hook copies all LoRA factors for that target from immutable
         host backing to the invocation's input device. The POST hook applies
@@ -263,21 +263,7 @@ class ModelOffloader:
                 f"use adapter_mode='merge'. Dense parameter deltas: {dense_names!r}."
             )
 
-        if self._active_device is not None and self._active_device.type == "cuda":
-            # The hooks stage every factor again on each forward: hold the
-            # factors' storage, pageable, for the session so a pinned copy of
-            # it stays readable and is never evicted under a staging copy. A
-            # CPU session stages synchronously and needs no lease.
-            self._routed_lease = host_pin_manager.acquire(
-                (
-                    tensor
-                    for contributions in updates.values()
-                    for factor in contributions.factors
-                    for host in (factor.a, factor.b)
-                    for tensor in host.storage_tensors()
-                ),
-                pin=False,
-            )
+        targets: list[tuple[nn.Linear, list[ScaledLoRAFactor]]] = []
         for param_name, contributions in updates.items():
             parent, _leaf = resolve_parent_leaf(self._model, param_name)
             if not isinstance(parent, nn.Linear):
@@ -287,10 +273,25 @@ class ModelOffloader:
                     f"type {type(parent).__name__}. Use mode='merge' "
                     f"for non-Linear targets."
                 )
-            remove_hook = install_routed_residual_hook(
-                parent,
-                contributions.factors,
+            targets.append((parent, contributions.factors))
+
+        if self._active_device is not None and self._active_device.type == "cuda":
+            # The hooks stage every factor again on each forward: hold the
+            # factors' storage, pageable, for the session so a pinned copy of
+            # it stays readable and is never evicted under a staging copy. A
+            # CPU session stages synchronously and needs no lease.
+            self._routed_lease = host_pin_manager.acquire(
+                (
+                    tensor
+                    for _, factors in targets
+                    for factor in factors
+                    for host in (factor.a, factor.b)
+                    for tensor in host.storage_tensors()
+                ),
+                pin=False,
             )
+        for parent, factors in targets:
+            remove_hook = install_routed_residual_hook(parent, factors)
             self._routed_hook_removers.append(remove_hook)
 
     def register_forward_hook(
