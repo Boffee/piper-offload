@@ -1,13 +1,11 @@
-"""Shared source selection, validation, and arithmetic for parameter updates.
+"""Plan parameter updates for activation and permanent merge.
 
-Activation and permanent merge both use :func:`plan_parameter_update` to select
-one optional replacement source and one combined arithmetic update. A supplied
-value is validated against its meta destination; arithmetic is validated against
-the effective physical source. The application path owns allocation, leases,
-and installation, and tensor adapters own representation-specific arithmetic.
+Replacement values are validated against their meta destinations. Arithmetic
+is validated against the effective physical source. The caller owns allocation,
+leases, and installation. Tensor adapters own representation-specific arithmetic.
 """
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -41,6 +39,7 @@ from .tensor_adapters import (
 )
 
 if TYPE_CHECKING:
+    from .adapter import AdapterTargetUpdates
     from .parameter_delta import ScaledParameterDelta
     from .parameter_value import ScaledParameterValue
 
@@ -55,18 +54,20 @@ def merge_target_id(param: nn.Parameter) -> tuple[Any, ...]:
         return ("__unsupported_param__", id(param))
 
 
-def validate_merge_target_aliases(
+def plan_merge_targets(
     params_by_name: Mapping[str, nn.Parameter],
-    target_names: Iterable[str],
-) -> None:
-    """Require one requested name per backing across active adapter updates.
+    updates: Mapping[str, AdapterTargetUpdates],
+    *,
+    stochastic_rounding: bool,
+) -> Iterator[tuple[str, nn.Parameter, ParameterUpdatePlan]]:
+    """Yield one plan per selected parameter in request order.
 
-    Call after resolving absent names and before skipping unpopulated targets.
-    Repeated contributions under the same name are allowed. Physical aliases
-    use tensor-adapter storage identity; meta parameters use object identity.
+    Check every requested name for tied aliases before skipping any target.
+    A meta parameter without a supplied value is skipped only when all its
+    deltas allow partial targets.
     """
     names_by_identity: dict[tuple[Any, ...], str] = {}
-    for name in target_names:
+    for name in updates:
         identity = merge_target_id(params_by_name[name])
         previous = names_by_identity.setdefault(identity, name)
         if previous != name:
@@ -74,6 +75,18 @@ def validate_merge_target_aliases(
                 f"Tied parameter aliases {previous!r} and {name!r} "
                 "cannot both be adapter targets; use one name per parameter."
             )
+
+    for name, contributions in updates.items():
+        param = params_by_name[name]
+        if param.is_meta and contributions.value is None and not contributions.requires_base:
+            continue
+        plan = plan_parameter_update(
+            contributions.deltas,
+            value=contributions.value,
+            stochastic_rounding=stochastic_rounding,
+            target_key=name,
+        )
+        yield name, param, plan
 
 
 @dataclass(slots=True, frozen=True)

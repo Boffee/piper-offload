@@ -66,17 +66,6 @@ class AdapterTargetUpdates:
             raise ValueError(f"Adapter target {target_key!r} has multiple active parameter values.")
         self.value = target.scaled(strength)
 
-    def should_skip_merge(self, param: torch.nn.Parameter) -> bool:
-        """Skip only an unpopulated target whose deltas all allow partial targets.
-
-        Call after collecting every active contribution. A supplied value
-        makes the target available regardless of adapter ordering. Both merge
-        paths validate target aliases before this check. A skipped target must
-        create no device override or permanent merge operation and requires no
-        staging or materialization; any strict delta still requires a base.
-        """
-        return param.is_meta and self.value is None and not self.requires_base
-
     @property
     def factors(self) -> list[ScaledLoRAFactor]:
         """Low-rank contributions extracted for routed execution."""
