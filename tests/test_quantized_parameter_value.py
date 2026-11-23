@@ -187,7 +187,8 @@ def test_structured_parameter_value_dtype_is_representation_owned() -> None:
 
 
 @CUDA
-def test_auto_mode_falls_back_for_incompatible_value_adapter() -> None:
+@pytest.mark.parametrize("block_mode", ["auto", "rolling"])
+def test_only_auto_falls_back_for_incompatible_value_adapter(block_mode) -> None:
     from tests._block_compile_helpers import _BlockModel
     from tests.test_tensor_adapter_registry import (
         _ExternalAdapter,
@@ -200,12 +201,11 @@ def test_auto_mode_falls_back_for_incompatible_value_adapter() -> None:
     offloader = ModelOffloader.from_module(
         model,
         block_paths=("blocks",),
-        block_mode="auto",
+        block_mode=block_mode,
         block_compile=BlockCompileConfig(fullgraph=True),
     )
     component = block_components(offloader)[0]
     assert component.block_mode == "rolling"
-    assert component._auto_rolling
     assert component._inductor_compile is None
 
     remove_adapter = register_adapter(_ExternalAdapter)
@@ -220,6 +220,11 @@ def test_auto_mode_falls_back_for_incompatible_value_adapter() -> None:
                 for idx in range(2)
             },
         )
+        if block_mode == "rolling":
+            with pytest.raises(NotImplementedError, match="does not support active parameter adapter"):
+                offloader.activate("cuda", adapters=[incompatible])
+            assert offloader.active_device is None
+            return
         offloader.activate("cuda", adapters=[incompatible])
         assert component._active_runtime is component._eager_runtime
         assert component._inductor_compile is not None
