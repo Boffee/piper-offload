@@ -19,7 +19,7 @@ from .adapter import Adapter, AdapterMode, AdapterTargetUpdates, group_adapter_u
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent
 from .block_mode import BlockMode
-from .composite_component import CompositeComponent, CompositeComponentStore, _capture_model
+from .composite_component import CompositeComponent, _capture_model
 from .host_component import HostComponent
 from .host_module import ParameterOverride
 from .lora import install_routed_residual_hook
@@ -209,7 +209,7 @@ class ModelOffloader:
             transient_paths=transient_paths,
             include_block_trainables=include_block_trainables,
         )
-        cache_bytes = captured.as_store(CompositeComponentStore).cache_bytes
+        cache_bytes = captured.cache_bytes
         composite = captured.component(block_compile=block_compile, block_mode=block_mode)
         return cls(model, composite=composite, cache_bytes=cache_bytes)
 

@@ -1,7 +1,7 @@
 """Composition of resident, transient, and block components."""
 
 import contextlib
-from collections.abc import Generator, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Self
@@ -130,13 +130,13 @@ class CompositeComponent:
 
 
 @dataclass(frozen=True, slots=True)
-class CompositeComponentStore:
-    """Reusable stores for resident, transient, and block model state."""
+class _ComponentGroups[Host, Blocks]:
+    """The model's ownership groups, used for both capture and binding."""
 
-    resident_store: HostComponentStore | None
-    block_stores: tuple[BlockComponentStore, ...]
-    transient_block_stores: tuple[BlockComponentStore, ...] = ()
-    transient_stores: tuple[tuple[str, HostComponentStore], ...] = ()
+    resident_store: Host | None
+    block_stores: tuple[Blocks, ...]
+    transient_block_stores: tuple[Blocks, ...] = ()
+    transient_stores: tuple[tuple[str, Host], ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -147,15 +147,40 @@ class CompositeComponentStore:
         ):
             raise ValueError("Offloading requires at least one parameter, registered buffer, or block to manage.")
 
-    def _stores(
-        self,
-    ) -> Iterator[HostComponentStore | BlockComponentStore]:
+    def _entries(self) -> Iterator[Host | Blocks]:
         if self.resident_store is not None:
             yield self.resident_store
-        for _path, store in self.transient_stores:
-            yield store
+        for _path, entry in self.transient_stores:
+            yield entry
         yield from self.block_stores
         yield from self.transient_block_stores
+
+    def _assemble(
+        self,
+        make_host: Callable[[Host], HostComponent],
+        make_block: Callable[[Blocks, bool], BlockComponent],
+    ) -> CompositeComponent:
+        resident = make_host(self.resident_store) if self.resident_store is not None else None
+        transient = tuple((path, make_host(store)) for path, store in self.transient_stores)
+        # Only persistent groups prefetch the first block after the last.
+        persistent = tuple(make_block(store, True) for store in self.block_stores)
+        transient_blocks = tuple(make_block(store, False) for store in self.transient_block_stores)
+        return CompositeComponent(
+            resident=resident,
+            transient=transient,
+            blocks=(*persistent, *transient_blocks),
+            transient_blocks=transient_blocks,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CompositeComponentStore(_ComponentGroups[HostComponentStore, BlockComponentStore]):
+    """Reusable stores for resident, transient, and block model state."""
+
+    resident_store: HostComponentStore | None
+    block_stores: tuple[BlockComponentStore, ...]
+    transient_block_stores: tuple[BlockComponentStore, ...] = ()
+    transient_stores: tuple[tuple[str, HostComponentStore], ...] = ()
 
     @classmethod
     def from_module(
@@ -177,11 +202,11 @@ class CompositeComponentStore:
 
     @property
     def cache_bytes(self) -> int:
-        return sum(store.cache_bytes for store in self._stores())
+        return sum(store.cache_bytes for store in self._entries())
 
     @property
     def has_trainables(self) -> bool:
-        return any(store.has_trainables for store in self._stores())
+        return any(store.has_trainables for store in self._entries())
 
     def bind(
         self,
@@ -190,70 +215,41 @@ class CompositeComponentStore:
         block_compile: BlockCompileConfig | None = None,
         block_mode: BlockMode = "streaming",
     ) -> CompositeComponent:
-        resident = self.resident_store.bind(model) if self.resident_store else None
-        transient = tuple((path, store.bind(model)) for path, store in self.transient_stores)
-        blocks = tuple(
-            store.bind(
-                model,
-                block_compile=block_compile,
-                wraparound=True,
-                block_mode=block_mode,
-            )
-            for store in self.block_stores
-        )
-        transient_blocks = tuple(
-            store.bind(
-                model,
-                block_compile=block_compile,
-                wraparound=False,
-                block_mode=block_mode,
-            )
-            for store in self.transient_block_stores
-        )
-        return CompositeComponent(
-            resident=resident,
-            blocks=(*blocks, *transient_blocks),
-            transient=transient,
-            transient_blocks=transient_blocks,
-        )
+        def bind_block(store: BlockComponentStore, wraparound: bool) -> BlockComponent:
+            return store.bind(model, block_compile=block_compile, block_mode=block_mode, wraparound=wraparound)
+
+        return self._assemble(lambda store: store.bind(model), bind_block)
 
 
 type _CapturedHost = tuple[HostComponentStore, HostModuleInstance]
 type _CapturedBlocks = tuple[BlockComponentStore, tuple[HostModuleInstance, ...]]
 
 
-@dataclass(slots=True)
-class _ModelCapture:
+class _ModelCapture(_ComponentGroups[_CapturedHost, _CapturedBlocks]):
     """Each store paired with the binding already installed on its source."""
 
-    resident: _CapturedHost | None
-    transient: list[tuple[str, _CapturedHost]]
-    blocks: tuple[_CapturedBlocks, ...]
-    transient_blocks: tuple[_CapturedBlocks, ...]
+    __slots__ = ()
+
+    @property
+    def cache_bytes(self) -> int:
+        return sum(store.cache_bytes for store, _ in self._entries())
 
     def as_store[S: CompositeComponentStore](self, store_type: type[S]) -> S:
         return store_type(
-            resident_store=self.resident[0] if self.resident else None,
-            transient_stores=tuple((path, store) for path, (store, _) in self.transient),
-            block_stores=tuple(store for store, _ in self.blocks),
-            transient_block_stores=tuple(store for store, _ in self.transient_blocks),
+            resident_store=self.resident_store[0] if self.resident_store else None,
+            transient_stores=tuple((path, store) for path, (store, _) in self.transient_stores),
+            block_stores=tuple(store for store, _ in self.block_stores),
+            transient_block_stores=tuple(store for store, _ in self.transient_block_stores),
         )
 
     def component(self, *, block_compile: BlockCompileConfig | None, block_mode: BlockMode) -> CompositeComponent:
-        def block_component(group: _CapturedBlocks, *, wraparound: bool) -> BlockComponent:
+        def block_component(group: _CapturedBlocks, wraparound: bool) -> BlockComponent:
             store, instances = group
             return store._component(
                 instances, block_compile=block_compile, block_mode=block_mode, wraparound=wraparound,
             )
 
-        blocks = tuple(block_component(group, wraparound=True) for group in self.blocks)
-        transient_blocks = tuple(block_component(group, wraparound=False) for group in self.transient_blocks)
-        return CompositeComponent(
-            resident=HostComponent(self.resident[1]) if self.resident else None,
-            blocks=(*blocks, *transient_blocks),
-            transient=tuple((path, HostComponent(instance)) for path, (_, instance) in self.transient),
-            transient_blocks=transient_blocks,
-        )
+        return self._assemble(lambda group: HostComponent(group[1]), block_component)
 
 
 def _capture_model(
@@ -305,8 +301,12 @@ def _capture_model(
         resident_params -= selected_params
         resident_buffers -= selected_buffers
     resident = capture_host(resident_params, resident_buffers) if resident_params or resident_buffers else None
-    return _ModelCapture(resident, transient, permanent, transient_blocks)
-
+    return _ModelCapture(
+        resident_store=resident,
+        transient_stores=tuple(transient),
+        block_stores=permanent,
+        transient_block_stores=transient_blocks,
+    )
 
 
 __all__ = ["CompositeComponent", "CompositeComponentStore"]

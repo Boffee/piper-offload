@@ -30,7 +30,7 @@ from piper_offload import (
     ResourceBinding,
     ResourceStore,
 )
-from piper_offload.composite_component import CompositeComponent
+from piper_offload.composite_component import CompositeComponent, CompositeComponentStore
 from piper_offload.host_module import HostModuleInstance, ParameterOverride
 from piper_offload._transfer_priority import foreground_transfer
 from piper_offload._working_set import WorkingSetState
@@ -660,6 +660,36 @@ class TestTransientResidency:
             assert host_component(offloader) is None
         finally:
             offloader.deactivate()
+
+    def test_capture_and_rebind_include_all_groups(self) -> None:
+        source = _make_block_model(num_blocks=2)
+        source.tail = nn.ModuleList([nn.Identity(), nn.Linear(8, 8, bias=False)]).requires_grad_(False)
+        source.embed.register_buffer("scale", torch.ones(8))
+        target = copy.deepcopy(source)
+        for tensor in target.state_dict().values():
+            tensor.zero_()
+
+        paths = {
+            "block_paths": ["transformer_blocks"],
+            "transient_block_paths": ["tail"],
+            "transient_paths": ["embed"],
+        }
+        expected_bytes = sum(t.nbytes for t in source.state_dict().values())
+        offloader = ModelOffloader.from_module(copy.deepcopy(source), **paths)
+        assert offloader.cache_bytes == expected_bytes
+
+        store = CompositeComponentStore.from_module(source, **paths)
+        assert store.cache_bytes == expected_bytes
+        bound = store.bind(target)
+        torch.testing.assert_close(target.state_dict(), source.state_dict())
+        assert bound.resident.param_names == {"head.weight"}
+        (path, embed), = bound.transient
+        assert path == "embed"
+        assert embed.buffer_names == {"embed.scale"}
+        persistent, tail = bound.blocks
+        assert persistent.blocks == tuple(target.transformer_blocks)
+        assert tail.blocks == (target.tail[1],)
+        assert bound.transient_blocks == (tail,)
 
     def test_cpu_activation_stays_eager(self) -> None:
         model = _make_block_model()
