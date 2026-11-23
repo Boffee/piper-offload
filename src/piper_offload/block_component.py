@@ -45,9 +45,10 @@ when you need bespoke composition (e.g., multiple block lists like Flux's
 """
 
 import contextlib
+import functools
 import logging
 import weakref
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Self, cast
 
@@ -69,7 +70,7 @@ from .host_param import HostParam
 from .module_names import walk_attr_path
 from .pin_manager import PinLease, TransferLease, host_pin_manager
 from .resident_runtime import ResidentBlockRuntime
-from .rolling_runtime import create_rolling_block_runtime
+from .rolling_runtime import RollingBlockRuntime, create_rolling_block_runtime
 from .streaming_runtime import StreamingBlockRuntime
 
 logger = logging.getLogger(__name__)
@@ -509,7 +510,7 @@ class BlockComponent:
             raise ValueError(f"unsupported block mode: {block_mode!r}")
         self._eager_runtime = eager_runtime
         self._runtime: BlockRuntime = rolling if rolling is not None else eager_runtime
-        self._auto_rolling_runtime = rolling if block_mode == "auto" else None
+        self._allow_rolling_fallback = block_mode == "auto"
         self._block_compile = _BlockCompileState.create(
             self._blocks,
             block_compile,
@@ -520,6 +521,7 @@ class BlockComponent:
         )
         self._active_device: torch.device | None = None
         self._active_runtime: BlockRuntime | None = None
+        self._acquire_runtime: Callable[[], None] | None = None
         self._load_plans: tuple[HostModuleLoadPlan, ...] = ()
         # Streaming and rolling hold one lease per session; resident holds
         # one per transfer. The working set's state says how far acquiring
@@ -700,39 +702,28 @@ class BlockComponent:
         *,
         compile_blocks: bool,
     ) -> None:
-        runtime, block_compile = self._select_cuda_runtime(
-            compile_blocks=compile_blocks,
-        )
+        runtime = self._eager_runtime
+        acquire = functools.partial(runtime.acquire, active_device, self._load_plans)
+        block_compile = self._block_compile
+        if compile_blocks and isinstance(self._runtime, RollingBlockRuntime):
+            try:
+                acquire = self._runtime._prepare_acquire(active_device, self._load_plans)
+            except NotImplementedError as exc:
+                if not self._allow_rolling_fallback:
+                    raise
+                logger.info("block group does not support rolling for this activation; using streaming: %s", exc)
+                block_compile = self._get_inductor_compile()
+            else:
+                runtime = self._runtime
 
         # Record the selected runtime before acquisition so deactivate() can
         # clean up a partially-created pool, stream, or hook set if activation
         # raises midway through its lifecycle.
         self._active_device = active_device
         self._active_runtime = runtime
+        self._acquire_runtime = acquire
         self.acquire()
         block_compile.install(compile_blocks)
-
-    def _select_cuda_runtime(
-        self,
-        *,
-        compile_blocks: bool,
-    ) -> tuple[BlockRuntime, _BlockCompileState]:
-        """Select the runtime after activation overrides have been resolved."""
-        if not compile_blocks:
-            return self._eager_runtime, self._block_compile
-
-        if self._auto_rolling_runtime is not None:
-            try:
-                self._auto_rolling_runtime.validate_load_plans(self._load_plans)
-            except NotImplementedError as exc:
-                logger.info(
-                    "block group does not support rolling for this activation; "
-                    "using streaming: %s",
-                    exc,
-                )
-                return self._eager_runtime, self._get_inductor_compile()
-
-        return self._runtime, self._block_compile
 
     def acquire(self) -> None:
         """Acquire this active session's CUDA working set.
@@ -753,8 +744,8 @@ class BlockComponent:
             raise RuntimeError("BlockComponent.acquire() requires an active session; call activate() first.")
         if active_device.type == "cpu":
             return
-        runtime = self._active_runtime
-        if runtime is None:
+        acquire = self._acquire_runtime
+        if acquire is None:
             raise RuntimeError("BlockComponent CUDA session has no selected runtime.")
         if self._working_set_state is WorkingSetState.ACQUIRED:
             return
@@ -767,11 +758,11 @@ class BlockComponent:
                 # A one-time upload: lease the sources pageable, for the upload
                 # only; the runtime synchronizes it before returning.
                 self._transfer.start(host_pin_manager, sources, active_device)
-                runtime.acquire(active_device, self._load_plans)
+                acquire()
                 self._transfer.close()  # the runtime synchronized the upload
             else:
                 self._pin_lease = host_pin_manager.acquire(sources)
-                runtime.acquire(active_device, self._load_plans)
+                acquire()
         except BaseException:
             self.release()
             raise
@@ -828,6 +819,7 @@ class BlockComponent:
             self.release()
         finally:
             self._active_runtime = None
+            self._acquire_runtime = None
             self._active_device = None
             self._load_plans = ()
 
