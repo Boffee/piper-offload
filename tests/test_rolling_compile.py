@@ -2,12 +2,14 @@
 
 import copy
 from collections.abc import Callable, Iterator
+from unittest.mock import patch
 
 import pytest
 import torch
 from torch import nn
 
 from piper_offload import BlockCompileConfig, BlockMode, Adapter, register_adapter
+from piper_offload import rolling_runtime
 from piper_offload.rolling_compile import (
     register_rolling_target,
     unregister_rolling_target,
@@ -447,6 +449,31 @@ class TestRollingCompile:
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert all(block.proj.weight.device.type == "cpu" for block in rolling_model.blocks)
+
+    @CUDA
+    @pytest.mark.parametrize("block_mode", ["auto", "rolling"])
+    def test_builds_one_rolling_layout_per_activation(self, block_mode: BlockMode) -> None:
+        with torch.device("meta"):
+            model = _BlockModel()
+        offloader = _make_offloader(model, block_mode=block_mode, block_compile=BlockCompileConfig(fullgraph=True))
+        component = block_components(offloader)[0]
+        weight = torch.eye(8)
+        replacement = Adapter.from_state_dict({"blocks.0.proj.weight": weight})
+
+        for adapters in ([], [replacement]):
+            with (
+                patch.object(
+                    rolling_runtime, "_resolve_rolling_loads", wraps=rolling_runtime._resolve_rolling_loads,
+                ) as build,
+                activated_model(offloader, "cuda", adapters=adapters),
+            ):
+                component.release()
+                component.acquire()
+                build.assert_called_once()
+                if adapters:
+                    torch.testing.assert_close(model.blocks[0].proj.weight, weight.cuda())
+                else:
+                    assert model.blocks[0].proj.weight.is_meta
 
     @CUDA
     def test_release_reacquire_rebinds_rolling_target(self) -> None:

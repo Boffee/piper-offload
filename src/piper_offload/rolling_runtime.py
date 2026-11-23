@@ -5,7 +5,7 @@ import functools
 import logging
 import math
 import weakref
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 
 import torch
 from torch import nn
@@ -55,8 +55,8 @@ _ROLLING_ADAPTER_TYPES = (
 def _resolve_rolling_loads(
     instances: Sequence[HostModuleInstance],
     load_plans: Sequence[HostModuleLoadPlan],
-) -> tuple[tuple[HostModuleLoadPlan, ...], dict[str, ParameterLoad]]:
-    """Validate active sources and build the shared-target allocation loads."""
+) -> tuple[tuple[HostModuleLoadPlan, ...], HostModuleLoadPlan]:
+    """Build the shared allocation plan in the order used by compiled slot indices."""
     plans = validate_load_plans(instances, load_plans)
     source_names = {name for plan in plans for name in plan.loads}
     allocation_loads: dict[str, ParameterLoad] = {}
@@ -90,7 +90,7 @@ def _resolve_rolling_loads(
         # This synthetic plan defines shared target storage only. Block
         # updates remain exclusively on their activation load plans.
         allocation_loads[name] = ParameterLoad(source)
-    return plans, allocation_loads
+    return plans, HostModuleLoadPlan(instances[0], allocation_loads)
 
 
 class RollingBlockRuntime:
@@ -137,14 +137,27 @@ class RollingBlockRuntime:
         device: torch.device,
         load_plans: Sequence[HostModuleLoadPlan],
     ) -> None:
+        acquire = self._prepare_acquire(device, load_plans)
+        acquire()
+
+    def _prepare_acquire(
+        self, device: torch.device, load_plans: Sequence[HostModuleLoadPlan],
+    ) -> Callable[[], None]:
+        """Bind this activation's layout for its initial acquire and all reacquires."""
         if self.acquired:
             raise RuntimeError("rolling block runtime is already acquired")
-        plans, allocation_loads = _resolve_rolling_loads(
-            self._instances,
-            load_plans,
-        )
+        plans, allocation = _resolve_rolling_loads(self._instances, load_plans)
+        return functools.partial(self._acquire, device, plans, allocation, tuple(allocation.loads))
+
+    def _acquire(
+        self,
+        device: torch.device,
+        plans: tuple[HostModuleLoadPlan, ...],
+        allocation: HostModuleLoadPlan,
+        slot_names: tuple[str, ...],
+    ) -> None:
         self._load_plans = plans
-        self._slot_names = tuple(allocation_loads)
+        self._slot_names = slot_names
         self._stream = torch.cuda.Stream(device=device, priority=-1)
         self._events = tuple(torch.cuda.Event() for _name in self._slot_names)
         self._ready_events = tuple(torch.cuda.Event() for _name in self._slot_names)
@@ -158,12 +171,8 @@ class RollingBlockRuntime:
             return
 
         self._fallback_event = torch.cuda.Event()
-        allocation_plan = HostModuleLoadPlan(
-            plans[0].instance,
-            allocation_loads,
-        )
         self._lease = CudaTargetLease.allocate(
-            allocation_plan,
+            allocation,
             device,
             buffer_names=(),
         )
