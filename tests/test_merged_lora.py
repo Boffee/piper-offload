@@ -45,7 +45,7 @@ from piper_offload import (
     merge_adapter,
     register_adapter,
 )
-from piper_offload.adapter import group_adapter_updates
+from piper_offload.adapter import group_adapter_updates, resolve_adapter_strengths
 from piper_offload.int4_tile_adapter import Int4TilePackedAdapter
 from piper_offload.host_module import ParameterOverride, HostModuleInstance
 from piper_offload.host_param import HostParam
@@ -1060,41 +1060,27 @@ class TestParameterDelta:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("strengths", "expected"),
+    [
+        (None, [("a", 1.0), ("b", 1.0), ("a", 1.0)]),
+        ([0.25, -0.5, 0.75], [("a", 0.25), ("b", -0.5), ("a", 0.75)]),
+        ([0.0, 0.25, -0.0], [("b", 0.25)]),
+    ],
+)
+def test_adapter_strengths_preserve_active_occurrences(strengths, expected) -> None:
+    assert resolve_adapter_strengths(["a", "b", "a"], strengths) == expected
+
+
 class TestActivationLoraValidation:
-    def test_lora_strengths_default_to_one(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        lora = _make_lora(4, 16)
-        assert s._normalize_adapters([lora]) == [(lora, 1.0)]
-
-    def test_accepts_lora_strengths(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        lora = _make_lora(4, 16)
-        assert s._normalize_adapters([lora], adapter_strengths=[0.25]) == [
-            (lora, 0.25),
-        ]
-
-    def test_lora_strengths_do_not_silently_truncate(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
+    def test_strength_mismatch_releases_activation_claim(self) -> None:
+        model = nn.Linear(1, 1)
+        offloader = ModelOffloader.from_module(model)
+        adapter = Adapter.from_state_dict({"weight": torch.ones(1, 1)})
         with pytest.raises(ValueError, match="shorter"):
-            s._normalize_adapters(
-                [_make_lora(4, 16)],
-                adapter_strengths=[],
-            )
-
-    @pytest.mark.parametrize("zero", [0.0, -0.0])
-    def test_zero_strengths_are_inactive(self, zero: float) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        inactive = _make_lora(4, 16, seed=1)
-        active = _make_lora(4, 16, seed=2)
-
-        assert s._normalize_adapters(
-            [inactive, active],
-            adapter_strengths=[zero, 0.25],
-        ) == [(active, 0.25)]
+            offloader.activate("cpu", adapters=[adapter], adapter_strengths=[])
+        with activated_model(offloader, "cpu") as active:
+            assert active is model
 
     def test_zero_strength_merge_activation_installs_no_hooks(self) -> None:
         m = _make_bf16_model().to(torch.float32)
@@ -1115,15 +1101,6 @@ class TestActivationLoraValidation:
             torch.testing.assert_close(m(x), expected)
         finally:
             s.deactivate()
-
-    def test_duplicate_lora_instances_keep_each_strength(self) -> None:
-        m = _make_bf16_model()
-        s = _make_strategy(m)
-        lora = _make_lora(4, 16)
-        assert s._normalize_adapters(
-            [lora, lora],
-            adapter_strengths=[0.25, 0.75],
-        ) == [(lora, 0.25), (lora, 0.75)]
 
     def test_invalid_lora_mode_releases_activation_claim(self) -> None:
         m = _make_bf16_model()
@@ -2390,8 +2367,8 @@ class TestPermanentMerge:
             merge_adapter(model, [(lora, 1.0)])
         torch.testing.assert_close(model.weight, before)
 
-    @pytest.mark.parametrize("zero", [0.0, -0.0])
-    def test_zero_strength_is_absent(self, zero: float) -> None:
+    @pytest.mark.parametrize("strengths", [(), (0.0,), (-0.0,)])
+    def test_inactive_merge_skips_model_parameters(self, strengths, monkeypatch: pytest.MonkeyPatch) -> None:
         m = _make_bf16_model(num_blocks=2, dim=16).to(torch.float32)
         before = {name: param.detach().clone() for name, param in m.named_parameters()}
         # Inactive LoRAs do not even require their target names to exist.
@@ -2401,14 +2378,9 @@ class TestPermanentMerge:
             prefix="missing.",
         )
 
-        assert (
-            merge_adapter(
-                m,
-                [(lora, zero)],
-                stochastic_rounding=True,
-            )
-            == 0
-        )
+        with monkeypatch.context() as patch:
+            patch.setattr(m, "named_parameters", lambda **_: pytest.fail("inactive merge walked the model"))
+            assert merge_adapter(m, [(lora, strength) for strength in strengths]) == 0
         for name, param in m.named_parameters():
             assert torch.equal(param, before[name])
 
@@ -3393,7 +3365,7 @@ class TestLoRAResource:
         ("stochastic_rounding", "expected"),
         [(None, True), (False, False)],
     )
-    def test_model_cache_stochastic_rounding_default_and_opt_out(
+    def test_model_cache_forwards_default_strengths_and_requested_rounding(
         self,
         monkeypatch: pytest.MonkeyPatch,
         stochastic_rounding: bool | None,
@@ -3413,6 +3385,7 @@ class TestLoRAResource:
             *args: object,
             **kwargs: object,
         ) -> None:
+            assert kwargs.get("adapter_strengths") is None
             captured.append(bool(kwargs.get("stochastic_rounding")))
             original_activate(offloader, *args, **kwargs)
 
@@ -3562,12 +3535,13 @@ class TestLoRAResource:
         )
         cache = ModelCache()
         value = torch.randn(2, 8)
+        disabled = AdapterSpec(key="disabled", factory=lambda: pytest.fail("disabled adapter was built"))
 
         with cache.use(
             model_spec,
             device="cpu",
-            adapter_specs=[lora_spec, lora_spec],
-            adapter_strengths=[0.25, 0.75],
+            adapter_specs=[lora_spec, disabled, lora_spec],
+            adapter_strengths=[0.25, 0.0, 0.75],
             adapter_mode="routed",
         ) as model:
             actual = model(value)

@@ -15,7 +15,7 @@ from torch import nn
 
 from ._devices import canonical_device
 from ._parameter_update import plan_parameter_update, validate_merge_target_aliases
-from .adapter import Adapter, AdapterMode, AdapterTargetUpdates, group_adapter_updates
+from .adapter import Adapter, AdapterMode, AdapterTargetUpdates, group_adapter_updates, resolve_adapter_strengths
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent
 from .block_mode import BlockMode
@@ -214,27 +214,6 @@ class ModelOffloader:
         return cls(model, composite=composite, cache_bytes=cache_bytes)
 
     # ------------------------------------------------------------------ API
-
-    @staticmethod
-    def _normalize_adapters(
-        adapters: Sequence[Adapter],
-        *,
-        adapter_strengths: Sequence[float] | None = None,
-    ) -> list[tuple[Adapter, float]]:
-        adapter_list = list(adapters)
-        if adapter_strengths is None:
-            strength_list = [1.0] * len(adapter_list)
-        else:
-            strength_list = [float(strength) for strength in adapter_strengths]
-        return [
-            (adapter, strength)
-            for adapter, strength in zip(
-                adapter_list,
-                strength_list,
-                strict=True,
-            )
-            if strength != 0.0
-        ]
 
     def _build_merge_parameter_overrides(
         self,
@@ -533,10 +512,7 @@ class ModelOffloader:
             self._active_device = active_device
             if adapter_mode not in ("merge", "routed"):
                 raise ValueError(f"adapter_mode must be 'merge' or 'routed', got {adapter_mode!r}")
-            active_adapters = self._normalize_adapters(
-                adapters,
-                adapter_strengths=adapter_strengths,
-            )
+            active_adapters = resolve_adapter_strengths(adapters, adapter_strengths)
             updates = group_adapter_updates(active_adapters, self.param_names) if active_adapters else {}
             parameter_overrides: dict[str, ParameterOverride] | None = None
             if updates:

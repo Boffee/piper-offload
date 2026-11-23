@@ -29,6 +29,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
+- `merge_adapter()` skips the model parameter walk when called with no adapters
+  or only zero-strength adapters.
 - Breaking: Removed the `bnb` and `quanto` extras and their built-in tensor
   adapters. For bitsandbytes or Quanto checkpoints, use another supported
   weight format or register a custom tensor adapter.
