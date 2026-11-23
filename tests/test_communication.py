@@ -5127,6 +5127,17 @@ def _open_two_ipc_arenas(
     return out, exch
 
 
+@pytest.fixture
+def simulated_ipc_devices(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep device selection simulated through arena setup and cleanup for both ranks."""
+    from contextlib import nullcontext
+
+    from piper_offload import _relay_ipc
+
+    monkeypatch.setattr(_relay_ipc, "_device_context", nullcontext)
+
+
+@pytest.mark.usefixtures("simulated_ipc_devices")
 def test_ipc_arena_fallbacks_and_close_semantics():
     # 1. Same PID fallback returns None cleanly in one exchange round.
     rt_same_pid = _FakeIpcRuntime()
@@ -5211,6 +5222,7 @@ def _check_ipc_handle_export_errors() -> None:
     assert not rt_interrupt.allocs
 
 
+@pytest.mark.usefixtures("simulated_ipc_devices")
 def test_ipc_slot_view_validation():
     from piper_offload import _relay_ipc
 
