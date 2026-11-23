@@ -14,7 +14,7 @@ import torch
 from torch import nn
 
 from ._devices import canonical_device
-from ._parameter_update import plan_parameter_update, validate_merge_target_aliases
+from ._parameter_update import plan_merge_targets
 from .adapter import Adapter, AdapterMode, AdapterTargetUpdates, group_adapter_updates, resolve_adapter_strengths
 from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent
@@ -230,23 +230,11 @@ class ModelOffloader:
             )
 
         params_by_name = dict(self._model.named_parameters(remove_duplicate=False))
-        validate_merge_target_aliases(params_by_name, updates)
+        targets = plan_merge_targets(params_by_name, updates, stochastic_rounding=stochastic_rounding)
         overrides: dict[str, ParameterOverride] = {}
-        for param_name, contributions in updates.items():
-            param = params_by_name[param_name]
-            if contributions.should_skip_merge(param):
-                continue
-            plan = plan_parameter_update(
-                contributions.deltas,
-                value=contributions.value,
-                stochastic_rounding=stochastic_rounding,
-                target_key=param_name,
-            )
+        for param_name, param, plan in targets:
             plan.validate_parameter(param)
-            overrides[param_name] = ParameterOverride(
-                source=plan.source,
-                update=plan.update,
-            )
+            overrides[param_name] = ParameterOverride(source=plan.source, update=plan.update)
         return overrides
 
     def _register_routed_lora_hooks(

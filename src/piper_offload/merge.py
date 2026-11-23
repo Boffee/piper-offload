@@ -21,12 +21,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from ._parameter_update import (
-    ParameterUpdatePlan,
-    merge_target_id,
-    plan_parameter_update,
-    validate_merge_target_aliases,
-)
+from ._parameter_update import ParameterUpdatePlan, merge_target_id, plan_merge_targets
 from .adapter import Adapter, AdapterTargetUpdates, active_adapter_pairs, group_adapter_updates
 from .host_module import install_parameters, validate_tied_parameter_trainability
 from .pin_manager import host_pin_manager
@@ -179,26 +174,13 @@ def _build_merge_ops(
     stochastic_rounding: bool,
 ) -> list[_MergeOp]:
     """Plan one operation per updated backing, preserving all its aliases."""
-    validate_merge_target_aliases(params_by_target, updates)
+    targets = list(plan_merge_targets(params_by_target, updates, stochastic_rounding=stochastic_rounding))
+    if not targets:
+        return []
+
     # A replacement parameter must reach every name sharing the target's
     # backing, including distinct wrapper objects over the same storage.
     names_by_tie: dict[tuple[Any, ...], list[str]] = {}
-    if updates:
-        for name, candidate in params_by_target.items():
-            names_by_tie.setdefault(merge_target_id(candidate), []).append(name)
-
-    merge_ops: list[_MergeOp] = []
-    for target_key, contributions in updates.items():
-        param = params_by_target[target_key]
-        if contributions.should_skip_merge(param):
-            continue
-        aliases = tuple(names_by_tie[merge_target_id(param)])
-        plan = plan_parameter_update(
-            contributions.deltas,
-            value=contributions.value,
-            stochastic_rounding=stochastic_rounding,
-            target_key=target_key,
-        )
-        merge_ops.append(_MergeOp(aliases, param, plan))
-
-    return merge_ops
+    for name, param in params_by_target.items():
+        names_by_tie.setdefault(merge_target_id(param), []).append(name)
+    return [_MergeOp(tuple(names_by_tie[merge_target_id(param)]), param, plan) for _, param, plan in targets]

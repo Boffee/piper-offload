@@ -83,7 +83,7 @@ Keep latency and throughput measurements in [benchmarks](../benchmarks).
 | Components | Own host state and device working sets for whole modules or block lists | [host_component.py](../src/piper_offload/host_component.py), [block_component.py](../src/piper_offload/block_component.py) |
 | Host parameters and tensor adapters | Capture, account for, transfer, and reconstruct each tensor representation | [host_param.py](../src/piper_offload/host_param.py), [tensor_adapters.py](../src/piper_offload/tensor_adapters.py) |
 | Model adapters | Immutable LoRA, delta, and value resources applied through load plans or hooks | [adapter.py](../src/piper_offload/adapter.py), [merge.py](../src/piper_offload/merge.py) |
-| Parameter updates | Shared source selection, validation, and arithmetic for activation and permanent merge | [_parameter_update.py](../src/piper_offload/_parameter_update.py), [lora.py](../src/piper_offload/lora.py) |
+| Parameter updates | Select merge targets and sources, validate them, and plan arithmetic for activation and permanent merge | [_parameter_update.py](../src/piper_offload/_parameter_update.py), [lora.py](../src/piper_offload/lora.py) |
 | Pin manager | Transfer leases, page accounting, registration order, and the shared lock | [pin_manager.py](../src/piper_offload/pin_manager.py) |
 | Transfer priority | Background host-to-device copies wait while foreground transfers move data | [_transfer_priority.py](../src/piper_offload/_transfer_priority.py) |
 | Relay process group | Coordinate collectives, point-to-point operations, and host staging across ranks | [communication.py](../src/piper_offload/communication.py) |
