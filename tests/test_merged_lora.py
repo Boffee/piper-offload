@@ -864,19 +864,20 @@ class TestParameterDelta:
         from piper_offload.int8_adapter import Int8Adapter
         from tests.test_int8_adapter import _make_affine_int8
 
-        rows, cols, rank = 3, 4, 2
-        qt = _make_affine_int8(torch.randn(rows, cols))
+        weight = torch.tensor([[1, -3, 2, 4], [2, 1, -5, 3], [3, 2, -1, -7]], dtype=torch.float32)
+        qt = _make_affine_int8(weight)
         model = nn.Module()
         model.target = nn.Module()
         model.target.weight = nn.Parameter(qt, requires_grad=False)
         before = qt.dequantize()
-        dense = torch.randn(rows, cols)
-        strength = -0.375
+        # Small integers scaled by -3/8 give an exact update in either accumulation order.
+        dense = torch.tensor([[-2, 1, 3, 2], [1, -2, 2, 4], [4, 1, -2, 3]], dtype=torch.float32)
+        strength = -3 / 8
         state_dict = {"target.delta.weight": dense}
         low_rank = torch.zeros_like(dense)
         if with_lora:
-            a = torch.randn(rank, cols)
-            b = torch.randn(rows, rank)
+            a = torch.tensor([[1, 2, 0, -1], [0, -1, 2, 1]], dtype=torch.float32)
+            b = torch.tensor([[1, -1], [2, 1], [-1, 2]], dtype=torch.float32)
             state_dict.update(
                 {
                     "target.lora_A.weight": a,
