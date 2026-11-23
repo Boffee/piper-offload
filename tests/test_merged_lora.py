@@ -37,6 +37,7 @@ from piper_offload import (
     ParameterDeltaTransform,
     ParameterValue,
     ParameterValueTransform,
+    PinManager,
     ResourceNotRegisteredError,
     AdapterSpec,
     ScaledLoRAFactor,
@@ -2860,8 +2861,11 @@ class TestRoutedMode:
                 f"  actual:   {actual.flatten()[:4]}"
             )
 
+    @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
     @pytest.mark.parametrize("invalid_block", [0, 1])
-    def test_routed_rejection_restores_base_model(self, invalid_block: int) -> None:
+    def test_routed_rejection_precedes_leasing_and_hooks(
+        self, invalid_block: int, device: str, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         class LinearLike(nn.Module):
             def __init__(self, weight: nn.Parameter) -> None:
                 super().__init__()
@@ -2878,9 +2882,17 @@ class TestRoutedMode:
         x = torch.randn(2, 16)
         expected = model(x)
 
-        # Rejecting block 1 exercises rollback after block 0 installed its hooks.
-        with pytest.raises(ValueError, match=r"Routed LoRA mode requires nn\.Linear"):
-            offloader.activate("cpu", adapters=[lora], adapter_mode="routed")
+        def unexpected_lease(*args, **kwargs):
+            pytest.fail("leased factors before validating all targets")
+
+        def unexpected_hook(*args, **kwargs):
+            pytest.fail("installed a hook before validating all targets")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(PinManager, "acquire", unexpected_lease)
+            patch.setattr(nn.Linear, "register_forward_pre_hook", unexpected_hook)
+            with pytest.raises(ValueError, match=r"Routed LoRA mode requires nn\.Linear"):
+                offloader.activate(device, adapters=[lora], adapter_mode="routed")
 
         assert offloader.active_device is None
         for block in model.transformer_blocks:
@@ -2889,6 +2901,24 @@ class TestRoutedMode:
         with activated_model(offloader, "cpu"):
             torch.testing.assert_close(model(x), expected)
         assert _plan_lora_merge(offloader, lora).keys() == lora.targets.keys()
+
+    def test_routed_hook_registration_failure_removes_partial_hooks(self, monkeypatch) -> None:
+        model = _make_bf16_model(num_blocks=2).float()
+        offloader = _make_strategy(model)
+        lora = _make_lora(num_blocks=2, dim=16)
+
+        def fail_registration(*args, **kwargs):
+            raise RuntimeError("post-hook registration failed")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(model.transformer_blocks[1].attn, "register_forward_hook", fail_registration)
+            with pytest.raises(RuntimeError, match="post-hook registration failed"):
+                offloader.activate("cpu", adapters=[lora], adapter_mode="routed")
+
+        assert offloader.active_device is None
+        for block in model.transformer_blocks:
+            assert not block.attn._forward_pre_hooks
+            assert not block.attn._forward_hooks
 
     @CUDA
     def test_routed_single_adapter(self) -> None:

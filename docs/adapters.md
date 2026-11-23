@@ -169,12 +169,13 @@ rounding is described below. The arithmetic and staging details belong to
 | `"merge"` (default) | Applies updates after each host-to-device load | LoRA, dense deltas, and meta parameter values, subject to format capabilities |
 | `"routed"` | Adds a LoRA residual to each targeted linear's output | LoRA factors only |
 
-Activation-scoped merge requires CUDA. Routed LoRA works with CPU or CUDA
-activation and leaves the base weight untouched. It requires an `nn.Linear`
-parent with a compatible logical weight shape and compute dtype. Factors are
-staged for that target's invocation and released afterwards; several LoRAs on
-one target contribute independently. For tied weights, only the named parent
-receives the routed residual.
+Activation-scoped merge requires CUDA. Routed LoRA works on CPU and CUDA
+and leaves the base weight untouched. Before leasing factor storage or
+installing hooks, activation checks that every target belongs to an `nn.Linear`.
+The factors must match the linear's logical weight shape and have a compatible
+compute dtype. Each forward stages its factors and releases them afterwards.
+Several LoRAs on one target contribute independently. For tied weights, only
+the named parent receives the routed residual.
 
 Use `adapter_mode="routed"` in the example above when avoiding quantized
 re-encoding matters more than the extra forward work, or the format cannot

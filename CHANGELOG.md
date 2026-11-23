@@ -54,6 +54,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Fixed
 
+- Routed LoRA activation now checks that every target belongs to an
+  `nn.Linear` before leasing factor storage or installing hooks.
 - `Adapter.from_state_dict()` now rejects a complete value and an additive
   update for the same parameter before capturing any tensors.
 - Permanent adapter merges into a noncontiguous checkpoint view now update an
