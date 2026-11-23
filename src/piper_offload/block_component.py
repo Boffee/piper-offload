@@ -69,7 +69,7 @@ from .host_param import HostParam
 from .module_names import walk_attr_path
 from .pin_manager import PinLease, TransferLease, host_pin_manager
 from .resident_runtime import ResidentBlockRuntime
-from .rolling_runtime import RollingBlockRuntime, create_rolling_block_runtime
+from .rolling_runtime import create_rolling_block_runtime
 from .streaming_runtime import StreamingBlockRuntime
 
 logger = logging.getLogger(__name__)
@@ -475,7 +475,8 @@ class BlockComponent:
         wraparound: bool = True,
         block_mode: BlockMode = "streaming",
     ) -> None:
-        if block_mode == "rolling" and (block_compile is None or not block_compile.fullgraph):
+        fullgraph = block_compile is not None and block_compile.fullgraph
+        if block_mode == "rolling" and not fullgraph:
             raise ValueError("block_mode='rolling' requires BlockCompileConfig(fullgraph=True).")
         self._block_instances = list(block_instances)
         if block_indices is None:
@@ -488,64 +489,34 @@ class BlockComponent:
                 f"{len(self._block_instances)} blocks."
             )
         self._blocks = [instance.module for instance in self._block_instances]
-        resolved_mode = block_mode
+        rolling = None
         if block_mode == "resident":
-            runtime: BlockRuntime = ResidentBlockRuntime(self._block_instances)
-            eager_runtime = runtime
-        elif block_mode == "streaming":
-            runtime = StreamingBlockRuntime(
-                self._block_instances,
-                wraparound=wraparound,
-            )
-            eager_runtime = runtime
-        elif block_mode == "rolling":
-            runtime = create_rolling_block_runtime(
-                self._block_instances,
-                wraparound=wraparound,
-            )
-            eager_runtime = StreamingBlockRuntime(
-                self._block_instances,
-                wraparound=wraparound,
-            )
-        elif block_mode == "auto":
-            streaming_runtime = StreamingBlockRuntime(
-                self._block_instances,
-                wraparound=wraparound,
-            )
-            eager_runtime = streaming_runtime
-            if block_compile is None or not block_compile.fullgraph:
-                runtime = streaming_runtime
-                resolved_mode = "streaming"
-            else:
+            eager_runtime: BlockRuntime = ResidentBlockRuntime(self._block_instances)
+            self._block_mode: BlockMode = "resident"
+        elif block_mode in ("streaming", "rolling", "auto"):
+            # Streaming construction can move gradients to CPU. Check rolling
+            # support first so a rejected strict request leaves them in place.
+            if block_mode != "streaming" and fullgraph:
                 try:
-                    runtime = create_rolling_block_runtime(
-                        self._block_instances,
-                        wraparound=wraparound,
-                    )
+                    rolling = create_rolling_block_runtime(self._block_instances, wraparound=wraparound)
                 except NotImplementedError as exc:
-                    logger.info(
-                        "block group %r does not support rolling; using streaming: %s",
-                        name,
-                        exc,
-                    )
-                    runtime = streaming_runtime
-                    resolved_mode = "streaming"
-                else:
-                    resolved_mode = "rolling"
+                    if block_mode == "rolling":
+                        raise
+                    logger.info("block group %r does not support rolling; using streaming: %s", name, exc)
+            eager_runtime = StreamingBlockRuntime(self._block_instances, wraparound=wraparound)
+            self._block_mode = "rolling" if rolling is not None else "streaming"
         else:
             raise ValueError(f"unsupported block mode: {block_mode!r}")
-        self._block_mode: BlockMode = resolved_mode
-        self._runtime, self._eager_runtime = runtime, eager_runtime
+        self._eager_runtime = eager_runtime
+        self._runtime: BlockRuntime = rolling if rolling is not None else eager_runtime
+        self._auto_rolling_runtime = rolling if block_mode == "auto" else None
         self._block_compile = _BlockCompileState.create(
             self._blocks,
             block_compile,
-            backend=runtime.compile_backend,
-        )
-        self._auto_rolling = (
-            block_mode == "auto" and isinstance(runtime, RollingBlockRuntime)
+            backend=self._runtime.compile_backend,
         )
         self._inductor_compile: _BlockCompileState | None = (
-            self._block_compile if runtime.compile_backend == "inductor" else None
+            self._block_compile if self._runtime.compile_backend == "inductor" else None
         )
         self._active_device: torch.device | None = None
         self._active_runtime: BlockRuntime | None = None
@@ -750,10 +721,9 @@ class BlockComponent:
         if not compile_blocks:
             return self._eager_runtime, self._block_compile
 
-        if self._auto_rolling:
-            rolling = cast(RollingBlockRuntime, self._runtime)
+        if self._auto_rolling_runtime is not None:
             try:
-                rolling.validate_load_plans(self._load_plans)
+                self._auto_rolling_runtime.validate_load_plans(self._load_plans)
             except NotImplementedError as exc:
                 logger.info(
                     "block group does not support rolling for this activation; "
