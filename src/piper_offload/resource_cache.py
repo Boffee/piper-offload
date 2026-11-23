@@ -458,27 +458,23 @@ class ResourceCache:
 
         with self._lock:
             candidates = self._eviction_candidates()
-            candidate_bytes = {candidate.key: candidate.cache_bytes for candidate in candidates}
-            target = min(bytes_to_free, sum(candidate_bytes.values()))
+            target = min(bytes_to_free, sum(candidate.cache_bytes for candidate in candidates))
             if target == 0:
                 return 0
 
-            # Present the one-shot target through the existing policy context
-            # without changing the cache's persistent byte limit.
+            # Give the policy a one-shot budget for this request.
             context = EvictionContext(
                 required_cache_bytes=0,
                 used_cache_bytes=self._used_bytes,
                 max_cache_bytes=self._used_bytes - target,
                 candidates=candidates,
             )
-            victims = self._validated_victims(context)
-
             freed = 0
-            for victim in victims:
+            for victim in self._validated_victims(context):
+                self._evict_inactive(victim.key)
+                freed += victim.cache_bytes
                 if freed >= target:
                     break
-                freed += candidate_bytes[victim]
-                self._evict_inactive(victim)
             return freed
 
     def clear(self) -> None:
@@ -589,53 +585,48 @@ class ResourceCache:
             )
         return tuple(candidates)
 
-    def _build_eviction_context(self, required_cache_bytes: int) -> EvictionContext:
-        assert self._max_cache_bytes is not None
-        return EvictionContext(
-            required_cache_bytes=required_cache_bytes,
-            used_cache_bytes=self._used_bytes,
-            max_cache_bytes=self._max_cache_bytes,
-            candidates=self._eviction_candidates(),
-        )
+    def _fits_in_budget(self, required_cache_bytes: int) -> bool:
+        available = self._available_cache_bytes
+        return available is None or required_cache_bytes <= available
 
     def _evict_to_fit(self, required_cache_bytes: int) -> None:
         """Evict inactive entries so ``required_cache_bytes`` fits.
         Raises :class:`ResourceTooLargeError` when leased entries block
         sufficient eviction."""
-        available = self._available_cache_bytes
-        if available is None or required_cache_bytes <= available:
+        if self._fits_in_budget(required_cache_bytes):
             return
 
-        context = self._build_eviction_context(required_cache_bytes)
-        bytes_to_free = context.bytes_to_free
-        candidate_bytes = {candidate.key: candidate.cache_bytes for candidate in context.candidates}
-        if sum(candidate_bytes.values()) < bytes_to_free:
+        limit = self._max_cache_bytes
+        assert limit is not None
+        context = EvictionContext(
+            required_cache_bytes=required_cache_bytes,
+            used_cache_bytes=self._used_bytes,
+            max_cache_bytes=limit,
+            candidates=self._eviction_candidates(),
+        )
+        if sum(candidate.cache_bytes for candidate in context.candidates) < context.bytes_to_free:
             raise ResourceTooLargeError(
                 required=required_cache_bytes,
                 used=self._used_bytes,
-                limit=context.max_cache_bytes,
+                limit=limit,
             )
-
-        victims = self._validated_victims(context)
-
-        for victim in victims:
-            available = self._available_cache_bytes
-            assert available is not None
-            if required_cache_bytes <= available:
+        for victim in self._validated_victims(context):
+            # Releasing a store can free other entries through its finalizer.
+            if self._fits_in_budget(required_cache_bytes):
                 break
-            self._evict_inactive(victim)
+            self._evict_inactive(victim.key)
 
-    def _validated_victims(
-        self,
-        context: EvictionContext,
-    ) -> tuple[str, ...]:
-        """Select and validate policy victims without evicting them."""
-        candidate_bytes = {candidate.key: candidate.cache_bytes for candidate in context.candidates}
-        victims = self._eviction.choose_victims(context)
-        if len(victims) != len(set(victims)) or not set(victims) <= candidate_bytes.keys():
-            raise EvictionPolicyError("eviction policy chose invalid victims")
+    def _validated_victims(self, context: EvictionContext) -> list[EvictionCandidate]:
+        """Resolve the entire policy selection before allowing any eviction."""
+        remaining = {candidate.key: candidate for candidate in context.candidates}
+        victims: list[EvictionCandidate] = []
+        for key in self._eviction.choose_victims(context):
+            candidate = remaining.pop(key, None)
+            if candidate is None:
+                raise EvictionPolicyError("eviction policy chose invalid victims")
+            victims.append(candidate)
 
-        selected_bytes = sum(candidate_bytes[victim] for victim in victims)
+        selected_bytes = sum(victim.cache_bytes for victim in victims)
         if selected_bytes < context.bytes_to_free:
             raise EvictionPolicyError(
                 "eviction policy chose insufficient victims "
@@ -644,19 +635,10 @@ class ResourceCache:
         return victims
 
     def _evict_inactive(self, key: str) -> None:
-        """Release a cached, inactive entry as an eviction. Asserts the
-        precondition (built + inactive)."""
+        """Release an inactive store and deduct its bytes from the cache."""
         entry = self._entries[key]
         assert entry.store is not None
         assert not entry.in_use
-        self._release_store(entry)
-
-    def _release_store(self, entry: _Entry) -> None:
-        """Drop the store reference and update accounting.
-
-        Used for policy eviction and store admission rejection. Storage is
-        released when the cache was its last owner.
-        """
         bytes_freed = entry.cache_bytes
         entry.store = None
         entry.cache_bytes = 0

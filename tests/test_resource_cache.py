@@ -90,7 +90,7 @@ def _is_registered(cache: ResourceCache, key: str) -> bool:
 
 
 class MRUEvictionPolicy:
-    """Evict the most recently released candidate first."""
+    """Offer every candidate in most-recently-released order."""
 
     def __init__(self) -> None:
         self.inactive: list[str] = []
@@ -107,17 +107,8 @@ class MRUEvictionPolicy:
         self.mark_active(key)
 
     def choose_victims(self, context: EvictionContext) -> tuple[str, ...]:
-        sizes = {candidate.key: candidate.cache_bytes for candidate in context.candidates}
-        selected: list[str] = []
-        freed = 0
-        for key in reversed(self.inactive):
-            if key not in sizes:
-                continue
-            selected.append(key)
-            freed += sizes[key]
-            if freed >= context.bytes_to_free:
-                break
-        return tuple(selected)
+        candidates = {candidate.key for candidate in context.candidates}
+        return tuple(key for key in reversed(self.inactive) if key in candidates)
 
 
 @pytest.fixture(autouse=True)
@@ -437,19 +428,25 @@ class TestEviction:
         assert cache.used_cache_bytes == 50
         assert cache.info("a").cached
 
-    def test_evict_bytes_validates_policy_before_eviction(self) -> None:
-        class EmptyPolicy(MRUEvictionPolicy):
+    @pytest.mark.parametrize(
+        ("victims", "message"),
+        [((), "insufficient"), (("a", "unknown"), "invalid")],
+    )
+    def test_evict_bytes_validates_policy_before_eviction(
+        self, victims: tuple[str, ...], message: str
+    ) -> None:
+        class InvalidPolicy(MRUEvictionPolicy):
             def choose_victims(
                 self,
                 context: EvictionContext,
             ) -> tuple[str, ...]:
-                return ()
+                return victims
 
-        cache = ResourceCache(None, eviction_policy=EmptyPolicy())
+        cache = ResourceCache(None, eviction_policy=InvalidPolicy())
         with cache.lease(_spec("a", 50)):
             pass
 
-        with pytest.raises(EvictionPolicyError, match="insufficient"):
+        with pytest.raises(EvictionPolicyError, match=message):
             cache.evict_bytes(25)
 
         assert cache.used_cache_bytes == 50
@@ -477,6 +474,22 @@ class TestEviction:
             pass
         assert cache.info("a").cached
         assert not cache.info("b").cached
+
+    def test_admission_rechecks_room_after_releasing_a_store(self) -> None:
+        cache = ResourceCache(100)
+
+        class Owner:
+            def __del__(self) -> None:
+                cache.evict("dependent")
+
+        with cache.lease(ObjectSpec(key="owner", factory=Owner, estimated_cache_bytes=50)):
+            pass
+        with cache.lease(_spec("dependent", 50)):
+            pass
+
+        with cache.lease(_spec("incoming", 100)):
+            assert cache.used_cache_bytes == 100
+            assert not cache.info("dependent").cached
 
     def test_custom_policy_controls_victim(self) -> None:
         cache = ResourceCache(100, eviction_policy=MRUEvictionPolicy())
