@@ -779,23 +779,26 @@ def test_permanent_merge_on_a_cuda_model_leases_pinned_factors(pins) -> None:
 @CUDA
 def test_permanent_merge_leases_sources_through_validation(pins, monkeypatch) -> None:
     from piper_offload import transfer_
-    from piper_offload._parameter_update import ParameterUpdateTransform
 
     manager, _backend = pins
     adapter = _routed_adapter()
-    with manager.acquire(_factor_tensors(adapter)):
+    factors = _factor_tensors(adapter)
+    with manager.acquire(factors):
         pass
-    original_validate = ParameterUpdateTransform.validate_parameter
+    original_validate = LoRATransform.validate_parameter
+    staged = []
 
     def staging_validate(update, param) -> None:
         # Quantized targets stage their sources while validating.
         original_validate(update, param)
         for tensor in update.storage_tensors():
             transfer_(torch.empty_like(tensor, device="cuda"), tensor, non_blocking=True)
+            staged.append(tensor.data_ptr())
 
-    monkeypatch.setattr(ParameterUpdateTransform, "validate_parameter", staging_validate)
+    monkeypatch.setattr(LoRATransform, "validate_parameter", staging_validate)
     model = _BlockModel().cuda()
     assert merge_adapter(model, [(adapter, 0.5)]) == 2
+    assert sorted(staged) == sorted(tensor.data_ptr() for tensor in factors)
     assert manager.stats.active_leases == 0
 
 

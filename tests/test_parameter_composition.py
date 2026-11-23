@@ -20,6 +20,7 @@ from piper_offload import (
     file_slice,
     merge_adapter,
 )
+from piper_offload._parameter_update import _DenseMergeTransform
 from piper_offload.adapter import group_adapter_updates
 from piper_offload.tensor_adapter_registry import param_representation, select_adapter
 from piper_offload.tensor_adapters import RegularAdapter
@@ -166,13 +167,16 @@ def test_partial_targets_do_not_disable_strict_contributions(application, kind):
         torch.testing.assert_close(model.physical.cpu(), torch.ones(2, 3))
 
 
-def test_unpopulated_partial_targets_create_no_merge_work(monkeypatch):
-    from piper_offload._parameter_update import ParameterUpdateTransform
+@pytest.fixture
+def forbid_dense_merge(monkeypatch):
+    def unexpected_dense_merge(*args, **kwargs):
+        pytest.fail("constructed a dense merge for a request that needs none")
 
-    def unexpected_update(*args, **kwargs):
-        pytest.fail("skipped targets must not stage merge updates")
+    monkeypatch.setattr(_DenseMergeTransform, "__init__", unexpected_dense_merge)
 
-    monkeypatch.setattr(ParameterUpdateTransform, "_stage_update_for_plan", unexpected_update)
+
+@pytest.mark.usefixtures("forbid_dense_merge")
+def test_unpopulated_partial_targets_create_no_merge_work():
     model = nn.Linear(3, 2, bias=False, device="meta").requires_grad_(False)
     # Even incompatible target shapes need no merge validation without a base.
     adapter = Adapter({"weight": ParameterDelta.from_tensors(dense=torch.ones(5, 7))}, allow_partial_targets=True)
@@ -291,13 +295,8 @@ def test_quantized_composition_encodes_once(application, kind, value_scale, monk
 @pytest.mark.parametrize("application", ["permanent", "activation"])
 @pytest.mark.parametrize(("scale_value", "value_strength"), [(False, 0.5), (True, -0.5), (True, 1.5)])
 @pytest.mark.parametrize("shape", [(2, 3), (4, 2, 3)])
+@pytest.mark.usefixtures("forbid_dense_merge")
 def test_value_with_loras_retains_one_factorized_merge(application, scale_value, value_strength, shape, monkeypatch):
-    from piper_offload._parameter_update import ParameterUpdateTransform
-
-    def unexpected_dense_merge(*args, **kwargs):
-        pytest.fail("value plus LoRAs should retain factorized staging")
-
-    monkeypatch.setattr(ParameterUpdateTransform, "_stage_update_for_plan", unexpected_dense_merge)
     calls = []
     original_merge = RegularAdapter.merge_lora_
 
@@ -320,9 +319,8 @@ def test_value_with_loras_retains_one_factorized_merge(application, scale_value,
 
 @pytest.mark.parametrize("application", ["permanent", "activation"])
 @pytest.mark.parametrize("kind", ["piper-convrot-int8", "piper-convrot-nvfp4"])
+@pytest.mark.usefixtures("forbid_dense_merge")
 def test_scaled_convrot_value_with_loras_uses_one_native_merge(application, kind, monkeypatch):
-    from piper_offload._parameter_update import ParameterUpdateTransform
-
     source = _make_quantized(kind)
     adapter_type = type(select_adapter(source))
     base = adapter_type.dequantize(source).float().clone()
@@ -341,11 +339,7 @@ def test_scaled_convrot_value_with_loras_uses_one_native_merge(application, kind
         original_merge(target, b, a, alpha=alpha, beta=beta, rounding_seed=rounding_seed)
         assert pointers == (target.qdata.data_ptr(), target.scale.data_ptr())
 
-    def unexpected_dense_staging(*args, **kwargs):
-        pytest.fail("scaled ConvRot value plus LoRAs must use factorized staging")
-
     monkeypatch.setattr(adapter_type, "merge_lora_", staticmethod(record_merge))
-    monkeypatch.setattr(ParameterUpdateTransform, "_stage_update_for_plan", unexpected_dense_staging)
     model = nn.Linear(cols, rows, bias=False, device="meta").requires_grad_(False)
     with _application(model, [(value, -0.5), (delta, 0.25), (delta, -0.125)], application):
         actual = adapter_type.dequantize(param_representation(model.weight)).cpu().float()
