@@ -278,10 +278,12 @@ adapter = Adapter.from_state_dict(make_adapter_state())
 modified = merge_adapter(model, [(adapter, 0.8)])
 ```
 
-The return value counts unique modified parameters. The operation validates
-active names, shapes, and capabilities and prepares any replacement weights
-before the first write. When the tensor adapter exposes the target's writable
-storage, Piper updates it in place. A mapped target gets owned backing under
+The return value counts unique modified parameters. An empty request or one
+with only zero strengths returns `0` before walking the model.
+
+The operation validates active names, shapes, and capabilities and prepares
+replacement weights before the first write. When the tensor adapter exposes
+writable storage, Piper updates it in place. A mapped target gets owned backing under
 every tied name. A trainable target keeps its parameter object and optimizer
 references. If its storage must be replaced, a tensor-subclass adapter must
 support a parameter data swap. Tied parameters that need replacement must

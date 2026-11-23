@@ -27,7 +27,7 @@ from ._parameter_update import (
     plan_parameter_update,
     validate_merge_target_aliases,
 )
-from .adapter import Adapter, AdapterTargetUpdates, group_adapter_updates
+from .adapter import Adapter, AdapterTargetUpdates, active_adapter_pairs, group_adapter_updates
 from .host_module import install_parameters, validate_tied_parameter_trainability
 from .pin_manager import host_pin_manager
 from .tensor_adapter_registry import (
@@ -112,8 +112,9 @@ def merge_adapter(
     """Merge one or more adapters into model parameters in-place.
 
     Returns the number of unique parameters that were modified. Exact-zero
-    strengths are inactive and do not create merge operations. Merge reads
-    immutable host backing, so the same adapter may also serve other
+    strengths are inactive. If no adapters are active, return zero before
+    visiting model parameters. Merge reads immutable host backing,
+    so the same adapter may also serve other
     merge or routed uses. Target names and capabilities of planned merges are
     validated before any parameter is modified. An adapter constructed with
     ``allow_partial_targets=True`` ignores targets absent from this model
@@ -136,28 +137,11 @@ def merge_adapter(
     never writes into a file mapping, because the pin manager
     may return a mapping's pages to the file.
     """
-    # Filtering here avoids target lookup, staging, validation, and
-    # requantization for work that cannot modify a parameter.
-    active_adapters: list[tuple[Adapter, float]] = []
-    for adapter, strength in adapters:
-        normalized = float(strength)
-        if normalized != 0.0:
-            active_adapters.append((adapter, normalized))
-    return _merge_adapters(
-        model,
-        active_adapters,
-        stochastic_rounding=stochastic_rounding,
-    )
-
-
-def _merge_adapters(
-    model: nn.Module,
-    adapters: Sequence[tuple[Adapter, float]],
-    *,
-    stochastic_rounding: bool,
-) -> int:
+    active = active_adapter_pairs(adapters)
+    if not active:
+        return 0
     params_by_target = dict(model.named_parameters(remove_duplicate=False))
-    updates = group_adapter_updates(adapters, params_by_target.keys())
+    updates = group_adapter_updates(active, params_by_target.keys())
     merge_ops = _build_merge_ops(params_by_target, updates, stochastic_rounding=stochastic_rounding)
 
     # Preflight every operation before applying any of them. This catches all

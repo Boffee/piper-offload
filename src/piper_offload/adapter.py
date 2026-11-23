@@ -7,7 +7,7 @@ storage and target metadata only; merge and routed execution live in their
 respective transform modules.
 """
 
-from collections.abc import Mapping, Sequence, Set
+from collections.abc import Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Literal, Self
@@ -215,6 +215,23 @@ class Adapter:
     def allow_partial_targets(self) -> bool:
         """Whether to skip absent names and additive merges into unpopulated meta targets."""
         return self._allow_partial_targets
+
+
+def active_adapter_pairs[T](pairs: Iterable[tuple[T, float]]) -> list[tuple[T, float]]:
+    """Keep nonzero strengths in request order, including repeated adapters."""
+    active: list[tuple[T, float]] = []
+    for adapter, requested_strength in pairs:
+        strength = float(requested_strength)
+        if strength != 0.0:
+            active.append((adapter, strength))
+    return active
+
+
+def resolve_adapter_strengths[T](adapters: Sequence[T], strengths: Sequence[float] | None) -> list[tuple[T, float]]:
+    """Pair adapters or cache specs with their requested strengths before use."""
+    if strengths is None:
+        return [(adapter, 1.0) for adapter in adapters]
+    return active_adapter_pairs(zip(adapters, strengths, strict=True))
 
 
 def group_adapter_updates(

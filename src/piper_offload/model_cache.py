@@ -14,8 +14,7 @@ from typing import cast
 import torch
 from torch import nn
 
-from .adapter import Adapter, AdapterMode
-from .model_offloader import ModelOffloader
+from .adapter import AdapterMode, resolve_adapter_strengths
 from .resource_cache import ResourceCache
 from .resource_specs import AdapterSpec, ModelSpec
 
@@ -57,25 +56,16 @@ class ModelCache(ResourceCache):
         stochastic requantization for quantized delta targets and scaled
         quantized parameter values; routed targets are unaffected.
         """
-        specs = tuple(adapter_specs)
-        strengths = None if adapter_strengths is None else tuple(adapter_strengths)
-        # A zero-strength adapter is absent from this activation. Filter it
-        # before leasing so its factory, cache admission, and host backing are
-        # never needed merely to produce a no-op.
-        if strengths is not None:
-            active = tuple((spec, strength) for spec, strength in zip(specs, strengths, strict=True) if strength != 0.0)
-            specs = tuple(spec for spec, _strength in active)
-            strengths = tuple(strength for _spec, strength in active)
-
-        # Dependencies are leased first, so admitting the model cannot evict a
-        # adapter selected for this same runtime.
-        with self.lease_many((*specs, model)) as resources:
-            adapters = cast(tuple[Adapter, ...], resources[:-1])
-            offloader = cast(ModelOffloader, resources[-1])
+        active = resolve_adapter_strengths(adapter_specs, adapter_strengths)
+        # Hold active adapters before model admission can evict them.
+        with (
+            self.lease_many([spec for spec, _ in active]) as adapters,
+            self.lease(model) as offloader,
+        ):
             offloader.activate(
                 device,
                 adapters=adapters,
-                adapter_strengths=strengths,
+                adapter_strengths=None if adapter_strengths is None else tuple(strength for _, strength in active),
                 adapter_mode=adapter_mode,
                 stochastic_rounding=stochastic_rounding,
             )
