@@ -54,6 +54,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Fixed
 
+- `Adapter.from_state_dict()` now rejects a complete value and an additive
+  update for the same parameter before capturing any tensors.
 - Permanent adapter merges into a noncontiguous checkpoint view now update an
   owned copy shared by the target's tied names. Previously a merge could write
   into the mapping when host capture normalized the view. Custom tensor

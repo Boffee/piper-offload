@@ -83,6 +83,10 @@ For one target, the additive update is
 intrinsic scale. Keeping alpha separate also preserves mapped factor storage
 that host-side arithmetic would replace.
 
+Within one adapter, a complete value must be the only input for its target.
+`Adapter.from_state_dict()` checks all targets for missing factor pairs and
+conflicting values before capturing tensors.
+
 Unknown targets raise by default. Set `AdapterSpec(allow_partial_targets=True)`
 when one checkpoint intentionally spans separately loaded or optional model
 components. Missing names are ignored. In activation merge and permanent
