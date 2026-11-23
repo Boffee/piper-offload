@@ -635,16 +635,6 @@ class BlockComponent:
         """
         return self._active_device is None and self._working_set_state is not WorkingSetState.RELEASED
 
-    def _resolve_param_name(
-        self,
-        name: str,
-    ) -> tuple[HostModuleInstance, str]:
-        ref = self._param_name_to_block_param.get(name)
-        if ref is None:
-            raise ValueError(f"param name {name!r} is not owned by this block component")
-        block_idx, local_name = ref
-        return self._resolve_block_param(block_idx, local_name)
-
     def _resolve_buffer_name(
         self,
         name: str,
@@ -654,18 +644,6 @@ class BlockComponent:
             raise ValueError(f"buffer name {name!r} is not owned by this block component")
         block_idx, local_name = ref
         return self._resolve_block_buffer(block_idx, local_name)
-
-    def _resolve_block_param(
-        self,
-        block_idx: int,
-        name: str,
-    ) -> tuple[HostModuleInstance, str]:
-        if block_idx < 0 or block_idx >= len(self._block_instances):
-            raise ValueError(f"block index {block_idx} is out of range")
-        instance = self._block_instances[block_idx]
-        if name not in instance.params:
-            raise ValueError(f"param name {name!r} is not owned by block {block_idx}")
-        return instance, name
 
     def _resolve_block_buffer(
         self,
