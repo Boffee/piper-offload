@@ -25,14 +25,19 @@ __all__ = [
 ]
 
 type AdapterMode = Literal["merge", "routed"]
-
-_LORA_A_SUFFIX = ".lora_A.weight"
-_LORA_B_SUFFIX = ".lora_B.weight"
-_ALPHA_SUFFIX = ".alpha"
-_DELTA_WEIGHT_SUFFIX = ".delta.weight"
-_DELTA_BIAS_SUFFIX = ".delta.bias"
-
 type AdapterTarget = ParameterDelta | ParameterValue
+
+type _InputPart = Literal["a", "b", "alpha", "dense", "value"]
+type _TargetInputs = dict[_InputPart, torch.Tensor]
+
+# Reserved input suffix, target suffix, and role within that parameter.
+_INPUT_SUFFIXES: tuple[tuple[str, str, _InputPart], ...] = (
+    (".lora_A.weight", ".weight", "a"),
+    (".lora_B.weight", ".weight", "b"),
+    (".alpha", ".weight", "alpha"),
+    (".delta.weight", ".weight", "dense"),
+    (".delta.bias", ".bias", "dense"),
+)
 
 
 @dataclass(slots=True)
@@ -83,17 +88,6 @@ class AdapterTargetUpdates:
     def has_dense(self) -> bool:
         """Whether any active delta contains a full-rank contribution."""
         return any(bound.delta.dense is not None for bound in self.deltas)
-
-
-@dataclass(slots=True)
-class _AdapterSources:
-    """One parsed view of canonical adapter tensors."""
-
-    a: dict[str, torch.Tensor]
-    b: dict[str, torch.Tensor]
-    alphas: dict[str, torch.Tensor]
-    deltas: dict[str, torch.Tensor]
-    values: dict[str, torch.Tensor]
 
 
 class Adapter:
@@ -186,7 +180,8 @@ class Adapter:
         use it as their logical compute dtype.
         ``scale_parameter_values=True`` multiplies those complete values by
         an active adapter's strength; by default they remain unchanged.
-        A zero-strength adapter remains inactive.
+        A zero-strength adapter remains inactive. Input keys for every target
+        are checked for missing partners and conflicts before tensor capture.
         Compatible complete pageable CPU allocations and non-empty views into
         non-resizable storage transfer to the resulting resource. The caller
         must not mutate input tensors after construction. Device tensors and
@@ -194,12 +189,11 @@ class Adapter:
         """
         if dtype is not None and not dtype.is_floating_point:
             raise ValueError(f"Adapter dtype must be floating-point, got {dtype}.")
-        sources = _parse_adapter_state_dict(state_dict)
-        targets = _build_adapter_targets(
-            sources,
-            dtype=dtype,
-            scale_parameter_values=scale_parameter_values,
-        )
+        inputs = _group_target_inputs(state_dict)
+        targets = {
+            name: _capture_target(parts, dtype=dtype, scale_parameter_values=scale_parameter_values)
+            for name, parts in inputs.items()
+        }
         return cls(targets, allow_partial_targets=allow_partial_targets)
 
     @property
@@ -257,109 +251,77 @@ def group_adapter_updates(
     return updates
 
 
-def _parse_adapter_state_dict(
-    state_dict: Mapping[str, torch.Tensor],
-) -> _AdapterSources:
-    """Parse and validate canonical adapter sources in one pass."""
-    sources = _AdapterSources({}, {}, {}, {}, {})
+def _target_and_part(key: str) -> tuple[str, _InputPart]:
+    for suffix, target_suffix, part in _INPUT_SUFFIXES:
+        if key.endswith(suffix):
+            base = key.removesuffix(suffix)
+            if not base:
+                raise ValueError(f"Adapter target names must be non-empty: {key!r}.")
+            return base + target_suffix, part
+    if not key:
+        raise ValueError("Parameter value target names must be non-empty")
+    return key, "value"
+
+
+def _group_target_inputs(state_dict: Mapping[str, torch.Tensor]) -> dict[str, _TargetInputs]:
+    groups: dict[str, _TargetInputs] = {}
+    # Preserve Adapter.targets order: A-factor order, then remaining deltas, then values.
+    order: dict[_InputPart, list[str]] = {"a": [], "dense": [], "value": []}
     for key, tensor in state_dict.items():
-        if key.endswith(_LORA_A_SUFFIX):
-            base = key[: -len(_LORA_A_SUFFIX)]
-            _validate_lora_base(base)
-            sources.a[base] = tensor
-        elif key.endswith(_LORA_B_SUFFIX):
-            base = key[: -len(_LORA_B_SUFFIX)]
-            _validate_lora_base(base)
-            sources.b[base] = tensor
-        elif key.endswith(_ALPHA_SUFFIX):
-            base = key[: -len(_ALPHA_SUFFIX)]
-            _validate_lora_base(base)
-            sources.alphas[base] = tensor
-        elif key.endswith(_DELTA_WEIGHT_SUFFIX):
-            base = key[: -len(_DELTA_WEIGHT_SUFFIX)]
-            _validate_delta_base(base)
-            sources.deltas[f"{base}.weight"] = tensor
-        elif key.endswith(_DELTA_BIAS_SUFFIX):
-            base = key[: -len(_DELTA_BIAS_SUFFIX)]
-            _validate_delta_base(base)
-            sources.deltas[f"{base}.bias"] = tensor
-        else:
-            if not key:
-                raise ValueError("Parameter value target names must be non-empty")
-            sources.values[key] = tensor
+        name, part = _target_and_part(key)
+        groups.setdefault(name, {})[part] = tensor
+        if part in order:
+            order[part].append(name)
 
-    _validate_factor_pairing(sources)
-    return sources
+    _validate_target_inputs(groups)
+    return {name: groups[name] for names in order.values() for name in names}
 
 
-def _validate_factor_pairing(sources: _AdapterSources) -> None:
-    """Validate factor pairing in an already parsed state dict."""
-    a_only = set(sources.a) - set(sources.b)
-    b_only = set(sources.b) - set(sources.a)
+def _validate_target_inputs(groups: dict[str, _TargetInputs]) -> None:
+    """Check every target's input combination before capturing the first tensor."""
+    a_only: list[str] = []
+    b_only: list[str] = []
+    orphaned: list[str] = []
+    for name, parts in groups.items():
+        if "a" in parts and "b" not in parts:
+            a_only.append(name.removesuffix(".weight"))
+        elif "b" in parts and "a" not in parts:
+            b_only.append(name.removesuffix(".weight"))
+        elif "alpha" in parts and "a" not in parts:
+            orphaned.append(name.removesuffix(".weight"))
     if a_only or b_only:
         raise ValueError(
-            f"Unpaired LoRA factors: A-only={sorted(a_only)}, "
-            f"B-only={sorted(b_only)}. Each target needs both "
-            f".lora_A.weight and .lora_B.weight."
+            f"Unpaired LoRA factors: A-only={sorted(a_only)}, B-only={sorted(b_only)}. "
+            "Each target needs both .lora_A.weight and .lora_B.weight."
         )
-    orphaned = sorted(set(sources.alphas) - set(sources.a))
     if orphaned:
         raise ValueError(
-            f"LoRA alpha without a factor pair: {orphaned}. Each .alpha needs "
-            f"its .lora_A.weight and .lora_B.weight."
+            f"LoRA alpha without a factor pair: {sorted(orphaned)}. Each .alpha needs "
+            "its .lora_A.weight and .lora_B.weight."
         )
 
-
-def _validate_lora_base(base: str) -> None:
-    if not base:
-        raise ValueError("LoRA target names must be non-empty")
-
-
-def _validate_delta_base(base: str) -> None:
-    if not base:
-        raise ValueError("Parameter delta target names must be non-empty")
+    for name, parts in groups.items():
+        if "value" in parts and len(parts) > 1:
+            raise ValueError(f"Adapter target {name!r} cannot contain both a parameter delta and a value.")
+        alpha = parts.get("alpha")
+        if alpha is not None and alpha.numel() != 1:
+            base = name.removesuffix(".weight")
+            raise ValueError(f"LoRA alpha for {base!r} must be a scalar; got shape {tuple(alpha.shape)}.")
 
 
-def _factor_alpha(base: str, sources: _AdapterSources) -> float | None:
-    """The magnitude a factor declares, or ``None`` when it declares none.
-
-    Dividing by the rank belongs to :meth:`LoRAFactor.from_tensors`, which has
-    already validated the tensor it reads that rank from.
-    """
-    alpha = sources.alphas.get(base)
-    if alpha is None:
-        return None
-    if alpha.numel() != 1:
-        raise ValueError(f"LoRA alpha for {base!r} must be a scalar; got shape {tuple(alpha.shape)}.")
-    return float(alpha.item())
-
-
-def _build_adapter_targets(
-    sources: _AdapterSources,
+def _capture_target(
+    parts: _TargetInputs,
     *,
-    dtype: torch.dtype | None = None,
-    scale_parameter_values: bool = False,
-) -> dict[str, AdapterTarget]:
-    """Capture parsed sources into one target value per parameter name."""
-    targets: dict[str, AdapterTarget] = {}
-    factor_sources = {f"{base}.weight": base for base in sources.a}
-    delta_targets = dict.fromkeys((*factor_sources, *sources.deltas))
-    for target_key in delta_targets:
-        base = factor_sources.get(target_key)
-        targets[target_key] = ParameterDelta.from_tensors(
-            a=None if base is None else sources.a[base],
-            b=None if base is None else sources.b[base],
-            dense=sources.deltas.get(target_key),
-            dtype=dtype,
-            lora_alpha=None if base is None else _factor_alpha(base, sources),
-        )
-
-    for target_key, source in sources.values.items():
-        if target_key in targets:
-            raise ValueError(f"Adapter target {target_key!r} cannot contain both a parameter delta and a value.")
-        targets[target_key] = ParameterValue.from_tensor(
-            source,
-            dtype=dtype,
-            scale_with_strength=scale_parameter_values,
-        )
-    return targets
+    dtype: torch.dtype | None,
+    scale_parameter_values: bool,
+) -> AdapterTarget:
+    if "value" in parts:
+        return ParameterValue.from_tensor(parts["value"], dtype=dtype, scale_with_strength=scale_parameter_values)
+    alpha = parts.get("alpha")
+    return ParameterDelta.from_tensors(
+        a=parts.get("a"),
+        b=parts.get("b"),
+        dense=parts.get("dense"),
+        dtype=dtype,
+        lora_alpha=None if alpha is None else float(alpha.item()),
+    )

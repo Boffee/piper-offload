@@ -474,14 +474,27 @@ class TestLoRAConstruction:
         assert tuple(adapter.targets) == ("target.delta.scale",)
         assert isinstance(adapter.targets["target.delta.scale"], ParameterValue)
 
-    def test_parameter_delta_and_value_cannot_share_target(self) -> None:
+    @pytest.mark.parametrize("updates", [("target.delta.weight",), ("target.lora_B.weight", "target.lora_A.weight")])
+    @pytest.mark.parametrize("value_first", [False, True])
+    def test_parameter_delta_and_value_conflict_before_any_capture(self, updates, value_first, monkeypatch) -> None:
+        def unexpected_capture(*args, **kwargs):
+            pytest.fail("captured a tensor before checking all target combinations")
+
+        monkeypatch.setattr(ParameterDelta, "from_tensors", unexpected_capture)
+        monkeypatch.setattr(ParameterValue, "from_tensor", unexpected_capture)
+        tensor = torch.ones(2, 2)
+        keys = ("target.weight", *updates) if value_first else (*updates, "target.weight")
+        state = dict.fromkeys(("other.weight", "other.delta.bias", *keys), tensor)
         with pytest.raises(ValueError, match="cannot contain both a parameter delta and a value"):
-            Adapter.from_state_dict(
-                {
-                    "target.delta.weight": torch.randn(2, 2),
-                    "target.weight": torch.randn(2, 2),
-                }
-            )
+            Adapter.from_state_dict(state)
+
+    def test_target_order_uses_a_factors_then_remaining_deltas_then_values(self) -> None:
+        tensor = torch.ones(2, 2)
+        state = dict.fromkeys((
+            "value", "last.lora_B.weight", "dense.delta.bias", "last.delta.weight",
+            "first.lora_A.weight", "last.lora_A.weight", "first.lora_B.weight",
+        ), tensor)
+        assert tuple(Adapter.from_state_dict(state).targets) == ("first.weight", "last.weight", "dense.bias", "value")
 
     @pytest.mark.parametrize(
         ("source", "message"),
@@ -3814,9 +3827,13 @@ class TestIntrinsicLoRAScale:
 
         torch.testing.assert_close(merged(sd), merged(folded))
 
-    def test_alpha_without_a_factor_pair_is_rejected(self) -> None:
+    @pytest.mark.parametrize("with_value", [False, True])
+    def test_alpha_without_a_factor_pair_is_rejected(self, with_value: bool) -> None:
+        state = {"orphan.alpha": torch.tensor(8.0)}
+        if with_value:
+            state["orphan.weight"] = torch.ones(2, 2)
         with pytest.raises(ValueError, match="alpha without a factor pair"):
-            Adapter.from_state_dict(state_dict={"orphan.alpha": torch.tensor(8.0)})
+            Adapter.from_state_dict(state)
 
     def test_a_non_scalar_alpha_is_rejected(self) -> None:
         sd = self._state()
