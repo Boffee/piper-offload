@@ -31,7 +31,7 @@ from piper_offload import (
     ResourceStore,
 )
 from piper_offload.composite_component import CompositeComponent, CompositeComponentStore
-from piper_offload.host_module import HostModuleInstance, ParameterOverride
+from piper_offload.host_module import HostModuleInstance, HostModuleStore, ParameterOverride
 from piper_offload._transfer_priority import foreground_transfer
 from piper_offload._working_set import WorkingSetState
 from piper_offload.pin_manager import host_pin_manager
@@ -2681,20 +2681,23 @@ class TestBlockNameSelection:
                     "blocks.1.scale",
                 }
             )
-            assert block_components(strategy)[0].buffer_names == frozenset(
+            streamer = block_components(strategy)[0]
+            assert streamer.buffer_names == frozenset(
                 {
                     "blocks.0.scale",
                     "blocks.1.scale",
                 }
             )
-            streamer = block_components(strategy)[0]
-            _instance, local_name = streamer._resolve_buffer_name("blocks.0.scale")
-            # The instance is module-agnostic now; block 0's scheduling module
-            # (== its from_module source) is model.blocks[0].
             assert streamer.blocks[0] is model.blocks[0]
-            assert local_name == "scale"
         finally:
             strategy.deactivate()
+
+    def test_block_component_rejects_duplicate_buffer_names(self) -> None:
+        block = nn.Module()
+        block.register_buffer("scale", torch.ones(1))
+        _, instance = HostModuleStore.capture(block)
+        with pytest.raises(ValueError, match=r"duplicate block buffer name '3\.scale'"):
+            BlockComponent([instance, instance], block_indices=[3, 3])
 
     def test_block_component_resolves_parameter_override_by_name(self) -> None:
         m = _make_block_model()
@@ -3958,6 +3961,8 @@ class TestSparseBlockStore:
 
     def test_empty_blocks_are_skipped(self) -> None:
         real = self._blocks(n=2)
+        for block in real:
+            block.register_buffer("scale", torch.ones(1))
         mixed: list[nn.Module] = [nn.Module(), real[0], nn.Module(), real[1]]
         model = _make_block_list_model(mixed, "blocks")
         store = BlockComponentStore.from_module(
@@ -3966,7 +3971,9 @@ class TestSparseBlockStore:
             include_block_trainables=False,
         )
         assert store.block_indices == (1, 3)
-        assert list(store.bind(model).blocks) == real
+        component = store.bind(model)
+        assert list(component.blocks) == real
+        assert store.buffer_names == component.buffer_names == {"blocks.1.scale", "blocks.3.scale"}
 
     def test_bind_rejects_unmanaged_nonempty_blocks(self) -> None:
         store_model = _make_block_list_model(self._blocks(n=3), "blocks")

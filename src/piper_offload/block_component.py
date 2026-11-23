@@ -133,30 +133,29 @@ def _build_param_name_index(
     for compact_idx, instance in enumerate(instances):
         true_idx = block_indices[compact_idx]
         for local_name in instance.params:
-            name = _block_param_name(prefix, true_idx, local_name)
+            name = _block_tensor_name(prefix, true_idx, local_name)
             if name in index:
                 raise ValueError(f"duplicate block parameter name {name!r}")
             index[name] = (compact_idx, local_name)
     return index
 
 
-def _build_buffer_name_index(
+def _block_buffer_names(
     instances: Sequence[HostModuleInstance],
     prefix: str | None,
     block_indices: Sequence[int],
-) -> dict[str, tuple[int, str]]:
-    index: dict[str, tuple[int, str]] = {}
-    for compact_idx, instance in enumerate(instances):
-        true_idx = block_indices[compact_idx]
+) -> frozenset[str]:
+    names: set[str] = set()
+    for block_idx, instance in zip(block_indices, instances, strict=True):
         for local_name in instance.buffers:
-            name = _block_param_name(prefix, true_idx, local_name)
-            if name in index:
+            name = _block_tensor_name(prefix, block_idx, local_name)
+            if name in names:
                 raise ValueError(f"duplicate block buffer name {name!r}")
-            index[name] = (compact_idx, local_name)
-    return index
+            names.add(name)
+    return frozenset(names)
 
 
-def _block_param_name(
+def _block_tensor_name(
     prefix: str | None,
     block_idx: int,
     local_name: str,
@@ -285,7 +284,7 @@ class BlockComponentStore:
         :meth:`CompositeComponentStore.from_module` lines up correctly.
         """
         names = {
-            _block_param_name(self.blocks_path, true_idx, local_name)
+            _block_tensor_name(self.blocks_path, true_idx, local_name)
             for true_idx, store in zip(
                 self.block_indices,
                 self._block_stores,
@@ -298,16 +297,11 @@ class BlockComponentStore:
     @property
     def buffer_names(self) -> frozenset[str]:
         """Externally addressable managed buffer names (true block indices)."""
-        names = {
-            _block_param_name(self.blocks_path, true_idx, local_name)
-            for true_idx, store in zip(
-                self.block_indices,
-                self._block_stores,
-                strict=True,
-            )
+        return frozenset(
+            _block_tensor_name(self.blocks_path, block_idx, local_name)
+            for block_idx, store in zip(self.block_indices, self._block_stores, strict=True)
             for local_name in store.buffers
-        }
-        return frozenset(names)
+        )
 
     @property
     def cache_bytes(self) -> int:
@@ -565,15 +559,8 @@ class BlockComponent:
             name,
             block_indices,
         )
-        self._buffer_name_to_block_buffer = _build_buffer_name_index(
-            self._block_instances,
-            name,
-            block_indices,
-        )
-        self._param_names, self._buffer_names = (
-            frozenset(self._param_name_to_block_param),
-            frozenset(self._buffer_name_to_block_buffer),
-        )
+        self._param_names = frozenset(self._param_name_to_block_param)
+        self._buffer_names = _block_buffer_names(self._block_instances, name, block_indices)
         self._optimizer_step_active = False
 
         # Auto-flush the CUDA allocator cache when the component is GC'd,
@@ -634,28 +621,6 @@ class BlockComponent:
         :meth:`release` or :meth:`deactivate` retries.
         """
         return self._active_device is None and self._working_set_state is not WorkingSetState.RELEASED
-
-    def _resolve_buffer_name(
-        self,
-        name: str,
-    ) -> tuple[HostModuleInstance, str]:
-        ref = self._buffer_name_to_block_buffer.get(name)
-        if ref is None:
-            raise ValueError(f"buffer name {name!r} is not owned by this block component")
-        block_idx, local_name = ref
-        return self._resolve_block_buffer(block_idx, local_name)
-
-    def _resolve_block_buffer(
-        self,
-        block_idx: int,
-        name: str,
-    ) -> tuple[HostModuleInstance, str]:
-        if block_idx < 0 or block_idx >= len(self._block_instances):
-            raise ValueError(f"block index {block_idx} is out of range")
-        instance = self._block_instances[block_idx]
-        if name not in instance.buffers:
-            raise ValueError(f"buffer name {name!r} is not owned by block {block_idx}")
-        return instance, name
 
     # ------------------------------------------------------------------
     # Lifecycle
