@@ -8,7 +8,7 @@ from typing import Self
 import torch
 from torch import nn
 
-from ._parameter_update import ParameterUpdateTransform
+from ._parameter_update import build_parameter_transform
 from .host_param import HostParam
 from .lora import LoRAFactor
 from .tensor_adapter_registry import param_representation
@@ -153,7 +153,7 @@ class ParameterDeltaTransform:
     ) -> None:
         if not deltas:
             raise ValueError("ParameterDeltaTransform requires a delta.")
-        self._update = ParameterUpdateTransform(
+        self._update = build_parameter_transform(
             deltas,
             source_scale=1.0,
             stochastic_rounding=stochastic_rounding,

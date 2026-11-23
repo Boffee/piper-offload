@@ -17,6 +17,7 @@ from torch import nn
 from .host_param import HostParam
 from .lora import (
     LoRATransform,
+    ScaledLoRAFactor,
     _localize_materialized_weight_factors,
     _materialize_weight_factors,
     _MaterializedWeightFactor,
@@ -24,6 +25,7 @@ from .lora import (
     _validate_factor_shapes,
     _validate_materialized_weight_factors,
 )
+from .parameter_transform import ParameterTransform
 from .seeding import derive_seed
 from .tensor_adapter_registry import param_representation, param_tensor_id, select_adapter
 from .tensor_adapters import (
@@ -91,69 +93,36 @@ class _DenseMergePlan:
     compute_dtype: torch.dtype
 
 
-class ParameterUpdateTransform:
-    """Repeated arithmetic on an already-loaded parameter source.
+class _DenseMergeTransform:
+    """Combine dense deltas and optional LoRA factors before one encoding.
 
-    Callers supply at least one delta or a non-unit finite ``source_scale``.
-    Each delta has its own strength; source scaling applies only to the loaded
-    weight. LoRA-only updates retain factorized merge at any source scale.
-    Value-only scaling and updates containing dense deltas use dense merge.
-    Both paths combine source scaling and updates before one terminal encoding.
-    This operation owns validation, staging, and the repeated-merge seed, while
-    callers own source selection, allocation, installation, and transfer leases.
-
-    ``source_scale`` is the supplied value's effective strength, or one for an
-    existing weight. It is passed separately as merge ``beta``, including through
-    ``LoRATransform``. Constructing a cancelling ``(source_scale - 1) * source``
-    delta can overflow or lose small updates in FP16/BF16. Value-only scaling
-    uses a zero dense update. Tensor adapters combine scaling and addition in
-    their compute precision before terminal encoding.
+    Value-only scaling uses a zero dense update. Passing the source scale as
+    merge ``beta`` avoids forming ``(source_scale - 1) * source`` in FP16 or
+    BF16, which can overflow or lose small updates.
     """
 
     __slots__ = (
         "_deltas",
         "_dense_plan",
         "_lora_factors",
-        "_lora_transform",
         "_merge_index",
         "_source_scale",
         "_stochastic_rounding",
         "_target_key",
-        "_uses_dense_merge",
     )
 
     def __init__(
         self,
-        deltas: Sequence[ScaledParameterDelta],
+        deltas: tuple[ScaledParameterDelta, ...],
+        factors: tuple[ScaledLoRAFactor, ...],
         *,
         source_scale: float,
         stochastic_rounding: bool,
         target_key: str,
     ) -> None:
         self._source_scale = source_scale
-        self._deltas = tuple(deltas)
-        if stochastic_rounding and not target_key:
-            raise ValueError(
-                "Stochastic parameter updates require a non-empty target_key."
-            )
-        self._lora_factors = tuple(
-            scaled.delta.lora.scaled(scaled.strength)
-            for scaled in self._deltas
-            if scaled.delta.lora is not None
-        )
-        self._uses_dense_merge = not self._lora_factors or any(
-            scaled.delta.dense is not None for scaled in self._deltas
-        )
-        self._lora_transform = (
-            None
-            if self._uses_dense_merge
-            else LoRATransform(
-                self._lora_factors,
-                beta=source_scale,
-                stochastic_rounding=stochastic_rounding,
-                target_key=target_key,
-            )
-        )
+        self._deltas = deltas
+        self._lora_factors = factors
         self._stochastic_rounding = stochastic_rounding
         self._target_key = target_key
         self._merge_index = 0
@@ -169,12 +138,6 @@ class ParameterUpdateTransform:
         ``transfer_`` without repeating localization or copying host backing.
         """
         self._dense_plan = None
-        if not self._uses_dense_merge:
-            # Factor-only application is completely owned by LoRATransform.
-            lora_transform = self._lora_transform
-            assert lora_transform is not None
-            lora_transform.validate_parameter(param)
-            return
         dense_sources = self._materialize_dense_sources()
 
         target = param_representation(param)
@@ -269,12 +232,6 @@ class ParameterUpdateTransform:
 
     def apply_parameter(self, param: nn.Parameter) -> None:
         """Stage all deltas, then scale and update the loaded parameter."""
-        if not self._uses_dense_merge:
-            lora_transform = self._lora_transform
-            assert lora_transform is not None
-            lora_transform.apply_parameter(param)
-            return
-
         plan = self._dense_plan
         if plan is None:
             raise RuntimeError("Parameter update target must be validated before application.")
@@ -421,7 +378,7 @@ class ParameterUpdatePlan:
     """
 
     source: HostParam | None
-    update: ParameterUpdateTransform | None
+    update: ParameterTransform | None
 
     def validate_parameter(self, param: nn.Parameter) -> None:
         if self.source is not None:
@@ -451,6 +408,40 @@ class ParameterUpdatePlan:
             )
 
 
+def build_parameter_transform(
+    deltas: Sequence[ScaledParameterDelta],
+    *,
+    source_scale: float,
+    stochastic_rounding: bool,
+    target_key: str,
+) -> ParameterTransform:
+    """Keep LoRA-only updates factorized at any base scale. Use dense merge
+    for updates with a dense delta or for scaling a value alone.
+    """
+    if stochastic_rounding and not target_key:
+        raise ValueError("Stochastic parameter updates require a non-empty target_key.")
+    deltas = tuple(deltas)
+    factors = tuple(
+        scaled.delta.lora.scaled(scaled.strength)
+        for scaled in deltas
+        if scaled.delta.lora is not None
+    )
+    if factors and all(scaled.delta.dense is None for scaled in deltas):
+        return LoRATransform(
+            factors,
+            beta=source_scale,
+            stochastic_rounding=stochastic_rounding,
+            target_key=target_key,
+        )
+    return _DenseMergeTransform(
+        deltas,
+        factors,
+        source_scale=source_scale,
+        stochastic_rounding=stochastic_rounding,
+        target_key=target_key,
+    )
+
+
 def plan_parameter_update(
     deltas: Sequence[ScaledParameterDelta],
     *,
@@ -461,15 +452,13 @@ def plan_parameter_update(
     """Select one source and combine all arithmetic before validation."""
     source = None if value is None else value.value.backing
     source_scale = 1.0 if value is None else value.effective_strength
-    update = (
-        ParameterUpdateTransform(
-            deltas,
-            source_scale=source_scale,
-            stochastic_rounding=stochastic_rounding,
-            target_key=target_key,
-        )
-        if deltas or source_scale != 1.0
-        else None
+    if not deltas and source_scale == 1.0:
+        return ParameterUpdatePlan(source, None)
+    update = build_parameter_transform(
+        deltas,
+        source_scale=source_scale,
+        stochastic_rounding=stochastic_rounding,
+        target_key=target_key,
     )
     return ParameterUpdatePlan(source, update)
 
