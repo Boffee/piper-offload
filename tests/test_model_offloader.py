@@ -661,7 +661,7 @@ class TestTransientResidency:
         finally:
             offloader.deactivate()
 
-    def test_composite_store_binds_all_groups_to_a_second_model(self) -> None:
+    def test_capture_and_rebind_include_all_groups(self) -> None:
         source = _make_block_model(num_blocks=2)
         source.tail = nn.ModuleList([nn.Identity(), nn.Linear(8, 8, bias=False)]).requires_grad_(False)
         source.embed.register_buffer("scale", torch.ones(8))
@@ -669,15 +669,19 @@ class TestTransientResidency:
         for tensor in target.state_dict().values():
             tensor.zero_()
 
-        store = CompositeComponentStore.from_module(
-            source,
-            block_paths=["transformer_blocks"],
-            transient_block_paths=["tail"],
-            transient_paths=["embed"],
-        )
+        paths = {
+            "block_paths": ["transformer_blocks"],
+            "transient_block_paths": ["tail"],
+            "transient_paths": ["embed"],
+        }
+        expected_bytes = sum(t.nbytes for t in source.state_dict().values())
+        offloader = ModelOffloader.from_module(copy.deepcopy(source), **paths)
+        assert offloader.cache_bytes == expected_bytes
+
+        store = CompositeComponentStore.from_module(source, **paths)
+        assert store.cache_bytes == expected_bytes
         bound = store.bind(target)
         torch.testing.assert_close(target.state_dict(), source.state_dict())
-        assert store.cache_bytes == sum(t.nbytes for t in source.state_dict().values())
         assert bound.resident.param_names == {"head.weight"}
         (path, embed), = bound.transient
         assert path == "embed"

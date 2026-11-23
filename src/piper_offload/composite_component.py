@@ -147,11 +147,11 @@ class _ComponentGroups[Host, Blocks]:
         ):
             raise ValueError("Offloading requires at least one parameter, registered buffer, or block to manage.")
 
-    def _stores(self) -> Iterator[Host | Blocks]:
+    def _entries(self) -> Iterator[Host | Blocks]:
         if self.resident_store is not None:
             yield self.resident_store
-        for _path, store in self.transient_stores:
-            yield store
+        for _path, entry in self.transient_stores:
+            yield entry
         yield from self.block_stores
         yield from self.transient_block_stores
 
@@ -202,11 +202,11 @@ class CompositeComponentStore(_ComponentGroups[HostComponentStore, BlockComponen
 
     @property
     def cache_bytes(self) -> int:
-        return sum(store.cache_bytes for store in self._stores())
+        return sum(store.cache_bytes for store in self._entries())
 
     @property
     def has_trainables(self) -> bool:
-        return any(store.has_trainables for store in self._stores())
+        return any(store.has_trainables for store in self._entries())
 
     def bind(
         self,
@@ -232,7 +232,7 @@ class _ModelCapture(_ComponentGroups[_CapturedHost, _CapturedBlocks]):
 
     @property
     def cache_bytes(self) -> int:
-        return sum(store.cache_bytes for store, _ in self._stores())
+        return sum(store.cache_bytes for store, _ in self._entries())
 
     def as_store[S: CompositeComponentStore](self, store_type: type[S]) -> S:
         return store_type(
