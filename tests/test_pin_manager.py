@@ -2934,3 +2934,78 @@ def test_real_commit_condition_can_be_watched() -> None:
     started = time.monotonic()
     assert not memory_module.commit_exhausted(0.05)
     assert time.monotonic() - started >= 0.04
+
+
+def _assert_close_entry_interrupt_retry(
+    local_manager: PinManager,
+    tensor: torch.Tensor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease2 = local_manager.acquire([tensor])
+    orig_close_lease = local_manager._close_lease
+    fail_enter = True
+
+    def interrupt_close_entry(key: int) -> None:
+        nonlocal fail_enter
+        if fail_enter:
+            fail_enter = False
+            raise KeyboardInterrupt("injected entry interrupt")
+        orig_close_lease(key)
+
+    monkeypatch.setattr(local_manager, "_close_lease", interrupt_close_entry)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="injected entry interrupt"):
+            lease2.close()
+        assert not lease2.closed
+        lease2.close()
+        assert lease2.closed
+        assert local_manager.stats.active_leases == 0
+    finally:
+        fail_enter = False
+        monkeypatch.setattr(local_manager, "_close_lease", orig_close_lease)
+
+
+def test_interrupted_lease_close_retry_preserves_accounting(
+    backend: FakeBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a, = _tensors((0, PAGE))
+    b, = _tensors((0, PAGE))
+    c, = _tensors((0, PAGE))
+    a_view = torch.empty(0, dtype=torch.uint8).set_(a.untyped_storage(), 0, (PAGE,), (1,))
+    local_manager = PinManager(2 * PAGE, backend=backend)
+    init_lease = local_manager.acquire([a])
+    init_lease.close()
+    lease = local_manager.acquire([a_view, b, c])
+    del a
+    gc.collect()
+
+    orig_unregister = backend.unregister
+    fail_once = True
+
+    def interrupt_unregister(pointer: int) -> None:
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise KeyboardInterrupt("injected unregister interrupt")
+        orig_unregister(pointer)
+
+    monkeypatch.setattr(backend, "unregister", interrupt_unregister)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="injected unregister interrupt"):
+            lease.close()
+        assert not lease.closed
+        lease.close()
+        assert lease.closed
+        assert local_manager.stats.active_leases == 0
+        local_manager.clear()
+        assert local_manager.stats.registrations == 0
+        assert backend.registered == {}
+
+        _assert_close_entry_interrupt_retry(local_manager, b, monkeypatch)
+    finally:
+        fail_once = False
+        monkeypatch.undo()
+        del a_view, b, c
+        gc.collect()
+        local_manager.clear()
