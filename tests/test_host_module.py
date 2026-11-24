@@ -991,13 +991,24 @@ def _make_sparse_meta(shape: tuple[int, ...], *, dtype: torch.dtype = torch.floa
     )
 
 
-def _make_trellis_weight(seed: int = 0) -> TrellisParameter:
+def _make_trellis_weight(seed: int = 0, *, variable_rows: bool = False) -> TrellisParameter:
     generator = torch.Generator().manual_seed(seed)
-    rows, blocks, num_bytes = 64, 1, 143
-    bitstreams = torch.randint(0, 256, (rows, blocks, num_bytes), dtype=torch.uint8, generator=generator)
+    rows, blocks = 64, 1
     codes = torch.randint(0x20, 0x40, (rows, blocks), dtype=torch.uint8, generator=generator)
     scale = torch.rand(rows, 1, generator=generator) * 1e-3 + 1e-4
-    return TrellisParameter(bitstreams, codes.view(torch.float8_e4m3fn), scale, block_size=256, group_size=256)
+    if not variable_rows:
+        bitstreams = torch.randint(0, 256, (rows, blocks, 143), dtype=torch.uint8, generator=generator)
+        return TrellisParameter(bitstreams, codes.view(torch.float8_e4m3fn), scale, block_size=256, group_size=256)
+    row_widths = torch.tensor([128] * 32 + [160] * 32, dtype=torch.uint8)
+    bitstreams = torch.randint(0, 256, (32 * (128 + 160),), dtype=torch.uint8, generator=generator)
+    return TrellisParameter(
+        bitstreams,
+        codes.view(torch.float8_e4m3fn),
+        scale,
+        block_size=256,
+        group_size=256,
+        row_widths=row_widths,
+    )
 
 
 class TestQuantizedMetaPlaceholderBind:
@@ -1162,20 +1173,27 @@ class TestQuantizedMetaPlaceholderBind:
             assert isinstance(gguf_skeleton.weight, cls)
             assert torch.equal(gguf_skeleton.weight.as_tensor().detach(), packed.view(torch.uint8))
 
-        trellis = _make_trellis_weight()
-        trellis_proto = nn.Module()
-        trellis_proto.weight = trellis
-        trellis_store = HostModuleStore.from_module(trellis_proto)
-        trellis_skeleton = nn.Linear(256, 64, bias=False, dtype=torch.float32, device="meta")
-        trellis_skeleton.weight.requires_grad_(False)
-        trellis_store.bind(trellis_skeleton)
-        assert isinstance(trellis_skeleton.weight, TrellisParameter)
-        assert torch.equal(trellis_skeleton.weight.bitstreams, trellis.bitstreams)
-        assert torch.equal(
-            trellis_skeleton.weight.block_scales.view(torch.uint8),
-            trellis.block_scales.view(torch.uint8),
-        )
-        assert torch.equal(trellis_skeleton.weight.scale, trellis.scale)
+        for variable_rows in (False, True):
+            trellis = _make_trellis_weight(variable_rows=variable_rows)
+            trellis_proto = nn.Module()
+            trellis_proto.weight = trellis
+            trellis_store = HostModuleStore.from_module(trellis_proto)
+            trellis_skeleton = nn.Linear(256, 64, bias=False, dtype=torch.float32, device="meta")
+            trellis_skeleton.weight.requires_grad_(False)
+            trellis_store.bind(trellis_skeleton)
+            assert isinstance(trellis_skeleton.weight, TrellisParameter)
+            assert torch.equal(trellis_skeleton.weight.bitstreams, trellis.bitstreams)
+            assert torch.equal(
+                trellis_skeleton.weight.block_scales.view(torch.uint8),
+                trellis.block_scales.view(torch.uint8),
+            )
+            assert torch.equal(trellis_skeleton.weight.scale, trellis.scale)
+            if variable_rows:
+                assert trellis_skeleton.weight.row_widths is not None
+                assert trellis.row_widths is not None
+                assert torch.equal(trellis_skeleton.weight.row_widths, trellis.row_widths)
+            else:
+                assert trellis_skeleton.weight.row_widths is None
 
     def test_meta_host_param_accepts_bind_target_checks_stride_offset_dtype_and_layout(self) -> None:
         base = torch.empty(12, dtype=torch.bfloat16, device="meta")
@@ -1219,21 +1237,23 @@ class TestQuantizedMetaPlaceholderBind:
             with pytest.raises(ValueError, match="layout mismatch"):
                 gguf_store.bind(meta_mod)
 
-        trellis_proto = nn.Module()
-        trellis_proto.weight = _make_trellis_weight()
-        trellis_store = HostModuleStore.from_module(trellis_proto)
+        for variable_rows in (False, True):
+            trellis_proto = nn.Module()
+            trellis_proto.weight = _make_trellis_weight(variable_rows=variable_rows)
+            trellis_store = HostModuleStore.from_module(trellis_proto)
 
-        meta_trellis_mod = nn.Module()
-        meta_trellis_mod.weight = TrellisParameter(
-            torch.empty((64, 1, 143), dtype=torch.uint8, device="meta"),
-            torch.empty((64, 1), dtype=torch.float8_e4m3fn, device="meta"),
-            torch.empty((64, 1), dtype=torch.float32, device="meta"),
-            block_size=256,
-            group_size=256,
-        )
-        assert not trellis_store.params["weight"].accepts_bind_target(meta_trellis_mod.weight)
-        with pytest.raises(ValueError, match="layout mismatch"):
-            trellis_store.bind(meta_trellis_mod)
+            meta_trellis_mod = nn.Module()
+            meta_trellis_mod.weight = TrellisParameter(
+                torch.empty(32 * (128 + 160) if variable_rows else (64, 1, 143), dtype=torch.uint8, device="meta"),
+                torch.empty((64, 1), dtype=torch.float8_e4m3fn, device="meta"),
+                torch.empty((64, 1), dtype=torch.float32, device="meta"),
+                block_size=256,
+                group_size=256,
+                row_widths=torch.empty((64,), dtype=torch.uint8, device="meta") if variable_rows else None,
+            )
+            assert not trellis_store.params["weight"].accepts_bind_target(meta_trellis_mod.weight)
+            with pytest.raises(ValueError, match="layout mismatch"):
+                trellis_store.bind(meta_trellis_mod)
 
     @staticmethod
     @contextmanager

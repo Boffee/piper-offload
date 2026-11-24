@@ -138,6 +138,26 @@ def _rolling_quant_weight(kind: str) -> tuple[torch.Tensor, int, torch.dtype]:
             width,
             torch.bfloat16,
         )
+    if kind == "trellis-variable-rows":
+        from piper_offload import TrellisParameter
+
+        width = 64
+        perm = torch.randperm(width)
+        row_widths = torch.where(perm < width // 2, 32, 40).to(torch.uint8)
+        total_bytes = int(row_widths.sum(dtype=torch.int64).item())
+        codes = torch.randint(0x20, 0x40, (width, 1), dtype=torch.uint8)
+        return (
+            TrellisParameter(
+                torch.randint(0, 256, (total_bytes,), dtype=torch.uint8),
+                codes.view(torch.float8_e4m3fn),
+                torch.rand(width, 1).mul_(1e-3).add_(1e-4),
+                block_size=width,
+                group_size=width,
+                row_widths=row_widths,
+            ),
+            width,
+            torch.bfloat16,
+        )
     raise AssertionError(f"unknown rolling quant test case {kind!r}")
 
 
@@ -247,9 +267,15 @@ class TestRollingCompile:
             "piper-convrot-nvfp4",
             "gguf-q4-0",
             "trellis",
+            "trellis-variable-rows",
         ],
     )
     def test_supported_quant_slots_match_compiled(self, quant_kind: str) -> None:
+        if quant_kind == "trellis-variable-rows":
+            from piper_offload._piper_convrot_int8 import supports_variable_row_trellis
+
+            if not supports_variable_row_trellis():
+                pytest.skip("piper-kernels variable-row trellis support required")
         torch.manual_seed(14)
         baseline_model, width, dtype = _rolling_quant_model(quant_kind)
         torch.manual_seed(14)

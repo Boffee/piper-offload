@@ -2,9 +2,18 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
-from piper_offload import Adapter, ModelOffloader, TrellisParameter, merge_adapter
+from piper_offload import (
+    Adapter,
+    ModelOffloader,
+    ModelStore,
+    OffloadConfig,
+    TrellisParameter,
+    merge_adapter,
+)
+from piper_offload._piper_convrot_int8 import supports_variable_row_trellis
 from piper_offload.host_param import HostParam
 from piper_offload.lora import LoRATransform, ScaledLoRAFactor
 from piper_offload.tensor_adapter_registry import (
@@ -18,6 +27,11 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm re
 ROWS = 64
 BLOCK_SIZE = 256
 GROUP_SIZE = 256
+
+VARIABLE_ROW_CUDA = pytest.mark.skipif(
+    not torch.cuda.is_available() or not supports_variable_row_trellis(),
+    reason="CUDA/ROCm and piper-kernels variable-row trellis support required",
+)
 
 
 def _weight(
@@ -41,15 +55,54 @@ def _weight(
     )
 
 
+def _variable_row_weight(
+    seed: int,
+    *,
+    blocks: int = 1,
+    widths: list[int] | None = None,
+    act_scale: float | None = None,
+    extra_bytes: int = 0,
+) -> TrellisParameter:
+    """Arbitrary variable-row trellis storage: every bit pattern is a valid walk."""
+    generator = torch.Generator().manual_seed(seed)
+    resolved_widths = (
+        [128] * (ROWS // 2) + [160] * (ROWS - ROWS // 2) if widths is None else widths
+    )
+    row_widths = torch.tensor(resolved_widths, dtype=torch.uint8)
+    rows = len(resolved_widths)
+    total_bytes = int(row_widths.sum(dtype=torch.int64).item()) * blocks + extra_bytes
+    bitstreams = torch.randint(0, 256, (total_bytes,), dtype=torch.uint8, generator=generator)
+    codes = torch.randint(0x20, 0x40, (rows, blocks), dtype=torch.uint8, generator=generator)
+    scale = torch.rand(rows, 1, generator=generator) * 1e-3 + 1e-4
+    return TrellisParameter(
+        bitstreams,
+        codes.view(torch.float8_e4m3fn),
+        scale,
+        block_size=BLOCK_SIZE,
+        group_size=GROUP_SIZE,
+        act_per_tensor_scale=None if act_scale is None else torch.tensor(act_scale),
+        row_widths=row_widths,
+    )
+
+
 def _decode(weight: TrellisParameter) -> torch.Tensor:
     from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
+    if weight.row_widths is None:
+        return ConvRotInt8Tensor.from_trellis(
+            weight.bitstreams.cuda(),
+            weight.block_scales.cuda(),
+            weight.scale.cuda(),
+            block_size=weight.block_size,
+            group_size=weight.group_size,
+        )
     return ConvRotInt8Tensor.from_trellis(
         weight.bitstreams.cuda(),
         weight.block_scales.cuda(),
         weight.scale.cuda(),
         block_size=weight.block_size,
         group_size=weight.group_size,
+        row_widths=weight.row_widths.cuda(),
     )
 
 
@@ -59,33 +112,118 @@ class TestTrellisSource:
 
         assert weight.shape == (ROWS, 2 * BLOCK_SIZE)
         assert weight.dtype is torch.bfloat16
+        assert weight.row_widths is None
         assert weight.storage_tensors() == (weight.bitstreams, weight.block_scales, weight.scale)
         assert "block_size=256" in repr(weight)
+        assert "bytes_per_block=143" in repr(weight)
         assert requires_activation(weight)
         assert isinstance(select_adapter(weight), TrellisAdapter)
 
-    def test_detach_shares_and_clone_copies_storage(self) -> None:
-        weight = _weight(1, act_scale=0.05)
+    def test_variable_row_parameter_presents_logical_weight(self) -> None:
+        weight = _variable_row_weight(0, blocks=2)
+        with_act_scale = _variable_row_weight(0, blocks=2, act_scale=0.05)
+
+        assert weight.shape == (ROWS, 2 * BLOCK_SIZE)
+        assert weight.dtype is torch.bfloat16
+        assert weight.row_widths is not None
+        assert weight.storage_tensors() == (
+            weight.bitstreams,
+            weight.block_scales,
+            weight.scale,
+            weight.row_widths,
+        )
+        assert with_act_scale.storage_tensors() == (
+            with_act_scale.bitstreams,
+            with_act_scale.block_scales,
+            with_act_scale.scale,
+            with_act_scale.row_widths,
+            with_act_scale.act_per_tensor_scale,
+        )
+        assert "variable_rows=True" in repr(weight)
+        assert f"total_bytes={weight.bitstreams.numel()}" in repr(weight)
+        assert requires_activation(weight)
+        assert isinstance(select_adapter(weight), TrellisAdapter)
+
+    @pytest.mark.parametrize(
+        ("variable_rows", "act_scale"),
+        [(False, 0.05), (True, None), (True, 0.05)],
+    )
+    def test_detach_shares_and_clone_copies_storage(
+        self, variable_rows: bool, act_scale: float | None
+    ) -> None:
+        weight = (
+            _variable_row_weight(1, act_scale=act_scale)
+            if variable_rows
+            else _weight(1, act_scale=act_scale)
+        )
 
         detached, cloned = weight.detach(), weight.clone()
 
         for copy, shares in ((detached, True), (cloned, False)):
             assert isinstance(copy, TrellisParameter)
             assert copy.shape == weight.shape
+            assert (copy.row_widths is not None) is variable_rows
+            assert (copy.act_per_tensor_scale is not None) is (act_scale is not None)
             for a, b in zip(copy.storage_tensors(), weight.storage_tensors(), strict=True):
                 assert (a.data_ptr() == b.data_ptr()) is shares
                 assert torch.equal(a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8))
+
+        with pytest.raises(ValueError, match="storage tensors"):
+            weight.rebuild(weight.storage_tensors()[:-1])
 
     def test_other_operations_require_split_storage_or_activation(self) -> None:
         with pytest.raises(NotImplementedError, match="split checkpoint storage"):
             _weight(2)[:8]
 
+    @pytest.mark.parametrize("bad_block_size", [0, 8, 512])
+    def test_parameter_rejects_out_of_range_block_size(self, bad_block_size: int) -> None:
+        weight = _weight(3)
+        with pytest.raises(ValueError, match="block_size"):
+            TrellisParameter(
+                weight.bitstreams,
+                weight.block_scales,
+                weight.scale,
+                block_size=bad_block_size,
+                group_size=GROUP_SIZE,
+            )
+
+    def test_parameter_rejects_bool_block_size(self) -> None:
+        weight = _weight(3)
+        with pytest.raises(TypeError, match="block_size"):
+            TrellisParameter(
+                weight.bitstreams,
+                weight.block_scales,
+                weight.scale,
+                block_size=True,
+                group_size=GROUP_SIZE,
+            )
+
+    def test_parameter_accepts_supports_index_block_size(self) -> None:
+        class _Index:
+            def __index__(self) -> int:
+                return BLOCK_SIZE
+
+        weight = _weight(3)
+        wrapped = TrellisParameter(
+            weight.bitstreams,
+            weight.block_scales,
+            weight.scale,
+            block_size=_Index(),  # type: ignore[arg-type]
+            group_size=GROUP_SIZE,
+        )
+        assert wrapped.block_size == BLOCK_SIZE
+        assert type(wrapped.block_size) is int
+
     @pytest.mark.parametrize(
         ("change", "message"),
         [
             ({"bitstreams": torch.zeros(ROWS, 1, 143)}, "uint8"),
+            ({"bitstreams": torch.zeros((ROWS, 0, 143), dtype=torch.uint8)}, "at least one block"),
             ({"block_scales": torch.zeros(ROWS, 2, dtype=torch.float8_e4m3fn)}, "block_scales"),
             ({"scale": torch.zeros(ROWS)}, "scale must be float32"),
+            ({"act_per_tensor_scale": torch.tensor(1, dtype=torch.int32)}, "strided float32 scalar"),
+            ({"act_per_tensor_scale": torch.ones(1, dtype=torch.float32)}, "strided float32 scalar"),
+            ({"scale": torch.zeros((ROWS, 1), dtype=torch.float32, device="meta")}, "mix meta"),
         ],
     )
     def test_parameter_rejects_inconsistent_storage(
@@ -100,6 +238,197 @@ class TestTrellisSource:
 
         with pytest.raises(ValueError, match=message):
             TrellisParameter(**tensors, block_size=BLOCK_SIZE, group_size=GROUP_SIZE)
+
+    def test_parameter_rejects_sparse_storage(self) -> None:
+        weight = _weight(3)
+        sparse = torch.zeros(ROWS * 128, dtype=torch.uint8).to_sparse()
+        with pytest.raises(ValueError, match="strided layout"):
+            TrellisParameter(
+                sparse,
+                weight.block_scales,
+                weight.scale,
+                block_size=BLOCK_SIZE,
+                group_size=GROUP_SIZE,
+                row_widths=torch.full((ROWS,), 128, dtype=torch.uint8),
+            )
+
+    @pytest.mark.parametrize(
+        ("change", "message"),
+        [
+            (
+                {"bitstreams": torch.zeros((ROWS, 1), dtype=torch.uint8)},
+                "1-D uint8",
+            ),
+            (
+                {"bitstreams": torch.zeros(ROWS * 128, dtype=torch.int8)},
+                "1-D uint8",
+            ),
+            (
+                {"block_scales": torch.zeros(ROWS, dtype=torch.float8_e4m3fn)},
+                "2-D float8_e4m3fn",
+            ),
+            (
+                {"block_scales": torch.zeros((ROWS, 0), dtype=torch.float8_e4m3fn)},
+                "at least one block",
+            ),
+            (
+                {"block_scales": torch.zeros((ROWS, 1), dtype=torch.float32)},
+                "2-D float8_e4m3fn",
+            ),
+            (
+                {"row_widths": torch.full((ROWS,), 128, dtype=torch.int16)},
+                "row_widths must be uint8",
+            ),
+            (
+                {"row_widths": torch.full((ROWS - 1,), 128, dtype=torch.uint8)},
+                "row_widths must be uint8",
+            ),
+            (
+                {"row_widths": torch.empty((ROWS,), dtype=torch.uint8, device="meta")},
+                "mix meta",
+            ),
+            (
+                {"row_widths": torch.tensor([95] + [128] * (ROWS - 1), dtype=torch.uint8)},
+                r"must be in \[96, 192\]",
+            ),
+            (
+                {"row_widths": torch.tensor([193] + [128] * (ROWS - 1), dtype=torch.uint8)},
+                r"must be in \[96, 192\]",
+            ),
+            (
+                {"bitstreams": torch.zeros(32 * (128 + 160) - 1, dtype=torch.uint8)},
+                "is smaller than row_widths sum",
+            ),
+        ],
+    )
+    def test_variable_row_parameter_rejects_invalid_storage(
+        self, change: dict[str, torch.Tensor], message: str
+    ) -> None:
+        weight = _variable_row_weight(3)
+        assert weight.row_widths is not None
+        tensors = {
+            "bitstreams": weight.bitstreams,
+            "block_scales": weight.block_scales,
+            "scale": weight.scale,
+            "row_widths": weight.row_widths,
+        } | change
+
+        with pytest.raises(ValueError, match=message):
+            TrellisParameter(**tensors, block_size=BLOCK_SIZE, group_size=GROUP_SIZE)
+
+    def test_variable_row_accepts_padded_bitstreams(self) -> None:
+        padded = _variable_row_weight(3, extra_bytes=7)
+        assert padded.shape == (ROWS, BLOCK_SIZE)
+        assert padded.bitstreams.numel() == 32 * (128 + 160) + 7
+
+    def test_variable_row_empty_rows_handled_without_content_crash(self) -> None:
+        valid = TrellisParameter(
+            torch.zeros(0, dtype=torch.uint8),
+            torch.zeros((0, 1), dtype=torch.float8_e4m3fn),
+            torch.zeros((0, 1), dtype=torch.float32),
+            block_size=BLOCK_SIZE,
+            group_size=GROUP_SIZE,
+            row_widths=torch.zeros((0,), dtype=torch.uint8),
+        )
+        assert valid.shape == (0, BLOCK_SIZE)
+        padded = TrellisParameter(
+            torch.zeros(1, dtype=torch.uint8),
+            torch.zeros((0, 1), dtype=torch.float8_e4m3fn),
+            torch.zeros((0, 1), dtype=torch.float32),
+            block_size=BLOCK_SIZE,
+            group_size=GROUP_SIZE,
+            row_widths=torch.zeros((0,), dtype=torch.uint8),
+        )
+        assert padded.shape == (0, BLOCK_SIZE)
+
+    def test_cpu_param_and_detach_skip_row_width_rescan(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import piper_offload.trellis_parameter as tp
+
+        weight = _variable_row_weight(4)
+        state = TrellisAdapter.capture_host(weight)
+
+        def _fail(*args: object, **kwargs: object) -> None:
+            raise AssertionError("unexpected row_widths validation")
+
+        monkeypatch.setattr(tp, "validate_row_widths_cpu", _fail)
+        rebuilt = TrellisAdapter.cpu_param(state)
+        detached = weight.detach()
+        assert isinstance(rebuilt, TrellisParameter)
+        assert isinstance(detached, TrellisParameter)
+
+        with pytest.raises(AssertionError, match="unexpected row_widths"):
+            weight.rebuild(weight.storage_tensors())
+
+    def test_alloc_gpu_fails_fast_when_variable_row_kernel_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import piper_offload.trellis_adapter as ta
+
+        weight = _variable_row_weight(4)
+        state = TrellisAdapter.capture_host(weight)
+
+        def _raise() -> None:
+            raise RuntimeError("missing row_widths support")
+
+        monkeypatch.setattr(ta, "require_variable_row_trellis", _raise)
+        with pytest.raises(RuntimeError, match="missing row_widths support"):
+            TrellisAdapter.alloc_gpu(state, torch.device("cpu"))
+
+    def test_model_store_distinguishes_negated_row_widths_sharing_storage(self) -> None:
+        class _Pair(nn.Module):
+            def __init__(self, first: TrellisParameter, second: TrellisParameter) -> None:
+                super().__init__()
+                self.first = nn.Linear(BLOCK_SIZE, 2, bias=False)
+                self.first.weight = first
+                self.second = nn.Linear(BLOCK_SIZE, 2, bias=False)
+                self.second.weight = second
+
+        # (-112) mod 256 == 144 and (-144) mod 256 == 112: lazy unsigned negation flips the rows.
+        base_widths = torch.tensor([112, 144], dtype=torch.uint8)
+        neg_widths = base_widths.neg()
+        assert torch.equal(neg_widths, torch.tensor([144, 112], dtype=torch.uint8))
+
+        bitstreams = torch.arange(256, dtype=torch.uint8)
+        block_scales = torch.full((2, 1), 0x3C, dtype=torch.uint8).view(torch.float8_e4m3fn)
+        scale = torch.ones((2, 1), dtype=torch.float32)
+
+        first = TrellisParameter(
+            bitstreams, block_scales, scale, block_size=BLOCK_SIZE, group_size=GROUP_SIZE,
+            row_widths=base_widths,
+        )
+        second = TrellisParameter(
+            bitstreams, block_scales, scale, block_size=BLOCK_SIZE, group_size=GROUP_SIZE,
+            row_widths=neg_widths,
+        )
+        proto = _Pair(first, second)
+        store = ModelStore.from_module(proto)
+
+        shell = nn.Module()
+        shell.first = nn.Linear(BLOCK_SIZE, 2, bias=False, device="meta")
+        shell.second = nn.Linear(BLOCK_SIZE, 2, bias=False, device="meta")
+        shell.requires_grad_(False)
+        store.bind(shell)
+
+        assert shell.first.weight.row_widths is not None
+        assert shell.second.weight.row_widths is not None
+        assert torch.equal(shell.first.weight.row_widths, torch.tensor([112, 144], dtype=torch.uint8))
+        assert torch.equal(shell.second.weight.row_widths, torch.tensor([144, 112], dtype=torch.uint8))
+
+    def test_meta_variable_row_parameter_skips_content_readback(self) -> None:
+        weight = TrellisParameter(
+            torch.empty(128, dtype=torch.uint8, device="meta"),
+            torch.empty((ROWS, 1), dtype=torch.float8_e4m3fn, device="meta"),
+            torch.empty((ROWS, 1), dtype=torch.float32, device="meta"),
+            block_size=BLOCK_SIZE,
+            group_size=GROUP_SIZE,
+            row_widths=torch.empty((ROWS,), dtype=torch.uint8, device="meta"),
+        )
+        assert weight.is_meta
+        assert weight.shape == (ROWS, BLOCK_SIZE)
+        with pytest.raises(ValueError, match="physical storage"):
+            TrellisAdapter.capture_host(weight)
 
     def test_adapter_captures_packed_storage(self) -> None:
         weight = _weight(4, act_scale=0.05)
@@ -117,6 +446,26 @@ class TestTrellisSource:
         assert TrellisAdapter.logical_shape(weight) == (ROWS, BLOCK_SIZE)
         assert TrellisAdapter.compute_dtype(weight) is torch.bfloat16
 
+    def test_variable_row_adapter_captures_packed_storage(self) -> None:
+        weight = _variable_row_weight(4, blocks=2, act_scale=0.05)
+
+        state = TrellisAdapter.capture_host(weight)
+
+        captured = TrellisAdapter.storage_tensors(state)
+        assert len(captured) == 5
+        assert [t.data_ptr() for t in captured] == [t.data_ptr() for t in weight.storage_tensors()]
+        # Bitstreams, FP8 block scales, FP32 row scales, uint8 row widths, then FP32 act scale.
+        assert (
+            TrellisAdapter.cache_bytes(state)
+            == weight.bitstreams.nbytes + ROWS * 2 + ROWS * 4 + ROWS + 4
+        )
+        first, second = TrellisAdapter.cpu_param(state), TrellisAdapter.cpu_param(state)
+        assert isinstance(first, TrellisParameter)
+        assert first is not second
+        assert [t.data_ptr() for t in first.storage_tensors()] == [t.data_ptr() for t in captured]
+        assert TrellisAdapter.logical_shape(weight) == (ROWS, 2 * BLOCK_SIZE)
+        assert TrellisAdapter.compute_dtype(weight) is torch.bfloat16
+
     def test_tensor_id_and_layout_follow_storage_and_rate(self) -> None:
         weight = _weight(5)
         other_rate = _weight(5, num_bytes=111)
@@ -128,6 +477,22 @@ class TestTrellisSource:
         )
         assert TrellisAdapter.layout_signature(weight) != TrellisAdapter.layout_signature(
             other_rate
+        )
+
+    def test_variable_row_tensor_id_and_layout_signature(self) -> None:
+        first = _variable_row_weight(5, widths=[128] * 32 + [160] * 32)
+        permuted = _variable_row_weight(6, widths=[160] * 32 + [128] * 32)
+        other_total = _variable_row_weight(7, widths=[112] * 32 + [144] * 32)
+        uniform_equal = _weight(8, num_bytes=144)
+
+        assert first.bitstreams.numel() == permuted.bitstreams.numel() == uniform_equal.bitstreams.numel()
+        assert TrellisAdapter.tensor_id(first) == TrellisAdapter.tensor_id(first.detach())
+        assert TrellisAdapter.tensor_id(first) != TrellisAdapter.tensor_id(first.clone())
+        assert TrellisAdapter.tensor_id(first) != TrellisAdapter.tensor_id(permuted)
+        assert TrellisAdapter.layout_signature(first) == TrellisAdapter.layout_signature(permuted)
+        assert TrellisAdapter.layout_signature(first) != TrellisAdapter.layout_signature(other_total)
+        assert TrellisAdapter.layout_signature(first) != TrellisAdapter.layout_signature(
+            uniform_equal
         )
 
     def test_rejects_permanent_merge(self) -> None:
@@ -208,3 +573,177 @@ class TestTrellisActivation:
         )
         torch.testing.assert_close(actual.qdata, expected.qdata)
         torch.testing.assert_close(actual.scale, expected.scale)
+
+    @CUDA
+    def test_capture_host_rejects_invalid_gpu_row_widths_before_copying_bitstreams(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import piper_offload.trellis_adapter as ta
+
+        bad_widths = torch.tensor([95] + [128] * (ROWS - 1), dtype=torch.uint8, device="cuda")
+        bitstreams = torch.zeros(32 * (128 + 160), dtype=torch.uint8, device="cuda")
+        block_scales = torch.full((ROWS, 1), 0x3C, dtype=torch.uint8, device="cuda").view(
+            torch.float8_e4m3fn
+        )
+        scale = torch.ones((ROWS, 1), dtype=torch.float32, device="cuda")
+        weight = TrellisParameter(
+            bitstreams, block_scales, scale, block_size=BLOCK_SIZE, group_size=GROUP_SIZE,
+            row_widths=bad_widths,
+        )
+
+        copied_ptrs: list[int] = []
+        real_capture = ta.capture_host_tensor
+
+        def _spy_capture(tensor: torch.Tensor, **kwargs: object) -> torch.Tensor:
+            copied_ptrs.append(tensor.data_ptr())
+            return real_capture(tensor, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(ta, "capture_host_tensor", _spy_capture)
+        with pytest.raises(ValueError, match=r"must be in \[96, 192\]"):
+            TrellisAdapter.capture_host(weight)
+        assert copied_ptrs == [bad_widths.data_ptr()]
+
+    @CUDA
+    def test_uniform_mixed_physical_devices_capture_to_cpu(self) -> None:
+        weight = _weight(7)
+        mixed = TrellisParameter(
+            weight.bitstreams,
+            weight.block_scales.cuda(),
+            weight.scale.cuda(),
+            block_size=BLOCK_SIZE,
+            group_size=GROUP_SIZE,
+        )
+        state = TrellisAdapter.capture_host(mixed)
+        assert all(part.device.type == "cpu" for part in TrellisAdapter.storage_tensors(state))
+
+    @VARIABLE_ROW_CUDA
+    def test_variable_row_activation_decodes_into_convrot_int8(self) -> None:
+        from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+
+        weight = _variable_row_weight(11, blocks=2, extra_bytes=7)
+        model = nn.Linear(2 * BLOCK_SIZE, ROWS, bias=False)
+        model.weight = weight
+        offloader = ModelOffloader.from_module(model)
+
+        offloader.activate("cuda")
+        try:
+            actual = param_representation(model.weight)
+            expected = _decode(weight)
+            assert isinstance(actual, ConvRotInt8Tensor)
+            assert actual.group_size == GROUP_SIZE
+            assert torch.equal(actual.qdata, expected.qdata)
+            assert torch.equal(actual.scale, expected.scale)
+        finally:
+            offloader.deactivate()
+
+        assert isinstance(model.weight, TrellisParameter)
+        assert model.weight.row_widths is not None
+
+    @VARIABLE_ROW_CUDA
+    def test_variable_row_refill_reuses_target_across_different_row_distributions(self) -> None:
+        first = _variable_row_weight(
+            12, blocks=2, widths=[128] * 32 + [160] * 32, act_scale=0.05
+        )
+        second = _variable_row_weight(
+            13, blocks=2, widths=[160] * 32 + [128] * 32, act_scale=0.25
+        )
+        backing = HostParam(first)
+        state = backing.allocate_gpu_storage(torch.device("cuda"))
+        actual = param_representation(backing.make_gpu_param(state))
+        backing.copy_to_gpu(state, non_blocking=True)
+        qdata_pointer = actual.qdata.data_ptr()
+
+        HostParam(second).copy_to_gpu(state, non_blocking=True)
+        torch.cuda.synchronize()
+
+        expected = _decode(second)
+        assert actual.qdata.data_ptr() == qdata_pointer
+        assert torch.equal(actual.qdata, expected.qdata)
+        assert torch.equal(actual.scale, expected.scale)
+        assert float(actual.act_per_tensor_scale) == pytest.approx(0.25)
+        assert len(state.staging) == 4
+        assert sum(t.nbytes for t in state.staging) < actual.qdata.nbytes
+
+    @VARIABLE_ROW_CUDA
+    def test_variable_row_streaming_blocks_share_target_and_merge_lora(self) -> None:
+        class _BlockModel(nn.Module):
+            def __init__(self, weights: tuple[TrellisParameter, ...]) -> None:
+                super().__init__()
+                blocks = []
+                for w in weights:
+                    layer = nn.Linear(BLOCK_SIZE, ROWS, bias=False)
+                    layer.weight = w
+                    blocks.append(layer)
+                self.blocks = nn.ModuleList(blocks)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                out = self.blocks[0](x)
+                for block in self.blocks[1:]:
+                    out = out + block(x)
+                return out
+
+        weights = (
+            _variable_row_weight(14, widths=[128] * 32 + [160] * 32),
+            _variable_row_weight(15, widths=[160] * 32 + [128] * 32),
+            _variable_row_weight(16, widths=[144] * ROWS),
+        )
+        model = _BlockModel(weights)
+
+        torch.manual_seed(17)
+        factors = [(torch.randn(4, BLOCK_SIZE), torch.randn(ROWS, 4)) for _ in weights]
+        adapter = Adapter.from_state_dict(
+            {
+                key: tensor
+                for idx, (a, b) in enumerate(factors)
+                for key, tensor in (
+                    (f"blocks.{idx}.lora_A.weight", a),
+                    (f"blocks.{idx}.lora_B.weight", b),
+                )
+            }
+        )
+
+        x = torch.randn(8, BLOCK_SIZE, device="cuda", dtype=torch.bfloat16)
+        expected = torch.zeros((8, ROWS), device="cuda", dtype=torch.bfloat16)
+        for weight, (a, b) in zip(weights, factors, strict=True):
+            decoded = _decode(weight)
+            decoded.addmm_(
+                b.to(device="cuda", dtype=torch.bfloat16),
+                a.to(device="cuda", dtype=torch.bfloat16),
+                alpha=0.25,
+            )
+            expected = expected + F.linear(x, decoded)
+
+        seen_ptrs: list[int] = []
+        handles = [
+            block.register_forward_hook(
+                lambda mod, _inp, _out: seen_ptrs.append(
+                    param_representation(mod.weight).qdata.data_ptr()
+                )
+            )
+            for block in model.blocks
+        ]
+
+        offloader = ModelOffloader.from_module(
+            model,
+            OffloadConfig(block_paths=("blocks",), block_mode="streaming"),
+        )
+        offloader.activate(
+            "cuda",
+            adapters=[adapter],
+            adapter_strengths=[0.25],
+            adapter_mode="merge",
+            stochastic_rounding=False,
+        )
+        try:
+            with torch.inference_mode():
+                actual = model(x)
+                torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected)
+            # Active + lookahead share a 2-target pool across all 3 blocks: block 2 reuses block 0.
+            assert len(seen_ptrs) == 3
+            assert len(set(seen_ptrs)) == 2
+            assert seen_ptrs[2] == seen_ptrs[0]
+        finally:
+            for handle in handles:
+                handle.remove()
+            offloader.deactivate()
