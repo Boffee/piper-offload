@@ -191,8 +191,9 @@ implementation in [resource_cache.py](../src/piper_offload/resource_cache.py).
    Route every physical host-to-device copy through `transfer_()` so the transfer
    uses the storage the pin manager prepared. See [custom transfers](memory.md#custom-transfers).
 2. Implement the capabilities the format supports. CPU round-trip, trainable
-   parameter data swaps, representation-preserving copy, conversion, and merge
-   are separate protocols. For factorized or dense merge, the merge and preflight
+   parameter data swaps, bind-target relaxation (`BindTargetTensorAdapter`),
+   representation-preserving copy, conversion, and merge are separate protocols.
+   For factorized or dense merge, the merge and preflight
    docstrings specify rounding, coefficients, broadcasting, locality, and
    storage preservation. See the [caller contract](adapters.md#broadcast-additive-updates)
    for how updates compose.

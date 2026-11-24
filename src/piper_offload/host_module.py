@@ -9,7 +9,6 @@ from collections.abc import (
     Iterable,
     Iterator,
     Mapping,
-    Sequence,
 )
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -459,26 +458,9 @@ def _capture_params(
     ):
         validate_tied_parameter_trainability(names, params)
         host = HostParam(params[names[0]])
-        _validate_param_storage_group_tieable(names, host)
         for name in names:
             host_by_name[name] = host
     return host_by_name
-
-
-def _validate_param_storage_group_tieable(names: Sequence[str], host: HostParam) -> None:
-    """Reject tied weights whose adapter migrates wrapper state on forward.
-
-    The first forward can move state off a shared wrapper and leave later
-    consumers with missing state. The rearm hook runs once per load.
-    """
-    if len(names) > 1 and host._needs_rearm:
-        raise NotImplementedError(
-            f"Tied weights {sorted(names)!r} use an adapter whose quant state "
-            f"migrates onto the owning module on first forward "
-            f"({type(host.adapter).__name__}); one shared wrapper cannot "
-            "serve multiple tied modules. Untie these weights, or keep them "
-            "resident instead of offloading."
-        )
 
 
 def _capture_buffers(
@@ -526,11 +508,12 @@ def _validate_module_matches(
 ) -> None:
     """Validate that ``module`` is a structurally compatible bind target.
 
-    Compares bind layouts, not full target layouts: binding replaces every
-    managed tensor with the host backing storage, so placeholder fields
-    the bind overwrites (dtype, for plain tensors) are not required to
-    match — a config-built meta skeleton binds against bytes captured from
-    natively loaded weights.
+    Compares bind compatibility via :meth:`HostParam.accepts_bind_target`
+    (and :meth:`HostBuffer.bind_layout_for` for buffers): binding replaces
+    every managed tensor with the host backing storage, so placeholder fields
+    overwritten on bind (such as plain tensor dtype or a plain strided
+    ``meta`` shape matching a frozen quantized store) do not reject a fresh
+    skeleton.
     """
     params = _named_parameters(module)
     buffers = _named_buffers(module)
@@ -544,8 +527,10 @@ def _validate_module_matches(
                 f"Param {name!r} requires_grad mismatch: store has "
                 f"{host.requires_grad}, module has {param.requires_grad}."
             )
+        if host.accepts_bind_target(param):
+            continue
+        representation = param_representation(param)
         if host.is_meta:
-            representation = param_representation(param)
             host_representation = cast(torch.Tensor, host.host_state)
             if (
                 type(representation) is not torch.Tensor
@@ -558,29 +543,22 @@ def _validate_module_matches(
                     f"type={type(representation).__name__}, "
                     f"device={representation.device}, layout={representation.layout}."
                 )
-            if (
-                tuple(representation.shape) != tuple(host.shape)
-                or representation.dtype is not host.compute_dtype
-                or representation.stride() != host_representation.stride()
-                or representation.storage_offset()
-                != host_representation.storage_offset()
-            ):
-                raise ValueError(
-                    f"Param {name!r} meta layout mismatch: store has "
-                    f"shape={tuple(host.shape)}, dtype={host.compute_dtype}, "
-                    f"stride={host_representation.stride()}, "
-                    f"storage_offset={host_representation.storage_offset()}, "
-                    f"module has type={type(representation).__name__}, "
-                    f"device={representation.device}, shape={tuple(representation.shape)}, "
-                    f"dtype={representation.dtype}, stride={representation.stride()}, "
-                    f"storage_offset={representation.storage_offset()}."
-                )
-            continue
-        layout = HostParam.bind_layout_for(param)
-        if layout != host.bind_layout:
             raise ValueError(
-                f"Param {name!r} layout mismatch: store has {host.bind_layout!r}, module has {layout!r}."
+                f"Param {name!r} meta layout mismatch: store has "
+                f"shape={tuple(host.shape)}, dtype={host_representation.dtype}, "
+                f"stride={host_representation.stride()}, "
+                f"storage_offset={host_representation.storage_offset()}, "
+                f"module has type={type(representation).__name__}, "
+                f"device={representation.device}, shape={tuple(representation.shape)}, "
+                f"dtype={representation.dtype}, stride={representation.stride()}, "
+                f"storage_offset={representation.storage_offset()}."
             )
+        raise ValueError(
+            f"Param {name!r} layout mismatch: store has {host.target_layout!r}, "
+            f"module has type={type(representation).__name__}, "
+            f"shape={tuple(representation.shape)}, dtype={representation.dtype}, "
+            f"device={representation.device}, layout={representation.layout}."
+        )
 
     for name, host in host_buffers.items():
         layout = HostBuffer.bind_layout_for(buffers[name])
@@ -817,7 +795,6 @@ def _load_param_target(
             "Reallocate the target for the current activation plan."
         )
     source.copy_to_gpu(target._state, non_blocking=non_blocking)
-    source.rearm_after_load(target.param, target._state)
     if load.update is not None:
         load.update.apply_parameter(target.param)
 

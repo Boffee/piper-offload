@@ -24,6 +24,7 @@ from piper_offload import (
     merge_adapter,
 )
 from piper_offload.dtensor_adapter import DTensorAdapter
+from piper_offload.host_module import HostModuleStore
 from piper_offload.int8_adapter import Int8Adapter
 from piper_offload.host_param import HostParam
 from piper_offload.tensor_adapters import (
@@ -200,19 +201,54 @@ class TestDTensorAdapter:
         assert tensor_id(sharded) != tensor_id(replicated)
         assert tensor_id(sharded)[0] == "dtensor"
 
-    def test_bind_layout_relaxes_inner_dtype_keeps_global_shape(self, tp_mesh: Any) -> None:
+    def test_accepts_bind_target_relaxes_inner_dtype_and_checks_shape_and_placements(
+        self, tp_mesh: Any,
+    ) -> None:
+        from torch.distributed.tensor import DTensor, Replicate
+
+        from piper_offload._dtensor import cpu_mesh_for
+
         bf16 = _dtensor_weight(tp_mesh, dtype=torch.bfloat16)[0]
         fp32 = _dtensor_weight(tp_mesh, dtype=torch.float32)[0]
-
-        # bind_layout delegates to the inner adapter's bind signature, which
-        # drops dtype (for meta-skeleton binding) — so the two compare equal;
-        # the strict layout_signature keeps dtype, so they differ.
         assert DTensorAdapter.layout_signature(bf16) != DTensorAdapter.layout_signature(fp32)
-        assert DTensorAdapter.bind_layout_signature(bf16) == DTensorAdapter.bind_layout_signature(fp32)
-        # Both keys carry the GLOBAL shape (gpu_param replays it; uneven shards
-        # are not host by the local shape alone).
-        assert tuple(bf16.shape) in DTensorAdapter.layout_signature(bf16)
-        assert tuple(bf16.shape) in DTensorAdapter.bind_layout_signature(bf16)
+
+        host = HostParam(nn.Parameter(bf16, requires_grad=False))
+        cpu_mesh = cpu_mesh_for(bf16.device_mesh)
+        # Plain dtype mismatch is accepted even on a CPU mesh.
+        fp32_cpu = DTensor.from_local(
+            fp32.to_local().cpu(),
+            cpu_mesh,
+            bf16.placements,
+            run_check=False,
+        )
+        assert host.accepts_bind_target(nn.Parameter(fp32_cpu, requires_grad=False))
+
+        # Global shape, placements, and local shard shape remain strict.
+        different_global = DTensor.from_local(
+            torch.empty((bf16.shape[0] + 4, *bf16.shape[1:]), device="meta"),
+            cpu_mesh,
+            bf16.placements,
+            run_check=False,
+        )
+        assert not host.accepts_bind_target(nn.Parameter(different_global, requires_grad=False))
+
+        different_place = DTensor.from_local(
+            fp32.to_local().cpu(),
+            fp32.device_mesh,
+            [Replicate()],
+            run_check=False,
+        )
+        assert not host.accepts_bind_target(nn.Parameter(different_place, requires_grad=False))
+        local_shape = tuple(bf16.to_local().shape)
+        mismatched_local = DTensor.from_local(
+            torch.empty((max(1, local_shape[0] // 2), *local_shape[1:]), device="meta"),
+            bf16.device_mesh,
+            bf16.placements,
+            shape=tuple(bf16.shape),
+            stride=bf16.stride(),
+            run_check=False,
+        )
+        assert not host.accepts_bind_target(nn.Parameter(mismatched_local, requires_grad=False))
 
     def test_tensor_id_keys_off_local_not_dtensor_dataptr(self, tp_mesh: Any) -> None:
         dt, _ = _dtensor_weight(tp_mesh)
@@ -959,3 +995,107 @@ class TestDTensorAdapter:
                     (rank, in_dim),
                 )
             ]
+
+    def test_meta_placeholder_requires_dtensor_and_accepts_quantized_meta_shard(
+        self, tp_mesh: Any,
+    ) -> None:
+        from torch.distributed.tensor import DTensor, Replicate
+
+        convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
+        convrot_cls = convrot_mod.ConvRotInt8Tensor
+
+        rows, cols = 16, 64
+        q_local = convrot_cls.from_quantized(
+            torch.randint(-127, 128, (rows, cols), dtype=torch.int8, device="cuda"),
+            torch.rand((rows, 1), dtype=torch.float32, device="cuda") + 0.1,
+            group_size=64,
+            logical_dtype=torch.bfloat16,
+        )
+        weight = DTensor.from_local(q_local, tp_mesh, [_shard(0)], run_check=False)
+
+        proto = nn.Module()
+        proto.weight = nn.Parameter(weight, requires_grad=False)
+        store = HostModuleStore.from_module(proto)
+
+        # Reject plain non-DTensor meta placeholder against a DTensor store.
+        plain_meta = nn.Module()
+        plain_meta.weight = nn.Parameter(torch.empty((rows, cols), device="meta"), requires_grad=False)
+        with pytest.raises(ValueError, match="layout mismatch"):
+            store.bind(plain_meta)
+
+        # Reject DTensor(meta) against a non-DTensor quantized store.
+        non_dtensor_proto = nn.Module()
+        non_dtensor_proto.weight = nn.Parameter(q_local, requires_grad=False)
+        non_dtensor_store = HostModuleStore.from_module(non_dtensor_proto)
+        dtensor_meta = nn.Module()
+        dtensor_meta.weight = nn.Parameter(
+            DTensor.from_local(
+                torch.empty((rows, cols), dtype=torch.float32, device="meta"),
+                tp_mesh,
+                [_shard(0)],
+                run_check=False,
+            ),
+            requires_grad=False,
+        )
+        with pytest.raises(ValueError, match="layout mismatch"):
+            non_dtensor_store.bind(dtensor_meta)
+
+        # Accept matching DTensor over plain strided meta local shard (with mismatched placeholder dtype),
+        # and allow re-binding after initial bind.
+        meta_skeleton = nn.Module()
+        meta_dt = DTensor.from_local(
+            torch.empty((rows, cols), dtype=torch.float32, device="meta"),
+            tp_mesh,
+            [_shard(0)],
+            run_check=False,
+        )
+        meta_skeleton.weight = nn.Parameter(meta_dt, requires_grad=False)
+        store.bind(meta_skeleton)
+        store.bind(meta_skeleton)
+        assert isinstance(meta_skeleton.weight.data, DTensor)
+        assert meta_skeleton.weight.data.device_mesh.device_type == "cpu"
+        assert isinstance(meta_skeleton.weight.data.to_local(), convrot_cls)
+
+        # Reject mismatched placements.
+        bad_place = nn.Module()
+        bad_place.weight = nn.Parameter(
+            DTensor.from_local(
+                torch.empty((rows, cols), dtype=torch.float32, device="meta"),
+                tp_mesh,
+                [Replicate()],
+                run_check=False,
+            ),
+            requires_grad=False,
+        )
+        with pytest.raises(ValueError, match="layout mismatch"):
+            store.bind(bad_place)
+
+        # Reject mismatched global shape.
+        bad_global = nn.Module()
+        bad_global.weight = nn.Parameter(
+            DTensor.from_local(
+                torch.empty((rows + 8, cols), dtype=torch.float32, device="meta"),
+                tp_mesh,
+                [_shard(0)],
+                run_check=False,
+            ),
+            requires_grad=False,
+        )
+        with pytest.raises(ValueError, match="layout mismatch"):
+            store.bind(bad_global)
+
+        # Reject mismatched local shard shape.
+        bad_local = nn.Module()
+        bad_local.weight = nn.Parameter(
+            DTensor.from_local(
+                torch.empty((rows // 2, cols), dtype=torch.float32, device="meta"),
+                tp_mesh,
+                [_shard(0)],
+                shape=(rows, cols),
+                stride=(cols, 1),
+                run_check=False,
+            ),
+            requires_grad=False,
+        )
+        with pytest.raises(ValueError, match="layout mismatch"):
+            store.bind(bad_local)

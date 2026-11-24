@@ -17,7 +17,12 @@ from torch import nn
 
 from ._convrot_int8_source import ConvRotInt8SourceAdapter
 from ._piper_convrot_int8 import create_convrot_int8_tensor
-from .tensor_adapters import capture_host_tensor, transfer_
+from .tensor_adapters import (
+    capture_host_tensor,
+    is_plain_meta_placeholder,
+    matches_layout_signature,
+    transfer_,
+)
 from .trellis_parameter import TrellisParameter
 
 __all__ = ["TrellisAdapter"]
@@ -84,6 +89,20 @@ class TrellisAdapter(ConvRotInt8SourceAdapter):
             parameter.group_size,
             parameter.act_per_tensor_scale is not None,
         )
+
+    @classmethod
+    def accepts_bind_target(
+        cls,
+        state: _TrellisHost,
+        target: torch.Tensor,
+        *,
+        layout_signature: object,
+        requires_grad: bool,
+    ) -> bool:
+        return (
+            not requires_grad
+            and is_plain_meta_placeholder(target, tuple(state.parameter.shape))
+        ) or (not target.is_meta and matches_layout_signature(cls, layout_signature, target))
 
     @staticmethod
     def capture_host(t: torch.Tensor) -> _TrellisHost:

@@ -29,7 +29,7 @@ external adapter selection lives in :mod:`tensor_adapter_registry`.
 from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 import torch
 from torch import nn
@@ -37,7 +37,7 @@ from torch import nn
 from .pin_manager import transfer_
 
 __all__ = [
-    "BindLayoutTensorAdapter",
+    "BindTargetTensorAdapter",
     "BroadcastMergeTensorAdapter",
     "CpuRoundTripTensorAdapter",
     "DenseMergeTargetValidationTensorAdapter",
@@ -51,13 +51,15 @@ __all__ = [
     "MergeLocalityTensorAdapter",
     "ParameterDataSwapTensorAdapter",
     "PermanentUpdateValidationTensorAdapter",
-    "PostLoadRearmTensorAdapter",
     "TensorAdapter",
     "TensorCopyIntoAdapter",
+    "accepts_bind_target",
     "adapter_name",
     "capture_host_tensor",
     "empty_like_strided",
     "host_state_is_owned",
+    "is_plain_meta_placeholder",
+    "matches_layout_signature",
     "metadata_key",
     "optional_tensor_id",
     "tensor_layout",
@@ -562,50 +564,77 @@ class TensorCopyIntoAdapter[HostStateT, GpuStateT](
 
 
 @runtime_checkable
-class BindLayoutTensorAdapter[HostStateT, GpuStateT](
+class BindTargetTensorAdapter[HostStateT, GpuStateT](
     TensorAdapter[HostStateT, GpuStateT],
     Protocol,
 ):
-    """Optional capability: relaxed layout for store↔module bind validation.
+    """Optional capability: own and relax bind target validation.
 
-    Binding replaces every managed tensor in the target module with
-    store-backed storage, so a placeholder's dtype carries no information
-    past validation — a meta skeleton built from config alone (e.g. fp32
-    defaults) is structurally compatible with a store captured from natively
-    loaded bf16 or mixed-precision weights. Adapters that opt in supply a
-    bind signature without the fields binding discards; adapters that
-    don't (quantized wrappers, whose placeholder representation is
-    structural) keep the strict :meth:`TensorAdapter.layout_signature`
-    comparison.
+    By default, store-to-module bind validation requires the target parameter
+    to match this adapter and compare equal on
+    :meth:`TensorAdapter.layout_signature`. Adapters implementing this protocol
+    own the bind compatibility decision — for example, accepting plain
+    tensors whose dtype differs from the store, plain strided ``meta``
+    placeholders matching a frozen quantized store's logical shape, or
+    ``DTensor`` wrappers resting on another mesh device type — without
+    requiring :meth:`TensorAdapter.layout_signature` to succeed on every
+    incompatible target first.
+
+    Consulted only for physical host stores after ``requires_grad`` equality
+    has been checked.
     """
 
     @staticmethod
-    def bind_layout_signature(t: torch.Tensor) -> tuple:
-        """Hashable structural layout for bind validation; excludes
-        fields binding overwrites (dtype for plain tensors)."""
+    def accepts_bind_target(
+        state: HostStateT,
+        target: torch.Tensor,
+        *,
+        layout_signature: object,
+        requires_grad: bool,
+    ) -> bool:
+        """Return whether ``target`` is a compatible bind target for ``state``."""
         ...
 
 
-@runtime_checkable
-class PostLoadRearmTensorAdapter[HostStateT, GpuStateT](
-    TensorAdapter[HostStateT, GpuStateT],
-    Protocol,
-):
-    """Optional capability: re-arm the active GPU wrapper after each load.
+def is_plain_meta_placeholder(
+    target: torch.Tensor,
+    logical_shape: tuple[int, ...],
+) -> bool:
+    """Return whether ``target`` is a plain strided ``meta`` tensor with ``logical_shape``."""
+    return (
+        type(target) is torch.Tensor
+        and target.is_meta
+        and target.layout is torch.strided
+        and tuple(target.shape) == logical_shape
+    )
 
-    The offloader builds one GPU wrapper per pool target and reuses it
-    across loads, refilling its buffers each time. An adapter whose
-    forward moves state from the wrapper onto the module can restore
-    the wrapper's state after each copy so the next forward uses the
-    current parameters.
-    """
 
-    @staticmethod
-    def rearm_after_load(param: nn.Parameter, gpu_state: GpuStateT) -> None:
-        """Re-point ``param``'s migrated quant state at ``gpu_state``,
-        called once per load after :meth:`TensorAdapter.copy_to_gpu` and
-        before the wrapper is installed into its module."""
-        ...
+def matches_layout_signature(
+    adapter: TensorAdapter[Any, Any] | type[TensorAdapter[Any, Any]],
+    layout_signature: object,
+    target: torch.Tensor,
+) -> bool:
+    """Return whether ``target`` matches ``adapter`` and its captured ``layout_signature``."""
+    return adapter.matches(target) and adapter.layout_signature(target) == layout_signature
+
+
+def accepts_bind_target(
+    adapter: TensorAdapter[Any, Any],
+    state: object,
+    layout_signature: object,
+    target: torch.Tensor,
+    *,
+    requires_grad: bool,
+) -> bool:
+    """Return whether ``target`` satisfies strict or adapter-relaxed bind validation."""
+    if isinstance(adapter, BindTargetTensorAdapter):
+        return cast(BindTargetTensorAdapter[Any, Any], adapter).accepts_bind_target(
+            state,
+            target,
+            layout_signature=layout_signature,
+            requires_grad=requires_grad,
+        )
+    return matches_layout_signature(adapter, layout_signature, target)
 
 
 # ---------------------------------------------------------------------------
@@ -810,13 +839,22 @@ class RegularAdapter:
 
     @staticmethod
     def layout_signature(t: torch.Tensor) -> tuple:
-        return (tuple(t.shape), t.dtype)
+        return (tuple(t.shape), t.dtype, t.layout)
 
     @staticmethod
-    def bind_layout_signature(t: torch.Tensor) -> tuple:
-        # dtype excluded: bind replaces plain-tensor placeholders with
-        # store-backed storage, so only the shape is structural.
-        return (tuple(t.shape),)
+    def accepts_bind_target(
+        state: _RegularHost,
+        target: torch.Tensor,
+        *,
+        layout_signature: object,
+        requires_grad: bool,
+    ) -> bool:
+        del layout_signature, requires_grad
+        return (
+            RegularAdapter.matches(target)
+            and target.layout is torch.strided
+            and tuple(target.shape) == tuple(state.data.shape)
+        )
 
     @staticmethod
     def capture_host(t: torch.Tensor) -> _RegularHost:

@@ -50,8 +50,8 @@ device (verified), so a CUDA mesh would re-allocate GPU memory for the
 offloaded state. Keeping it a DTensor (rather than a bare local shard) means
 a deactivated block's weight still resolves to this adapter, so the
 store<->module bind and the resident GPU form stay layout-consistent;
-:meth:`bind_layout_signature` drops the mesh device type so the CPU-resting
-and CUDA-resident forms compare equal. The resident GPU parameter is rebuilt
+:meth:`accepts_bind_target` ignores the mesh device type so the CPU-resting
+and CUDA-resident forms match. The resident GPU parameter is rebuilt
 on the original CUDA mesh in :meth:`gpu_param`.
 """
 
@@ -75,7 +75,6 @@ from ._dtensor import (
 )
 from .seeding import derive_seed
 from .tensor_adapters import (
-    BindLayoutTensorAdapter,
     DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
     DenseMergeValidationTensorAdapter,
@@ -85,6 +84,7 @@ from .tensor_adapters import (
     LoRAMergeValidationTensorAdapter,
     RegularAdapter,
     TensorAdapter,
+    accepts_bind_target,
     adapter_name,
 )
 
@@ -99,10 +99,12 @@ class _DTensorHost:
     resting weight. ``shape`` / ``stride`` are the original GLOBAL shape/stride,
     captured so the rebuilt DTensor reports the true global shape even for
     uneven shards (where ``from_local`` would otherwise infer
-    ``local_size * world_size``)."""
+    ``local_size * world_size``), and ``inner_layout_signature`` is the inner
+    adapter's layout signature used during recursive bind validation."""
 
     inner: TensorAdapter[Any, Any]
     inner_state: object
+    inner_layout_signature: tuple
     mesh: object
     placements: tuple[object, ...]
     shape: object
@@ -395,36 +397,16 @@ class DTensorAdapter:
         # uneven shards the local shard layout alone doesn't pin them (two
         # different global shapes can share a local shape on a rank), so a
         # pool target reused across such blocks would carry the wrong shape.
-        dt = require_dtensor(t)
-        local = dt.to_local()
-        return (
-            _select(local).layout_signature(local),
-            tuple(dt.shape),
-            dt.stride(),
-            mesh_signature(dt.device_mesh),
-            placements_key(dt.placements),
-        )
-
-    @staticmethod
-    def bind_layout_signature(t: torch.Tensor) -> tuple:
-        # Bind validation compares the store (captured from the CUDA-mesh weight)
-        # against the bound module, whose resting weight cpu_param rebuilt on a
-        # CPU mesh. Drop the mesh device type so the two compare equal. Delegate
-        # the local shard to the inner adapter's *bind* signature (not the
-        # strict layout) so it drops the same binding-overwritten fields it
-        # would standalone (e.g. RegularAdapter drops dtype for meta skeletons).
+        # Tag with type(inner) so distinct inner adapters cannot collide.
         dt = require_dtensor(t)
         local = dt.to_local()
         inner = _select(local)
-        inner_sig = (
-            inner.bind_layout_signature(local)
-            if isinstance(inner, BindLayoutTensorAdapter)
-            else inner.layout_signature(local)
-        )
         return (
-            inner_sig,
+            type(inner),
+            inner.layout_signature(local),
             tuple(dt.shape),
-            mesh_signature(dt.device_mesh, include_device=False),
+            dt.stride(),
+            mesh_signature(dt.device_mesh),
             placements_key(dt.placements),
         )
 
@@ -446,10 +428,39 @@ class DTensorAdapter:
         return _DTensorHost(
             inner=inner,
             inner_state=inner.capture_host(local),
+            inner_layout_signature=inner.layout_signature(local),
             mesh=dt.device_mesh,
             placements=tuple(dt.placements),
             shape=dt.shape,
             stride=dt.stride(),
+        )
+
+    @staticmethod
+    def accepts_bind_target(
+        state: _DTensorHost,
+        target: torch.Tensor,
+        *,
+        layout_signature: object,
+        requires_grad: bool,
+    ) -> bool:
+        """Return whether ``target`` matches the DTensor layout and inner bind contract."""
+        del layout_signature
+        if not DTensorAdapter.matches(target):
+            return False
+        dt = require_dtensor(target)
+        if (
+            tuple(dt.shape) != tuple(cast(Any, state.shape))
+            or mesh_signature(dt.device_mesh, include_device=False)
+            != mesh_signature(cast(Any, state.mesh), include_device=False)
+            or placements_key(dt.placements) != placements_key(state.placements)
+        ):
+            return False
+        return accepts_bind_target(
+            state.inner,
+            state.inner_state,
+            state.inner_layout_signature,
+            dt.to_local(),
+            requires_grad=requires_grad,
         )
 
     @staticmethod
@@ -514,6 +525,7 @@ class DTensorAdapter:
         return _DTensorHost(
             inner=source_adapter,
             inner_state=source_adapter.capture_host_view(local),
+            inner_layout_signature=source_adapter.layout_signature(local),
             mesh=dt.device_mesh,
             placements=placements,
             shape=dt.shape,
