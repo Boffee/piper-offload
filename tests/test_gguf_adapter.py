@@ -342,8 +342,6 @@ class TestDirectConversion:
         assert state.staging.nbytes < actual.dequantize().nbytes
         torch.testing.assert_close(actual.qdata, expected_second.qdata)
         torch.testing.assert_close(actual.scale, expected_second.scale)
-        with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            first_backing.copy_to_cpu(state)
 
     @CUDA
     def test_lora_merges_into_converted_target(self) -> None:

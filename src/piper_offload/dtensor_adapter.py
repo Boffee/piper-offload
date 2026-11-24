@@ -29,13 +29,12 @@ a full plain host parameter. The target DTensor supplies only its distributed
 layout and may use a meta local tensor; the resting local shard remains a view
 of the original host allocation, including mmap-backed checkpoint storage.
 
-The adapter advertises no CPU round-trip, full dequantize/requantize,
-``copy_into``, or trainable ``.data`` swap capability. It can expose a dense
-local shard when the inner adapter can, which lets exact-name parameter values
-reuse the same dense merge path for value-only scaling. A DTensor merge is
-available only when its local shard's adapter supports the corresponding
-factorized or dense merge operation; otherwise routed LoRA remains the
-inference path.
+The adapter advertises no full dequantize/requantize or ``copy_into``
+capability. It can expose a dense local shard when the inner adapter can, which
+lets exact-name parameter values reuse the same dense merge path for value-only
+scaling. A DTensor merge is available only when its local shard's adapter
+supports the corresponding factorized or dense merge operation; otherwise
+routed LoRA remains the inference path.
 
 Identity and layout keys are taken from the **local shard** (delegated to
 the inner adapter) plus a structural ``(mesh, placements)`` signature. This
@@ -441,7 +440,6 @@ class DTensorAdapter:
         target: torch.Tensor,
         *,
         layout_signature: object,
-        requires_grad: bool,
     ) -> bool:
         """Return whether ``target`` matches the DTensor layout and inner bind contract."""
         del layout_signature
@@ -460,7 +458,6 @@ class DTensorAdapter:
             state.inner_state,
             state.inner_layout_signature,
             dt.to_local(),
-            requires_grad=requires_grad,
         )
 
     @staticmethod
@@ -537,14 +534,14 @@ class DTensorAdapter:
         return state.inner.storage_tensors(state.inner_state)
 
     @staticmethod
-    def cpu_param(state: _DTensorHost, *, requires_grad: bool = False) -> nn.Parameter:
+    def cpu_param(state: _DTensorHost) -> nn.Parameter:
         # The resting weight stays a DTensor (so its adapter/layout matches the
         # store and a deactivated block is still a DTensor), but on a CPU mesh
         # so the local shard stays on the host — a CUDA mesh would move the
         # local onto the device, re-allocating GPU memory for the offloaded
         # state. The resting form never computes, so a freshly-derived CPU mesh
         # is fine. The local aliases the inner adapter's host storage.
-        local = state.inner.cpu_param(state.inner_state, requires_grad=False).data
+        local = state.inner.cpu_param(state.inner_state).data
         dt = rebuild_dtensor(
             local,
             cpu_mesh_for(state.mesh),
@@ -552,7 +549,7 @@ class DTensorAdapter:
             state.shape,
             state.stride,
         )
-        return nn.Parameter(dt, requires_grad=requires_grad)
+        return nn.Parameter(dt, requires_grad=False)
 
     @staticmethod
     def alloc_gpu(state: _DTensorHost, device: torch.device) -> _DTensorGpu:
@@ -562,16 +559,14 @@ class DTensorAdapter:
     def gpu_param(
         host: _DTensorHost,
         gpu_state: _DTensorGpu,
-        *,
-        requires_grad: bool = False,
     ) -> nn.Parameter:
         # Reconstruct the local shard on the GPU via the inner adapter, then
         # replay the distributed wrapper. run_check=False: pure local rebuild,
         # never a collective. The local already lives on the mesh device, so
         # from_local aliases it (no copy) — the reused wrapper sees refills.
-        local = host.inner.gpu_param(host.inner_state, gpu_state.inner_gpu, requires_grad=False).data
+        local = host.inner.gpu_param(host.inner_state, gpu_state.inner_gpu).data
         dt = rebuild_dtensor(local, host.mesh, host.placements, host.shape, host.stride)
-        return nn.Parameter(dt, requires_grad=requires_grad)
+        return nn.Parameter(dt, requires_grad=False)
 
     @staticmethod
     def copy_to_gpu(src: _DTensorHost, dst: _DTensorGpu, *, non_blocking: bool = False) -> None:

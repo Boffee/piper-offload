@@ -1,10 +1,9 @@
 """CUDA execution strategy that streams whole block targets."""
 
-import contextlib
 import functools
 import logging
 import weakref
-from collections.abc import Generator, Sequence
+from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
@@ -17,7 +16,6 @@ from .block_runtime import validate_load_plans
 from .host_module import (
     HostModuleInstance,
     HostModuleLoadPlan,
-    HostModuleTarget,
 )
 from .module_names import group_names
 from .target_lease import CudaTargetLease
@@ -25,7 +23,6 @@ from .target_lease import CudaTargetLease
 logger = logging.getLogger(__name__)
 
 type BlockSignature = tuple[object, ...]
-type _LoadedTrainableBlock = tuple[HostModuleInstance, HostModuleTarget]
 
 
 def _wait_for_prefetch(future: Future[None]) -> None:
@@ -75,7 +72,6 @@ def _plan_target_signature(plan: HostModuleLoadPlan) -> BlockSignature:
     param_sig = tuple(
         (
             tuple(names),
-            params[names[0]].requires_grad,
             params[names[0]].target_layout,
         )
         for names in group_names(
@@ -178,7 +174,6 @@ class StreamingBlockRuntime:
         self._executor: ThreadPoolExecutor | None = None
         self._stream: torch.cuda.Stream | None = None
         self._last_idx = -1
-        self._move_trainable_grads_to(torch.device("cpu"))
 
     @property
     def acquired(self) -> bool:
@@ -206,7 +201,6 @@ class StreamingBlockRuntime:
         self._stream = torch.cuda.Stream(device=device, priority=-1)
         self._last_idx = -1
         self._pool = _TargetPool(device)
-        self._move_trainable_grads_to(device)
 
         current_stream = torch.cuda.current_stream(device)
         self._acquire_block(self._stage_block(0, current_stream), current_stream)
@@ -236,7 +230,6 @@ class StreamingBlockRuntime:
             # as after a failed synchronization, so nothing reuses that target.
             if self._active is None and self._lookahead is None:
                 self._stream = None
-                self._move_trainable_grads_to(torch.device("cpu"))
                 if self._pool is not None:
                     self._pool.close()
                 self._pool = None
@@ -244,78 +237,6 @@ class StreamingBlockRuntime:
                 self._device = None
                 self._load_plans = ()
                 self._signatures = ()
-
-    @contextlib.contextmanager
-    def optimizer_step(self) -> Generator[None]:
-        if not self.acquired:
-            raise RuntimeError(
-                "BlockComponent.optimizer_step() called while its CUDA "
-                "working set is released. Acquire the component before "
-                "entering the optimizer step."
-            )
-        if not any(instance.has_trainables for instance in self._instances):
-            yield
-            return
-
-        self._release_blocks()
-
-        device = self._require_device()
-        step_stream = self._stream
-        assert step_stream is not None, "stream allocated in acquire()"
-
-        with contextlib.ExitStack() as stack:
-            loaded = self._load_trainables_for_step(device, step_stream, stack)
-            try:
-                yield
-            finally:
-                self._scatter_trainables_after_step(loaded, step_stream, device)
-
-    def _require_device(self) -> torch.device:
-        device = self._device
-        if device is None:
-            raise RuntimeError("streaming block runtime is released")
-        return device
-
-    def _load_trainables_for_step(
-        self,
-        device: torch.device,
-        step_stream: torch.cuda.Stream,
-        stack: contextlib.ExitStack,
-    ) -> list[_LoadedTrainableBlock]:
-        loaded: list[_LoadedTrainableBlock] = []
-        with torch.cuda.stream(step_stream):
-            for instance in self._instances:
-                if not instance.has_trainables:
-                    continue
-                stack.callback(instance.install_host)
-                plan = instance.resolve_load_plan().select_parameters(
-                    instance.trainable_param_names,
-                )
-                target = plan.allocate_target(
-                    device,
-                    buffer_names=(),
-                )
-                plan.load_to_target(target, non_blocking=True)
-                instance.move_trainable_grads_to(device)
-                loaded.append((instance, target))
-        torch.cuda.current_stream(device).wait_stream(step_stream)
-        return loaded
-
-    def _scatter_trainables_after_step(
-        self,
-        loaded: list[_LoadedTrainableBlock],
-        step_stream: torch.cuda.Stream,
-        device: torch.device,
-    ) -> None:
-        step_stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(step_stream):
-            for instance, target in loaded:
-                instance.copy_trainables_from_target(target, non_blocking=False)
-        step_stream.synchronize()
-
-    def _move_trainable_grads_to(self, device: torch.device) -> None:
-        for instance in self._instances:
-            instance.move_trainable_grads_to(device)
 
     # Targets move only on the forward thread. Each step keeps every lease in
     # the pool, the active target, or the lookahead target, also when it raises.

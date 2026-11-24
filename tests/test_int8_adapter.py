@@ -279,17 +279,6 @@ class TestInt8Adapter:
         )
         assert host.reduce_range is True
 
-    def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
-        host_param = HostParam(
-            nn.Parameter(_make_int8(), requires_grad=True),
-        )
-        state = host_param.allocate_gpu_storage(torch.device("cpu"))
-
-        with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            host_param.copy_to_cpu(state)
-        with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            host_param.validate_parameter_data_swap_target()
-
     @pytest.mark.parametrize("dynamic_activation", [False, True])
     def test_dequantize_requantize_preserves_representation(self, dynamic_activation: bool) -> None:
         int8_cls = _int8_tensor_cls()

@@ -253,18 +253,6 @@ class TestMxAdapter:
         assert _param_target_layout(dynamic) != _param_target_layout(weight_only)
 
     @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
-    def test_no_cpu_round_trip_or_trainable_swap_capability(self, elem_dtype: torch.dtype) -> None:
-        host_param = HostParam(
-            nn.Parameter(_make_mx(elem_dtype=elem_dtype), requires_grad=True),
-        )
-        state = host_param.allocate_gpu_storage(torch.device("cpu"))
-
-        with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            host_param.copy_to_cpu(state)
-        with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            host_param.validate_parameter_data_swap_target()
-
-    @pytest.mark.parametrize("elem_dtype", ELEM_DTYPES)
     def test_dequantize_requantize_preserves_representation(self, elem_dtype: torch.dtype) -> None:
         mx = _make_mx(elem_dtype=elem_dtype, rows=16, cols=64)
         dense = MxAdapter.dequantize(mx)

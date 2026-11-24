@@ -39,6 +39,8 @@ def _validate_factor_tensors(
     for name, tensor in (("LoRA A", a), ("LoRA B", b)):
         if not isinstance(tensor, torch.Tensor):
             raise ValueError(f"{name} must be a torch.Tensor; got {type(tensor).__name__}.")
+        if tensor.requires_grad:
+            raise ValueError(f"{name} must be frozen (requires_grad=False).")
         if tensor.is_meta:
             raise ValueError(f"{name} must own physical values, not meta storage.")
     if not a.is_floating_point() or not b.is_floating_point():

@@ -237,181 +237,21 @@ class TestHostComponentStoreBind:
 
 
 # ---------------------------------------------------------------------------
-# Trainable params
+# Frozen contract
 # ---------------------------------------------------------------------------
 
 
-class TestTrainableParams:
-    def test_accepts_trainable_param_and_preserves_identity_on_cpu(self) -> None:
-        m = nn.Linear(4, 2, bias=False)
-        param = m.weight
-        opt = torch.optim.SGD(m.parameters(), lr=0.1)
+class TestFrozenContract:
+    def test_from_module_rejects_trainable_parameter_without_mutating_earlier(self) -> None:
+        m = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 2, bias=False))
+        m[0].weight.requires_grad_(False)
+        first_storage_ptr = m[0].weight.untyped_storage().data_ptr()
 
-        pw = ModelOffloader.from_module(m)
-        try:
-            assert m.weight is param
-            assert m.weight.requires_grad
-            assert not m.weight.is_pinned()
+        with pytest.raises(ValueError, match="requires_grad=False"):
+            ModelOffloader.from_module(m)
 
-            before = m.weight.detach().clone()
-            with activated_model(pw, "cpu"):
-                loss = m(torch.ones(1, 4)).sum()
-                loss.backward()
-                with pw.optimizer_step():
-                    opt.step()
-                opt.zero_grad(set_to_none=True)
-
-            assert m.weight is param
-            assert not m.weight.is_pinned()
-            assert not torch.equal(m.weight.detach(), before)
-        finally:
-            pw.deactivate()
-
-    def test_optimizer_step_rejects_reentrant_entry(self) -> None:
-        pw = ModelOffloader.from_module(nn.Linear(4, 2, bias=False))
-        try:
-            with pytest.raises(RuntimeError, match="reentrant"):
-                with pw.optimizer_step():
-                    with pw.optimizer_step():
-                        pass
-        finally:
-            pw.deactivate()
-
-    def test_cpu_active_optimizer_step_rejects_reentrant_entry(self) -> None:
-        pw = ModelOffloader.from_module(nn.Linear(4, 2, bias=False))
-        try:
-            with activated_model(pw, "cpu"):
-                with pytest.raises(RuntimeError, match="reentrant"):
-                    with pw.optimizer_step():
-                        with pw.optimizer_step():
-                            pass
-        finally:
-            pw.deactivate()
-
-    @CUDA
-    def test_cuda_trainable_identity_survives_activate_deactivate(self) -> None:
-        m = nn.Linear(4, 2, bias=False)
-        param = m.weight
-
-        pw = ModelOffloader.from_module(m)
-        try:
-            with activated_model(pw, "cuda"):
-                assert m.weight is param
-                assert m.weight.is_cuda
-                assert m.weight.requires_grad
-            assert m.weight is param
-            assert not m.weight.is_pinned()
-        finally:
-            pw.deactivate()
-
-    @CUDA
-    def test_cuda_optimizer_step_copies_updates_back_to_host(self) -> None:
-        m = nn.Linear(4, 1, bias=False)
-        param = m.weight
-        opt = torch.optim.SGD(m.parameters(), lr=0.25)
-
-        pw = ModelOffloader.from_module(m)
-        try:
-            with activated_model(pw, "cuda"):
-                loss = m(torch.ones(1, 4, device="cuda")).sum()
-                loss.backward()
-                with pw.optimizer_step():
-                    opt.step()
-                opt.zero_grad(set_to_none=True)
-                updated = m.weight.detach().cpu().clone()
-
-            assert m.weight is param
-            assert not m.weight.is_pinned()
-            assert torch.equal(m.weight.detach(), updated)
-
-            with activated_model(pw, "cuda"):
-                assert torch.equal(m.weight.detach().cpu(), updated)
-        finally:
-            pw.deactivate()
-
-    @CUDA
-    def test_cuda_optimizer_step_copies_back_on_body_exception(self) -> None:
-        m = nn.Linear(4, 1, bias=False)
-        pw = ModelOffloader.from_module(m)
-        try:
-            with activated_model(pw, "cuda"):
-                with pytest.raises(RuntimeError, match="boom"):
-                    with pw.optimizer_step():
-                        m.weight.data.add_(1)
-                        updated = m.weight.detach().cpu().clone()
-                        raise RuntimeError("boom")
-
-            assert torch.equal(m.weight.detach(), updated)
-        finally:
-            pw.deactivate()
-
-    @CUDA
-    def test_cuda_deactivate_moves_trainable_grad_to_cpu(self) -> None:
-        # A host trainable's grad must follow its data to CPU on
-        # deactivate, mirroring the streamed component. Otherwise grads
-        # linger on the GPU (capture device memory and stranding the
-        # gradient off-host), which breaks the context-free CPU step.
-        torch.manual_seed(0)
-        m = nn.Linear(4, 2, bias=False)
-        pw = ModelOffloader.from_module(m)
-        try:
-            with activated_model(pw, "cuda"):
-                m(torch.ones(1, 4, device="cuda")).sum().backward()
-                torch.cuda.synchronize()
-                # Mid-cycle: grad lives on GPU (native AccumulateGrad).
-                assert m.weight.grad is not None
-                assert m.weight.grad.device.type == "cuda"
-
-            # Deactivated: data and grad are both host-resident, and the
-            # grad is preserved (moved, not cleared).
-            assert m.weight.data.device.type == "cpu" and not m.weight.is_pinned()
-            assert m.weight.grad is not None
-            assert m.weight.grad.device.type == "cpu"
-        finally:
-            pw.deactivate()
-
-    @CUDA
-    def test_cuda_context_free_cpu_optimizer_step(self) -> None:
-        """A plain ``optimizer.step()`` while deactivated (and outside
-        ``optimizer_step()``) runs the optimizer on CPU over the host
-        trainable: Adam state allocates on the host and the in-place update
-        writes through to what the next forward loads. Pins the context-free
-        CPU-optimizer pattern for the host (whole-model) path; fp32
-        trainables make the update a correct master-weight update."""
-        torch.manual_seed(0)
-        m = nn.Linear(8, 8, bias=False)
-        pw = ModelOffloader.from_module(m)
-        opt = torch.optim.AdamW(m.parameters(), lr=0.1)
-        try:
-            for _ in range(2):
-                x = torch.randn(4, 8, device="cuda")
-                with activated_model(pw, "cuda") as gpu_model:
-                    gpu_model(x).sum().backward()
-
-                # Deactivated: trainable data + grad are host-resident.
-                assert m.weight.device.type == "cpu" and not m.weight.is_pinned()
-                assert m.weight.grad is not None
-                assert m.weight.grad.device.type == "cpu"
-
-                before = m.weight.detach().clone()
-                opt.step()  # CPU step — no optimizer_step() context
-                opt.zero_grad(set_to_none=True)
-                assert not torch.equal(m.weight.detach(), before)
-                updated = m.weight.detach().clone()
-
-                # Write-through: the next forward loads the updated weight.
-                with activated_model(pw, "cuda"):
-                    assert torch.equal(m.weight.detach().cpu(), updated)
-
-            # The optimizer's state (Adam moments) lives on the host.
-            assert all(
-                not t.is_cuda
-                for state in opt.state.values()
-                for t in state.values()
-                if torch.is_tensor(t)
-            )
-        finally:
-            pw.deactivate()
+        assert m[0].weight.untyped_storage().data_ptr() == first_storage_ptr
+        assert m[1].weight.requires_grad is True
 
 
 # ---------------------------------------------------------------------------
@@ -783,17 +623,14 @@ class TestSharedSubmoduleAlias:
 
 
 class TestMixedTrainableFrozenTied:
-    def test_raises_when_tied_group_has_mixed_grad(self) -> None:
-        # Two distinct Parameter objects sharing storage, one trainable
-        # and one frozen. One host backing cannot preserve both
-        # requires_grad values, so the store rejects the storage group.
+    def test_raises_when_tied_group_has_trainable_param(self) -> None:
         shared = torch.randn(8, dtype=torch.bfloat16)
         a = nn.Parameter(shared, requires_grad=True)
         b = nn.Parameter(shared, requires_grad=False)
         m = nn.Module()
         m.a = a
         m.b = b
-        with pytest.raises(ValueError, match="mixed requires_grad"):
+        with pytest.raises(ValueError, match="requires_grad=False"):
             ModelOffloader.from_module(m)
 
 class TestZeroSizedParams:

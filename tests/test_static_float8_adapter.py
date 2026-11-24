@@ -223,33 +223,6 @@ class TestStaticFloat8Adapter:
         assert signature[-1][0] == "act_quant_scale"
         assert signature[-1][1] == ((), torch.float32, ())
 
-    def test_cpu_round_trip_restores_all_three_storage_tensors(self) -> None:
-        host_param = HostParam(
-            nn.Parameter(_make_static_float8(), requires_grad=False)
-        )
-        state = host_param.allocate_gpu_storage(torch.device("cpu"))
-        host_param.copy_to_gpu(state)
-        originals = tuple(t.clone() for t in state.storage)
-
-        for tensor in host_param.host_state.storage:
-            tensor.zero_()
-        host_param.copy_to_cpu(state)
-
-        for restored, original in zip(
-            host_param.host_state.storage, originals, strict=True
-        ):
-            assert torch.equal(
-                restored.reshape(-1).view(torch.uint8),
-                original.reshape(-1).view(torch.uint8),
-            )
-
-    def test_no_trainable_swap_capability(self) -> None:
-        host_param = HostParam(
-            nn.Parameter(_make_static_float8(), requires_grad=True)
-        )
-        with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            host_param.validate_parameter_data_swap_target()
-
     def test_dequantize_requantize_preserves_static_representation(self) -> None:
         prototype_cls, _, _, _ = _static_float8_modules()
         f8 = _make_static_float8(act_scale_shape=(1, 1, 1))
@@ -600,7 +573,7 @@ class TestStaticFloat8Adapter:
         )
 
     @CUDA
-    def test_h2d_d2h_round_trip_preserves_wrapper_and_all_storage(self) -> None:
+    def test_allocate_copy_make_gpu_param_preserves_wrapper_and_all_storage(self) -> None:
         prototype_cls, _, _, _ = _static_float8_modules()
         host_param = HostParam(
             nn.Parameter(
@@ -612,7 +585,6 @@ class TestStaticFloat8Adapter:
         host_param.copy_to_gpu(gpu_state, non_blocking=True)
         gpu_param = host_param.make_gpu_param(gpu_state)
         torch.cuda.synchronize()
-        originals = tuple(t.detach().cpu().clone() for t in gpu_state.storage)
 
         assert isinstance(gpu_param.data, prototype_cls)
         assert gpu_param.data.qdata.is_cuda
@@ -620,16 +592,12 @@ class TestStaticFloat8Adapter:
         assert gpu_param.data.act_quant_scale.is_cuda
         assert tuple(gpu_param.data.block_size) == host_param.host_state.meta.block_size
         assert gpu_param.data.dtype is torch.bfloat16
-        for host in host_param.host_state.storage:
-            host.zero_()
-        host_param.copy_to_cpu(gpu_state, non_blocking=True)
-        torch.cuda.synchronize()
-        for restored, original in zip(
-            host_param.host_state.storage, originals, strict=True
+        for host_tensor, gpu_tensor in zip(
+            host_param.host_state.storage, gpu_state.storage, strict=True
         ):
             assert torch.equal(
-                restored.reshape(-1).view(torch.uint8),
-                original.reshape(-1).view(torch.uint8),
+                gpu_tensor.detach().cpu().reshape(-1).view(torch.uint8),
+                host_tensor.reshape(-1).view(torch.uint8),
             )
 
     @CUDA
@@ -637,8 +605,7 @@ class TestStaticFloat8Adapter:
     def test_stock_linear_accepts_scalar_scale_for_2d_and_3d(
         self, input_shape: tuple[int, ...]
     ) -> None:
-        layer = nn.Linear(64, 128, bias=True, dtype=torch.bfloat16)
-        layer.weight.requires_grad = False
+        layer = nn.Linear(64, 128, bias=True, dtype=torch.bfloat16).requires_grad_(False)
         layer.weight = nn.Parameter(
             _make_static_float8(rows=128, cols=64, act_scale_shape=()),
             requires_grad=False,

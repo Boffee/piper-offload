@@ -150,7 +150,7 @@ class TestBlockCompileConfig:
             )
 
     def test_compile_without_block_paths_is_unused(self) -> None:
-        model = nn.Linear(4, 4, bias=False)
+        model = nn.Linear(4, 4, bias=False).requires_grad_(False)
         offloader = ModelOffloader.from_module(
             model,
             block_compile=BlockCompileConfig(),

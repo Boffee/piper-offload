@@ -28,7 +28,6 @@ from piper_offload.host_module import HostModuleStore
 from piper_offload.int8_adapter import Int8Adapter
 from piper_offload.host_param import HostParam
 from piper_offload.tensor_adapters import (
-    CpuRoundTripTensorAdapter,
     DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
     DenseMergeValidationTensorAdapter,
@@ -36,7 +35,6 @@ from piper_offload.tensor_adapters import (
     DequantRequantTensorAdapter,
     LoRAMergeTensorAdapter,
     MergeLocalityTensorAdapter,
-    ParameterDataSwapTensorAdapter,
     RegularAdapter,
     TensorCopyIntoAdapter,
 )
@@ -595,14 +593,13 @@ class TestDTensorAdapter:
             assert actual.device_mesh == tp_mesh
             torch.testing.assert_close(actual.full_tensor(), expected)
 
-    def test_advertises_merge_but_not_training_capabilities(
+    def test_advertises_merge_capabilities(
         self,
         tp_mesh: Any,
     ) -> None:
-        # Frozen-inference scope: shard-local additive merge is available, but
-        # CPU round-trip, full dequant/requant, copy_into, and trainable .data
-        # swap stay hidden. Dense local-shard exposure is available for
-        # parameter-value scaling.
+        # Frozen-inference scope: shard-local additive merge is available, while
+        # full dequant/requant and copy_into stay hidden. Dense local-shard
+        # exposure is available for parameter-value scaling.
         adapter = select_adapter(_dtensor_weight(tp_mesh)[0])
         assert isinstance(adapter, LoRAMergeTensorAdapter)
         assert isinstance(adapter, DenseMergeTensorAdapter)
@@ -610,10 +607,8 @@ class TestDTensorAdapter:
         assert isinstance(adapter, DenseMergeValidationTensorAdapter)
         assert isinstance(adapter, DequantizeTensorAdapter)
         assert isinstance(adapter, MergeLocalityTensorAdapter)
-        assert not isinstance(adapter, CpuRoundTripTensorAdapter)
         assert not isinstance(adapter, DequantRequantTensorAdapter)
         assert not isinstance(adapter, TensorCopyIntoAdapter)
-        assert not isinstance(adapter, ParameterDataSwapTensorAdapter)
 
     @pytest.mark.parametrize("with_delta", [False, True])
     def test_parameter_value_preserves_dtensor_and_scales_local_shard(

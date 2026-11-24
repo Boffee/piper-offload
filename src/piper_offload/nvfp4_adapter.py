@@ -20,12 +20,6 @@ for two-level scaling, the global ``per_tensor_scale``. Like any merge
 into a quantized base it is lossy, and NVFP4's 4-bit grid makes it coarse,
 so choosing merge vs routed (non-destructive) LoRA is the caller's
 tradeoff.
-
-It does not opt into CPU round-trip or trainable ``Parameter.data`` swap:
-the quant state lives in the wrapper object, not its bytes, so NVFP4
-weights stay frozen for streaming/training. Routed LoRA remains the
-non-destructive alternative when the owning module is a logical
-``nn.Linear`` with compatible shape/dtype.
 """
 
 from dataclasses import dataclass

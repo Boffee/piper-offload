@@ -38,9 +38,20 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   `BindTargetTensorAdapter`, while existing external adapters remain strict.
 - Breaking: Replaced `BindLayoutTensorAdapter` (`HostParam.bind_layout` and
   `HostParam.bind_layout_for`) with `BindTargetTensorAdapter`
-  (`accepts_bind_target(state, target, *, layout_signature, requires_grad)` and
+  (`accepts_bind_target(state, target, *, layout_signature)` and
   `HostParam.accepts_bind_target`), and removed the unused
   `PostLoadRearmTensorAdapter` / `HostParam.rearm_after_load` hooks.
+- Breaking: Made Piper Offload strictly frozen / inference-only: capture,
+  store binding, `merge_adapter()`, `ParameterValue.from_tensor()`,
+  `ParameterDelta.from_tensors()`, and `LoRAFactor.from_tensors()` now reject
+  inputs with `requires_grad=True`, and removed `optimizer_step()`,
+  `gather_for_step()`, `include_block_trainables`, `has_trainables`,
+  `CpuRoundTripTensorAdapter`, `ParameterDataSwapTensorAdapter`, and
+  `requires_grad` parameters on `TensorAdapter.cpu_param()` and
+  `TensorAdapter.gpu_param()`. Freeze models with
+  `model.requires_grad_(False)` before capture, binding, or `merge_adapter()`,
+  and remove `requires_grad` parameters from custom `TensorAdapter.cpu_param()`
+  and `gpu_param()` implementations.
 - `merge_adapter()` skips the model parameter walk when called with no adapters
   or only zero-strength adapters.
 - Breaking: Removed the `bnb` and `quanto` extras and their built-in tensor

@@ -23,14 +23,13 @@ from torch import nn
 
 from ._parameter_update import ParameterUpdatePlan, merge_target_id, plan_merge_targets
 from .adapter import Adapter, AdapterTargetUpdates, active_adapter_pairs, group_adapter_updates
-from .host_module import install_parameters, validate_tied_parameter_trainability
+from .host_module import install_parameters
 from .pin_manager import host_pin_manager
 from .tensor_adapter_registry import (
     param_representation,
     select_adapter,
 )
 from .tensor_adapters import (
-    ParameterDataSwapTensorAdapter,
     PermanentUpdateValidationTensorAdapter,
     clone_host_state,
     host_state_is_owned,
@@ -55,6 +54,12 @@ class _MergeOp:
 
     def prepare(self, params_by_name: Mapping[str, nn.Parameter]) -> nn.Parameter:
         """Validate the update and resolve its writable target before any model mutation."""
+        trainable_aliases = [name for name in self.aliases if params_by_name[name].requires_grad]
+        if trainable_aliases:
+            raise ValueError(
+                "Permanent adapter merge requires frozen parameters (requires_grad=False); "
+                f"found trainable parameter(s): {', '.join(repr(name) for name in trainable_aliases)}."
+            )
         if self.plan.update is not None:
             adapter = (
                 self.plan.source.adapter
@@ -64,10 +69,7 @@ class _MergeOp:
             _validate_permanent_update(adapter)
         self.plan.validate_parameter(self.param)
 
-        target = self.plan.source.clone_cpu_param() if self.plan.source is not None else _writable_parameter(self.param)
-        if target is not self.param:
-            validate_tied_parameter_trainability(self.aliases, params_by_name)
-        return target
+        return self.plan.source.clone_cpu_param() if self.plan.source is not None else _writable_parameter(self.param)
 
     def apply(self, model: nn.Module, param: nn.Parameter) -> None:
         """Apply to the prepared target and install a replacement under all tied names."""
@@ -86,15 +88,9 @@ def _writable_parameter(param: nn.Parameter) -> nn.Parameter:
     state = view_host_state(adapter, tensor)
     if not host_state_is_owned(adapter, state):
         state = clone_host_state(adapter, tensor, state)
-    target = adapter.cpu_param(state, requires_grad=param.requires_grad)
+    target = adapter.cpu_param(state)
     if adapter.tensor_id(tensor) == adapter.tensor_id(param_representation(target)):
         return param
-    if param.requires_grad and type(tensor) is not torch.Tensor:
-        if not isinstance(adapter, ParameterDataSwapTensorAdapter):
-            raise ValueError(
-                "Replacing trainable tensor-subclass storage requires a Parameter.data-swap-capable adapter."
-            )
-        adapter.validate_parameter_data_swap_target(tensor)
     return target
 
 
@@ -108,10 +104,11 @@ def merge_adapter(
 
     Returns the number of unique parameters that were modified. Exact-zero
     strengths are inactive. If no adapters are active, return zero before
-    visiting model parameters. Merge reads immutable host backing,
-    so the same adapter may also serve other
-    merge or routed uses. Target names and capabilities of planned merges are
-    validated before any parameter is modified. An adapter constructed with
+    visiting model parameters. Merge requires frozen target parameters
+    (``requires_grad=False``) across every tied alias and reads immutable host
+    backing, so the same adapter may also serve other merge or routed uses.
+    Target names and capabilities of planned merges are validated before any
+    parameter is modified. An adapter constructed with
     ``allow_partial_targets=True`` ignores targets absent from this model
     and skips deltas to meta parameters without an active value provider.
     A strict delta on the same target still requires a source. Skipped

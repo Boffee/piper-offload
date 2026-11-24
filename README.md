@@ -65,12 +65,12 @@ lists with `ModelSpec(..., block_paths=("transformer_blocks",))`; see
 - Models and adapters stay cached by default. Set a cache budget to evict
   inactive entries automatically. Pinning has a separate budget, and the OS
   controls how much of a mapped file stays in RAM.
-- Factories transfer ownership of compatible CPU storage. Set `requires_grad`
-  before capture and do not mutate factory-produced tensors afterwards.
+- Models must be frozen (`requires_grad=False`) before capture. Factories
+  transfer ownership of compatible CPU storage; do not mutate factory-produced
+  tensors afterwards.
 - Buffer changes made on CUDA are discarded at deactivation. Models that
   need persistent buffer state across calls require a different arrangement.
-- Compilation supports declared block forwards. Streamed training requires
-  activation checkpointing and explicit handling of optimizer updates.
+- Compilation supports declared inference block forwards.
 
 ## Documentation
 
@@ -81,7 +81,7 @@ a pinned release.
 | Task | Read |
 |---|---|
 | Cache models, manage activation, inspect or release resources | [Models](https://github.com/Boffee/piper-offload/blob/main/docs/models.md) |
-| Run models larger than VRAM, compile blocks, or train streamed weights | [Streaming](https://github.com/Boffee/piper-offload/blob/main/docs/streaming.md) |
+| Run models larger than VRAM or compile inference blocks | [Streaming](https://github.com/Boffee/piper-offload/blob/main/docs/streaming.md) |
 | Apply LoRA, parameter deltas, or parameter values | [Adapters](https://github.com/Boffee/piper-offload/blob/main/docs/adapters.md) |
 | Configure checkpoint backing, pinning, and Windows copy retention | [Memory](https://github.com/Boffee/piper-offload/blob/main/docs/memory.md) |
 | Check tensor formats, optional dependencies, or DTensor support | [Formats](https://github.com/Boffee/piper-offload/blob/main/docs/formats.md) |

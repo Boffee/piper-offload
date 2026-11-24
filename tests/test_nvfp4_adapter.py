@@ -326,17 +326,6 @@ class TestNvfp4Adapter:
 
         assert _param_target_layout(with_activation) != _param_target_layout(weight_only)
 
-    def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
-        host_param = HostParam(
-            nn.Parameter(_make_nvfp4(), requires_grad=True),
-        )
-        state = host_param.allocate_gpu_storage(torch.device("cpu"))
-
-        with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            host_param.copy_to_cpu(state)
-        with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            host_param.validate_parameter_data_swap_target()
-
     @pytest.mark.parametrize("swizzled", [False, True])
     def test_dequantize_requantize_preserves_representation(self, swizzled: bool) -> None:
         nvfp4_cls, _ = _nvfp4_modules()

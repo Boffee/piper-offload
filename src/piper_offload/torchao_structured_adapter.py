@@ -17,14 +17,14 @@ exposes the per-format parts as small hooks. Concrete adapters
 :class:`~piper_offload.nvfp4_adapter.Nvfp4Adapter`, ...) subclass it and
 implement those hooks.
 
-Capabilities beyond inference movement and metadata queries (CPU round-trip,
-dequantize/requantize conversion, representation-preserving copy, and staged
-factorized or dense merge) are added by the concrete subclass that supports
-them — and only that subclass — so the ``@runtime_checkable`` capability
-protocols, which test for method presence on the class, report each format's
-true capability. The base deliberately implements no mutation capabilities:
-subclasses that add nothing stay frozen-inference, while a subclass that
-defines the extra methods advertises exactly those capabilities.
+Capabilities beyond inference movement and metadata queries (dequantize/requantize
+conversion, representation-preserving copy, and staged factorized or dense
+merge) are added by the concrete subclass that supports them — and only that
+subclass — so the ``@runtime_checkable`` capability protocols, which test for
+method presence on the class, report each format's true capability. The base
+deliberately implements no mutation capabilities: subclasses that add nothing
+stay inference-only movement, while a subclass that defines the extra methods
+advertises exactly those capabilities.
 """
 
 from abc import ABC, abstractmethod
@@ -83,7 +83,7 @@ def copy_storage(
     non_blocking: bool,
 ) -> None:
     """Per-tensor bulk copy of a parallel storage tuple, skipping absent
-    (``None``) entries. Used for both H2D and the Float8 D2H round-trip.
+    (``None``) entries for H2D movement.
 
     Movement keeps the same representation on both sides, so a ``None`` on
     one side is ``None`` on the other; skipping on ``src`` therefore also
@@ -127,8 +127,8 @@ class TorchaoStructuredAdapter[MetaT](ABC):
     identity contract in terms of per-format hooks. A concrete adapter
     sets :attr:`_TAG` / :attr:`_STORAGE_NAMES` and implements the ``_*``
     hooks; it opts into capabilities beyond inference movement by defining
-    the relevant methods (``copy_to_cpu``, ``dequantize`` / ``requantize`` /
-    ``copy_into``, ``merge_lora_``, or ``merge_dense_``) itself.
+    the relevant methods (``dequantize`` / ``requantize`` / ``copy_into``,
+    ``merge_lora_``, or ``merge_dense_``) itself.
 
     The hooks operate on the validated wrapper, typed :data:`Any` because
     TorchAO tensor subclasses are untyped — the same boundary the
@@ -257,11 +257,9 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         target: torch.Tensor,
         *,
         layout_signature: object,
-        requires_grad: bool,
     ) -> bool:
-        return (
-            not requires_grad
-            and is_plain_meta_placeholder(target, state.logical_shape)
+        return is_plain_meta_placeholder(
+            target, state.logical_shape
         ) or matches_layout_signature(cls, layout_signature, target)
 
     @staticmethod
@@ -269,12 +267,10 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         return tuple(tensor for tensor in state.storage if tensor is not None)
 
     @classmethod
-    def cpu_param(
-        cls, state: TorchaoHost[MetaT], *, requires_grad: bool = False
-    ) -> nn.Parameter:
+    def cpu_param(cls, state: TorchaoHost[MetaT]) -> nn.Parameter:
         return nn.Parameter(
             cls._reconstruct(state.storage, state.meta),
-            requires_grad=requires_grad,
+            requires_grad=False,
         )
 
     @classmethod
@@ -293,12 +289,10 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         cls,
         host: TorchaoHost[MetaT],
         gpu_state: TorchaoGpu,
-        *,
-        requires_grad: bool = False,
     ) -> nn.Parameter:
         return nn.Parameter(
             cls._reconstruct(gpu_state.storage, host.meta),
-            requires_grad=requires_grad,
+            requires_grad=False,
         )
 
     @classmethod

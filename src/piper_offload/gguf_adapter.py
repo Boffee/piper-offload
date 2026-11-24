@@ -153,12 +153,10 @@ class GgufAdapter(ConvRotInt8SourceAdapter):
         target: torch.Tensor,
         *,
         layout_signature: object,
-        requires_grad: bool,
     ) -> bool:
-        return (
-            not requires_grad
-            and is_plain_meta_placeholder(target, state.logical_shape)
-        ) or (not target.is_meta and matches_layout_signature(cls, layout_signature, target))
+        return is_plain_meta_placeholder(target, state.logical_shape) or (
+            not target.is_meta and matches_layout_signature(cls, layout_signature, target)
+        )
 
     @staticmethod
     def capture_host(
@@ -180,14 +178,8 @@ class GgufAdapter(ConvRotInt8SourceAdapter):
     def storage_tensors(state: _GgufHost) -> tuple[torch.Tensor, ...]:
         return (state.data,)
 
-    @classmethod
-    def cpu_param(
-        cls,
-        state: _GgufHost,
-        *,
-        requires_grad: bool = False,
-    ) -> nn.Parameter:
-        cls._require_frozen(requires_grad)
+    @staticmethod
+    def cpu_param(state: _GgufHost) -> nn.Parameter:
         parameter = cast(Any, state.parameter_type)(
             state.data,
             requires_grad=False,

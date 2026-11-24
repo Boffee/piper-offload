@@ -97,12 +97,10 @@ class TrellisAdapter(ConvRotInt8SourceAdapter):
         target: torch.Tensor,
         *,
         layout_signature: object,
-        requires_grad: bool,
     ) -> bool:
-        return (
-            not requires_grad
-            and is_plain_meta_placeholder(target, tuple(state.parameter.shape))
-        ) or (not target.is_meta and matches_layout_signature(cls, layout_signature, target))
+        return is_plain_meta_placeholder(target, tuple(state.parameter.shape)) or (
+            not target.is_meta and matches_layout_signature(cls, layout_signature, target)
+        )
 
     @staticmethod
     def capture_host(t: torch.Tensor) -> _TrellisHost:
@@ -117,9 +115,8 @@ class TrellisAdapter(ConvRotInt8SourceAdapter):
     def storage_tensors(state: _TrellisHost) -> tuple[torch.Tensor, ...]:
         return state.parameter.storage_tensors()
 
-    @classmethod
-    def cpu_param(cls, state: _TrellisHost, *, requires_grad: bool = False) -> nn.Parameter:
-        cls._require_frozen(requires_grad)
+    @staticmethod
+    def cpu_param(state: _TrellisHost) -> nn.Parameter:
         # Each binding gets its own wrapper over the shared host tensors.
         parameter = state.parameter
         return parameter.rebuild(parameter.storage_tensors())

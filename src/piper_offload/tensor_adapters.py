@@ -3,10 +3,8 @@
 Different tensor subclasses need different machinery to move bytes
 across the CPU↔GPU boundary while preserving correctness:
 
-- Plain ``torch.Tensor``: single contiguous host
-  buffer; consumers either replace ``module._parameters[leaf]`` with a
-  fresh :class:`nn.Parameter` wrapping it, or ``.data``-swap to preserve
-  identity for trainable params.
+- Plain ``torch.Tensor``: single contiguous host buffer; consumers replace
+  ``module._parameters[leaf]`` with a frozen :class:`nn.Parameter` wrapping it.
 - Quantized tensor subclasses: packed values, scales, and metadata.
   The adapter reconstructs the wrapper over the active storage.
 
@@ -39,7 +37,6 @@ from .pin_manager import transfer_
 __all__ = [
     "BindTargetTensorAdapter",
     "BroadcastMergeTensorAdapter",
-    "CpuRoundTripTensorAdapter",
     "DenseMergeTargetValidationTensorAdapter",
     "DenseMergeTensorAdapter",
     "DenseMergeValidationTensorAdapter",
@@ -49,7 +46,6 @@ __all__ = [
     "LoRAMergeValidationTensorAdapter",
     "LogicalShapeTensorAdapter",
     "MergeLocalityTensorAdapter",
-    "ParameterDataSwapTensorAdapter",
     "PermanentUpdateValidationTensorAdapter",
     "TensorAdapter",
     "TensorCopyIntoAdapter",
@@ -79,8 +75,8 @@ def host_state_is_owned[HostStateT](
 
     A view into a file mapping, or into a buffer the process did not
     allocate, is not owned. Piper never writes into a file mapping: the pin
-    manager may return its pages to the file, so host state that Piper
-    writes, trainable parameters and merge targets, must be owned first.
+    manager may return its pages to the file, so merge targets modified in place
+    must be owned first.
     """
     return all(tensor.untyped_storage().resizable() for tensor in adapter.storage_tensors(state))
 
@@ -175,16 +171,11 @@ class TensorAdapter[HostStateT, GpuStateT](Protocol):
         ...
 
     @staticmethod
-    def cpu_param(
-        state: HostStateT, *, requires_grad: bool = False
-    ) -> nn.Parameter:
-        """Build a stable :class:`nn.Parameter` wrapping the host state.
+    def cpu_param(state: HostStateT) -> nn.Parameter:
+        """Build a frozen :class:`nn.Parameter` wrapping the host state.
+
         Used as the deactivated-state registry value
         (``module._parameters[leaf] = cpu_param``).
-
-        ``requires_grad`` defaults to ``False`` to match frozen
-        registry-replacement callers; pass ``True`` when building a wrapper
-        for trainable storage.
         """
         ...
 
@@ -195,17 +186,12 @@ class TensorAdapter[HostStateT, GpuStateT](Protocol):
         ...
 
     @staticmethod
-    def gpu_param(
-        host: HostStateT, gpu_state: GpuStateT, *, requires_grad: bool = False
-    ) -> nn.Parameter:
-        """Build a stable :class:`nn.Parameter` wrapping the GPU state.
+    def gpu_param(host: HostStateT, gpu_state: GpuStateT) -> nn.Parameter:
+        """Build a frozen :class:`nn.Parameter` wrapping the GPU state.
         Reused across many :meth:`copy_to_gpu` calls.
 
         Structured adapters use captured metadata from ``host`` to
         reconstruct the GPU-side wrapper.
-
-        ``requires_grad`` defaults to ``False``; pass ``True`` for
-        trainable use cases where the wrapper participates in autograd.
         """
         ...
 
@@ -241,30 +227,6 @@ class TensorAdapter[HostStateT, GpuStateT](Protocol):
         storage and metadata retained by the adapter.
         """
         ...
-
-@runtime_checkable
-class CpuRoundTripTensorAdapter[HostStateT, GpuStateT](
-    TensorAdapter[HostStateT, GpuStateT],
-    Protocol,
-):
-    """Optional D2H counterpart to the base H2D movement contract."""
-
-    @staticmethod
-    def copy_to_cpu(
-        src: GpuStateT, dst: HostStateT, *, non_blocking: bool = False
-    ) -> None:
-        """Bulk D2H the GPU state's bytes into host storage.
-
-        Symmetric counterpart to :meth:`copy_to_gpu`. Used to sync the
-        host backing with post-update GPU contents — e.g., after
-        an optimizer step has written into the GPU param, scatter the
-        update back to the host state so the next H2D reads it.
-
-        Adapters whose GPU representation is not round-trippable should
-        not implement this capability.
-        """
-        ...
-
 
 @runtime_checkable
 class LogicalShapeTensorAdapter[HostStateT, GpuStateT](
@@ -527,24 +489,6 @@ class DequantRequantTensorAdapter[HostStateT, GpuStateT](
 
 
 @runtime_checkable
-class ParameterDataSwapTensorAdapter[HostStateT, GpuStateT](
-    TensorAdapter[HostStateT, GpuStateT],
-    Protocol,
-):
-    """Optional capability for trainable streaming via ``Parameter.data`` swap."""
-
-    @staticmethod
-    def validate_parameter_data_swap_target(t: torch.Tensor) -> None:
-        """Raise if ``t`` cannot safely round-trip through ``param.data =``.
-
-        Streamed trainables preserve user Parameter identity by swapping
-        only ``.data``. Tensor subclasses with wrapper metadata generally
-        must not opt into this capability.
-        """
-        ...
-
-
-@runtime_checkable
 class TensorCopyIntoAdapter[HostStateT, GpuStateT](
     TensorAdapter[HostStateT, GpuStateT],
     Protocol,
@@ -580,8 +524,7 @@ class BindTargetTensorAdapter[HostStateT, GpuStateT](
     requiring :meth:`TensorAdapter.layout_signature` to succeed on every
     incompatible target first.
 
-    Consulted only for physical host stores after ``requires_grad`` equality
-    has been checked.
+    Consulted only for frozen physical host stores.
     """
 
     @staticmethod
@@ -590,7 +533,6 @@ class BindTargetTensorAdapter[HostStateT, GpuStateT](
         target: torch.Tensor,
         *,
         layout_signature: object,
-        requires_grad: bool,
     ) -> bool:
         """Return whether ``target`` is a compatible bind target for ``state``."""
         ...
@@ -623,8 +565,6 @@ def accepts_bind_target(
     state: object,
     layout_signature: object,
     target: torch.Tensor,
-    *,
-    requires_grad: bool,
 ) -> bool:
     """Return whether ``target`` satisfies strict or adapter-relaxed bind validation."""
     if isinstance(adapter, BindTargetTensorAdapter):
@@ -632,7 +572,6 @@ def accepts_bind_target(
             state,
             target,
             layout_signature=layout_signature,
-            requires_grad=requires_grad,
         )
     return matches_layout_signature(adapter, layout_signature, target)
 
@@ -806,13 +745,9 @@ class _RegularGpu:
 class RegularAdapter:
     """Adapter for plain ``torch.Tensor`` (no subclass machinery).
 
-    Builds fresh :class:`nn.Parameter` objects wrapping the CPU
-    and GPU storages. Frozen model-bound callers replace the module registry via
-    ``module._parameters[leaf] = ...`` with a CPU wrapper or
-    active GPU wrapper; trainable callers preserve Parameter identity
-    by skipping registry replacement and ``.data``-swapping into their own
-    persistent Parameter. Both paths are supported by the shape of this
-    adapter (plain tensors round-trip through ``.data =`` cleanly).
+    Builds frozen :class:`nn.Parameter` objects wrapping the CPU and GPU
+    storages. Model-bound callers replace the module registry via
+    ``module._parameters[leaf] = ...`` with a CPU wrapper or active GPU wrapper.
 
     Conservative on dispatch: only matches exactly
     ``type(t) is torch.Tensor`` (or ``nn.Parameter``). Unrecognized
@@ -847,9 +782,8 @@ class RegularAdapter:
         target: torch.Tensor,
         *,
         layout_signature: object,
-        requires_grad: bool,
     ) -> bool:
-        del layout_signature, requires_grad
+        del layout_signature
         return (
             RegularAdapter.matches(target)
             and target.layout is torch.strided
@@ -875,36 +809,23 @@ class RegularAdapter:
         return (state.data,)
 
     @staticmethod
-    def cpu_param(
-        state: _RegularHost, *, requires_grad: bool = False
-    ) -> nn.Parameter:
-        return nn.Parameter(state.data, requires_grad=requires_grad)
+    def cpu_param(state: _RegularHost) -> nn.Parameter:
+        return nn.Parameter(state.data, requires_grad=False)
 
     @staticmethod
     def alloc_gpu(state: _RegularHost, device: torch.device) -> _RegularGpu:
         return _RegularGpu(data=torch.empty_like(state.data, device=device))
 
     @staticmethod
-    def gpu_param(
-        host: _RegularHost,
-        gpu_state: _RegularGpu,
-        *,
-        requires_grad: bool = False,
-    ) -> nn.Parameter:
+    def gpu_param(host: _RegularHost, gpu_state: _RegularGpu) -> nn.Parameter:
         _ = host
-        return nn.Parameter(gpu_state.data, requires_grad=requires_grad)
+        return nn.Parameter(gpu_state.data, requires_grad=False)
 
     @staticmethod
     def copy_to_gpu(
         src: _RegularHost, dst: _RegularGpu, *, non_blocking: bool = False
     ) -> None:
         transfer_(dst.data, src.data, non_blocking=non_blocking)
-
-    @staticmethod
-    def copy_to_cpu(
-        src: _RegularGpu, dst: _RegularHost, *, non_blocking: bool = False
-    ) -> None:
-        dst.data.copy_(src.data, non_blocking=non_blocking)
 
     @staticmethod
     def compute_dtype(t: torch.Tensor) -> torch.dtype:
@@ -977,14 +898,6 @@ class RegularAdapter:
             target.add_(update, alpha=alpha)
         else:
             target.copy_(target.mul(beta).add_(update, alpha=alpha))
-
-    @staticmethod
-    def validate_parameter_data_swap_target(t: torch.Tensor) -> None:
-        if type(t) is not torch.Tensor:
-            raise NotImplementedError(
-                f"Parameter data-swap target is {type(t).__name__}; "
-                "Parameter.data swap requires a plain torch.Tensor."
-            )
 
     @staticmethod
     def cache_bytes(state: _RegularHost) -> int:

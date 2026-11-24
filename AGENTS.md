@@ -43,12 +43,13 @@ the code that owns a behavior.
 
 ## Contracts to preserve
 
-- [Models](docs/models.md). Factories transfer compatible host storage. Set
-  `requires_grad` before capture and keep frozen bytes immutable. Activation
-  is exclusive. Construction and activation failures have different recovery paths.
+- [Models](docs/models.md). Models must be frozen (`requires_grad=False`) before
+  capture. Factories transfer compatible host storage, and captured bytes stay
+  immutable. Activation is exclusive. Construction and activation failures have
+  different recovery paths.
 - [Streaming](docs/streaming.md). Preserve aliases within each ownership
-  boundary (host state or one streamed block). Consult the guide for training,
-  compilation, and transient lifetimes. [Scheduling hooks](docs/development.md#scheduling-hooks)
+  boundary (host state or one streamed block). Consult the guide for
+  compilation and transient lifetimes. [Scheduling hooks](docs/development.md#scheduling-hooks)
   must recover from interrupted, skipped, and direct calls.
 - [Adapters](docs/adapters.md) and [formats](docs/formats.md). Model-update
   resources are immutable. Merge, routed execution, and tensor-format

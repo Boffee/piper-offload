@@ -85,12 +85,12 @@ class _ExternalAdapter(RegularAdapter):
         return RegularAdapter.capture_host(t.as_subclass(torch.Tensor))
 
     @staticmethod
-    def cpu_param(state, *, requires_grad: bool = False):
-        return torch.nn.Parameter(state.data.as_subclass(_ExternalTensor), requires_grad=requires_grad)
+    def cpu_param(state):
+        return torch.nn.Parameter(state.data.as_subclass(_ExternalTensor), requires_grad=False)
 
     @staticmethod
-    def gpu_param(host, gpu_state, *, requires_grad: bool = False):
-        return torch.nn.Parameter(gpu_state.data.as_subclass(_ExternalTensor), requires_grad=requires_grad)
+    def gpu_param(host, gpu_state):
+        return torch.nn.Parameter(gpu_state.data.as_subclass(_ExternalTensor), requires_grad=False)
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:

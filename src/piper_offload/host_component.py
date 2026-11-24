@@ -14,19 +14,15 @@ exclusive activation contract.
 
 Class-specific caveats
 ----------------------
-- Binding mutates the wrapped ``model`` — frozen parameter
-  registry entries (``module._parameters[leaf]``) are replaced with Parameters
-  wrapping CPU storage, trainable parameter ``.data`` points at
-  CPU storage while preserving the user's Parameter objects, and
-  registered buffers are replaced with host copies.
+- Binding mutates the wrapped ``model`` — parameter
+  registry entries (``module._parameters[leaf]``) are replaced with frozen
+  Parameters wrapping CPU storage, and registered buffers are replaced with host
+  copies.
 - Buffer mutations during forward (RNN/SSM state, KV cache,
-  training-mode BatchNorm running stats) are *discarded* on
+  stateful BatchNorm running stats) are *discarded* on
   :meth:`release` or :meth:`deactivate`. Suitable for inference of stateless
   modules; not suitable for models that need persistent buffer state across
   calls.
-- Trainable parameter updates on CUDA must run inside
-  :meth:`optimizer_step`. Without that boundary, release or deactivation
-  restores older CPU bytes and discards active GPU updates.
 - **Caller owns lifecycle correctness.** Calling :meth:`activate`
   twice without an intervening :meth:`deactivate` raises before registry
   movement or GPU allocation. Host construction optimizes peak host memory
@@ -43,9 +39,8 @@ Class-specific caveats
   distinct parameter objects that the tensor adapter identifies as aliases.
 """
 
-import contextlib
 import weakref
-from collections.abc import Generator, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Self
 
@@ -107,14 +102,16 @@ class HostComponentStore:
         """Total host-backing bytes held by this store."""
         return self._module_store.cache_bytes
 
-    @property
-    def has_trainables(self) -> bool:
-        """Whether any host parameter is trainable."""
-        return self._module_store.has_trainables
+    def _validate_bind(self, model: nn.Module) -> None:
+        self._module_store._validate_bind(model)
+
+    def _bind_validated(self, model: nn.Module) -> HostComponent:
+        return HostComponent(self._module_store._install(model))
 
     def bind(self, model: nn.Module) -> HostComponent:
         """Bind this store's host backing bytes to ``model``."""
-        return HostComponent(self._module_store.bind(model))
+        self._validate_bind(model)
+        return self._bind_validated(model)
 
 
 class HostComponent:
@@ -126,16 +123,9 @@ class HostComponent:
     :meth:`activate` starts a device session and eagerly calls
     :meth:`acquire`. Acquisition allocates GPU tensors for each unique host
     parameter and installs that active storage into the managed model registry
-    entries. Frozen parameters use registry replacement; trainable parameters
-    preserve the user's Parameter objects and swap only ``.data`` so optimizer
-    state remains valid. :meth:`release` restores CPU storage and frees
+    entries. :meth:`release` restores CPU storage and frees
     the CUDA working set without ending the session; :meth:`deactivate` also
     ends the session.
-
-    If trainable params are active on CUDA, run ``optimizer.step()``
-    inside :meth:`optimizer_step` so updated GPU bytes are copied back
-    into the CPU cache before the next deactivate/reactivate
-    cycle.
 
     Buffer-only modules (only registered buffers, no params)
     are valid — common for sibling tables like RoPE/positional
@@ -153,14 +143,12 @@ class HostComponent:
         self._instance = instance
         self._param_names = frozenset(instance.params)
         self._buffer_names = frozenset(instance.buffers)
-        self._has_trainables = instance.has_trainables
         self._active_device: torch.device | None = None
         self._load_plan: HostModuleLoadPlan | None = None
         self._lease: CudaTargetLease | None = None
         self._transfer = TransferLease()
         self._use_hook: torch.utils.hooks.RemovableHandle | None = None
         self._working_set_state = WorkingSetState.RELEASED
-        self._optimizer_step_active: bool = False
 
     # ------------------------------------------------------------------
     # Component API
@@ -197,9 +185,7 @@ class HostComponent:
 
         CUDA activation bulk-DMAs host weights to GPU: per-tensor
         ``.to()`` (non-blocking), then a single ``cuda.synchronize`` to
-        make the writes visible, then realigns any retained trainable
-        ``.grad`` to the GPU so the next backward accumulates on-device
-        (mirrors :meth:`deactivate` moving grad to CPU). Tied parameter
+        make the writes visible. Tied parameter
         names all receive the same GPU Parameter. CPU activation repoints
         registry entries back to the CPU Parameters and performs no
         device copy.
@@ -281,10 +267,6 @@ class HostComponent:
             )
             self._instance.install_target(lease.acquire(current_stream))
             self._transfer.finish()
-            # Realign trainable grads with their now-GPU data so the next
-            # backward accumulates on-device. A no-op unless a prior CPU
-            # optimizer step left a retained CPU grad (set_to_none=False).
-            self._instance.move_trainable_grads_to(active_device)
             self._install_use_hook()
         except BaseException:
             self.release()
@@ -325,34 +307,25 @@ class HostComponent:
     def release(self) -> None:
         """Idempotently release this session's CUDA working set.
 
-        Registry entries and trainable gradients return to CPU storage,
-        and the CUDA target lease is closed. The activation session remains
-        active so :meth:`acquire` can prepare another traversal.
-        Target retirement completes recorded CUDA work, so release is safe to
-        call immediately after a forward.
-
-        Trainable ``.grad`` follows ``.data`` to CPU here (grads
-        otherwise linger wherever ``AccumulateGrad`` left them, i.e. on the
-        GPU, retaining device memory and stranding the gradient off-host).
-        This gives a uniform released resting state — ``.data`` and
-        ``.grad`` both on CPU — so a context-free CPU
-        ``optimizer.step()`` works the same for host and streamed
-        trainables.
+        Registry entries return to CPU storage, and the CUDA target lease is
+        closed. The activation session remains active so :meth:`acquire` can
+        prepare another traversal. Target retirement completes recorded CUDA
+        work, so release is safe to call immediately after a forward.
 
         Each step must finish before the next releases anything: a failed
-        synchronization keeps the transfer lease, and a failed host restore
-        or target close keeps the target, and a later call retries."""
+        synchronization keeps the transfer lease, a failed host restore or
+        target close keeps the target, and a later call retries.
+        """
         if self._working_set_state is WorkingSetState.RELEASED:
             return
         self._working_set_state = WorkingSetState.CHANGING
-        # A partial upload or copy-back may still be in flight; its lease
+        # A partial upload may still be in flight; its lease
         # closes only once the device has synchronized.
         self._transfer.finish()
         lease = self._lease
         if lease is not None:
             self._remove_use_hook()
             self._instance.install_host()
-            self._instance.move_trainable_grads_to(torch.device("cpu"))
             lease.close()
             self._lease = None
         self._working_set_state = WorkingSetState.RELEASED
@@ -370,61 +343,6 @@ class HostComponent:
             self._active_device = None
             self._load_plan = None
 
-    @contextlib.contextmanager
-    def optimizer_step(self) -> Generator[None]:
-        """Optimizer-step boundary for managed trainable parameters.
-
-        On CUDA activation, the model's trainable ``.data`` points at
-        active GPU target storage. Wrap ``optimizer.step()`` in this
-        context so updated trainable bytes are copied back into host
-        CPU storage before the model is deactivated or reactivated.
-
-        On CPU activation, or when inactive, this is a guarded no-op
-        because trainable data is already resident in CPU storage.
-
-        This context does not move ``param.grad``; grad placement is owned
-        by the activate/deactivate cycle, which keeps grad on the same
-        device as ``.data`` (GPU while active, CPU once deactivated).
-        Use this context to step on the GPU; to step on the CPU instead,
-        call ``optimizer.step()`` while deactivated.
-        """
-        if self._optimizer_step_active:
-            raise RuntimeError(
-                "HostComponent.optimizer_step() does not support reentrant entry."
-            )
-
-        self._optimizer_step_active = True
-        try:
-            active_device = self._active_device
-            lease = self._lease
-            if (
-                self._has_trainables
-                and active_device is not None
-                and active_device.type == "cuda"
-            ):
-                if lease is None or self._working_set_state is not WorkingSetState.ACQUIRED:
-                    raise RuntimeError(
-                        "HostComponent.optimizer_step() called while its CUDA "
-                        "working set is not acquired. Acquire the component "
-                        "before entering the optimizer step."
-                    )
-                self._transfer.start(
-                    host_pin_manager, self._instance.trainable_storage_tensors(), active_device,
-                )
-                try:
-                    yield
-                finally:
-                    try:
-                        self._instance.copy_trainables_from_target(
-                            lease.target,
-                            non_blocking=True,
-                        )
-                    finally:
-                        self._transfer.finish()
-            else:
-                yield
-        finally:
-            self._optimizer_step_active = False
 
 __all__ = [
     "HostComponent",

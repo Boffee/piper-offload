@@ -22,14 +22,12 @@ from piper_offload.piper_convrot_nvfp4_adapter import (
 from piper_offload.rolling_runtime import _ROLLING_ADAPTER_TYPES
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
-    CpuRoundTripTensorAdapter,
     DequantRequantTensorAdapter,
     DequantizeTensorAdapter,
     DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
-    ParameterDataSwapTensorAdapter,
     TensorCopyIntoAdapter,
 )
 from tests.conftest import activated_model
@@ -387,8 +385,6 @@ class TestPiperConvRotNVFP4Adapter:
         assert isinstance(adapter, DequantizeTensorAdapter)
         assert not isinstance(adapter, DequantRequantTensorAdapter)
         assert not isinstance(adapter, TensorCopyIntoAdapter)
-        assert not isinstance(adapter, CpuRoundTripTensorAdapter)
-        assert not isinstance(adapter, ParameterDataSwapTensorAdapter)
         assert PiperConvRotNVFP4Adapter in _ROLLING_ADAPTER_TYPES
 
     def test_validates_mutated_rotation_metadata(self) -> None:

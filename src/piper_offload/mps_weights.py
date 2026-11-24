@@ -146,6 +146,5 @@ def _assert_frozen_param(param: nn.Parameter) -> None:
     if not param.requires_grad:
         return
     raise ValueError(
-        "MpsWeights cannot manage trainable parameters because replacing "
-        "the Parameter object would break optimizer/grad identity."
+        "MpsWeights is inference-only and requires frozen parameters (requires_grad=False)."
     )
