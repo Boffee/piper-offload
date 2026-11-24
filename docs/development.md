@@ -79,8 +79,9 @@ Keep latency and throughput measurements in [benchmarks](../benchmarks).
 | Resource cache | Specs, stores, accounting, resource leases, eviction | [resource_cache.py](../src/piper_offload/resource_cache.py), [resource_specs.py](../src/piper_offload/resource_specs.py) |
 | Checkpoint reader | Validate file headers, map tensor storage read-only, and record its file slice | [checkpoint.py](../src/piper_offload/checkpoint.py) |
 | Model cache | Lease adapters and a model, then activate the model for a use | [model_cache.py](../src/piper_offload/model_cache.py) |
-| Model offloader | One model's host capture, components, hooks, activation and deactivation | [model_offloader.py](../src/piper_offload/model_offloader.py) |
-| Components | Own host state and device working sets for whole modules or block lists | [host_component.py](../src/piper_offload/host_component.py), [block_component.py](../src/piper_offload/block_component.py) |
+| Model store and offload config | Capture flat frozen host backing once and configure/bind offload topologies | [model_store.py](../src/piper_offload/model_store.py), [offload_config.py](../src/piper_offload/offload_config.py) |
+| Model offloader | Coordinate bound host/block components, hooks, activation, and deactivation | [model_offloader.py](../src/piper_offload/model_offloader.py) |
+| Internal components | Own host state and device working sets composed by `ModelStore` and `ModelOffloader` | [host_component.py](../src/piper_offload/host_component.py), [block_component.py](../src/piper_offload/block_component.py), [composite_component.py](../src/piper_offload/composite_component.py) |
 | Host parameters and tensor adapters | Capture, account for, transfer, and reconstruct each tensor representation | [host_param.py](../src/piper_offload/host_param.py), [tensor_adapters.py](../src/piper_offload/tensor_adapters.py) |
 | Model adapters | Immutable LoRA, delta, and value resources applied through load plans or hooks | [adapter.py](../src/piper_offload/adapter.py), [merge.py](../src/piper_offload/merge.py) |
 | Parameter updates | Select merge targets and sources, validate them, and plan arithmetic for activation and permanent merge | [_parameter_update.py](../src/piper_offload/_parameter_update.py), [lora.py](../src/piper_offload/lora.py) |
@@ -107,9 +108,8 @@ owns format-specific arithmetic. Activation load plans and permanent merge
 share parameter-update planning. Each path owns its allocations, leases, and
 installation of results.
 
-The offloader cleans up partial activation. Callers using components directly
-own their cleanup. Each component's docstring describes its responsibilities.
-If construction fails, discard the partially captured model. See
+The offloader cleans up partial activation. If construction fails past preflight
+checks, discard the partially modified model. See
 [manual lifecycle](models.md#manual-lifecycle) for the public recovery paths.
 
 When a log record or object retains a failure past the `except` block, store

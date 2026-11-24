@@ -15,11 +15,10 @@ import piper_offload.pin_manager as pin_module
 from piper_offload import (
     Adapter,
     BlockCompileConfig,
-    BlockComponentStore,
-    HostComponentStore,
     LoRATransform,
     MappedCheckpoint,
     ModelOffloader,
+    OffloadConfig,
     ParameterDelta,
     merge_adapter,
     ParameterDeltaTransform,
@@ -33,7 +32,7 @@ from piper_offload.host_param import HostParam
 from piper_offload.target_lease import CudaTargetLease
 from piper_offload.tensor_adapter_registry import param_representation, select_adapter
 from tests._block_compile_helpers import _BlockModel, _make_offloader
-from tests.conftest import CallbackParameterTransform, activated_model, block_components
+from tests.conftest import CallbackParameterTransform, activated_model, block_components, host_component
 from tests.test_pin_manager import install_fake_kernel
 from tests.test_quantized_parameter_value import _QUANT_KINDS, _make_quantized
 
@@ -177,8 +176,10 @@ def test_cpu_execution_does_not_acquire_pins(device: str, mode: str, pins, monke
     monkeypatch.setattr(manager, "acquire", unexpected_acquire)
     offloader = ModelOffloader.from_module(
         _BlockModel(),
-        block_paths=[] if mode == "host" else ["blocks"],
-        block_mode="resident" if mode == "resident" else "streaming",
+        config=OffloadConfig(
+            block_paths=() if mode == "host" else ("blocks",),
+            block_mode="resident" if mode == "resident" else "streaming",
+        ),
     )
     with activated_model(offloader, device):
         assert manager.stats.active_leases == 0
@@ -252,7 +253,8 @@ def test_quantized_replacements_pin_payload_and_metadata_without_conversion(kind
     block.register_buffer("alias", block.buffer)
     model = nn.Module()
     model.blocks = nn.ModuleList([block])
-    component = BlockComponentStore.from_module(model, blocks_path="blocks").bind(model)
+    offloader = _make_offloader(model)
+    component = block_components(offloader)[0]
     tensors = backing.storage_tensors()
     pointers = {tensor.untyped_storage().data_ptr() for tensor in tensors if tensor.numel()}
     try:
@@ -355,7 +357,8 @@ def test_failed_runtime_quiescence_does_not_release_host_lease(
 def test_prefetch_update_failure_waits_before_releasing_pins(pins) -> None:
     manager, backend = pins
     model = _BlockModel()
-    component = BlockComponentStore.from_module(model, blocks_path="blocks").bind(model)
+    offloader = _make_offloader(model)
+    component = block_components(offloader)[0]
 
     def fail_update(_parameter):
         raise RuntimeError("injected update failure after upload")
@@ -382,10 +385,8 @@ def test_prefetch_update_failure_waits_before_releasing_pins(pins) -> None:
 
 def _resident_component(model: nn.Module, mode: str):
     if mode == "host":
-        return HostComponentStore.from_module(model).bind(model)
-    return BlockComponentStore.from_module(
-        model, blocks_path="blocks",
-    ).bind(model, block_mode="resident")
+        return host_component(ModelOffloader.from_module(model))
+    return block_components(_make_offloader(model, block_mode="resident"))[0]
 
 
 @CUDA

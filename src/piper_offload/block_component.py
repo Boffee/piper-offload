@@ -1,45 +1,16 @@
-"""Block-residency primitive for memory-efficient inference.
+"""Internal block-residency primitive for memory-efficient inference.
 
-A :class:`BlockComponentStore` manages reusable CPU backing
-storage for a single structurally compatible block list.
-Binding that store to a compatible model creates a
-:class:`BlockComponent` that either streams the resolved blocks to GPU on
-demand or keeps every block resident. Ordinary streaming uses a reusable GPU
-target pool and background prefetcher; rolling compilation selects a
-single-target parameter runtime; resident mode loads every target once. On
-CPU, the host-backed state is used directly without streaming.
-
-Blocks in one list may be heterogeneously quantized (mixed dtypes or
-quant formats on the same-named weights): the GPU target pool keys its
-reusable targets by per-block layout signature, so each block streams
-into a target matching its own format and no cross-format ``copy_`` ever
-happens. Only block lists whose blocks differ in *structure* — different
-parameter or buffer *names*, e.g. Flux's two block kinds — must split
-into multiple :class:`BlockComponent` instances composed via
-:class:`ModelOffloader`.
-
-This is the sharp, low-level primitive. It does NOT manage:
-
-- Non-block parts of the model (parent-module state, sibling
-  modules) — caller derives :class:`HostComponent` include-name sets
-  by excluding the block component's owned names.
-- Shared storage with tensors outside the block list — caller
-  must choose a valid composition; use whole-model
-  :class:`HostComponent` if sharing must be preserved.
-
-Most users want :class:`ModelOffloader` (the blessed safe API). Reach for
-:class:`BlockComponentStore` / :class:`BlockComponent` directly only
-when you need bespoke composition (e.g., multiple block lists like Flux's
-``transformer_blocks`` + ``single_transformer_blocks``).
+A :class:`BlockComponent` manages a structurally compatible block list bound to
+host backing from :class:`~piper_offload.model_store.ModelStore`, composed
+internally inside :class:`~piper_offload.model_offloader.ModelOffloader`.
 """
 
 import contextlib
 import functools
 import logging
 import weakref
-from collections.abc import Callable, Generator, Mapping, Sequence
-from dataclasses import dataclass
-from typing import Self, cast
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
+from typing import cast
 
 import torch
 from torch import nn
@@ -52,7 +23,6 @@ from .block_runtime import BlockRuntime
 from .host_module import (
     HostModuleInstance,
     HostModuleLoadPlan,
-    HostModuleStore,
     ParameterOverride,
 )
 from .host_param import HostParam
@@ -165,276 +135,43 @@ def _resolve_blocks(module: nn.Module, blocks_path: str) -> list[nn.Module]:
 
 
 def _block_is_empty(block: nn.Module) -> bool:
-    """A block with no parameters or buffers at any depth.
-
-    Empty positions carry nothing to stream and are skipped by
-    :meth:`BlockComponentStore.from_module` while later blocks retain their
-    true externally-visible indices.
-    """
+    """Return whether ``block`` holds no parameters or buffers at any depth."""
     return next(block.parameters(), None) is None and next(block.buffers(), None) is None
 
 
-@dataclass(frozen=True, slots=True)
-class BlockComponentStore:
-    """Reusable host backing storage for a block group.
-
-    Built via :meth:`from_module`: the tensor source is the model's block list,
-    resolved by ``blocks_path``.
-
-    ``block_indices`` records which positions of the resolved block list this
-    group actually occupies. :meth:`from_module` skips structurally-empty
-    positions (no parameters or buffers) while keeping each retained block at
-    its true externally-visible index.
-    """
-
-    _block_stores: tuple[HostModuleStore, ...]
-    blocks_path: str
-    block_indices: tuple[int, ...]
-
-    @classmethod
-    def from_module(
-        cls,
-        model: nn.Module,
-        *,
-        blocks_path: str,
-    ) -> Self:
-        """Resolve ``blocks_path`` on ``model`` and capture its managed blocks.
-
-        Structurally-empty positions (no parameters or buffers) are skipped and
-        dropped from :attr:`block_indices`. Requires frozen parameters
-        (``requires_grad=False``). Surviving blocks must agree on parameter
-        names and buffer names.
-        """
-        store, _ = cls._capture(model, blocks_path=blocks_path)
-        return store
-
-    @classmethod
-    def _capture(
-        cls, model: nn.Module, *, blocks_path: str,
-    ) -> tuple[Self, tuple[HostModuleInstance, ...]]:
-        # Validate every block before capture mutates the first. The schema
-        # holds names only, so each block's original tensors can be reclaimed as
-        # soon as its host backing is installed.
-        blocks = _resolve_blocks(model, blocks_path)
-        indices: list[int] = []
-        params: set[str] = set()
-        buffers: set[str] = set()
-        for idx, block in enumerate(blocks):
-            trainable = sorted(
-                name
-                for name, p in block.named_parameters(remove_duplicate=False)
-                if p.requires_grad
-            )
-            if trainable:
-                raise ValueError(
-                    "Piper Offload is inference-only and requires frozen parameters "
-                    f"(requires_grad=False); block {idx} at {blocks_path!r} has "
-                    f"trainable parameter(s): {trainable!r}."
-                )
-            block_params = {name for name, _ in block.named_parameters(remove_duplicate=False)}
-            block_buffers = {name for name, _ in block.named_buffers(remove_duplicate=False)}
-            if not block_params and not block_buffers:
-                continue
-            if indices:
-                if block_params != params:
-                    difference = sorted(block_params ^ params)
-                    raise ValueError(
-                        f"Block {idx} parameter names differ from block {indices[0]}: {difference}."
-                    )
-                if block_buffers != buffers:
-                    difference = sorted(block_buffers ^ buffers)
-                    raise ValueError(f"Block {idx} buffer names differ from block {indices[0]}: {difference}.")
-            else:
-                params, buffers = block_params, block_buffers
-            indices.append(idx)
-        if not indices:
-            raise ValueError(
-                f"Block path {blocks_path!r} has no streamable blocks (every block is structurally empty)."
-            )
-
-        captured = [
-            HostModuleStore.capture(blocks[idx], include_param_names=params, include_buffer_names=buffers)
-            for idx in indices
-        ]
-        store = cls(tuple(store for store, _ in captured), blocks_path, tuple(indices))
-        return store, tuple(instance for _, instance in captured)
-
-    @property
-    def managed_param_names_by_block(self) -> list[list[str]]:
-        """Per-block managed parameter names."""
-        return [list(store.params) for store in self._block_stores]
-
-    @property
-    def managed_buffer_names_by_block(self) -> list[list[str]]:
-        """Per-block managed buffer names."""
-        return [list(store.buffers) for store in self._block_stores]
-
-    @property
-    def param_names(self) -> frozenset[str]:
-        """Externally addressable managed parameter names.
-
-        Named by TRUE block index (:attr:`block_indices`), not the compact
-        store position — so a sparse group's factors are advertised at their
-        real path (``blocks.2...``) and the host-remainder subtraction in
-        :meth:`CompositeComponentStore.from_module` lines up correctly.
-        """
-        names = {
-            _block_tensor_name(self.blocks_path, true_idx, local_name)
-            for true_idx, store in zip(
-                self.block_indices,
-                self._block_stores,
-                strict=True,
-            )
-            for local_name in store.params
-        }
-        return frozenset(names)
-
-    @property
-    def buffer_names(self) -> frozenset[str]:
-        """Externally addressable managed buffer names (true block indices)."""
-        return frozenset(
-            _block_tensor_name(self.blocks_path, block_idx, local_name)
-            for block_idx, store in zip(self.block_indices, self._block_stores, strict=True)
-            for local_name in store.buffers
-        )
-
-    @property
-    def cache_bytes(self) -> int:
-        return sum(store.cache_bytes for store in self._block_stores)
-
-    def resolve_blocks(self, model: nn.Module) -> list[nn.Module]:
-        """Resolve this store's blocks path on ``model``."""
-        return _resolve_blocks(model, self.blocks_path)
-
-    def _validate_bind(self, model: nn.Module) -> list[nn.Module]:
-        last = self.block_indices[-1]
-        bind_blocks = self.resolve_blocks(model)
-        if last >= len(bind_blocks):
-            raise ValueError(
-                f"BlockComponentStore.bind() bind model has too few blocks "
-                f"at {self.blocks_path!r}: needs index {last}, found "
-                f"{len(bind_blocks)}."
-            )
-        occupied = set(self.block_indices)
-        unmanaged = [pos for pos, block in enumerate(bind_blocks) if pos not in occupied and not _block_is_empty(block)]
-        if unmanaged:
-            raise ValueError(
-                f"BlockComponentStore.bind() bind model has non-empty "
-                f"block(s) {unmanaged} at {self.blocks_path!r} that this store "
-                f"does not occupy (it occupies {list(self.block_indices)}); "
-                "those blocks would never be moved or streamed. Bind a model "
-                "whose only non-empty blocks are the occupied ones."
-            )
-        for store, idx in zip(self._block_stores, self.block_indices, strict=True):
-            store._validate_bind(bind_blocks[idx])
-        return bind_blocks
-
-    def _bind_validated(
-        self,
-        bind_blocks: Sequence[nn.Module],
-        *,
-        block_compile: BlockCompileConfig | None = None,
-        wraparound: bool = True,
-        block_mode: BlockMode = "streaming",
-    ) -> BlockComponent:
-        instances = [
-            store._install(bind_blocks[idx]) for store, idx in zip(self._block_stores, self.block_indices, strict=True)
-        ]
-        return self._component(instances, block_compile=block_compile, wraparound=wraparound, block_mode=block_mode)
-
-    def bind(
-        self,
-        model: nn.Module,
-        *,
-        block_compile: BlockCompileConfig | None = None,
-        wraparound: bool = True,
-        block_mode: BlockMode = "streaming",
-    ) -> BlockComponent:
-        """Bind this store's per-block backing bytes to ``model``.
-
-        Each instance owns and is installed onto its model block; loads repoint
-        the instance's own module onto the filled target, and that block's
-        forward triggers its streaming. ``model`` must have a block at every
-        occupied :attr:`block_indices` position. Non-empty blocks outside those
-        positions are rejected because they would be silently unmanaged.
-        """
-        bind_blocks = self._validate_bind(model)
-        return self._bind_validated(
-            bind_blocks,
-            block_compile=block_compile,
-            wraparound=wraparound,
-            block_mode=block_mode,
-        )
-
-    def _component(
-        self,
-        instances: Sequence[HostModuleInstance],
-        *,
-        block_compile: BlockCompileConfig | None,
-        wraparound: bool,
-        block_mode: BlockMode,
-    ) -> BlockComponent:
-        return BlockComponent(
-            instances,
-            name=self.blocks_path,
-            block_indices=self.block_indices,
-            block_compile=block_compile,
-            wraparound=wraparound,
-            block_mode=block_mode,
-        )
-
-
 # ---------------------------------------------------------------------------
-# BlockComponent — public block-residency primitive
+# BlockComponent — internal block-residency primitive
 # ---------------------------------------------------------------------------
 
 
 class BlockComponent:
-    """Manages a block list between CPU and CUDA.
+    """Internal CUDA/CPU residency runtime for one block group.
 
-    The sharp, low-level block-residency primitive. Manages bound block
-    instances whose owned params and buffers are stored on CPU. By default it
-    streams them to CUDA via forward-pre hooks on :meth:`activate`; with
-    resident mode loads every block once and installs no scheduling hooks.
-    CPU activation is pass-through over that host-backed state:
-    no pool, no hooks, no copies.
+    Manages bound block instances backed by host parameters and buffers from
+    :class:`~piper_offload.model_store.ModelStore`. By default it streams them
+    to CUDA via forward-pre hooks on :meth:`activate`; resident mode loads every
+    block once without scheduling hooks, and rolling compilation uses one shared
+    parameter runtime. CPU activation runs directly over host-backed state.
 
-    A :class:`BlockComponent` is a *component* meant to be composed
-    inside a :class:`~piper_offload.model_offloader.ModelOffloader`.
-    It deliberately is NOT a top-level model runtime (its
-    :meth:`activate` returns ``None`` because it doesn't own the
-    model). For top-level use, build a model runtime via
-    :class:`~piper_offload.model_offloader.ModelOffloader`.
-
-    Lifecycle is uniform with :class:`HostComponent`: store construction
-    captures host storage (so ``cache_bytes`` is final at construction time, ready
-    for :class:`~piper_offload.resource_cache.ResourceCache` admission), and
-    ``activate`` starts a device session and initially acquires its CUDA working
-    set, while ``deactivate`` releases that working set, returns state to host
-    CPU, removes hooks, and restores eager forwards. :meth:`release` and
-    :meth:`acquire` may cycle the CUDA working set without ending the session.
-    Optional
-    ``block_compile`` policy belongs to this bound runtime and installs lazy
-    compiled forwards for eligible CPU and CUDA inference activations. Ordinary
-    streaming owns one active block and one lookahead target, resident mode
-    owns one target per block, and rolling compilation owns one shared
-    parameter target. Streaming strategies wrap to block 0 by default;
-    transient model scheduling disables that wraparound.
-    There is no ``close()``; host memory in module state is freed when the
-    caller drops the binding and model references.
+    Lifecycle is uniform with :class:`HostComponent`: ``activate`` starts a
+    device session and initially acquires its CUDA working set, while
+    ``deactivate`` releases that working set, returns state to host CPU,
+    removes hooks, and restores eager forwards. :meth:`release` and
+    :meth:`acquire` cycle the CUDA working set without ending the session.
 
     **Calling deactivate() before dropping the binding is preferred**
-    — it removes the forward hooks (cleaner model state) and reverts
-    GPU-resident blocks back to CPU. The hook closure uses
-    ``weakref.ref(self)`` so dropping the binding without deactivate
-    is non-fatal: the orphaned hooks remain installed on the model
+    — it removes forward hooks and reverts GPU-resident blocks back to CPU.
+    The hook closure uses ``weakref.ref(self)`` so dropping the binding
+    without deactivate is non-fatal: the orphaned hooks remain installed on the
+    model
     but no-op; resident blocks stay on GPU until the model itself is
     dropped. Forward calls through still-resident blocks work; calls
     through previously-evicted blocks find CPU tensors (slow but
     functional).
 
     Instances are usually created by binding a
-    :class:`BlockComponentStore` to a compatible model.
+    :class:`~piper_offload.model_store.ModelStore` or via
+    :meth:`ModelOffloader.from_module`.
 
     Parameters
     ----------
@@ -475,6 +212,8 @@ class BlockComponent:
         *,
         name: str | None = None,
         block_indices: Sequence[int] | None = None,
+        param_name_index: Mapping[str, tuple[int, str]] | None = None,
+        buffer_names: Iterable[str] | None = None,
         block_compile: BlockCompileConfig | None = None,
         wraparound: bool = True,
         block_mode: BlockMode = "streaming",
@@ -529,13 +268,21 @@ class BlockComponent:
         # one per transfer. The working set's state says how far acquiring
         # or releasing them got.
         self._pin_lease, self._transfer, self._working_set_state = None, TransferLease(), WorkingSetState.RELEASED
-        self._param_name_to_block_param = _build_param_name_index(
-            self._block_instances,
-            name,
-            block_indices,
+        self._param_name_to_block_param = (
+            dict(param_name_index)
+            if param_name_index is not None
+            else _build_param_name_index(
+                self._block_instances,
+                name,
+                block_indices,
+            )
         )
         self._param_names = frozenset(self._param_name_to_block_param)
-        self._buffer_names = _block_buffer_names(self._block_instances, name, block_indices)
+        self._buffer_names = (
+            frozenset(buffer_names)
+            if buffer_names is not None
+            else _block_buffer_names(self._block_instances, name, block_indices)
+        )
 
         # Auto-flush the CUDA allocator cache when the component is GC'd,
         # so callers don't need to remember an explicit empty_cache() at
@@ -657,6 +404,10 @@ class BlockComponent:
         self,
         overrides: Mapping[str, ParameterOverride] | None,
     ) -> tuple[HostModuleLoadPlan, ...]:
+        peer_indices_by_module: dict[int, list[int]] = {}
+        for idx, instance in enumerate(self._block_instances):
+            peer_indices_by_module.setdefault(id(instance.module), []).append(idx)
+
         by_block: list[dict[str, ParameterOverride]] = [
             {} for _instance in self._block_instances
         ]
@@ -668,7 +419,19 @@ class BlockComponent:
                         f"param name {name!r} is not owned by this block component"
                     )
                 block_idx, local_name = ref
-                by_block[block_idx][local_name] = override
+                for peer_idx in peer_indices_by_module[
+                    id(self._block_instances[block_idx].module)
+                ]:
+                    existing = by_block[peer_idx].get(local_name)
+                    if existing is not None and (
+                        existing.source is not override.source
+                        or existing.update is not override.update
+                    ):
+                        raise ValueError(
+                            "Tied parameter aliases cannot resolve to different loads; "
+                            f"conflict at {name!r}."
+                        )
+                    by_block[peer_idx][local_name] = override
         return tuple(
             instance.resolve_load_plan(local_overrides)
             for instance, local_overrides in zip(
@@ -835,7 +598,4 @@ class BlockComponent:
             self.deactivate()
 
 
-__all__ = [
-    "BlockComponent",
-    "BlockComponentStore",
-]
+__all__ = ["BlockComponent"]

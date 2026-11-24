@@ -14,7 +14,7 @@ import pytest
 import torch
 from torch import nn
 
-from piper_offload import ModelOffloader
+from piper_offload import ModelOffloader, OffloadConfig
 from piper_offload.streaming_runtime import _plan_target_signature
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -83,7 +83,7 @@ def test_heterogeneous_block_list_builds_and_partitions_signatures() -> None:
     # differs from block 0 ...") right here.
     offloader = ModelOffloader.from_module(
         model,
-        block_paths=["blocks"],
+        OffloadConfig(block_paths=("blocks",)),
     )
 
     signatures = _signatures(offloader)
@@ -99,7 +99,7 @@ def test_signature_distinguishes_each_dtype() -> None:
     model = _frozen_model(16, [torch.float32, torch.float16, torch.bfloat16])
     offloader = ModelOffloader.from_module(
         model,
-        block_paths=["blocks"],
+        OffloadConfig(block_paths=("blocks",)),
     )
     signatures = _signatures(offloader)
     assert len(set(signatures)) == 3
@@ -123,7 +123,7 @@ def test_cuda_streams_mixed_dtype_blocks_matches_reference() -> None:
 
     offloader = ModelOffloader.from_module(
         model,
-        block_paths=["blocks"],
+        OffloadConfig(block_paths=("blocks",)),
     )
 
     with torch.no_grad(), activated_model(offloader, "cuda") as bound:
@@ -144,7 +144,7 @@ def test_cuda_morphing_pool_handles_repeated_iterations() -> None:
 
     offloader = ModelOffloader.from_module(
         model,
-        block_paths=["blocks"],
+        OffloadConfig(block_paths=("blocks",)),
     )
 
     with torch.no_grad(), activated_model(offloader, "cuda") as bound:
@@ -213,7 +213,7 @@ def test_cuda_streams_mixed_quant_and_plain_blocks() -> None:
 
     offloader = ModelOffloader.from_module(
         model,
-        block_paths=["blocks"],
+        OffloadConfig(block_paths=("blocks",)),
     )
     assert len(set(_signatures(offloader))) == 2
 

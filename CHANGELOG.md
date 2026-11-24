@@ -7,6 +7,10 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Added `ModelStore`, `ModelStoreSpec`, and `OffloadConfig` so callers can capture
+  frozen module weights once into a topology-free store and lease that cached
+  store via one `ModelStoreSpec` key to bind multiple caller-owned shells with
+  independent offloading configurations.
 - `piper_relay` now accepts `RelayOptions(transport="ipc")` for Linux CUDA/HIP
   GPU-to-GPU IPC collective transfers through a bounded device staging ring
   (`staging_bytes / world_size` per rank, zero host payload copies and zero
@@ -29,8 +33,18 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
-- Binding frozen built-in quantized and packed host stores (`HostModuleStore`,
-  `HostComponentStore`, `BlockComponentStore`, and `CompositeComponentStore`)
+- Breaking: Replaced `ModelOffloader.from_module()` flat offloading keyword
+  arguments (`block_paths`, `transient_block_paths`, `transient_paths`,
+  `block_mode`, and `block_compile`) and matching `ModelSpec` fields with
+  `OffloadConfig`, internalized `HostComponent` and `BlockComponent`, and
+  removed `HostComponentStore`, `BlockComponentStore`, and
+  `CompositeComponentStore` in favor of `ModelStore`. `OffloadConfig` path
+  fields now require `tuple[str, ...]` (`list[str]` raises `TypeError`),
+  binding onto a shell with a live `ModelOffloader` is rejected, and public
+  named-subset capture (`include_param_names` / `include_buffer_names`) has been
+  removed.
+- Binding frozen built-in quantized and packed host stores (`HostModuleStore` and
+  `ModelStore`)
   now accepts plain strided `meta` placeholder parameters matching the store's
   logical shape (and `DTensor` wrappers over matching plain strided `meta` local
   shards), enabling `meta` skeleton binding onto quantized and packed host

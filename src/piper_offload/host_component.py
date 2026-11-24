@@ -1,48 +1,13 @@
-"""CPU component for selected model parameters and buffers.
+"""Internal CPU component for selected model parameters and buffers.
 
-Holds selected parameters and buffers in CPU memory and
-bulk-copies them to the activation device. This is the component used
-by :class:`ModelOffloader` for both non-streamed names and whole-model
-capture. It is a composable activate/deactivate lifecycle piece, not a
-top-level model runtime.
-
-Application compatibility is covered by the
-`models <https://github.com/Boffee/piper-offload/blob/main/docs/models.md>`_ and
-`streaming <https://github.com/Boffee/piper-offload/blob/main/docs/streaming.md>`_
-guides. :class:`ModelOffloader` owns the coordinated model lifecycle and
-exclusive activation contract.
-
-Class-specific caveats
-----------------------
-- Binding mutates the wrapped ``model`` — parameter
-  registry entries (``module._parameters[leaf]``) are replaced with frozen
-  Parameters wrapping CPU storage, and registered buffers are replaced with host
-  copies.
-- Buffer mutations during forward (RNN/SSM state, KV cache,
-  stateful BatchNorm running stats) are *discarded* on
-  :meth:`release` or :meth:`deactivate`. Suitable for inference of stateless
-  modules; not suitable for models that need persistent buffer state across
-  calls.
-- **Caller owns lifecycle correctness.** Calling :meth:`activate`
-  twice without an intervening :meth:`deactivate` raises before registry
-  movement or GPU allocation. Host construction optimizes peak host memory
-  by letting :class:`HostParam` repoint plain ``Parameter.data`` at captured
-  host backing as each host parameter is created; if construction or activation
-  raises after that point, retrying the same model/component is unsupported —
-  drop references and rebuild from a fresh model instance.
-- There is no ``close()``. Host memory is freed when the caller
-  drops the component AND model references; Python's refcount-based
-  GC reclaims the host tensors immediately. The component releases
-  what it owns (its internal name tracking); the user's model is the
-  user's concern.
-- Tied weights share one :class:`HostParam` and one active target, including
-  distinct parameter objects that the tensor adapter identifies as aliases.
+Holds selected parameters and buffers in CPU memory and bulk-copies them to the
+activation device. :class:`~piper_offload.model_offloader.ModelOffloader`
+composes :class:`HostComponent` instances internally for resident and
+transient model state.
 """
 
 import weakref
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
-from typing import Self
+from collections.abc import Mapping
 
 import torch
 from torch import nn
@@ -52,91 +17,20 @@ from ._working_set import WorkingSetState
 from .host_module import (
     HostModuleInstance,
     HostModuleLoadPlan,
-    HostModuleStore,
     ParameterOverride,
 )
 from .pin_manager import TransferLease, host_pin_manager
 from .target_lease import CudaTargetLease
 
 
-@dataclass(frozen=True, slots=True)
-class HostComponentStore:
-    """Reusable host backing storage for :class:`HostComponent`.
-
-    Component-level wrapper over the internal name-keyed module store.
-    Build once from a prototype module, then bind it to concrete
-    compatible modules with :meth:`bind`.
-    """
-
-    _module_store: HostModuleStore
-
-    @classmethod
-    def from_module(
-        cls,
-        model: nn.Module,
-        *,
-        include_param_names: Iterable[str] | None = None,
-        include_buffer_names: Iterable[str] | None = None,
-    ) -> Self:
-        """Create a reusable store that owns captured pageable CPU backing."""
-        return cls(
-            HostModuleStore.from_module(
-                model,
-                include_param_names=include_param_names,
-                include_buffer_names=include_buffer_names,
-            )
-        )
-
-    @property
-    def param_names(self) -> frozenset[str]:
-        """Host parameter names in this store."""
-        return frozenset(self._module_store.params)
-
-    @property
-    def buffer_names(self) -> frozenset[str]:
-        """Host buffer names in this store."""
-        return frozenset(self._module_store.buffers)
-
-    @property
-    def cache_bytes(self) -> int:
-        """Total host-backing bytes held by this store."""
-        return self._module_store.cache_bytes
-
-    def _validate_bind(self, model: nn.Module) -> None:
-        self._module_store._validate_bind(model)
-
-    def _bind_validated(self, model: nn.Module) -> HostComponent:
-        return HostComponent(self._module_store._install(model))
-
-    def bind(self, model: nn.Module) -> HostComponent:
-        """Bind this store's host backing bytes to ``model``."""
-        self._validate_bind(model)
-        return self._bind_validated(model)
-
-
 class HostComponent:
-    """CPU component with bulk device transfer.
+    """Internal CPU component with bulk device transfer.
 
-    Instances are created by binding a :class:`HostComponentStore` to a
-    compatible model. Tensor adapters capture the CPU storage for each
-    managed parameter, sharing it across tied weights.
-    :meth:`activate` starts a device session and eagerly calls
-    :meth:`acquire`. Acquisition allocates GPU tensors for each unique host
-    parameter and installs that active storage into the managed model registry
-    entries. :meth:`release` restores CPU storage and frees
-    the CUDA working set without ending the session; :meth:`deactivate` also
-    ends the session.
-
-    Buffer-only modules (only registered buffers, no params)
-    are valid — common for sibling tables like RoPE/positional
-    embeddings managed via :class:`ModelOffloader`'s non-block
-    composition. Empty selections are valid no-op components; the
-    top-level :class:`ModelOffloader` still rejects configurations
-    with no components to manage.
-
-    Stores are constructed with :meth:`HostComponentStore.from_module`.
-    Managed tensors may start on CPU or CUDA; store construction clones
-    them directly into CPU storage.
+    Manages one bound :class:`HostModuleInstance` covering a disjoint set of
+    managed parameter and buffer names. :meth:`activate` starts a device session
+    and eagerly calls :meth:`acquire`. :meth:`release` restores CPU storage and
+    frees the CUDA working set without ending the session; :meth:`deactivate`
+    also ends the session.
     """
 
     def __init__(self, instance: HostModuleInstance) -> None:
@@ -344,7 +238,4 @@ class HostComponent:
             self._load_plan = None
 
 
-__all__ = [
-    "HostComponent",
-    "HostComponentStore",
-]
+__all__ = ["HostComponent"]

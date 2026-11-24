@@ -12,6 +12,7 @@ from piper_offload import (
     Adapter,
     ModelOffloader,
     ModelSpec,
+    OffloadConfig,
 )
 from piper_offload.resident_runtime import ResidentBlockRuntime
 from piper_offload.rolling_compile import rolling_inductor_backend
@@ -153,7 +154,7 @@ class TestBlockCompileConfig:
         model = nn.Linear(4, 4, bias=False).requires_grad_(False)
         offloader = ModelOffloader.from_module(
             model,
-            block_compile=BlockCompileConfig(),
+            OffloadConfig(block_compile=BlockCompileConfig()),
         )
         try:
             assert not block_components(offloader)
@@ -176,8 +177,10 @@ class TestBlockCompileConfig:
             key="compiled",
             estimated_cache_bytes=1024,
             factory=_BlockModel,
-            transient_block_paths=("blocks",),
-            block_compile=config,
+            config=OffloadConfig(
+                transient_block_paths=("blocks",),
+                block_compile=config,
+            ),
         )
 
         offloader = spec.build_store()
@@ -212,9 +215,11 @@ class TestBlockCompileConfig:
             key="resident-compiled",
             estimated_cache_bytes=1024,
             factory=_BlockModel,
-            block_paths=("blocks",),
-            block_mode="resident",
-            block_compile=BlockCompileConfig(),
+            config=OffloadConfig(
+                block_paths=("blocks",),
+                block_mode="resident",
+                block_compile=BlockCompileConfig(),
+            ),
         )
 
         offloader = spec.build_store()

@@ -6,16 +6,16 @@ protocol.
 """
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast
 
 import torch
 from torch import nn
 
 from .adapter import Adapter
-from .block_compile import BlockCompileConfig
-from .block_mode import BlockMode
 from .model_offloader import ModelOffloader
+from .model_store import ModelStore
+from .offload_config import OffloadConfig, validate_offload_config
 from .protocols import ResourceStore
 
 
@@ -25,40 +25,49 @@ class ModelSpec[M: nn.Module]:
 
     ``factory`` runs once to construct the cached :class:`ModelOffloader`.
     Every lease reuses that same model runtime sequentially; overlapping uses
-    are rejected by the offloader. ``block_compile`` is an opt-in construction
-    policy for CPU and CUDA execution of every group named by ``block_paths`` or
-    ``transient_block_paths``. ``block_mode`` selects resident, whole-block
-    streaming, compiled rolling, or automatic rolling-with-streaming-fallback
-    CUDA execution for every block group. CPU compilation uses existing host state.
-    Transient block groups release their CUDA working sets after their final blocks.
-    ``transient_paths`` gives named modules independent CUDA working sets
-    scoped to their forwards. The factory transfers compatible pageable CPU
-    storage to the cached runtime, preserving checkpoint-backed mappings.
+    are rejected by the offloader. ``config`` configures block streaming,
+    compilation, and transient working sets for the bound runtime. The factory
+    transfers compatible pageable CPU storage to the cached runtime,
+    preserving checkpoint-backed mappings.
     """
 
     key: str
     factory: Callable[[], M]
     estimated_cache_bytes: int = 0
-    block_paths: tuple[str, ...] = ()
-    transient_block_paths: tuple[str, ...] = ()
-    block_mode: BlockMode = "streaming"
-    block_compile: BlockCompileConfig | None = None
-    transient_paths: tuple[str, ...] = ()
+    config: OffloadConfig = field(default_factory=OffloadConfig)
+
+    def __post_init__(self) -> None:
+        validate_offload_config(self.config)
 
     def build_store(self) -> ModelOffloader:
         """Build, capture, and bind the cached model runtime."""
-        return ModelOffloader.from_module(
-            self.factory(),
-            block_paths=self.block_paths,
-            transient_block_paths=self.transient_block_paths,
-            block_mode=self.block_mode,
-            block_compile=self.block_compile,
-            transient_paths=self.transient_paths,
-        )
+        return ModelOffloader.from_module(self.factory(), self.config)
 
     def value(self, store: ResourceStore) -> ModelOffloader:
         """Return the leased model runtime."""
         return cast(ModelOffloader, store)
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class ModelStoreSpec:
+    """Reusable host-backing store resource built from a frozen model factory.
+
+    ``factory`` runs once to build a flat :class:`ModelStore` whose host bytes
+    can be bound across multiple target models or offload configurations via
+    :meth:`ModelStore.bind`.
+    """
+
+    key: str
+    factory: Callable[[], nn.Module]
+    estimated_cache_bytes: int = 0
+
+    def build_store(self) -> ModelStore:
+        """Build and capture this reusable flat model store."""
+        return ModelStore.from_module(self.factory())
+
+    def value(self, store: ResourceStore) -> ModelStore:
+        """Return the leased model store."""
+        return cast(ModelStore, store)
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -130,4 +139,4 @@ class ObjectSpec[T]:
         return cast(_ObjectStore[T], store).value
 
 
-__all__ = ["AdapterSpec", "ModelSpec", "ObjectSpec"]
+__all__ = ["AdapterSpec", "ModelSpec", "ModelStoreSpec", "ObjectSpec"]

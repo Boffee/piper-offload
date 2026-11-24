@@ -7,8 +7,10 @@ capture, caching, and activation.
 
 ## Select block groups
 
-Set `ModelSpec.block_paths` to dotted paths resolving to nonempty
-`nn.ModuleList` objects. Each list becomes an independent group. The model's
+Set `OffloadConfig.block_paths` to dotted paths resolving to nonempty
+`nn.ModuleList` objects whose block entries are registered submodules of the
+root model (unregistered modules in plain Python lists are rejected during
+preflight). Each list becomes an independent group. The model's
 forward calls its blocks normally, letting Piper's hooks load their weights.
 Everything outside those groups stays resident for the activation by default.
 
@@ -18,7 +20,7 @@ larger model with, for example, a block list at `model.transformer.blocks`:
 ```python
 import torch
 from torch import nn
-from piper_offload import ModelCache, ModelSpec
+from piper_offload import ModelCache, ModelSpec, OffloadConfig
 
 
 class BlockModel(nn.Module):
@@ -37,7 +39,11 @@ def build_model():
 
 
 cache = ModelCache()
-spec = ModelSpec(key="streaming-example", factory=build_model, block_paths=("blocks",))
+spec = ModelSpec(
+    key="streaming-example",
+    factory=build_model,
+    config=OffloadConfig(block_paths=("blocks",)),
+)
 with cache.use(spec, device="cuda") as model, torch.inference_mode():
     output = model(torch.randn(1, 8, device="cuda"))
 
@@ -48,10 +54,10 @@ cache.clear()
 Enter `cache.use()` before `torch.inference_mode()` so background copies can
 refill the streamed targets. Keep inference mode around forward computation.
 
-For multiple lists, use paths such as
-`block_paths=("transformer_blocks", "single_transformer_blocks")`. The same
-block settings are accepted by `ModelOffloader.from_module()` when you manage
-activation directly.
+For multiple lists, use
+`OffloadConfig(block_paths=("transformer_blocks", "single_transformer_blocks"))`.
+Pass the same `OffloadConfig` to `ModelSpec`, `ModelOffloader.from_module()`,
+or `ModelStore.bind()` when binding models directly.
 
 Blocks within a group must share parameter and buffer names. Ordinary streaming
 supports differing shapes, dtypes, quantization formats, alias topology, and
@@ -59,8 +65,8 @@ buffer layouts within that structure. Shared storage is preserved within host
 state, including tied embeddings and output heads, or within one streamed block.
 Sharing between host and streamed state, between streamed blocks, or between
 block groups is unsupported. Use whole-model offloading when those ties must be
-preserved. For custom grouping, see
-[`BlockComponentStore`](../src/piper_offload/block_component.py).
+preserved. See [`OffloadConfig`](../src/piper_offload/offload_config.py) and
+[`ModelStore`](../src/piper_offload/model_store.py).
 
 The GPU must fit the resident state, block targets, activations, and temporary
 workspace together. Ordinary streaming keeps an active block and a lookahead
@@ -106,13 +112,15 @@ Compilation is optional. Add one `BlockCompileConfig` to
 the spec for all declared groups. Using the factory above:
 
 ```python
-from piper_offload import BlockCompileConfig
+from piper_offload import BlockCompileConfig, ModelSpec, OffloadConfig
 
 spec = ModelSpec(
     key="compiled-example",
     factory=build_model,
-    block_paths=("blocks",),
-    block_compile=BlockCompileConfig(),
+    config=OffloadConfig(
+        block_paths=("blocks",),
+        block_compile=BlockCompileConfig(),
+    ),
 )
 ```
 
@@ -154,9 +162,11 @@ Rolling requires full-graph compilation:
 spec = ModelSpec(
     key="rolling-example",
     factory=build_model,
-    block_paths=("blocks",),
-    block_mode="auto",  # use "rolling" to require it
-    block_compile=BlockCompileConfig(fullgraph=True),
+    config=OffloadConfig(
+        block_paths=("blocks",),
+        block_mode="auto",  # use "rolling" to require it
+        block_compile=BlockCompileConfig(fullgraph=True),
+    ),
 )
 ```
 
@@ -196,7 +206,7 @@ finishes:
 spec = ModelSpec(
     key="transient-example",
     factory=build_model,
-    transient_block_paths=("blocks",),
+    config=OffloadConfig(transient_block_paths=("blocks",)),
 )
 ```
 

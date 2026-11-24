@@ -31,7 +31,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from piper_offload import BlockCompileConfig, BlockMode, ModelOffloader, PinLease, host_pin_manager
+from piper_offload import BlockCompileConfig, BlockMode, ModelOffloader, OffloadConfig, PinLease, host_pin_manager
 from piper_offload._host_registration import RuntimeHostRegistration
 from piper_offload.block_component import _host_transfer_tensors
 from piper_offload.streaming_runtime import StreamingBlockRuntime
@@ -166,9 +166,11 @@ def _build_subject(name: str, mode: BlockMode, representation: str, args: argpar
     model = _Model(args.blocks, args.width, representation, getattr(torch, args.dtype))
     offloader = ModelOffloader.from_module(
         model,
-        block_paths=("blocks",),
-        block_mode=mode,
-        block_compile=BlockCompileConfig(fullgraph=True, dynamic=False),
+        config=OffloadConfig(
+            block_paths=("blocks",),
+            block_mode=mode,
+            block_compile=BlockCompileConfig(fullgraph=True, dynamic=False),
+        ),
     )
     # Benchmark-only inspection of the actual captured allocations, including
     # quant metadata. Merge page intervals without allocating a set per page.

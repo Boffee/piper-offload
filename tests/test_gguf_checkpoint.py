@@ -12,7 +12,14 @@ import torch
 from torch import nn
 
 from piper_offload import (
-    CheckpointError, GgufParameter, MappedCheckpoint, ModelOffloader, PinManager, file_slice, requires_activation,
+    CheckpointError,
+    GgufParameter,
+    MappedCheckpoint,
+    ModelOffloader,
+    OffloadConfig,
+    PinManager,
+    file_slice,
+    requires_activation,
 )
 from piper_offload.gguf_adapter import GgufAdapter
 from tests._block_compile_helpers import _BlockModel
@@ -265,7 +272,10 @@ def test_mapped_blocks_execute_and_preserve_pinning_policy(checkpoint, pins, mod
             "blocks.1.weight": reader.get_tensor("weight2"),
         }, assign=True)
     sources = [parameter.as_tensor() for parameter in model.parameters()]
-    offloader = ModelOffloader.from_module(model, block_paths=["blocks"], block_mode=mode)
+    offloader = ModelOffloader.from_module(
+        model,
+        OffloadConfig(block_paths=("blocks",), block_mode=mode),
+    )
     value = torch.randn(2, 64, device="cuda", dtype=torch.bfloat16)
     expected = value
     for data in (packed, packed.flip(0)):

@@ -9,6 +9,7 @@ from collections.abc import (
     Iterable,
     Iterator,
     Mapping,
+    Sequence,
 )
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -116,31 +117,21 @@ class HostModuleStore:
         include_param_names: Iterable[str] | None = None,
         include_buffer_names: Iterable[str] | None = None,
     ) -> tuple[Self, HostModuleInstance]:
-        """Capture host backing and return its first installed binding."""
-        all_params = _named_parameters(module)
-        params = _select_known_names(
-            all_params,
-            include_param_names,
+        """Capture host backing incrementally per alias group and install it."""
+        param_groups, buffer_groups = _collect_capture_groups(
+            module,
+            include_param_names=include_param_names,
+            include_buffer_names=include_buffer_names,
         )
-
-        all_buffers = _named_buffers(module)
-        buffers = _select_known_names(
-            all_buffers,
-            include_buffer_names,
+        host_params = _capture_install_param_groups(module, param_groups)
+        host_buffers = _capture_install_buffer_groups(module, buffer_groups)
+        store = cls(params=host_params, buffers=host_buffers)
+        instance = HostModuleInstance(
+            module=module,
+            params=store.params,
+            buffers=store.buffers,
         )
-
-        trainable = sorted(name for name, p in params.items() if p.requires_grad)
-        if trainable:
-            raise ValueError(
-                "Piper Offload is inference-only and requires frozen parameters "
-                f"(requires_grad=False); found trainable parameter(s): {_format_names(trainable)}."
-            )
-
-        store = cls(
-            params=_capture_params(params),
-            buffers=_capture_buffers(buffers),
-        )
-        return store, store._install(module)
+        return store, instance
 
     @property
     def cache_bytes(self) -> int:
@@ -367,31 +358,78 @@ class HostModuleLoadPlan:
         )
 
 
-def _capture_params(
-    params: Mapping[str, nn.Parameter],
+def _collect_capture_groups(
+    module: nn.Module,
+    *,
+    include_param_names: Iterable[str] | None = None,
+    include_buffer_names: Iterable[str] | None = None,
+) -> tuple[list[tuple[str, ...]], list[tuple[str, ...]]]:
+    all_params = _named_parameters(module)
+    params = _select_known_names(all_params, include_param_names)
+    all_buffers = _named_buffers(module)
+    buffers = _select_known_names(all_buffers, include_buffer_names)
+
+    trainable = sorted(name for name, p in params.items() if p.requires_grad)
+    if trainable:
+        raise ValueError(
+            "Piper Offload is inference-only and requires frozen parameters "
+            f"(requires_grad=False); found trainable parameter(s): {_format_names(trainable)}."
+        )
+
+    param_groups = group_names(params.keys(), lambda name: param_tensor_id(params[name]))
+    buffer_groups = group_names(buffers.keys(), lambda name: buffer_tensor_id(buffers[name]))
+    return param_groups, buffer_groups
+
+
+def _capture_one_param_group(module: nn.Module, names: tuple[str, ...]) -> HostParam:
+    parent, leaf = resolve_parent_leaf(module, names[0])
+    source = parent._parameters[leaf]
+    if source is None:
+        raise RuntimeError(f"Parameter {names[0]!r} is unexpectedly missing.")
+    del parent
+    host = HostParam(source)
+    del source
+    cpu_param = host.make_cpu_param()
+    for name in names:
+        target_parent, target_leaf = resolve_parent_leaf(module, name)
+        _set_param(target_parent, target_leaf, cpu_param)
+    return host
+
+
+def _capture_install_param_groups(
+    module: nn.Module,
+    groups: Sequence[tuple[str, ...]],
 ) -> dict[str, HostParam]:
     host_by_name: dict[str, HostParam] = {}
-    for names in group_names(
-        params.keys(),
-        lambda name: param_tensor_id(params[name]),
-    ):
-        host = HostParam(params[names[0]])
+    for names in groups:
+        host = _capture_one_param_group(module, names)
         for name in names:
             host_by_name[name] = host
     return host_by_name
 
 
-def _capture_buffers(
-    buffers: Mapping[str, torch.Tensor],
+def _capture_one_buffer_group(module: nn.Module, names: tuple[str, ...]) -> HostBuffer:
+    parent, leaf = resolve_parent_leaf(module, names[0])
+    source = parent._buffers[leaf]
+    if source is None:
+        raise RuntimeError(f"Buffer {names[0]!r} is unexpectedly missing.")
+    del parent
+    host = HostBuffer.capture(source)
+    del source
+    for name in names:
+        target_parent, target_leaf = resolve_parent_leaf(module, name)
+        persistent = target_leaf not in target_parent._non_persistent_buffers_set
+        target_parent.register_buffer(target_leaf, host.tensor, persistent=persistent)
+    return host
+
+
+def _capture_install_buffer_groups(
+    module: nn.Module,
+    groups: Sequence[tuple[str, ...]],
 ) -> dict[str, HostBuffer]:
     host_by_name: dict[str, HostBuffer] = {}
-    for names in group_names(
-        buffers.keys(),
-        lambda name: buffer_tensor_id(buffers[name]),
-    ):
-        host = HostBuffer.capture(
-            buffers[names[0]],
-        )
+    for names in groups:
+        host = _capture_one_buffer_group(module, names)
         for name in names:
             host_by_name[name] = host
     return host_by_name
@@ -419,6 +457,24 @@ def _items_for_names[NamedT](
     return {name: value for name, value in items.items() if name in included}
 
 
+def _record_target_slot[HostT](
+    owners: dict[tuple[int, str], tuple[str, HostT]],
+    module: nn.Module,
+    name: str,
+    host: HostT,
+    kind: str,
+) -> None:
+    parent, leaf = resolve_parent_leaf(module, name)
+    slot = (id(parent), leaf)
+    existing = owners.get(slot)
+    if existing is not None and existing[1] is not host:
+        raise ValueError(
+            f"{kind}s {existing[0]!r} and {name!r} share the same target "
+            f"module slot but map to distinct store {kind.lower()}s."
+        )
+    owners[slot] = (name, host)
+
+
 def _validate_module_matches(
     host_params: Mapping[str, HostParam],
     host_buffers: Mapping[str, HostBuffer],
@@ -431,19 +487,22 @@ def _validate_module_matches(
     every managed tensor with the host backing storage, so placeholder fields
     overwritten on bind (such as plain tensor dtype or a plain strided
     ``meta`` shape matching a frozen quantized store) do not reject a fresh
-    skeleton.
+    skeleton. Also rejects distinct store items mapping to the same target
+    module attribute slot before mutating ``module``.
     """
     params = _named_parameters(module)
     buffers = _named_buffers(module)
 
     _validate_names_present(host_params, host_buffers, params, buffers)
 
+    param_slots: dict[tuple[int, str], tuple[str, HostParam]] = {}
     for name, host in host_params.items():
         param = params[name]
         if param.requires_grad:
             raise ValueError(
                 f"Param {name!r} must be frozen (requires_grad=False)."
             )
+        _record_target_slot(param_slots, module, name, host, "Param")
         if host.accepts_bind_target(param):
             continue
         representation = param_representation(param)
@@ -477,6 +536,7 @@ def _validate_module_matches(
             f"device={representation.device}, layout={representation.layout}."
         )
 
+    buffer_slots: dict[tuple[int, str], tuple[str, HostBuffer]] = {}
     for name, host in host_buffers.items():
         layout = HostBuffer.bind_layout_for(buffers[name])
         if layout != HostBuffer.bind_layout_for(host.tensor):
@@ -484,6 +544,7 @@ def _validate_module_matches(
                 f"Buffer {name!r} layout mismatch: store has "
                 f"{HostBuffer.bind_layout_for(host.tensor)!r}, module has {layout!r}."
             )
+        _record_target_slot(buffer_slots, module, name, host, "Buffer")
 
 
 def _validate_target_names_known(

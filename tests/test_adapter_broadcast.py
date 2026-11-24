@@ -12,6 +12,7 @@ from piper_offload import (
     BlockCompileConfig,
     MappedCheckpoint,
     ModelOffloader,
+    OffloadConfig,
     ParameterDelta,
     ParameterDeltaTransform,
     ParameterValue,
@@ -370,8 +371,12 @@ def test_broadcast_activation_restores_mapped_model_and_sources(tmp_path, block_
     _assert_mapped_delta_sources(first, {name: mapped[name] for name in sources})
     _assert_mapped_delta_sources(second, {name: mapped[name] for name in sources})
     offloader = ModelOffloader.from_module(
-        model, block_paths=("blocks",), block_mode=block_mode,
-        block_compile=BlockCompileConfig(dynamic=False, fullgraph=True) if block_mode == "rolling" else None,
+        model,
+        OffloadConfig(
+            block_paths=("blocks",),
+            block_mode=block_mode,
+            block_compile=BlockCompileConfig(dynamic=False, fullgraph=True) if block_mode == "rolling" else None,
+        ),
     )
     x = torch.tensor([[0.5, -0.75, 0.125], [1.0, 0.25, -0.5]])
     for strengths in [(0.5, -0.25), (-0.75, 0.125), None]:

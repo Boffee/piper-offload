@@ -14,6 +14,7 @@ from torch import nn
 from piper_offload import (
     Adapter,
     ModelOffloader,
+    OffloadConfig,
     ParameterValue,
     merge_adapter,
 )
@@ -233,7 +234,7 @@ class TestInt4TilePackedAdapter:
             block.weight = nn.Parameter(_make_int4_tile(), requires_grad=False)
         offloader = ModelOffloader.from_module(
             model,
-            block_paths=["blocks"],
+            OffloadConfig(block_paths=("blocks",)),
         )
         lora = Adapter.from_state_dict(
             state_dict={

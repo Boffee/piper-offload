@@ -16,6 +16,7 @@ from piper_offload import (
     ModelCache,
     ModelOffloader,
     ModelSpec,
+    OffloadConfig,
     ParameterDelta,
     file_slice,
     merge_adapter,
@@ -387,9 +388,11 @@ def test_composed_values_reload_across_block_uses(mode):
         model = _BlockModel(blocks=[Block(4, 4, bias=False) for _ in range(2)])
     offloader = ModelOffloader.from_module(
         model,
-        block_paths=("blocks",),
-        block_mode=mode,
-        block_compile=BlockCompileConfig(fullgraph=True, dynamic=False) if mode == "rolling" else None,
+        OffloadConfig(
+            block_paths=("blocks",),
+            block_mode=mode,
+            block_compile=BlockCompileConfig(fullgraph=True, dynamic=False) if mode == "rolling" else None,
+        ),
     )
     values = {f"blocks.{i}.weight": torch.eye(4) * (i + 1) for i in range(2)}
     value = Adapter.from_state_dict(values, scale_parameter_values=True)

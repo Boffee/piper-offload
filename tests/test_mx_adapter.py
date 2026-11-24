@@ -9,6 +9,7 @@ from piper_offload import (
     Adapter,
     LoRATransform,
     ModelOffloader,
+    OffloadConfig,
     ScaledLoRAFactor,
     merge_adapter,
 )
@@ -841,7 +842,7 @@ class TestMxAdapter:
             )
         offloader = ModelOffloader.from_module(
             model,
-            block_paths=["blocks"],
+            OffloadConfig(block_paths=("blocks",)),
         )
         lora = Adapter.from_state_dict(
             state_dict={
@@ -921,7 +922,7 @@ class TestMxAdapter:
 
         offloader = ModelOffloader.from_module(
             model,
-            block_paths=["blocks"],
+            OffloadConfig(block_paths=("blocks",)),
         )
         try:
             x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")

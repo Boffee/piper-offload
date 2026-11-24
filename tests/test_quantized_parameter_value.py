@@ -8,6 +8,7 @@ from piper_offload import (
     Adapter,
     BlockCompileConfig,
     ModelOffloader,
+    OffloadConfig,
     ParameterValue,
     merge_adapter,
     register_adapter,
@@ -200,9 +201,11 @@ def test_only_auto_falls_back_for_incompatible_value_adapter(block_mode) -> None
         model = _BlockModel(width=dim)
     offloader = ModelOffloader.from_module(
         model,
-        block_paths=("blocks",),
-        block_mode=block_mode,
-        block_compile=BlockCompileConfig(fullgraph=True),
+        OffloadConfig(
+            block_paths=("blocks",),
+            block_mode=block_mode,
+            block_compile=BlockCompileConfig(fullgraph=True),
+        ),
     )
     component = block_components(offloader)[0]
     assert component.block_mode == "rolling"

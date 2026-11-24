@@ -11,15 +11,14 @@ import torch.distributed as dist
 from torch import nn
 
 from piper_offload import (
-    BlockComponentStore,
     GgufParameter,
-    HostComponentStore,
     ModelOffloader,
+    ModelStore,
+    OffloadConfig,
     TrellisParameter,
     register_adapter,
 )
 from piper_offload._dtensor import DTENSOR_AVAILABLE
-from piper_offload.composite_component import CompositeComponentStore
 from piper_offload.dtensor_adapter import DTensorAdapter
 from piper_offload.host_buffer import HostBuffer
 from piper_offload.host_module import (
@@ -1013,7 +1012,7 @@ class TestQuantizedMetaPlaceholderBind:
             proto.left.weight = shared_weight
             proto.right.weight = shared_weight
             module_store = HostModuleStore.from_module(proto)
-            comp_store = HostComponentStore.from_module(proto)
+            model_store = ModelStore.from_module(proto)
 
             def make_untied_skeleton() -> nn.Module:
                 sk = nn.Module()
@@ -1040,7 +1039,7 @@ class TestQuantizedMetaPlaceholderBind:
             assert cast(_PackedWrapper, sk1.left.weight.data)._packed.data_ptr() == first_ptr
 
             sk2 = make_untied_skeleton()
-            comp_store.bind(sk2)
+            model_store.bind(sk2)
             assert sk2.left.weight is sk2.right.weight
             assert type(sk2.left.weight.data) is _PackedMetaBindTensor
             assert torch.equal(cast(_PackedWrapper, sk2.left.weight.data)._packed, packed)
@@ -1488,13 +1487,13 @@ class TestQuantizedMetaPlaceholderBind:
 
         return proto, weights, make_meta_skeleton
 
-    def test_binds_convrot_host_block_and_composite_stores_onto_meta_skeleton(self) -> None:
+    def test_binds_convrot_model_store_onto_meta_skeleton(self) -> None:
         convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
         convrot_cls = convrot_mod.ConvRotInt8Tensor
         proto, weights, make_meta_skeleton = self._build_convrot_and_meta_nets(convrot_cls)
         (_, head_q, head_s), (_, b0_q, b0_s), (_, b1_q, b1_s) = weights
 
-        head_store = HostComponentStore.from_module(proto.head)
+        head_store = ModelStore.from_module(proto.head)
         sk_head = nn.Linear(64, 64, bias=False, dtype=torch.float32, device="meta")
         sk_head.weight.requires_grad_(False)
         head_store.bind(sk_head)
@@ -1502,18 +1501,17 @@ class TestQuantizedMetaPlaceholderBind:
         assert torch.equal(sk_head.weight.data.qdata, head_q)
         assert torch.equal(sk_head.weight.data.scale, head_s)
 
-        block_store = BlockComponentStore.from_module(proto, blocks_path="blocks")
+        model_store = ModelStore.from_module(proto)
         sk1 = make_meta_skeleton()
-        block_store.bind(sk1)
+        model_store.bind(sk1, OffloadConfig(block_paths=("blocks",)))
         for idx, (exp_q, exp_s) in enumerate(((b0_q, b0_s), (b1_q, b1_s))):
             w = sk1.blocks[idx].weight.data
             assert isinstance(w, convrot_cls)
             assert torch.equal(w.qdata, exp_q)
             assert torch.equal(w.scale, exp_s)
 
-        composite_store = CompositeComponentStore.from_module(proto, block_paths=("blocks",))
         sk2 = make_meta_skeleton()
-        composite_store.bind(sk2, block_mode="streaming")
+        model_store.bind(sk2, OffloadConfig(block_paths=("blocks",), block_mode="streaming"))
         assert isinstance(sk2.head.weight.data, convrot_cls)
         assert torch.equal(sk2.head.weight.data.qdata, head_q)
         for idx, (exp_q, exp_s) in enumerate(((b0_q, b0_s), (b1_q, b1_s))):
@@ -1522,21 +1520,26 @@ class TestQuantizedMetaPlaceholderBind:
             assert torch.equal(w.qdata, exp_q)
             assert torch.equal(w.scale, exp_s)
 
-    def test_convrot_meta_bound_composite_offloader_forward_parity(self) -> None:
+    def test_convrot_meta_bound_offloader_forward_parity(self) -> None:
         if not torch.cuda.is_available():
             pytest.skip("CUDA/HIP device required")
         convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
         proto, _, make_meta_skeleton = self._build_convrot_and_meta_nets(convrot_mod.ConvRotInt8Tensor)
 
-        composite_store = CompositeComponentStore.from_module(proto, block_paths=("blocks",))
+        model_store = ModelStore.from_module(proto)
         skeleton = make_meta_skeleton()
-        composite = composite_store.bind(skeleton, block_mode="streaming")
+        offloader = model_store.bind(
+            skeleton,
+            OffloadConfig(block_paths=("blocks",), block_mode="streaming"),
+        )
 
         x = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
-        offloader = ModelOffloader(skeleton, composite=composite, cache_bytes=composite_store.cache_bytes)
         with activated_model(offloader, "cuda"):
             actual = skeleton.blocks[1](skeleton.blocks[0](skeleton.head(x)))
-        proto_off = ModelOffloader.from_module(proto, block_paths=("blocks",), block_mode="resident")
+        proto_off = ModelOffloader.from_module(
+            proto,
+            config=OffloadConfig(block_paths=("blocks",), block_mode="resident"),
+        )
         with activated_model(proto_off, "cuda"):
             expected = proto.blocks[1](proto.blocks[0](proto.head(x)))
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)

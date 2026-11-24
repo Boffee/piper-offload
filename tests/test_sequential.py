@@ -17,7 +17,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
 
-from piper_offload import BlockCompileConfig, ModelOffloader
+from piper_offload import BlockCompileConfig, ModelOffloader, OffloadConfig
 from piper_offload.host_module import HostModuleStore
 from piper_offload.host_param import HostParam
 from piper_offload.sequential import SequentialExecutor
@@ -218,9 +218,11 @@ def test_model_forward(executor, compiled, streamed):
             config = BlockCompileConfig(fullgraph=True, options=options) if compiled else None
             offloader = ModelOffloader.from_module(
                 module,
-                block_paths=["blocks"],
-                block_mode="streaming",
-                block_compile=config,
+                OffloadConfig(
+                    block_paths=("blocks",),
+                    block_mode="streaming",
+                    block_compile=config,
+                ),
             )
             assert all(p.device_mesh.device_type == "cpu" for p in module.parameters())
         elif compiled:
