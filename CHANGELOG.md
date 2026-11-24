@@ -5,6 +5,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.10.0rc16] - 2026-11-24
+
 ### Added
 
 - Variable-row trellis weight support on `TrellisParameter(..., row_widths=...)` and
@@ -1097,7 +1099,8 @@ under 0.9.0rc1, 0.9.0rc2, and 0.9.0rc3 below.
 - Python 3.14, PyTorch 2.13, TorchAO 0.18, Apache-2.0 licensing, and the Piper Offload package
   identity.
 
-[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc15...HEAD
+[Unreleased]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc16...HEAD
+[0.10.0rc16]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc15...v0.10.0rc16
 [0.10.0rc15]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc14...v0.10.0rc15
 [0.10.0rc14]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc13...v0.10.0rc14
 [0.10.0rc13]: https://github.com/Boffee/piper-offload/compare/v0.10.0rc12...v0.10.0rc13
