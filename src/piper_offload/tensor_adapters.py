@@ -669,19 +669,34 @@ def empty_like_strided(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     )
 
 
+def _storage_identity(t: torch.Tensor) -> object:
+    ptr = t.data_ptr()
+    if ptr != 0:
+        return ptr
+    if t.layout is torch.strided:
+        return ("storage", t.untyped_storage()._cdata)
+    return ("tensor", id(t))
+
+
+def _physical_tensor_id(t: torch.Tensor) -> tuple[object, ...]:
+    return (
+        t.device,
+        _storage_identity(t),
+        t.dtype,
+        tuple(t.shape),
+        t.stride(),
+        t.storage_offset(),
+        t.is_conj(),
+        t.is_neg(),
+    )
+
+
 def optional_tensor_id(t: torch.Tensor | None) -> tuple[object, ...] | None:
     """Identity key fragment for one (possibly absent) inner storage
     tensor, for use in adapter :meth:`TensorAdapter.tensor_id` keys."""
     if t is None:
         return None
-    return (
-        t.device,
-        t.data_ptr(),
-        t.dtype,
-        tuple(t.shape),
-        t.stride(),
-        t.storage_offset(),
-    )
+    return _physical_tensor_id(t)
 
 
 def tensor_layout(t: torch.Tensor | None) -> tuple[object, ...] | None:
@@ -762,15 +777,7 @@ class RegularAdapter:
 
     @staticmethod
     def tensor_id(t: torch.Tensor) -> tuple:
-        return (
-            "regular",
-            t.device,
-            t.data_ptr(),
-            t.dtype,
-            tuple(t.shape),
-            t.stride(),
-            t.storage_offset(),
-        )
+        return ("regular", *_physical_tensor_id(t))
 
     @staticmethod
     def layout_signature(t: torch.Tensor) -> tuple:

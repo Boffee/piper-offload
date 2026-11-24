@@ -4,7 +4,8 @@ import functools
 import logging
 import math
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -305,28 +306,57 @@ class RollingBlockRuntime:
         self._reset_acquired_state()
 
 
-def _validate_instance(
-    instance: HostModuleInstance,
+@dataclass(frozen=True, slots=True)
+class RollingSlotSpec:
+    """Normalized per-slot metadata used to validate rolling compatibility."""
+
+    identity: Hashable
+    adapter_type: type
+    shape: torch.Size
+    target_layout: tuple[object, object]
+
+
+def _validate_rolling_block_slots(
+    params: Mapping[str, RollingSlotSpec],
     param_names: tuple[str, ...],
     reference_layouts: tuple[tuple[object, object], ...],
 ) -> None:
-    params = instance.params
-    if instance.buffers:
-        raise NotImplementedError("rolling compilation does not yet support block buffers")
     if tuple(params) != param_names:
         raise NotImplementedError("rolling compilation requires identical parameter names and ordering in every block")
-    if len({id(host) for host in params.values()}) != len(params):
+    if len({spec.identity for spec in params.values()}) != len(params):
         raise NotImplementedError("rolling compilation does not yet support tied parameters inside blocks")
-    layouts = tuple(host.target_layout for host in params.values())
+    layouts = tuple(spec.target_layout for spec in params.values())
     if layouts != reference_layouts:
         raise NotImplementedError("rolling compilation requires identical parameter layouts in every block")
-    if any(type(host.adapter) not in _ROLLING_ADAPTER_TYPES for host in params.values()):
+    if any(spec.adapter_type not in _ROLLING_ADAPTER_TYPES for spec in params.values()):
         raise NotImplementedError(
             "rolling compilation supports only regular dense, TorchAO-family, "
             "GGUF, trellis-coded, and Piper ConvRot INT8/NVFP4 parameters"
         )
-    if any(host.shape.numel() == 0 for host in params.values()):
+    if any(spec.shape.numel() == 0 for spec in params.values()):
         raise NotImplementedError("rolling compilation does not support zero-sized parameter slots")
+
+
+def validate_rolling_block_specs(
+    block_module_ids: Sequence[int],
+    block_params: Sequence[Mapping[str, RollingSlotSpec]],
+    *,
+    has_buffers: bool,
+) -> None:
+    """Validate rolling constraints prior to or during runtime construction."""
+    if not block_params:
+        raise ValueError("rolling compilation requires at least one block")
+    if len(set(block_module_ids)) != len(block_module_ids):
+        raise NotImplementedError("rolling compilation does not support aliased block modules")
+    if has_buffers:
+        raise NotImplementedError("rolling compilation does not yet support block buffers")
+
+    param_names = tuple(block_params[0])
+    if not param_names:
+        raise NotImplementedError("rolling compilation requires block parameters")
+    reference_layouts = tuple(spec.target_layout for spec in block_params[0].values())
+    for params in block_params:
+        _validate_rolling_block_slots(params, param_names, reference_layouts)
 
 
 def create_rolling_block_runtime(
@@ -335,22 +365,22 @@ def create_rolling_block_runtime(
     wraparound: bool = True,
 ) -> RollingBlockRuntime:
     """Validate and create a rolling block runtime."""
-    if not instances:
-        raise ValueError("rolling compilation requires at least one block")
-    if len({id(instance.module) for instance in instances}) != len(instances):
-        raise NotImplementedError("rolling compilation does not support aliased block modules")
-
-    reference_params = instances[0].params
-    param_names = tuple(reference_params)
-    if not param_names:
-        raise NotImplementedError("rolling compilation requires block parameters")
-    reference_layouts = tuple(host.target_layout for host in reference_params.values())
-    for instance in instances:
-        _validate_instance(
-            instance,
-            param_names,
-            reference_layouts,
-        )
+    validate_rolling_block_specs(
+        [id(instance.module) for instance in instances],
+        [
+            {
+                name: RollingSlotSpec(
+                    identity=id(host),
+                    adapter_type=type(host.adapter),
+                    shape=host.shape,
+                    target_layout=host.target_layout,
+                )
+                for name, host in instance.params.items()
+            }
+            for instance in instances
+        ],
+        has_buffers=any(instance.buffers for instance in instances),
+    )
 
     return RollingBlockRuntime(
         tuple(instances),
@@ -358,4 +388,9 @@ def create_rolling_block_runtime(
     )
 
 
-__all__ = ["RollingBlockRuntime", "create_rolling_block_runtime"]
+__all__ = [
+    "RollingBlockRuntime",
+    "RollingSlotSpec",
+    "create_rolling_block_runtime",
+    "validate_rolling_block_specs",
+]

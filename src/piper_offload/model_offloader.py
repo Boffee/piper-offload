@@ -16,14 +16,13 @@ from torch import nn
 from ._devices import canonical_device
 from ._parameter_update import plan_merge_targets
 from .adapter import Adapter, AdapterMode, AdapterTargetUpdates, group_adapter_updates, resolve_adapter_strengths
-from .block_compile import BlockCompileConfig
 from .block_component import BlockComponent
-from .block_mode import BlockMode
-from .composite_component import CompositeComponent, _capture_model
+from .composite_component import CompositeComponent, _capture_and_bind, _ShellClaim, claim_shell
 from .host_component import HostComponent
 from .host_module import ParameterOverride
 from .lora import ScaledLoRAFactor, install_routed_residual_hook
 from .module_names import resolve_parent_leaf
+from .offload_config import OffloadConfig, resolve_offload_config
 from .pin_manager import PinLease, host_pin_manager
 
 type _ParameterUpdateMap = dict[str, AdapterTargetUpdates]
@@ -81,31 +80,25 @@ class ModelOffloader:
     """Move a whole model or managed block groups between host RAM and
     CUDA, with optional adapter application.
 
-    Construct with :meth:`from_module`. One offloader owns one model and may
-    be reused sequentially, but it cannot create model replicas or serve
-    overlapping activations. Concurrent use fails immediately with
-    :class:`ModelRuntimeInUseError`.
+    Construct directly from a module with :meth:`from_module` or bind a reusable
+    flat :class:`~piper_offload.model_store.ModelStore` with
+    :meth:`~piper_offload.model_store.ModelStore.bind`. One offloader owns one
+    bound model and may be reused sequentially, but it cannot create model
+    replicas or serve overlapping activations. Concurrent use fails immediately
+    with :class:`ModelRuntimeInUseError`.
 
-    ``block_mode`` selects resident, whole-block streaming, compiled rolling,
-    or automatic rolling-with-streaming-fallback execution for groups named by
-    ``block_paths`` and ``transient_block_paths``. Other state remains resident
-    unless its module is selected by ``transient_paths``. Supplying
-    ``block_compile`` opts declared block forwards into Inductor during CPU or CUDA
-    inference. CPU activation uses ordinary Inductor on the existing host-backed
-    module state, without acquiring a CUDA runtime or moving weights.
-
-    Composes resident and transient :class:`HostComponent`\\ s with one or
-    more :class:`BlockComponent`\\ s internally. Adapter requests are supplied
-    directly to :meth:`activate`; merge mode builds activation-scoped
-    parameter overrides so each update runs immediately after its source is
-    copied to CUDA. No separate merge binding is needed.
+    :class:`~piper_offload.offload_config.OffloadConfig` selects block paths,
+    transient groups, CUDA execution mode, and optional Inductor compilation.
+    Adapter requests are supplied directly to :meth:`activate`; merge mode builds
+    activation-scoped parameter overrides so each update runs immediately after
+    its source is copied to CUDA. No separate merge binding is needed.
 
     Parameters
     ----------
     model:
         The concrete model bound to the supplied composite.
     composite:
-        Bound :class:`CompositeComponent` owning the model's host
+        Bound internal :class:`CompositeComponent` owning the model's host
         and block offload components.
     cache_bytes:
         Stable host-cache bytes owned by the bound components.
@@ -117,7 +110,9 @@ class ModelOffloader:
         *,
         composite: CompositeComponent,
         cache_bytes: int,
+        _shell_claim: _ShellClaim | None = None,
     ) -> None:
+        self._shell_claim = claim_shell(model) if _shell_claim is None else _shell_claim
         self._model = model
         self._active_device: torch.device | None = None
         self._composite = composite
@@ -131,48 +126,32 @@ class ModelOffloader:
     def from_module(
         cls,
         model: nn.Module,
-        *,
-        block_paths: Sequence[str] = (),
-        transient_block_paths: Sequence[str] = (),
-        block_mode: BlockMode = "streaming",
-        block_compile: BlockCompileConfig | None = None,
-        transient_paths: Sequence[str] = (),
+        config: OffloadConfig | None = None,
     ) -> Self:
-        """Capture ``model`` as one reusable cached runtime.
+        """Capture ``model`` and bind it under ``config`` as one cached runtime.
 
-        Capture installs each component's host backing on its source module.
-        The runtime retains those bindings across activations.
-        ``block_compile`` applies one forward-only compile policy to every
-        block group and is unused when no block group is declared. By default,
-        ``block_mode`` selects how every declared block group becomes resident:
-        all at once, one whole block ahead, parameter-by-parameter through a
-        compiled rolling graph, or rolling with per-group streaming fallback.
-        Groups named by ``block_paths`` retain their
-        CUDA working sets for the activation. Groups named by
-        ``transient_block_paths`` release after their final blocks and
-        reacquire after the root model forward; a root forward also reacquires
-        any that remain released when it starts, such as after a forward
-        raised. These groups must not be traversed again later in the same root
-        forward, and their block lists must contain distinct module objects
-        because a module hook cannot distinguish occurrences of an aliased
-        block.
-        Each module named by ``transient_paths`` similarly owns a separate
-        CUDA working set that releases after that module's forward.
+        Capture installs host backing on ``model``. The runtime retains those
+        bindings across activations. ``config`` configures ``block_paths``,
+        ``transient_block_paths``, ``transient_paths``, ``block_mode``, and
+        ``block_compile`` (defaulting to whole-model offload when omitted).
         Requires frozen parameters (``requires_grad=False``) and takes
         ownership of compatible pageable CPU backing for every managed
         parameter and buffer, including non-resizable checkpoint views, while
         preserving mappings and each adapter's physical representation. Other
         devices and incompatible views are normalized into CPU storage.
         """
-        captured = _capture_model(
-            model,
-            block_paths=block_paths,
-            transient_block_paths=transient_block_paths,
-            transient_paths=transient_paths,
-        )
-        cache_bytes = captured.cache_bytes
-        composite = captured.component(block_compile=block_compile, block_mode=block_mode)
-        return cls(model, composite=composite, cache_bytes=cache_bytes)
+        resolved = resolve_offload_config(config)
+        store, composite, claim = _capture_and_bind(model, resolved)
+        try:
+            return cls(
+                model,
+                composite=composite,
+                cache_bytes=store.cache_bytes,
+                _shell_claim=claim,
+            )
+        except BaseException:
+            claim.release()
+            raise
 
     # ------------------------------------------------------------------ API
 

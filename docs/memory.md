@@ -206,9 +206,9 @@ while the manager owns it.
 
 A storage left pageable stays pageable until all its active leases close, even
 if capacity becomes available. Dropping its tensor owners retires a registration,
-which is released after its remaining leases close. `BlockComponent.release()`
-also closes its lease during a temporary working-set release; `acquire()` obtains
-one again.
+which is released after its remaining leases close. Temporary working-set
+releases during a transient module or block forward also close their leases;
+the next reacquisition obtains a lease again.
 
 A runtime capacity failure evicts unrelated idle registrations and retries the
 current registration. If capacity remains unavailable, the rest of that

@@ -1,5 +1,7 @@
 """Shared fixtures for block-compilation tests."""
 
+from collections.abc import Sequence
+
 import torch
 from torch import nn
 
@@ -7,6 +9,7 @@ from piper_offload import (
     BlockCompileConfig,
     BlockMode,
     ModelOffloader,
+    OffloadConfig,
 )
 
 
@@ -42,19 +45,21 @@ class _BlockModel(nn.Module):
 def _make_offloader(
     model: nn.Module,
     *,
-    block_paths: list[str] | None = None,
+    block_paths: Sequence[str] | None = None,
     transient_block_paths: tuple[str, ...] = (),
     block_compile: BlockCompileConfig | None = None,
     block_mode: BlockMode = "streaming",
 ) -> ModelOffloader:
     if block_paths is None:
-        block_paths = [] if transient_block_paths else ["blocks"]
+        block_paths = () if transient_block_paths else ("blocks",)
     return ModelOffloader.from_module(
         model,
-        block_paths=block_paths,
-        transient_block_paths=transient_block_paths,
-        block_compile=block_compile,
-        block_mode=block_mode,
+        config=OffloadConfig(
+            block_paths=tuple(block_paths),
+            transient_block_paths=transient_block_paths,
+            block_compile=block_compile,
+            block_mode=block_mode,
+        ),
     )
 
 

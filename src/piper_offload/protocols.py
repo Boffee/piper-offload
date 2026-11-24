@@ -17,14 +17,12 @@ These Protocols form the contract:
 Top-level :class:`ResourceBinding` implementations in this package:
 :class:`~piper_offload.ModelOffloader` (whole-model bulk DMA or streamed
 block offload) and :class:`~piper_offload.MpsWeights` (whole-model
-CPU->MPS materialization without a second CPU cache). An
-:class:`~piper_offload.Adapter` is itself the cached adapter resource. Merge
-and routed consumers read its immutable host backing directly; routed
-device copies belong to activation-scoped model hooks.
-
-Composable lifecycle pieces inside a model runtime include
-:class:`~piper_offload.HostComponent` and
-:class:`~piper_offload.BlockComponent`.
+CPU->MPS materialization without a second CPU cache).
+:class:`~piper_offload.ModelStore` captures reusable frozen host backing
+that binds onto target shells as :class:`~piper_offload.ModelOffloader`
+instances. An :class:`~piper_offload.Adapter` is itself the cached adapter
+resource. Merge and routed consumers read its immutable host backing directly;
+routed device copies belong to activation-scoped model hooks.
 
 Lifecycle
 ---------

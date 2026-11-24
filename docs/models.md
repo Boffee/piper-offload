@@ -50,9 +50,9 @@ yields its model, then deactivates it and releases leases in reverse order.
 Use the yielded model inside that context. Retaining a Python reference after
 exit does not keep it active and can prevent its host storage from being freed.
 
-To configure block residency, pass `block_paths`, `block_mode`, and related
-options to `ModelSpec`; see [streaming](streaming.md). To attach cached updates,
-pass `adapter_specs` to `use()`; see [adapters](adapters.md).
+To configure block residency, pass `config=OffloadConfig(...)` to
+`ModelSpec`; see [streaming](streaming.md). To attach cached updates, pass
+`adapter_specs` to `use()`; see [adapters](adapters.md).
 
 ## Ownership and persistent state
 
@@ -136,8 +136,10 @@ del offloader, model
 Access the bound model while it is active. Successful activations require
 matching deactivation.
 
-If construction fails during capture, discard the partially captured model
-and build a fresh one. If activation fails, the offloader rolls back the
+Preflight validation failures (such as trainable parameters, incompatible group
+paths, or an already-owned shell) leave the model untouched. If construction
+fails after capture or installation begins, discard the partially modified
+model and build a fresh one. If activation fails, the offloader rolls back the
 partial activation. Correct the cause before retrying.
 
 If cleanup cannot finish releasing a CUDA session, `offloader.failed` is true.
@@ -150,6 +152,43 @@ For frozen CPU models destined to stay on Apple MPS, `MpsWeights` provides a
 separate constructor-time materializer. It retains no CPU cache, does not
 preserve tied aliases, and leaves the model on MPS when deactivated. See its
 [contract](../src/piper_offload/mps_weights.py).
+
+## Share backing across models
+
+Capture flat host backing once with `ModelStore.from_module(model)` and bind
+separate fresh shells or `OffloadConfig` instances via `store.bind(shell,
+config=...)`. Each `ModelOffloader` owns its bound shell exclusively; binding
+another offloader onto a shell with a live binding is rejected. Preflight
+validation rejections leave the target shell untouched, whereas a failure mid-way
+through installation requires discarding that shell and binding a fresh one. Extra
+unmanaged parameters on the target shell (including inside occupied blocks)
+are ignored and stay on the caller-selected device, while extra non-empty blocks
+inside configured block lists are rejected:
+
+```python
+import torch
+from torch import nn
+from piper_offload import ModelStore, OffloadConfig
+
+prototype = nn.Linear(8, 4).eval().requires_grad_(False)
+store = ModelStore.from_module(prototype)
+second_shell = nn.Linear(8, 4, device="meta").eval().requires_grad_(False)
+
+offloader = store.bind(second_shell, OffloadConfig())
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+offloader.activate(device)
+try:
+    with torch.inference_mode():
+        output = offloader.value(torch.randn(1, 8, device=device))
+finally:
+    offloader.deactivate()
+```
+
+Use `ModelStoreSpec` when caching one reusable `ModelStore` under a `ModelCache`
+or `ResourceCache` byte budget. Because an escaped `ModelOffloader` binding keeps
+host backing alive even if the store is later evicted, keep `with cache.lease(spec)
+as store:` open around the bound shells' use and cleanup when enforcing a cache
+budget.
 
 ## Other resources and finite budgets
 
@@ -185,6 +224,8 @@ For custom specs and eviction policies, see [Development](development.md#extendi
 
 Signatures and per-method contracts are in
 [`ModelCache`](../src/piper_offload/model_cache.py),
+[`ModelStore`](../src/piper_offload/model_store.py),
+[`OffloadConfig`](../src/piper_offload/offload_config.py),
 [`ModelSpec` and other specs](../src/piper_offload/resource_specs.py),
 [`ModelOffloader`](../src/piper_offload/model_offloader.py), and
 [`ResourceCache`](../src/piper_offload/resource_cache.py).

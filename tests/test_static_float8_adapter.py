@@ -9,6 +9,7 @@ from piper_offload import (
     Adapter,
     LoRATransform,
     ModelOffloader,
+    OffloadConfig,
     ScaledLoRAFactor,
     merge_adapter,
 )
@@ -662,7 +663,7 @@ class TestStaticFloat8Adapter:
         for mode in ("merge", "routed"):
             model = make_model()
             calibrated_scale = model.blocks[0].weight.data.act_quant_scale.clone()
-            offloader = ModelOffloader.from_module(model, block_paths=["blocks"])
+            offloader = ModelOffloader.from_module(model, OffloadConfig(block_paths=("blocks",)))
             try:
                 x = torch.randn(2, 8, 64, dtype=torch.bfloat16, device="cuda")
                 with activated_model(
@@ -719,7 +720,7 @@ class TestStaticFloat8Adapter:
         eager_model = M(weights)
         eager_offloader = ModelOffloader.from_module(
             eager_model,
-            block_paths=["blocks"],
+            OffloadConfig(block_paths=("blocks",)),
         )
         try:
             with activated_model(eager_offloader, "cuda"):
@@ -731,8 +732,10 @@ class TestStaticFloat8Adapter:
         compiled_model = M(weights)
         compiled_offloader = ModelOffloader.from_module(
             compiled_model,
-            block_paths=["blocks"],
-            block_compile=BlockCompileConfig(),
+            OffloadConfig(
+                block_paths=("blocks",),
+                block_compile=BlockCompileConfig(),
+            ),
         )
         try:
             with activated_model(compiled_offloader, "cuda"):

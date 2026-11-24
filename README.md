@@ -54,14 +54,17 @@ cache.clear()
 ```
 
 Each `use()` activates the model and deactivates it on exit. Place inputs on
-the compute device yourself. For a model larger than VRAM, select its block
-lists with `ModelSpec(..., block_paths=("transformer_blocks",))`; see
+the compute device yourself. For a model larger than VRAM, configure its block
+lists with `ModelSpec(..., config=OffloadConfig(block_paths=("transformer_blocks",)))`; see
 [streaming](https://github.com/Boffee/piper-offload/blob/main/docs/streaming.md) for the required model structure.
 
 ## Fit and limitations
 
-- Each cached model has one runtime and supports sequential use. Concurrent
-  replicas need separately constructed models under distinct keys.
+- Each `ModelSpec` binds one cached model runtime and supports sequential use;
+  concurrent replicas via `cache.use()` require separately constructed models
+  under distinct keys. To share captured host backing across multiple
+  independently bound shells under one cache key, see
+  [Share backing across models](https://github.com/Boffee/piper-offload/blob/main/docs/models.md#share-backing-across-models).
 - Models and adapters stay cached by default. Set a cache budget to evict
   inactive entries automatically. Pinning has a separate budget, and the OS
   controls how much of a mapped file stays in RAM.

@@ -20,8 +20,9 @@ class BlockCompileConfig:
     """Compilation options applied to every declared block group.
 
     Compilation is disabled unless an instance of this configuration is
-    supplied to :meth:`piper_offload.ModelOffloader.from_module` (directly or
-    through :class:`piper_offload.ModelSpec`). The initial API intentionally
+    supplied inside :class:`piper_offload.OffloadConfig` to
+    :meth:`piper_offload.ModelOffloader.from_module`,
+    :meth:`piper_offload.ModelStore.bind`, or :class:`piper_offload.ModelSpec`. The initial API intentionally
     fixes the backend to Inductor's default mode and exposes only the two
     graph-capture controls needed by supported inference workloads, plus an
     optional mapping for target-specific compiler extensions.

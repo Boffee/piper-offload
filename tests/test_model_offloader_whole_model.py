@@ -8,10 +8,11 @@ from torch import nn
 
 from piper_offload import (
     ModelOffloader,
-    HostComponentStore,
+    ModelStore,
     ResourceBinding,
 )
-from piper_offload.host_module import ParameterOverride
+from piper_offload.host_component import HostComponent
+from piper_offload.host_module import HostModuleStore, ParameterOverride
 
 from tests.conftest import CallbackParameterTransform, activated_model, host_component
 
@@ -52,33 +53,36 @@ class TestResourceBindingConformance:
 
     def test_component_is_not_top_level_binding(self) -> None:
         model = _make_simple_model()
-        component = HostComponentStore.from_module(model).bind(model)
+        offloader = ModelOffloader.from_module(model)
         try:
+            component = host_component(offloader)
+            assert component is not None
             assert not isinstance(component, ResourceBinding)
         finally:
-            component.deactivate()
+            offloader.deactivate()
 
     def test_offloader_constructor_requires_bound_composite(self) -> None:
         with pytest.raises(TypeError, match="composite"):
             cast(Any, ModelOffloader)(_make_simple_model())
 
-class TestHostComponentStoreBind:
+
+class TestHostComponentBind:
     def test_bind_allows_empty_noop_component(self) -> None:
         module = nn.Module()
         module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         module.register_buffer("running", torch.randn(2))
 
-        store = HostComponentStore.from_module(
+        store = HostModuleStore.from_module(
             module,
             include_param_names=set(),
             include_buffer_names=set(),
         )
 
         assert store.cache_bytes == 0
-        assert store.param_names == frozenset()
-        assert store.buffer_names == frozenset()
+        assert not store.params
+        assert not store.buffers
 
-        component = store.bind(module)
+        component = HostComponent(store.bind(module))
         try:
             assert component.param_names == frozenset()
             assert component.buffer_names == frozenset()
@@ -98,7 +102,7 @@ class TestHostComponentStoreBind:
                 self.used.append(stream)
 
         model = _make_simple_model()
-        component = HostComponentStore.from_module(model).bind(model)
+        component = HostComponent(HostModuleStore.from_module(model).bind(model))
         lease = Lease()
         forward_stream = object()
         component._lease = cast(Any, lease)
@@ -122,7 +126,7 @@ class TestHostComponentStoreBind:
         prototype = nn.Module()
         prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         prototype.register_buffer("running", torch.randn(2))
-        store = HostComponentStore.from_module(prototype)
+        store = ModelStore.from_module(prototype)
 
         first = store.bind(prototype)
         second_model = nn.Module()
@@ -131,12 +135,16 @@ class TestHostComponentStoreBind:
         second = store.bind(second_model)
 
         try:
+            first_resident = host_component(first)
+            second_resident = host_component(second)
+            assert first_resident is not None
+            assert second_resident is not None
             assert store.param_names == frozenset({"weight"})
-            assert first.param_names == store.param_names
-            assert second.param_names == store.param_names
+            assert first_resident.param_names == store.param_names
+            assert second_resident.param_names == store.param_names
             assert store.buffer_names == frozenset({"running"})
-            assert first.buffer_names == store.buffer_names
-            assert second.buffer_names == store.buffer_names
+            assert first_resident.buffer_names == store.buffer_names
+            assert second_resident.buffer_names == store.buffer_names
 
             assert prototype.weight.data_ptr() == second_model.weight.data_ptr()
             assert prototype.weight is not second_model.weight
@@ -151,7 +159,7 @@ class TestHostComponentStoreBind:
     def test_bind_propagates_module_mismatch_errors(self) -> None:
         prototype = nn.Module()
         prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
-        store = HostComponentStore.from_module(prototype)
+        store = ModelStore.from_module(prototype)
 
         target = nn.Module()
         target.weight = nn.Parameter(torch.randn(3, 2), requires_grad=False)
@@ -161,7 +169,7 @@ class TestHostComponentStoreBind:
 
     def test_cpu_acquire_and_release_are_noops(self) -> None:
         model = _make_simple_model()
-        component = HostComponentStore.from_module(model).bind(model)
+        component = HostComponent(HostModuleStore.from_module(model).bind(model))
         try:
             component.activate(torch.device("cpu"))
             component.release()
@@ -175,7 +183,7 @@ class TestHostComponentStoreBind:
 
     def test_acquire_requires_active_session(self) -> None:
         model = _make_simple_model()
-        component = HostComponentStore.from_module(model).bind(model)
+        component = HostComponent(HostModuleStore.from_module(model).bind(model))
         try:
             component.release()
             with pytest.raises(RuntimeError, match="active session"):
@@ -193,7 +201,7 @@ class TestHostComponentStoreBind:
         with torch.inference_mode():
             expected = eager(value)
 
-        component = HostComponentStore.from_module(model).bind(model)
+        component = HostComponent(HostModuleStore.from_module(model).bind(model))
         copied: list[torch.device] = []
         try:
             component.activate(

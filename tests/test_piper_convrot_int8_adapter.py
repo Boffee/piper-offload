@@ -14,6 +14,8 @@ from piper_offload import (
     BlockCompileConfig,
     LoRATransform,
     ModelOffloader,
+    ModelStore,
+    OffloadConfig,
     ParameterValue,
     ScaledLoRAFactor,
     derive_seed,
@@ -180,6 +182,8 @@ class TestPiperConvRotInt8Adapter:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        from piper_offload import host_module
+
         class Block(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -188,25 +192,38 @@ class TestPiperConvRotInt8Adapter:
                     requires_grad=False,
                 )
 
-        blocks = [Block(), Block()]
-        first_source_ref = weakref.ref(blocks[0].weight)
-        original_capture = HostModuleStore.capture
+        real_host_param = HostParam
         calls = 0
+        watched_ref: weakref.ref[nn.Parameter] | None = None
 
-        def tracked_capture(module, **kwargs):
+        def wrapped_host_param(param: nn.Parameter) -> HostParam:
             nonlocal calls
             if calls == 1:
-                # Preflight and the first bound instance keep only captured state.
-                assert first_source_ref() is None
+                assert watched_ref is not None
+                assert watched_ref() is None
             calls += 1
-            return original_capture(module, **kwargs)
+            return real_host_param(param)
 
-        monkeypatch.setattr(HostModuleStore, "capture", staticmethod(tracked_capture))
+        monkeypatch.setattr(host_module, "HostParam", wrapped_host_param)
+
         model = nn.Module()
-        model.blocks = nn.ModuleList(blocks)
-        ModelOffloader.from_module(model, block_paths=("blocks",))
+        model.blocks = nn.ModuleList([Block(), Block()])
+        first_source_ref = weakref.ref(model.blocks[0].weight)
+        watched_ref = first_source_ref
+        offloader = ModelOffloader.from_module(model, OffloadConfig(block_paths=("blocks",)))
         assert calls == 2
         assert first_source_ref() is None
+        offloader.deactivate()
+
+        calls = 0
+        store_model = nn.Module()
+        store_model.blocks = nn.ModuleList([Block(), Block()])
+        store_source_ref = weakref.ref(store_model.blocks[0].weight)
+        watched_ref = store_source_ref
+        store = ModelStore.from_module(store_model)
+        assert calls == 2
+        assert store_source_ref() is None
+        assert store.cache_bytes > 0
 
     def test_tensor_id_tracks_storage_group_size_and_logical_dtype(self) -> None:
         qdata = torch.randint(-127, 128, (8, 64), dtype=torch.int8)
@@ -764,9 +781,11 @@ class TestPiperConvRotInt8Adapter:
         model = M()
         offloader = ModelOffloader.from_module(
             model,
-            block_paths=("blocks",),
-            block_mode="rolling",
-            block_compile=BlockCompileConfig(dynamic=False, fullgraph=True),
+            OffloadConfig(
+                block_paths=("blocks",),
+                block_mode="rolling",
+                block_compile=BlockCompileConfig(dynamic=False, fullgraph=True),
+            ),
         )
         inputs = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
         expected = torch.nn.functional.linear(inputs, source.clone().cuda())
@@ -826,9 +845,11 @@ class TestPiperConvRotInt8Adapter:
         )
         offloader = ModelOffloader.from_module(
             model,
-            block_paths=("blocks",),
-            block_mode=block_mode,  # type: ignore[arg-type]
-            block_compile=compile_config,
+            OffloadConfig(
+                block_paths=("blocks",),
+                block_mode=block_mode,  # type: ignore[arg-type]
+                block_compile=compile_config,
+            ),
         )
         inputs = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
         expected = inputs
@@ -911,7 +932,7 @@ class TestPiperConvRotInt8Adapter:
 
         offloader = ModelOffloader.from_module(
             model,
-            block_paths=["blocks"],
+            OffloadConfig(block_paths=("blocks",)),
         )
         try:
             inputs = torch.randn(
@@ -968,7 +989,7 @@ class TestPiperConvRotInt8Adapter:
                 "blocks.0.lora_B.weight": torch.randn(64, 4),
             }
         )
-        offloader = ModelOffloader.from_module(model, block_paths=["blocks"])
+        offloader = ModelOffloader.from_module(model, OffloadConfig(block_paths=("blocks",)))
 
         samples: list[torch.Tensor] = []
         for _ in range(2):

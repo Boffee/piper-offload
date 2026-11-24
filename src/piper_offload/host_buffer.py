@@ -41,13 +41,13 @@ class HostBuffer:
     def bind_layout_for(buffer: torch.Tensor) -> tuple[object, ...]:
         """Opaque bind-compatibility layout for ``buffer``.
 
-        dtype excluded: binding replaces the module's buffer with the
-        host tensor, so a placeholder's dtype carries no information
-        past validation (mirrors :meth:`HostParam.accepts_bind_target`).
+        ``dtype`` and ``stride`` are excluded: binding replaces the module's
+        buffer with the normalized contiguous host tensor, so placeholder
+        dtype and layout strides carry no constraint past shape and layout
+        (mirrors :meth:`HostParam.accepts_bind_target`).
         """
         return (
             tuple(buffer.shape),
-            tuple(buffer.stride()),
             buffer.layout,
         )
 

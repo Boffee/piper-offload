@@ -20,6 +20,7 @@ from piper_offload import (
     BlockCompileConfig,
     BlockMode,
     ModelOffloader,
+    OffloadConfig,
 )
 
 MIB = 1024**2
@@ -108,9 +109,11 @@ def _run(
     model = _Model(blocks=args.blocks, width=args.width, dtype=dtype)
     offloader = ModelOffloader.from_module(
         model,
-        block_paths=("blocks",),
-        block_mode=block_mode,
-        block_compile=BlockCompileConfig(fullgraph=True),
+        OffloadConfig(
+            block_paths=("blocks",),
+            block_mode=block_mode,
+            block_compile=BlockCompileConfig(fullgraph=True),
+        ),
     )
     milliseconds: list[float] = []
     output: torch.Tensor | None = None

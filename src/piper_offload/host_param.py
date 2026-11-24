@@ -1,9 +1,9 @@
 """Per-parameter CPU storage primitive.
 
 Internal to the ``piper_offload`` subpackage. Shared by
-:class:`ModelOffloader` (whole-model bulk capture) and :class:`BlockComponent`
-(per-block streaming). Both consumers reach this through the same
-abstraction so the addition of new tensor types only requires writing
+:class:`ModelStore`, :class:`ModelOffloader` (whole-model bulk capture), and
+:class:`BlockComponent` (per-block streaming). Both consumers reach this through
+the same abstraction so the addition of new tensor types only requires writing
 a new :class:`TensorAdapter`, not editing the consumers.
 
 :class:`HostParam` pairs one frozen
@@ -206,6 +206,24 @@ class HostParam:
         return (type(adapter), signature)
 
     @classmethod
+    def rolling_slot_metadata_for(
+        cls,
+        param: nn.Parameter,
+    ) -> tuple[type, torch.Size, tuple[object, object]]:
+        """Adapter type, representation shape, and target layout before capture.
+
+        Keeps :class:`HostParam` as the single owner of adapter dispatch and
+        representation shape for pre-capture rolling validation.
+        """
+        representation = param_representation(param)
+        adapter = select_adapter(representation)
+        return (
+            type(adapter),
+            torch.Size(representation.shape),
+            cls._target_layout_from_adapter(adapter, representation),
+        )
+
+    @classmethod
     def target_layout_for(cls, param: nn.Parameter) -> tuple[object, object]:
         """Opaque target-compatibility layout for ``param``.
 
@@ -213,9 +231,7 @@ class HostParam:
         :class:`HostParam` mutates the source parameter. Callers should
         compare the returned value for equality only.
         """
-        representation = param_representation(param)
-        adapter = select_adapter(representation)
-        return cls._target_layout_from_adapter(adapter, representation)
+        return cls.rolling_slot_metadata_for(param)[2]
 
     def accepts_bind_target(self, param: nn.Parameter) -> bool:
         """Return whether ``param`` is a compatible bind target for this host store.

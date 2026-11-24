@@ -2,8 +2,10 @@
 
 - :class:`ModelCache` uses :class:`ModelSpec` and :class:`AdapterSpec` to cache
   resources and coordinate model activation.
-- :class:`ModelOffloader` provides direct control over one model's lifecycle,
-  including whole-model uploads and block streaming.
+- :class:`ModelStore` and :class:`ModelStoreSpec` hold reusable flat host
+  backing that binds to compatible models with :class:`OffloadConfig`.
+- :class:`ModelOffloader` provides direct control over one bound model's
+  lifecycle, including whole-model uploads and block streaming.
 - :class:`ResourceCache` and :class:`ObjectSpec` support other cached resources.
 - :class:`Adapter` holds reusable model updates; :func:`merge_adapter` applies
   them permanently.
@@ -23,16 +25,16 @@ maps implementation ownership and extension points.
 from ._host_registration import HostRegistrationError
 from .adapter import Adapter, AdapterMode, AdapterTarget
 from .block_compile import BlockCompileConfig
-from .block_component import BlockComponent, BlockComponentStore
 from .block_mode import BlockMode
 from .checkpoint import CheckpointError, FileSlice, MappedCheckpoint, file_slice
 from .gguf_parameter import GgufParameter
-from .host_component import HostComponent, HostComponentStore
 from .lora import LoRAFactor, LoRATransform, ScaledLoRAFactor
 from .merge import merge_adapter
 from .model_cache import ModelCache
 from .model_offloader import ModelOffloader, ModelRuntimeFailedError, ModelRuntimeInUseError
+from .model_store import ModelStore
 from .mps_weights import MpsWeights
+from .offload_config import OffloadConfig
 from .parameter_delta import ParameterDelta, ParameterDeltaTransform, ScaledParameterDelta
 from .parameter_transform import ParameterTransform
 from .parameter_value import (
@@ -61,7 +63,7 @@ from .resource_cache import (
     ResourceNotRegisteredError,
     ResourceTooLargeError,
 )
-from .resource_specs import AdapterSpec, ModelSpec, ObjectSpec
+from .resource_specs import AdapterSpec, ModelSpec, ModelStoreSpec, ObjectSpec
 from .seeding import derive_seed
 from .tensor_adapter_registry import register_adapter, requires_activation
 from .tensor_adapters import (
@@ -76,8 +78,6 @@ __all__ = [
     "AdapterSpec",
     "AdapterTarget",
     "BlockCompileConfig",
-    "BlockComponent",
-    "BlockComponentStore",
     "BlockMode",
     "CacheError",
     "CheckpointError",
@@ -88,8 +88,6 @@ __all__ = [
     "EvictionPolicyError",
     "FileSlice",
     "GgufParameter",
-    "HostComponent",
-    "HostComponentStore",
     "HostRegistrationError",
     "LRUEvictionPolicy",
     "LoRAFactor",
@@ -100,8 +98,11 @@ __all__ = [
     "ModelRuntimeFailedError",
     "ModelRuntimeInUseError",
     "ModelSpec",
+    "ModelStore",
+    "ModelStoreSpec",
     "MpsWeights",
     "ObjectSpec",
+    "OffloadConfig",
     "ParameterDelta",
     "ParameterDeltaTransform",
     "ParameterTransform",

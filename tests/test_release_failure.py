@@ -27,6 +27,7 @@ from piper_offload import (
     BlockMode,
     ModelOffloader,
     ModelRuntimeFailedError,
+    OffloadConfig,
 )
 from piper_offload.host_module import HostModuleInstance, HostModuleLoadPlan
 from tests.conftest import Interrupt, activated_model
@@ -74,14 +75,16 @@ class _Config:
             return ModelOffloader.from_module(model)
         return ModelOffloader.from_module(
             model,
-            block_paths=() if self.transient else ("blocks",),
-            transient_block_paths=("blocks",) if self.transient else (),
-            transient_paths=("embed",) if self.transient else (),
-            block_mode=self.block_mode,
-            block_compile=(
-                BlockCompileConfig(dynamic=False, fullgraph=True)
-                if self.block_mode == "rolling"
-                else None
+            OffloadConfig(
+                block_paths=() if self.transient else ("blocks",),
+                transient_block_paths=("blocks",) if self.transient else (),
+                transient_paths=("embed",) if self.transient else (),
+                block_mode=self.block_mode,
+                block_compile=(
+                    BlockCompileConfig(dynamic=False, fullgraph=True)
+                    if self.block_mode == "rolling"
+                    else None
+                ),
             ),
         )
 

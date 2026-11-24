@@ -1,0 +1,1728 @@
+"""Tests for ``ModelStore``, ``ModelStoreSpec``, and ``OffloadConfig``."""
+
+from __future__ import annotations
+
+import copy
+import gc
+from pathlib import Path
+import threading
+import tracemalloc
+from typing import Any, cast
+import weakref
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch import nn
+
+from piper_offload import (
+    Adapter,
+    BlockCompileConfig,
+    ModelCache,
+    ModelOffloader,
+    ModelSpec,
+    ModelStore,
+    ModelStoreSpec,
+    OffloadConfig,
+    ResourceCache,
+    ResourceStore,
+    register_adapter,
+)
+from piper_offload._dtensor import DTENSOR_AVAILABLE
+from piper_offload.adapter import group_adapter_updates
+from piper_offload.host_module import HostModuleInstance, ParameterOverride
+from piper_offload.tensor_adapters import RegularAdapter
+from tests.conftest import activated_model, block_components, host_component, transient_components
+
+CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+class _TwoStageBlockModel(nn.Module):
+    def __init__(self, *, num_blocks: int = 2, width: int = 8, meta: bool = False) -> None:
+        super().__init__()
+        device = torch.device("meta") if meta else torch.device("cpu")
+        self.embed = nn.Linear(width, width, bias=False, device=device)
+        self.blocks = nn.ModuleList(
+            [nn.Linear(width, width, bias=False, device=device) for _ in range(num_blocks)]
+        )
+        self.head = nn.Linear(width, width, bias=False, device=device)
+        self.register_buffer("scale", torch.empty(width, device=device) if meta else torch.ones(width))
+        self.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.embed(x)
+        for block in self.blocks:
+            x = torch.relu(block(x))
+        return self.head(x) * self.scale
+
+
+def _snapshot_tensors(module: nn.Module) -> list[tuple[str, nn.Parameter | torch.Tensor, int]]:
+    snap: list[tuple[str, nn.Parameter | torch.Tensor, int]] = []
+    for name, param in module.named_parameters(remove_duplicate=False):
+        snap.append((f"param:{name}", param, param.untyped_storage().data_ptr()))
+    for name, buf in module.named_buffers(remove_duplicate=False):
+        snap.append((f"buffer:{name}", buf, buf.untyped_storage().data_ptr()))
+    return snap
+
+
+def _assert_unmutated(
+    module: nn.Module,
+    before: list[tuple[str, nn.Parameter | torch.Tensor, int]],
+) -> None:
+    after = _snapshot_tensors(module)
+    assert len(after) == len(before)
+    for (name_a, obj_a, ptr_a), (name_b, obj_b, ptr_b) in zip(before, after, strict=True):
+        assert name_a == name_b
+        assert obj_a is obj_b
+        assert ptr_a == ptr_b
+
+
+def _make_heterogeneous_model() -> nn.Module:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks = nn.ModuleList(
+                [
+                    nn.Linear(4, 4, bias=False),
+                    nn.Linear(4, 8, bias=False),
+                ]
+            )
+            self.requires_grad_(False)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            for block in self.blocks:
+                x = block(x)
+            return x
+
+    return Model()
+
+
+class TestOffloadConfigValidation:
+    @pytest.mark.parametrize(
+        "field_name",
+        ["block_paths", "transient_block_paths", "transient_paths"],
+    )
+    def test_rejects_non_tuple_and_non_str_paths(self, field_name: str) -> None:
+        with pytest.raises(TypeError, match=f"{field_name} must be a tuple"):
+            OffloadConfig(**{field_name: "blocks"})  # type: ignore[arg-type]
+
+        with pytest.raises(TypeError, match=f"{field_name} must be a tuple"):
+            OffloadConfig(**{field_name: ["blocks"]})  # type: ignore[arg-type]
+
+        with pytest.raises(TypeError, match=f"{field_name} entries must be str"):
+            OffloadConfig(**{field_name: (1,)})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["block_paths", "transient_block_paths", "transient_paths"],
+    )
+    def test_rejects_duplicate_paths(self, field_name: str) -> None:
+        with pytest.raises(ValueError, match="duplicate path"):
+            OffloadConfig(**{field_name: ("blocks", "blocks")})
+
+    def test_rejects_overlapping_block_and_transient_block_paths(self) -> None:
+        with pytest.raises(ValueError, match="disjoint"):
+            OffloadConfig(
+                block_paths=("blocks",),
+                transient_block_paths=("blocks",),
+            )
+
+    def test_rejects_invalid_block_mode(self) -> None:
+        with pytest.raises(ValueError, match="unsupported block mode"):
+            OffloadConfig(block_mode=cast(Any, "invalid"))
+
+    @pytest.mark.parametrize(
+        "block_compile",
+        [None, BlockCompileConfig(fullgraph=False)],
+    )
+    def test_rejects_rolling_without_fullgraph_compile(
+        self,
+        block_compile: BlockCompileConfig | None,
+    ) -> None:
+        with pytest.raises(ValueError, match="requires BlockCompileConfig\\(fullgraph=True\\)"):
+            OffloadConfig(block_mode="rolling", block_compile=block_compile)
+
+    def test_rejects_invalid_block_compile_type(self) -> None:
+        with pytest.raises(TypeError, match="block_compile must be a BlockCompileConfig or None"):
+            OffloadConfig(block_compile=cast(Any, {"fullgraph": True}))
+
+    def test_entrypoints_reject_non_offload_config_and_resolve_none(self) -> None:
+        model = _TwoStageBlockModel()
+        store = ModelStore.from_module(model)
+
+        default_direct = ModelOffloader.from_module(_TwoStageBlockModel(), None)
+        default_bound = store.bind(_TwoStageBlockModel(), None)
+        assert not block_components(default_direct)
+        assert not block_components(default_bound)
+
+        with pytest.raises(TypeError, match="OffloadConfig"):
+            ModelOffloader.from_module(_TwoStageBlockModel(), config=cast(Any, {"block_paths": ("blocks",)}))
+
+        with pytest.raises(TypeError, match="OffloadConfig"):
+            store.bind(_TwoStageBlockModel(), config=cast(Any, "streaming"))
+
+        with pytest.raises(TypeError, match="OffloadConfig"):
+            ModelSpec(
+                key="bad",
+                factory=_TwoStageBlockModel,
+                config=cast(Any, object()),
+            )
+
+        with pytest.raises(TypeError, match="OffloadConfig"):
+            ModelSpec(
+                key="bad-none",
+                factory=_TwoStageBlockModel,
+                config=cast(Any, None),
+            )
+
+
+class TestModelStoreCaptureAndBind:
+    def test_conformance_and_capture_metadata(self) -> None:
+        model = _TwoStageBlockModel(num_blocks=2, width=8)
+        expected_bytes = sum(t.nbytes for t in model.state_dict().values())
+
+        store = ModelStore.from_module(model)
+        assert isinstance(store, ResourceStore)
+        assert store.param_names == frozenset(
+            {"embed.weight", "blocks.0.weight", "blocks.1.weight", "head.weight"}
+        )
+        assert store.buffer_names == frozenset({"scale"})
+        assert store.cache_bytes == expected_bytes
+
+    def test_from_module_rejects_empty_and_trainable_without_partial_mutation(self) -> None:
+        with pytest.raises(ValueError, match="at least one parameter or registered buffer"):
+            ModelStore.from_module(nn.Module())
+
+        with pytest.raises(ValueError, match="at least one parameter"):
+            ModelOffloader.from_module(nn.Module())
+
+        model = _TwoStageBlockModel(num_blocks=2, width=8)
+        model.head.weight.requires_grad_(True)
+        before = _snapshot_tensors(model)
+
+        with pytest.raises(ValueError, match="frozen"):
+            ModelStore.from_module(model)
+
+        _assert_unmutated(model, before)
+
+    def test_one_store_binds_multiple_shells_with_distinct_configs_on_cpu(self) -> None:
+        torch.manual_seed(0)
+        prototype = _TwoStageBlockModel(num_blocks=2, width=8)
+        reference = copy.deepcopy(prototype)
+        x = torch.randn(3, 8)
+        with torch.inference_mode():
+            expected = reference(x)
+
+        store = ModelStore.from_module(prototype)
+        configs = (
+            OffloadConfig(),
+            OffloadConfig(block_paths=("blocks",), block_mode="streaming"),
+            OffloadConfig(
+                block_paths=("blocks",),
+                block_mode="resident",
+                transient_paths=("embed",),
+            ),
+            OffloadConfig(
+                transient_block_paths=("blocks",),
+                transient_paths=("head",),
+            ),
+        )
+        offloaders = [store.bind(_TwoStageBlockModel(num_blocks=2, width=8), cfg) for cfg in configs]
+        try:
+            assert host_component(offloaders[0]) is not None
+            assert not block_components(offloaders[0])
+            assert len(block_components(offloaders[1])) == 1
+            assert block_components(offloaders[2])[0].block_mode == "resident"
+            assert [p for p, _ in transient_components(offloaders[2])] == ["embed"]
+            assert len(offloaders[3]._composite.transient_blocks) == 1
+            assert [p for p, _ in transient_components(offloaders[3])] == ["head"]
+
+            proto_ptrs = {name: p.untyped_storage().data_ptr() for name, p in prototype.named_parameters()}
+            proto_buf_ptr = prototype.scale.untyped_storage().data_ptr()
+            for offloader in offloaders:
+                shell = offloader.value
+                for name, param in shell.named_parameters():
+                    assert param.untyped_storage().data_ptr() == proto_ptrs[name]
+                    assert param is not prototype.get_parameter(name)
+                assert shell.scale.untyped_storage().data_ptr() == proto_buf_ptr
+                with activated_model(offloader, "cpu"), torch.inference_mode():
+                    actual = shell(x)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        finally:
+            for offloader in offloaders:
+                offloader.deactivate()
+
+    @CUDA
+    def test_one_store_binds_multiple_shells_with_cuda_forward_parity(self) -> None:
+        torch.manual_seed(1)
+        prototype = _TwoStageBlockModel(num_blocks=2, width=8)
+        reference = copy.deepcopy(prototype).cuda()
+        x = torch.randn(3, 8, device="cuda")
+        with torch.inference_mode():
+            expected = reference(x).cpu()
+
+        store = ModelStore.from_module(prototype)
+        offloaders = [
+            store.bind(_TwoStageBlockModel(num_blocks=2, width=8), OffloadConfig()),
+            store.bind(
+                _TwoStageBlockModel(num_blocks=2, width=8),
+                OffloadConfig(block_paths=("blocks",), block_mode="streaming"),
+            ),
+            store.bind(
+                _TwoStageBlockModel(num_blocks=2, width=8),
+                OffloadConfig(
+                    transient_block_paths=("blocks",),
+                    transient_paths=("embed", "head"),
+                ),
+            ),
+        ]
+        for offloader in offloaders:
+            with activated_model(offloader, "cuda"), torch.inference_mode():
+                actual = offloader.value(x).cpu()
+            torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+    def test_bind_populates_meta_skeleton_and_ignores_extra_trainable_params(self) -> None:
+        torch.manual_seed(2)
+        prototype = _TwoStageBlockModel(num_blocks=2, width=8)
+        store = ModelStore.from_module(prototype)
+
+        class ShellWithExtras(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embed = nn.Linear(8, 8, bias=False, device="meta")
+                self.blocks = nn.ModuleList(
+                    [nn.Linear(8, 8, bias=False, device="meta") for _ in range(2)]
+                )
+                for block in self.blocks:
+                    block.extra_trainable = nn.Parameter(torch.randn(8))
+                self.head = nn.Linear(8, 8, bias=False, device="meta")
+                self.register_buffer("scale", torch.empty(8, device="meta"))
+                self.outer_trainable = nn.Parameter(torch.randn(8))
+                for name, param in self.named_parameters():
+                    if "extra_trainable" not in name and name != "outer_trainable":
+                        param.requires_grad_(False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                x = self.embed(x)
+                for block in self.blocks:
+                    x = torch.relu(block(x)) + block.extra_trainable
+                return self.head(x) * self.scale + self.outer_trainable
+
+        shell = ShellWithExtras()
+        outer_param = shell.outer_trainable
+        outer_ptr = outer_param.untyped_storage().data_ptr()
+        block0_extra = shell.blocks[0].extra_trainable
+        block0_ptr = block0_extra.untyped_storage().data_ptr()
+
+        offloader = store.bind(shell, OffloadConfig(block_paths=("blocks",)))
+        try:
+            assert all(not p.is_meta for p in shell.parameters())
+            assert not shell.scale.is_meta
+            assert shell.outer_trainable is outer_param
+            assert shell.outer_trainable.requires_grad
+            assert shell.outer_trainable.untyped_storage().data_ptr() == outer_ptr
+            assert shell.blocks[0].extra_trainable is block0_extra
+            assert shell.blocks[0].extra_trainable.requires_grad
+            assert shell.blocks[0].extra_trainable.untyped_storage().data_ptr() == block0_ptr
+            assert "outer_trainable" not in offloader.param_names
+            assert "blocks.0.extra_trainable" not in offloader.param_names
+            with activated_model(offloader, "cpu"):
+                out = shell(torch.randn(2, 8))
+            assert out.shape == (2, 8)
+        finally:
+            offloader.deactivate()
+
+    def test_bind_quantized_store_onto_meta_skeleton(self) -> None:
+        convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
+        convrot_cls = convrot_mod.ConvRotInt8Tensor
+
+        proto = nn.Module()
+        proto.blocks = nn.ModuleList([nn.Linear(64, 64, bias=False, dtype=torch.bfloat16) for _ in range(2)])
+        for block in proto.blocks:
+            block.weight = nn.Parameter(
+                convrot_cls.from_hp(block.weight.detach(), group_size=64),
+                requires_grad=False,
+            )
+
+        store = ModelStore.from_module(proto)
+        skeleton = nn.Module()
+        skeleton.blocks = nn.ModuleList([nn.Linear(64, 64, bias=False, device="meta") for _ in range(2)])
+        skeleton.requires_grad_(False)
+
+        offloader = store.bind(skeleton, OffloadConfig(block_paths=("blocks",)))
+        for idx, block in enumerate(skeleton.blocks):
+            assert isinstance(block.weight.data, convrot_cls)
+            assert block.weight.data.qdata.data_ptr() == proto.blocks[idx].weight.data.qdata.data_ptr()
+        if torch.cuda.is_available():
+            x = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
+            with activated_model(offloader, "cuda"), torch.inference_mode():
+                out = skeleton.blocks[1](skeleton.blocks[0](x))
+            assert out.shape == (2, 64)
+
+
+class TestAtomicRejectionAndAliasing:
+    def test_atomic_rejection_on_bind_errors(self) -> None:
+        prototype = _TwoStageBlockModel(num_blocks=2, width=8)
+        store = ModelStore.from_module(prototype)
+
+        # Trainable managed param
+        bad_trainable = _TwoStageBlockModel(num_blocks=2, width=8)
+        bad_trainable.blocks[1].weight.requires_grad_(True)
+        snap = _snapshot_tensors(bad_trainable)
+        with pytest.raises(ValueError, match="frozen"):
+            store.bind(bad_trainable, OffloadConfig(block_paths=("blocks",)))
+        _assert_unmutated(bad_trainable, snap)
+
+        # Layout mismatch
+        bad_shape = _TwoStageBlockModel(num_blocks=2, width=8)
+        bad_shape.blocks[1] = nn.Linear(8, 16, bias=False).requires_grad_(False)
+        snap = _snapshot_tensors(bad_shape)
+        with pytest.raises(ValueError, match="layout mismatch"):
+            store.bind(bad_shape, OffloadConfig(block_paths=("blocks",)))
+        _assert_unmutated(bad_shape, snap)
+
+        # Unmanaged non-empty block
+        bad_unmanaged = _TwoStageBlockModel(num_blocks=3, width=8)
+        snap = _snapshot_tensors(bad_unmanaged)
+        with pytest.raises(ValueError, match="does not occupy"):
+            store.bind(bad_unmanaged, OffloadConfig(block_paths=("blocks",)))
+        _assert_unmutated(bad_unmanaged, snap)
+
+        # Rolling on heterogeneous blocks leaves target unmutated in both entrypoints
+        hetero_proto = _make_heterogeneous_model()
+        hetero_store = ModelStore.from_module(hetero_proto)
+        hetero_target = _make_heterogeneous_model()
+        snap_target = _snapshot_tensors(hetero_target)
+        rolling_cfg = OffloadConfig(
+            block_paths=("blocks",),
+            block_mode="rolling",
+            block_compile=BlockCompileConfig(fullgraph=True),
+        )
+        with pytest.raises(NotImplementedError, match="identical parameter layouts"):
+            hetero_store.bind(hetero_target, rolling_cfg)
+        _assert_unmutated(hetero_target, snap_target)
+
+        hetero_direct = _make_heterogeneous_model()
+        # Non-contiguous view weights would be normalized into fresh CPU storage if capture ran first.
+        hetero_direct.blocks[0].weight = nn.Parameter(
+            torch.randn(4, 4).t(),
+            requires_grad=False,
+        )
+        assert not hetero_direct.blocks[0].weight.is_contiguous()
+        snap_direct = _snapshot_tensors(hetero_direct)
+        with pytest.raises(NotImplementedError, match="identical parameter layouts"):
+            ModelOffloader.from_module(hetero_direct, rolling_cfg)
+        _assert_unmutated(hetero_direct, snap_direct)
+        assert not hetero_direct.blocks[0].weight.is_contiguous()
+
+        if torch.cuda.is_available():
+            hetero_cuda = _make_heterogeneous_model().cuda()
+            snap_cuda = _snapshot_tensors(hetero_cuda)
+            with pytest.raises(NotImplementedError, match="identical parameter layouts"):
+                ModelOffloader.from_module(hetero_cuda, rolling_cfg)
+            _assert_unmutated(hetero_cuda, snap_cuda)
+            assert hetero_cuda.blocks[0].weight.is_cuda
+
+    @pytest.mark.parametrize(
+        "tie_kind",
+        [
+            "resident_block",
+            "block_block",
+            "block_transient_block",
+            "transient_block",
+            "transient_resident",
+            "transient_transient",
+        ],
+    )
+    def test_cross_group_param_ties_rejected_atomically(self, tie_kind: str) -> None:
+        def make_tied() -> nn.Module:
+            m = _TwoStageBlockModel(num_blocks=2, width=8)
+            if tie_kind == "block_transient_block":
+                m.other_blocks = nn.ModuleList([nn.Linear(8, 8, bias=False).requires_grad_(False)])
+                m.other_blocks[0].weight = m.blocks[0].weight
+            elif tie_kind == "resident_block":
+                m.head.weight = m.blocks[0].weight
+            elif tie_kind == "block_block":
+                m.blocks[1].weight = m.blocks[0].weight
+            elif tie_kind == "transient_block":
+                m.embed.weight = m.blocks[0].weight
+            else:
+                m.head.weight = m.embed.weight
+            return m
+
+        if tie_kind == "block_transient_block":
+            cfg = OffloadConfig(block_paths=("blocks",), transient_block_paths=("other_blocks",))
+        elif tie_kind in {"transient_block", "transient_resident"}:
+            cfg = OffloadConfig(block_paths=("blocks",), transient_paths=("embed",))
+        elif tie_kind == "transient_transient":
+            cfg = OffloadConfig(block_paths=("blocks",), transient_paths=("embed", "head"))
+        else:
+            cfg = OffloadConfig(block_paths=("blocks",))
+
+        direct = make_tied()
+        snap_direct = _snapshot_tensors(direct)
+        with pytest.raises(ValueError, match="Parameter storage shared across offload groups"):
+            ModelOffloader.from_module(direct, cfg)
+        _assert_unmutated(direct, snap_direct)
+
+        proto = make_tied()
+        store = ModelStore.from_module(proto)
+        target = make_tied()
+        snap_target = _snapshot_tensors(target)
+        with pytest.raises(ValueError, match="Parameter storage shared across offload groups"):
+            store.bind(target, cfg)
+        _assert_unmutated(target, snap_target)
+
+    def test_cross_group_buffer_only_slot_aliases_rejected_atomically(self) -> None:
+        def make_buf_only_block_model() -> nn.Module:
+            m = nn.Module()
+            buf_block = nn.Module()
+            buf_block.register_buffer("table", torch.randn(4))
+            m.blocks = nn.ModuleList([buf_block])
+            m.alias_blocks = m.blocks
+            return m
+
+        for cfg in (
+            OffloadConfig(block_paths=("blocks", "alias_blocks")),
+            OffloadConfig(block_paths=("blocks",), transient_block_paths=("alias_blocks",)),
+        ):
+            direct = make_buf_only_block_model()
+            snap = _snapshot_tensors(direct)
+            with pytest.raises(ValueError, match="Buffer module slot shared across offload groups"):
+                ModelOffloader.from_module(direct, cfg)
+            _assert_unmutated(direct, snap)
+
+            proto = make_buf_only_block_model()
+            store = ModelStore.from_module(proto)
+            target = make_buf_only_block_model()
+            snap_target = _snapshot_tensors(target)
+            with pytest.raises(ValueError, match="Buffer module slot shared across offload groups"):
+                store.bind(target, cfg)
+            _assert_unmutated(target, snap_target)
+
+        def make_buf_only_transient_model() -> nn.Module:
+            m = nn.Module()
+            sub = nn.Module()
+            sub.register_buffer("table", torch.randn(4))
+            m.a = sub
+            m.b = sub
+            return m
+
+        transient_cfg = OffloadConfig(transient_paths=("a",))
+        direct_sub = make_buf_only_transient_model()
+        snap_sub = _snapshot_tensors(direct_sub)
+        with pytest.raises(ValueError, match="Buffer module slot shared across offload groups"):
+            ModelOffloader.from_module(direct_sub, transient_cfg)
+        _assert_unmutated(direct_sub, snap_sub)
+
+        proto_sub = make_buf_only_transient_model()
+        store_sub = ModelStore.from_module(proto_sub)
+        target_sub = make_buf_only_transient_model()
+        snap_target_sub = _snapshot_tensors(target_sub)
+        with pytest.raises(ValueError, match="Buffer module slot shared across offload groups"):
+            store_sub.bind(target_sub, transient_cfg)
+        _assert_unmutated(target_sub, snap_target_sub)
+
+    def test_rejects_distinct_store_entries_on_aliased_target_slot_without_mutation(self) -> None:
+        # Pair of distinct weights vs shared param module slot
+        proto = nn.Module()
+        proto.left = nn.Linear(4, 4, bias=False)
+        proto.right = nn.Linear(4, 4, bias=False)
+        proto.register_buffer("buf_a", torch.randn(4))
+        proto.register_buffer("buf_b", torch.randn(4))
+        proto.requires_grad_(False)
+        store = ModelStore.from_module(proto)
+
+        shared = nn.Linear(4, 4, bias=False).requires_grad_(False)
+        target_param_alias = nn.Module()
+        target_param_alias.left = shared
+        target_param_alias.right = shared
+        target_param_alias.register_buffer("buf_a", torch.zeros(4))
+        target_param_alias.register_buffer("buf_b", torch.zeros(4))
+        snap = _snapshot_tensors(target_param_alias)
+        with pytest.raises(ValueError, match="distinct store params"):
+            store.bind(target_param_alias)
+        _assert_unmutated(target_param_alias, snap)
+
+        # Pair of distinct blocks bound onto ModuleList([shared, shared])
+        block_proto = nn.Module()
+        block_proto.blocks = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(2)]).requires_grad_(False)
+        block_store = ModelStore.from_module(block_proto)
+        shared_block = nn.Linear(4, 4, bias=False).requires_grad_(False)
+        target_blocks = nn.Module()
+        target_blocks.blocks = nn.ModuleList([shared_block, shared_block])
+        snap_blocks = _snapshot_tensors(target_blocks)
+        with pytest.raises(ValueError, match="distinct store params"):
+            block_store.bind(target_blocks, OffloadConfig(block_paths=("blocks",)))
+        _assert_unmutated(target_blocks, snap_blocks)
+
+        # Buffer slot conflict
+        buf_proto = nn.Module()
+        buf_proto.left = nn.Module()
+        buf_proto.right = nn.Module()
+        buf_proto.left.register_buffer("table", torch.ones(4))
+        buf_proto.right.register_buffer("table", torch.zeros(4))
+        buf_store = ModelStore.from_module(buf_proto)
+
+        shared_sub = nn.Module()
+        shared_sub.register_buffer("table", torch.zeros(4))
+        target_buf_alias = nn.Module()
+        target_buf_alias.left = shared_sub
+        target_buf_alias.right = shared_sub
+        snap_buf = _snapshot_tensors(target_buf_alias)
+        with pytest.raises(ValueError, match="distinct store buffers"):
+            buf_store.bind(target_buf_alias)
+        _assert_unmutated(target_buf_alias, snap_buf)
+
+    def test_allows_aliased_block_modules_root_block_alias_and_shared_buffers(self) -> None:
+        torch.manual_seed(3)
+
+        class AliasedBlockModel(nn.Module):
+            def __init__(self, shared_buf: torch.Tensor | None = None) -> None:
+                super().__init__()
+                shared_block = nn.Linear(8, 8, bias=False)
+                other_block = nn.Linear(8, 8, bias=False)
+                table = torch.randn(8) if shared_buf is None else shared_buf
+                shared_block.register_buffer("table", table)
+                other_block.register_buffer("table", table)
+                self.blocks = nn.ModuleList([shared_block, shared_block, other_block])
+                self.first_block = shared_block
+                self.requires_grad_(False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.blocks:
+                    x = block(x) * block.table
+                return self.first_block(x)
+
+        ref = AliasedBlockModel()
+        x = torch.randn(2, 8)
+        with torch.inference_mode():
+            expected = ref(x)
+
+        direct = copy.deepcopy(ref)
+        cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+        direct_offloader = ModelOffloader.from_module(direct, cfg)
+        assert direct.blocks[0] is direct.blocks[1] is direct.first_block
+        assert host_component(direct_offloader) is None
+        with activated_model(direct_offloader, "cpu"), torch.inference_mode():
+            torch.testing.assert_close(direct(x), expected)
+
+        store = ModelStore.from_module(copy.deepcopy(ref))
+        shell = AliasedBlockModel()
+        bound_offloader = store.bind(shell, cfg)
+        assert shell.blocks[0] is shell.blocks[1] is shell.first_block
+        assert host_component(bound_offloader) is None
+        with activated_model(bound_offloader, "cpu"), torch.inference_mode():
+            torch.testing.assert_close(shell(x), expected)
+        if torch.cuda.is_available():
+            with activated_model(bound_offloader, "cuda"), torch.inference_mode():
+                actual = shell(x.cuda()).cpu()
+            torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+class TestModelStoreSpec:
+    def test_cache_accounting_eviction_and_shared_leasing(self) -> None:
+        builds = {"a": 0, "b": 0}
+
+        def build_a() -> nn.Module:
+            builds["a"] += 1
+            return _TwoStageBlockModel(num_blocks=2, width=8)
+
+        def build_b() -> nn.Module:
+            builds["b"] += 1
+            return _TwoStageBlockModel(num_blocks=2, width=8)
+
+        sample = _TwoStageBlockModel(num_blocks=2, width=8)
+        one_bytes = sum(t.nbytes for t in sample.state_dict().values())
+
+        cache = ResourceCache(max_cache_bytes=one_bytes)
+        spec_a = ModelStoreSpec(key="store:a", factory=build_a, estimated_cache_bytes=one_bytes)
+        spec_b = ModelStoreSpec(key="store:b", factory=build_b, estimated_cache_bytes=one_bytes)
+
+        with cache.lease(spec_a) as store_a_first:
+            assert isinstance(store_a_first, ModelStore)
+            assert store_a_first.cache_bytes == one_bytes
+            with cache.lease(spec_a) as store_a_second:
+                assert store_a_second is store_a_first
+                assert cache.info("store:a").lease_count == 2
+                first = store_a_first.bind(_TwoStageBlockModel(num_blocks=2, width=8), OffloadConfig())
+                second = store_a_second.bind(
+                    _TwoStageBlockModel(num_blocks=2, width=8),
+                    OffloadConfig(block_paths=("blocks",)),
+                )
+                try:
+                    assert first.value.embed.weight.untyped_storage().data_ptr() == (
+                        second.value.embed.weight.untyped_storage().data_ptr()
+                    )
+                finally:
+                    first.deactivate()
+                    second.deactivate()
+
+        assert builds["a"] == 1
+        assert cache.used_cache_bytes == one_bytes
+
+        # Exceeding max_cache_bytes evicts cold store:a when admitting store:b.
+        with cache.lease(spec_b) as store_b:
+            assert store_b.cache_bytes == one_bytes
+            assert not cache.info("store:a").cached
+            assert cache.info("store:b").cached
+
+        assert builds["b"] == 1
+
+    def test_model_cache_resize_eviction_and_binding(self) -> None:
+        sample = _TwoStageBlockModel(num_blocks=2, width=8)
+        one_bytes = sum(t.nbytes for t in sample.state_dict().values())
+
+        cache = ModelCache()
+        spec_a = ModelStoreSpec(
+            key="model-store-a",
+            factory=lambda: _TwoStageBlockModel(num_blocks=2, width=8),
+            estimated_cache_bytes=one_bytes,
+        )
+        spec_b = ModelStoreSpec(
+            key="model-store-b",
+            factory=lambda: _TwoStageBlockModel(num_blocks=2, width=8),
+            estimated_cache_bytes=one_bytes,
+        )
+        with cache.lease(spec_a) as store:
+            assert isinstance(store, ModelStore)
+            offloader = store.bind(
+                _TwoStageBlockModel(num_blocks=2, width=8),
+                OffloadConfig(block_paths=("blocks",)),
+            )
+            with activated_model(offloader, "cpu"), torch.inference_mode():
+                out = offloader.value(torch.randn(2, 8))
+            assert out.shape == (2, 8)
+
+        cache.resize(one_bytes)
+        with cache.lease(spec_b) as store_b:
+            assert store_b.cache_bytes == one_bytes
+            assert not cache.info("model-store-a").cached
+            assert cache.info("model-store-b").cached
+
+
+def _plan_lora_merge(
+    offloader: ModelOffloader,
+    adapter: Adapter,
+) -> dict[str, ParameterOverride]:
+    updates = group_adapter_updates([(adapter, 1.0)], offloader.param_names)
+    return offloader._build_merge_parameter_overrides(torch.device("cuda"), updates)
+
+
+class _UnsupportedTensor(torch.Tensor):
+    pass
+
+
+class _ExternalParam(nn.Parameter):
+    pass
+
+
+class _ExternalParamAdapter(RegularAdapter):
+    @staticmethod
+    def matches(t: torch.Tensor) -> bool:
+        return isinstance(t, _ExternalParam)
+
+
+class _EmptyShardDTensorModel(nn.Module):
+    def __init__(self, mesh: Any) -> None:
+        super().__init__()
+        from torch.distributed.tensor import Shard, distribute_tensor
+
+        def make_block() -> nn.Module:
+            block = nn.Module()
+            block.weight = nn.Parameter(
+                distribute_tensor(torch.ones(1, 4, dtype=torch.float32), mesh, [Shard(0)]),
+                requires_grad=False,
+            )
+            block.register_buffer(
+                "table",
+                distribute_tensor(torch.ones(1, 4, dtype=torch.float32), mesh, [Shard(0)]),
+            )
+            return block
+
+        self.blocks = nn.ModuleList([make_block(), make_block()])
+        self.head = make_block()
+        self.requires_grad_(False)
+
+
+def _dtensor_empty_shard_worker(rank: int, init_file: str) -> None:
+    from torch.distributed.tensor import init_device_mesh
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("tp",))
+        cfg = OffloadConfig(block_paths=("blocks",))
+
+        direct = _EmptyShardDTensorModel(mesh)
+        if rank == 1:
+            assert direct.blocks[0].weight.to_local().numel() == 0
+            assert direct.blocks[1].weight.to_local().numel() == 0
+            assert direct.blocks[0].table.to_local().numel() == 0
+            assert direct.blocks[1].table.to_local().numel() == 0
+        offloader = ModelOffloader.from_module(direct, cfg)
+        assert len(offloader.param_names) == 3
+        offloader.deactivate()
+        del offloader
+
+        proto = _EmptyShardDTensorModel(mesh)
+        target = _EmptyShardDTensorModel(mesh)
+        store = ModelStore.from_module(proto)
+        bound = store.bind(target, cfg)
+        assert len(bound.param_names) == 3
+        bound.deactivate()
+        del bound
+
+        # A genuine cross-group alias of the same empty-shard Parameter still fails on both ranks.
+        tied_direct = _EmptyShardDTensorModel(mesh)
+        tied_direct.head.weight = tied_direct.blocks[0].weight
+        with pytest.raises(ValueError, match="Parameter storage shared across offload groups"):
+            ModelOffloader.from_module(tied_direct, cfg)
+
+        tied_proto = _EmptyShardDTensorModel(mesh)
+        tied_proto.head.weight = tied_proto.blocks[0].weight
+        tied_store = ModelStore.from_module(tied_proto)
+        tied_target = _EmptyShardDTensorModel(mesh)
+        with pytest.raises(ValueError, match="Parameter storage shared across offload groups"):
+            tied_store.bind(tied_target, cfg)
+
+        # Distinct wrappers over the same DTensor preserve aliasing on BOTH ranks (even when local shard is empty).
+        from torch.distributed.tensor import Shard, distribute_tensor
+
+        shared_dt = distribute_tensor(torch.ones(1, 4, dtype=torch.float32), mesh, [Shard(0)])
+        flat_shared = nn.Module()
+        flat_shared.a = nn.Parameter(shared_dt, requires_grad=False)
+        flat_shared.b = nn.Parameter(shared_dt, requires_grad=False)
+        flat_shared.register_buffer("ba", shared_dt.detach())
+        flat_shared.register_buffer("bb", shared_dt.detach())
+        shared_store = ModelStore.from_module(flat_shared)
+        assert shared_store._module_store.params["a"] is shared_store._module_store.params["b"]
+        assert shared_store._module_store.buffers["ba"] is shared_store._module_store.buffers["bb"]
+
+        distinct_wrapper_blocks = _EmptyShardDTensorModel(mesh)
+        distinct_wrapper_blocks.blocks[1].weight = nn.Parameter(
+            distinct_wrapper_blocks.blocks[0].weight.data,
+            requires_grad=False,
+        )
+        with pytest.raises(ValueError, match="Parameter storage shared across offload groups"):
+            ModelOffloader.from_module(distinct_wrapper_blocks, cfg)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+class TestReviewRegressions:
+    def test_incremental_buffer_capture_releases_previous_buffers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from piper_offload import host_module
+
+        real_capture = host_module.HostBuffer.capture
+        live_counts: list[int] = []
+        watched_refs: list[weakref.ref[torch.Tensor]] = []
+
+        def wrapped_capture(buf: torch.Tensor) -> Any:
+            live_counts.append(sum(ref() is not None for ref in watched_refs))
+            return real_capture(buf)
+
+        monkeypatch.setattr(host_module.HostBuffer, "capture", wrapped_capture)
+
+        def make_buffer_model() -> tuple[nn.Module, list[weakref.ref[torch.Tensor]]]:
+            model = nn.Module()
+            blocks = [nn.Module() for _ in range(6)]
+            refs: list[weakref.ref[torch.Tensor]] = []
+            for idx, block in enumerate(blocks):
+                non_contig = (
+                    torch.arange(16, dtype=torch.float32) + float(idx)
+                ).reshape(4, 4).T
+                assert not non_contig.is_contiguous()
+                block.register_buffer("table", non_contig)
+                refs.append(weakref.ref(non_contig))
+            model.blocks = nn.ModuleList(blocks)
+            return model, refs
+
+        direct, direct_refs = make_buffer_model()
+        watched_refs = direct_refs
+        offloader = ModelOffloader.from_module(direct, OffloadConfig(block_paths=("blocks",)))
+        assert live_counts == [6, 5, 4, 3, 2, 1]
+        offloader.deactivate()
+
+        live_counts.clear()
+        store_model, store_refs = make_buffer_model()
+        watched_refs = store_refs
+        store = ModelStore.from_module(store_model)
+        assert live_counts == [6, 5, 4, 3, 2, 1]
+        assert store.cache_bytes > 0
+
+    def test_rolling_preflight_inspects_param_representation_before_capture(self) -> None:
+        rolling_cfg = OffloadConfig(
+            block_paths=("blocks",),
+            block_mode="rolling",
+            block_compile=BlockCompileConfig(fullgraph=True),
+        )
+
+        # Case 1: unregistered tensor subclass wrapped inside nn.Parameter.
+        unreg = nn.Module()
+        b0 = nn.Module()
+        b0.weight = nn.Parameter(torch.randn(4, 4).T, requires_grad=False)
+        assert not b0.weight.is_contiguous()
+        b1 = nn.Module()
+        raw_sub = cast(
+            _UnsupportedTensor,
+            torch.Tensor._make_subclass(
+                _UnsupportedTensor,
+                torch.randn(4, 4),
+                False,
+            ),
+        )
+        b1.weight = nn.Parameter(raw_sub, requires_grad=False)
+        unreg.blocks = nn.ModuleList([b0, b1])
+        snap_unreg = _snapshot_tensors(unreg)
+        with pytest.raises(NotImplementedError, match="register_adapter"):
+            ModelOffloader.from_module(unreg, rolling_cfg)
+        _assert_unmutated(unreg, snap_unreg)
+        assert not unreg.blocks[0].weight.is_contiguous()
+
+        # Case 2: nn.Parameter subclass with a registered external adapter (not rolling-safe).
+        remove = register_adapter(_ExternalParamAdapter)
+        try:
+            ext = nn.Module()
+            eb0 = nn.Module()
+            eb0.weight = nn.Parameter(torch.randn(4, 4).T, requires_grad=False)
+            assert not eb0.weight.is_contiguous()
+            eb1 = nn.Module()
+            eb1.weight = _ExternalParam(torch.randn(4, 4), requires_grad=False)
+            ext.blocks = nn.ModuleList([eb0, eb1])
+            snap_ext = _snapshot_tensors(ext)
+            with pytest.raises(NotImplementedError, match="identical parameter layouts"):
+                ModelOffloader.from_module(ext, rolling_cfg)
+            _assert_unmutated(ext, snap_ext)
+            assert not ext.blocks[0].weight.is_contiguous()
+
+            # Case 3: both blocks use _ExternalParam -> unsupported rolling adapter type before capture.
+            both_ext = nn.Module()
+            be0 = nn.Module()
+            be0.weight = _ExternalParam(torch.randn(4, 4).T, requires_grad=False)
+            assert not be0.weight.is_contiguous()
+            be1 = nn.Module()
+            be1.weight = _ExternalParam(torch.randn(4, 4), requires_grad=False)
+            both_ext.blocks = nn.ModuleList([be0, be1])
+            snap_both = _snapshot_tensors(both_ext)
+            with pytest.raises(NotImplementedError, match="supports only"):
+                ModelOffloader.from_module(both_ext, rolling_cfg)
+            _assert_unmutated(both_ext, snap_both)
+            assert not both_ext.blocks[0].weight.is_contiguous()
+        finally:
+            remove()
+
+    @pytest.mark.skipif(
+        not (DTENSOR_AVAILABLE and dist.is_gloo_available()),
+        reason="PyTorch DTensor and Gloo backend required",
+    )
+    def test_empty_local_shard_dtensor_two_rank_capture_and_bind(self, tmp_path: Path) -> None:
+        init_file = tmp_path / "dtensor-empty-shard-init"
+        mp.spawn(
+            _dtensor_empty_shard_worker,
+            args=(str(init_file),),
+            nprocs=2,
+            join=True,
+        )
+
+    def test_conj_and_neg_buffers_preserve_distinct_values(self) -> None:
+        class _ViewBufferBlock(nn.Module):
+            def __init__(self, c: torch.Tensor, r: torch.Tensor) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(1), requires_grad=False)
+                self.register_buffer("c", c)
+                self.register_buffer("r", r)
+
+            def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                return x.to(self.c.dtype) * self.c, x * self.r
+
+        def make_view_buffer_model() -> nn.Module:
+            model = nn.Module()
+            base_complex = torch.tensor([1j])
+            base_real = torch.tensor([3.0])
+            b0 = _ViewBufferBlock(base_complex, base_real)
+            b1 = _ViewBufferBlock(base_complex.conj(), torch._neg_view(base_real))
+            assert b1.c.is_conj()
+            assert b1.r.is_neg()
+            model.blocks = nn.ModuleList([b0, b1])
+            return model
+
+        cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+        direct = make_view_buffer_model()
+        offloader = ModelOffloader.from_module(direct, cfg)
+        try:
+            assert torch.equal(direct.blocks[0].c, torch.tensor([1j]))
+            assert torch.equal(direct.blocks[1].c, torch.tensor([-1j]))
+            assert torch.equal(direct.blocks[0].r, torch.tensor([3.0]))
+            assert torch.equal(direct.blocks[1].r, torch.tensor([-3.0]))
+        finally:
+            offloader.deactivate()
+
+        proto = make_view_buffer_model()
+        store = ModelStore.from_module(proto)
+        assert store._module_store.buffers["blocks.0.c"] is not store._module_store.buffers["blocks.1.c"]
+        assert store._module_store.buffers["blocks.0.r"] is not store._module_store.buffers["blocks.1.r"]
+        shell = nn.Module()
+        shell.blocks = nn.ModuleList(
+            [
+                _ViewBufferBlock(
+                    torch.zeros(1, dtype=torch.complex64),
+                    torch.zeros(1, dtype=torch.float32),
+                )
+                for _ in range(2)
+            ]
+        )
+        shell.requires_grad_(False)
+
+        bound = store.bind(shell, cfg)
+        try:
+            assert torch.equal(shell.blocks[0].c, torch.tensor([1j]))
+            assert torch.equal(shell.blocks[1].c, torch.tensor([-1j]))
+            assert torch.equal(shell.blocks[0].r, torch.tensor([3.0]))
+            assert torch.equal(shell.blocks[1].r, torch.tensor([-3.0]))
+            if torch.cuda.is_available():
+                with activated_model(bound, "cuda"), torch.inference_mode():
+                    x_cuda = torch.ones(1, device="cuda")
+                    out0_c, out0_r = shell.blocks[0](x_cuda)
+                    out1_c, out1_r = shell.blocks[1](x_cuda)
+                assert torch.equal(out0_c.cpu(), torch.tensor([1j]))
+                assert torch.equal(out1_c.cpu(), torch.tensor([-1j]))
+                assert torch.equal(out0_r.cpu(), torch.tensor([3.0]))
+                assert torch.equal(out1_r.cpu(), torch.tensor([-3.0]))
+        finally:
+            bound.deactivate()
+
+    def test_root_block_alias_targets_routed_merge_and_conflicts(self) -> None:
+        torch.manual_seed(4)
+
+        class AliasedRootModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                shared = nn.Linear(8, 8, bias=False)
+                other = nn.Linear(8, 8, bias=False)
+                self.blocks = nn.ModuleList([shared, other])
+                self.first_block = shared
+                self.requires_grad_(False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.blocks:
+                    x = torch.relu(block(x))
+                return self.first_block(x)
+
+        ref = AliasedRootModel()
+        lora_a = torch.randn(2, 8)
+        lora_b = torch.randn(8, 2)
+        adapter = Adapter.from_state_dict(
+            {
+                "first_block.lora_A.weight": lora_a,
+                "first_block.lora_B.weight": lora_b,
+            },
+            allow_partial_targets=False,
+        )
+        other_alias_adapter = Adapter.from_state_dict(
+            {
+                "blocks.0.lora_A.weight": lora_a * 2.0,
+                "blocks.0.lora_B.weight": lora_b,
+            },
+            allow_partial_targets=False,
+        )
+        conflict_adapter = Adapter.from_state_dict(
+            {
+                "first_block.lora_A.weight": lora_a,
+                "first_block.lora_B.weight": lora_b,
+                "blocks.0.lora_A.weight": lora_a * 2.0,
+                "blocks.0.lora_B.weight": lora_b,
+            },
+            allow_partial_targets=False,
+        )
+
+        x = torch.randn(3, 8)
+        merged_ref = copy.deepcopy(ref)
+        with torch.no_grad():
+            cast(nn.Linear, merged_ref.blocks[0]).weight.add_(lora_b @ lora_a)
+        with torch.inference_mode():
+            expected = merged_ref(x)
+
+        cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+        store = ModelStore.from_module(copy.deepcopy(ref))
+        candidates = [
+            ModelOffloader.from_module(copy.deepcopy(ref), cfg),
+            store.bind(copy.deepcopy(ref), cfg),
+        ]
+        try:
+            for offloader in candidates:
+                assert "first_block.weight" in offloader.param_names
+                assert "blocks.0.weight" in offloader.param_names
+
+                with (
+                    activated_model(
+                        offloader,
+                        "cpu",
+                        adapters=[adapter],
+                        adapter_mode="routed",
+                    ),
+                    torch.inference_mode(),
+                ):
+                    actual_routed = offloader.value(x)
+                torch.testing.assert_close(actual_routed, expected, atol=1e-5, rtol=1e-5)
+
+                overrides = _plan_lora_merge(offloader, adapter)
+                plans = block_components(offloader)[0]._resolve_load_plans(overrides)
+                assert plans[0].loads["weight"].update is not None
+                assert plans[1].loads["weight"].update is None
+
+                with pytest.raises(ValueError, match="Tied parameter aliases"):
+                    _plan_lora_merge(offloader, conflict_adapter)
+
+                other_overrides = _plan_lora_merge(offloader, other_alias_adapter)
+                with pytest.raises(ValueError, match="Tied parameter aliases"):
+                    block_components(offloader)[0]._resolve_load_plans(
+                        {**overrides, **other_overrides}
+                    )
+
+                if torch.cuda.is_available():
+                    with (
+                        activated_model(offloader, "cuda", adapters=[adapter]),
+                        torch.inference_mode(),
+                    ):
+                        actual_cuda = offloader.value(x.cuda()).cpu()
+                    torch.testing.assert_close(actual_cuda, expected, atol=1e-5, rtol=1e-5)
+        finally:
+            for offloader in candidates:
+                offloader.deactivate()
+
+    @pytest.mark.parametrize("block_mode", ["streaming", "resident"])
+    @pytest.mark.parametrize("target_prefix", ["blocks.0", "blocks.1"])
+    def test_aliased_block_module_propagates_merge_and_rejects_conflicts(
+        self,
+        block_mode: Any,
+        target_prefix: str,
+    ) -> None:
+        torch.manual_seed(5)
+
+        class AliasedBlockListModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                shared = nn.Linear(8, 8, bias=False)
+                other = nn.Linear(8, 8, bias=False)
+                self.blocks = nn.ModuleList([shared, shared, other])
+                self.requires_grad_(False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.blocks:
+                    x = torch.relu(block(x))
+                return x
+
+        ref = AliasedBlockListModel()
+        lora_a = torch.randn(2, 8)
+        lora_b = torch.randn(8, 2)
+        adapter = Adapter.from_state_dict(
+            {
+                f"{target_prefix}.lora_A.weight": lora_a,
+                f"{target_prefix}.lora_B.weight": lora_b,
+            },
+            allow_partial_targets=False,
+        )
+        peer_prefix = "blocks.1" if target_prefix == "blocks.0" else "blocks.0"
+        peer_adapter = Adapter.from_state_dict(
+            {
+                f"{peer_prefix}.lora_A.weight": lora_a * 2.0,
+                f"{peer_prefix}.lora_B.weight": lora_b,
+            },
+            allow_partial_targets=False,
+        )
+        conflict_adapter = Adapter.from_state_dict(
+            {
+                "blocks.0.lora_A.weight": lora_a,
+                "blocks.0.lora_B.weight": lora_b,
+                "blocks.1.lora_A.weight": lora_a * 2.0,
+                "blocks.1.lora_B.weight": lora_b,
+            },
+            allow_partial_targets=False,
+        )
+
+        x = torch.randn(3, 8)
+        merged_ref = copy.deepcopy(ref)
+        with torch.no_grad():
+            cast(nn.Linear, merged_ref.blocks[0]).weight.add_(lora_b @ lora_a)
+        with torch.inference_mode():
+            expected = merged_ref(x)
+
+        cfg = OffloadConfig(block_paths=("blocks",), block_mode=block_mode)
+        store = ModelStore.from_module(copy.deepcopy(ref))
+        candidates = [
+            ModelOffloader.from_module(copy.deepcopy(ref), cfg),
+            store.bind(copy.deepcopy(ref), cfg),
+        ]
+        try:
+            for offloader in candidates:
+                overrides = _plan_lora_merge(offloader, adapter)
+                plans = block_components(offloader)[0]._resolve_load_plans(overrides)
+                shared_update = plans[0].loads["weight"].update
+                assert shared_update is not None
+                assert plans[1].loads["weight"].update is shared_update
+                assert plans[2].loads["weight"].update is None
+
+                with pytest.raises(ValueError, match="Tied parameter aliases"):
+                    _plan_lora_merge(offloader, conflict_adapter)
+
+                peer_overrides = _plan_lora_merge(offloader, peer_adapter)
+                with pytest.raises(ValueError, match="Tied parameter aliases"):
+                    block_components(offloader)[0]._resolve_load_plans(
+                        {**overrides, **peer_overrides}
+                    )
+
+                if torch.cuda.is_available():
+                    with (
+                        activated_model(offloader, "cuda", adapters=[adapter]),
+                        torch.inference_mode(),
+                    ):
+                        actual_cuda = offloader.value(x.cuda()).cpu()
+                    torch.testing.assert_close(actual_cuda, expected, atol=1e-5, rtol=1e-5)
+                    with pytest.raises(ValueError, match="Tied parameter aliases"):
+                        offloader.activate("cuda", adapters=[conflict_adapter])
+        finally:
+            for offloader in candidates:
+                offloader.deactivate()
+
+    def test_swapped_per_block_parameter_order_parity_between_direct_and_bind(self) -> None:
+        def make_swapped_order_model() -> nn.Module:
+            model = nn.Module()
+            b0 = nn.Module()
+            b0.a = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+            b0.b = nn.Parameter(torch.randn(4, 8), requires_grad=False)
+            b1 = nn.Module()
+            b1.b = nn.Parameter(torch.randn(4, 8), requires_grad=False)
+            b1.a = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+            model.blocks = nn.ModuleList([b0, b1])
+            return model
+
+        rolling_cfg = OffloadConfig(
+            block_paths=("blocks",),
+            block_mode="rolling",
+            block_compile=BlockCompileConfig(fullgraph=True),
+        )
+        auto_cfg = OffloadConfig(
+            block_paths=("blocks",),
+            block_mode="auto",
+            block_compile=BlockCompileConfig(fullgraph=True),
+        )
+
+        direct_rolling = make_swapped_order_model()
+        snap_direct = _snapshot_tensors(direct_rolling)
+        with pytest.raises(NotImplementedError, match="names and ordering"):
+            ModelOffloader.from_module(direct_rolling, rolling_cfg)
+        _assert_unmutated(direct_rolling, snap_direct)
+
+        store = ModelStore.from_module(make_swapped_order_model())
+        bind_rolling = make_swapped_order_model()
+        snap_bind = _snapshot_tensors(bind_rolling)
+        with pytest.raises(NotImplementedError, match="names and ordering"):
+            store.bind(bind_rolling, rolling_cfg)
+        _assert_unmutated(bind_rolling, snap_bind)
+
+        direct_auto = ModelOffloader.from_module(make_swapped_order_model(), auto_cfg)
+        bound_auto = store.bind(make_swapped_order_model(), auto_cfg)
+        try:
+            assert block_components(direct_auto)[0].block_mode == "streaming"
+            assert block_components(bound_auto)[0].block_mode == "streaming"
+        finally:
+            direct_auto.deactivate()
+            bound_auto.deactivate()
+
+    def test_property_aliased_block_paths_whole_and_slice(self) -> None:
+        torch.manual_seed(6)
+
+        class PropertyWholeModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.layers = nn.ModuleList([nn.Linear(8, 8, bias=False) for _ in range(2)])
+                self.requires_grad_(False)
+
+            @property
+            def blocks(self) -> nn.ModuleList:
+                return self.layers
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.blocks:
+                    x = torch.relu(block(x))
+                return x
+
+        class PropertySlicedModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.layers = nn.ModuleList([nn.Linear(8, 8, bias=False) for _ in range(3)])
+                self.requires_grad_(False)
+
+            @property
+            def blocks(self) -> nn.ModuleList:
+                return self.layers[1:]
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                x = torch.relu(self.layers[0](x))
+                for block in self.blocks:
+                    x = torch.relu(block(x))
+                return x
+
+        x = torch.randn(3, 8)
+        cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+
+        # Full alias: @property blocks -> self.layers
+        whole_ref = PropertyWholeModel()
+        with torch.inference_mode():
+            whole_expected = whole_ref(x)
+        whole_store = ModelStore.from_module(copy.deepcopy(whole_ref))
+        whole_offloaders = [
+            ModelOffloader.from_module(copy.deepcopy(whole_ref), cfg),
+            whole_store.bind(copy.deepcopy(whole_ref), cfg),
+        ]
+        try:
+            for offloader in whole_offloaders:
+                assert host_component(offloader) is None
+                assert offloader.param_names == frozenset({"layers.0.weight", "layers.1.weight"})
+                with activated_model(offloader, "cpu"), torch.inference_mode():
+                    torch.testing.assert_close(offloader.value(x), whole_expected, atol=0, rtol=0)
+        finally:
+            for offloader in whole_offloaders:
+                offloader.deactivate()
+
+        # Sliced property alias: @property blocks -> self.layers[1:]
+        slice_ref = PropertySlicedModel()
+        lora_a = torch.randn(2, 8)
+        lora_b = torch.randn(8, 2)
+        slice_adapter = Adapter.from_state_dict(
+            {
+                "layers.1.lora_A.weight": lora_a,
+                "layers.1.lora_B.weight": lora_b,
+            },
+            allow_partial_targets=False,
+        )
+        merged_slice_ref = copy.deepcopy(slice_ref)
+        with torch.no_grad():
+            cast(nn.Linear, merged_slice_ref.layers[1]).weight.add_(lora_b @ lora_a)
+        with torch.inference_mode():
+            slice_expected = slice_ref(x)
+            slice_lora_expected = merged_slice_ref(x)
+
+        slice_store = ModelStore.from_module(copy.deepcopy(slice_ref))
+        slice_offloaders = [
+            ModelOffloader.from_module(copy.deepcopy(slice_ref), cfg),
+            slice_store.bind(copy.deepcopy(slice_ref), cfg),
+        ]
+        try:
+            for offloader in slice_offloaders:
+                host = host_component(offloader)
+                assert host is not None
+                assert host.param_names == frozenset({"layers.0.weight"})
+                assert "layers.1.weight" in offloader.param_names
+                with activated_model(offloader, "cpu"), torch.inference_mode():
+                    torch.testing.assert_close(offloader.value(x), slice_expected, atol=0, rtol=0)
+                with (
+                    activated_model(
+                        offloader,
+                        "cpu",
+                        adapters=[slice_adapter],
+                        adapter_mode="routed",
+                    ),
+                    torch.inference_mode(),
+                ):
+                    torch.testing.assert_close(
+                        offloader.value(x),
+                        slice_lora_expected,
+                        atol=1e-5,
+                        rtol=1e-5,
+                    )
+        finally:
+            for offloader in slice_offloaders:
+                offloader.deactivate()
+
+    def test_bind_noncontiguous_buffer_onto_fresh_cpu_and_meta_shells(self) -> None:
+        torch.manual_seed(7)
+
+        class NonContiguousBufferModel(nn.Module):
+            def __init__(self, *, meta: bool = False) -> None:
+                super().__init__()
+                device = torch.device("meta") if meta else torch.device("cpu")
+                self.proj = nn.Linear(3, 4, bias=False, device=device)
+                buf = (
+                    torch.empty(3, 4, device=device).T
+                    if meta
+                    else torch.arange(12, dtype=torch.float32).reshape(3, 4).T
+                )
+                assert not buf.is_contiguous()
+                self.register_buffer("table", buf)
+                self.requires_grad_(False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.proj(x) * self.table.reshape(-1)[:4]
+
+        ref = NonContiguousBufferModel()
+        x = torch.randn(2, 3)
+        with torch.inference_mode():
+            expected = ref(x)
+
+        store = ModelStore.from_module(copy.deepcopy(ref))
+        for fresh in (
+            NonContiguousBufferModel(meta=False),
+            NonContiguousBufferModel(meta=True),
+        ):
+            offloader = store.bind(fresh)
+            try:
+                assert not fresh.table.is_meta
+                assert fresh.table.is_contiguous()
+                assert torch.equal(fresh.table, ref.table)
+                with activated_model(offloader, "cpu"), torch.inference_mode():
+                    torch.testing.assert_close(fresh(x), expected, atol=0, rtol=0)
+            finally:
+                offloader.deactivate()
+
+    def test_exclusive_live_shell_ownership(self) -> None:
+        model = _TwoStageBlockModel(num_blocks=2, width=8)
+        cfg = OffloadConfig(block_paths=("blocks",))
+        store = ModelStore.from_module(_TwoStageBlockModel(num_blocks=2, width=8))
+        offloader: ModelOffloader | None = ModelOffloader.from_module(model, cfg)
+        assert offloader is not None
+
+        snap = _snapshot_tensors(model)
+        with pytest.raises(ValueError, match="already bound to a live ModelOffloader"):
+            ModelOffloader.from_module(model, cfg)
+        _assert_unmutated(model, snap)
+
+        with pytest.raises(ValueError, match="already bound to a live ModelOffloader"):
+            ModelStore.from_module(model)
+        _assert_unmutated(model, snap)
+
+        with pytest.raises(ValueError, match="already bound to a live ModelOffloader"):
+            store.bind(model, cfg)
+        _assert_unmutated(model, snap)
+
+        with activated_model(offloader, "cpu"):
+            with pytest.raises(ValueError, match="already bound to a live ModelOffloader"):
+                store.bind(model, cfg)
+            with pytest.raises(ValueError, match="already bound to a live ModelOffloader"):
+                ModelStore.from_module(model)
+
+        sub_snap = _snapshot_tensors(model.embed)
+        with pytest.raises(ValueError, match="already bound to a live ModelOffloader"):
+            ModelOffloader.from_module(model.embed)
+        with pytest.raises(ValueError, match="already bound to a live ModelOffloader"):
+            ModelStore.from_module(model.embed)
+        _assert_unmutated(model.embed, sub_snap)
+
+        sub_store = ModelStore.from_module(nn.Linear(8, 8, bias=False).requires_grad_(False))
+        with pytest.raises(ValueError, match="already bound to a live ModelOffloader"):
+            sub_store.bind(model.blocks[0])
+
+        wrapper = nn.Module()
+        wrapper.inner = model
+        with pytest.raises(ValueError, match="already bound to a live ModelOffloader"):
+            ModelOffloader.from_module(wrapper)
+
+        # ModelStore.from_module releases its temporary claim on return so bind(same_model) succeeds once.
+        reusable = _TwoStageBlockModel(num_blocks=2, width=8)
+        reusable_store = ModelStore.from_module(reusable)
+        reusable_offloader = reusable_store.bind(reusable, cfg)
+        with pytest.raises(ValueError, match="already bound to a live ModelOffloader"):
+            reusable_store.bind(reusable, cfg)
+        reusable_offloader.deactivate()
+
+        # Dropping the live offloader releases exclusive ownership.
+        offloader.deactivate()
+        offloader = None
+        gc.collect()
+        ModelStore.from_module(model)
+        rebound = store.bind(model, cfg)
+        rebound.deactivate()
+
+    @staticmethod
+    def _pause_first_install(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[threading.Event, threading.Event]:
+        real_install = HostModuleInstance.install_host
+        entered = threading.Event()
+        proceed = threading.Event()
+        paused = False
+        pause_lock = threading.Lock()
+
+        def paused_install(instance: HostModuleInstance) -> None:
+            nonlocal paused
+            should_pause = False
+            with pause_lock:
+                if not paused:
+                    paused = True
+                    should_pause = True
+            if should_pause:
+                entered.set()
+                assert proceed.wait(timeout=5)
+            real_install(instance)
+
+        monkeypatch.setattr(HostModuleInstance, "install_host", paused_install)
+        return entered, proceed
+
+    def test_concurrent_bind_race_rejects_loser_before_mutating_winner(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def filled_store(value: float) -> ModelStore:
+            proto = nn.Linear(4, 4, bias=False).requires_grad_(False)
+            with torch.no_grad():
+                proto.weight.fill_(value)
+            return ModelStore.from_module(proto)
+
+        store_one, store_two = filled_store(1.0), filled_store(2.0)
+        shell = nn.Linear(4, 4, bias=False, device="meta").requires_grad_(False)
+        winner_entered, winner_proceed = self._pause_first_install(monkeypatch)
+        winner_result: list[ModelOffloader] = []
+        winner_error: list[BaseException] = []
+
+        def run_winner() -> None:
+            try:
+                winner_result.append(store_one.bind(shell))
+            except BaseException as exc:
+                winner_error.append(exc)
+
+        t_winner = threading.Thread(target=run_winner)
+        t_winner.start()
+        assert winner_entered.wait(timeout=5)
+        try:
+            with pytest.raises(ValueError, match="Deactivate and drop"):
+                store_two.bind(shell)
+        finally:
+            winner_proceed.set()
+            t_winner.join(timeout=5)
+
+        assert not winner_error
+        (offloader,) = winner_result
+        try:
+            with activated_model(offloader, "cpu"), torch.inference_mode():
+                out = shell(torch.ones(1, 4))
+            torch.testing.assert_close(out, torch.full((1, 4), 4.0), atol=0, rtol=0)
+        finally:
+            offloader.deactivate()
+
+    def test_custom_eq_and_hash_sibling_modules_do_not_bypass_ownership(self) -> None:
+        class EqualContainer(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lin = nn.Linear(4, 4, bias=False)
+
+            def __eq__(self, other: object) -> bool:
+                return isinstance(other, EqualContainer)
+
+            def __hash__(self) -> int:
+                return 42
+
+        root = nn.Module()
+        root.a = EqualContainer()
+        root.b = EqualContainer()
+        root.a.requires_grad_(False)
+        root.b.requires_grad_(False)
+        offloader = ModelOffloader.from_module(root)
+        try:
+            assert offloader.param_names == frozenset({"a.lin.weight", "b.lin.weight"})
+            child_store = ModelStore.from_module(EqualContainer().requires_grad_(False))
+            snap_b = _snapshot_tensors(root.b)
+            with pytest.raises(ValueError, match="already bound"):
+                child_store.bind(root.b)
+            _assert_unmutated(root.b, snap_b)
+
+            # Equal but disjoint shells remain independently bindable.
+            shell_x = EqualContainer().requires_grad_(False)
+            shell_y = EqualContainer().requires_grad_(False)
+            off_x = child_store.bind(shell_x)
+            off_y = child_store.bind(shell_y)
+            off_x.deactivate()
+            off_y.deactivate()
+        finally:
+            offloader.deactivate()
+
+    def test_torchao_int8_neg_view_preserves_distinct_weights(self) -> None:
+        pytest.importorskip("torchao")
+        try:
+            from torchao.quantization.granularity import PerRow
+            from torchao.quantization.quant_primitives import MappingType
+            from torchao.quantization.quantize_.workflows.int8.int8_tensor import Int8Tensor
+        except ImportError as exc:
+            pytest.skip(f"torchao int8 API unavailable: {exc}")
+
+        from piper_offload.int8_adapter import Int8Adapter
+
+        def make_neg_view_model() -> tuple[nn.Module, torch.Tensor, torch.Tensor]:
+            base = torch.tensor([[2.0, 3.0], [4.0, 5.0]], dtype=torch.bfloat16)
+            t0 = Int8Tensor.from_hp(base, PerRow(), MappingType.SYMMETRIC)
+            t1 = Int8Tensor(
+                torch._neg_view(t0.qdata),
+                t0.scale,
+                list(t0.block_size),
+                t0.dtype,
+                zero_point=t0.zero_point,
+                act_quant_scale=t0.act_quant_scale,
+                act_quant_zero_point=t0.act_quant_zero_point,
+                act_pre_scale=t0.act_pre_scale,
+                act_quant_kwargs=t0.act_quant_kwargs,
+                reduce_range=t0.reduce_range,
+            )
+            model = nn.Module()
+            b0 = nn.Module()
+            b0.weight = nn.Parameter(t0, requires_grad=False)
+            b1 = nn.Module()
+            b1.weight = nn.Parameter(t1, requires_grad=False)
+            model.blocks = nn.ModuleList([b0, b1])
+            return model, Int8Adapter.dequantize(t0), Int8Adapter.dequantize(t1)
+
+        m_store, d0, d1 = make_neg_view_model()
+        store = ModelStore.from_module(m_store)
+        assert store._module_store.params["blocks.0.weight"] is not (
+            store._module_store.params["blocks.1.weight"]
+        )
+        assert torch.equal(Int8Adapter.dequantize(m_store.blocks[0].weight.data), d0)
+        assert torch.equal(Int8Adapter.dequantize(m_store.blocks[1].weight.data), d1)
+
+        m_direct, d0, d1 = make_neg_view_model()
+        offloader = ModelOffloader.from_module(m_direct, OffloadConfig(block_paths=("blocks",)))
+        try:
+            assert torch.equal(Int8Adapter.dequantize(m_direct.blocks[0].weight.data), d0)
+            assert torch.equal(Int8Adapter.dequantize(m_direct.blocks[1].weight.data), d1)
+        finally:
+            offloader.deactivate()
+
+    def test_unregistered_property_block_rejected_atomically(self) -> None:
+        class UnregisteredPropModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.registered = nn.Linear(4, 4, bias=False)
+                self._unregistered = [nn.Linear(4, 4, bias=False)]
+                self.requires_grad_(False)
+
+            @property
+            def blocks(self) -> nn.ModuleList:
+                return nn.ModuleList([self.registered, self._unregistered[0]])
+
+        direct = UnregisteredPropModel()
+        snap = _snapshot_tensors(direct)
+        with pytest.raises(ValueError, match="not registered on the root model"):
+            ModelOffloader.from_module(direct, OffloadConfig(block_paths=("blocks",)))
+        _assert_unmutated(direct, snap)
+
+        store = ModelStore.from_module(UnregisteredPropModel())
+        target = UnregisteredPropModel()
+        snap_target = _snapshot_tensors(target)
+        with pytest.raises(ValueError, match="does not occupy"):
+            store.bind(target, OffloadConfig(block_paths=("blocks",)))
+        _assert_unmutated(target, snap_target)
+
+    def test_bind_ignores_extra_shell_only_block_submodule_alias(self) -> None:
+        torch.manual_seed(8)
+
+        class ProjBlock(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.proj = nn.Linear(4, 4, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return torch.relu(self.proj(x))
+
+        class OrdinaryModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocks = nn.ModuleList([ProjBlock(), ProjBlock()])
+                self.requires_grad_(False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for block in self.blocks:
+                    x = block(x)
+                return x
+
+        class SlicedPropModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.layers = nn.ModuleList([ProjBlock() for _ in range(3)])
+                self.requires_grad_(False)
+
+            @property
+            def blocks(self) -> nn.ModuleList:
+                return self.layers[1:]
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                x = self.layers[0](x)
+                for block in self.blocks:
+                    x = block(x)
+                return x
+
+        x = torch.randn(2, 4)
+        cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+
+        ord_proto = OrdinaryModel()
+        with torch.inference_mode():
+            ord_expected = ord_proto(x)
+        ord_store = ModelStore.from_module(copy.deepcopy(ord_proto))
+        ord_shell = OrdinaryModel()
+        ord_shell.blocks[0].extra = ord_shell.blocks[0].proj
+        ord_offloader = ord_store.bind(ord_shell, cfg)
+        try:
+            assert "blocks.0.extra.weight" not in ord_offloader.param_names
+            assert "blocks.0.proj.weight" in ord_offloader.param_names
+            with activated_model(ord_offloader, "cpu"), torch.inference_mode():
+                torch.testing.assert_close(ord_shell(x), ord_expected, atol=0, rtol=0)
+        finally:
+            ord_offloader.deactivate()
+
+        prop_proto = SlicedPropModel()
+        with torch.inference_mode():
+            prop_expected = prop_proto(x)
+        prop_store = ModelStore.from_module(copy.deepcopy(prop_proto))
+        prop_shell = SlicedPropModel()
+        prop_shell.blocks[0].extra = prop_shell.blocks[0].proj
+        prop_offloader = prop_store.bind(prop_shell, cfg)
+        try:
+            assert "layers.1.extra.weight" not in prop_offloader.param_names
+            assert "layers.1.proj.weight" in prop_offloader.param_names
+            with activated_model(prop_offloader, "cpu"), torch.inference_mode():
+                torch.testing.assert_close(prop_shell(x), prop_expected, atol=0, rtol=0)
+        finally:
+            prop_offloader.deactivate()
+
+    def test_repeated_block_aliases_scale_linearly_in_memory(self) -> None:
+        def make_repeated() -> nn.Module:
+            shared = nn.Module()
+            for i in range(12):
+                setattr(shared, f"p{i}", nn.Parameter(torch.zeros(2, 2), requires_grad=False))
+            model = nn.Module()
+            model.blocks = nn.ModuleList([shared] * 256)
+            return model
+
+        cfg = OffloadConfig(block_paths=("blocks",))
+        direct = make_repeated()
+        tracemalloc.start()
+        try:
+            offloader = ModelOffloader.from_module(direct, cfg)
+            _cur, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        try:
+            assert peak < 4 * 1024 * 1024
+            assert len(offloader.param_names) == 256 * 12
+            index = block_components(offloader)[0]._param_name_to_block_param
+            assert index["blocks.0.p0"] == (0, "p0")
+            assert index["blocks.255.p11"] == (255, "p11")
+        finally:
+            offloader.deactivate()
+
+        store = ModelStore.from_module(make_repeated())
+        bound = store.bind(make_repeated(), cfg)
+        try:
+            assert len(bound.param_names) == 256 * 12
+            index_bound = block_components(bound)[0]._param_name_to_block_param
+            assert index_bound["blocks.0.p0"] == (0, "p0")
+            assert index_bound["blocks.255.p11"] == (255, "p11")
+        finally:
+            bound.deactivate()

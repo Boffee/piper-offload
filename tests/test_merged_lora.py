@@ -33,6 +33,7 @@ from piper_offload import (
     ResourceCache,
     ModelOffloader,
     ModelSpec,
+    OffloadConfig,
     ParameterDelta,
     ParameterDeltaTransform,
     ParameterValue,
@@ -265,7 +266,7 @@ def _expected_routed_output(
 
 def _make_strategy(model: nn.Module) -> ModelOffloader:
     """Shorthand for constructing the strategy."""
-    return ModelOffloader.from_module(model, block_paths=["transformer_blocks"])
+    return ModelOffloader.from_module(model, OffloadConfig(block_paths=("transformer_blocks",)))
 
 
 def _plan_lora_merge(offloader: ModelOffloader, adapter: Adapter) -> dict[str, ParameterOverride]:
@@ -1428,7 +1429,7 @@ class TestMergeCorrectness:
         )
         offloader = ModelOffloader.from_module(
             model,
-            transient_paths=["embed"],
+            OffloadConfig(transient_paths=("embed",)),
         )
         component = dict(transient_components(offloader))["embed"]
         with activated_model(offloader, "cuda", adapters=[lora], adapter_strengths=[0.5], adapter_mode=mode):
@@ -1456,7 +1457,7 @@ class TestMergeCorrectness:
         lora = _make_lora(num_blocks=2, dim=16, seed=9)
         offloader = ModelOffloader.from_module(
             model,
-            transient_block_paths=["transformer_blocks"],
+            OffloadConfig(transient_block_paths=("transformer_blocks",)),
         )
         with activated_model(offloader, "cuda", adapters=[lora], adapter_strengths=[0.5], adapter_mode=mode):
             value = torch.randn(
@@ -1505,7 +1506,9 @@ class TestMergeCorrectness:
         ]
         strategy = ModelOffloader.from_module(
             m,
-            block_paths=["transformer_blocks"] if streamed else [],
+            OffloadConfig(
+                block_paths=("transformer_blocks",) if streamed else (),
+            ),
         )
         adapters, strengths = zip(*loras, strict=True)
         with activated_model(strategy, "cuda", adapters=adapters, adapter_strengths=strengths):
@@ -2040,9 +2043,11 @@ class TestParameterValueActivation:
         )
         offloader = ModelOffloader.from_module(
             model,
-            block_paths=("blocks",),
-            block_mode=block_mode,  # type: ignore[arg-type]
-            block_compile=compile_config,
+            OffloadConfig(
+                block_paths=("blocks",),
+                block_mode=block_mode,  # type: ignore[arg-type]
+                block_compile=compile_config,
+            ),
         )
         values = {f"blocks.{idx}.weight": torch.eye(dim) * (idx + 1) for idx in range(3)}
         lora = Adapter.from_state_dict(values)
@@ -2094,9 +2099,11 @@ class TestParameterValueActivation:
         )
         offloader = ModelOffloader.from_module(
             model,
-            block_paths=("blocks",),
-            block_mode=block_mode,  # type: ignore[arg-type]
-            block_compile=compile_config,
+            OffloadConfig(
+                block_paths=("blocks",),
+                block_mode=block_mode,  # type: ignore[arg-type]
+                block_compile=compile_config,
+            ),
         )
         value = torch.eye(dim)
         lora = Adapter.from_state_dict({"blocks.1.weight": value})
@@ -2964,7 +2971,7 @@ class TestRoutedMode:
         strength = 0.5
         s = ModelOffloader.from_module(
             m,
-            block_paths=["transformer_blocks"],
+            OffloadConfig(block_paths=("transformer_blocks",)),
         )
         with activated_model(s, "cuda", adapters=[lora], adapter_strengths=[strength], adapter_mode="routed"):
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
@@ -3001,7 +3008,7 @@ class TestRoutedStaging:
         x = torch.randn(3, 16)
         lora1 = _make_lora(num_blocks=1, dim=16, seed=1)
         lora2 = _make_lora(num_blocks=1, dim=16, seed=2)
-        s = ModelOffloader.from_module(m, block_paths=["transformer_blocks"])
+        s = ModelOffloader.from_module(m, OffloadConfig(block_paths=("transformer_blocks",)))
 
         def routed_forward(adapters: list[Adapter], strengths: list[float]) -> torch.Tensor:
             with activated_model(s, "cpu", adapters=adapters, adapter_strengths=strengths, adapter_mode="routed"):
@@ -3136,7 +3143,7 @@ class TestRoutedStaging:
             "transformer_blocks.1.attn.base_layer.weight",
         }
 
-        s = ModelOffloader.from_module(m, block_paths=["transformer_blocks"])
+        s = ModelOffloader.from_module(m, OffloadConfig(block_paths=("transformer_blocks",)))
         x = torch.randn(2, 16)
         with activated_model(s, "cpu", adapters=[lora], adapter_strengths=[0.5], adapter_mode="routed"):
             actual = m(x).clone()
@@ -3154,7 +3161,7 @@ class TestRoutedStaging:
     def test_deactivate_removes_staging_hooks(self) -> None:
         m = _make_bf16_model(num_blocks=2, dim=16).float()
         lora = _make_lora(num_blocks=2, dim=16, seed=4)
-        s = ModelOffloader.from_module(m, block_paths=["transformer_blocks"])
+        s = ModelOffloader.from_module(m, OffloadConfig(block_paths=("transformer_blocks",)))
 
         x = torch.randn(2, 16)
         base = m(x)
@@ -3176,7 +3183,7 @@ class TestRoutedStaging:
             state_dict=_make_lora_sd(num_blocks=2, dim=16, seed=7),
         )
         x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
-        s = ModelOffloader.from_module(m, block_paths=["transformer_blocks"])
+        s = ModelOffloader.from_module(m, OffloadConfig(block_paths=("transformer_blocks",)))
         with activated_model(s, "cuda", adapters=[lora], adapter_strengths=[0.5]):
             merged = m(x).clone()
             torch.cuda.synchronize()
@@ -3196,7 +3203,7 @@ class TestRoutedStaging:
             "transformer_blocks.0.absent.lora_B.weight": torch.randn(16, 4),
         }
         bad = Adapter.from_state_dict(state_dict=sd)
-        s = ModelOffloader.from_module(m, block_paths=["transformer_blocks"])
+        s = ModelOffloader.from_module(m, OffloadConfig(block_paths=("transformer_blocks",)))
         x = torch.randn(2, 16, dtype=torch.bfloat16)
         base = m(x)
         with pytest.raises(ValueError, match="not parameters in the model"):
