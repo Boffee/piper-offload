@@ -92,11 +92,12 @@ foreground; streaming then resumes prefetching from the block that ran.
 
 ### Yield to collectives
 
-Weight copies and collectives of the experimental `piper_relay` process group
-share the host link, and running both at once slows both. Streaming copies the
-lookahead block one tensor at a time, yielding between 4 MiB chunks of large
-contiguous tensors (and between smaller or non-contiguous tensors) while a
-collective moves data, so a collective issued inside a block waits for at most
+Weight copies and transfers of the experimental `piper_relay` process group
+share each GPU's host link, and running both at once on the same GPU slows
+both. Streaming copies the lookahead block one tensor at a time, yielding
+between 4 MiB chunks of large contiguous tensors (and between smaller or
+non-contiguous tensors) while a `piper_relay` transfer moves data on that same
+GPU, so a collective issued inside a block waits for at most
 one chunk of a large weight rather than the whole tensor or block. Rolling
 refills cannot wait; use streaming for blocks that issue collectives.
 

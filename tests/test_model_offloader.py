@@ -1172,7 +1172,7 @@ class TestTraversalPrefetch:
         x = torch.randn(2, 8, device="cuda")
 
         with activated_model(strategy, "cuda"), torch.no_grad():
-            with foreground_transfer():
+            with foreground_transfer("cuda"):
                 streamer.blocks[0](x)
                 lookahead = runtime._lookahead
                 assert lookahead is not None and lookahead.prefetch is not None
