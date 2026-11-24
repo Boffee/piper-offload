@@ -1,6 +1,8 @@
 """Tests for name-based host module store/instance primitives."""
 
+import tempfile
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -1414,11 +1416,17 @@ class TestQuantizedMetaPlaceholderBind:
 
         from torch.distributed.tensor import init_device_mesh
 
-        dist.init_process_group("gloo", store=dist.HashStore(), rank=0, world_size=1)
-        try:
-            yield init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
-        finally:
-            dist.destroy_process_group()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            dist.init_process_group(
+                "gloo",
+                store=dist.FileStore(str(Path(tmpdir) / "store"), 1),
+                rank=0,
+                world_size=1,
+            )
+            try:
+                yield init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
+            finally:
+                dist.destroy_process_group()
 
     def test_dtensor_cpu_mesh_binds_packed_adapter_and_rejects_mismatches(self) -> None:
         from torch.distributed.tensor import DTensor, Replicate, Shard, init_device_mesh
