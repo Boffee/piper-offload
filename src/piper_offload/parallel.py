@@ -117,7 +117,14 @@ from ._parallel_collectives import (
     validate_tensors,
     validate_writable,
 )
-from ._sequential_runtime import StartupGate, acquire_session, isolate_runtime, owns_session, release_session
+from ._sequential_runtime import (
+    StartupGate,
+    acquire_session,
+    isolate_runtime,
+    make_in_process_store,
+    owns_session,
+    release_session,
+)
 
 __all__ = ["ParallelExecutor"]
 
@@ -1211,7 +1218,7 @@ class ParallelExecutor:
                 )
                 self._progress_thread.start()
                 self._startup_gate = StartupGate()
-                self._start_workers(dist.HashStore())
+                self._start_workers(make_in_process_store())
                 with self._cv:
                     self._state = _State.OPEN
             except BaseException:

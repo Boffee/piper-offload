@@ -31,7 +31,7 @@ from torch.distributed.distributed_c10d import GroupName
 from torch.utils._pytree import tree_map_only
 
 from ._sequential_collectives import LocalCollective, execute
-from ._sequential_runtime import StartupGate, acquire_session, owns_session, release_session
+from ._sequential_runtime import StartupGate, acquire_session, make_in_process_store, owns_session, release_session
 
 _BACKEND = "piper_sequential"
 _active_executor: SequentialExecutor | None = None
@@ -330,7 +330,7 @@ class SequentialExecutor:
                 self._runtime = runtime
                 runtime.__enter__()
                 _active_executor = self
-                store = dist.HashStore()
+                store = make_in_process_store()
                 ready: list[Future[None]] = [Future(), Future()]
                 self._queues = [queue.SimpleQueue(), queue.SimpleQueue()]
                 gate = StartupGate()

@@ -6,9 +6,11 @@ import contextlib
 import sys
 import threading
 import time
+from collections.abc import Sequence
+from datetime import timedelta
 from functools import wraps
 from itertools import count
-from typing import Any
+from typing import Any, cast
 
 import torch.distributed as dist
 
@@ -16,6 +18,8 @@ import torch.distributed as dist
 from torch._C._distributed_c10d import _set_thread_isolation_mode  # type: ignore[attr-defined]
 from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 from torch.distributed.device_mesh import DeviceMesh
+
+_MAX_STORE_WAIT_SECONDS = 3600.0
 
 # Process-wide lock shared by SequentialExecutor and ParallelExecutor because
 # c10d._world and _set_thread_isolation_mode are global state.
@@ -200,3 +204,128 @@ class _RuntimeIsolation:
 def isolate_runtime(backend: str = "piper_sequential") -> _RuntimeIsolation:
     """Build a retryable isolation scope capturing current globals before mutation."""
     return _RuntimeIsolation(backend)
+
+
+class _InProcessStore(dist.Store):
+    """Cross-platform in-memory ``dist.Store`` for in-process rank threads.
+
+    PyTorch omits ``HashStore`` from Windows builds; implementing ``dist.Store``
+    directly keeps Linux and Windows on one shared coordination path.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cv = threading.Condition()
+        self._data: dict[str, bytes] = {}
+
+    @staticmethod
+    def _to_bytes(value: str | bytes) -> bytes:
+        return value.encode("utf-8") if isinstance(value, str) else bytes(value)
+
+    def _timeout_seconds(self) -> float:
+        return cast("timedelta", cast("Any", self).timeout).total_seconds()
+
+    def _wait_all_locked(self, keys: Sequence[str], timeout_seconds: float, missing_msg: str) -> None:
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while any(key not in self._data for key in keys):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise dist.DistStoreError(missing_msg)  # type: ignore[attr-defined]
+            self._cv.wait(timeout=min(remaining, _MAX_STORE_WAIT_SECONDS))
+
+    def set(self, key: str, value: str | bytes) -> None:  # type: ignore[override]
+        raw = self._to_bytes(value)
+        with self._cv:
+            self._data[key] = raw
+            self._cv.notify_all()
+
+    def get(self, key: str) -> bytes:
+        with self._cv:
+            self._wait_all_locked(
+                (key,),
+                self._timeout_seconds(),
+                f"Timeout waiting for key {key!r} in in-process store",
+            )
+            return self._data[key]
+
+    def add(self, key: str, value: int) -> int:
+        with self._cv:
+            raw = self._data.get(key)
+            current = 0 if raw is None else int(raw)
+            updated = current + int(value)
+            self._data[key] = str(updated).encode("ascii")
+            self._cv.notify_all()
+            return updated
+
+    def wait(self, keys: Sequence[str], timeout: timedelta | None = None) -> None:  # type: ignore[override]
+        dur = timeout.total_seconds() if isinstance(timeout, timedelta) else self._timeout_seconds()
+        with self._cv:
+            self._wait_all_locked(
+                keys,
+                dur,
+                f"Timeout waiting for keys {list(keys)!r} in in-process store",
+            )
+
+    def check(self, keys: Sequence[str]) -> bool:  # type: ignore[override]
+        with self._cv:
+            return all(key in self._data for key in keys)
+
+    def compare_set(self, key: str, expected: str | bytes, desired: str | bytes) -> bytes:  # type: ignore[override]
+        exp = self._to_bytes(expected)
+        des = self._to_bytes(desired)
+        with self._cv:
+            current = self._data.get(key)
+            if current is None:
+                if exp != b"":
+                    return exp
+                self._data[key] = des
+                self._cv.notify_all()
+                return des
+            if current == exp:
+                self._data[key] = des
+                self._cv.notify_all()
+                return des
+            return current
+
+    def deleteKey(self, key: str) -> bool:  # noqa: N802 -- C++ PyStore virtual trampoline name
+        with self._cv:
+            return self._data.pop(key, None) is not None
+
+    delete_key = deleteKey
+
+    def getNumKeys(self) -> int:  # noqa: N802 -- C++ PyStore virtual trampoline name
+        with self._cv:
+            return len(self._data)
+
+    num_keys = getNumKeys
+
+    def append(self, key: str, value: str | bytes) -> None:  # type: ignore[override]
+        raw = self._to_bytes(value)
+        with self._cv:
+            self._data[key] = self._data.get(key, b"") + raw
+            self._cv.notify_all()
+
+    def multi_get(self, keys: Sequence[str]) -> list[bytes]:  # type: ignore[override]
+        with self._cv:
+            self._wait_all_locked(
+                keys,
+                self._timeout_seconds(),
+                f"Timeout waiting for keys {list(keys)!r} in in-process store",
+            )
+            return [self._data[key] for key in keys]
+
+    def multi_set(self, keys: Sequence[str], values: Sequence[str | bytes]) -> None:  # type: ignore[override]
+        if len(keys) != len(values):
+            raise ValueError("keys and values must have the same length")
+        with self._cv:
+            for key, value in zip(keys, values, strict=True):
+                self._data[key] = self._to_bytes(value)
+            self._cv.notify_all()
+
+    def clone(self) -> _InProcessStore:
+        return self
+
+
+def make_in_process_store() -> dist.Store:
+    """Create a cross-platform in-memory ``dist.Store`` for in-process rank workers."""
+    return _InProcessStore()

@@ -795,10 +795,7 @@ def _exercise_mapped_ro_subrange(ro: torch.Tensor, ro_sub: torch.Tensor) -> None
         ex.run(check_views)
 
 
-def test_validation_subrange_scatter_alias_singleton_and_uneven_allgather(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _run_mapped_ro_subrange_checks(tmp_path: Path) -> None:
     ckpt_path = tmp_path / "readonly.bin"
     raw = torch.arange(16, dtype=torch.float32).numpy().tobytes()
     ckpt_path.write_bytes(raw)
@@ -812,13 +809,29 @@ def test_validation_subrange_scatter_alias_singleton_and_uneven_allgather(
         warnings.filterwarnings("ignore", message="The given buffer is not writable")
         ro_sub = torch.frombuffer(memoryview(mapped)[8:24], dtype=torch.float32)
 
+    unwinding = False
     try:
         _exercise_mapped_ro_subrange(ro_tensor, ro_sub)
+    except BaseException:
+        unwinding = True
+        raise
     finally:
         del ro_sub, ro_tensor, mapped
         gc.collect()
-        mm.close()
-        f.close()
+        try:
+            mm.close()
+        except BufferError:
+            if not unwinding:
+                raise
+        finally:
+            f.close()
+
+
+def test_validation_subrange_scatter_alias_singleton_and_uneven_allgather(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _run_mapped_ro_subrange_checks(tmp_path)
 
     with ParallelExecutor(["cpu", "cpu"], staging_bytes=256) as ex:
         # CPU scatter self-alias collision: root sources [x=11, y=22], root out=x, rank 1 out=x.
@@ -915,9 +928,10 @@ print(json.dumps({"shards": res, "hits": du.counters["inductor"].get("fxgraph_ca
             env=run_env,
             capture_output=True,
             text=True,
-            check=True,
+            check=False,
             timeout=120,
         )
+        assert proc.returncode == 0, proc.stderr
         return json.loads(proc.stdout.strip().splitlines()[-1])
 
     first = _run_case("0")
@@ -957,9 +971,10 @@ print("OK")
         cwd=tmp_path,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
         timeout=60,
     )
+    assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip().endswith("OK")
 
     retained: list[dist.Work] = []
@@ -978,10 +993,43 @@ print("OK")
 
 
 def test_rejects_preexisting_process_group() -> None:
+    store = _sequential_runtime.make_in_process_store()
+    store.set_timeout(timedelta(seconds=0.05))
+    prefixed = dist.PrefixStore("inproc", store)
+    prefixed.set("k", b"\x80\xff")
+    assert prefixed.get("k") == b"\x80\xff"
+    assert prefixed.check(["k"]) and not prefixed.check(["missing"])
+    assert prefixed.add("cnt", 2) == 2
+    assert prefixed.add("cnt", 3) == 5
+    assert prefixed.compare_set("missing_nonempty", b"expected", b"new") == b"expected"
+    assert not prefixed.check(["missing_nonempty"])
+    assert prefixed.compare_set("missing_empty", b"", b"created") == b"created"
+    assert prefixed.compare_set("missing_empty", b"wrong", b"other") == b"created"
+    assert prefixed.compare_set("missing_empty", b"created", b"updated") == b"updated"
+    prefixed.append("k", b"\x01")
+    assert prefixed.get("k") == b"\x80\xff\x01"
+    prefixed.multi_set(["m1", "m2"], [b"v1", "v2"])
+    assert prefixed.multi_get(["m1", "m2"]) == [b"v1", b"v2"]
+    assert prefixed.num_keys() == 5
+    assert prefixed.delete_key("m2") is True
+    assert prefixed.delete_key("m2") is False
+    assert prefixed.num_keys() == 4
+    assert prefixed.clone().get("m1") == b"v1"
+    store_err: type[BaseException] = getattr(dist, "DistStoreError", RuntimeError)
+    with pytest.raises(store_err):
+        prefixed.wait(["never_set"], timedelta(seconds=0.01))
+    with pytest.raises(store_err):
+        prefixed.get("never_set")
+
     if not dist.is_gloo_available():
         pytest.skip("Gloo needed to set up pre-existing group")
     original_hook = sys.excepthook
-    dist.init_process_group("gloo", store=dist.HashStore(), rank=0, world_size=1)
+    dist.init_process_group(
+        "gloo",
+        store=_sequential_runtime.make_in_process_store(),
+        rank=0,
+        world_size=1,
+    )
     try:
         with pytest.raises(RuntimeError, match="no existing distributed"):
             with ParallelExecutor(["cpu", "cpu"]):
