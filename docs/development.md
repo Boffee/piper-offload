@@ -88,6 +88,7 @@ Keep latency and throughput measurements in [benchmarks](../benchmarks).
 | Pin manager | Transfer leases, page accounting, registration order, and the shared lock | [pin_manager.py](../src/piper_offload/pin_manager.py) |
 | Transfer priority | Background host-to-device copies wait while foreground transfers move data | [_transfer_priority.py](../src/piper_offload/_transfer_priority.py) |
 | Relay process group | Coordinate collectives, point-to-point operations, and host staging across ranks | [communication.py](../src/piper_offload/communication.py) |
+| In-process multi-rank executors | Coordinate concurrent or serialized multi-rank threads, runtime isolation, and local transports | [sequential.py](../src/piper_offload/sequential.py), [parallel.py](../src/piper_offload/parallel.py), [_sequential_runtime.py](../src/piper_offload/_sequential_runtime.py), [_parallel_collectives.py](../src/piper_offload/_parallel_collectives.py) |
 | Memory components | Owned checkpoint copies, platform allocation, and Windows retention | [_copy_memory.py](../src/piper_offload/_copy_memory.py), [_copy_memory_windows.py](../src/piper_offload/_copy_memory_windows.py), [_host_memory.py](../src/piper_offload/_host_memory.py) |
 | Block compilation | Compile declared block forwards and schedule rolling transfers | [block_compile.py](../src/piper_offload/block_compile.py), [rolling_compile.py](../src/piper_offload/rolling_compile.py) |
 

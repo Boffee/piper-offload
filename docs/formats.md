@@ -176,12 +176,17 @@ See [dtensor_adapter.py](../src/piper_offload/dtensor_adapter.py) for supported
 host projections and reconstruction.
 
 For experimental DTensor execution, [communication.py](../src/piper_offload/communication.py)
-documents `piper_relay` collectives through host memory, and
+documents `piper_relay` collectives through host memory,
 [sequential.py](../src/piper_offload/sequential.py) documents `SequentialExecutor`
-for two ranks sharing one process and GPU. Their docstrings cover setup and
-execution contracts. Block streaming yields host transfers to `piper_relay`
-collectives, as [streaming](streaming.md#yield-to-collectives) describes;
-`SequentialExecutor` does not coordinate ordinary offloader scheduling.
+for two ranks sharing one process and GPU, and
+[parallel.py](../src/piper_offload/parallel.py) documents `ParallelExecutor`
+and the `piper_parallel` backend for concurrent multi-rank execution over CPU,
+direct CUDA peer copies, and bounded host-staged transfers. Their docstrings
+cover setup and execution contracts. Block streaming yields host transfers to
+`piper_relay` collectives and CUDA `ParallelExecutor` transfers via
+`foreground_transfer`, as [streaming](streaming.md#yield-to-collectives)
+describes; `SequentialExecutor` does not coordinate ordinary offloader
+scheduling.
 
 A custom tensor format integrates through `register_adapter()`. Implement the
 capture, physical-storage enumeration, allocation, transfer, and reconstruction

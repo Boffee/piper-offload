@@ -31,9 +31,9 @@ from torch.distributed.distributed_c10d import GroupName
 from torch.utils._pytree import tree_map_only
 
 from ._sequential_collectives import LocalCollective, execute
+from ._sequential_runtime import StartupGate, acquire_session, owns_session, release_session
 
 _BACKEND = "piper_sequential"
-_session_lock = threading.Lock()
 _active_executor: SequentialExecutor | None = None
 
 
@@ -292,58 +292,69 @@ class SequentialExecutor:
         self._call_lock = threading.Lock()
         self._pending_job: _Job | None = None
         self._runtime: AbstractContextManager[None] | None = None
+        self._startup_gate: StartupGate | None = None
         self._closing = False
 
     def __enter__(self) -> Self:
         global _active_executor  # noqa: PLW0603 -- one scoped process-wide rank runtime
-        if self._coordinator is not None or self._closing:
-            raise RuntimeError("sequential executor cannot be reopened")
-        if self.device.type != "cuda" or not torch.cuda.is_available():
-            raise ValueError("SequentialExecutor requires one CUDA/HIP device")
-        if not _session_lock.acquire(blocking=False):
-            raise RuntimeError("another SequentialExecutor is already open")
+        if not self._call_lock.acquire(blocking=False):
+            raise RuntimeError("cannot open SequentialExecutor while run or close is active")
         try:
-            if dist.is_initialized() or dist.distributed_c10d._world.pg_map:
-                raise RuntimeError("SequentialExecutor requires no existing distributed process groups")
-            # Fail before changing process-wide state if the direct SUM kernel
-            # dependency is unavailable.
-            from . import _triton_sequential  # noqa: PLC0415, F401
-            from ._sequential_runtime import isolate_runtime  # noqa: PLC0415
+            if self._coordinator is not None or self._closing or owns_session(self) or self._startup_gate is not None:
+                raise RuntimeError("sequential executor cannot be reopened")
+            if self.device.type != "cuda" or not torch.cuda.is_available():
+                raise ValueError("SequentialExecutor requires one CUDA/HIP device")
+            if not acquire_session(self):
+                raise RuntimeError("another executor is already open")
+            try:
+                if dist.is_initialized() or dist.distributed_c10d._world.pg_map:
+                    raise RuntimeError("SequentialExecutor requires no existing distributed process groups")
+                # Fail before changing process-wide state if the direct SUM kernel
+                # dependency is unavailable.
+                from . import _triton_sequential  # noqa: PLC0415, F401
+                from ._sequential_runtime import isolate_runtime  # noqa: PLC0415
 
-            index = self.device.index if self.device.index is not None else torch.cuda.current_device()
-            self.device = torch.device("cuda", index)
-            self._coordinator = _Coordinator(
-                self.device,
-                torch.cuda.default_stream(self.device),
-                self.timeout.total_seconds(),
-            )
-            plugin = dist.Backend._plugins.get(_BACKEND.upper())
-            if plugin is not None and plugin.creator_fn is not _create_group:
-                raise RuntimeError("a different backend is already registered as piper_sequential")
-            if plugin is None:
-                dist.Backend.register_backend(_BACKEND, _create_group, extended_api=True, devices=["cpu", "cuda"])
-            runtime = isolate_runtime()
-            runtime.__enter__()
-            self._runtime = runtime
-            _active_executor = self
-            store = dist.HashStore()
-            ready: list[Future[None]] = [Future(), Future()]
-            self._queues = [queue.SimpleQueue(), queue.SimpleQueue()]
-            for rank in range(2):
-                thread = threading.Thread(target=self._worker, args=(rank, store, ready[rank]), daemon=True)
-                thread.start()
-                self._threads.append(thread)
-            for result in ready:
-                result.result(timeout=self.timeout.total_seconds())
-        except BaseException:
-            if self._runtime is not None:
-                self.close()
-            else:
-                _session_lock.release()
-            raise
+                index = self.device.index if self.device.index is not None else torch.cuda.current_device()
+                self.device = torch.device("cuda", index)
+                self._coordinator = _Coordinator(
+                    self.device,
+                    torch.cuda.default_stream(self.device),
+                    self.timeout.total_seconds(),
+                )
+                plugin = dist.Backend._plugins.get(_BACKEND.upper())
+                if plugin is not None and plugin.creator_fn is not _create_group:
+                    raise RuntimeError("a different backend is already registered as piper_sequential")
+                if plugin is None:
+                    dist.Backend.register_backend(_BACKEND, _create_group, extended_api=True, devices=["cpu", "cuda"])
+                runtime = isolate_runtime()
+                self._runtime = runtime
+                runtime.__enter__()
+                _active_executor = self
+                store = dist.HashStore()
+                ready: list[Future[None]] = [Future(), Future()]
+                self._queues = [queue.SimpleQueue(), queue.SimpleQueue()]
+                gate = StartupGate()
+                self._startup_gate = gate
+                for rank in range(2):
+                    thread = threading.Thread(
+                        target=self._worker,
+                        args=(rank, store, ready[rank], gate),
+                        daemon=True,
+                    )
+                    self._threads.append(thread)
+                    thread.start()
+                for result in ready:
+                    result.result(timeout=self.timeout.total_seconds())
+            except BaseException:
+                self._close_locked()
+                raise
+        finally:
+            self._call_lock.release()
         return self
 
-    def _worker(self, rank: int, store: dist.Store, ready: Future[None]) -> None:
+    def _worker(self, rank: int, store: dist.Store, ready: Future[None], gate: StartupGate) -> None:
+        if not gate.try_admit():
+            return
         coordinator = self._coordinator
         assert coordinator is not None
         try:
@@ -372,8 +383,11 @@ class SequentialExecutor:
             if not ready.done():
                 ready.set_exception(error)
         finally:
-            if dist.is_initialized():
-                dist.destroy_process_group()
+            try:
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+            finally:
+                gate.mark_exited()
 
     def run[T](self, callback: Callable[[int], T], *, sequential: bool = True) -> tuple[T, T]:
         """Invoke both ranks; after an error, only local ``sequential=False`` cleanup is allowed."""
@@ -414,37 +428,58 @@ class SequentialExecutor:
                 self._pending_job = None
             self._call_lock.release()
 
+    def _close_locked(self) -> None:
+        global _active_executor  # noqa: PLW0603 -- restore the scoped process-wide rank runtime
+        if (
+            self._runtime is None
+            and not owns_session(self)
+            and self._coordinator is None
+            and self._startup_gate is None
+        ):
+            return
+        self._closing = True
+        gate = self._startup_gate
+        if gate is not None:
+            gate.cancel()
+        deadline = time.monotonic() + self.timeout.total_seconds()
+        if self._coordinator is not None:
+            self._coordinator.abort(RuntimeError("sequential executor is closing"))
+            for inbox in self._queues:
+                inbox.put(None)
+            for thread in self._threads:
+                if thread.is_alive():
+                    thread.join(min(max(0, deadline - time.monotonic()), 3600.0))
+            if any(thread.is_alive() for thread in self._threads) or (
+                gate is not None and not gate.wait_exited(deadline)
+            ):
+                raise TimeoutError("sequential callbacks have not exited; distributed isolation is still active")
+            self._threads.clear()
+            self._queues.clear()
+            self._startup_gate = None
+            self._coordinator.stream.synchronize()
+            self._coordinator.pending = None
+            self._coordinator.error = None
+            self._coordinator = None
+            self._pending_job = None
+        elif gate is not None:
+            if not gate.wait_exited(deadline):
+                raise TimeoutError("sequential workers have not exited; distributed isolation is still active")
+            self._startup_gate = None
+        if self._runtime is not None:
+            self._runtime.__exit__(None, None, None)
+            self._runtime = None
+        if _active_executor is self:
+            _active_executor = None
+        release_session(self)
+
     def close(self) -> None:
         """Join rank workers and then restore the process's distributed state."""
-        global _active_executor  # noqa: PLW0603 -- restore the scoped process-wide rank runtime
-        if self._runtime is None:
-            return
         if threading.current_thread() in self._threads:
             raise RuntimeError("close SequentialExecutor outside its rank callbacks")
         if not self._call_lock.acquire(blocking=False):
             raise RuntimeError("cannot close SequentialExecutor while run is active")
         try:
-            assert self._coordinator is not None
-            self._closing = True
-            self._coordinator.abort(RuntimeError("sequential executor is closing"))
-            for inbox in self._queues:
-                inbox.put(None)
-            deadline = time.monotonic() + self.timeout.total_seconds()
-            for thread in self._threads:
-                thread.join(max(0, deadline - time.monotonic()))
-            if any(thread.is_alive() for thread in self._threads):
-                raise TimeoutError("sequential callbacks have not exited; distributed isolation is still active")
-            try:
-                self._coordinator.stream.synchronize()
-            finally:
-                self._runtime.__exit__(None, None, None)
-                self._runtime = None
-                self._coordinator.pending = None
-                self._coordinator.error = None
-                self._coordinator = None
-                self._pending_job = None
-                _active_executor = None
-                _session_lock.release()
+            self._close_locked()
         finally:
             self._call_lock.release()
 

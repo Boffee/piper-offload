@@ -179,16 +179,26 @@ class PinLease:
     ) -> None:
         self.registered_bytes = registered_bytes
         self.pageable_bytes = pageable_bytes
+        self._manager: PinManager | None = manager
+        self._key = key
+        self._closed = False
         self._finalizer = weakref.finalize(self, manager._close_lease, key)
         self._finalizer.atexit = False
 
     @property
     def closed(self) -> bool:
-        return not self._finalizer.alive
+        return self._closed or not self._finalizer.alive
 
     def close(self) -> None:
-        """Close the lease, releasing what it holds; idempotent."""
-        self._finalizer()
+        """Close the lease, releasing what it holds; idempotent and retry-safe."""
+        if self._closed:
+            return
+        manager = self._manager
+        if manager is not None:
+            manager._close_lease(self._key)
+        self._closed = True
+        self._finalizer.detach()
+        self._manager = None
 
     def __enter__(self) -> Self:
         if self.closed:
