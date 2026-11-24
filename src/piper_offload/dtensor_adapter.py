@@ -24,10 +24,12 @@ weights, LoRA factor regions needed by each rank before device staging, then
 delegates the actual update to the local shard's adapter. This keeps
 tensor-parallel concerns out of format-specific quant adapters.
 
-Dense ``Shard(0)`` and rank-two ``Shard(1)`` tensors can also be projected from
-a full plain host parameter. The target DTensor supplies only its distributed
-layout and may use a meta local tensor; the resting local shard remains a view
-of the original host allocation, including mmap-backed checkpoint storage.
+Dense ``Replicate`` and contiguous ``Shard(dim)`` tensors across 1D and N-D
+meshes can also be projected from a full plain host parameter (and
+``Replicate`` tensors from non-``nn.Parameter``-subclass quantized host
+parameters). The target DTensor supplies only its distributed layout and may
+use a meta local tensor; the resting local shard remains a view or alias of the
+original host allocation, including mmap-backed checkpoint storage.
 
 The adapter advertises no full dequantize/requantize or ``copy_into``
 capability. It can expose a dense local shard when the inner adapter can, which
@@ -43,15 +45,15 @@ would collapse tied-weight dedup) and its ``shape``/``numel`` are *global*
 (which would over-account :meth:`cache_bytes` by the world size).
 
 The resting (deactivated) weight stays a ``DTensor`` but on a CPU
-``DeviceMesh`` (:func:`~piper_offload._dtensor.cpu_mesh_for`) so its local
-shard stays on the host — ``from_local`` moves the local onto the mesh
-device (verified), so a CUDA mesh would re-allocate GPU memory for the
-offloaded state. Keeping it a DTensor (rather than a bare local shard) means
-a deactivated block's weight still resolves to this adapter, so the
-store<->module bind and the resident GPU form stay layout-consistent;
-:meth:`accepts_bind_target` ignores the mesh device type so the CPU-resting
-and CUDA-resident forms match. The resident GPU parameter is rebuilt
-on the original CUDA mesh in :meth:`gpu_param`.
+``DeviceMesh`` (:func:`~piper_offload._dtensor.cpu_mesh_for`, cached on host
+state during capture or projection) so its local shard stays on the host —
+``from_local`` moves the local onto the mesh device (verified), so a CUDA mesh
+would re-allocate GPU memory for the offloaded state. Keeping it a DTensor
+(rather than a bare local shard) means a deactivated block's weight still
+resolves to this adapter, so the store<->module bind and the resident GPU form
+stay layout-consistent; :meth:`accepts_bind_target` ignores the mesh device type
+so the CPU-resting and CUDA-resident forms match. The resident GPU parameter is
+rebuilt on the original CUDA mesh in :meth:`gpu_param`.
 """
 
 from collections.abc import Sequence
@@ -92,19 +94,21 @@ from .tensor_adapters import (
 class _DTensorHost:
     """Host state for a DTensor: the inner adapter's host local-shard
     state plus the distributed wrapper to replay on reconstruction. ``mesh`` is
-    the original (CUDA) mesh — used as-is by :meth:`gpu_param` for the resident
-    weight (which computes, so it must reuse the model's canonical mesh), and
-    mirrored to a CPU mesh on demand by :meth:`cpu_param` for the non-computing
-    resting weight. ``shape`` / ``stride`` are the original GLOBAL shape/stride,
-    captured so the rebuilt DTensor reports the true global shape even for
-    uneven shards (where ``from_local`` would otherwise infer
-    ``local_size * world_size``), and ``inner_layout_signature`` is the inner
-    adapter's layout signature used during recursive bind validation."""
+    the target mesh — used as-is by :meth:`gpu_param` for the resident weight
+    (which computes, so it must reuse the model's canonical mesh) — and
+    ``cpu_mesh`` is cached via :func:`~piper_offload._dtensor.cpu_mesh_for` at
+    capture/projection time for :meth:`cpu_param`. ``shape`` / ``stride`` are
+    the original GLOBAL shape/stride, captured so the rebuilt DTensor reports
+    the true global shape even for uneven shards (where ``from_local`` would
+    otherwise infer ``local_size * world_size``), and
+    ``inner_layout_signature`` is the inner adapter's layout signature used
+    during recursive bind validation."""
 
     inner: TensorAdapter[Any, Any]
     inner_state: object
     inner_layout_signature: tuple
     mesh: object
+    cpu_mesh: object
     placements: tuple[object, ...]
     shape: object
     stride: tuple[int, ...]
@@ -365,6 +369,128 @@ def _local_lora_factors(
     return local_b.contiguous(), local_a.contiguous()
 
 
+def require_initialized_mesh(mesh: Any) -> None:  # noqa: ANN401
+    """Validate that ``mesh`` targets CPU/CUDA and owns initialized groups."""
+    if mesh.device_type not in ("cpu", "cuda"):
+        raise ValueError(
+            "DTensor projection target must use a CPU or CUDA/HIP device mesh; "
+            f"got {mesh.device_type!r}."
+        )
+    for dim in range(mesh.ndim):
+        try:
+            mesh.get_group(dim)
+        except Exception as exc:
+            raise ValueError(
+                "DTensor projection requires a DeviceMesh with initialized process groups."
+            ) from exc
+
+
+def _project_replicated_host(
+    source_adapter: TensorAdapter[Any, Any],
+    source_state: object,
+    dt: Any,  # noqa: ANN401
+    placements: tuple[object, ...],
+) -> _DTensorHost:
+    """Project an unsharded host backing onto an all-``Replicate`` DTensor."""
+    source_cpu = source_adapter.cpu_param(source_state)
+    if (
+        issubclass(type(source_cpu), nn.Parameter)
+        and type(source_cpu) is not nn.Parameter
+    ) or issubclass(type(source_cpu.data), nn.Parameter):
+        raise NotImplementedError(
+            "DTensor Replicate projection supports adapters whose local shard "
+            "reconstructs without an nn.Parameter subclass wrapper."
+        )
+    source_data = source_cpu.data
+    if tuple(source_data.shape) != tuple(dt.shape):
+        raise ValueError("DTensor projection source and target shapes must match.")
+    target_local = dt.to_local()
+    inner_layout_signature = source_adapter.layout_signature(source_data)
+    if not accepts_bind_target(
+        source_adapter,
+        source_state,
+        inner_layout_signature,
+        target_local,
+    ):
+        raise ValueError(
+            "DTensor projection local target does not match the replicated source layout."
+        )
+    cpu_mesh = cpu_mesh_for(dt.device_mesh)
+    stride = source_data.stride()
+    if type(source_data) is not torch.Tensor:
+        try:
+            # Validate during preflight that DTensor wrapping and Parameter
+            # wrapping succeed for this tensor subclass (e.g. Int8Tensor lacks
+            # aten.view and would otherwise fail late during install_host after
+            # earlier components mutated the shell).
+            nn.Parameter(
+                rebuild_dtensor(source_data, cpu_mesh, placements, dt.shape, stride),
+                requires_grad=False,
+            )
+        except (NotImplementedError, RuntimeError) as exc:
+            raise NotImplementedError(
+                "DTensor Replicate projection requires a local tensor representation "
+                f"compatible with DTensor wrapping ({type(source_data).__name__}): {exc}"
+            ) from exc
+    return _DTensorHost(
+        inner=source_adapter,
+        inner_state=source_state,
+        inner_layout_signature=inner_layout_signature,
+        mesh=dt.device_mesh,
+        cpu_mesh=cpu_mesh,
+        placements=placements,
+        shape=dt.shape,
+        stride=stride,
+    )
+
+
+def _project_sharded_host(
+    source_adapter: TensorAdapter[Any, Any],
+    source_state: object,
+    dt: Any,  # noqa: ANN401
+    placements: tuple[object, ...],
+    local_shape: tuple[int, ...],
+    offsets: tuple[int, ...],
+) -> _DTensorHost:
+    """Project a zero-copy view of a plain tensor onto a sharded DTensor."""
+    if not isinstance(source_adapter, RegularAdapter):
+        raise NotImplementedError(
+            "DTensor shard projection currently supports plain tensor sources only."
+        )
+    (source_tensor,) = source_adapter.storage_tensors(cast(Any, source_state))
+    if tuple(source_tensor.shape) != tuple(dt.shape):
+        raise ValueError("DTensor projection source and target shapes must match.")
+    target_local = dt.to_local()
+    if type(target_local) is not torch.Tensor:
+        raise NotImplementedError(
+            "DTensor projection currently supports plain tensor local targets only."
+        )
+    if target_local.layout is not torch.strided:
+        raise ValueError(
+            "DTensor projection local target must use a strided layout; "
+            f"got {target_local.layout}."
+        )
+    if tuple(target_local.shape) != local_shape:
+        raise ValueError(
+            "DTensor projection local source and target shapes must match: "
+            f"expected {local_shape}, got {tuple(target_local.shape)}."
+        )
+    local = source_tensor
+    for dim, (offset, size) in enumerate(zip(offsets, local_shape, strict=True)):
+        if offset != 0 or size != local.shape[dim]:
+            local = local.narrow(dim, offset, size)
+    return _DTensorHost(
+        inner=source_adapter,
+        inner_state=source_adapter.capture_host_view(local),
+        inner_layout_signature=source_adapter.layout_signature(local),
+        mesh=dt.device_mesh,
+        cpu_mesh=cpu_mesh_for(dt.device_mesh),
+        placements=placements,
+        shape=dt.shape,
+        stride=source_tensor.stride(),
+    )
+
+
 class DTensorAdapter:
     """Movement and shard-local additive merges for tensor-parallel weights."""
 
@@ -410,6 +536,18 @@ class DTensorAdapter:
         )
 
     @staticmethod
+    def layout_signature_from_host(state: _DTensorHost) -> tuple:
+        """Rebuild the target layout signature from captured or projected host state."""
+        return (
+            type(state.inner),
+            state.inner_layout_signature,
+            tuple(cast(Any, state.shape)),
+            state.stride,
+            mesh_signature(cast(Any, state.mesh)),
+            placements_key(state.placements),
+        )
+
+    @staticmethod
     def capture_host(t: torch.Tensor) -> _DTensorHost:
         dt = require_dtensor(t)
         local = dt.to_local()
@@ -429,6 +567,7 @@ class DTensorAdapter:
             inner_state=inner.capture_host(local),
             inner_layout_signature=inner.layout_signature(local),
             mesh=dt.device_mesh,
+            cpu_mesh=cpu_mesh_for(dt.device_mesh),
             placements=tuple(dt.placements),
             shape=dt.shape,
             stride=dt.stride(),
@@ -466,67 +605,39 @@ class DTensorAdapter:
         source_state: object,
         target: torch.Tensor,
     ) -> _DTensorHost:
-        """Project a zero-copy dense ``Shard(0)`` or ``Shard(1)`` host view."""
+        """Project a full host parameter into a zero-copy ``DTensor`` view."""
         dt = require_dtensor(target)
-        if not isinstance(source_adapter, RegularAdapter):
+        if isinstance(source_adapter, DTensorAdapter):
             raise NotImplementedError(
-                "DTensor projection currently supports plain tensor sources only."
+                "Cannot project a DTensor source onto another DTensor target."
             )
-        (source_tensor,) = source_adapter.storage_tensors(cast(Any, source_state))
-        if tuple(source_tensor.shape) != tuple(dt.shape):
-            raise ValueError("DTensor projection source and target shapes must match.")
-        if dt.device_mesh.device_type != "cuda":
-            raise ValueError("DTensor projection target must use a CUDA/HIP device mesh.")
-        placements = tuple(dt.placements)
-        if len(placements) != 1 or type(placements[0]) is not Shard:
-            raise NotImplementedError(
-                "DTensor projection requires one Shard(0) or Shard(1) placement."
-            )
-        shard_dim = cast(Any, placements[0]).dim
-        if shard_dim < 0:
-            shard_dim += source_tensor.ndim
-        if shard_dim not in (0, 1) or (shard_dim == 1 and source_tensor.ndim != 2):
-            raise NotImplementedError(
-                "DTensor projection supports Shard(0) tensors and rank-two "
-                "Shard(1) tensors."
-            )
+        require_initialized_mesh(dt.device_mesh)
         coordinate = dt.device_mesh.get_coordinate()
         if coordinate is None:
             raise ValueError(
                 "DTensor projection cannot run on a rank outside the target device mesh."
             )
+        placements = tuple(dt.placements)
         local_shape, offsets = _local_shape_and_offsets(
             tuple(dt.shape),
             tuple(dt.device_mesh.shape),
             tuple(coordinate),
             placements,
         )
-        target_local = dt.to_local()
-        if type(target_local) is not torch.Tensor:
-            raise NotImplementedError(
-                "DTensor projection currently supports plain tensor local targets only."
+        if all(isinstance(p, Replicate) for p in placements):
+            return _project_replicated_host(
+                source_adapter,
+                source_state,
+                dt,
+                placements,
             )
-        local = source_tensor.narrow(
-            shard_dim,
-            offsets[shard_dim],
-            local_shape[shard_dim],
-        )
-        if (
-            tuple(target_local.shape) != tuple(local.shape)
-            or target_local.dtype is not local.dtype
-        ):
-            raise ValueError(
-                "DTensor projection local source and target must have matching "
-                "shapes and dtypes."
-            )
-        return _DTensorHost(
-            inner=source_adapter,
-            inner_state=source_adapter.capture_host_view(local),
-            inner_layout_signature=source_adapter.layout_signature(local),
-            mesh=dt.device_mesh,
-            placements=placements,
-            shape=dt.shape,
-            stride=dt.stride(),
+        return _project_sharded_host(
+            source_adapter,
+            source_state,
+            dt,
+            placements,
+            local_shape,
+            offsets,
         )
 
     @staticmethod
@@ -536,15 +647,14 @@ class DTensorAdapter:
     @staticmethod
     def cpu_param(state: _DTensorHost) -> nn.Parameter:
         # The resting weight stays a DTensor (so its adapter/layout matches the
-        # store and a deactivated block is still a DTensor), but on a CPU mesh
-        # so the local shard stays on the host — a CUDA mesh would move the
-        # local onto the device, re-allocating GPU memory for the offloaded
-        # state. The resting form never computes, so a freshly-derived CPU mesh
-        # is fine. The local aliases the inner adapter's host storage.
+        # store and a deactivated block is still a DTensor), using the cached
+        # CPU mesh captured at construction so deactivation neither allocates
+        # GPU memory nor requires an active distributed context. The local
+        # aliases the inner adapter's host storage.
         local = state.inner.cpu_param(state.inner_state).data
         dt = rebuild_dtensor(
             local,
-            cpu_mesh_for(state.mesh),
+            state.cpu_mesh,
             state.placements,
             state.shape,
             state.stride,

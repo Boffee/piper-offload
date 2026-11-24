@@ -70,18 +70,27 @@ class ModelStore:
         shell and bind a fresh one.
 
         ``model`` must not already be owned by a live :class:`ModelOffloader`.
+        When an unsharded store is bound onto a shell whose parameters use
+        PyTorch ``DTensor`` wrappers (such as a tensor-parallel ``meta`` shell
+        from ``parallelize_module``), each DTensor target receives a zero-copy
+        rank-local projection sharing this store's underlying host backing, and
+        the returned offloader reports the rank-local ``cache_bytes``.
         Extra unmanaged parameters anywhere on ``model`` (including inside
         occupied blocks) are permitted, ignored, and stay on the caller's
         device, whereas extra non-empty blocks inside a configured block list
         are rejected so no block silently remains unstreamed.
         """
         resolved = resolve_offload_config(config)
-        composite, claim = _bind_module_store(self._module_store, model, resolved)
+        composite, claim, resolved_store = _bind_module_store(
+            self._module_store,
+            model,
+            resolved,
+        )
         try:
             return ModelOffloader(
                 model,
                 composite=composite,
-                cache_bytes=self.cache_bytes,
+                cache_bytes=resolved_store.cache_bytes,
                 _shell_claim=claim,
             )
         except BaseException:

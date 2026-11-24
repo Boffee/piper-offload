@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from piper_offload._dtensor import DTENSOR_AVAILABLE
 from piper_offload.host_buffer import HostBuffer
 from piper_offload.host_param import HostParam
 from piper_offload.tensor_adapters import (
@@ -325,3 +326,128 @@ class TestFrozenContract:
 
         assert frozen_host.untyped_storage().data_ptr() == mapped.untyped_storage().data_ptr()
         assert not frozen_host.untyped_storage().resizable()
+
+
+class TestDTensorProjection:
+    def test_project_dtensor_sets_projected_target_layout_and_supports_nd_shards(
+        self,
+    ) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        from torch.distributed.tensor import DTensor, Shard, init_device_mesh
+
+        from piper_offload._dtensor import cpu_mesh_for
+        from piper_offload.parallel import ParallelExecutor
+        from piper_offload.tensor_adapters import RegularAdapter
+
+        src_2d = torch.randn(4, 6, dtype=torch.bfloat16)
+        src_3d = torch.arange(2 * 4 * 6, dtype=torch.bfloat16).reshape(2, 4, 6)
+        host_2d = HostParam(nn.Parameter(src_2d, requires_grad=False))
+        host_3d = HostParam(nn.Parameter(src_3d, requires_grad=False))
+        ptr_2d = host_2d.storage_tensors()[0].untyped_storage().data_ptr()
+        ptr_3d = host_3d.storage_tensors()[0].untyped_storage().data_ptr()
+
+        def verify(rank: int) -> None:
+            mesh = init_device_mesh("cpu", (2,))
+            assert cpu_mesh_for(mesh) is mesh
+
+            # Default float32 meta placeholder against bfloat16 source must record bfloat16 target_layout.
+            meta_2d = DTensor.from_local(
+                torch.empty((4, 3), dtype=torch.float32, device="meta"),
+                mesh,
+                [Shard(1)],
+                shape=src_2d.shape,
+                stride=src_2d.stride(),
+                run_check=False,
+            )
+            proj_2d = HostParam.project_dtensor(host_2d, nn.Parameter(meta_2d, requires_grad=False))
+            assert proj_2d.compute_dtype is torch.bfloat16
+            assert proj_2d.target_layout[0] is type(select_adapter(meta_2d))
+            inner_sig = proj_2d.target_layout[1][1]
+            assert inner_sig == RegularAdapter.layout_signature(torch.empty((4, 3), dtype=torch.bfloat16))
+            assert proj_2d.storage_tensors()[0].untyped_storage().data_ptr() == ptr_2d
+            assert proj_2d.accepts_bind_target(nn.Parameter(meta_2d, requires_grad=False))
+            assert proj_2d.accepts_bind_target(proj_2d.make_cpu_param())
+
+            # 3-D Shard(1) and Shard(2) produce non-contiguous zero-copy views with exact data.
+            for shard_dim, local_shape in ((1, (2, 2, 6)), (2, (2, 4, 3))):
+                meta_3d = DTensor.from_local(
+                    torch.empty(local_shape, dtype=torch.float32, device="meta"),
+                    mesh,
+                    [Shard(shard_dim)],
+                    shape=src_3d.shape,
+                    stride=src_3d.stride(),
+                    run_check=False,
+                )
+                proj_3d = HostParam.project_dtensor(host_3d, nn.Parameter(meta_3d, requires_grad=False))
+                (backing,) = proj_3d.storage_tensors()
+                assert backing.untyped_storage().data_ptr() == ptr_3d
+                assert backing.dtype is torch.bfloat16
+                expected = src_3d.chunk(2, dim=shard_dim)[rank]
+                torch.testing.assert_close(backing, expected, rtol=0, atol=0)
+
+        with ParallelExecutor(["cpu", "cpu"]) as ex:
+            ex.run(verify)
+
+    def test_project_dtensor_quantized_replicate_and_rejections(self) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        torchao_quant = pytest.importorskip("torchao.quantization")
+        from torch.distributed.tensor import DTensor, Replicate, Shard, init_device_mesh
+
+        from piper_offload.dtensor_adapter import DTensorAdapter
+        from piper_offload.parallel import ParallelExecutor
+        from piper_offload.tensor_adapters import RegularAdapter
+
+        linear = nn.Linear(16, 16, bias=False, dtype=torch.bfloat16).eval().requires_grad_(False)
+        torchao_quant.quantize_(linear, torchao_quant.Float8WeightOnlyConfig())
+        q_host = HostParam(linear.weight)
+        q_ptrs = tuple(t.untyped_storage().data_ptr() for t in q_host.storage_tensors())
+
+        class _SubParam(nn.Parameter):
+            pass
+
+        class _ParamSubclassAdapter(RegularAdapter):
+            @staticmethod
+            def cpu_param(state):
+                return _SubParam(state.data, requires_grad=False)
+
+        plain_state = RegularAdapter.capture_host(torch.randn(4, 4))
+
+        def verify(_rank: int) -> None:
+            mesh = init_device_mesh("cpu", (2,))
+            meta_rep = DTensor.from_local(
+                torch.empty((16, 16), dtype=torch.float32, device="meta"),
+                mesh,
+                [Replicate()],
+                run_check=False,
+            )
+            proj_q = HostParam.project_dtensor(q_host, nn.Parameter(meta_rep, requires_grad=False))
+            assert proj_q.compute_dtype is torch.bfloat16
+            assert proj_q.target_layout[1][0] is type(q_host.adapter)
+            assert tuple(t.untyped_storage().data_ptr() for t in proj_q.storage_tensors()) == q_ptrs
+            assert proj_q.accepts_bind_target(nn.Parameter(meta_rep, requires_grad=False))
+            assert proj_q.accepts_bind_target(proj_q.make_cpu_param())
+
+            meta_shard = DTensor.from_local(
+                torch.empty((8, 16), dtype=torch.float32, device="meta"),
+                mesh,
+                [Shard(0)],
+                shape=(16, 16),
+                stride=(16, 1),
+                run_check=False,
+            )
+            with pytest.raises(NotImplementedError, match="plain tensor sources only"):
+                HostParam.project_dtensor(q_host, nn.Parameter(meta_shard, requires_grad=False))
+
+            rep_4x4 = DTensor.from_local(
+                torch.empty((4, 4), dtype=torch.float32, device="meta"),
+                mesh,
+                [Replicate()],
+                run_check=False,
+            )
+            with pytest.raises(NotImplementedError, match="nn.Parameter subclass"):
+                DTensorAdapter.project_host(_ParamSubclassAdapter(), plain_state, rep_4x4)
+
+        with ParallelExecutor(["cpu", "cpu"]) as ex:
+            ex.run(verify)

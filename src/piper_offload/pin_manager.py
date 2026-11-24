@@ -567,6 +567,10 @@ class PinManager:
         if source.device.type != "cpu":
             destination.copy_(source, non_blocking=non_blocking)
             return
+        if source.numel() == 0:
+            # Empty views hold no lease in _requests() and transfer no payload.
+            destination.copy_(source, non_blocking=non_blocking)
+            return
         asynchronous = non_blocking and destination.device.type == "cuda"
         with self._lock:
             registration = self._registrations.get(source.untyped_storage().data_ptr())

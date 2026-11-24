@@ -13,11 +13,13 @@ from collections.abc import (
 )
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Self, cast
+from typing import NoReturn, Self, cast
 
 import torch
 from torch import nn
 
+from ._dtensor import is_dtensor, mesh_signature, placements_key, require_dtensor
+from .dtensor_adapter import DTensorAdapter, require_initialized_mesh
 from .host_buffer import HostBuffer
 from .host_param import HostParam
 from .module_names import group_names, resolve_parent_leaf
@@ -137,13 +139,16 @@ class HostModuleStore:
     def cache_bytes(self) -> int:
         return _unique_cache_bytes(self.params) + _unique_cache_bytes(self.buffers)
 
-    def _validate_bind(self, module: nn.Module) -> None:
-        _validate_module_matches(self.params, self.buffers, module)
+    def _resolve_bind(self, module: nn.Module) -> HostModuleStore:
+        """Validate ``module`` and project unsharded params onto DTensor targets."""
+        resolved_params = _resolve_module_bind(self.params, self.buffers, module)
+        if resolved_params is None:
+            return self
+        return HostModuleStore(params=resolved_params, buffers=self.buffers)
 
     def bind(self, module: nn.Module) -> HostModuleInstance:
         """Validate a compatible module and install this store's backing on it."""
-        self._validate_bind(module)
-        return self._install(module)
+        return self._resolve_bind(module)._install(module)
 
     def _install(self, module: nn.Module) -> HostModuleInstance:
         instance = HostModuleInstance(
@@ -475,20 +480,95 @@ def _record_target_slot[HostT](
     owners[slot] = (name, host)
 
 
-def _validate_module_matches(
+def _raise_param_bind_mismatch(
+    name: str,
+    host: HostParam,
+    representation: torch.Tensor,
+) -> NoReturn:
+    if host.is_meta:
+        host_representation = cast(torch.Tensor, host.host_state)
+        if (
+            type(representation) is not torch.Tensor
+            or not representation.is_meta
+            or representation.layout is not torch.strided
+        ):
+            raise ValueError(
+                f"Param {name!r} meta layout mismatch: store requires a "
+                "plain strided meta tensor, module has "
+                f"type={type(representation).__name__}, "
+                f"device={representation.device}, layout={representation.layout}."
+            )
+        raise ValueError(
+            f"Param {name!r} meta layout mismatch: store has "
+            f"shape={tuple(host.shape)}, dtype={host_representation.dtype}, "
+            f"stride={host_representation.stride()}, "
+            f"storage_offset={host_representation.storage_offset()}, "
+            f"module has type={type(representation).__name__}, "
+            f"device={representation.device}, shape={tuple(representation.shape)}, "
+            f"dtype={representation.dtype}, stride={representation.stride()}, "
+            f"storage_offset={representation.storage_offset()}."
+        )
+    raise ValueError(
+        f"Param {name!r} layout mismatch: store has {host.target_layout!r}, "
+        f"module has type={type(representation).__name__}, "
+        f"shape={tuple(representation.shape)}, dtype={representation.dtype}, "
+        f"device={representation.device}, layout={representation.layout}."
+    )
+
+
+def _resolve_projected_param(
+    name: str,
+    host: HostParam,
+    param: nn.Parameter,
+    representation: torch.Tensor,
+    projected_by_key: dict[tuple[object, ...], HostParam],
+) -> HostParam:
+    dt = require_dtensor(representation)
+    mesh = dt.device_mesh
+    try:
+        require_initialized_mesh(mesh)
+    except ValueError as exc:
+        raise ValueError(f"Param {name!r} layout mismatch: {exc}") from exc
+    key = (
+        id(host),
+        tuple(dt.shape),
+        mesh_signature(mesh),
+        mesh.mesh_dim_names,
+        tuple(id(mesh.get_group(dim)) for dim in range(mesh.ndim)),
+        placements_key(dt.placements),
+    )
+    existing = projected_by_key.get(key)
+    if existing is not None:
+        if existing.accepts_bind_target(param):
+            return existing
+        raise ValueError(
+            f"Param {name!r} layout mismatch: target does not match projected "
+            f"DTensor layout {existing.target_layout!r}."
+        )
+    try:
+        projected = HostParam.project_dtensor(host, param)
+    except (NotImplementedError, TypeError, ValueError) as exc:
+        raise ValueError(f"Param {name!r} layout mismatch: {exc}") from exc
+    projected_by_key[key] = projected
+    return projected
+
+
+def _resolve_module_bind(
     host_params: Mapping[str, HostParam],
     host_buffers: Mapping[str, HostBuffer],
     module: nn.Module,
-) -> None:
-    """Validate that ``module`` is a structurally compatible bind target.
+) -> dict[str, HostParam] | None:
+    """Validate ``module`` and project unsharded host params onto DTensor targets.
 
     Compares bind compatibility via :meth:`HostParam.accepts_bind_target`
     (and :meth:`HostBuffer.bind_layout_for` for buffers): binding replaces
     every managed tensor with the host backing storage, so placeholder fields
     overwritten on bind (such as plain tensor dtype or a plain strided
     ``meta`` shape matching a frozen quantized store) do not reject a fresh
-    skeleton. Also rejects distinct store items mapping to the same target
-    module attribute slot before mutating ``module``.
+    skeleton. When a non-meta unsharded store param targets a ``DTensor``,
+    projects a zero-copy rank-local view (deduplicated per host source and
+    target distributed layout so tied parameters stay tied). Returns a new
+    parameter mapping when any projection occurred, otherwise ``None``.
     """
     params = _named_parameters(module)
     buffers = _named_buffers(module)
@@ -496,45 +576,37 @@ def _validate_module_matches(
     _validate_names_present(host_params, host_buffers, params, buffers)
 
     param_slots: dict[tuple[int, str], tuple[str, HostParam]] = {}
+    resolved_params: dict[str, HostParam] = {}
+    projected_by_key: dict[tuple[object, ...], HostParam] = {}
+    projected = False
+
     for name, host in host_params.items():
         param = params[name]
         if param.requires_grad:
             raise ValueError(
                 f"Param {name!r} must be frozen (requires_grad=False)."
             )
-        _record_target_slot(param_slots, module, name, host, "Param")
         if host.accepts_bind_target(param):
-            continue
-        representation = param_representation(param)
-        if host.is_meta:
-            host_representation = cast(torch.Tensor, host.host_state)
+            resolved_host = host
+        else:
+            representation = param_representation(param)
             if (
-                type(representation) is not torch.Tensor
-                or not representation.is_meta
-                or representation.layout is not torch.strided
+                not host.is_meta
+                and not isinstance(host.adapter, DTensorAdapter)
+                and is_dtensor(representation)
             ):
-                raise ValueError(
-                    f"Param {name!r} meta layout mismatch: store requires a "
-                    "plain strided meta tensor, module has "
-                    f"type={type(representation).__name__}, "
-                    f"device={representation.device}, layout={representation.layout}."
+                resolved_host = _resolve_projected_param(
+                    name,
+                    host,
+                    param,
+                    representation,
+                    projected_by_key,
                 )
-            raise ValueError(
-                f"Param {name!r} meta layout mismatch: store has "
-                f"shape={tuple(host.shape)}, dtype={host_representation.dtype}, "
-                f"stride={host_representation.stride()}, "
-                f"storage_offset={host_representation.storage_offset()}, "
-                f"module has type={type(representation).__name__}, "
-                f"device={representation.device}, shape={tuple(representation.shape)}, "
-                f"dtype={representation.dtype}, stride={representation.stride()}, "
-                f"storage_offset={representation.storage_offset()}."
-            )
-        raise ValueError(
-            f"Param {name!r} layout mismatch: store has {host.target_layout!r}, "
-            f"module has type={type(representation).__name__}, "
-            f"shape={tuple(representation.shape)}, dtype={representation.dtype}, "
-            f"device={representation.device}, layout={representation.layout}."
-        )
+                projected = True
+            else:
+                _raise_param_bind_mismatch(name, host, representation)
+        _record_target_slot(param_slots, module, name, resolved_host, "Param")
+        resolved_params[name] = resolved_host
 
     buffer_slots: dict[tuple[int, str], tuple[str, HostBuffer]] = {}
     for name, host in host_buffers.items():
@@ -545,6 +617,8 @@ def _validate_module_matches(
                 f"{HostBuffer.bind_layout_for(host.tensor)!r}, module has {layout!r}."
             )
         _record_target_slot(buffer_slots, module, name, host, "Buffer")
+
+    return resolved_params if projected else None
 
 
 def _validate_target_names_known(

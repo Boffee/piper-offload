@@ -3009,3 +3009,32 @@ def test_interrupted_lease_close_retry_preserves_accounting(
         del a_view, b, c
         gc.collect()
         local_manager.clear()
+
+
+def test_empty_view_into_idle_registered_storage_transfers_without_lease(
+    backend: FakeBackend,
+) -> None:
+    (base,) = _tensors((0, PAGE))
+    empty = base.narrow(0, PAGE, 0)
+    assert empty.numel() == 0
+    assert empty.untyped_storage().data_ptr() == base.untyped_storage().data_ptr()
+
+    manager = PinManager(2 * PAGE, backend=backend)
+    try:
+        # Leave the underlying storage registered with zero active leases.
+        with manager.acquire([base]):
+            pass
+        assert manager.stats.registrations == 1
+        assert manager.stats.active_leases == 0
+
+        copies: list[tuple[int, bool]] = []
+        fake_cuda_dst = SimpleNamespace(
+            device=torch.device("cuda", 0),
+            copy_=lambda src, *, non_blocking=False: copies.append((src.numel(), non_blocking)),
+        )
+        with manager.acquire([empty]) as lease:
+            assert (lease.registered_bytes, lease.pageable_bytes) == (0, 0)
+            manager.transfer(fake_cuda_dst, empty, non_blocking=True)  # type: ignore[arg-type]
+        assert copies == [(0, True)]
+    finally:
+        manager.clear()

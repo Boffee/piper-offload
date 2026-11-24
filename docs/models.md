@@ -190,6 +190,20 @@ host backing alive even if the store is later evicted, keep `with cache.lease(sp
 as store:` open around the bound shells' use and cleanup when enforcing a cache
 budget.
 
+One unsharded `ModelStore` can also bind directly onto tensor-parallel `meta`
+shells produced by `torch.distributed.tensor.parallel.parallelize_module` under
+`ParallelExecutor`, `SequentialExecutor`, or multi-process collectives.
+`store.bind(shell, config=...)` projects zero-copy rank-local `DTensor` views
+over the single shared host backing (including `MappedCheckpoint` mappings)
+and reports per-rank local shard bytes on `ModelOffloader.cache_bytes`. See
+[formats](formats.md#dtensor-and-custom-formats) for supported placement and
+representation combinations. PyTorch's `SequenceParallel` resets
+`requires_grad=True` on replicated normalization parameters, so call
+`.requires_grad_(False)` after `parallelize_module(...)`. Re-binding a
+CUDA-projected shell requires constructing a fresh `DTensor` shell over an
+initialized `DeviceMesh`, because a deactivated shell rests on an uninitialized
+CPU mesh.
+
 ## Other resources and finite budgets
 
 `ObjectSpec` caches ordinary objects such as tokenizers. A resource lease

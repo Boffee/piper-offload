@@ -73,12 +73,26 @@ def cpu_mesh_for(mesh: Any) -> Any:  # noqa: ANN401
     ``DTensorAdapter.cpu_param`` keeps the offloaded (resting) weight a DTensor
     on the host: ``from_local`` moves the local onto the mesh device, so a CUDA
     mesh would re-allocate GPU memory; a CPU mesh keeps the local on the host.
-    Constructing a ``DeviceMesh`` initializes a (gloo) process group, but torch
-    deduplicates the underlying group across equivalent meshes — so the adapter
-    builds one per host param (held in its state) with no global cache."""
+    When ``mesh`` already targets CPU, return it directly so CPU-activated
+    collectives retain their initialized process groups. For non-CPU meshes,
+    return an uninitialized backend-less CPU ``DeviceMesh`` with distinct
+    resting dimension names so resting host wrappers never initialize duplicate
+    process groups, never require an active distributed context during
+    deactivation, and cannot collide with real CPU meshes in PyTorch's
+    process-global DTensor propagator cache.
+    """
+    if mesh.device_type == "cpu":
+        return mesh
+
     from torch.distributed.device_mesh import DeviceMesh  # noqa: PLC0415
 
-    return DeviceMesh("cpu", mesh.mesh.cpu())
+    return DeviceMesh(
+        "cpu",
+        mesh.mesh.cpu(),
+        mesh_dim_names=tuple(f"_piper_resting_{dim}" for dim in range(mesh.ndim)),
+        _init_backend=False,
+        _rank=getattr(mesh, "_rank", None),
+    )
 
 
 def placements_key(placements: tuple[Any, ...]) -> tuple[str, ...]:

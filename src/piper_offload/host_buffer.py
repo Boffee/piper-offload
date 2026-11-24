@@ -43,10 +43,13 @@ class HostBuffer:
 
         ``dtype`` and ``stride`` are excluded: binding replaces the module's
         buffer with the normalized contiguous host tensor, so placeholder
-        dtype and layout strides carry no constraint past shape and layout
-        (mirrors :meth:`HostParam.accepts_bind_target`).
+        dtype and layout strides carry no constraint past wrapper type, shape,
+        and layout (mirrors :meth:`HostParam.accepts_bind_target`). Including
+        ``type(buffer)`` rejects mismatched tensor wrappers such as ``DTensor``
+        buffers against a plain-tensor store.
         """
         return (
+            type(buffer),
             tuple(buffer.shape),
             buffer.layout,
         )

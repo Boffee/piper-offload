@@ -7,6 +7,14 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- `ModelStore.bind()` and `HostModuleStore.bind()` now project an unsharded host
+  store directly onto `DTensor`-sharded shells (such as `meta` shells produced
+  by `torch.distributed.tensor.parallel.parallelize_module`) with zero-copy
+  rank-local views sharing one host allocation and `MappedCheckpoint` file
+  mapping, supporting 1D and N-D CPU/CUDA `DeviceMesh` topologies, `Replicate`
+  and contiguous `Shard(dim)` placements for plain tensors, all-`Replicate`
+  projection for non-`nn.Parameter`-subclass quantized tensors, tied-weight
+  deduplication, and per-rank `ModelOffloader.cache_bytes`.
 - Added `ParallelExecutor` (`piper_offload.parallel`) and the `piper_parallel`
   PyTorch `ProcessGroup` backend for concurrent multi-GPU and CPU execution in
   persistent worker threads (`transport="auto" | "p2p" | "host_staged"`),
@@ -19,6 +27,20 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   (`reduce_scatter_tensor_coalesced`) over `ReduceOp.SUM`, `dist.new_group()`
   and `DeviceMesh` subgroups, `torch.compile`, and `ModelStore`/`ModelOffloader`
   streaming coordination.
+
+### Fixed
+
+- Cached a backend-less resting CPU `DeviceMesh` (with distinct internal
+  dimension names) inside DTensor host state during capture and projection (and
+  returned already-CPU meshes directly), preventing crashes when deactivating
+  CUDA `DTensor` offloaders outside an active distributed context or after
+  `ParallelExecutor.close()`, avoiding duplicate CPU subgroup initialization,
+  and preventing PyTorch DTensor propagator cache collisions with live CPU
+  meshes.
+- Derived projected parameter target layouts from the projected host state
+  rather than `meta` shell placeholder metadata, allocated contiguous device
+  storage for projected non-contiguous plain views, and bypassed host
+  registration lookups for empty (`0`-element) transfer views.
 
 ## [0.10.0rc16] - 2026-11-24
 
