@@ -33,6 +33,11 @@ class MappedFile:
         self.file = file
         self.mmap = mapping
         weakref.finalize(self, _forget_dead_mappings)
+        length = len(mapping)
+        if length > 0:
+            base = _mapping_base_ptr(mapping)
+            with _lock:
+                _mapping_ranges[id(self)] = (weakref.ref(self), base, base + length)
 
     def __buffer__(self, flags: int, /) -> memoryview:
         return memoryview(self.mmap)
@@ -59,6 +64,18 @@ class MappedFile:
 _lock = threading.RLock()
 # Storage pointer -> (its mapping, weakly, and its slice).
 _provenance: dict[int, tuple[weakref.ReferenceType[MappedFile], FileSlice]] = {}
+# id(MappedFile) -> (mapping weakref, base_ptr, end_ptr).
+_mapping_ranges: dict[int, tuple[weakref.ReferenceType[MappedFile], int, int]] = {}
+
+
+def _mapping_base_ptr(mapping: mmap.mmap) -> int:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="The given buffer is not writable")
+        mv = memoryview(mapping)
+        try:
+            return torch.frombuffer(mv[:1], dtype=torch.uint8).data_ptr()
+        finally:
+            mv.release()
 
 
 def file_slice(source: torch.Tensor | torch.UntypedStorage) -> FileSlice | None:
@@ -78,7 +95,25 @@ def file_slice(source: torch.Tensor | torch.UntypedStorage) -> FileSlice | None:
     return piece if mapping() is not None and piece.length == storage.nbytes() else None
 
 
+def overlaps_mapped_file(tensor: torch.Tensor) -> bool:
+    """Return True if a nonempty CPU tensor overlaps any live read-only ``MappedFile`` range."""
+    if tensor.device.type != "cpu" or tensor.nbytes == 0:
+        return False
+    start = tensor.data_ptr()
+    end = start + tensor.nbytes
+    with _lock:
+        entries = tuple(_mapping_ranges.values())
+    for mapping, m_start, m_end in entries:
+        if start < m_end and m_start < end:
+            m = mapping()
+            if m is not None and not getattr(m.mmap, "closed", False):
+                return True
+    return False
+
+
 def _forget_dead_mappings() -> None:
     with _lock:
         for pointer in [pointer for pointer, (mapping, _) in _provenance.items() if mapping() is None]:
             _provenance.pop(pointer, None)
+        for key in [key for key, (mapping, _, _) in _mapping_ranges.items() if mapping() is None]:
+            _mapping_ranges.pop(key, None)

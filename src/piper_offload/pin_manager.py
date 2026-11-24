@@ -45,8 +45,8 @@ import mmap
 import threading
 import weakref
 from bisect import bisect_left
-from collections import OrderedDict
-from collections.abc import Callable, Generator, Iterable
+from collections import OrderedDict, deque
+from collections.abc import Callable, Generator, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Self
 
@@ -154,8 +154,8 @@ class _Pageable:
 
 @dataclass(slots=True)
 class _LeaseState:
-    registrations: tuple[_Registration, ...]
-    pageable: tuple[int, ...]
+    registrations: deque[_Registration]
+    pageable: deque[int]
     tensors: tuple[torch.Tensor, ...]
 
 
@@ -179,16 +179,26 @@ class PinLease:
     ) -> None:
         self.registered_bytes = registered_bytes
         self.pageable_bytes = pageable_bytes
+        self._manager: PinManager | None = manager
+        self._key = key
+        self._closed = False
         self._finalizer = weakref.finalize(self, manager._close_lease, key)
         self._finalizer.atexit = False
 
     @property
     def closed(self) -> bool:
-        return not self._finalizer.alive
+        return self._closed or not self._finalizer.alive
 
     def close(self) -> None:
-        """Close the lease, releasing what it holds; idempotent."""
-        self._finalizer()
+        """Close the lease, releasing what it holds; idempotent and retry-safe."""
+        if self._closed:
+            return
+        manager = self._manager
+        if manager is not None:
+            manager._close_lease(self._key)
+        self._closed = True
+        self._finalizer.detach()
+        self._manager = None
 
     def __enter__(self) -> Self:
         if self.closed:
@@ -482,8 +492,9 @@ class PinManager:
                 self._discard_pending(pending)
                 for registration in created:
                     registration.retired = True
-                self._release_pageable(pointer for pointer in pageable if pointer not in held)
-                self._release(tuple(held.values()))
+                self._release_pageable(deque(pointer for pointer in pageable if pointer not in held))
+                retired = self._release_registrations(deque(held.values()))
+                self._reclaim_released(retired)
             if releases is not None:
                 releases.finish()
             raise
@@ -529,8 +540,8 @@ class PinManager:
             pointer for pointer in requests if pointer not in held
         )
         self._leases[key] = _LeaseState(
-            tuple(held.values()),
-            pageable_pointers,
+            deque(held.values()),
+            deque(pageable_pointers),
             tuple(tensor for request in requests.values() for tensor in request.tensors),
         )
         _live_managers.add(self)
@@ -906,18 +917,27 @@ class PinManager:
         self._drop_lifetime_root_if_empty()
         return True
 
-    def _release(self, registrations: tuple[_Registration, ...]) -> None:
-        for registration in registrations:
+    def _release_registrations(self, registrations: deque[_Registration]) -> list[_Registration]:
+        retired: list[_Registration] = []
+        while registrations:
+            registration = registrations.popleft()
             registration.leases -= 1
             if registration.leases == 0:
                 self._idle[registration.pointer] = None
                 if registration.retired:
-                    self._unregister(registration)
+                    retired.append(registration)
+        return retired
+
+    def _reclaim_released(self, retired: Sequence[_Registration]) -> None:
+        for registration in retired:
+            if registration.leases == 0 and self._registrations.get(registration.pointer) is registration:
+                self._unregister(registration)
         if self._max_pinned_bytes is not None and self._pinned_bytes > self._max_pinned_bytes:
             self._fit(lambda: 0)
 
-    def _release_pageable(self, pointers: Iterable[int]) -> None:
-        for pointer in pointers:
+    def _release_pageable(self, pointers: deque[int]) -> None:
+        while pointers:
+            pointer = pointers.popleft()
             pageable = self._pageable[pointer]
             pageable.leases -= 1
             if pageable.leases == 0:
@@ -929,10 +949,13 @@ class PinManager:
             state = self._leases.get(key)
             if state is None:
                 return
-            self._release(state.registrations)
-            self._release_pageable(state.pageable)
-            del self._leases[key]
-            self._drop_lifetime_root_if_empty()
+            try:
+                self._release_pageable(state.pageable)
+                retired = self._release_registrations(state.registrations)
+                del self._leases[key]
+                self._reclaim_released(retired)
+            finally:
+                self._drop_lifetime_root_if_empty()
 
     def _drop_lifetime_root_if_empty(self) -> None:
         if not self._registrations and not self._leases:

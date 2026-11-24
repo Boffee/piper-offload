@@ -5,6 +5,21 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Added `ParallelExecutor` (`piper_offload.parallel`) and the `piper_parallel`
+  PyTorch `ProcessGroup` backend for concurrent multi-GPU and CPU execution in
+  persistent worker threads (`transport="auto" | "p2p" | "host_staged"`),
+  supporting `barrier`, `broadcast`, `scatter`, `allgather`, `all_gather_single`
+  (`_allgather_base`), `all_gather_single_coalesced`
+  (`allgather_into_tensor_coalesced`), `alltoall`, and `all_to_all_single`
+  (`alltoall_base`) over supported contiguous tensor dtypes, `allreduce`,
+  `allreduce_coalesced`, `reduce_scatter`, `reduce_scatter_single`
+  (`_reduce_scatter_base`), and `reduce_scatter_single_coalesced`
+  (`reduce_scatter_tensor_coalesced`) over `ReduceOp.SUM`, `dist.new_group()`
+  and `DeviceMesh` subgroups, `torch.compile`, and `ModelStore`/`ModelOffloader`
+  streaming coordination.
+
 ## [0.10.0rc16] - 2026-11-24
 
 ### Added

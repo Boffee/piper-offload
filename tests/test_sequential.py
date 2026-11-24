@@ -18,6 +18,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distrib
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
 
 from piper_offload import BlockCompileConfig, ModelOffloader, OffloadConfig
+from piper_offload._sequential_runtime import make_in_process_store
 from piper_offload.host_module import HostModuleStore
 from piper_offload.host_param import HostParam
 from piper_offload.sequential import SequentialExecutor
@@ -748,7 +749,7 @@ def test_collective_timeout_keeps_isolation_until_close_then_allows_reopen():
 def test_rejects_existing_group_without_changing_it():
     pytest.importorskip("triton")
     original_hook = sys.excepthook
-    dist.init_process_group("gloo", store=dist.HashStore(), rank=0, world_size=1)
+    dist.init_process_group("gloo", store=make_in_process_store(), rank=0, world_size=1)
     try:
         group = dist.distributed_c10d._get_default_group()
         with pytest.raises(RuntimeError, match="no existing distributed"):
