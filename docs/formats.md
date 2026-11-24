@@ -145,9 +145,15 @@ Trellis coding stores a ConvRot INT8 matrix at 3 to 6 bits per weight; Piper
 Kernels owns the format and its encoder, `TrellisStorage.from_hp`. Wrap each
 weight's stored tensors and block size, as `TrellisStorage` holds them, in a
 `TrellisParameter` with the ConvRot group size, the logical dtype, and any
-static activation scale. Split or regroup checkpoint storage first: the
-parameter supports only detach and clone. Assign the parameters to the model
-and freeze it before capture.
+static activation scale. For per-row bitrates within a matrix, pass
+`row_widths` (`uint8 [out]`, giving bytes per block for each row) with
+row-concatenated 1-D `bitstreams` (`uint8` of at least
+`(in / block_size) * sum(row_widths)` bytes); CPU construction and host capture
+validate width bounds (`3` to `6` code bits per weight) and minimum bitstream
+capacity, and variable-row decoding requires a Piper Kernels release that
+accepts `row_widths` (added in Piper Kernels PR #320, after `0.8.0rc6`). Split or
+regroup checkpoint storage first: the parameter supports only detach and clone.
+Assign the parameters to the model and freeze it before capture.
 
 Host backing stays packed, and `requires_activation(parameter)` is true. Each
 refill transfers the packed tensors and decodes them into a reusable ConvRot

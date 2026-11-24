@@ -11,6 +11,7 @@ subclasses ``TorchAOBaseTensor``, so this import fails without the ``torchao``
 extra and the adapter then reports the format unavailable.
 """
 
+import inspect
 from typing import Any
 
 import torch
@@ -97,3 +98,23 @@ def validate_layout(t: torch.Tensor) -> None:
         wrapped.dtype,
         wrapped.act_per_tensor_scale,
     )
+
+
+def supports_variable_row_trellis() -> bool:
+    """Return whether the installed ``piper-kernels`` decodes variable-row trellis streams."""
+    if not PIPER_CONVROT_AVAILABLE:
+        return False
+    return "row_widths" in inspect.signature(ConvRotInt8Tensor.copy_from_trellis_).parameters
+
+
+def require_variable_row_trellis() -> None:
+    """Raise when installed ``piper-kernels`` lacks variable-row trellis decoding support."""
+    if not PIPER_CONVROT_AVAILABLE:
+        raise RuntimeError(
+            "piper-kernels[convrot] is required to decode variable-row trellis weights"
+        )
+    if not supports_variable_row_trellis():
+        raise RuntimeError(
+            "installed piper-kernels does not support variable-row trellis decoding "
+            "(ConvRotInt8Tensor.copy_from_trellis_ lacks row_widths); upgrade piper-kernels"
+        )

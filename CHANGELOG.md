@@ -7,6 +7,13 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Variable-row trellis weight support on `TrellisParameter(..., row_widths=...)` and
+  `TrellisAdapter`, accepting 1-D row-concatenated `bitstreams` with `uint8 [out]`
+  bytes-per-block `row_widths`, validating row widths (`3` to `6` code bits per
+  weight) and minimum bitstream capacity during CPU construction and host capture, and
+  forwarding `row_widths` through target staging to Piper Kernels (variable-row
+  decoding requires a Piper Kernels release with `row_widths` support; uniform
+  trellis weights remain compatible with `piper-kernels>=0.8.0rc1`).
 - Added `ModelStore`, `ModelStoreSpec`, and `OffloadConfig` so callers can capture
   frozen module weights once into a topology-free store and lease that cached
   store via one `ModelStoreSpec` key to bind multiple caller-owned shells with
