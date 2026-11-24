@@ -29,6 +29,18 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
+- Binding frozen built-in quantized and packed host stores (`HostModuleStore`,
+  `HostComponentStore`, `BlockComponentStore`, and `CompositeComponentStore`)
+  now accepts plain strided `meta` placeholder parameters matching the store's
+  logical shape (and `DTensor` wrappers over matching plain strided `meta` local
+  shards), enabling `meta` skeleton binding onto quantized and packed host
+  stores; external adapters can opt into the same behavior by implementing
+  `BindTargetTensorAdapter`, while existing external adapters remain strict.
+- Breaking: Replaced `BindLayoutTensorAdapter` (`HostParam.bind_layout` and
+  `HostParam.bind_layout_for`) with `BindTargetTensorAdapter`
+  (`accepts_bind_target(state, target, *, layout_signature, requires_grad)` and
+  `HostParam.accepts_bind_target`), and removed the unused
+  `PostLoadRearmTensorAdapter` / `HostParam.rearm_after_load` hooks.
 - `merge_adapter()` skips the model parameter walk when called with no adapters
   or only zero-strength adapters.
 - Breaking: Removed the `bnb` and `quanto` extras and their built-in tensor

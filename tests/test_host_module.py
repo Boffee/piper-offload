@@ -1,12 +1,27 @@
 """Tests for name-based host module store/instance primitives."""
 
-from typing import cast
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
 
-from piper_offload import host_module
+from piper_offload import (
+    BlockComponentStore,
+    GgufParameter,
+    HostComponentStore,
+    ModelOffloader,
+    TrellisParameter,
+    host_module,
+    register_adapter,
+)
+from piper_offload._dtensor import DTENSOR_AVAILABLE
+from piper_offload.composite_component import CompositeComponentStore
+from piper_offload.dtensor_adapter import DTensorAdapter
 from piper_offload.host_buffer import HostBuffer
 from piper_offload.host_module import (
     ParameterOverride,
@@ -17,7 +32,9 @@ from piper_offload.host_module import (
     HostParamTarget,
 )
 from piper_offload.host_param import HostParam
-from tests.conftest import CallbackParameterTransform
+from piper_offload.tensor_adapters import is_plain_meta_placeholder, matches_layout_signature
+from tests._gguf_helpers import GGUFParameter, packed_q4_0
+from tests.conftest import CallbackParameterTransform, activated_model
 
 
 class _FakeHostParam:
@@ -41,9 +58,6 @@ class _FakeHostParam:
         # storage). A fresh wrapper object each call, but the same storage.
         self._cpu_data = torch.empty_like(target_data)
         self.target_layout = HostParam.target_layout_for(
-            nn.Parameter(target_data, requires_grad=requires_grad),
-        )
-        self.bind_layout = HostParam.bind_layout_for(
             nn.Parameter(target_data, requires_grad=requires_grad),
         )
 
@@ -77,9 +91,6 @@ class _FakeHostParam:
         del target_state, non_blocking
         self.copied += 1
 
-    def rearm_after_load(self, param: nn.Parameter, gpu_state: object) -> None:
-        del param, gpu_state  # no-op: the fake adapter migrates no state
-
     def copy_to_cpu(
         self,
         target_state: object,
@@ -92,6 +103,15 @@ class _FakeHostParam:
 
     def validate_parameter_data_swap_target(self) -> None:
         self.validated += 1
+
+    def accepts_bind_target(self, param: nn.Parameter) -> bool:
+        return (
+            param.requires_grad == self.requires_grad
+            and type(param) is nn.Parameter
+            and type(param.data) is torch.Tensor
+            and param.layout is torch.strided
+            and tuple(param.shape) == self.logical_shape
+        )
 
 
 class TestHostModuleStore:
@@ -986,3 +1006,709 @@ class TestHostModuleInstance:
         assert model.weight.grad is not None
         assert model.weight.grad.device.type == "cpu"
         torch.testing.assert_close(model.weight.grad, grad)
+
+
+class _PackedWrapper(torch.Tensor):
+    _packed: torch.Tensor
+    __torch_function__ = torch._C._disabled_torch_function_impl
+
+    @staticmethod
+    def __new__(
+        cls: type[_PackedWrapper],
+        packed: torch.Tensor,
+        *,
+        requires_grad: bool = False,
+    ) -> _PackedWrapper:
+        logical = (int(packed.shape[0]), int(packed.shape[1]) // 2)
+        tensor = torch.Tensor._make_wrapper_subclass(
+            cls,
+            logical,
+            dtype=torch.bfloat16,
+            device=packed.device,
+            requires_grad=requires_grad,
+        )
+        tensor._packed = packed
+        return tensor
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        del types
+        aten = torch.ops.aten
+        src = cast(_PackedWrapper, args[0])
+        if func in (aten.detach.default, aten.alias.default, aten.clone.default):
+            out = src._packed if func is aten.alias.default else func(src._packed, **(kwargs or {}))
+            return cls(out, requires_grad=src.requires_grad)
+        if func in (aten.view.default, aten._unsafe_view.default) and tuple(args[1]) == tuple(src.shape):
+            return cls(src._packed, requires_grad=src.requires_grad)
+        raise NotImplementedError(func)
+
+
+class _PackedStrictTensor(_PackedWrapper):
+    pass
+
+
+class _PackedMetaBindTensor(_PackedWrapper):
+    pass
+
+
+class _CollidingStrictTensor(_PackedWrapper):
+    pass
+
+
+class _UnregisteredSubTensor(_PackedWrapper):
+    pass
+
+
+class _MetaParamSubclass(nn.Parameter):
+    pass
+
+
+class _PackedStrictAdapter:
+    _tensor_cls: type[_PackedWrapper] = _PackedStrictTensor
+    _tag: str = "packed-strict"
+
+    @classmethod
+    def matches(cls, t: torch.Tensor) -> bool:
+        return type(t) is cls._tensor_cls
+
+    @classmethod
+    def tensor_id(cls, t: torch.Tensor) -> tuple[object, ...]:
+        packed = cast(_PackedWrapper, t)._packed
+        return (cls._tag, packed.data_ptr(), tuple(packed.shape), packed.dtype)
+
+    @staticmethod
+    def layout_signature(t: torch.Tensor) -> tuple[object, ...]:
+        packed = cast(_PackedWrapper, t)._packed
+        return (tuple(packed.shape), packed.dtype)
+
+    @staticmethod
+    def capture_host(t: torch.Tensor) -> torch.Tensor:
+        return cast(_PackedWrapper, t)._packed.detach().clone()
+
+    @staticmethod
+    def storage_tensors(state: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return (state,)
+
+    @classmethod
+    def cpu_param(cls, state: torch.Tensor, *, requires_grad: bool = False) -> nn.Parameter:
+        return nn.Parameter(cls._tensor_cls(state, requires_grad=requires_grad), requires_grad=requires_grad)
+
+    @staticmethod
+    def alloc_gpu(state: torch.Tensor, device: torch.device) -> torch.Tensor:
+        return torch.empty_like(state, device=device)
+
+    @classmethod
+    def gpu_param(cls, host: torch.Tensor, gpu_state: torch.Tensor, *, requires_grad: bool = False) -> nn.Parameter:
+        del host
+        return nn.Parameter(cls._tensor_cls(gpu_state, requires_grad=requires_grad), requires_grad=requires_grad)
+
+    @staticmethod
+    def copy_to_gpu(src: torch.Tensor, dst: torch.Tensor, *, non_blocking: bool = False) -> None:
+        dst.copy_(src, non_blocking=non_blocking)
+
+    @staticmethod
+    def compute_dtype(t: torch.Tensor) -> torch.dtype:
+        return t.dtype
+
+    @staticmethod
+    def cache_bytes(state: torch.Tensor) -> int:
+        return state.nbytes
+
+    @staticmethod
+    def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
+        return tuple(t.shape)
+
+
+class _PackedMetaBindAdapter(_PackedStrictAdapter):
+    _tensor_cls = _PackedMetaBindTensor
+    _tag = "packed-meta-bind"
+
+    @classmethod
+    def accepts_bind_target(
+        cls,
+        state: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        layout_signature: object,
+        requires_grad: bool,
+    ) -> bool:
+        logical_shape = (int(state.shape[0]), int(state.shape[1]) // 2)
+        return (
+            not requires_grad
+            and is_plain_meta_placeholder(target, logical_shape)
+        ) or matches_layout_signature(cls, layout_signature, target)
+
+
+class _CollidingStrictAdapter(_PackedStrictAdapter):
+    _tensor_cls = _CollidingStrictTensor
+    _tag = "colliding-strict"
+
+    @staticmethod
+    def layout_signature(t: torch.Tensor) -> tuple[object, ...]:
+        # Intentionally mirrors RegularAdapter.layout_signature(t) to verify
+        # DTensorAdapter tags its inner adapter type and cannot collide.
+        return (tuple(t.shape), t.dtype, t.layout)
+
+
+def _wrap_packed(cls: type[_PackedWrapper], data: torch.Tensor, *, requires_grad: bool = False) -> torch.Tensor:
+    return cls(data, requires_grad=requires_grad)
+
+
+def _make_sparse_meta(shape: tuple[int, ...], *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    return torch.sparse_coo_tensor(
+        torch.empty((len(shape), 0), dtype=torch.int64, device="meta"),
+        torch.empty(0, dtype=dtype, device="meta"),
+        shape,
+        dtype=dtype,
+        device="meta",
+        check_invariants=False,
+    )
+
+
+def _make_trellis_weight(seed: int = 0) -> TrellisParameter:
+    generator = torch.Generator().manual_seed(seed)
+    rows, blocks, num_bytes = 64, 1, 143
+    bitstreams = torch.randint(0, 256, (rows, blocks, num_bytes), dtype=torch.uint8, generator=generator)
+    codes = torch.randint(0x20, 0x40, (rows, blocks), dtype=torch.uint8, generator=generator)
+    scale = torch.rand(rows, 1, generator=generator) * 1e-3 + 1e-4
+    return TrellisParameter(bitstreams, codes.view(torch.float8_e4m3fn), scale, block_size=256, group_size=256)
+
+
+class TestQuantizedMetaPlaceholderBind:
+    def test_binds_opt_in_packed_adapter_onto_plain_meta_skeleton_rebinds_and_restores_ties(self) -> None:
+        remove = register_adapter(_PackedMetaBindAdapter)
+        try:
+            packed = torch.arange(32, dtype=torch.int8).reshape(4, 8)
+            proto = nn.Module()
+            proto.left = nn.Module()
+            proto.right = nn.Module()
+            shared_weight = nn.Parameter(_wrap_packed(_PackedMetaBindTensor, packed), requires_grad=False)
+            proto.left.weight = shared_weight
+            proto.right.weight = shared_weight
+            module_store = HostModuleStore.from_module(proto)
+            comp_store = HostComponentStore.from_module(proto)
+
+            def make_untied_skeleton() -> nn.Module:
+                sk = nn.Module()
+                sk.left = nn.Module()
+                sk.right = nn.Module()
+                sk.left.weight = nn.Parameter(
+                    torch.empty((4, 4), dtype=torch.float32, device="meta"), requires_grad=False
+                )
+                sk.right.weight = nn.Parameter(
+                    torch.empty((4, 4), dtype=torch.float32, device="meta"), requires_grad=False
+                )
+                return sk
+
+            sk1 = make_untied_skeleton()
+            module_store.bind(sk1)
+            assert sk1.left.weight is sk1.right.weight
+            assert type(sk1.left.weight.data) is _PackedMetaBindTensor
+            assert torch.equal(cast(_PackedWrapper, sk1.left.weight.data)._packed, packed)
+            first_ptr = cast(_PackedWrapper, sk1.left.weight.data)._packed.data_ptr()
+
+            # Re-binding after initial bind succeeds and shares the store's backing tensor.
+            module_store.bind(sk1)
+            assert sk1.left.weight is sk1.right.weight
+            assert cast(_PackedWrapper, sk1.left.weight.data)._packed.data_ptr() == first_ptr
+
+            sk2 = make_untied_skeleton()
+            comp_store.bind(sk2)
+            assert sk2.left.weight is sk2.right.weight
+            assert type(sk2.left.weight.data) is _PackedMetaBindTensor
+            assert torch.equal(cast(_PackedWrapper, sk2.left.weight.data)._packed, packed)
+        finally:
+            remove()
+
+    def test_rejects_strict_logical_shape_adapter_without_bind_opt_in(self) -> None:
+        remove = register_adapter(_PackedStrictAdapter)
+        try:
+            packed = torch.arange(32, dtype=torch.int8).reshape(4, 8)
+            proto = nn.Module()
+            proto.weight = nn.Parameter(_wrap_packed(_PackedStrictTensor, packed), requires_grad=False)
+            store = HostModuleStore.from_module(proto)
+
+            for bad_shape in ((4, 4), (4, 8)):
+                sk = nn.Module()
+                sk.weight = nn.Parameter(torch.empty(bad_shape, device="meta"), requires_grad=False)
+                with pytest.raises(ValueError, match="layout mismatch"):
+                    store.bind(sk)
+
+            exact = nn.Module()
+            exact.weight = nn.Parameter(
+                _wrap_packed(_PackedStrictTensor, torch.zeros((4, 8), dtype=torch.int8)),
+                requires_grad=False,
+            )
+            store.bind(exact)
+            assert torch.equal(cast(_PackedWrapper, exact.weight.data)._packed, packed)
+        finally:
+            remove()
+
+    def test_rejects_mismatched_non_meta_subclass_trainable_and_partial_targets(self) -> None:
+        remove = register_adapter(_PackedMetaBindAdapter)
+        try:
+            packed = torch.arange(32, dtype=torch.int8).reshape(4, 8)
+            proto = nn.Module()
+            proto.weight = nn.Parameter(_wrap_packed(_PackedMetaBindTensor, packed), requires_grad=False)
+            store = HostModuleStore.from_module(proto)
+            frozen_host = store.params["weight"]
+
+            wrong_shape = nn.Module()
+            wrong_shape.weight = nn.Parameter(torch.empty((8, 4), device="meta"), requires_grad=False)
+            with pytest.raises(ValueError, match="layout mismatch"):
+                store.bind(wrong_shape)
+
+            sparse_meta = nn.Module()
+            sparse_meta.weight = nn.Parameter(_make_sparse_meta((4, 4)), requires_grad=False)
+            with pytest.raises(ValueError, match="layout mismatch"):
+                store.bind(sparse_meta)
+
+            materialized_plain = nn.Module()
+            materialized_plain.weight = nn.Parameter(torch.zeros((4, 4), dtype=torch.bfloat16), requires_grad=False)
+            with pytest.raises(ValueError, match="layout mismatch"):
+                store.bind(materialized_plain)
+
+            subclass_meta = nn.Module()
+            subclass_meta.weight = _MetaParamSubclass(torch.empty((4, 4), device="meta"), requires_grad=False)
+            with pytest.raises(ValueError, match="layout mismatch"):
+                store.bind(subclass_meta)
+
+            trainable_meta = nn.Module()
+            trainable_meta.weight = nn.Parameter(torch.empty((4, 4), device="meta"), requires_grad=True)
+            assert not frozen_host.accepts_bind_target(trainable_meta.weight)
+            with pytest.raises(ValueError, match="requires_grad mismatch"):
+                store.bind(trainable_meta)
+
+            # Trainable quantized stores must also reject trainable plain meta targets.
+            packed_tr = torch.zeros((4, 8), dtype=torch.float32)
+            tr_param = HostParam(
+                nn.Parameter(_wrap_packed(_PackedMetaBindTensor, packed_tr, requires_grad=True), requires_grad=True)
+            )
+            tr_target = nn.Parameter(torch.empty((4, 4), device="meta"), requires_grad=True)
+            assert not tr_param.accepts_bind_target(tr_target)
+
+            # Multi-parameter rejection must not partially mutate earlier valid params.
+            pair_proto = nn.Module()
+            pair_proto.a = nn.Parameter(_wrap_packed(_PackedMetaBindTensor, packed), requires_grad=False)
+            pair_proto.b = nn.Parameter(_wrap_packed(_PackedMetaBindTensor, packed), requires_grad=False)
+            pair_store = HostModuleStore.from_module(pair_proto)
+
+            pair_target = nn.Module()
+            pair_target.a = nn.Parameter(torch.empty((4, 4), device="meta"), requires_grad=False)
+            pair_target.b = nn.Parameter(torch.empty((8, 4), device="meta"), requires_grad=False)
+            with pytest.raises(ValueError, match="Param 'b' layout mismatch"):
+                pair_store.bind(pair_target)
+            assert pair_target.a.is_meta
+        finally:
+            remove()
+
+    def test_regular_store_rejects_sparse_meta_target(self) -> None:
+        proto = nn.Module()
+        proto.weight = nn.Parameter(torch.randn(4, 4, dtype=torch.bfloat16), requires_grad=False)
+        store = HostModuleStore.from_module(proto)
+
+        for sparse_dtype in (torch.bfloat16, torch.float32):
+            sparse = nn.Module()
+            sparse.weight = nn.Parameter(
+                _make_sparse_meta((4, 4), dtype=sparse_dtype),
+                requires_grad=False,
+            )
+            with pytest.raises(ValueError, match="layout mismatch"):
+                store.bind(sparse)
+
+        dense_meta = nn.Module()
+        dense_meta.weight = nn.Parameter(torch.empty((4, 4), dtype=torch.float32, device="meta"), requires_grad=False)
+        store.bind(dense_meta)
+        assert dense_meta.weight.dtype == torch.bfloat16
+        assert torch.equal(dense_meta.weight.data, proto.weight.data)
+
+    def test_binds_gguf_and_trellis_onto_plain_meta_skeleton(self) -> None:
+        packed = packed_q4_0(8, 64)
+        for cls in (GgufParameter, GGUFParameter):
+            gguf_proto = nn.Module()
+            gguf_proto.weight = cls(packed, requires_grad=False, quant_type=2)
+            gguf_store = HostModuleStore.from_module(gguf_proto)
+            gguf_skeleton = nn.Linear(64, 8, bias=False, dtype=torch.float32, device="meta")
+            gguf_skeleton.weight.requires_grad_(False)
+            gguf_store.bind(gguf_skeleton)
+            assert isinstance(gguf_skeleton.weight, cls)
+            assert torch.equal(gguf_skeleton.weight.as_tensor().detach(), packed.view(torch.uint8))
+
+        trellis = _make_trellis_weight()
+        trellis_proto = nn.Module()
+        trellis_proto.weight = trellis
+        trellis_store = HostModuleStore.from_module(trellis_proto)
+        trellis_skeleton = nn.Linear(256, 64, bias=False, dtype=torch.float32, device="meta")
+        trellis_skeleton.weight.requires_grad_(False)
+        trellis_store.bind(trellis_skeleton)
+        assert isinstance(trellis_skeleton.weight, TrellisParameter)
+        assert torch.equal(trellis_skeleton.weight.bitstreams, trellis.bitstreams)
+        assert torch.equal(
+            trellis_skeleton.weight.block_scales.view(torch.uint8),
+            trellis.block_scales.view(torch.uint8),
+        )
+        assert torch.equal(trellis_skeleton.weight.scale, trellis.scale)
+
+    def test_meta_host_param_accepts_bind_target_checks_stride_offset_dtype_and_layout(self) -> None:
+        base = torch.empty(12, dtype=torch.bfloat16, device="meta")
+        meta_param = nn.Parameter(base.as_strided((2, 3), (3, 1), 1), requires_grad=False)
+        host = HostParam(meta_param)
+
+        def strided_meta(
+            stride: tuple[int, int] = (3, 1),
+            offset: int = 1,
+            *,
+            dtype: torch.dtype = torch.bfloat16,
+            requires_grad: bool = False,
+        ) -> nn.Parameter:
+            t = torch.empty(12, dtype=dtype, device="meta").as_strided((2, 3), stride, offset)
+            return nn.Parameter(t, requires_grad=requires_grad)
+
+        matching = strided_meta()
+        assert host.accepts_bind_target(matching)
+
+        non_matching = (
+            strided_meta(stride=(1, 2)),
+            strided_meta(offset=2),
+            strided_meta(dtype=torch.float32),
+            nn.Parameter(_make_sparse_meta((2, 3), dtype=torch.bfloat16), requires_grad=False),
+            nn.Parameter(torch.zeros((2, 3), dtype=torch.bfloat16), requires_grad=False),
+            strided_meta(requires_grad=True),
+        )
+        for bad in non_matching:
+            assert not host.accepts_bind_target(bad)
+
+    def test_rejects_meta_gguf_and_trellis_wrappers_cleanly(self) -> None:
+        packed = packed_q4_0(8, 64)
+        for cls in (GgufParameter, GGUFParameter):
+            gguf_proto = nn.Module()
+            gguf_proto.weight = cls(packed, requires_grad=False, quant_type=2)
+            gguf_store = HostModuleStore.from_module(gguf_proto)
+
+            meta_mod = nn.Module()
+            meta_mod.weight = cls(torch.empty_like(packed, device="meta"), requires_grad=False, quant_type=2)
+            assert not gguf_store.params["weight"].accepts_bind_target(meta_mod.weight)
+            with pytest.raises(ValueError, match="layout mismatch"):
+                gguf_store.bind(meta_mod)
+
+        trellis_proto = nn.Module()
+        trellis_proto.weight = _make_trellis_weight()
+        trellis_store = HostModuleStore.from_module(trellis_proto)
+
+        meta_trellis_mod = nn.Module()
+        meta_trellis_mod.weight = TrellisParameter(
+            torch.empty((64, 1, 143), dtype=torch.uint8, device="meta"),
+            torch.empty((64, 1), dtype=torch.float8_e4m3fn, device="meta"),
+            torch.empty((64, 1), dtype=torch.float32, device="meta"),
+            block_size=256,
+            group_size=256,
+        )
+        assert not trellis_store.params["weight"].accepts_bind_target(meta_trellis_mod.weight)
+        with pytest.raises(ValueError, match="layout mismatch"):
+            trellis_store.bind(meta_trellis_mod)
+
+    @staticmethod
+    @contextmanager
+    def _cpu_dtensor_mesh():
+        if not dist.is_gloo_available() or not DTENSOR_AVAILABLE:
+            pytest.skip("CPU Gloo and torch.distributed.tensor required")
+        assert not dist.is_initialized()
+
+        from torch.distributed.tensor import init_device_mesh
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            dist.init_process_group(
+                "gloo",
+                store=dist.FileStore(str(Path(tmpdir) / "store"), 1),
+                rank=0,
+                world_size=1,
+            )
+            try:
+                yield init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
+            finally:
+                dist.destroy_process_group()
+
+    def test_dtensor_cpu_mesh_binds_packed_adapter_and_rejects_mismatches(self) -> None:
+        from torch.distributed.tensor import DTensor, Replicate, Shard, init_device_mesh
+
+        with self._cpu_dtensor_mesh() as mesh:
+            rem_meta = register_adapter(_PackedMetaBindAdapter)
+            try:
+                packed = torch.arange(32, dtype=torch.int8).reshape(4, 8)
+                dt_packed = DTensor.from_local(
+                    _wrap_packed(_PackedMetaBindTensor, packed), mesh, [Shard(0)], run_check=False
+                )
+                proto = nn.Module()
+                proto.weight = nn.Parameter(dt_packed, requires_grad=False)
+                store = HostModuleStore.from_module(proto)
+
+                sk = nn.Module()
+                sk.weight = nn.Parameter(
+                    DTensor.from_local(
+                        torch.empty((4, 4), dtype=torch.float32, device="meta"),
+                        mesh,
+                        [Shard(0)],
+                        run_check=False,
+                    ),
+                    requires_grad=False,
+                )
+                store.bind(sk)
+                store.bind(sk)
+                assert isinstance(sk.weight.data, DTensor)
+                bound_local = sk.weight.data.to_local()
+                assert type(bound_local) is _PackedMetaBindTensor
+                assert torch.equal(cast(_PackedWrapper, bound_local)._packed, packed)
+
+                mesh_2d = init_device_mesh("cpu", (1, 1), mesh_dim_names=("dp", "tp"))
+                bad_targets: list[torch.Tensor] = [
+                    torch.empty((4, 4), device="meta"),
+                    DTensor.from_local(torch.zeros((4, 4), dtype=torch.bfloat16), mesh, [Shard(0)], run_check=False),
+                    DTensor.from_local(torch.empty((4, 4), device="meta"), mesh, [Replicate()], run_check=False),
+                    DTensor.from_local(torch.empty((8, 4), device="meta"), mesh, [Shard(0)], run_check=False),
+                    DTensor.from_local(
+                        torch.empty((2, 4), device="meta"),
+                        mesh,
+                        [Shard(0)],
+                        shape=(4, 4),
+                        stride=(4, 1),
+                        run_check=False,
+                    ),
+                    DTensor.from_local(
+                        torch.empty((4, 4), device="meta"), mesh_2d, [Replicate(), Shard(0)], run_check=False
+                    ),
+                ]
+                for bad in bad_targets:
+                    m = nn.Module()
+                    m.weight = nn.Parameter(bad, requires_grad=False)
+                    with pytest.raises(ValueError, match="layout mismatch"):
+                        store.bind(m)
+
+                # Non-DTensor quantized store rejects DTensor(meta).
+                plain_proto = nn.Module()
+                plain_proto.weight = nn.Parameter(
+                    _wrap_packed(_PackedMetaBindTensor, packed), requires_grad=False
+                )
+                plain_store = HostModuleStore.from_module(plain_proto)
+                dt_meta_only = nn.Module()
+                dt_meta_only.weight = nn.Parameter(
+                    DTensor.from_local(torch.empty((4, 4), device="meta"), mesh, [Shard(0)], run_check=False),
+                    requires_grad=False,
+                )
+                with pytest.raises(ValueError, match="layout mismatch"):
+                    plain_store.bind(dt_meta_only)
+            finally:
+                rem_meta()
+
+    def test_dtensor_cpu_mesh_enforces_strict_and_regular_bind_policies(self) -> None:
+        from torch.distributed.tensor import DTensor, Shard
+
+        with self._cpu_dtensor_mesh() as mesh:
+            rem_strict = register_adapter(_PackedStrictAdapter)
+            try:
+                packed = torch.arange(32, dtype=torch.int8).reshape(4, 8)
+                strict_proto = nn.Module()
+                strict_proto.weight = nn.Parameter(
+                    DTensor.from_local(
+                        _wrap_packed(_PackedStrictTensor, packed), mesh, [Shard(0)], run_check=False
+                    ),
+                    requires_grad=False,
+                )
+                strict_store = HostModuleStore.from_module(strict_proto)
+                for bad_local_shape in ((4, 4), (4, 8)):
+                    bad_strict = nn.Module()
+                    bad_strict.weight = nn.Parameter(
+                        DTensor.from_local(
+                            torch.empty(bad_local_shape, device="meta"), mesh, [Shard(0)], run_check=False
+                        ),
+                        requires_grad=False,
+                    )
+                    with pytest.raises(ValueError, match="layout mismatch"):
+                        strict_store.bind(bad_strict)
+                good_strict = nn.Module()
+                good_strict.weight = nn.Parameter(
+                    DTensor.from_local(
+                        _wrap_packed(_PackedStrictTensor, torch.zeros_like(packed)),
+                        mesh,
+                        [Shard(0)],
+                        run_check=False,
+                    ),
+                    requires_grad=False,
+                )
+                strict_store.bind(good_strict)
+                assert torch.equal(cast(_PackedWrapper, good_strict.weight.data.to_local())._packed, packed)
+
+                # DTensor over RegularAdapter accepts dtype-mismatched meta.
+                reg_proto = nn.Module()
+                reg_weights = torch.randn(4, 4, dtype=torch.bfloat16)
+                reg_proto.weight = nn.Parameter(
+                    DTensor.from_local(reg_weights, mesh, [Shard(0)], run_check=False),
+                    requires_grad=False,
+                )
+                reg_store = HostModuleStore.from_module(reg_proto)
+                reg_meta = nn.Module()
+                reg_meta.weight = nn.Parameter(
+                    DTensor.from_local(
+                        torch.empty((4, 4), dtype=torch.float32, device="meta"), mesh, [Shard(0)], run_check=False
+                    ),
+                    requires_grad=False,
+                )
+                reg_store.bind(reg_meta)
+                assert torch.equal(reg_meta.weight.data.to_local(), reg_weights)
+
+                # DTensor over RegularAdapter rejects mismatched local shard shape or subclass wrapper.
+                for bad_reg_local in (
+                    torch.empty((2, 4), device="meta"),
+                    _wrap_packed(_PackedStrictTensor, packed),
+                ):
+                    kwargs: dict[str, Any] = (
+                        {"shape": (4, 4), "stride": (4, 1)} if tuple(bad_reg_local.shape) != (4, 4) else {}
+                    )
+                    bad_reg = nn.Module()
+                    bad_reg.weight = nn.Parameter(
+                        DTensor.from_local(bad_reg_local, mesh, [Shard(0)], run_check=False, **kwargs),
+                        requires_grad=False,
+                    )
+                    with pytest.raises(ValueError, match="layout mismatch"):
+                        reg_store.bind(bad_reg)
+            finally:
+                rem_strict()
+
+    def test_dtensor_cpu_mesh_isolates_inner_signature_and_rejects_unregistered_subclasses(self) -> None:
+        from torch.distributed.tensor import DTensor, Shard
+
+        with self._cpu_dtensor_mesh() as mesh:
+            rem_colliding = register_adapter(_CollidingStrictAdapter)
+            rem_meta = register_adapter(_PackedMetaBindAdapter)
+            try:
+                packed = torch.arange(32, dtype=torch.int8).reshape(4, 8)
+                colliding_dt = DTensor.from_local(
+                    _wrap_packed(_CollidingStrictTensor, packed), mesh, [Shard(0)], run_check=False
+                )
+                plain_bf16_dt = DTensor.from_local(
+                    torch.zeros((4, 4), dtype=torch.bfloat16), mesh, [Shard(0)], run_check=False
+                )
+                assert DTensorAdapter.layout_signature(colliding_dt) != DTensorAdapter.layout_signature(plain_bf16_dt)
+
+                # Strict external adapter inside DTensor must not collide with RegularAdapter even if
+                # its layout_signature tuple matches RegularAdapter.
+                colliding_proto = nn.Module()
+                colliding_proto.weight = nn.Parameter(colliding_dt, requires_grad=False)
+                colliding_store = HostModuleStore.from_module(colliding_proto)
+                for bad_local in (
+                    torch.empty((4, 4), dtype=torch.bfloat16, device="meta"),
+                    torch.zeros((4, 4), dtype=torch.bfloat16),
+                ):
+                    m = nn.Module()
+                    m.weight = nn.Parameter(
+                        DTensor.from_local(bad_local, mesh, [Shard(0)], run_check=False),
+                        requires_grad=False,
+                    )
+                    with pytest.raises(ValueError, match="layout mismatch"):
+                        colliding_store.bind(m)
+
+                # DTensor wrapping an unregistered subclass must return False / ValueError("layout mismatch")
+                # rather than crashing with NotImplementedError from select_adapter(local).
+                unreg_param = nn.Parameter(
+                    DTensor.from_local(_wrap_packed(_UnregisteredSubTensor, packed), mesh, [Shard(0)], run_check=False),
+                    requires_grad=False,
+                )
+                reg_proto = nn.Module()
+                reg_proto.weight = nn.Parameter(plain_bf16_dt, requires_grad=False)
+                reg_store = HostModuleStore.from_module(reg_proto)
+                meta_proto = nn.Module()
+                meta_proto.weight = nn.Parameter(
+                    DTensor.from_local(_wrap_packed(_PackedMetaBindTensor, packed), mesh, [Shard(0)], run_check=False),
+                    requires_grad=False,
+                )
+                meta_store = HostModuleStore.from_module(meta_proto)
+
+                for store in (reg_store, meta_store):
+                    assert not store.params["weight"].accepts_bind_target(unreg_param)
+                    unreg_mod = nn.Module()
+                    unreg_mod.weight = unreg_param
+                    with pytest.raises(ValueError, match="layout mismatch"):
+                        store.bind(unreg_mod)
+            finally:
+                rem_meta()
+                rem_colliding()
+
+    @staticmethod
+    def _build_convrot_and_meta_nets(convrot_cls: Any):
+        def make_convrot(seed: int) -> tuple[Any, torch.Tensor, torch.Tensor]:
+            gen = torch.Generator().manual_seed(seed)
+            q = torch.randint(-127, 128, (64, 64), dtype=torch.int8, generator=gen)
+            s = torch.rand((64, 1), dtype=torch.float32, generator=gen) + 0.1
+            return convrot_cls.from_quantized(q, s, group_size=64, logical_dtype=torch.bfloat16), q, s
+
+        weights = [make_convrot(seed) for seed in (0, 1, 2)]
+        proto = nn.Module()
+        proto.head = nn.Linear(64, 64, bias=False, device="meta")
+        proto.head.weight = nn.Parameter(weights[0][0], requires_grad=False)
+        proto.blocks = nn.ModuleList([nn.Linear(64, 64, bias=False, device="meta") for _ in range(2)])
+        proto.blocks[0].weight = nn.Parameter(weights[1][0], requires_grad=False)
+        proto.blocks[1].weight = nn.Parameter(weights[2][0], requires_grad=False)
+        proto.requires_grad_(False)
+
+        def make_meta_skeleton() -> nn.Module:
+            with torch.device("meta"):
+                net = nn.Module()
+                net.head = nn.Linear(64, 64, bias=False, dtype=torch.float32)
+                net.blocks = nn.ModuleList([nn.Linear(64, 64, bias=False, dtype=torch.float32) for _ in range(2)])
+                net.requires_grad_(False)
+                return net
+
+        return proto, weights, make_meta_skeleton
+
+    def test_binds_convrot_host_block_and_composite_stores_onto_meta_skeleton(self) -> None:
+        convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
+        convrot_cls = convrot_mod.ConvRotInt8Tensor
+        proto, weights, make_meta_skeleton = self._build_convrot_and_meta_nets(convrot_cls)
+        (_, head_q, head_s), (_, b0_q, b0_s), (_, b1_q, b1_s) = weights
+
+        head_store = HostComponentStore.from_module(proto.head)
+        sk_head = nn.Linear(64, 64, bias=False, dtype=torch.float32, device="meta")
+        sk_head.weight.requires_grad_(False)
+        head_store.bind(sk_head)
+        assert isinstance(sk_head.weight.data, convrot_cls)
+        assert torch.equal(sk_head.weight.data.qdata, head_q)
+        assert torch.equal(sk_head.weight.data.scale, head_s)
+
+        block_store = BlockComponentStore.from_module(proto, blocks_path="blocks")
+        sk1 = make_meta_skeleton()
+        block_store.bind(sk1)
+        for idx, (exp_q, exp_s) in enumerate(((b0_q, b0_s), (b1_q, b1_s))):
+            w = sk1.blocks[idx].weight.data
+            assert isinstance(w, convrot_cls)
+            assert torch.equal(w.qdata, exp_q)
+            assert torch.equal(w.scale, exp_s)
+
+        composite_store = CompositeComponentStore.from_module(proto, block_paths=("blocks",))
+        sk2 = make_meta_skeleton()
+        composite_store.bind(sk2, block_mode="streaming")
+        assert isinstance(sk2.head.weight.data, convrot_cls)
+        assert torch.equal(sk2.head.weight.data.qdata, head_q)
+        for idx, (exp_q, exp_s) in enumerate(((b0_q, b0_s), (b1_q, b1_s))):
+            w = sk2.blocks[idx].weight.data
+            assert isinstance(w, convrot_cls)
+            assert torch.equal(w.qdata, exp_q)
+            assert torch.equal(w.scale, exp_s)
+
+    def test_convrot_meta_bound_composite_offloader_forward_parity(self) -> None:
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP device required")
+        convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
+        proto, _, make_meta_skeleton = self._build_convrot_and_meta_nets(convrot_mod.ConvRotInt8Tensor)
+
+        composite_store = CompositeComponentStore.from_module(proto, block_paths=("blocks",))
+        skeleton = make_meta_skeleton()
+        composite = composite_store.bind(skeleton, block_mode="streaming")
+
+        x = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
+        offloader = ModelOffloader(skeleton, composite=composite, cache_bytes=composite_store.cache_bytes)
+        with activated_model(offloader, "cuda"):
+            actual = skeleton.blocks[1](skeleton.blocks[0](skeleton.head(x)))
+        proto_off = ModelOffloader.from_module(proto, block_paths=("blocks",), block_mode="resident")
+        with activated_model(proto_off, "cuda"):
+            expected = proto.blocks[1](proto.blocks[0](proto.head(x)))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+

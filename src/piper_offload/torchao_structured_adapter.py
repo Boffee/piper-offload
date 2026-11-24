@@ -37,6 +37,8 @@ from torch import nn
 from .tensor_adapters import (
     capture_host_tensor,
     empty_like_strided,
+    is_plain_meta_placeholder,
+    matches_layout_signature,
     optional_tensor_id,
     tensor_layout,
     transfer_,
@@ -57,11 +59,13 @@ class TorchaoHost[MetaT]:
     ``storage`` holds the inner storage tensors positionally, parallel to
     the adapter's ``_STORAGE_NAMES``; an entry is ``None`` for an absent
     optional tensor (e.g. NVFP4 global scales). ``meta`` is the immutable
-    metadata snapshot used to rebuild the wrapper on each move.
+    metadata snapshot used to rebuild the wrapper on each move, and
+    ``logical_shape`` is the dense wrapper shape preserved across offload.
     """
 
     storage: tuple[torch.Tensor | None, ...]
     meta: MetaT
+    logical_shape: tuple[int, ...]
 
 
 @dataclass(slots=True, frozen=True)
@@ -240,7 +244,25 @@ class TorchaoStructuredAdapter[MetaT](ABC):
             capture_host_tensor(s) if s is not None else None
             for s in cls._storage_of(w)
         )
-        return TorchaoHost(storage=storage, meta=cls._meta_of(w))
+        return TorchaoHost(
+            storage=storage,
+            meta=cls._meta_of(w),
+            logical_shape=tuple(w.shape),
+        )
+
+    @classmethod
+    def accepts_bind_target(
+        cls,
+        state: TorchaoHost[MetaT],
+        target: torch.Tensor,
+        *,
+        layout_signature: object,
+        requires_grad: bool,
+    ) -> bool:
+        return (
+            not requires_grad
+            and is_plain_meta_placeholder(target, state.logical_shape)
+        ) or matches_layout_signature(cls, layout_signature, target)
 
     @staticmethod
     def storage_tensors(state: TorchaoHost[MetaT]) -> tuple[torch.Tensor, ...]:

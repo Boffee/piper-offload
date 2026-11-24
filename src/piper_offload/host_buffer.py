@@ -43,7 +43,7 @@ class HostBuffer:
 
         dtype excluded: binding replaces the module's buffer with the
         host tensor, so a placeholder's dtype carries no information
-        past validation (mirrors :meth:`HostParam.bind_layout_for`).
+        past validation (mirrors :meth:`HostParam.accepts_bind_target`).
         """
         return (
             tuple(buffer.shape),

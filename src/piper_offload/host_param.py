@@ -21,12 +21,11 @@ from torch import nn
 from .dtensor_adapter import DTensorAdapter
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
-    BindLayoutTensorAdapter,
     CpuRoundTripTensorAdapter,
     LogicalShapeTensorAdapter,
     ParameterDataSwapTensorAdapter,
-    PostLoadRearmTensorAdapter,
     TensorAdapter,
+    accepts_bind_target,
     adapter_name,
     clone_host_state,
     host_state_is_owned,
@@ -81,9 +80,7 @@ class HostParam:
     """
 
     __slots__ = (
-        "_bind_layout",
         "_logical_shape",
-        "_needs_rearm",
         "_shape",
         "_target_layout",
         "adapter",
@@ -203,19 +200,10 @@ class HostParam:
             if isinstance(adapter, LogicalShapeTensorAdapter)
             else tuple(representation.shape)
         )
-        # Precompute the rearm capability once: the per-load check is a hot
-        # path (every param, every block rotation), and a runtime_checkable
-        # Protocol isinstance structurally probes every member each call.
-        self._needs_rearm: bool = isinstance(
-            adapter, PostLoadRearmTensorAdapter
-        )
         self._target_layout = self._target_layout_from_adapter(
             adapter,
             representation,
             unresolved_meta=self.is_meta,
-        )
-        self._bind_layout = self._bind_layout_from_adapter(
-            adapter, representation,
         )
 
     @staticmethod
@@ -242,14 +230,6 @@ class HostParam:
             )
         return (type(adapter), signature)
 
-    @staticmethod
-    def _bind_layout_from_adapter(
-        adapter: TensorAdapter[Any, Any], tensor: torch.Tensor,
-    ) -> tuple[object, object]:
-        if isinstance(adapter, BindLayoutTensorAdapter):
-            return (type(adapter), adapter.bind_layout_signature(tensor))
-        return (type(adapter), adapter.layout_signature(tensor))
-
     @classmethod
     def target_layout_for(cls, param: nn.Parameter) -> tuple[object, object]:
         """Opaque target-compatibility layout for ``param``.
@@ -262,29 +242,40 @@ class HostParam:
         adapter = select_adapter(representation)
         return cls._target_layout_from_adapter(adapter, representation)
 
-    @classmethod
-    def bind_layout_for(cls, param: nn.Parameter) -> tuple[object, object]:
-        """Opaque bind-compatibility layout for ``param``.
+    def accepts_bind_target(self, param: nn.Parameter) -> bool:
+        """Return whether ``param`` is a compatible bind target for this host store.
 
-        Relaxed counterpart of :meth:`target_layout_for` for store↔module
-        bind validation: adapters opting into
-        :class:`BindLayoutTensorAdapter` drop fields that binding
-        overwrites (dtype for plain tensors), so config-built skeletons
-        bind against stores captured from natively loaded weights.
+        Unrecognized or incompatible tensor types return ``False`` cleanly; malformed
+        instances of an adapter's own tensor type (such as an unsupported transposed
+        layout) may still raise during layout validation.
         """
+        if param.requires_grad != self.requires_grad:
+            return False
         representation = param_representation(param)
-        adapter = select_adapter(representation)
-        return cls._bind_layout_from_adapter(adapter, representation)
+        if self.is_meta:
+            host_representation = cast(torch.Tensor, self.host_state)
+            return bool(
+                type(representation) is torch.Tensor
+                and representation.is_meta
+                and representation.layout is torch.strided
+                and tuple(representation.shape) == tuple(self.shape)
+                and representation.dtype is host_representation.dtype
+                and representation.stride() == host_representation.stride()
+                and representation.storage_offset()
+                == host_representation.storage_offset()
+            )
+        return accepts_bind_target(
+            self.adapter,
+            self.host_state,
+            self._target_layout[1],
+            representation,
+            requires_grad=self.requires_grad,
+        )
 
     @property
     def target_layout(self) -> tuple[object, object]:
         """Opaque target-compatibility layout for this host backing."""
         return self._target_layout
-
-    @property
-    def bind_layout(self) -> tuple[object, object]:
-        """Opaque bind-compatibility layout for this host backing."""
-        return self._bind_layout
 
     @property
     def shape(self) -> torch.Size:
@@ -386,19 +377,6 @@ class HostParam:
             gpu_state, self.host_state, non_blocking=non_blocking
         )
 
-    def rearm_after_load(self, param: nn.Parameter, gpu_state: object) -> None:
-        """Re-arm the active GPU wrapper after a load, if the adapter needs it.
-
-        No-op for adapters whose reconstructed wrapper stays self-describing
-        across buffer refills (the common case); delegates to adapters that
-        implement :class:`PostLoadRearmTensorAdapter`. Capability is decided
-        once at construction (:attr:`_needs_rearm`).
-        """
-        if self._needs_rearm:
-            cast(
-                "PostLoadRearmTensorAdapter[Any, Any]", self.adapter
-            ).rearm_after_load(param, gpu_state)
-
     def materialize(
         self,
         device: torch.device,
@@ -432,7 +410,6 @@ class HostParam:
         state = self.allocate_gpu_storage(device)
         param = self.make_gpu_param(state)
         self.copy_to_gpu(state, non_blocking=non_blocking)
-        self.rearm_after_load(param, state)
         return param
 
     def clone_cpu_param(self) -> nn.Parameter:
