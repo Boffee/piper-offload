@@ -8,6 +8,7 @@ import gc
 import json
 import mmap
 import os
+import struct
 import subprocess
 import sys
 import threading
@@ -27,8 +28,15 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, SequenceParallel, parallelize_module
 
 from piper_offload import (
+    Adapter,
+    BlockCompileConfig,
+    MappedCheckpoint,
+    ModelCache,
+    ModelOffloader,
     ModelStore,
+    ModelStoreSpec,
     OffloadConfig,
+    checkpoint as checkpoint_mod,
     _parallel_collectives,
     _sequential_runtime,
     _transfer_priority,
@@ -2269,3 +2277,249 @@ def test_startup_timeout_rolls_back_isolation(monkeypatch: pytest.MonkeyPatch) -
     assert not _sequential_runtime.session_lock.locked()
     with ParallelExecutor(["cpu", "cpu"]) as reopened:
         assert reopened.run(_run_simple_allreduce) == (3.0, 3.0)
+
+
+class _TwoGpuTPBlock(nn.Module):
+    def __init__(self, dim: int, *, device: torch.device | str = "cpu", dtype: torch.dtype = torch.bfloat16) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim * 2, bias=True, device=device, dtype=dtype)
+        self.fc2 = nn.Linear(dim * 2, dim, bias=True, device=device, dtype=dtype)
+        self.norm = nn.LayerNorm(dim, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.fc2(torch.relu(self.fc1(x)))) + x
+
+
+class _TwoGpuTPModel(nn.Module):
+    def __init__(
+        self,
+        dim: int = 64,
+        num_blocks: int = 2,
+        *,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__()
+        self.embed = nn.Linear(dim, dim, bias=False, device=device, dtype=dtype)
+        self.blocks = nn.ModuleList([_TwoGpuTPBlock(dim, device=device, dtype=dtype) for _ in range(num_blocks)])
+        self.head = nn.Linear(dim, dim, bias=False, device=device, dtype=dtype)
+        self.register_buffer("scale", torch.ones(dim, device=device, dtype=dtype))
+        self.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.embed(x) * self.scale
+        for block in self.blocks:
+            h = block(h)
+        return self.head(h)
+
+
+def _parallelize_two_gpu_tp(model: nn.Module, mesh: DeviceMesh) -> nn.Module:
+    plan: dict[str, Any] = {}
+    for idx in range(len(model.blocks)):
+        plan[f"blocks.{idx}.fc1"] = ColwiseParallel(input_layouts=Shard(1))
+        plan[f"blocks.{idx}.fc2"] = RowwiseParallel(output_layouts=Shard(1))
+        plan[f"blocks.{idx}.norm"] = SequenceParallel(sequence_dim=1, use_local_output=True)
+    # PyTorch's SequenceParallel wraps replicated norm params without preserving requires_grad=False.
+    return parallelize_module(model, mesh, plan).requires_grad_(False)
+
+
+def _write_tp_safetensors(path: Path, tensors: dict[str, torch.Tensor]) -> None:
+    tags = {dtype: tag for tag, dtype in checkpoint_mod._DTYPES.items()}
+    header: dict[str, object] = {}
+    payload = bytearray()
+    for name, tensor in tensors.items():
+        raw = tensor.reshape(-1).contiguous().view(torch.uint8).numpy().tobytes() if tensor.numel() else b""
+        header[name] = {
+            "dtype": tags[tensor.dtype],
+            "shape": list(tensor.shape),
+            "data_offsets": [len(payload), len(payload) + len(raw)],
+        }
+        payload += raw
+    encoded = json.dumps(header).encode()
+    encoded += b" " * (-(8 + len(encoded)) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + bytes(payload))
+
+
+def _build_cached_tp_store(tmp_path: Path, ref: _TwoGpuTPModel) -> tuple[MappedCheckpoint, ModelCache, ModelStoreSpec]:
+    ckpt_path = tmp_path / "tp_two_gpu.safetensors"
+    _write_tp_safetensors(ckpt_path, {k: v.clone() for k, v in ref.state_dict().items()})
+    ckpt = MappedCheckpoint(ckpt_path)
+
+    def load_proto() -> nn.Module:
+        with torch.device("meta"):
+            proto = _TwoGpuTPModel(dim=64, num_blocks=2, device="meta", dtype=torch.bfloat16)
+        for name, _p in list(proto.named_parameters()):
+            parent = proto.get_submodule(name.rpartition(".")[0]) if "." in name else proto
+            parent.register_parameter(
+                name.rpartition(".")[2],
+                nn.Parameter(ckpt.get_tensor(name), requires_grad=False),
+            )
+        proto.register_buffer("scale", ckpt.get_tensor("scale").clone())
+        return proto
+
+    cache = ModelCache()
+    spec = ModelStoreSpec(key="tp_two_gpu", factory=load_proto)
+    return ckpt, cache, spec
+
+
+def _assert_two_gpu_pin_sharing(store: ModelStore) -> None:
+    assert 0 < host_pin_manager.stats.registrations <= len(store.param_names) + 1
+    fc1_tensor = store._module_store.params["blocks.0.fc1.weight"].storage_tensors()[0]
+    assert host_pin_manager._registrations[fc1_tensor.untyped_storage().data_ptr()].leases == 2
+
+
+@TWO_GPUS
+@pytest.mark.parametrize(
+    "block_compile",
+    [None, BlockCompileConfig(fullgraph=True)],
+    ids=["eager", "compiled"],
+)
+def test_two_gpu_model_store_bind_tp_meta_shell_streaming_and_mmap(
+    tmp_path: Path,
+    block_compile: BlockCompileConfig | None,
+) -> None:
+    host_pin_manager.clear()
+    torch.manual_seed(23)
+    ref = _TwoGpuTPModel(dim=64, num_blocks=2, device="cpu", dtype=torch.bfloat16)
+    x = torch.randn(2, 4, 64, dtype=torch.bfloat16)
+    with torch.inference_mode():
+        expected = ref(x)
+
+    ckpt, cache, spec = _build_cached_tp_store(tmp_path, ref)
+    cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming", block_compile=block_compile)
+    offloaders: list[ModelOffloader | None] = [None, None]
+    try:
+        with cache.lease(spec) as store:
+            def bind_rank(rank: int) -> None:
+                mesh = init_device_mesh("cuda", (2,))
+                with torch.device("meta"):
+                    shell = _TwoGpuTPModel(dim=64, num_blocks=2, device="meta", dtype=torch.float32)
+                _parallelize_two_gpu_tp(shell, mesh)
+                offloaders[rank] = store.bind(shell, cfg)
+
+            def run_rank(rank: int) -> tuple[torch.Tensor, bool]:
+                dev = torch.device(f"cuda:{rank}")
+                off = offloaders[rank]
+                assert off is not None
+                with activated_model(off, dev) as model, torch.inference_mode():
+                    fc2_local = model.blocks[0].fc2.weight.to_local()
+                    is_contig = fc2_local.is_cuda and fc2_local.is_contiguous()
+                    return model(x.chunk(2, dim=1)[rank].to(dev)).cpu(), is_contig
+
+            with ParallelExecutor(["cuda:0", "cuda:1"], transport="host_staged", staging_bytes=64 * 1024) as ex:
+                ex.run(bind_rank)
+                outs = ex.run(run_rank)
+                for rank in range(2):
+                    assert outs[rank][1]
+                    torch.testing.assert_close(outs[rank][0], expected.chunk(2, dim=1)[rank], rtol=2e-2, atol=2e-2)
+                    cast_off = offloaders[rank]
+                    assert cast_off is not None
+                    cast_off.deactivate()
+
+                ex.run(lambda r: offloaders[r].activate(f"cuda:{r}"))  # type: ignore[union-attr]
+                _assert_two_gpu_pin_sharing(store)
+
+            for off in offloaders:
+                assert off is not None
+                off.deactivate()
+            offloaders.clear()
+
+        with ParallelExecutor(["cpu", "cpu"]) as ex_cpu:
+            res = ex_cpu.run(
+                lambda _r: tuple(
+                    nn.Parameter(
+                        DTensor.from_local(
+                            torch.ones(2, 4), init_device_mesh("cpu", (2,)), [Shard(0)],
+                            shape=(4, 4), stride=(4, 1), run_check=False,
+                        ),
+                        requires_grad=False,
+                    ).full_tensor().shape
+                )
+            )
+            assert res == ((4, 4), (4, 4))
+    finally:
+        for off in offloaders:
+            if off is not None and off.active_device is not None:
+                off.deactivate()
+        offloaders.clear()
+        cache.clear()
+        ckpt.close()
+        host_pin_manager.clear()
+
+
+@TWO_GPUS
+def test_two_gpu_model_store_bind_tp_meta_shell_lora_and_p2p() -> None:
+    torch.manual_seed(31)
+    dim = 64
+    lora_rank = 4
+    ref = _TwoGpuTPModel(dim=dim, num_blocks=2, device="cpu", dtype=torch.bfloat16)
+    lora_state = {
+        "embed.lora_A.weight": torch.randn(lora_rank, dim, dtype=torch.bfloat16) * 0.1,
+        "embed.lora_B.weight": torch.randn(dim, lora_rank, dtype=torch.bfloat16) * 0.1,
+        "blocks.0.fc1.lora_A.weight": torch.randn(lora_rank, dim, dtype=torch.bfloat16) * 0.1,
+        "blocks.0.fc1.lora_B.weight": torch.randn(dim * 2, lora_rank, dtype=torch.bfloat16) * 0.1,
+        "blocks.1.fc2.lora_A.weight": torch.randn(lora_rank, dim * 2, dtype=torch.bfloat16) * 0.1,
+        "blocks.1.fc2.lora_B.weight": torch.randn(dim, lora_rank, dtype=torch.bfloat16) * 0.1,
+    }
+    lora = Adapter.from_state_dict(lora_state)
+    routed_lora = Adapter.from_state_dict(
+        {
+            "embed.lora_A.weight": lora_state["embed.lora_A.weight"],
+            "embed.lora_B.weight": lora_state["embed.lora_B.weight"],
+        }
+    )
+
+    x = torch.randn(2, 4, dim, dtype=torch.bfloat16)
+    strength = 0.5
+    merged_ref = copy.deepcopy(ref)
+    with torch.no_grad():
+        merged_ref.embed.weight.add_((lora_state["embed.lora_B.weight"] @ lora_state["embed.lora_A.weight"]) * strength)
+        merged_ref.blocks[0].fc1.weight.add_(
+            (lora_state["blocks.0.fc1.lora_B.weight"] @ lora_state["blocks.0.fc1.lora_A.weight"]) * strength
+        )
+        merged_ref.blocks[1].fc2.weight.add_(
+            (lora_state["blocks.1.fc2.lora_B.weight"] @ lora_state["blocks.1.fc2.lora_A.weight"]) * strength
+        )
+        expected_merged = merged_ref(x)
+
+    routed_ref = copy.deepcopy(ref)
+    with torch.no_grad():
+        routed_ref.embed.weight.add_((lora_state["embed.lora_B.weight"] @ lora_state["embed.lora_A.weight"]) * strength)
+        expected_routed = routed_ref(x)
+
+    store = ModelStore.from_module(ref)
+    cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+    transport = "p2p" if _HAS_TWO_GPU_P2P else "host_staged"
+
+    with ParallelExecutor(["cuda:0", "cuda:1"], transport=transport, staging_bytes=64 * 1024) as ex:
+        def run_rank(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+            dev = torch.device(f"cuda:{rank}")
+            mesh = init_device_mesh("cuda", (2,))
+            with torch.device("meta"):
+                shell = _TwoGpuTPModel(dim=dim, num_blocks=2, device="meta", dtype=torch.float32)
+            _parallelize_two_gpu_tp(shell, mesh)
+            offloader = store.bind(shell, cfg)
+            x_local = x.chunk(2, dim=1)[rank].to(dev)
+            with activated_model(
+                offloader,
+                dev,
+                adapters=[lora],
+                adapter_strengths=[strength],
+                adapter_mode="merge",
+            ) as model, torch.inference_mode():
+                y_merged = model(x_local).cpu()
+            with activated_model(
+                offloader,
+                dev,
+                adapters=[routed_lora],
+                adapter_strengths=[strength],
+                adapter_mode="routed",
+            ) as model, torch.inference_mode():
+                y_routed = model(x_local).cpu()
+            offloader.deactivate()
+            return y_merged, y_routed
+
+        outs = ex.run(run_rank)
+        for rank in range(2):
+            torch.testing.assert_close(outs[rank][0], expected_merged.chunk(2, dim=1)[rank], rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(outs[rank][1], expected_routed.chunk(2, dim=1)[rank], rtol=2e-2, atol=2e-2)

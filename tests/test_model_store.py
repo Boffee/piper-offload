@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 import gc
+import json
 from pathlib import Path
+import struct
 import threading
 import tracemalloc
 from typing import Any, cast
@@ -1726,3 +1728,570 @@ class TestReviewRegressions:
             assert index_bound["blocks.255.p11"] == (255, "p11")
         finally:
             bound.deactivate()
+
+
+def _write_safetensors(path: Path, tensors: dict[str, torch.Tensor]) -> None:
+    import piper_offload.checkpoint as checkpoint_module
+
+    tags = {dtype: tag for tag, dtype in checkpoint_module._DTYPES.items()}
+    header: dict[str, object] = {}
+    payload = bytearray()
+    for name, tensor in tensors.items():
+        raw = (
+            tensor.reshape(-1).contiguous().view(torch.uint8).numpy().tobytes()
+            if tensor.numel()
+            else b""
+        )
+        header[name] = {
+            "dtype": tags[tensor.dtype],
+            "shape": list(tensor.shape),
+            "data_offsets": [len(payload), len(payload) + len(raw)],
+        }
+        payload += raw
+    encoded = json.dumps(header).encode()
+    encoded += b" " * (-(8 + len(encoded)) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + bytes(payload))
+
+
+class _TPSequenceBlock(nn.Module):
+    def __init__(self, dim: int, *, device: torch.device, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim * 2, bias=True, device=device, dtype=dtype)
+        self.fc2 = nn.Linear(dim * 2, dim, bias=True, device=device, dtype=dtype)
+        self.norm = nn.LayerNorm(dim, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.fc2(torch.relu(self.fc1(x)))) + x
+
+
+class _TPSequenceModel(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim: int = 8,
+        num_blocks: int = 2,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__()
+        dev = torch.device(device)
+        self.embed = nn.Linear(dim, dim, bias=False, device=dev, dtype=dtype)
+        self.blocks = nn.ModuleList(
+            [_TPSequenceBlock(dim, device=dev, dtype=dtype) for _ in range(num_blocks)]
+        )
+        self.head = nn.Linear(dim, dim, bias=False, device=dev, dtype=dtype)
+        self.register_buffer("scale", torch.ones(dim, device=dev, dtype=dtype))
+        self.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.embed(x) * self.scale
+        for block in self.blocks:
+            h = block(h)
+        return self.head(h)
+
+
+def _parallelize_tp_sequence(model: nn.Module, mesh: Any) -> nn.Module:
+    from torch.distributed.tensor import Shard
+    from torch.distributed.tensor.parallel import (
+        ColwiseParallel,
+        RowwiseParallel,
+        SequenceParallel,
+        parallelize_module,
+    )
+
+    plan: dict[str, Any] = {}
+    for idx in range(len(cast(nn.ModuleList, model.blocks))):
+        plan[f"blocks.{idx}.fc1"] = ColwiseParallel(input_layouts=Shard(1))
+        plan[f"blocks.{idx}.fc2"] = RowwiseParallel(output_layouts=Shard(1))
+        plan[f"blocks.{idx}.norm"] = SequenceParallel(sequence_dim=1, use_local_output=True)
+    # PyTorch's SequenceParallel wraps replicated norm params without preserving requires_grad=False.
+    return parallelize_module(model, mesh, plan).requires_grad_(False)
+
+
+def _make_meta_dtensor_param(
+    mesh: Any,
+    placements: list[Any],
+    *,
+    global_shape: tuple[int, ...] = (4, 4),
+    local_shape: tuple[int, ...] | None = None,
+) -> nn.Parameter:
+    from torch.distributed.tensor import DTensor, Shard
+
+    resolved_local = local_shape
+    if resolved_local is None:
+        if len(placements) == 1 and placements[0] == Shard(0):
+            resolved_local = (global_shape[0] // 2, *global_shape[1:])
+        elif len(placements) == 1 and placements[0] == Shard(1):
+            resolved_local = (global_shape[0], global_shape[1] // 2, *global_shape[2:])
+        else:
+            resolved_local = global_shape
+    stride = (global_shape[1], 1) if len(global_shape) == 2 else (1,)
+    return nn.Parameter(
+        DTensor.from_local(
+            torch.empty(resolved_local, device="meta"),
+            mesh,
+            placements,
+            shape=global_shape,
+            stride=stride,
+            run_check=False,
+        ),
+        requires_grad=False,
+    )
+
+
+def _load_tp_model_from_mmap_checkpoint(tmp_path: Path, ref: _TPSequenceModel) -> tuple[Any, ModelStore]:
+    from piper_offload import MappedCheckpoint
+
+    ckpt_path = tmp_path / "tp_model.safetensors"
+    _write_safetensors(ckpt_path, {k: v.clone() for k, v in ref.state_dict().items()})
+    ckpt = MappedCheckpoint(ckpt_path)
+    try:
+        with torch.device("meta"):
+            proto = _TPSequenceModel(dim=8, num_blocks=2, device="meta", dtype=torch.bfloat16)
+        for name, _p in list(proto.named_parameters()):
+            parent = proto.get_submodule(name.rpartition(".")[0]) if "." in name else proto
+            parent.register_parameter(
+                name.rpartition(".")[2],
+                nn.Parameter(ckpt.get_tensor(name), requires_grad=False),
+            )
+        proto.register_buffer("scale", ckpt.get_tensor("scale").clone())
+        store = ModelStore.from_module(proto)
+    except BaseException:
+        ckpt.close()
+        raise
+    return ckpt, store
+
+
+def _build_valid_tied_shell(mesh: Any) -> nn.Module:
+    from torch.distributed.tensor import Shard
+
+    m = nn.Module()
+    m.a = _make_meta_dtensor_param(mesh, [Shard(0)])
+    m.b = m.a
+    m.blocks = nn.ModuleList([nn.Module()])
+    m.blocks[0].w = _make_meta_dtensor_param(mesh, [Shard(0)])
+    m.register_buffer("buf", torch.empty(4, device="meta"))
+    return m
+
+
+class TestModelStoreDTensorProjection:
+    def test_bind_projects_parallelize_module_meta_shells_and_shares_mmap(
+        self, tmp_path: Path,
+    ) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        from torch.distributed.tensor import DTensor, Replicate, Shard, init_device_mesh
+
+        from piper_offload.parallel import ParallelExecutor
+
+        torch.manual_seed(11)
+        ref = _TPSequenceModel(dim=8, num_blocks=2, device="cpu", dtype=torch.bfloat16)
+        ckpt, store = _load_tp_model_from_mmap_checkpoint(tmp_path, ref)
+        try:
+            store_ptrs = {
+                name: tuple(t.untyped_storage().data_ptr() for t in hp.storage_tensors())
+                for name, hp in store._module_store.params.items()
+            }
+            x = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+            with torch.inference_mode():
+                expected = ref(x)
+
+            cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+            bound_offloaders: list[ModelOffloader | None] = [None, None]
+
+            def setup_worker(rank: int) -> tuple[torch.Tensor, int]:
+                mesh = init_device_mesh("cpu", (2,))
+                with torch.device("meta"):
+                    shell = _TPSequenceModel(dim=8, num_blocks=2, device="meta", dtype=torch.float32)
+                _parallelize_tp_sequence(shell, mesh)
+                offloader = store.bind(shell, cfg)
+                bound_offloaders[rank] = offloader
+
+                for name, param in shell.named_parameters():
+                    raw = param.to_local() if isinstance(param.data, DTensor) else param.data
+                    assert (raw.untyped_storage().data_ptr(),) == store_ptrs[name]
+                    assert raw.dtype is torch.bfloat16
+
+                assert offloader.cache_bytes < store.cache_bytes
+                assert shell.blocks[0].fc1.weight.placements == (Shard(0),)
+                assert shell.blocks[0].fc2.weight.placements == (Shard(1),)
+                assert shell.blocks[0].fc2.bias.placements == (Replicate(),)
+                assert shell.blocks[0].norm.weight.placements == (Replicate(),)
+                assert type(shell.embed.weight.data) is torch.Tensor
+                fc1_hp = block_components(offloader)[0]._block_instances[0].params["fc1.weight"]
+                assert fc1_hp.compute_dtype is torch.bfloat16
+
+                offloader.activate("cpu")
+                with torch.inference_mode():
+                    out = offloader.value(x.chunk(2, dim=1)[rank])
+                return out.clone(), offloader.cache_bytes
+
+            with ParallelExecutor(["cpu", "cpu"]) as ex:
+                results = ex.run(setup_worker)
+                for r in range(2):
+                    torch.testing.assert_close(results[r][0], expected.chunk(2, dim=1)[r], rtol=1e-2, atol=1e-2)
+                    cast(ModelOffloader, bound_offloaders[r]).deactivate()
+
+                def rerun(rank: int) -> torch.Tensor:
+                    off = cast(ModelOffloader, bound_offloaders[rank])
+                    with activated_model(off, "cpu"), torch.inference_mode():
+                        return off.value(x.chunk(2, dim=1)[rank]).clone()
+
+                outs2 = ex.run(rerun)
+                for r in range(2):
+                    torch.testing.assert_close(outs2[r], expected.chunk(2, dim=1)[r], rtol=1e-2, atol=1e-2)
+
+                ex.run(lambda rank: cast(ModelOffloader, bound_offloaders[rank]).activate("cpu"))
+
+            for off in bound_offloaders:
+                cast(ModelOffloader, off).deactivate()
+        finally:
+            ckpt.close()
+
+    def test_bind_dtensor_2d_mesh_uneven_and_empty_shards(self) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        from torch.distributed.device_mesh import DeviceMesh
+        from torch.distributed.tensor import DTensor, Replicate, Shard
+
+        from piper_offload.dtensor_adapter import _local_shape_and_offsets
+        from piper_offload.parallel import ParallelExecutor
+
+        class _MixedShardModel(nn.Module):
+            def __init__(self, *, device: str = "cpu", dtype: torch.dtype = torch.bfloat16) -> None:
+                super().__init__()
+                self.w_rep_s0 = nn.Parameter(torch.empty((6, 4), device=device, dtype=dtype), requires_grad=False)
+                self.w_s0_s1 = nn.Parameter(torch.empty((4, 6), device=device, dtype=dtype), requires_grad=False)
+                self.w_uneven = nn.Parameter(torch.empty((5, 4), device=device, dtype=dtype), requires_grad=False)
+                self.w_empty = nn.Parameter(torch.empty((1, 4), device=device, dtype=dtype), requires_grad=False)
+                self.b_rep = nn.Parameter(torch.empty((4,), device=device, dtype=dtype), requires_grad=False)
+
+        torch.manual_seed(17)
+        proto = _MixedShardModel()
+        for p in proto.parameters():
+            p.copy_(torch.arange(p.numel(), dtype=torch.bfloat16).reshape(p.shape) * 0.01)
+        full_tensors = {n: p.detach().clone() for n, p in proto.named_parameters()}
+        store = ModelStore.from_module(proto)
+        store_ptrs = {
+            n: hp.storage_tensors()[0].untyped_storage().data_ptr()
+            for n, hp in store._module_store.params.items()
+        }
+        specs = {
+            "w_rep_s0": (Replicate(), Shard(0)),
+            "w_s0_s1": (Shard(0), Shard(1)),
+            "w_uneven": (Shard(0), Replicate()),
+            "w_empty": (Shard(0), Replicate()),
+            "b_rep": (Replicate(), Replicate()),
+        }
+
+        def verify(_rank: int) -> dict[str, tuple[int, tuple[int, ...]]]:
+            mesh = DeviceMesh("cpu", [[0, 1], [2, 3]])
+            coord = tuple(mesh.get_coordinate() or ())
+            shell = _MixedShardModel(device="meta", dtype=torch.float32)
+            for name, placements in specs.items():
+                global_t = full_tensors[name]
+                local_shape, _ = _local_shape_and_offsets(
+                    tuple(global_t.shape), tuple(mesh.shape), coord, placements,
+                )
+                meta_dt = DTensor.from_local(
+                    torch.empty(local_shape, device="meta"),
+                    mesh,
+                    list(placements),
+                    shape=global_t.shape,
+                    stride=global_t.stride(),
+                    run_check=False,
+                )
+                shell.register_parameter(name, nn.Parameter(meta_dt, requires_grad=False))
+
+            offloader = store.bind(shell)
+            try:
+                summary: dict[str, tuple[int, tuple[int, ...]]] = {}
+                with activated_model(offloader, "cpu"):
+                    for name, placements in specs.items():
+                        param = offloader.model.get_parameter(name)
+                        local = param.to_local()
+                        assert local.untyped_storage().data_ptr() == store_ptrs[name]
+                        local_shape, offsets = _local_shape_and_offsets(
+                            tuple(full_tensors[name].shape), tuple(mesh.shape), coord, placements,
+                        )
+                        expected = full_tensors[name]
+                        for dim, (off, sz) in enumerate(zip(offsets, local_shape, strict=True)):
+                            if off != 0 or sz != expected.shape[dim]:
+                                expected = expected.narrow(dim, off, sz)
+                        torch.testing.assert_close(local, expected, rtol=0, atol=0)
+                        summary[name] = (local.numel(), tuple(local.shape))
+                return summary
+            finally:
+                offloader.deactivate()
+
+        with ParallelExecutor(["cpu"] * 4) as ex:
+            results = ex.run(verify)
+        assert results[0]["w_empty"] == (4, (1, 4))
+        assert results[2]["w_empty"] == (0, (0, 4))
+        assert results[0]["w_uneven"] == (12, (3, 4))
+        assert results[2]["w_uneven"] == (8, (2, 4))
+
+    def test_bind_dtensor_tied_weights_and_group_ties(self) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        from torch.distributed.tensor import Shard, init_device_mesh
+
+        from piper_offload.parallel import ParallelExecutor
+
+        shared = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+        proto = nn.Module()
+        proto.a = shared
+        proto.b = shared
+        proto.blocks = nn.ModuleList([nn.Module()])
+        proto.blocks[0].w = shared
+        store = ModelStore.from_module(proto)
+        ptr = store._module_store.params["a"].storage_tensors()[0].untyped_storage().data_ptr()
+
+        def verify(_rank: int) -> None:
+            mesh = init_device_mesh("cpu", (2,))
+            same = nn.Module()
+            same.a = _make_meta_dtensor_param(mesh, [Shard(0)])
+            same.b = _make_meta_dtensor_param(mesh, [Shard(0)])
+            same.blocks = nn.ModuleList([nn.Module()])
+            same.blocks[0].w = _make_meta_dtensor_param(mesh, [Shard(0)])
+            offloader = store.bind(same)
+            assert same.a is same.b
+            offloader.deactivate()
+
+            conflict = nn.Module()
+            conflict.a = _make_meta_dtensor_param(mesh, [Shard(0)])
+            conflict.b = _make_meta_dtensor_param(mesh, [Shard(0)])
+            conflict.blocks = nn.ModuleList([nn.Module()])
+            conflict.blocks[0].w = _make_meta_dtensor_param(mesh, [Shard(0)])
+            snap = _snapshot_tensors(conflict)
+            with pytest.raises(ValueError, match="Parameter storage shared across offload groups"):
+                store.bind(conflict, OffloadConfig(block_paths=("blocks",)))
+            _assert_unmutated(conflict, snap)
+
+            # Differing placements project independently over 1x storage and pass across groups.
+            cross = nn.Module()
+            cross.a = _make_meta_dtensor_param(mesh, [Shard(1)])
+            cross.b = _make_meta_dtensor_param(mesh, [Shard(1)])
+            cross.blocks = nn.ModuleList([nn.Module()])
+            cross.blocks[0].w = _make_meta_dtensor_param(mesh, [Shard(0)])
+            diff_offloader = store.bind(cross, OffloadConfig(block_paths=("blocks",)))
+            assert cross.a is cross.b
+            assert cross.a is not cross.blocks[0].w
+            assert cross.a.to_local().untyped_storage().data_ptr() == ptr
+            assert cross.blocks[0].w.to_local().untyped_storage().data_ptr() == ptr
+            diff_offloader.deactivate()
+
+        with ParallelExecutor(["cpu", "cpu"]) as ex:
+            ex.run(verify)
+
+    def test_bind_dtensor_preflight_atomicity_and_mesh_safety(self) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        from torch.distributed.device_mesh import DeviceMesh
+        from torch.distributed.tensor import DTensor, Partial, Shard, init_device_mesh
+
+        from piper_offload._dtensor import cpu_mesh_for
+        from piper_offload.parallel import ParallelExecutor
+
+        shared = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+        proto = nn.Module()
+        proto.a, proto.b = shared, shared
+        proto.blocks = nn.ModuleList([nn.Module()])
+        proto.blocks[0].w = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+        proto.register_buffer("buf", torch.ones(4))
+        store = ModelStore.from_module(proto)
+
+        def assert_rejected(
+            shell: nn.Module,
+            exc_type: type[Exception],
+            match: str,
+            cfg: OffloadConfig | None = None,
+        ) -> None:
+            snap = _snapshot_tensors(shell)
+            with pytest.raises(exc_type, match=match):
+                store.bind(shell, cfg)
+            _assert_unmutated(shell, snap)
+
+        def verify(_rank: int) -> None:
+            mesh = init_device_mesh("cpu", (2,))
+
+            m_shape = _build_valid_tied_shell(mesh)
+            m_shape.a = _make_meta_dtensor_param(mesh, [Shard(0)], global_shape=(6, 4), local_shape=(3, 4))
+            m_shape.b = m_shape.a
+            assert_rejected(m_shape, ValueError, "layout mismatch")
+
+            m_partial = _build_valid_tied_shell(mesh)
+            m_partial.a = _make_meta_dtensor_param(mesh, [Partial()], local_shape=(4, 4))
+            m_partial.b = m_partial.a
+            assert_rejected(m_partial, ValueError, "layout mismatch")
+
+            m_buf = _build_valid_tied_shell(mesh)
+            buf_dt = _make_meta_dtensor_param(mesh, [Shard(0)], global_shape=(4,), local_shape=(2,)).data
+            m_buf.register_buffer("buf", buf_dt)
+            assert_rejected(m_buf, ValueError, "Buffer 'buf' layout mismatch")
+
+            uninit = DeviceMesh("cpu", [0, 1], mesh_dim_names=("_piper_resting_0",), _init_backend=False)
+            m_uninit = _build_valid_tied_shell(mesh)
+            m_uninit.a = _make_meta_dtensor_param(uninit, [Shard(0)])
+            m_uninit.b = m_uninit.a
+            assert_rejected(m_uninit, ValueError, "layout mismatch")
+
+            m_alias = _build_valid_tied_shell(mesh)
+            m_alias.b = _make_meta_dtensor_param(mesh, [Shard(0)], local_shape=(1, 4))
+            assert_rejected(m_alias, ValueError, "layout mismatch")
+
+            rolling_cfg = OffloadConfig(
+                block_paths=("blocks",),
+                block_mode="rolling",
+                block_compile=BlockCompileConfig(fullgraph=True),
+            )
+            assert_rejected(_build_valid_tied_shell(mesh), NotImplementedError, "rolling compilation", rolling_cfg)
+
+            assert cpu_mesh_for(mesh) is mesh
+            _ = nn.Parameter(
+                DTensor.from_local(torch.empty(2, 4), uninit, [Shard(0)], shape=(4, 4), stride=(4, 1), run_check=False),
+                requires_grad=False,
+            )
+            live = nn.Parameter(
+                DTensor.from_local(torch.ones(2, 4), mesh, [Shard(0)], shape=(4, 4), stride=(4, 1), run_check=False),
+                requires_grad=False,
+            )
+            torch.testing.assert_close(live.full_tensor(), torch.ones(4, 4), rtol=0, atol=0)
+
+        with ParallelExecutor(["cpu", "cpu"]) as ex:
+            ex.run(verify)
+
+    def test_bind_dtensor_quantized_replicate_accepted_and_shard_rejected(self) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        torchao_quant = pytest.importorskip("torchao.quantization")
+        from torch.distributed.tensor import Replicate, Shard, init_device_mesh
+
+        from piper_offload.parallel import ParallelExecutor
+
+        q_mod = nn.Linear(16, 16, bias=False, dtype=torch.bfloat16).eval().requires_grad_(False)
+        torchao_quant.quantize_(q_mod, torchao_quant.Float8WeightOnlyConfig())
+        q_store = ModelStore.from_module(q_mod)
+
+        def verify(_rank: int) -> None:
+            mesh = init_device_mesh("cpu", (2,))
+            rep_shell = nn.Linear(16, 16, bias=False, device="meta")
+            rep_shell.weight = _make_meta_dtensor_param(mesh, [Replicate()], global_shape=(16, 16))
+            rep_offloader = q_store.bind(rep_shell)
+            assert rep_offloader.model.weight.placements == (Replicate(),)
+            rep_offloader.deactivate()
+
+            shard_shell = nn.Linear(16, 16, bias=False, device="meta")
+            shard_shell.weight = _make_meta_dtensor_param(mesh, [Shard(0)], global_shape=(16, 16), local_shape=(8, 16))
+            snap = _snapshot_tensors(shard_shell)
+            with pytest.raises(ValueError, match="layout mismatch"):
+                q_store.bind(shard_shell)
+            _assert_unmutated(shard_shell, snap)
+
+        with ParallelExecutor(["cpu", "cpu"]) as ex:
+            ex.run(verify)
+
+    def test_bind_dtensor_dedups_sliced_submeshes_and_preserves_source_stride(self) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        from torch.distributed.tensor import DTensor, Shard, init_device_mesh
+
+        from piper_offload.parallel import ParallelExecutor
+
+        shared = nn.Parameter(torch.randn(4, 6), requires_grad=False)
+        proto = nn.Module()
+        proto.a, proto.b = shared, shared
+        proto.blocks = nn.ModuleList([nn.Module()])
+        proto.blocks[0].w = shared
+        store = ModelStore.from_module(proto)
+
+        def verify(_rank: int) -> None:
+            mesh_2d = init_device_mesh("cpu", (1, 2), mesh_dim_names=("dp", "tp"))
+            tp_first, tp_second = mesh_2d["tp"], mesh_2d["tp"]
+            assert tp_first is not tp_second
+
+            shell = nn.Module()
+            shell.a = nn.Parameter(
+                DTensor.from_local(
+                    torch.empty((6, 2), device="meta").t(),
+                    tp_first,
+                    [Shard(0)],
+                    shape=(4, 6),
+                    stride=(1, 4),
+                    run_check=False,
+                ),
+                requires_grad=False,
+            )
+            shell.b = _make_meta_dtensor_param(tp_second, [Shard(0)], global_shape=(4, 6), local_shape=(2, 6))
+            shell.blocks = nn.ModuleList([nn.Module()])
+            shell.blocks[0].w = _make_meta_dtensor_param(
+                mesh_2d["tp"], [Shard(0)], global_shape=(4, 6), local_shape=(2, 6),
+            )
+            offloader = store.bind(shell)
+            assert shell.a is shell.b
+            assert shell.a.stride() == (6, 1)
+            assert tuple(shell.a.view(24).shape) == (24,)
+            offloader.deactivate()
+
+            # Confirm cross-group rejection on fresh meta wrappers over distinct mesh_2d["tp"] slices.
+            conflict = nn.Module()
+            conflict.a = _make_meta_dtensor_param(tp_first, [Shard(0)], global_shape=(4, 6), local_shape=(2, 6))
+            conflict.b = _make_meta_dtensor_param(tp_second, [Shard(0)], global_shape=(4, 6), local_shape=(2, 6))
+            conflict.blocks = nn.ModuleList([nn.Module()])
+            conflict.blocks[0].w = _make_meta_dtensor_param(
+                mesh_2d["tp"], [Shard(0)], global_shape=(4, 6), local_shape=(2, 6),
+            )
+            snap = _snapshot_tensors(conflict)
+            with pytest.raises(ValueError, match="Parameter storage shared across offload groups"):
+                store.bind(conflict, OffloadConfig(block_paths=("blocks",)))
+            _assert_unmutated(conflict, snap)
+
+        with ParallelExecutor(["cpu", "cpu"]) as ex:
+            ex.run(verify)
+
+    def test_bind_dtensor_preflight_atomic_on_unwrappable_quant_replicate_and_cpu_mesh_post_close(self) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        torchao_quant = pytest.importorskip("torchao.quantization")
+        from types import SimpleNamespace
+
+        from torch.distributed.tensor import Replicate, init_device_mesh
+
+        from piper_offload._dtensor import cpu_mesh_for
+        from piper_offload.parallel import ParallelExecutor
+
+        proto = nn.Module()
+        proto.embed = nn.Linear(16, 16, bias=False, dtype=torch.bfloat16)
+        proto.blocks = nn.ModuleList([nn.Linear(16, 16, bias=False, dtype=torch.bfloat16)])
+        proto.eval().requires_grad_(False)
+        torchao_quant.quantize_(proto.blocks[0], torchao_quant.Int8WeightOnlyConfig())
+        store = ModelStore.from_module(proto)
+
+        def verify(_rank: int) -> None:
+            mesh = init_device_mesh("cpu", (2,))
+            with torch.device("meta"):
+                shell = nn.Module()
+                shell.embed = nn.Linear(16, 16, bias=False)
+                shell.blocks = nn.ModuleList([nn.Linear(16, 16, bias=False)])
+                shell.eval().requires_grad_(False)
+            shell.blocks[0].weight = _make_meta_dtensor_param(mesh, [Replicate()], global_shape=(16, 16))
+            snap = _snapshot_tensors(shell)
+            with pytest.raises(ValueError, match="layout mismatch"):
+                store.bind(shell, OffloadConfig(block_paths=("blocks",)))
+            _assert_unmutated(shell, snap)
+            assert shell.embed.weight.is_meta
+
+        with ParallelExecutor(["cpu", "cpu"]) as ex:
+            captured_mesh = ex.run(lambda _r: init_device_mesh("cpu", (2,)))[0]
+            ex.run(verify)
+
+        # cpu_mesh_for handles post-close non-CPU mesh descriptors when _rank is preserved.
+        fake_cuda = SimpleNamespace(
+            device_type="cuda",
+            mesh=captured_mesh.mesh,
+            ndim=captured_mesh.ndim,
+            _rank=getattr(captured_mesh, "_rank", 0),
+        )
+        assert not dist.is_initialized()
+        resting = cpu_mesh_for(fake_cuda)
+        assert resting.device_type == "cpu"

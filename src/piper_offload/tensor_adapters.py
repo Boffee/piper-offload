@@ -821,7 +821,15 @@ class RegularAdapter:
 
     @staticmethod
     def alloc_gpu(state: _RegularHost, device: torch.device) -> _RegularGpu:
-        return _RegularGpu(data=torch.empty_like(state.data, device=device))
+        # Allocate contiguous device storage so projected non-contiguous views
+        # (e.g., Shard(1)) materialize contiguously on the device.
+        return _RegularGpu(
+            data=torch.empty_like(
+                state.data,
+                device=device,
+                memory_format=torch.contiguous_format,
+            )
+        )
 
     @staticmethod
     def gpu_param(host: _RegularHost, gpu_state: _RegularGpu) -> nn.Parameter:

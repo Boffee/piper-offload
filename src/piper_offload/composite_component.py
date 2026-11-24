@@ -746,17 +746,21 @@ def _bind_module_store(
     store: HostModuleStore,
     model: nn.Module,
     config: OffloadConfig,
-) -> tuple[CompositeComponent, _ShellClaim]:
+) -> tuple[CompositeComponent, _ShellClaim, HostModuleStore]:
     claim = claim_shell(model)
     try:
-        store._validate_bind(model)
-        partition = _plan_model_groups(model, config, store=store)
-        _validate_no_cross_group_ties(model, partition, lambda name: id(store.params[name]))
-        composite = _assemble_composite(store, model, partition, config, install=True)
+        resolved_store = store._resolve_bind(model)
+        partition = _plan_model_groups(model, config, store=resolved_store)
+        _validate_no_cross_group_ties(
+            model,
+            partition,
+            lambda name: id(resolved_store.params[name]),
+        )
+        composite = _assemble_composite(resolved_store, model, partition, config, install=True)
     except BaseException:
         claim.release()
         raise
-    return composite, claim
+    return composite, claim, resolved_store
 
 
 def _validate_capture_inputs(

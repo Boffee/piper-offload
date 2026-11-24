@@ -127,10 +127,11 @@ class HostParam:
         source remains the captured host allocation, including any file
         mapping retained during capture.
 
-        Projection supports frozen plain tensors with one ``Shard(0)``
-        placement, or rank-two tensors with ``Shard(1)``. The local CPU shard
-        is a view into the full source allocation, so construction allocates no
-        rank-local host tensor.
+        Projection supports ``Replicate`` and contiguous ``Shard(dim)``
+        placements across CPU and CUDA/HIP meshes for plain tensors, and
+        ``Replicate`` placements for non-``nn.Parameter``-subclass quantized
+        tensors. The local CPU shard views or aliases the full source
+        allocation, so construction allocates no rank-local host tensor.
         """
         if source.is_meta:
             raise ValueError("DTensor projection source must own physical host storage.")
@@ -156,6 +157,10 @@ class HostParam:
             representation,
             adapter=adapter,
             host_state=host_state,
+            target_layout=(
+                type(adapter),
+                adapter.layout_signature_from_host(host_state),
+            ),
         )
         return projected
 
@@ -165,6 +170,7 @@ class HostParam:
         *,
         adapter: TensorAdapter[Any, Any],
         host_state: object,
+        target_layout: tuple[object, object] | None = None,
     ) -> None:
         """Install representation metadata and an already-captured host state."""
         self._shape = torch.Size(representation.shape)
@@ -175,10 +181,14 @@ class HostParam:
             if isinstance(adapter, LogicalShapeTensorAdapter)
             else tuple(representation.shape)
         )
-        self._target_layout = self._target_layout_from_adapter(
-            adapter,
-            representation,
-            unresolved_meta=self.is_meta,
+        self._target_layout = (
+            self._target_layout_from_adapter(
+                adapter,
+                representation,
+                unresolved_meta=self.is_meta,
+            )
+            if target_layout is None
+            else target_layout
         )
 
     @staticmethod
