@@ -22,6 +22,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distrib
 from torch.distributed.tensor.parallel import RowwiseParallel, parallelize_module
 
 from piper_offload import _transfer_priority, communication
+from piper_offload._devices import canonical_device
 from piper_offload.communication import RelayOptions, register_relay_backend
 from piper_offload._host_registration import RuntimeHostRegistration
 from piper_offload.pin_manager import PinManager, host_pin_manager
@@ -516,10 +517,13 @@ def test_accelerator_collective_moves_data_as_a_foreground_transfer(single_rank_
     # weights again.
     seen = []
 
+    device = canonical_device("cuda")
+
     class ObservingTransport:
         def allreduce(self, tensors, options):
             del tensors, options
-            seen.append(_transfer_priority._foreground.count)
+            with _transfer_priority._foreground.condition:
+                seen.append(dict(_transfer_priority._foreground.counts))
             return self
 
         def wait(self):
@@ -527,8 +531,8 @@ def test_accelerator_collective_moves_data_as_a_foreground_transfer(single_rank_
 
     monkeypatch.setattr(single_rank_group, "_cpu_group", ObservingTransport())
     dist.all_reduce(torch.ones(256, device="cuda"))
-    assert seen == [1]
-    assert _transfer_priority._foreground.count == 0
+    assert seen == [{device: 1}]
+    assert _transfer_priority._foreground.counts == {}
 
 
 @CUDA

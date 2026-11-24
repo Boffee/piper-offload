@@ -38,8 +38,8 @@ returns once the transfer has completed, and the outputs are then ready for
 every stream.
 Transfers on accelerator tensors start once the caller's current stream has
 produced its inputs and move their data as foreground transfers, which
-background copies such as block prefetch wait for (see
-``piper_offload._transfer_priority``). No offloader, NCCL, or compiled extension
+background copies targeting the same device (such as block prefetch) wait for
+(see ``piper_offload._transfer_priority``). No offloader, NCCL, or compiled extension
 is required. Gloo collectives default to two pipeline buffers; shared
 collectives use three outgoing slots per rank.
 
@@ -335,7 +335,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
                     # A private stream: synchronizing the worker's default
                     # stream would also wait for the caller's work on it.
                     stream = self._stream = torch.cuda.Stream(device=device)
-                with torch.cuda.device(device), torch.cuda.stream(stream), foreground_transfer():
+                with torch.cuda.device(device), torch.cuda.stream(stream), foreground_transfer(device):
                     body()
             return None
 
@@ -380,7 +380,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
             with (
                 torch.cuda.device(device),
                 torch.cuda.stream(stream),
-                foreground_transfer(),
+                foreground_transfer(device),
                 host_pin_manager.acquire([buf]),
             ):
                 try:

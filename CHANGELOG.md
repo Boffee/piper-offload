@@ -38,8 +38,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   rank, bounding GPU reduction scratch to at most `staging_bytes / world_size`
   and updating the minimum accepted `staging_bytes` for small budgets.
 - Block-streaming lookahead copies now yield between 4 MiB chunks of large
-  contiguous tensors while a `piper_relay` collective runs, rather than
-  waiting for an entire large weight tensor.
+  contiguous tensors while a `piper_relay` transfer runs on the same GPU,
+  rather than waiting for an entire large weight tensor or stalling lookahead
+  copies targeting other GPUs.
 - `PinManager.acquire` now holds already-registered storages immediately
   without waiting for unrelated concurrent checkpoint fills.
 - `RelayOptions.pipeline_buffers` now defaults to `2` for Gloo transfers,
