@@ -530,9 +530,27 @@ def test_accelerator_collective_moves_data_as_a_foreground_transfer(single_rank_
             pass
 
     monkeypatch.setattr(single_rank_group, "_cpu_group", ObservingTransport())
+    assert _transfer_priority.should_yield("cuda")
     dist.all_reduce(torch.ones(256, device="cuda"))
     assert seen == [{device: 1}]
     assert _transfer_priority._foreground.counts == {}
+
+
+def test_relay_group_registers_and_clears_foreground_producer(tmp_path):
+    assert not _transfer_priority.should_yield("cuda")
+    register_relay_backend()
+    dist.init_process_group(
+        "piper_relay",
+        store=dist.FileStore(str(tmp_path / "producer-store"), 1),
+        rank=0,
+        world_size=1,
+        timeout=timedelta(seconds=5),
+    )
+    try:
+        assert _transfer_priority.should_yield("cuda")
+    finally:
+        dist.destroy_process_group()
+    assert not _transfer_priority.should_yield("cuda")
 
 
 @CUDA

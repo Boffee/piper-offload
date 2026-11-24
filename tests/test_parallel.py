@@ -2523,3 +2523,41 @@ def test_two_gpu_model_store_bind_tp_meta_shell_lora_and_p2p() -> None:
         for rank in range(2):
             torch.testing.assert_close(outs[rank][0], expected_merged.chunk(2, dim=1)[rank], rtol=2e-2, atol=2e-2)
             torch.testing.assert_close(outs[rank][1], expected_routed.chunk(2, dim=1)[rank], rtol=2e-2, atol=2e-2)
+
+
+def test_cpu_parallel_executor_does_not_enable_background_yielding() -> None:
+    assert not _transfer_priority.should_yield("cpu")
+    if torch.cuda.is_available():
+        assert not _transfer_priority.should_yield("cuda:0")
+    with ParallelExecutor(["cpu", "cpu"]) as ex:
+        assert not _transfer_priority.should_yield("cpu")
+        if torch.cuda.is_available():
+            assert not _transfer_priority.should_yield("cuda:0")
+        assert _transfer_priority._foreground.wildcard_producers == 0
+        assert _transfer_priority._foreground.device_producers == {}
+        assert ex.run(_run_simple_allreduce) == (3.0, 3.0)
+    assert not _transfer_priority.should_yield("cpu")
+
+
+@CUDA
+def test_cuda_parallel_executor_scopes_foreground_producer_to_its_devices() -> None:
+    dev0 = torch.device("cuda:0")
+    dev1 = torch.device("cuda:1")
+    assert not _transfer_priority.should_yield(dev0)
+    assert not _transfer_priority.should_yield(dev1)
+    assert not _transfer_priority.should_yield("cpu")
+
+    def cuda_allreduce(rank: int) -> float:
+        t = torch.full((4,), float(rank + 1), device=dev0)
+        dist.all_reduce(t)
+        return float(t[0].item())
+
+    with ParallelExecutor(["cuda:0"], collective_timeout=timedelta(seconds=5.0)) as ex:
+        assert _transfer_priority.should_yield(dev0)
+        assert not _transfer_priority.should_yield(dev1)
+        assert not _transfer_priority.should_yield("cpu")
+        assert _transfer_priority._foreground.wildcard_producers == 0
+        assert ex.run(cuda_allreduce) == (1.0,)
+    assert not _transfer_priority.should_yield(dev0)
+    assert not _transfer_priority.should_yield(dev1)
+    assert _transfer_priority._foreground.device_producers == {}

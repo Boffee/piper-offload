@@ -99,13 +99,17 @@ foreground; streaming then resumes prefetching from the block that ran.
 
 Weight copies and transfers of the experimental `piper_relay` process group and
 CUDA `ParallelExecutor` (`piper_parallel`) process groups share PCIe/host
-transfer resources, and running both at once on the same GPU slows both.
-Streaming copies the lookahead block one tensor at a time, yielding between
-4 MiB chunks of large contiguous tensors (and between smaller or non-contiguous
-tensors) while a `piper_relay` or CUDA `piper_parallel` transfer moves data on
-that same GPU, so a collective issued inside a block waits for at most one
-chunk per active background copy stream rather than the whole tensor or block.
-Rolling refills cannot wait; use streaming for blocks that issue collectives.
+transfer resources, and running both at once on the same GPU slows both. While a
+`piper_relay` process group is active in the process or a CUDA `piper_parallel`
+collective backend targets that GPU, streaming copies the lookahead block one
+tensor at a time, pipelining large contiguous tensors in 2 MiB chunks with at
+most two chunks (4 MiB) in flight on the copy stream and yielding between chunks
+(and between smaller or non-contiguous tensors), so a collective issued inside a
+block waits for at most the queued chunks per active background copy stream
+rather than the whole tensor or block. When neither is active for that GPU,
+lookahead copies enqueue directly without per-chunk or per-tensor stream
+synchronizations. Rolling refills cannot wait; use streaming for blocks that
+issue collectives.
 
 ### Compile block forwards
 

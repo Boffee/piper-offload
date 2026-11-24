@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 
 from ._mapped_file import overlaps_mapped_file
-from ._transfer_priority import foreground_transfer
+from ._transfer_priority import ForegroundProducer, foreground_transfer, register_foreground_producer
 from .pin_manager import PinLease, host_pin_manager
 
 TransportPreference = Literal["auto", "p2p", "host_staged"]
@@ -719,6 +719,9 @@ class _ParallelTransport:
         self._poisoned = False
         self._rank_streams: dict[int, torch.cuda.Stream] = {}
         self._device_streams: dict[int, torch.cuda.Stream] = {}
+        self._foreground_producer: ForegroundProducer | None = (
+            register_foreground_producer(devices) if mode != "cpu" else None
+        )
 
     def _device_stream(self, device: torch.device) -> torch.cuda.Stream:
         assert device.index is not None
@@ -859,10 +862,15 @@ class _ParallelTransport:
 
     def close(self) -> None:
         """Release cached staging buffers and streams after drain completes."""
-        with self._lock:
-            self._stage.quarantine()
-        self._rank_streams.clear()
-        self._device_streams.clear()
+        try:
+            with self._lock:
+                self._stage.quarantine()
+            self._rank_streams.clear()
+            self._device_streams.clear()
+        finally:
+            if self._foreground_producer is not None:
+                self._foreground_producer.close()
+                self._foreground_producer = None
 
     def _plan_budgets(
         self,
