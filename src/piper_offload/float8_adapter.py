@@ -10,8 +10,6 @@ this module supplies the Float8-specific hooks.
 
 Beyond inference movement, this adapter opts into:
 
-- CPU round-trip: GPU storage is the identical fp8 bytes, so D2H back
-  into the host state is lossless.
 - Format-specific LoRA merge: CUDA per-row, per-tensor, and standard
   per-group weights use raw Triton kernels when available. Other layouts
   and installations without Triton use the existing
@@ -21,9 +19,6 @@ Beyond inference movement, this adapter opts into:
   Requantization recomputes scales via the public ``Float8Tensor.from_hp``,
   which is lossy but standard practice for permanent merges into quantized
   weights.
-
-No trainable ``Parameter.data`` swap — the quant state lives in the
-wrapper object, not its bytes, so scaled-fp8 weights stay frozen.
 """
 
 from dataclasses import dataclass
@@ -42,12 +37,7 @@ from ._torchao_float8 import (
     validate_layout,
 )
 from .tensor_adapters import metadata_key
-from .torchao_structured_adapter import (
-    TorchaoGpu,
-    TorchaoHost,
-    TorchaoStructuredAdapter,
-    copy_storage,
-)
+from .torchao_structured_adapter import TorchaoStructuredAdapter
 
 try:
     from . import _triton_float8_lora
@@ -243,12 +233,6 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
         return t.dtype
 
     # --- capabilities beyond inference movement ---------------------------
-
-    @staticmethod
-    def copy_to_cpu(src: TorchaoGpu, dst: TorchaoHost[_Float8Meta], *, non_blocking: bool = False) -> None:
-        # GPU storage is the identical fp8 bytes + scales, so D2H is a
-        # lossless byte copy. Quant metadata lives on the host state.
-        copy_storage(src.storage, dst.storage, non_blocking=non_blocking)
 
     @staticmethod
     def dequantize(t: torch.Tensor) -> torch.Tensor:

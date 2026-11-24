@@ -146,30 +146,6 @@ class TestFloat8Adapter:
 
         assert _param_target_layout(with_activation) != _param_target_layout(weight_only)
 
-    def test_cpu_round_trip_restores_host_bytes(self) -> None:
-        host_param = HostParam(
-            nn.Parameter(_make_float8(), requires_grad=False),
-        )
-        state = host_param.allocate_gpu_storage(torch.device("cpu"))
-        host_param.copy_to_gpu(state)
-
-        original_qdata = host_param.host_state.storage[0].view(torch.uint8).clone()
-        original_scale = host_param.host_state.storage[1].clone()
-        host_param.host_state.storage[0].view(torch.uint8).zero_()
-        host_param.host_state.storage[1].zero_()
-        host_param.copy_to_cpu(state)
-
-        assert torch.equal(host_param.host_state.storage[0].view(torch.uint8), original_qdata)
-        assert torch.equal(host_param.host_state.storage[1], original_scale)
-
-    def test_no_trainable_swap_capability(self) -> None:
-        host_param = HostParam(
-            nn.Parameter(_make_float8(), requires_grad=True),
-        )
-
-        with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            host_param.validate_parameter_data_swap_target()
-
     @pytest.mark.parametrize("per_tensor", [False, True])
     def test_dequantize_requantize_preserves_representation(self, per_tensor: bool) -> None:
         f8 = _make_float8(per_tensor=per_tensor)

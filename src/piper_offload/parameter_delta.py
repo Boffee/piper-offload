@@ -23,6 +23,10 @@ __all__ = [
 def _validate_dense_tensor(source: torch.Tensor) -> None:
     if type(source) is not torch.Tensor:
         raise ValueError(f"Dense parameter deltas must be plain torch.Tensor values; got {type(source).__name__}.")
+    if source.requires_grad:
+        raise ValueError(
+            "Dense parameter deltas are inference-only and must be frozen (requires_grad=False)."
+        )
     if source.is_meta:
         raise ValueError("Dense parameter deltas must own physical values, not meta storage.")
     if not source.is_floating_point():

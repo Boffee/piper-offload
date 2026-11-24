@@ -41,7 +41,6 @@ class ModelSpec[M: nn.Module]:
     estimated_cache_bytes: int = 0
     block_paths: tuple[str, ...] = ()
     transient_block_paths: tuple[str, ...] = ()
-    include_block_trainables: bool = False
     block_mode: BlockMode = "streaming"
     block_compile: BlockCompileConfig | None = None
     transient_paths: tuple[str, ...] = ()
@@ -52,7 +51,6 @@ class ModelSpec[M: nn.Module]:
             self.factory(),
             block_paths=self.block_paths,
             transient_block_paths=self.transient_block_paths,
-            include_block_trainables=self.include_block_trainables,
             block_mode=self.block_mode,
             block_compile=self.block_compile,
             transient_paths=self.transient_paths,

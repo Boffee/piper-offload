@@ -20,12 +20,6 @@ temporary. Unsupported layouts or environments without Triton retain the
 public ``MXTensor.to_mx`` fallback. Like any merge into a quantized base it
 is lossy; MXFP4's 4-bit grid makes a permanent merge far coarser than
 MXFP8, so routed LoRA remains the non-destructive alternative.
-
-It does not opt into CPU round-trip or trainable ``Parameter.data`` swap:
-the quant state lives in the wrapper object, not its bytes, so MX weights
-stay frozen for streaming/training. Routed LoRA remains the
-non-destructive alternative when the owning module is a logical
-``nn.Linear`` with compatible shape/dtype.
 """
 
 from dataclasses import dataclass

@@ -22,10 +22,7 @@ scale and preserve the existing wrapper and storage tensors. Like any
 merge into a quantized base it is lossy; choosing merge vs routed
 (non-destructive) LoRA is the caller's tradeoff.
 
-It does not opt into CPU round-trip or trainable ``Parameter.data`` swap: the
-quant state lives in the wrapper object, not its bytes, so int8 weights stay
-frozen for streaming/training. Routed LoRA remains the non-destructive
-alternative.
+Routed LoRA remains the non-destructive alternative.
 """
 
 from collections.abc import Sequence

@@ -45,9 +45,7 @@ class _Model(nn.Module):
 
 
 def _frozen_model(dim: int, dtypes: Sequence[torch.dtype]) -> _Model:
-    # Heterogeneous-quant weights are frozen in practice; freezing also
-    # routes them through the streamer (trainables are not streamed by
-    # default) rather than the resident HostComponent.
+    # Heterogeneous-quant weights are frozen for inference.
     torch.manual_seed(0)
     model = _Model(dim, dtypes)
     for param in model.parameters():

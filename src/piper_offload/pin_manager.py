@@ -12,7 +12,7 @@ instances can use an injected backend for testing.
 Every host transfer runs under a lease, so nothing is read or written while
 it could be evicted, and only transfers that repeat ask the lease to pin:
 streaming, rolling, and the relay register their storage; a resident or host
-upload and the optimizer copy-back lease it pageable.
+upload leases it pageable.
 
 Registration uses whole storage byte ranges. Storage that records a
 checkpoint file slice (:func:`file_slice`) is never pinned in place: the
@@ -28,9 +28,8 @@ outside a lease raises, since eviction is safe only because every such
 reader holds one, while a synchronous one completes under the manager's
 lock. Other storage, anonymous memory and mappings without provenance,
 registers where it is, as before.
-Piper never writes into a file mapping: ``HostParam`` copies trainable
-parameters out at capture and ``merge_adapter`` copies its targets out before
-merging.
+Piper never writes into a file mapping: ``merge_adapter`` copies its targets out
+before merging.
 
 Budget accounting counts the union of OS pages, including pages shared by
 separate storages. Registrations retain storage until unregistration

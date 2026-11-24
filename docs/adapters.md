@@ -287,13 +287,11 @@ The return value counts unique modified parameters. An empty request or one
 with only zero strengths returns `0` before walking the model.
 
 The operation validates active names, shapes, and capabilities and prepares
-replacement weights before the first write. When the tensor adapter exposes
-writable storage, Piper updates it in place. A mapped target gets owned backing under
-every tied name. A trainable target keeps its parameter object and optimizer
-references. If its storage must be replaced, a tensor-subclass adapter must
-support a parameter data swap. Tied parameters that need replacement must
-agree on `requires_grad`. Meta targets become independent frozen CPU
-parameters with their aliases preserved.
+replacement weights before the first write. Target parameters (and every tied
+alias) must be frozen (`requires_grad=False`). When the tensor adapter exposes
+writable storage, Piper updates it in place. A mapped target gets owned backing
+under every tied name. Meta targets become independent frozen CPU parameters
+with their aliases preserved.
 
 Permanent merge accepts the same cross-adapter composition, strength,
 partial-target, and rounding policies. Quantized support follows the [format matrix](formats.md), except

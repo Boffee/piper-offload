@@ -1,8 +1,7 @@
 """CUDA execution strategy that keeps every block target resident."""
 
-import contextlib
 import logging
-from collections.abc import Generator, Sequence
+from collections.abc import Sequence
 
 import torch
 
@@ -24,7 +23,6 @@ class ResidentBlockRuntime:
         self._instances = tuple(instances)
         self._device: torch.device | None = None
         self._leases: list[CudaTargetLease] = []
-        self._move_trainable_grads_to(torch.device("cpu"))
 
     @property
     def acquired(self) -> bool:
@@ -47,7 +45,6 @@ class ResidentBlockRuntime:
         self._device = device
         current_stream = torch.cuda.current_stream(device)
         try:
-            self._move_trainable_grads_to(device)
             for instance, plan in zip(self._instances, plans, strict=True):
                 lease = CudaTargetLease.allocate(
                     plan,
@@ -74,7 +71,7 @@ class ResidentBlockRuntime:
     def release(self) -> None:
         if self._device is not None:
             # Leave acquired state intact on failure so the component keeps
-            # its pageable lease while an upload or copy-back may still be live.
+            # its pageable lease while an upload may still be live.
             torch.cuda.synchronize(self._device)
         # Every block returns to host storage before any target closes. A
         # failure keeps the remaining targets and leaves the runtime acquired,
@@ -82,49 +79,10 @@ class ResidentBlockRuntime:
         # idempotent, so a later release() retries from the start.
         for instance in self._instances:
             instance.install_host()
-            instance.move_trainable_grads_to(torch.device("cpu"))
         while self._leases:
             self._leases[-1].close()
             self._leases.pop()
         self._device = None
-
-    @contextlib.contextmanager
-    def optimizer_step(self) -> Generator[None]:
-        if not self.acquired:
-            raise RuntimeError(
-                "BlockComponent.optimizer_step() called while its CUDA "
-                "working set is released. Acquire the component before "
-                "entering the optimizer step."
-            )
-        if not any(instance.has_trainables for instance in self._instances):
-            yield
-            return
-
-        try:
-            yield
-        finally:
-            self._copy_trainables_to_host()
-
-    def _copy_trainables_to_host(self) -> None:
-        device = self._device
-        if device is None:
-            raise RuntimeError("resident block runtime is released")
-        current_stream = torch.cuda.current_stream(device)
-        for instance, lease in zip(
-            self._instances,
-            self._leases,
-            strict=True,
-        ):
-            if instance.has_trainables:
-                instance.copy_trainables_from_target(
-                    lease.target,
-                    non_blocking=True,
-                )
-        current_stream.synchronize()
-
-    def _move_trainable_grads_to(self, device: torch.device) -> None:
-        for instance in self._instances:
-            instance.move_trainable_grads_to(device)
 
 
 __all__ = ["ResidentBlockRuntime"]

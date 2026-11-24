@@ -7,9 +7,8 @@ remain yours. For a complete first example, see the [README](../README.md).
 ## Caching and activation
 
 A `ModelSpec` identifies a model by key and supplies a factory that builds a
-fresh module. The first use constructs and captures the model; later uses
-reuse it until eviction. Configure the model, including `requires_grad`, in
-the factory. Passing a new spec with an existing key does not replace the
+fresh frozen module (`requires_grad=False`). The first use constructs and captures the model; later uses
+reuse it until eviction. Passing a new spec with an existing key does not replace the
 registered factory; use `register(spec, replace=True)` when replacing an
 inactive entry intentionally.
 
@@ -64,17 +63,13 @@ models rather than return externally retained instances. The precise
 [capture rules](memory.md#preserve-checkpoint-backing) describe when copies
 are required.
 
-Frozen host bytes are immutable while captured. Trainable parameters keep
-their parameter identity and use owned storage; file mappings are never
-written. See [memory](memory.md) for checkpoint loading and storage lifetimes.
+Frozen host bytes are immutable while captured. File mappings are never written.
+See [memory](memory.md) for checkpoint loading and storage lifetimes.
 
 CUDA buffer mutations are discarded at deactivation. CPU activation uses
 host-backed buffers directly, so mutations there have ordinary PyTorch
-semantics. Models with persistent CUDA buffer state, such as training-time
-BatchNorm statistics or a registered KV cache, do not fit this lifecycle.
-Wrap the model before DDP/FSDP, whose own parameter-storage management can
-conflict with capture. See [streaming](streaming.md#train-streamed-blocks) for training and
-optimizer synchronization.
+semantics. Models with persistent CUDA buffer state, such as RNN/SSM recurrent
+state or a registered KV cache, do not fit this lifecycle.
 
 ## Releasing and inspecting resources
 
@@ -139,9 +134,7 @@ del offloader, model
 ```
 
 Access the bound model while it is active. Successful activations require
-matching deactivation; CUDA training also needs the
-[`optimizer_step()` context](streaming.md#train-streamed-blocks) to copy updated weights
-back before deactivation when the optimizer runs on CUDA.
+matching deactivation.
 
 If construction fails during capture, discard the partially captured model
 and build a fresh one. If activation fails, the offloader rolls back the

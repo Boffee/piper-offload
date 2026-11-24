@@ -16,7 +16,6 @@ from piper_offload import (
     HostComponentStore,
     ModelOffloader,
     TrellisParameter,
-    host_module,
     register_adapter,
 )
 from piper_offload._dtensor import DTENSOR_AVAILABLE
@@ -38,27 +37,18 @@ from tests.conftest import CallbackParameterTransform, activated_model
 
 
 class _FakeHostParam:
-    def __init__(
-        self,
-        target_data: torch.Tensor,
-        *,
-        requires_grad: bool = False,
-    ) -> None:
+    def __init__(self, target_data: torch.Tensor) -> None:
         self.allocated = 0
         self.copied = 0
-        self.copied_back = 0
-        self.validated = 0
-        self.copy_to_cpu_non_blocking: list[bool] = []
         self.is_meta = False
         self.logical_shape = tuple(target_data.shape)
-        self.requires_grad = requires_grad
         self.target_data = target_data
         # Stable CPU backing aliased by every make_cpu_param() call,
         # mirroring real adapters (whose CPU wrapper aliases shared host
         # storage). A fresh wrapper object each call, but the same storage.
         self._cpu_data = torch.empty_like(target_data)
         self.target_layout = HostParam.target_layout_for(
-            nn.Parameter(target_data, requires_grad=requires_grad),
+            nn.Parameter(target_data, requires_grad=False),
         )
 
     @property
@@ -66,10 +56,7 @@ class _FakeHostParam:
         return self.target_data.numel() * self.target_data.element_size()
 
     def make_cpu_param(self) -> nn.Parameter:
-        return nn.Parameter(
-            self._cpu_data,
-            requires_grad=self.requires_grad,
-        )
+        return nn.Parameter(self._cpu_data, requires_grad=False)
 
     def allocate_gpu_storage(self, device: torch.device) -> object:
         self.allocated += 1
@@ -77,10 +64,7 @@ class _FakeHostParam:
 
     def make_gpu_param(self, target_state: object) -> nn.Parameter:
         del target_state
-        return nn.Parameter(
-            self.target_data.clone(),
-            requires_grad=self.requires_grad,
-        )
+        return nn.Parameter(self.target_data.clone(), requires_grad=False)
 
     def copy_to_gpu(
         self,
@@ -91,22 +75,9 @@ class _FakeHostParam:
         del target_state, non_blocking
         self.copied += 1
 
-    def copy_to_cpu(
-        self,
-        target_state: object,
-        *,
-        non_blocking: bool = False,
-    ) -> None:
-        del target_state
-        self.copied_back += 1
-        self.copy_to_cpu_non_blocking.append(non_blocking)
-
-    def validate_parameter_data_swap_target(self) -> None:
-        self.validated += 1
-
     def accepts_bind_target(self, param: nn.Parameter) -> bool:
         return (
-            param.requires_grad == self.requires_grad
+            not param.requires_grad
             and type(param) is nn.Parameter
             and type(param.data) is torch.Tensor
             and param.layout is torch.strided
@@ -147,17 +118,19 @@ class TestHostModuleStore:
         assert module.a is module.b
         assert module.a.data_ptr() == store.params["a"].make_cpu_param().data_ptr()
 
-    def test_rejects_storage_aliases_with_mixed_requires_grad(self) -> None:
+    def test_rejects_trainable_parameter_before_mutating_earlier_params(self) -> None:
         module = nn.Module()
-        shared = torch.randn(2, 2)
-        module.frozen = nn.Parameter(shared, requires_grad=False)
-        module.trainable = nn.Parameter(shared, requires_grad=True)
+        module.first = nn.Parameter(torch.randn(2, 2), requires_grad=False)
+        module.second = nn.Parameter(torch.randn(2, 2), requires_grad=True)
+        orig_first = module.first
+        orig_ptr = module.first.untyped_storage().data_ptr()
 
-        with pytest.raises(ValueError, match="mixed requires_grad"):
+        with pytest.raises(ValueError, match="frozen"):
             HostModuleStore.from_module(module)
 
-        assert module.frozen.requires_grad is False
-        assert module.trainable.requires_grad is True
+        assert module.first is orig_first
+        assert module.first.untyped_storage().data_ptr() == orig_ptr
+        assert module.second.requires_grad is True
 
     def test_keeps_distinct_param_backings_separate(self) -> None:
         module = nn.Module()
@@ -275,34 +248,6 @@ class TestHostModuleStore:
                 module,
                 include_buffer_names={"missing"},
             )
-
-    def test_from_module_validates_trainable_swap_before_restore(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        module = nn.Module()
-        module.weight = nn.Parameter(torch.zeros(2), requires_grad=True)
-        calls: list[str] = []
-
-        def fail_validate(_host: HostParam) -> None:
-            calls.append("validate")
-            raise NotImplementedError("unsupported")
-
-        def fail_install(*_args: object, **_kwargs: object) -> None:
-            calls.append("install")
-            raise AssertionError("install should not run before validation")
-
-        monkeypatch.setattr(
-            HostParam,
-            "validate_parameter_data_swap_target",
-            fail_validate,
-        )
-        monkeypatch.setattr(host_module, "_install_host_params", fail_install)
-
-        with pytest.raises(NotImplementedError, match="Trainable param 'weight'"):
-            HostModuleStore.from_module(module)
-
-        assert calls == ["validate"]
 
 
 class TestHostModuleInstance:
@@ -570,101 +515,38 @@ class TestHostModuleInstance:
         assert module.running is original
         assert "extra" not in module._buffers
 
-    def test_copy_trainables_from_target_dedupes_aliases_and_skips_frozen(self) -> None:
-        frozen = _FakeHostParam(torch.ones(2), requires_grad=False)
-        host = _FakeHostParam(torch.ones(2), requires_grad=True)
-        store = HostModuleStore(
-            params={
-                "frozen": cast(HostParam, frozen),
-                "left.weight": cast(HostParam, host),
-                "right.weight": cast(HostParam, host),
-            },
-            buffers={},
-        )
-        instance = HostModuleInstance(
-            module=nn.Module(),
-            params=store.params,
-            buffers=store.buffers,
-        )
-        target = instance.resolve_load_plan().allocate_target(torch.device("cuda"))
+    def test_bind_rejects_trainable_managed_param_without_mutating_earlier_params(self) -> None:
+        proto = nn.Module()
+        proto.first = nn.Parameter(torch.ones(2), requires_grad=False)
+        proto.second = nn.Parameter(torch.zeros(2), requires_grad=False)
+        store = HostModuleStore.from_module(proto)
 
-        instance.copy_trainables_from_target(target, non_blocking=True)
+        target = nn.Module()
+        target.first = nn.Parameter(torch.full((2,), 5.0), requires_grad=False)
+        target.second = nn.Parameter(torch.zeros(2), requires_grad=True)
+        orig_first = target.first
+        orig_ptr = target.first.untyped_storage().data_ptr()
 
-        assert host.copied_back == 1
-        assert host.copy_to_cpu_non_blocking == [True]
-        assert frozen.copied_back == 0
+        with pytest.raises(ValueError, match="must be frozen"):
+            store.bind(target)
 
-    def test_copy_trainables_from_target_validates_before_copying(self) -> None:
-        host = _FakeHostParam(torch.ones(2), requires_grad=True)
-        store = HostModuleStore(
-            params={"weight": cast(HostParam, host)},
-            buffers={},
-        )
-        instance = HostModuleInstance(
-            module=nn.Module(),
-            params=store.params,
-            buffers=store.buffers,
-        )
+        assert target.first is orig_first
+        assert target.first.untyped_storage().data_ptr() == orig_ptr
 
-        with pytest.raises(ValueError, match="param target names mismatch"):
-            instance.copy_trainables_from_target(
-                HostModuleTarget(param_targets={}, buffer_targets={}),
-            )
+    def test_bind_ignores_extra_unmanaged_trainable_params(self) -> None:
+        proto = nn.Module()
+        proto.weight = nn.Parameter(torch.ones(2), requires_grad=False)
+        store = HostModuleStore.from_module(proto)
 
-        assert host.copied_back == 0
+        target = nn.Module()
+        target.weight = nn.Parameter(torch.zeros(2), requires_grad=False)
+        target.extra_lora = nn.Parameter(torch.full((2,), 3.0), requires_grad=True)
 
-    def test_trainable_only_round_trip_preserves_wrappers_and_host_storage(self) -> None:
-        module = nn.Module()
-        module.frozen = nn.Parameter(torch.zeros(2), requires_grad=False)
-        module.trainable = nn.Parameter(torch.zeros(2), requires_grad=True)
-        original_trainable = module.trainable
-        frozen = _FakeHostParam(torch.ones(2), requires_grad=False)
-        trainable = _FakeHostParam(torch.full((2,), 2.0), requires_grad=True)
-        store = HostModuleStore(
-            params={
-                "frozen": cast(HostParam, frozen),
-                "trainable": cast(HostParam, trainable),
-            },
-            buffers={},
-        )
-        instance = store.bind(module)
-        original_frozen = module.frozen
-        host_data_ptr = module.trainable.data_ptr()
-        assert module.trainable is original_trainable
-        assert trainable.validated == 0
+        store.bind(target)
 
-        plan = instance.resolve_load_plan().select_parameters(
-            store.trainable_param_names
-        )
-        target = plan.allocate_target(torch.device("cuda"), buffer_names=())
-        plan.load_to_target(target, non_blocking=True)
-
-        assert set(target.param_targets) == {"trainable"}
-        assert target.buffer_targets == {}
-        assert frozen.allocated == 0
-        assert trainable.allocated == 1
-        assert frozen.copied == 0
-        assert trainable.copied == 1
-        assert frozen.validated == 0
-        assert trainable.validated == 0
-        assert module.frozen is original_frozen
-        assert module.trainable is original_trainable
-        assert module.trainable.data_ptr() == (
-            target.param_targets["trainable"].param.data_ptr()
-        )
-        assert module.trainable.data_ptr() != host_data_ptr
-
-        instance.copy_trainables_from_target(target)
-        assert frozen.copied_back == 0
-        assert trainable.copied_back == 1
-        assert trainable.copy_to_cpu_non_blocking == [False]
-
-        instance.install_host()
-
-        # Only trainable parameters preserve their wrappers across restoration.
-        assert module.frozen.requires_grad is False
-        assert module.trainable is original_trainable
-        assert module.trainable.data_ptr() == host_data_ptr
+        torch.testing.assert_close(target.weight, torch.ones(2))
+        assert target.extra_lora.requires_grad is True
+        torch.testing.assert_close(target.extra_lora, torch.full((2,), 3.0))
 
     def test_binds_same_store_to_multiple_modules(self) -> None:
         prototype = nn.Module()
@@ -720,24 +602,6 @@ class TestHostModuleInstance:
         assert target.right.weight is cpu_param
         assert cpu_param.data_ptr() == host.make_cpu_param().data_ptr()
 
-    def test_trainable_restore_preserves_parameter_wrapper(self) -> None:
-        prototype = nn.Module()
-        prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=True)
-        store = HostModuleStore.from_module(prototype)
-
-        target = nn.Module()
-        target.weight = nn.Parameter(torch.randn(2, 2), requires_grad=True)
-        target_param = target.weight
-
-        store.bind(target)
-
-        # Trainable restore preserves the user's Parameter wrapper and swaps
-        # only ``.data`` to the materialized wrapper aliasing the host bytes.
-        assert target.weight is target_param
-        assert target.weight.data_ptr() == (
-            store.params["weight"].make_cpu_param().data_ptr()
-        )
-
     def test_non_contiguous_buffer_can_bind_after_store_restore(self) -> None:
         module = nn.Module()
         source = torch.randn(2, 3).t()
@@ -766,7 +630,7 @@ class TestHostModuleInstance:
         with pytest.raises(ValueError, match="missing host names.*running"):
             store.bind(nn.Module())
 
-    def test_rejects_requires_grad_mismatch(self) -> None:
+    def test_rejects_trainable_bind_target(self) -> None:
         prototype = nn.Module()
         prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         store = HostModuleStore.from_module(prototype)
@@ -774,7 +638,7 @@ class TestHostModuleInstance:
         target = nn.Module()
         target.weight = nn.Parameter(torch.randn(2, 2), requires_grad=True)
 
-        with pytest.raises(ValueError, match="requires_grad mismatch"):
+        with pytest.raises(ValueError, match="must be frozen"):
             store.bind(target)
 
     def test_rejects_param_layout_mismatch(self) -> None:
@@ -971,42 +835,6 @@ class TestHostModuleInstance:
 
         assert target.running is target.running_alias
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_move_trainable_grads_to_realigns_across_devices(self) -> None:
-        # The shared grad-movement primitive used by HostComponent and
-        # BlockComponent. Exercises the cross-device in-place branch
-        # (offloaded CPU data, grad moved to GPU), the None skip, and
-        # frozen-param exclusion.
-        torch.manual_seed(0)
-        model = nn.Linear(4, 3, bias=True)
-        model.bias.requires_grad = False  # frozen
-        instance = HostModuleStore.from_module(model).bind(model)
-        # ``bind`` installs trainable .data on CPU.
-
-        # No grad yet -> no-op, no crash on the None case.
-        instance.move_trainable_grads_to(torch.device("cuda"))
-        assert model.weight.grad is None
-
-        # CPU grad while data stays offloaded (CPU).
-        grad = torch.randn_like(model.weight)
-        model.weight.grad = grad.clone()
-        model.bias.grad = torch.randn_like(model.bias)  # frozen: ignored
-
-        # data is CPU, target is CUDA -> cross-device in-place branch.
-        instance.move_trainable_grads_to(torch.device("cuda"))
-        assert model.weight.grad is not None
-        assert model.weight.grad.device.type == "cuda"
-        torch.testing.assert_close(model.weight.grad.cpu(), grad)
-        # The frozen param is excluded -> its grad is left where it was.
-        assert model.bias.grad is not None
-        assert model.bias.grad.device.type == "cpu"
-
-        # Moving back to CPU (data co-located) -> clean grad-setter branch.
-        instance.move_trainable_grads_to(torch.device("cpu"))
-        assert model.weight.grad is not None
-        assert model.weight.grad.device.type == "cpu"
-        torch.testing.assert_close(model.weight.grad, grad)
-
 
 class _PackedWrapper(torch.Tensor):
     _packed: torch.Tensor
@@ -1090,17 +918,17 @@ class _PackedStrictAdapter:
         return (state,)
 
     @classmethod
-    def cpu_param(cls, state: torch.Tensor, *, requires_grad: bool = False) -> nn.Parameter:
-        return nn.Parameter(cls._tensor_cls(state, requires_grad=requires_grad), requires_grad=requires_grad)
+    def cpu_param(cls, state: torch.Tensor) -> nn.Parameter:
+        return nn.Parameter(cls._tensor_cls(state, requires_grad=False), requires_grad=False)
 
     @staticmethod
     def alloc_gpu(state: torch.Tensor, device: torch.device) -> torch.Tensor:
         return torch.empty_like(state, device=device)
 
     @classmethod
-    def gpu_param(cls, host: torch.Tensor, gpu_state: torch.Tensor, *, requires_grad: bool = False) -> nn.Parameter:
+    def gpu_param(cls, host: torch.Tensor, gpu_state: torch.Tensor) -> nn.Parameter:
         del host
-        return nn.Parameter(cls._tensor_cls(gpu_state, requires_grad=requires_grad), requires_grad=requires_grad)
+        return nn.Parameter(cls._tensor_cls(gpu_state, requires_grad=False), requires_grad=False)
 
     @staticmethod
     def copy_to_gpu(src: torch.Tensor, dst: torch.Tensor, *, non_blocking: bool = False) -> None:
@@ -1130,13 +958,12 @@ class _PackedMetaBindAdapter(_PackedStrictAdapter):
         target: torch.Tensor,
         *,
         layout_signature: object,
-        requires_grad: bool,
     ) -> bool:
         logical_shape = (int(state.shape[0]), int(state.shape[1]) // 2)
         return (
-            not requires_grad
-            and is_plain_meta_placeholder(target, logical_shape)
-        ) or matches_layout_signature(cls, layout_signature, target)
+            is_plain_meta_placeholder(target, logical_shape)
+            or matches_layout_signature(cls, layout_signature, target)
+        )
 
 
 class _CollidingStrictAdapter(_PackedStrictAdapter):
@@ -1276,16 +1103,18 @@ class TestQuantizedMetaPlaceholderBind:
             trainable_meta = nn.Module()
             trainable_meta.weight = nn.Parameter(torch.empty((4, 4), device="meta"), requires_grad=True)
             assert not frozen_host.accepts_bind_target(trainable_meta.weight)
-            with pytest.raises(ValueError, match="requires_grad mismatch"):
+            with pytest.raises(ValueError, match="frozen"):
                 store.bind(trainable_meta)
 
-            # Trainable quantized stores must also reject trainable plain meta targets.
-            packed_tr = torch.zeros((4, 8), dtype=torch.float32)
-            tr_param = HostParam(
-                nn.Parameter(_wrap_packed(_PackedMetaBindTensor, packed_tr, requires_grad=True), requires_grad=True)
+            trainable_packed = nn.Module()
+            trainable_packed.weight = nn.Parameter(
+                _wrap_packed(_PackedMetaBindTensor, packed, requires_grad=True),
+                requires_grad=True,
             )
-            tr_target = nn.Parameter(torch.empty((4, 4), device="meta"), requires_grad=True)
-            assert not tr_param.accepts_bind_target(tr_target)
+            with pytest.raises(ValueError, match="requires_grad=False"):
+                HostParam(trainable_packed.weight)
+            with pytest.raises(ValueError, match="frozen"):
+                store.bind(trainable_packed)
 
             # Multi-parameter rejection must not partially mutate earlier valid params.
             pair_proto = nn.Module()

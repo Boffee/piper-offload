@@ -26,14 +26,12 @@ from piper_offload.host_param import HostParam
 from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
-    CpuRoundTripTensorAdapter,
     DequantRequantTensorAdapter,
     DequantizeTensorAdapter,
     DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
-    ParameterDataSwapTensorAdapter,
     TensorCopyIntoAdapter,
 )
 from tests.conftest import activated_model
@@ -603,10 +601,9 @@ class TestPiperConvRotInt8Adapter:
         assert torch.equal(first[0], replay[0])
         assert torch.equal(first[1], replay[1])
 
-    def test_advertises_merge_but_not_training_capabilities(self) -> None:
+    def test_advertises_merge_capabilities(self) -> None:
         adapter = PiperConvRotInt8Adapter()
 
-        assert not isinstance(adapter, CpuRoundTripTensorAdapter)
         assert isinstance(adapter, DequantizeTensorAdapter)
         assert not isinstance(adapter, DequantRequantTensorAdapter)
         assert not isinstance(adapter, TensorCopyIntoAdapter)
@@ -614,16 +611,6 @@ class TestPiperConvRotInt8Adapter:
         assert isinstance(adapter, LoRAMergeValidationTensorAdapter)
         assert isinstance(adapter, DenseMergeTensorAdapter)
         assert isinstance(adapter, DenseMergeTargetValidationTensorAdapter)
-        assert not isinstance(adapter, ParameterDataSwapTensorAdapter)
-
-        host_param = HostParam(
-            nn.Parameter(_make_convrot(), requires_grad=True),
-        )
-        state = host_param.allocate_gpu_storage(torch.device("cpu"))
-        with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            host_param.copy_to_cpu(state)
-        with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            host_param.validate_parameter_data_swap_target()
 
     @CUDA
     def test_allocate_copy_and_reconstruct_gpu_wrapper(self) -> None:

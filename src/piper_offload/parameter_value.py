@@ -64,8 +64,6 @@ class ParameterValue:
                 "ParameterValue backing must be a HostParam; "
                 f"got {type(self.backing).__name__}."
             )
-        if self.backing.requires_grad:
-            raise ValueError("Parameter values are inference-only and must be frozen.")
         _select_value_adapter(
             param_representation(self.backing.make_cpu_param())
         )
@@ -84,8 +82,10 @@ class ParameterValue:
                 "Parameter values must be tensor representations; "
                 f"got {type(source).__name__}."
             )
-        if issubclass(type(source), nn.Parameter) and source.requires_grad:
-            raise ValueError("Parameter values are inference-only and must be frozen.")
+        if source.requires_grad:
+            raise ValueError(
+                "Parameter values are inference-only and must be frozen (requires_grad=False)."
+            )
         # Inspect only the source representation and dtype policy here. The
         # final captured representation is validated once by
         # ``ParameterValue.__post_init__``.

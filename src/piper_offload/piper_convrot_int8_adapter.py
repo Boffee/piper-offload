@@ -9,8 +9,7 @@ and dense updates to the public in-place ``ConvRotInt8Tensor.addmm_`` and
 When stochastic rounding is requested, Piper Offload forwards its stable
 per-target seed to the kernel-owned terminal INT8 code selection.
 
-The adapter remains frozen-only: it does not advertise CPU round-trip or
-trainable ``Parameter.data`` swap. Permanent and activation-time LoRA merge
+Permanent and activation-time LoRA merge
 preserve the existing target wrapper and storage identities. Piper selects its
 optimized Triton backend on supported CUDA devices and its portable reference
 backend elsewhere. Routed LoRA remains available when the base must remain

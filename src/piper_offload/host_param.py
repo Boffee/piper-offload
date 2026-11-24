@@ -6,11 +6,10 @@ Internal to the ``piper_offload`` subpackage. Shared by
 abstraction so the addition of new tensor types only requires writing
 a new :class:`TensorAdapter`, not editing the consumers.
 
-:class:`HostParam` pairs one
+:class:`HostParam` pairs one frozen
 :class:`nn.Parameter` with the adapter that handles its tensor type
 plus the host state that adapter produced. Optional operations
-such as D2H round-trip, trainable ``.data`` swap, and in-place updates
-are exposed through adapter capability methods.
+such as in-place updates are exposed through adapter capability methods.
 """
 
 from typing import Any, Self, cast
@@ -21,49 +20,35 @@ from torch import nn
 from .dtensor_adapter import DTensorAdapter
 from .tensor_adapter_registry import param_representation, select_adapter
 from .tensor_adapters import (
-    CpuRoundTripTensorAdapter,
     LogicalShapeTensorAdapter,
-    ParameterDataSwapTensorAdapter,
     TensorAdapter,
     accepts_bind_target,
-    adapter_name,
     clone_host_state,
-    host_state_is_owned,
 )
 
 
 class HostParam:
-    """Host storage for one parameter, with GPU-load helpers.
+    """Host storage for one frozen parameter, with GPU-load helpers.
 
-    Construction picks an adapter via :func:`select_adapter` based on
-    the parameter's tensor type, then takes ownership of compatible pageable
-    CPU allocations or non-resizable views and normalizes other sources into
-    CPU storage when required.
+    Construction requires ``requires_grad=False``, picks an adapter via
+    :func:`select_adapter` based on the parameter's tensor type, then takes
+    ownership of compatible pageable CPU allocations or non-resizable views
+    and normalizes other sources into CPU storage when required.
     Model-bound callers create their own
     deactivated-state :class:`nn.Parameter` wrappers with
     :meth:`make_cpu_param`.
 
     The lifecycle methods (:meth:`make_cpu_param`,
     :meth:`allocate_gpu_storage`, :meth:`make_gpu_param`,
-    :meth:`copy_to_gpu`, :meth:`copy_to_cpu`) all dispatch through the
-    adapter. This primitive works with the opaque state returned by
-    :meth:`allocate_gpu_storage`; model-bound callers should normally
-    use :class:`~piper_offload.host_module.HostModuleStore` and
-    :class:`~piper_offload.host_module.HostModuleInstance`, which wrap
-    active storage in target objects.
-
-    The host parameter captures the source parameter's ``requires_grad`` at
-    construction time and threads it through to the adapter when
-    building CPU and GPU parameter wrappers. Model-bound callers can
-    either replace frozen params with those wrappers or preserve
-    trainable Parameter identity by ``.data``-swapping into the user's
-    persistent Parameter — both are supported.
+    :meth:`copy_to_gpu`) all dispatch through the adapter. This primitive works
+    with the opaque state returned by :meth:`allocate_gpu_storage`; model-bound
+    callers should normally use :class:`~piper_offload.host_module.HostModuleStore`
+    and :class:`~piper_offload.host_module.HostModuleInstance`, which wrap active
+    storage in target objects.
 
     Low-peak host construction behavior: compatible complete CPU allocations
     and views into non-resizable storage are retained directly, preserving file
-    mappings without a copy. A trainable parameter is the exception: optimizer
-    steps write its host bytes back, and Piper never writes into a file
-    mapping, so a trainable view into one is copied out at capture. For plain
+    mappings without a copy. For plain
     ``torch.Tensor`` parameters, construction immediately repoints the source
     ``Parameter.data`` at the captured backing.
     This promptly releases replaced GPU or incompatible CPU storage before the
@@ -85,13 +70,16 @@ class HostParam:
         "_target_layout",
         "adapter",
         "host_state",
-        "requires_grad",
     )
 
     def __init__(self, param: nn.Parameter) -> None:
+        if param.requires_grad:
+            raise ValueError(
+                "Piper Offload is inference-only and requires frozen parameters "
+                "(requires_grad=False)."
+            )
         # Select the tensor that carries the parameter's representation.
         representation = param_representation(param)
-        requires_grad = param.requires_grad
         is_meta = representation.is_meta
         if is_meta:
             if type(representation) is not torch.Tensor:
@@ -109,24 +97,14 @@ class HostParam:
                     "Meta parameters must be floating-point; "
                     f"got {representation.dtype}."
                 )
-            if requires_grad:
-                raise ValueError(
-                    "Meta parameters are inference-only and must have "
-                    "requires_grad=False."
-                )
         adapter: TensorAdapter[Any, Any] = select_adapter(representation)
         # A meta tensor is the complete resting representation: it records
         # shape, dtype, and stride without owning physical host bytes.
         host_state = (
             representation.detach() if is_meta else adapter.capture_host(representation)
         )
-        if requires_grad and not is_meta and not host_state_is_owned(adapter, host_state):
-            # Optimizer steps write trainable host bytes back, and the pin
-            # manager may return a mapping's pages to the file.
-            host_state = clone_host_state(adapter, representation, host_state)
         self._init_from_host_state(
             representation,
-            requires_grad=requires_grad,
             adapter=adapter,
             host_state=host_state,
         )
@@ -156,9 +134,9 @@ class HostParam:
         """
         if source.is_meta:
             raise ValueError("DTensor projection source must own physical host storage.")
-        if source.requires_grad or target.requires_grad:
+        if target.requires_grad:
             raise ValueError(
-                "DTensor projection supports frozen inference parameters only."
+                "DTensor projection supports frozen inference parameters only (requires_grad=False)."
             )
 
         representation = param_representation(target)
@@ -176,7 +154,6 @@ class HostParam:
         projected = cls.__new__(cls)
         projected._init_from_host_state(
             representation,
-            requires_grad=False,
             adapter=adapter,
             host_state=host_state,
         )
@@ -186,13 +163,11 @@ class HostParam:
         self,
         representation: torch.Tensor,
         *,
-        requires_grad: bool,
         adapter: TensorAdapter[Any, Any],
         host_state: object,
     ) -> None:
         """Install representation metadata and an already-captured host state."""
         self._shape = torch.Size(representation.shape)
-        self.requires_grad = requires_grad
         self.adapter = adapter
         self.host_state = host_state
         self._logical_shape = (
@@ -249,7 +224,7 @@ class HostParam:
         instances of an adapter's own tensor type (such as an unsupported transposed
         layout) may still raise during layout validation.
         """
-        if param.requires_grad != self.requires_grad:
+        if param.requires_grad:
             return False
         representation = param_representation(param)
         if self.is_meta:
@@ -269,7 +244,6 @@ class HostParam:
             self.host_state,
             self._target_layout[1],
             representation,
-            requires_grad=self.requires_grad,
         )
 
     @property
@@ -304,7 +278,7 @@ class HostParam:
         return self.adapter.storage_tensors(self.host_state)
 
     def make_cpu_param(self) -> nn.Parameter:
-        """Build a CPU :class:`nn.Parameter` wrapper over this host state.
+        """Build a frozen CPU :class:`nn.Parameter` wrapper over this host state.
 
         Each model-bound binding owns its own wrapper object, while the
         underlying host storage remains shared through this
@@ -315,15 +289,14 @@ class HostParam:
                 cast(torch.Tensor, self.host_state),
                 requires_grad=False,
             )
-        return self.adapter.cpu_param(
-            self.host_state, requires_grad=self.requires_grad,
-        )
+        return self.adapter.cpu_param(self.host_state)
 
     def allocate_gpu_storage(self, device: torch.device) -> object:
         """Allocate empty GPU storage mirroring this host parameter's layout.
+
         Returns an opaque adapter-specific handle; pass it back to
-        :meth:`make_gpu_param`, :meth:`copy_to_gpu`, and
-        :meth:`copy_to_cpu`."""
+        :meth:`make_gpu_param` and :meth:`copy_to_gpu`.
+        """
         if self.is_meta:
             source = cast(torch.Tensor, self.host_state)
             return torch.empty_strided(
@@ -335,15 +308,14 @@ class HostParam:
         return self.adapter.alloc_gpu(self.host_state, device)
 
     def make_gpu_param(self, gpu_state: object) -> nn.Parameter:
-        """Build the GPU-side :class:`nn.Parameter` for this host parameter.
+        """Build the frozen GPU-side :class:`nn.Parameter` for this host parameter.
+
         The adapter receives the paired host state to reconstruct
-        structured tensor wrappers. The wrapper's
-        ``requires_grad`` matches the source parameter's at capture time."""
+        structured tensor wrappers.
+        """
         if self.is_meta:
             return nn.Parameter(cast(torch.Tensor, gpu_state), requires_grad=False)
-        return self.adapter.gpu_param(
-            self.host_state, gpu_state, requires_grad=self.requires_grad,
-        )
+        return self.adapter.gpu_param(self.host_state, gpu_state)
 
     def copy_to_gpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk DMA host bytes into pre-allocated GPU storage."""
@@ -352,30 +324,6 @@ class HostParam:
             # directly. There are deliberately no zero bytes to transfer.
             return
         self.adapter.copy_to_gpu(self.host_state, gpu_state, non_blocking=non_blocking)
-
-    def copy_to_cpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
-        """Bulk D2H GPU bytes back into the host state.
-
-        Optional symmetric counterpart to :meth:`copy_to_gpu`. The
-        host state is overwritten in place with the current GPU
-        contents — useful for syncing host backing after an in-place
-        GPU update (e.g., an optimizer step). Adapters whose GPU
-        representation is not round-trippable do not expose this
-        capability and raise :class:`NotImplementedError` here.
-        """
-        if self.is_meta:
-            raise NotImplementedError(
-                "Meta parameters have no physical host backing to update."
-            )
-        if not isinstance(self.adapter, CpuRoundTripTensorAdapter):
-            raise NotImplementedError(
-                f"{adapter_name(self.adapter)} does not support CPU round-trip: "
-                "its GPU representation cannot be copied back into the "
-                "host state without adapter-specific conversion."
-            )
-        self.adapter.copy_to_cpu(
-            gpu_state, self.host_state, non_blocking=non_blocking
-        )
 
     def materialize(
         self,
@@ -426,7 +374,7 @@ class HostParam:
             )
         representation = param_representation(self.make_cpu_param())
         cloned_state = clone_host_state(self.adapter, representation, self.host_state)
-        return self.adapter.cpu_param(cloned_state, requires_grad=False)
+        return self.adapter.cpu_param(cloned_state)
 
     @property
     def compute_dtype(self) -> torch.dtype:
@@ -434,39 +382,6 @@ class HostParam:
         return self.adapter.compute_dtype(
             param_representation(self.make_cpu_param())
         )
-
-    def validate_parameter_data_swap_target(self) -> None:
-        """Raise if this host parameter cannot use trainable streaming.
-
-        CUDA trainable streaming requires both Parameter.data swap
-        compatibility and a D2H path back into host state after
-        optimizer updates.
-        """
-        if self.is_meta:
-            raise NotImplementedError(
-                "Meta parameters are frozen and cannot use Parameter.data swap."
-            )
-        if not isinstance(self.adapter, ParameterDataSwapTensorAdapter):
-            raise NotImplementedError(
-                f"Trainable streaming requires a Parameter.data-swap-capable "
-                f"tensor adapter; this parameter uses {adapter_name(self.adapter)}. "
-                "Quantized or structured weights are inference-only here — "
-                "keep them frozen, or wrap with PEFT/LoRA so the trainable "
-                "adapter weights are plain tensors."
-            )
-        try:
-            self.adapter.validate_parameter_data_swap_target(
-                self.make_cpu_param().data
-            )
-        except NotImplementedError as exc:
-            raise NotImplementedError(
-                f"Trainable streaming cannot use Parameter.data swap: {exc}"
-            ) from exc
-        if not isinstance(self.adapter, CpuRoundTripTensorAdapter):
-            raise NotImplementedError(
-                f"Trainable streaming requires a CPU-round-trip-capable "
-                f"tensor adapter; this parameter uses {adapter_name(self.adapter)}."
-            )
 
     @property
     def cache_bytes(self) -> int:

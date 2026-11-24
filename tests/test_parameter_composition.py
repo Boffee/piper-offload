@@ -191,11 +191,10 @@ def test_unpopulated_partial_targets_create_no_merge_work():
 
 
 @pytest.mark.parametrize("application", ["permanent", "activation"])
-@pytest.mark.parametrize("requires_grad", [False, True])
-def test_merge_rejects_distinct_parameter_objects_sharing_storage(application, requires_grad):
+def test_merge_rejects_distinct_parameter_objects_sharing_storage(application):
     model = nn.Module()
-    model.weight = nn.Parameter(torch.ones(2, 3), requires_grad=requires_grad)
-    model.alias = nn.Parameter(model.weight.detach(), requires_grad=requires_grad)
+    model.weight = nn.Parameter(torch.ones(2, 3), requires_grad=False)
+    model.alias = nn.Parameter(model.weight.detach(), requires_grad=False)
     assert model.weight is not model.alias
     assert model.weight.data_ptr() == model.alias.data_ptr()
     delta = ParameterDelta.from_tensors(dense=torch.ones(2, 3))
@@ -206,6 +205,31 @@ def test_merge_rejects_distinct_parameter_objects_sharing_storage(application, r
         pytest.fail("distinct wrappers hid a shared parameter backing")
     torch.testing.assert_close(model.weight, torch.ones(2, 3))
     torch.testing.assert_close(model.alias, torch.ones(2, 3))
+
+
+def test_merge_and_offloader_reject_trainable_parameters():
+    from piper_offload import LoRAFactor, ParameterValue
+
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.ones(2, 3), requires_grad=True)
+    delta = ParameterDelta.from_tensors(dense=torch.ones(2, 3))
+    adapter = Adapter({"weight": delta})
+
+    with pytest.raises(ValueError, match="requires_grad=False"):
+        merge_adapter(model, [(adapter, 1.0)])
+    with pytest.raises(ValueError, match="requires_grad=False"):
+        ModelOffloader.from_module(model)
+
+    with pytest.raises(ValueError, match="requires_grad=False"):
+        ParameterValue.from_tensor(torch.ones(2, 3, requires_grad=True))
+    with pytest.raises(ValueError, match="requires_grad=False"):
+        ParameterValue.from_tensor(nn.Parameter(torch.ones(2, 3), requires_grad=True))
+    with pytest.raises(ValueError, match="requires_grad=False"):
+        ParameterDelta.from_tensors(dense=torch.ones(2, 3, requires_grad=True))
+    with pytest.raises(ValueError, match="requires_grad=False"):
+        LoRAFactor.from_tensors(torch.ones(1, 3, requires_grad=True), torch.ones(2, 1))
+    with pytest.raises(ValueError, match="requires_grad=False"):
+        LoRAFactor.from_tensors(torch.ones(1, 3), torch.ones(2, 1, requires_grad=True))
 
 
 @pytest.mark.parametrize("application", ["permanent", "activation"])

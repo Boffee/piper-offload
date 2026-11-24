@@ -28,7 +28,7 @@ from piper_offload import (
     ScaledLoRAFactor,
 )
 from piper_offload._host_registration import RuntimeHostRegistration
-from piper_offload.host_module import HostModuleInstance, HostModuleStore, ParameterOverride
+from piper_offload.host_module import HostModuleStore, ParameterOverride
 from piper_offload.host_param import HostParam
 from piper_offload.target_lease import CudaTargetLease
 from piper_offload.tensor_adapter_registry import param_representation, select_adapter
@@ -184,23 +184,21 @@ def test_cpu_execution_does_not_acquire_pins(device: str, mode: str, pins, monke
         assert manager.stats.active_leases == 0
 
 
-def test_transfer_sources_include_buffers_and_optimizer_backing() -> None:
+def test_transfer_sources_include_active_params_and_buffers() -> None:
     module = nn.Module()
-    module.frozen = nn.Parameter(torch.randn(4, 4), requires_grad=False)
-    module.trainable = nn.Parameter(torch.randn(4, 4))
+    module.overridden = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+    module.kept = nn.Parameter(torch.randn(4, 4), requires_grad=False)
     module.register_buffer("buffer", torch.ones(4))
     module.register_buffer("alias", module.buffer)
     store = HostModuleStore.from_module(module)
-    frozen = HostParam(nn.Parameter(torch.randn(4, 4), requires_grad=False))
-    trainable = HostParam(nn.Parameter(torch.randn(4, 4)))
+    replacement = HostParam(nn.Parameter(torch.randn(4, 4), requires_grad=False))
     plan = store.bind(module).resolve_load_plan({
-        "frozen": ParameterOverride(source=frozen),
-        "trainable": ParameterOverride(source=trainable),
+        "overridden": ParameterOverride(source=replacement),
     })
     tensors = list(plan.storage_tensors())
     identities = {id(tensor) for tensor in tensors}
-    assert id(store.params["frozen"].storage_tensors()[0]) not in identities
-    for host in (frozen, trainable, store.params["trainable"], store.buffers["buffer"]):
+    assert id(store.params["overridden"].storage_tensors()[0]) not in identities
+    for host in (replacement, store.params["kept"], store.buffers["buffer"]):
         assert all(id(tensor) in identities for tensor in host.storage_tensors())
 
 
@@ -382,34 +380,11 @@ def test_prefetch_update_failure_waits_before_releasing_pins(pins) -> None:
         component.deactivate()
 
 
-@CUDA
-def test_trainable_copy_back_preserves_registered_host_storage(pins) -> None:
-    manager, backend = pins
-    model = _BlockModel().requires_grad_(True)
-    expected = [parameter.detach().clone() + 1 for parameter in model.parameters()]
-    component = BlockComponentStore.from_module(
-        model, blocks_path="blocks", include_block_trainables=True,
-    ).bind(model)
-    try:
-        component.activate(torch.device("cuda"))
-        count = len(backend.registrations)
-        with component.optimizer_step(), torch.no_grad():
-            for parameter in model.parameters():
-                parameter.add_(1)
-        assert manager.stats.active_leases == 1
-        assert len(backend.registrations) == count
-    finally:
-        component.deactivate()
-    for parameter, updated in zip(model.parameters(), expected, strict=True):
-        torch.testing.assert_close(parameter, updated)
-        assert parameter.is_pinned()
-
-
 def _resident_component(model: nn.Module, mode: str):
     if mode == "host":
         return HostComponentStore.from_module(model).bind(model)
     return BlockComponentStore.from_module(
-        model, blocks_path="blocks", include_block_trainables=True,
+        model, blocks_path="blocks",
     ).bind(model, block_mode="resident")
 
 
@@ -507,32 +482,6 @@ def test_partial_upload_keeps_its_lease_until_cleanup_synchronizes(mode, fail_sy
 
 
 @CUDA
-def test_resident_copy_back_closes_at_the_runtime_completion_point(pins, monkeypatch) -> None:
-    manager, _backend = pins
-    model = _BlockModel().requires_grad_(True)
-    expected = [parameter.detach().clone() + 1 for parameter in model.parameters()]
-    component = _resident_component(model, "resident")
-
-    def failed_sync(*_args, **_kwargs):
-        raise RuntimeError("a device-wide synchronization is not needed here")
-
-    try:
-        component.activate(torch.device("cuda"))
-        with monkeypatch.context() as patch:
-            # The runtime synchronizes its own stream after the copy-back, which
-            # is the completion point the lease closes at.
-            patch.setattr(torch.cuda, "synchronize", failed_sync)
-            with component.optimizer_step(), torch.no_grad():
-                for parameter in model.parameters():
-                    parameter.add_(1)
-        assert manager.stats.active_leases == 0
-    finally:
-        component.deactivate()
-    for parameter, updated in zip(model.parameters(), expected, strict=True):
-        torch.testing.assert_close(parameter, updated)
-
-
-@CUDA
 def test_failed_deactivation_refuses_resident_reactivation(pins, monkeypatch) -> None:
     manager, _backend = pins
     component = _resident_component(_BlockModel(), "resident")
@@ -560,81 +509,6 @@ def test_failed_deactivation_refuses_resident_reactivation(pins, monkeypatch) ->
         assert not component.failed
     finally:
         component.deactivate()
-
-
-@CUDA
-@pytest.mark.parametrize("mode", ["resident", "host"])
-def test_frozen_optimizer_step_takes_no_transfer_lease(mode, pins, monkeypatch) -> None:
-    manager, _backend = pins
-    component = _resident_component(_BlockModel().requires_grad_(False), mode)
-
-    def unexpected(*_args, **_kwargs):
-        raise AssertionError("a frozen model has nothing to copy back")
-
-    try:
-        component.activate(torch.device("cuda"))
-        with monkeypatch.context() as patch:
-            patch.setattr(manager, "acquire", unexpected)
-            patch.setattr(torch.cuda, "synchronize", unexpected)
-            with component.optimizer_step():
-                pass
-    finally:
-        component.deactivate()
-
-
-@CUDA
-@pytest.mark.parametrize("mode", ["resident", "host"])
-@pytest.mark.parametrize("failure", [None, "copy", "sync"])
-def test_optimizer_copy_back_has_its_own_pageable_lease(mode, failure, pins, monkeypatch) -> None:
-    manager, backend = pins
-    model = _BlockModel().requires_grad_(True)
-    expected = [parameter.detach().clone() + 1 for parameter in model.parameters()]
-    component = _resident_component(model, mode)
-    original_copy = HostModuleInstance.copy_trainables_from_target
-    copied = False
-
-    def checked_copy(instance, target, **kwargs):
-        nonlocal copied
-        assert manager.stats.active_leases == 1
-        assert backend.registrations == []
-        assert not any(tensor.is_pinned() for tensor in instance.trainable_storage_tensors())
-        original_copy(instance, target, **kwargs)
-        copied = True
-        if failure == "copy":
-            raise RuntimeError("injected copy-back failure")
-
-    def failed_sync(*_args, **_kwargs):
-        raise RuntimeError("injected synchronization failure")
-
-    def step():
-        with component.optimizer_step(), torch.no_grad():
-            for parameter in model.parameters():
-                parameter.add_(1)
-
-    try:
-        component.activate(torch.device("cuda"))
-        assert manager.stats.active_leases == 0
-        with monkeypatch.context() as patch:
-            patch.setattr(HostModuleInstance, "copy_trainables_from_target", checked_copy)
-            if failure == "sync":
-                # Both the runtime's stream synchronization and the device-wide retry fail.
-                patch.setattr(torch.cuda, "synchronize", failed_sync)
-                patch.setattr(torch.cuda.Stream, "synchronize", failed_sync)
-            if failure is None:
-                step()
-            else:
-                with pytest.raises(RuntimeError, match="injected"):
-                    step()
-            assert copied
-            assert manager.stats.active_leases == (1 if failure == "sync" else 0)
-        component.release()
-        assert manager.stats.active_leases == 0
-        assert backend.registrations == []
-    finally:
-        component.deactivate()
-    if failure != "copy":
-        for parameter, updated in zip(model.parameters(), expected, strict=True):
-            torch.testing.assert_close(parameter, updated)
 
 
 @CUDA

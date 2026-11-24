@@ -79,7 +79,7 @@ __all__ = [
 
 class ModelOffloader:
     """Move a whole model or managed block groups between host RAM and
-    CUDA, with optional adapter application and trainable-parameter support.
+    CUDA, with optional adapter application.
 
     Construct with :meth:`from_module`. One offloader owns one model and may
     be reused sequentially, but it cannot create model replicas or serve
@@ -99,44 +99,6 @@ class ModelOffloader:
     directly to :meth:`activate`; merge mode builds activation-scoped
     parameter overrides so each update runs immediately after its source is
     copied to CUDA. No separate merge binding is needed.
-
-    Training
-    --------
-    Training through streamed blocks **requires activation
-    checkpointing on each block** — wrap call sites in
-    :func:`torch.utils.checkpoint.checkpoint`, or call
-    ``model.gradient_checkpointing_enable()`` on a HuggingFace model.
-    Without it, ``loss.backward()`` raises ``RuntimeError: ... has
-    been modified by an inplace operation`` on the first target reuse.
-
-    Why: autograd saves a reference to each ``Linear``'s weight
-    tensor at forward time and records its version counter. Streaming
-    is a sequence of in-place ``copy_`` writes into a fixed pool of
-    GPU target tensors — every load bumps the target tensor's version,
-    invalidating any previously-saved reference into that target.
-    Checkpointing makes each block's internal forward run under
-    ``no_grad`` (no internal tensors saved); when backward arrives,
-    PyTorch re-runs the block's forward with grad enabled, building
-    a fresh autograd graph whose saved references only live within
-    that one block's recompute-then-backward window. Target reuse
-    outside that window is then safe. Ensuring each streamed block that
-    participates in training is checkpointed is the caller's
-    responsibility — there is no auto-detection or guard.
-
-    By default, trainable params are not streamed through the block
-    residency pool. They are managed by :class:`HostComponent`, stay
-    GPU-resident while the offloader binding is active on CUDA, and must be
-    updated inside :meth:`optimizer_step` so CUDA updates are copied
-    back to the CPU cache. CPU activation leaves them in the
-    host-backed module state.
-
-    Configure ``include_block_trainables=True`` on :meth:`from_module` to
-    stream in-block trainable parameter data through the CUDA block target
-    pool. In that mode,
-    :meth:`optimizer_step` is the optimizer boundary: it materializes
-    streamed trainable ``.data`` on GPU while an arbitrary PyTorch
-    optimizer updates it, then copies the updated data back to host
-    CPU. Gradients are not streamed; PyTorch owns ``param.grad`` normally.
 
     Parameters
     ----------
@@ -172,7 +134,6 @@ class ModelOffloader:
         *,
         block_paths: Sequence[str] = (),
         transient_block_paths: Sequence[str] = (),
-        include_block_trainables: bool = False,
         block_mode: BlockMode = "streaming",
         block_compile: BlockCompileConfig | None = None,
         transient_paths: Sequence[str] = (),
@@ -191,13 +152,14 @@ class ModelOffloader:
         ``transient_block_paths`` release after their final blocks and
         reacquire after the root model forward; a root forward also reacquires
         any that remain released when it starts, such as after a forward
-        raised. These groups are inference-only
-        and must not be traversed again later in the same root forward. Their
-        block lists must contain distinct module objects because a module hook
-        cannot distinguish occurrences of an aliased block.
+        raised. These groups must not be traversed again later in the same root
+        forward, and their block lists must contain distinct module objects
+        because a module hook cannot distinguish occurrences of an aliased
+        block.
         Each module named by ``transient_paths`` similarly owns a separate
         CUDA working set that releases after that module's forward.
-        Takes ownership of compatible pageable CPU backing for every managed
+        Requires frozen parameters (``requires_grad=False``) and takes
+        ownership of compatible pageable CPU backing for every managed
         parameter and buffer, including non-resizable checkpoint views, while
         preserving mappings and each adapter's physical representation. Other
         devices and incompatible views are normalized into CPU storage.
@@ -207,7 +169,6 @@ class ModelOffloader:
             block_paths=block_paths,
             transient_block_paths=transient_block_paths,
             transient_paths=transient_paths,
-            include_block_trainables=include_block_trainables,
         )
         cache_bytes = captured.cache_bytes
         composite = captured.component(block_compile=block_compile, block_mode=block_mode)
@@ -566,57 +527,3 @@ class ModelOffloader:
                 finally:
                     self._active_device = None
                     self._activation_lock.release()
-
-    def optimizer_step(self) -> contextlib.AbstractContextManager[None]:
-        """Context manager wrapping the optimizer-step boundary for
-        managed trainable weights.
-
-        On CUDA activation, non-streamed trainables are already active
-        through :class:`HostComponent`, while block-component trainables
-        are materialized on enter after force-evicting loaded blocks.
-        On exit, updated trainable bytes are copied back to their host
-        CPU storage. On CPU activation, or while inactive, this is a
-        guarded no-op: nested entry still raises.
-
-        ``param.grad`` is unaffected throughout. On CUDA, it lives on
-        GPU during backward via PyTorch's native ``AccumulateGrad`` and
-        is read+modified by the optimizer in place. ``optimizer.zero_grad()``,
-        ``clip_grad_norm_``, AMP's ``GradScaler.unscale_`` and other
-        grad-walking tools work as in vanilla PyTorch — they don't need
-        to be inside this context.
-
-        Typical loop::
-
-            loss.backward()
-            with offload.optimizer_step():
-                optimizer.step()
-            optimizer.zero_grad()
-
-        This context steps on the *GPU* for speed. To run the optimizer on
-        *CPU* instead — keeping its state on the host — call
-        ``optimizer.step()`` after :meth:`deactivate` without this context. On
-        ``deactivate()`` every managed trainable has its ``.data``
-        restored to CPU storage *and* its ``.grad`` moved to CPU
-        (:class:`HostComponent` and :class:`BlockComponent` alike), so
-        the step runs on CPU and the in-place update is streamed to GPU on the
-        next forward. Keep such trainables in fp32 so the update is a correct
-        master-weight update::
-
-            offload.activate("cuda")
-            try:
-                loss = model(x); loss.backward()
-            finally:
-                offload.deactivate()
-            optimizer.step()        # runs on CPU; states stay on host
-            optimizer.zero_grad()
-        """
-        return self._composite.optimizer_step()
-
-    def gather_for_step(self) -> contextlib.AbstractContextManager[None]:
-        """Backward-compatible alias for :meth:`optimizer_step`.
-
-        The public API names the boundary after the operation that
-        requires all streamed trainable weight data to be materialized: the
-        optimizer step.
-        """
-        return self.optimizer_step()

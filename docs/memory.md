@@ -38,7 +38,7 @@ to register that storage. Piper's built-in runtimes choose as follows:
 | Transfer | Requests new registration |
 |---|---|
 | Streaming blocks, rolling blocks, experimental host relay | Yes: the transfer repeats |
-| Resident blocks, host components, optimizer copy-back | No: pageable lease |
+| Resident blocks, host components | No: pageable lease |
 | Routed LoRA factors | No: pageable lease while hooks are installed |
 | CPU execution | No lease |
 
@@ -87,11 +87,10 @@ views into ordinary resizable allocations, and incompatible layouts are copied
 into pageable CPU storage. Quantized formats retain their packed bytes, scales,
 and reconstruction metadata. Capture alone never registers memory.
 
-Factory-produced tensors must not be mutated afterwards. Frozen host bytes are
-immutable while captured; set `requires_grad` before capture. Trainable mapped
-parameters are copied into owned memory at capture, and `merge_adapter()` copies
-a mapped target before modifying it. Buffers are never copied back from the
-device. **Piper never writes into a file mapping.**
+Factory-produced tensors must not be mutated afterwards. Models must be frozen
+(`requires_grad=False`) before capture, and captured host bytes are immutable.
+`merge_adapter()` copies a mapped target before modifying it. Buffers are never
+copied back from the device. **Piper never writes into a file mapping.**
 
 [`MappedCheckpoint`](../src/piper_offload/checkpoint.py) reads safetensors and
 GGUF files through a read-only mapping and records each storage's file slice.

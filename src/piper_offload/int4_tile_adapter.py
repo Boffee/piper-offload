@@ -14,11 +14,9 @@ kernel library. The matmul runs on CUDA; re-wrapping already-packed bytes
 is a pure constructor call, so the CPU representation round-trips
 cleanly.
 
-The adapter exposes inference movement only. INT4 model weights are
-treated as frozen: no CPU round-trip, no trainable ``Parameter.data``
-swap, and no activation-scoped dense ``addmm_`` LoRA merge. Routed LoRA
-remains possible when the owning module is a logical ``nn.Linear`` with
-compatible shape/dtype.
+The adapter exposes inference movement only (no activation-scoped dense
+``addmm_`` LoRA merge). Routed LoRA remains possible when the owning module
+is a logical ``nn.Linear`` with compatible shape/dtype.
 """
 
 from dataclasses import dataclass

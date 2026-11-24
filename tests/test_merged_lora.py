@@ -1089,7 +1089,7 @@ def test_adapter_strengths_preserve_active_occurrences(strengths, expected) -> N
 
 class TestActivationLoraValidation:
     def test_strength_mismatch_releases_activation_claim(self) -> None:
-        model = nn.Linear(1, 1)
+        model = nn.Linear(1, 1).requires_grad_(False)
         offloader = ModelOffloader.from_module(model)
         adapter = Adapter.from_state_dict({"weight": torch.ones(1, 1)})
         with pytest.raises(ValueError, match="shorter"):
@@ -2684,7 +2684,7 @@ class TestPermanentMerge:
                 )
                 self.other.weight = nn.Parameter(wrapped, requires_grad=False)
 
-        m = M()
+        m = M().requires_grad_(False)
         before = m.target.weight.detach().clone()
         sd = {
             "target.lora_A.weight": torch.randn(4, 16),
@@ -3681,19 +3681,25 @@ class TestMergeIntoMappedModel:
         torch.testing.assert_close(model.target.weight, base + 0.5 * dense)
         torch.testing.assert_close(mapped, base)
 
-    def test_replacing_mixed_trainability_aliases_leaves_optimizer_attached(self) -> None:
+    def test_rejects_trainable_target_and_mixed_trainability_aliases(self) -> None:
         mapped = torch.frombuffer(bytearray(24), dtype=torch.float32).reshape(2, 3)
         model = nn.Sequential(nn.Linear(3, 2, bias=False), nn.Linear(3, 2, bias=False))
         model[0].weight = nn.Parameter(mapped, requires_grad=False)
-        trainable = model[1].weight = nn.Parameter(mapped)
-        optimizer = torch.optim.SGD([trainable], lr=0.25)
+        model[1].weight = nn.Parameter(mapped)
         delta = Adapter.from_state_dict({"0.delta.weight": torch.ones_like(mapped)})
 
-        with pytest.raises(ValueError, match="mixed requires_grad"):
+        with pytest.raises(ValueError, match="requires_grad=False"):
             merge_adapter(model, [(delta, 1.0)])
-        assert model[1].weight is optimizer.param_groups[0]["params"][0]
+        assert model[1].weight.requires_grad
         assert not model[0].weight.requires_grad
         torch.testing.assert_close(mapped, torch.zeros_like(mapped))
+
+        direct = nn.Linear(3, 2, bias=False)
+        before = direct.weight.detach().clone()
+        direct_delta = Adapter.from_state_dict({"weight": torch.ones_like(direct.weight)})
+        with pytest.raises(ValueError, match="requires_grad=False"):
+            merge_adapter(direct, [(direct_delta, 1.0)])
+        torch.testing.assert_close(direct.weight.detach(), before)
 
     def test_external_adapter_copy_failure_precedes_all_writes(self, request) -> None:
         class ViewOnlyAdapter(RegularAdapter):
@@ -3728,7 +3734,9 @@ class TestMergeIntoMappedModel:
         torch.testing.assert_close(source, torch.full_like(source, 2.0))
 
     @pytest.mark.parametrize("always_copy", [False, True], ids=["view", "copy"])
-    def test_registered_dense_adapter_preserves_optimizer_parameter(self, request, always_copy) -> None:
+    def test_registered_dense_adapter_updates_frozen_parameter_and_preserves_owned_identity(
+        self, request, always_copy
+    ) -> None:
         # Implement the public dense-merge protocol by delegation, as a third-party adapter can.
         dense_methods = {
             name: staticmethod(getattr(RegularAdapter, name)) for name in get_protocol_members(DenseMergeTensorAdapter)
@@ -3736,22 +3744,19 @@ class TestMergeIntoMappedModel:
         if always_copy:
             dense_methods["capture_host"] = staticmethod(lambda t: RegularAdapter.capture_host(t.clone()))
         request.addfinalizer(register_adapter(type("ExternalDenseAdapter", (), dense_methods)))
-        model = nn.Sequential(nn.Linear(2, 3, bias=False))
-        weight = model[0].weight = nn.Parameter(torch.zeros(2, 3).T)
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.25)
+        model = nn.Sequential(nn.Linear(2, 3, bias=False)).requires_grad_(False)
+        weight = model[0].weight = nn.Parameter(torch.zeros(2, 3).T, requires_grad=False)
         delta = Adapter.from_state_dict({"0.delta.weight": torch.ones_like(weight)})
 
         merge_adapter(model, [(delta, 1.0)])
-        assert model[0].weight is weight
-        weight.grad = torch.ones_like(weight)
-        optimizer.step()
-        torch.testing.assert_close(model[0].weight, torch.full_like(weight, 0.75))
+        assert (model[0].weight is weight) == (not always_copy)
+        torch.testing.assert_close(model[0].weight, torch.ones_like(weight))
 
     @pytest.mark.parametrize("mapped", [True, False], ids=["mapped", "owned"])
     def test_wrapper_merge_uses_physical_payload(self, request, tmp_path, mapped) -> None:
         class Packed(nn.Parameter):
-            def __new__(cls, payload, requires_grad=False):
-                wrapper = super().__new__(cls, torch.zeros_like(payload), requires_grad)
+            def __new__(cls, payload):
+                wrapper = super().__new__(cls, torch.zeros_like(payload), requires_grad=False)
                 wrapper.payload = payload
                 return wrapper
 
@@ -3769,8 +3774,8 @@ class TestMergeIntoMappedModel:
                 return RegularAdapter.capture_host(t.payload)
 
             @staticmethod
-            def cpu_param(state, *, requires_grad=False):
-                return Packed(state.data, requires_grad)
+            def cpu_param(state):
+                return Packed(state.data)
 
             @staticmethod
             def merge_dense_(target, *args, **kwargs):
@@ -3781,7 +3786,7 @@ class TestMergeIntoMappedModel:
         data = torch.from_file(str(path), shared=True, size=6) if mapped else torch.zeros(6)
         # Normal capture would make the transposed payload contiguous in both cases.
         weight = Packed(data.reshape(2, 3).T)
-        model = nn.Sequential(nn.Linear(2, 3, bias=False))
+        model = nn.Sequential(nn.Linear(2, 3, bias=False)).requires_grad_(False)
         model[0].weight = weight
         delta = Adapter.from_state_dict({"0.delta.weight": torch.ones(3, 2)})
         request.addfinalizer(register_adapter(PackedAdapter))

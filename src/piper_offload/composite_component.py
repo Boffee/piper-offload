@@ -1,7 +1,7 @@
 """Composition of resident, transient, and block components."""
 
 import contextlib
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Self
@@ -121,13 +121,6 @@ class CompositeComponent:
             for component in self._components():
                 stack.callback(component.deactivate)
 
-    @contextlib.contextmanager
-    def optimizer_step(self) -> Generator[None]:
-        with contextlib.ExitStack() as stack:
-            for component in self._components():
-                stack.enter_context(component.optimizer_step())
-            yield
-
 
 @dataclass(frozen=True, slots=True)
 class _ComponentGroups[Host, Blocks]:
@@ -190,23 +183,17 @@ class CompositeComponentStore(_ComponentGroups[HostComponentStore, BlockComponen
         block_paths: Sequence[str] = (),
         transient_block_paths: Sequence[str] = (),
         transient_paths: Sequence[str] = (),
-        include_block_trainables: bool = False,
     ) -> Self:
         return _capture_model(
             model,
             block_paths=block_paths,
             transient_block_paths=transient_block_paths,
             transient_paths=transient_paths,
-            include_block_trainables=include_block_trainables,
         ).as_store(cls)
 
     @property
     def cache_bytes(self) -> int:
         return sum(store.cache_bytes for store in self._entries())
-
-    @property
-    def has_trainables(self) -> bool:
-        return any(store.has_trainables for store in self._entries())
 
     def bind(
         self,
@@ -215,10 +202,25 @@ class CompositeComponentStore(_ComponentGroups[HostComponentStore, BlockComponen
         block_compile: BlockCompileConfig | None = None,
         block_mode: BlockMode = "streaming",
     ) -> CompositeComponent:
-        def bind_block(store: BlockComponentStore, wraparound: bool) -> BlockComponent:
-            return store.bind(model, block_compile=block_compile, block_mode=block_mode, wraparound=wraparound)
-
-        return self._assemble(lambda store: store.bind(model), bind_block)
+        # Validate every resident, transient, and block store before installing
+        # onto any module so rejected binds leave the target model untouched.
+        if self.resident_store is not None:
+            self.resident_store._validate_bind(model)
+        for _path, store in self.transient_stores:
+            store._validate_bind(model)
+        validated_blocks = {
+            id(store): store._validate_bind(model)
+            for store in (*self.block_stores, *self.transient_block_stores)
+        }
+        return self._assemble(
+            lambda store: store._bind_validated(model),
+            lambda store, wraparound: store._bind_validated(
+                validated_blocks[id(store)],
+                block_compile=block_compile,
+                block_mode=block_mode,
+                wraparound=wraparound,
+            ),
+        )
 
 
 type _CapturedHost = tuple[HostComponentStore, HostModuleInstance]
@@ -258,7 +260,6 @@ def _capture_model(
     block_paths: Sequence[str],
     transient_block_paths: Sequence[str],
     transient_paths: Sequence[str],
-    include_block_trainables: bool,
 ) -> _ModelCapture:
     overlap = set(block_paths) & set(transient_block_paths)
     if overlap:
@@ -273,10 +274,23 @@ def _capture_model(
                 f"modules; {path!r} contains repeated module objects."
             )
 
-    def capture_blocks(path: str) -> _CapturedBlocks:
-        return BlockComponentStore._capture(
-            model, blocks_path=path, include_block_trainables=include_block_trainables,
+    # Validate transient paths and frozen preconditions across the whole model
+    # before any capture mutates blocks or parameters.
+    transient_modules = [(path, model.get_submodule(path)) for path in transient_paths]
+    trainable = sorted(
+        name
+        for name, param in model.named_parameters(remove_duplicate=False)
+        if param.requires_grad
+    )
+    if trainable:
+        formatted = ", ".join(repr(name) for name in trainable)
+        raise ValueError(
+            "Piper Offload is inference-only and requires frozen parameters "
+            f"(requires_grad=False); found trainable parameter(s): {formatted}."
         )
+
+    def capture_blocks(path: str) -> _CapturedBlocks:
+        return BlockComponentStore._capture(model, blocks_path=path)
 
     def capture_host(params: set[str], buffers: set[str]) -> _CapturedHost:
         store, instance = HostModuleStore.capture(model, include_param_names=params, include_buffer_names=buffers)
@@ -290,8 +304,7 @@ def _capture_model(
         resident_params -= store.param_names
         resident_buffers -= store.buffer_names
     transient: list[tuple[str, _CapturedHost]] = []
-    for path in transient_paths:
-        module = model.get_submodule(path)
+    for path, module in transient_modules:
         prefix = f"{path}." if path else ""
         selected_params = {f"{prefix}{name}" for name in parameter_names(module)} & resident_params
         selected_buffers = {f"{prefix}{name}" for name in buffer_names(module)} & resident_buffers

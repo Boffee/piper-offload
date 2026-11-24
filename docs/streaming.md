@@ -53,14 +53,13 @@ For multiple lists, use paths such as
 block settings are accepted by `ModelOffloader.from_module()` when you manage
 activation directly.
 
-Blocks within a group must share parameter and buffer names and trainability
-structure. Ordinary streaming supports differing
-shapes, dtypes, quantization formats, alias topology, and buffer layouts within
-that structure. Shared storage is preserved within host state, including tied
-embeddings and output heads, or within one streamed block. Sharing between host
-and streamed state, between streamed blocks, or between block groups is
-unsupported. Use whole-model offloading when those ties must be preserved.
-For custom grouping, see
+Blocks within a group must share parameter and buffer names. Ordinary streaming
+supports differing shapes, dtypes, quantization formats, alias topology, and
+buffer layouts within that structure. Shared storage is preserved within host
+state, including tied embeddings and output heads, or within one streamed block.
+Sharing between host and streamed state, between streamed blocks, or between
+block groups is unsupported. Use whole-model offloading when those ties must be
+preserved. For custom grouping, see
 [`BlockComponentStore`](../src/piper_offload/block_component.py).
 
 The GPU must fit the resident state, block targets, activations, and temporary
@@ -80,9 +79,9 @@ weight copies. It can still use block compilation as described below.
 
 | Mode | CUDA behavior | When to use it |
 |---|---|---|
-| `"streaming"` (default) | Copies whole blocks through an active/lookahead pool. | General streaming, including heterogeneous groups and training. |
+| `"streaming"` (default) | Copies whole blocks through an active/lookahead pool. | General streaming, including heterogeneous groups. |
 | `"resident"` | Loads all block targets at activation. | All weights fit, but per-block compilation or transient group release is useful. |
-| `"rolling"` | Refills one shared target parameter by parameter during compiled computation. | Supported inference workloads needing a smaller weight working set. |
+| `"rolling"` | Refills one shared target parameter by parameter during compiled computation. | Supported workloads needing a smaller weight working set. |
 | `"auto"` | Selects rolling per compatible group with full-graph compilation; otherwise uses streaming. | Try rolling while allowing unsupported groups to stream normally. |
 
 Resident mode creates no prefetch thread, private copy stream, or block
@@ -103,7 +102,7 @@ refills cannot wait; use streaming for blocks that issue collectives.
 
 ### Compile block forwards
 
-Compilation is optional and inference-only. Add one `BlockCompileConfig` to
+Compilation is optional. Add one `BlockCompileConfig` to
 the spec for all declared groups. Using the factory above:
 
 ```python
@@ -142,7 +141,7 @@ disable compilation. See [adapters](adapters.md).
 Compiler errors propagate. Piper does not retry a failed compiled invocation
 eagerly: earlier graph segments may already have executed, and retrying could
 repeat mutations. PyTorch's graph-break and recompilation behavior still
-applies. Compilation with autograd is unsupported.
+applies.
 
 Compiler artifact caches and workspace are outside resource byte accounting;
 model eviction does not reset the process-wide compiler cache.
@@ -217,67 +216,8 @@ the next root forward reacquires that component before running.
 Choose boundaries after which that state is no longer used in the current
 root forward. A transient block group cannot be traversed again later in that
 call, and its module objects must be distinct. Paths must own disjoint state,
-including shared-storage aliases. `ModuleList` and `ModuleDict` entries in
-`transient_paths` are not expanded into child boundaries: the selected module's
-own forward is the release point. Piper does not infer repeated calls,
-functional parameter access, cross-component aliases, or autograd lifetimes.
-These are caller contracts. CPU activation installs no transient scheduling.
-
-## Train streamed blocks
-
-Use eager execution for training. **Every streamed block participating in
-training must use activation checkpointing.** Enable your model's checkpointing
-support or wrap each block call with `torch.utils.checkpoint.checkpoint`.
-Verify that it covers every selected block; Piper does not detect omissions.
-
-Streaming reuses GPU weight storage. Without checkpointing, backward can find
-overwritten weights and raise a version-counter error. With streamed trainable
-parameters, the `.data` swap can instead silently produce incorrect gradients.
-Checkpointing reconstructs each block's graph when its weights are resident
-again for backward.
-
-By default, trainable parameters remain GPU-resident for the activation even
-when their frozen block weights stream. Set `requires_grad` before capture.
-To stream in-block trainable weight data too, pass
-`include_block_trainables=True`.
-
-```python
-from piper_offload import ModelOffloader
-
-# model is a fresh training model with trainable parameters already selected.
-# Its checkpointing support must cover all selected blocks.
-model.gradient_checkpointing_enable()
-model.train()
-offload = ModelOffloader.from_module(
-    model,
-    block_paths=["transformer_blocks"],
-    include_block_trainables=True,
-)
-optimizer = torch.optim.AdamW(p for p in model.parameters() if p.requires_grad)
-
-offload.activate("cuda")
-try:
-    for batch in loader:  # batch tensors are on CUDA
-        loss = offload.value(**batch).loss
-        loss.backward()
-        with offload.optimizer_step():
-            optimizer.step()
-        optimizer.zero_grad()
-finally:
-    offload.deactivate()
-```
-
-Wrap CUDA optimizer updates in `optimizer_step()` whether trainables are
-streamed or resident. It gathers streamed trainable data onto GPU for the
-update and copies updated bytes back to host storage afterward. Those gathered
-weights, gradients, and optimizer state must fit; streaming weights does not
-stream gradients or optimizer state. Gradient clipping, AMP unscaling, and
-`zero_grad()` need not be inside the context.
-
-For an optimizer that runs on CPU, deactivate after backward, then call
-`optimizer.step()` outside the context. Deactivation returns managed trainable
-data and gradients to CPU, so optimizer state can remain there. Use fp32
-trainables for master-weight updates. See
-[`ModelOffloader.optimizer_step`](../src/piper_offload/model_offloader.py)
-for this lifecycle. During CPU activation, or while the offloader is inactive,
-the context moves no data.
+including shared-storage aliases. `ModuleList` and `ModuleDict` entries in `transient_paths` are not expanded
+into child boundaries: the selected module's own forward is the release point.
+Piper does not infer repeated calls, functional parameter access, or
+cross-component aliases. These are caller contracts. CPU activation installs
+no transient scheduling.

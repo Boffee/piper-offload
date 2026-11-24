@@ -1,11 +1,10 @@
 """CUDA execution strategy for compiled single-target parameter rolling."""
 
-import contextlib
 import functools
 import logging
 import math
 import weakref
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 from torch import nn
@@ -305,16 +304,6 @@ class RollingBlockRuntime:
             lease.close()
         self._reset_acquired_state()
 
-    @contextlib.contextmanager
-    def optimizer_step(self) -> Generator[None]:
-        if not self.acquired:
-            raise RuntimeError(
-                "BlockComponent.optimizer_step() called while its CUDA "
-                "working set is released. Acquire the component before "
-                "entering the optimizer step."
-            )
-        yield
-
 
 def _validate_instance(
     instance: HostModuleInstance,
@@ -322,8 +311,6 @@ def _validate_instance(
     reference_layouts: tuple[tuple[object, object], ...],
 ) -> None:
     params = instance.params
-    if instance.has_trainables:
-        raise NotImplementedError("rolling compilation is inference-only")
     if instance.buffers:
         raise NotImplementedError("rolling compilation does not yet support block buffers")
     if tuple(params) != param_names:

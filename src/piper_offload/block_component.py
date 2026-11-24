@@ -1,4 +1,4 @@
-"""Block-residency primitive for memory-efficient training and inference.
+"""Block-residency primitive for memory-efficient inference.
 
 A :class:`BlockComponentStore` manages reusable CPU backing
 storage for a single structurally compatible block list.
@@ -18,25 +18,14 @@ parameter or buffer *names*, e.g. Flux's two block kinds — must split
 into multiple :class:`BlockComponent` instances composed via
 :class:`ModelOffloader`.
 
-In-block trainable params (LoRA adapters) flow through the same target
-pool; host module instances branch on the source trainable flag to swap
-``.data`` (preserves user Parameter identity for autograd / optimizer
-state) instead of replacing the Parameter wrapper. Gradients live on GPU
-during backward via PyTorch's native ``AccumulateGrad``; only ``.data``
-is materialized around ``optimizer.step()`` via :meth:`optimizer_step`.
-
 This is the sharp, low-level primitive. It does NOT manage:
 
 - Non-block parts of the model (parent-module state, sibling
   modules) — caller derives :class:`HostComponent` include-name sets
   by excluding the block component's owned names.
-- Out-of-block trainable parameter movement — caller handles that
-  alongside non-streamed parameters, usually with :class:`HostComponent`.
 - Shared storage with tensors outside the block list — caller
   must choose a valid composition; use whole-model
   :class:`HostComponent` if sharing must be preserved.
-- Activation-checkpointing enforcement — the caller must checkpoint every
-  streamed block participating in training, including with ModelOffloader.
 
 Most users want :class:`ModelOffloader` (the blessed safe API). Reach for
 :class:`BlockComponentStore` / :class:`BlockComponent` directly only
@@ -81,7 +70,7 @@ def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
     # refcount-based GC of a block component can't release on its own. Without
     # this, freed GPU pages stay held by the allocator until the
     # next allocation pressure event, which manifests as OOMs at
-    # workload boundaries (e.g. successive trainers in one process).
+    # workload boundaries (e.g. successive workloads in one process).
     # ``empty_cache()`` is process-global (not per-device), so a single
     # bool is the right abstraction — capturing the device object would
     # imply per-device scoping that PyTorch doesn't actually provide.
@@ -208,50 +197,55 @@ class BlockComponentStore:
         model: nn.Module,
         *,
         blocks_path: str,
-        include_block_trainables: bool = False,
     ) -> Self:
         """Resolve ``blocks_path`` on ``model`` and capture its managed blocks.
 
         Structurally-empty positions (no parameters or buffers) are skipped and
-        dropped from :attr:`block_indices`. Surviving blocks must agree on
-        managed parameter names and trainability, and on buffer names.
+        dropped from :attr:`block_indices`. Requires frozen parameters
+        (``requires_grad=False``). Surviving blocks must agree on parameter
+        names and buffer names.
         """
-        store, _ = cls._capture(
-            model, blocks_path=blocks_path, include_block_trainables=include_block_trainables,
-        )
+        store, _ = cls._capture(model, blocks_path=blocks_path)
         return store
 
     @classmethod
     def _capture(
-        cls, model: nn.Module, *, blocks_path: str, include_block_trainables: bool,
+        cls, model: nn.Module, *, blocks_path: str,
     ) -> tuple[Self, tuple[HostModuleInstance, ...]]:
         # Validate every block before capture mutates the first. The schema
-        # holds names and booleans only, so each block's original tensors can
-        # be reclaimed as soon as its host backing is installed.
+        # holds names only, so each block's original tensors can be reclaimed as
+        # soon as its host backing is installed.
         blocks = _resolve_blocks(model, blocks_path)
         indices: list[int] = []
-        params: dict[str, bool] = {}
+        params: set[str] = set()
         buffers: set[str] = set()
         for idx, block in enumerate(blocks):
-            all_params = {name: p.requires_grad for name, p in block.named_parameters(remove_duplicate=False)}
+            trainable = sorted(
+                name
+                for name, p in block.named_parameters(remove_duplicate=False)
+                if p.requires_grad
+            )
+            if trainable:
+                raise ValueError(
+                    "Piper Offload is inference-only and requires frozen parameters "
+                    f"(requires_grad=False); block {idx} at {blocks_path!r} has "
+                    f"trainable parameter(s): {trainable!r}."
+                )
+            block_params = {name for name, _ in block.named_parameters(remove_duplicate=False)}
             block_buffers = {name for name, _ in block.named_buffers(remove_duplicate=False)}
-            if not all_params and not block_buffers:
+            if not block_params and not block_buffers:
                 continue
-            selected = {name: grad for name, grad in all_params.items() if include_block_trainables or not grad}
             if indices:
-                if selected.keys() != params.keys():
-                    difference = sorted(selected.keys() ^ params.keys())
+                if block_params != params:
+                    difference = sorted(block_params ^ params)
                     raise ValueError(
-                        f"Block {idx} selected parameter names differ from block {indices[0]}: {difference}."
+                        f"Block {idx} parameter names differ from block {indices[0]}: {difference}."
                     )
                 if block_buffers != buffers:
                     difference = sorted(block_buffers ^ buffers)
-                    raise ValueError(f"Block {idx} selected buffer names differ from block {indices[0]}: {difference}.")
-                if selected != params:
-                    difference = [name for name in params if selected[name] != params[name]]
-                    raise ValueError(f"Block {idx} requires_grad differs from block {indices[0]} for {difference}.")
+                    raise ValueError(f"Block {idx} buffer names differ from block {indices[0]}: {difference}.")
             else:
-                params, buffers = selected, block_buffers
+                params, buffers = block_params, block_buffers
             indices.append(idx)
         if not indices:
             raise ValueError(
@@ -308,30 +302,11 @@ class BlockComponentStore:
     def cache_bytes(self) -> int:
         return sum(store.cache_bytes for store in self._block_stores)
 
-    @property
-    def has_trainables(self) -> bool:
-        return any(store.has_trainables for store in self._block_stores)
-
     def resolve_blocks(self, model: nn.Module) -> list[nn.Module]:
         """Resolve this store's blocks path on ``model``."""
         return _resolve_blocks(model, self.blocks_path)
 
-    def bind(
-        self,
-        model: nn.Module,
-        *,
-        block_compile: BlockCompileConfig | None = None,
-        wraparound: bool = True,
-        block_mode: BlockMode = "streaming",
-    ) -> BlockComponent:
-        """Bind this store's per-block backing bytes to ``model``.
-
-        Each instance owns and is installed onto its model block; loads repoint
-        the instance's own module onto the filled target, and that block's
-        forward triggers its streaming. ``model`` must have a block at every
-        occupied :attr:`block_indices` position. Non-empty blocks outside those
-        positions are rejected because they would be silently unmanaged.
-        """
+    def _validate_bind(self, model: nn.Module) -> list[nn.Module]:
         last = self.block_indices[-1]
         bind_blocks = self.resolve_blocks(model)
         if last >= len(bind_blocks):
@@ -350,10 +325,46 @@ class BlockComponentStore:
                 "those blocks would never be moved or streamed. Bind a model "
                 "whose only non-empty blocks are the occupied ones."
             )
+        for store, idx in zip(self._block_stores, self.block_indices, strict=True):
+            store._validate_bind(bind_blocks[idx])
+        return bind_blocks
+
+    def _bind_validated(
+        self,
+        bind_blocks: Sequence[nn.Module],
+        *,
+        block_compile: BlockCompileConfig | None = None,
+        wraparound: bool = True,
+        block_mode: BlockMode = "streaming",
+    ) -> BlockComponent:
         instances = [
-            store.bind(bind_blocks[idx]) for store, idx in zip(self._block_stores, self.block_indices, strict=True)
+            store._install(bind_blocks[idx]) for store, idx in zip(self._block_stores, self.block_indices, strict=True)
         ]
         return self._component(instances, block_compile=block_compile, wraparound=wraparound, block_mode=block_mode)
+
+    def bind(
+        self,
+        model: nn.Module,
+        *,
+        block_compile: BlockCompileConfig | None = None,
+        wraparound: bool = True,
+        block_mode: BlockMode = "streaming",
+    ) -> BlockComponent:
+        """Bind this store's per-block backing bytes to ``model``.
+
+        Each instance owns and is installed onto its model block; loads repoint
+        the instance's own module onto the filled target, and that block's
+        forward triggers its streaming. ``model`` must have a block at every
+        occupied :attr:`block_indices` position. Non-empty blocks outside those
+        positions are rejected because they would be silently unmanaged.
+        """
+        bind_blocks = self._validate_bind(model)
+        return self._bind_validated(
+            bind_blocks,
+            block_compile=block_compile,
+            wraparound=wraparound,
+            block_mode=block_mode,
+        )
 
     def _component(
         self,
@@ -386,11 +397,7 @@ class BlockComponent:
     streams them to CUDA via forward-pre hooks on :meth:`activate`; with
     resident mode loads every block once and installs no scheduling hooks.
     CPU activation is pass-through over that host-backed state:
-    no pool, no hooks, no copies. Frozen params use parameter
-    replacement; trainable params keep Parameter identity and swap only
-    ``.data``.
-    Does not touch parent modules, sibling modules, or out-of-block
-    trainable parameters — those are the composer's responsibility.
+    no pool, no hooks, no copies.
 
     A :class:`BlockComponent` is a *component* meant to be composed
     inside a :class:`~piper_offload.model_offloader.ModelOffloader`.
@@ -438,10 +445,6 @@ class BlockComponent:
         :attr:`param_names` and activation parameter overrides use names like
         ``"blocks.3.weight"``. When omitted, standalone components use
         ``"3.weight"``.
-        Trainable streaming requires activation checkpointing on every
-        block (the ``.data`` swap bypasses autograd's version-counter
-        check). Neither the component nor :class:`ModelOffloader` enforces
-        that precondition; the caller supplies checkpointing.
     block_indices:
         True block index for each instance, used to NAME its params/buffers
         (so a sparse group addresses ``"blocks.2.weight"`` not the compact
@@ -495,8 +498,7 @@ class BlockComponent:
             eager_runtime: BlockRuntime = ResidentBlockRuntime(self._block_instances)
             self._block_mode: BlockMode = "resident"
         elif block_mode in ("streaming", "rolling", "auto"):
-            # Streaming construction can move gradients to CPU. Check rolling
-            # support first so a rejected strict request leaves them in place.
+            # Check rolling support before constructing the streaming runtime.
             if block_mode != "streaming" and fullgraph:
                 try:
                     rolling = create_rolling_block_runtime(self._block_instances, wraparound=wraparound)
@@ -534,7 +536,6 @@ class BlockComponent:
         )
         self._param_names = frozenset(self._param_name_to_block_param)
         self._buffer_names = _block_buffer_names(self._block_instances, name, block_indices)
-        self._optimizer_step_active = False
 
         # Auto-flush the CUDA allocator cache when the component is GC'd,
         # so callers don't need to remember an explicit empty_cache() at
@@ -582,10 +583,6 @@ class BlockComponent:
         return self._buffer_names
 
     @property
-    def has_trainables(self) -> bool:
-        return any(instance.has_trainables for instance in self._block_instances)
-
-    @property
     def failed(self) -> bool:
         """Whether a prior session left its working set unreleased.
 
@@ -625,7 +622,7 @@ class BlockComponent:
         tears down whatever was allocated."""
         # Hard-guard against the documented "don't activate twice"
         # case. Without this, a double-activate would double-install
-        # forward-pre hooks (silent grad doubling) and stack a second
+        # forward-pre hooks and stack a second
         # target pool on top of an active one.
         if self._active_device is not None:
             raise RuntimeError(
@@ -836,66 +833,6 @@ class BlockComponent:
             yield
         finally:
             self.deactivate()
-
-    # ------------------------------------------------------------------
-    # Optimizer-step boundary
-    # ------------------------------------------------------------------
-
-    @contextlib.contextmanager
-    def optimizer_step(self) -> Generator[None]:
-        """Materialize streamed trainables around an optimizer step.
-
-        On CUDA activation, trainables are on the GPU for the step and their
-        updated bytes return to host storage on exit. On CPU activation, or
-        while inactive, they are already in host storage, so this is a
-        guarded no-op. Nested entry raises in every case.
-        """
-        if self._optimizer_step_active:
-            # Rejected in every mode for one contract. Streaming is where it
-            # matters: the outer step's copy-back would write its stale bytes
-            # over the nested step's update.
-            raise RuntimeError("BlockComponent.optimizer_step() does not support reentrant entry.")
-        self._optimizer_step_active = True
-        try:
-            runtime = self._active_runtime
-            if runtime is None:
-                yield
-            elif self._block_mode != "resident" or not any(
-                instance.has_trainables for instance in self._block_instances
-            ):
-                # The session lease already covers the trainables streaming
-                # copies back, and a frozen resident group copies nothing back.
-                with runtime.optimizer_step():
-                    yield
-            else:
-                active_device = self._active_device
-                assert active_device is not None, "set with the runtime"
-                # The copy-back writes host storage once per step; lease it
-                # pageable, for the copy-back only.
-                self._transfer.start(
-                    host_pin_manager,
-                    (
-                        tensor
-                        for instance in self._block_instances
-                        for tensor in instance.trainable_storage_tensors()
-                    ),
-                    active_device,
-                )
-                try:
-                    with runtime.optimizer_step():
-                        yield
-                except BaseException:
-                    # The copy-back may still be in flight; a failed
-                    # synchronization keeps the lease for release() to retry.
-                    self._transfer.finish()
-                    raise
-                self._transfer.close()  # the runtime synchronized its copy-back stream
-        finally:
-            self._optimizer_step_active = False
-
-    def gather_for_step(self) -> contextlib.AbstractContextManager[None]:
-        """Backward-compatible alias for :meth:`optimizer_step`."""
-        return self.optimizer_step()
 
 
 __all__ = [

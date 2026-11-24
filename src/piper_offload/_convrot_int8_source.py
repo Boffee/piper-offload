@@ -32,20 +32,12 @@ class ConvRotInt8SourceAdapter:
     """The source format's name in error messages, such as ``"packed GGUF"``."""
 
     @classmethod
-    def _require_frozen(cls, requires_grad: bool) -> None:
-        if requires_grad:
-            raise ValueError(f"{cls._SOURCE_NAME} parameters are inference-only")
-
-    @classmethod
     def gpu_param(
         cls,
         host: object,
         gpu_state: _TargetState,
-        *,
-        requires_grad: bool = False,
     ) -> nn.Parameter:
-        del host
-        cls._require_frozen(requires_grad)
+        del cls, host
         return nn.Parameter(gpu_state.target, requires_grad=False)
 
     @classmethod

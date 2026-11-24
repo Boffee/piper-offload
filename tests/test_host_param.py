@@ -280,37 +280,31 @@ class TestHostBuffer:
 
 
 # ---------------------------------------------------------------------------
-# requires_grad propagation through the wrapper builders
+# Frozen-only contract
 # ---------------------------------------------------------------------------
 
 
-class TestRequiresGradPropagation:
-    """The host parameter captures the source param's ``requires_grad`` at
-    construction time and threads it through to ``make_cpu_param`` /
-    ``gpu_param``. Frozen sources get historic ``requires_grad=False``
-    wrappers; trainable sources get ``True`` wrappers so consumers
-    that DO use the wrapper objects (rather than ``.data``-swapping)
-    see the right autograd flag."""
+class TestFrozenContract:
+    """HostParam captures frozen parameters (``requires_grad=False``) only
+    and yields frozen wrappers from ``make_cpu_param`` / ``make_gpu_param``."""
+
+    def test_rejects_trainable_parameter(self) -> None:
+        source = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=True)
+
+        with pytest.raises(ValueError, match="requires_grad=False"):
+            HostParam(source)
+
+    def test_project_dtensor_rejects_trainable_target(self) -> None:
+        source = HostParam(nn.Parameter(torch.randn(4, 4), requires_grad=False))
+        target = nn.Parameter(torch.empty(4, 4), requires_grad=True)
+
+        with pytest.raises(ValueError, match="requires_grad=False"):
+            HostParam.project_dtensor(source, target)
 
     def test_frozen_source_yields_frozen_cpu_param(self) -> None:
         p = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         host_param = HostParam(p)
-        assert host_param.requires_grad is False
         assert host_param.make_cpu_param().requires_grad is False
-
-    def test_trainable_source_yields_trainable_cpu_param(self) -> None:
-        p = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=True)
-        host_param = HostParam(p)
-        assert host_param.requires_grad is True
-        assert host_param.make_cpu_param().requires_grad is True
-
-    @CUDA
-    def test_trainable_source_yields_trainable_gpu_param(self) -> None:
-        p = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=True)
-        host_param = HostParam(p)
-        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
-        gpu_param = host_param.make_gpu_param(gpu_state)
-        assert gpu_param.requires_grad is True
 
     @CUDA
     def test_frozen_source_yields_frozen_gpu_param(self) -> None:
@@ -320,93 +314,14 @@ class TestRequiresGradPropagation:
         gpu_param = host_param.make_gpu_param(gpu_state)
         assert gpu_param.requires_grad is False
 
-
-# ---------------------------------------------------------------------------
-# copy_to_cpu — D2H counterpart to copy_to_gpu
-# ---------------------------------------------------------------------------
-
-
-class TestCopyToCpu:
-    """Symmetric D2H of GPU contents back into the host state.
-    Used at the optimizer-step boundary in trainable streaming: GPU
-    weights got updated in place by ``optimizer.step()``, scatter the
-    update back to the host clone so the next H2D reads it."""
-
-    @CUDA
-    def test_regular_round_trip(self) -> None:
-        p = nn.Parameter(torch.randn(16, dtype=torch.bfloat16), requires_grad=False)
-        original = p.data.clone()
-        host_param = HostParam(p)
-        device = torch.device("cuda")
-        gpu_state = host_param.allocate_gpu_storage(device)
-        host_param.copy_to_gpu(gpu_state, non_blocking=True)
-        torch.cuda.synchronize()
-
-        # Mutate GPU side as if optimizer.step had run there.
-        new_vals_gpu = torch.randn(16, dtype=torch.bfloat16, device=device)
-        gpu_state.data.copy_(new_vals_gpu)
-        torch.cuda.synchronize()
-
-        # D2H should overwrite the host state with the new GPU contents.
-        host_param.copy_to_cpu(gpu_state, non_blocking=True)
-        torch.cuda.synchronize()
-        assert torch.equal(host_param.host_state.data, new_vals_gpu.cpu())
-        # The host state has actually changed from the original.
-        assert not torch.equal(host_param.host_state.data, original)
-
-    @CUDA
-    def test_regular_host_tensor_identity_preserved(self) -> None:
-        # The host buffer stays at the same address after D2H —
-        # we're overwriting in place, not allocating a new tensor.
-        # Callers that hold CPU Parameter wrapper references rely on this.
-        p = nn.Parameter(torch.randn(16, dtype=torch.bfloat16), requires_grad=True)
-        host_param = HostParam(p)
-        original_ptr = host_param.host_state.data.data_ptr()
-        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
-        host_param.copy_to_gpu(gpu_state)
-        host_param.copy_to_cpu(gpu_state)
-        torch.cuda.synchronize()
-        assert host_param.host_state.data.data_ptr() == original_ptr
-
-    @CUDA
-    def test_gguf_lacks_cpu_round_trip_capability(self) -> None:
-        # GGUF stores packed source bytes on CPU but a different ConvRot
-        # representation on GPU. D2H would require a reverse conversion,
-        # which isn't implemented. Surface it as NotImplementedError, not a
-        # silent corruption of the host packed bytes.
-        from tests._gguf_helpers import GGUFParameter
-
-        # Build minimal GGUF state directly via the adapter — avoids
-        # needing a real .gguf file to load. Q4_0 has the simplest
-        # block layout and is broadly supported.
-        # Q4_0 packs 32 fp16 weights into an 18-byte block (2 scale + 16 quants).
-        packed = torch.zeros((1, 36), dtype=torch.uint8)
-        gguf_t = GGUFParameter(packed, quant_type=2)
-        host_param = HostParam(gguf_t)
-        gpu_state = host_param.allocate_gpu_storage(torch.device("cuda"))
-        with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            host_param.copy_to_cpu(gpu_state)
-
-
-class TestTrainableMappedCapture:
-    def test_trainable_view_into_a_mapping_is_copied_out(self, tmp_path: Path) -> None:
+    def test_frozen_view_into_mapping_retains_mapping(self, tmp_path: Path) -> None:
         path = tmp_path / "weights.bin"
         path.write_bytes(bytes(24 * 4))
         mapped = torch.from_file(str(path), shared=False, size=24, dtype=torch.float32)
         mapped.copy_(torch.arange(24, dtype=torch.float32))
         frozen = nn.Parameter(mapped[:12].reshape(3, 4), requires_grad=False)
-        trainable = nn.Parameter(mapped[12:].reshape(3, 4), requires_grad=True)
-        expected = trainable.detach().clone()
 
         (frozen_host,) = HostParam(frozen).storage_tensors()
-        (trainable_host,) = HostParam(trainable).storage_tensors()
 
-        # The frozen view keeps the mapping; the trainable one owns its bytes,
-        # so the pin manager may return the mapping's pages to the file.
         assert frozen_host.untyped_storage().data_ptr() == mapped.untyped_storage().data_ptr()
         assert not frozen_host.untyped_storage().resizable()
-        assert trainable_host.untyped_storage().data_ptr() != mapped.untyped_storage().data_ptr()
-        assert trainable_host.untyped_storage().resizable()
-        assert trainable.data_ptr() == trainable_host.data_ptr()
-        assert trainable.requires_grad
-        torch.testing.assert_close(trainable.detach(), expected)

@@ -2,7 +2,7 @@
 
 Piper's tensor adapters manage capture, movement, and reconstruction of each
 supported weight representation. Offloading a format does not imply that it
-supports training or additive updates. See [adapters](adapters.md) for applying
+supports additive updates. See [adapters](adapters.md) for applying
 LoRA, deltas, and complete values, [streaming](streaming.md) for execution modes,
 and the [README](../README.md) for the starting point.
 
@@ -55,13 +55,7 @@ stochastic rounding. See [adapter rounding](adapters.md#choose-merge-or-routed-l
 for configuration and reproducibility. Backend selection is documented with
 each format's adapter.
 
-## Training and layout limits
-
-Quantized weights stay frozen. Only plain tensors support training. Both scaled
-FP8 adapters support copying device state back to CPU. Other quantized adapters
-and DTensor provide inference movement and the merges listed above. Separate
-plain trainable parameters can coexist with a frozen quantized base; follow
-the [training guidance](streaming.md).
+## Layout limits
 
 Transposed MX and NVFP4 packed targets cannot be re-encoded into their existing
 storage; use routed LoRA. Scaled FP8 supports transposed per-row and per-tensor

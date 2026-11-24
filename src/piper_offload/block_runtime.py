@@ -1,6 +1,5 @@
 """Shared contract for CUDA block-residency runtimes."""
 
-import contextlib
 from collections.abc import Sequence
 from typing import Protocol
 
@@ -62,16 +61,6 @@ class BlockRuntime(Protocol):
         start. Once ``acquired`` is false, no queued operation may still read
         any source in the activation load plans, and no block points at a
         released target.
-        """
-        ...
-
-    def optimizer_step(self) -> contextlib.AbstractContextManager[None]:
-        """Keep trainables on the GPU for one optimizer step, then copy their updated bytes to host storage.
-
-        A streaming runtime loads them for the step; a resident one already
-        holds them. Requires :attr:`acquired`. The owning
-        :class:`BlockComponent` rejects nested entry, so runtimes do not
-        check for it.
         """
         ...
 

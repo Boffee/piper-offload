@@ -114,17 +114,6 @@ class TestInt4TilePackedAdapter:
             nn.Parameter(qt, requires_grad=False),
         ) == _param_target_layout(nn.Parameter(other, requires_grad=False))
 
-    def test_no_cpu_round_trip_or_trainable_swap_capability(self) -> None:
-        host_param = HostParam(
-            nn.Parameter(_make_int4_tile(), requires_grad=True),
-        )
-        state = host_param.allocate_gpu_storage(torch.device("cpu"))
-
-        with pytest.raises(NotImplementedError, match="CPU round-trip"):
-            host_param.copy_to_cpu(state)
-        with pytest.raises(NotImplementedError, match="Parameter.data-swap"):
-            host_param.validate_parameter_data_swap_target()
-
     def test_exact_parameter_value_accepts_format_without_dense_merge(self) -> None:
         value = ParameterValue.from_tensor(_make_int4_tile())
 

@@ -151,7 +151,7 @@ class TestLifecycle:
 class TestConstruction:
     def test_rejects_trainable_param(self) -> None:
         model = nn.Linear(4, 4)
-        with pytest.raises(ValueError, match="cannot manage trainable parameter"):
+        with pytest.raises(ValueError, match="requires_grad=False"):
             MpsWeights(model)
 
     def test_rejects_empty_model(self) -> None:

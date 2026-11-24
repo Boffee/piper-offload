@@ -4,9 +4,9 @@ The prototype static FP8 representation is deliberately separate from
 :class:`~piper_offload.float8_adapter.Float8Adapter`: TorchAO's regular
 ``Float8Tensor`` owns dynamic/weight-only metadata, while
 ``PrototypeFloat8Tensor`` additionally owns a checkpoint-calibrated
-``act_quant_scale``.  This adapter keeps all three storage tensors
+``act_quant_scale``. This adapter keeps all three storage tensors
 (``qdata``, weight ``scale``, and ``act_quant_scale``) quantized and intact
-through capture, block streaming, cache reuse, and lossless CPU round trips.
+through capture, block streaming, and cache reuse.
 
 CUDA LoRA updates use a format-specific Triton merge when available, with a
 pure-Torch dequantize/GEMM/requantize fallback. Both recompute only the weight
@@ -31,12 +31,7 @@ from ._torchao_static_float8 import (
     validate_layout,
 )
 from .tensor_adapters import metadata_key
-from .torchao_structured_adapter import (
-    TorchaoGpu,
-    TorchaoHost,
-    TorchaoStructuredAdapter,
-    copy_storage,
-)
+from .torchao_structured_adapter import TorchaoStructuredAdapter
 
 try:
     from ._triton_static_float8_lora import (
@@ -196,16 +191,6 @@ class StaticFloat8Adapter(TorchaoStructuredAdapter[_StaticFloat8Meta]):
         return t.dtype
 
     # --- capabilities beyond inference movement -------------------------
-
-    @staticmethod
-    def copy_to_cpu(
-        src: TorchaoGpu,
-        dst: TorchaoHost[_StaticFloat8Meta],
-        *,
-        non_blocking: bool = False,
-    ) -> None:
-        # All three GPU tensors use the identical representation on CPU.
-        copy_storage(src.storage, dst.storage, non_blocking=non_blocking)
 
     @staticmethod
     def dequantize(t: torch.Tensor) -> torch.Tensor:

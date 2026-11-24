@@ -129,28 +129,29 @@ class HostModuleStore:
             include_buffer_names,
         )
 
+        trainable = sorted(name for name, p in params.items() if p.requires_grad)
+        if trainable:
+            raise ValueError(
+                "Piper Offload is inference-only and requires frozen parameters "
+                f"(requires_grad=False); found trainable parameter(s): {_format_names(trainable)}."
+            )
+
         store = cls(
             params=_capture_params(params),
             buffers=_capture_buffers(buffers),
         )
-        _validate_trainable_param_data_swaps(store.params)
         return store, store._install(module)
 
     @property
     def cache_bytes(self) -> int:
         return _unique_cache_bytes(self.params) + _unique_cache_bytes(self.buffers)
 
-    @property
-    def has_trainables(self) -> bool:
-        return bool(self.trainable_param_names)
-
-    @property
-    def trainable_param_names(self) -> tuple[str, ...]:
-        return tuple(name for name, host in self.params.items() if host.requires_grad)
+    def _validate_bind(self, module: nn.Module) -> None:
+        _validate_module_matches(self.params, self.buffers, module)
 
     def bind(self, module: nn.Module) -> HostModuleInstance:
         """Validate a compatible module and install this store's backing on it."""
-        _validate_module_matches(self.params, self.buffers, module)
+        self._validate_bind(module)
         return self._install(module)
 
     def _install(self, module: nn.Module) -> HostModuleInstance:
@@ -168,24 +169,15 @@ class HostModuleInstance:
     """One concrete module bound to host parameter and buffer backings.
 
     Owns the :class:`nn.Module` whose managed params and buffers are backed by
-    this instance's host bytes, including trainable target-to-host
-    synchronization. :meth:`resolve_load_plan` combines activation-scoped
-    overrides with immutable model backing; the resulting plan owns target
-    allocation and loading. :meth:`install_host` restores the host
+    this instance's host bytes. :meth:`resolve_load_plan` combines
+    activation-scoped overrides with immutable model backing; the resulting plan
+    owns target allocation and loading. :meth:`install_host` restores the host
     bytes onto :attr:`module`.
     """
 
     module: nn.Module
     params: Mapping[str, HostParam]
     buffers: Mapping[str, HostBuffer]
-
-    @property
-    def has_trainables(self) -> bool:
-        return bool(self.trainable_param_names)
-
-    @property
-    def trainable_param_names(self) -> tuple[str, ...]:
-        return tuple(name for name, host in self.params.items() if host.requires_grad)
 
     def install_host(self) -> None:
         """Install the host bytes onto :attr:`module`'s attributes.
@@ -254,67 +246,6 @@ class HostModuleInstance:
                 parameters[name] = load
         return HostModuleLoadPlan(self, parameters)
 
-    def copy_trainables_from_target(
-        self,
-        target: HostModuleTarget,
-        *,
-        non_blocking: bool = False,
-    ) -> None:
-        """Copy trainable target params back into host storage.
-
-        This is the explicit host-cache mutation path for optimizer-step
-        sync. Frozen params and buffers are intentionally not copied back.
-        """
-        _validate_target_names_known(self.params, self.buffers, target)
-        _validate_target_has_trainable_params(self.params, target)
-        _copy_trainable_params_from_target(
-            self.params,
-            target.param_targets,
-            non_blocking=non_blocking,
-        )
-
-    def move_trainable_grads_to(self, device: torch.device) -> None:
-        """Move each trainable param's ``.grad`` (if any) to ``device``.
-
-        During backward, PyTorch's native ``AccumulateGrad`` writes grads on
-        the param's data device. As ``.data`` is moved between CPU and
-        a GPU target, ``.grad`` keeps living wherever ``AccumulateGrad`` placed
-        it; this realigns grad with data so the optimizer reads both on the
-        same device. Tied params are deduplicated, and ``None`` grads (no
-        backward yet, or ``zero_grad(set_to_none=True)``) are skipped.
-        """
-        for param in self._iter_trainable_params():
-            grad = param.grad
-            if grad is None or grad.device == device:
-                continue
-            moved = grad.to(device)
-            if param.data.device == device:
-                param.grad = moved
-            else:
-                # PyTorch's grad setter rejects cross-device grad/data pairs.
-                # A trainable can transiently have offloaded (CPU) data
-                # and a GPU grad, so move the grad storage in place instead.
-                grad.data = moved.data
-
-    def _iter_trainable_params(self) -> Iterator[nn.Parameter]:
-        params = dict(self.module.named_parameters(remove_duplicate=False))
-        seen: set[int] = set()
-        for name, host in self.params.items():
-            if not host.requires_grad:
-                continue
-            param = params[name]
-            param_id = id(param)
-            if param_id in seen:
-                continue
-            seen.add(param_id)
-            yield param
-
-    def trainable_storage_tensors(self) -> Iterator[torch.Tensor]:
-        """Host destinations for optimizer copy-back, including tied storage."""
-        for host in self.params.values():
-            if host.requires_grad:
-                yield from host.storage_tensors()
-
 
 @dataclass(frozen=True, slots=True, init=False)
 class HostModuleLoadPlan:
@@ -355,10 +286,9 @@ class HostModuleLoadPlan:
         return {name: load.source for name, load in self.loads.items()}
 
     def storage_tensors(self) -> Iterator[torch.Tensor]:
-        """Host transfer sources and optimizer backing, without alias deduplication.
+        """Host transfer sources without alias deduplication.
 
-        Replacements supersede frozen sources; optimizer steps still write
-        the instance's own trainable storage. The pin manager deduplicates
+        Replacements supersede base sources; the pin manager deduplicates
         aliases and whole storage allocations.
         """
         for load in self.loads.values():
@@ -367,17 +297,6 @@ class HostModuleLoadPlan:
                 yield from load.update.storage_tensors()
         for buffer in self.instance.buffers.values():
             yield from buffer.storage_tensors()
-        yield from self.instance.trainable_storage_tensors()
-
-    def select_parameters(
-        self,
-        names: Iterable[str],
-    ) -> HostModuleLoadPlan:
-        """Return a plan containing only the requested active parameters."""
-        return HostModuleLoadPlan(
-            self.instance,
-            _select_known_names(self.loads, names),
-        )
 
     def allocate_target(
         self,
@@ -456,7 +375,6 @@ def _capture_params(
         params.keys(),
         lambda name: param_tensor_id(params[name]),
     ):
-        validate_tied_parameter_trainability(names, params)
         host = HostParam(params[names[0]])
         for name in names:
             host_by_name[name] = host
@@ -522,10 +440,9 @@ def _validate_module_matches(
 
     for name, host in host_params.items():
         param = params[name]
-        if param.requires_grad != host.requires_grad:
+        if param.requires_grad:
             raise ValueError(
-                f"Param {name!r} requires_grad mismatch: store has "
-                f"{host.requires_grad}, module has {param.requires_grad}."
+                f"Param {name!r} must be frozen (requires_grad=False)."
             )
         if host.accepts_bind_target(param):
             continue
@@ -569,18 +486,6 @@ def _validate_module_matches(
             )
 
 
-def _validate_target_has_trainable_params(
-    params: Mapping[str, HostParam],
-    target: HostModuleTarget,
-) -> None:
-    trainable_params = _trainable_params(params)
-    expected_names = set(trainable_params)
-    actual_names = set(target.param_targets)
-    missing = sorted(expected_names - actual_names)
-    if missing:
-        raise ValueError(f"HostModuleTarget trainable param target names mismatch: missing {_format_names(missing)}.")
-
-
 def _validate_target_names_known(
     params: Mapping[str, HostParam],
     buffers: Mapping[str, HostBuffer],
@@ -597,35 +502,6 @@ def _validate_target_names_known(
     if extra_buffers:
         details.append(f"buffers {_format_names(extra_buffers)}")
     raise ValueError(f"HostModuleTarget contains entries outside the store: {'; '.join(details)}.")
-
-
-def validate_tied_parameter_trainability(
-    names: Iterable[str],
-    params: Mapping[str, nn.Parameter],
-) -> None:
-    """A shared replacement parameter can carry only one requires_grad flag."""
-    names = list(names)
-    requires_grad = {params[name].requires_grad for name in names}
-    if len(requires_grad) <= 1:
-        return
-    raise ValueError(f"Cannot replace tied parameters with mixed requires_grad: {_format_names(names)}.")
-
-
-def _validate_trainable_param_data_swaps(
-    params: Mapping[str, HostParam],
-) -> None:
-    seen: set[int] = set()
-    for name, host in params.items():
-        if not host.requires_grad:
-            continue
-        key = id(host)
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            host.validate_parameter_data_swap_target()
-        except NotImplementedError as exc:
-            raise NotImplementedError(f"Trainable param {name!r} cannot use Parameter.data swap: {exc}") from exc
 
 
 def _validate_names_present(
@@ -683,11 +559,6 @@ def _resolve_parameter_load(
             f"Parameter load source shape mismatch for {name!r}: source has "
             f"{source.logical_shape}, model slot has {base.logical_shape}."
         )
-    if source.requires_grad != base.requires_grad:
-        raise ValueError(
-            f"Parameter load source requires_grad mismatch for {name!r}: "
-            f"source has {source.requires_grad}, model slot has {base.requires_grad}."
-        )
     return ParameterLoad(source, override.update)
 
 
@@ -735,12 +606,6 @@ def _allocate_param_targets(
 def _validate_cuda_device(device: torch.device) -> None:
     if device.type != "cuda":
         raise ValueError(f"HostModuleTarget requires a CUDA device; got {device}.")
-
-
-def _trainable_params(
-    params: Mapping[str, HostParam],
-) -> dict[str, HostParam]:
-    return {name: host for name, host in params.items() if host.requires_grad}
 
 
 def _allocate_buffer_targets(
@@ -814,23 +679,6 @@ def _copy_buffers_to_target(
         copied.add(key)
 
 
-def _copy_trainable_params_from_target(
-    params: Mapping[str, HostParam],
-    targets: Mapping[str, HostParamTarget],
-    *,
-    non_blocking: bool,
-) -> None:
-    copied: set[int] = set()
-    for name, host in params.items():
-        if not host.requires_grad:
-            continue
-        key = id(host)
-        if key in copied:
-            continue
-        host.copy_to_cpu(targets[name]._state, non_blocking=non_blocking)
-        copied.add(key)
-
-
 def _install_host_params(
     module: nn.Module,
     params: Mapping[str, HostParam],
@@ -855,15 +703,10 @@ def install_parameters(
     module: nn.Module,
     materialized_params: Mapping[str, nn.Parameter],
 ) -> None:
-    """Install prepared storage, preserving trainable Parameters already validated for data swaps."""
+    """Install frozen parameter wrappers into ``module``'s registry."""
     for name, materialized in materialized_params.items():
         parent, leaf = resolve_parent_leaf(module, name)
-        if materialized.requires_grad:
-            # Trainable: keep the user's wrapper, swap only ``.data``.
-            _get_param(parent, leaf).data = materialized.data
-        else:
-            # Frozen: replace the registry entry outright.
-            _set_param(parent, leaf, materialized)
+        _set_param(parent, leaf, materialized)
 
 
 def _install_host_buffers(
@@ -903,13 +746,6 @@ def _unique_name_dict[NamedT](
             raise ValueError(f"Module yielded duplicate name {name!r}.")
         values[name] = value
     return values
-
-
-def _get_param(parent: nn.Module, leaf: str) -> nn.Parameter:
-    param = parent._parameters.get(leaf)
-    if param is None:
-        raise RuntimeError(f"Parameter {leaf!r} is unexpectedly missing.")
-    return param
 
 
 def _set_param(parent: nn.Module, leaf: str, param: nn.Parameter) -> None:
