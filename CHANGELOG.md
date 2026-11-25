@@ -15,10 +15,18 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   and contiguous `Shard(dim)` placements for plain tensors, all-`Replicate`
   projection for `DTensor`-compatible non-`nn.Parameter`-subclass quantized
   tensors, and zero-copy `Shard(dim)` projection for TorchAO `Float8Tensor`
-  (`PerTensor`, `PerRow` along any axis, and group-aligned `PerGroup`) and 2-D
-  Piper `ConvRotInt8Tensor` (`Shard(0)` on any non-empty split and
-  `group_size`-aligned `Shard(1)`, preserving optional scalar
-  `act_per_tensor_scale`), with contiguous 1/P CUDA target allocation,
+  (`PerTensor`, `PerRow` along any axis, and group-aligned `PerGroup`), TorchAO
+  `MXTensor` (MXFP8 and packed MXFP4 across 2-D and N-D leading dims, including
+  zero-copy 128x4 swizzled tile-grid slicing with `rows % 128 == 0` when
+  `prod(leading) > 1`), TorchAO `NVFP4Tensor` (scalar or `None`
+  `per_tensor_scale`) and Piper `PiperNVFP4Tensor` (2-D and 3-D `(E, M, K)`
+  per-expert swizzling with `(E, 1, 1)` or scalar `per_tensor_scale`,
+  unswizzled and 128x4 swizzled), 2-D Piper `ConvRotInt8Tensor` (`Shard(0)` on
+  any non-empty split and `group_size`-aligned `Shard(1)`, preserving optional
+  scalar `act_per_tensor_scale`), and 2-D Piper `ConvRotNVFP4Tensor`
+  (`Shard(0)` aligned to 128 rows with tail allowance when 128x4 swizzled, and
+  `block_size`/`group_size`/swizzle-aligned `Shard(1)`), with contiguous 1/P
+  CUDA target allocation (expanding tile-grid host views cleanly),
   `requires_activation()` guards on non-canonical resting shards, active LoRA
   and dense adapter merges on CUDA, preflight rejection of unsupported, empty,
   misaligned, or transposed quantized shards and 5-D Conv3D weights, tied-weight
@@ -38,6 +46,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
+- `merge_adapter()` now requires an unbound model and rejects models or
+  submodules owned by a live `ModelOffloader` before mutating any shared backing.
 - Removed permanent per-parameter GPU decode staging buffers from
   `TrellisAdapter` and `GgufAdapter` in favor of transient stream-ordered
   scratch staging, and narrowed their `layout_signature` keys to the active

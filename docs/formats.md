@@ -175,22 +175,42 @@ tensor subclass supports `DTensor` wrapping (such as TorchAO FP8, MX, NVFP4, or
 Piper ConvRot) project zero-copy for all-`Replicate` targets. For `Shard(dim)`
 placements across 1D and N-D `DeviceMesh` shells, zero-copy projection supports
 TorchAO `Float8Tensor` (`PerTensor`, `PerRow` along any axis, and `PerGroup`
-when shard boundaries align with the group size) and 2-D Piper
-`ConvRotInt8Tensor` (`Shard(0)` on any non-empty split; `Shard(1)` when shard
-offset and local width are aligned to `group_size`, preserving optional scalar
-`act_per_tensor_scale`). Formats without shard projection (`MXTensor`,
-`NVFP4Tensor`, `ConvRotNVFP4Tensor`, and 5-D Conv3D `ConvRotInt8Tensor`),
-empty, misaligned, or transposed quantized shards, and `DTensor`-incompatible
-tensor subclasses (such as TorchAO `Int8Tensor`, tile-packed INT4, or
-`PrototypeFloat8Tensor`) are rejected cleanly with `layout mismatch` during bind
-preflight. Non-canonical projected quantized shards (such as `Shard(1)`) keep
-zero-copy host views under the single store allocation, report
+when shard boundaries align with the group size), TorchAO `MXTensor` (MXFP8 and
+packed MXFP4 across 2-D and N-D tensors when column shards align to
+`block_size=32`, and for 128x4 swizzled scales when row shards align to 128
+rows and column shards align to 128 columns with final tail-block allowance —
+requiring `rows % 128 == 0` for N-D tensors when `prod(leading) > 1`), TorchAO
+`NVFP4Tensor` and Piper `PiperNVFP4Tensor` (2-D and N-D tensors when column
+shards align to `block_size=16`, and for 128x4 swizzled scales when row shards
+align to 128 rows and column shards align to 64 columns with final tail-block
+allowance; flattened N-D swizzled TorchAO `NVFP4Tensor` and 4-D+ weights
+require `rows % 128 == 0` when `prod(leading) > 1`, whereas 3-D `(E, M, K)`
+`PiperNVFP4Tensor` pads each expert's 128-row tiles independently, narrows
+per-expert `(E, 1, 1)` `per_tensor_scale` zero-copy, and replicates scalar
+global scales while plain TorchAO `NVFP4Tensor` accepts `None` or scalar
+`per_tensor_scale`), 2-D Piper `ConvRotInt8Tensor` (`Shard(0)` on any non-empty
+split; `Shard(1)` when shard offset and local width are aligned to
+`group_size`, preserving optional scalar `act_per_tensor_scale`), and 2-D Piper
+`ConvRotNVFP4Tensor` (`Shard(0)` on any non-empty split when unswizzled or
+aligned to 128 rows with tail-block allowance when 128x4 swizzled, and
+`Shard(1)` aligned to `block_size=16` and rotation `group_size` plus 64-col
+swizzle alignment with tail-block allowance when 128x4 swizzled, preserving
+optional scalar global scales). Formats without shard projection (5-D Conv3D
+`ConvRotInt8Tensor` and non-2-D `ConvRotNVFP4Tensor`), empty, misaligned, or
+transposed quantized shards, and `DTensor`-incompatible tensor subclasses (such
+as TorchAO `Int8Tensor`, tile-packed INT4, `PrototypeFloat8Tensor`, or TorchAO
+`NVFP4Tensor` with non-scalar `per_tensor_scale`) are rejected cleanly with
+`layout mismatch` during bind preflight. Non-canonical projected quantized
+shards (such as `Shard(1)` or non-contiguous swizzled 512-byte tile-grid slices)
+keep zero-copy host views under the single store allocation, report
 `requires_activation(param) == True` while resting on CPU (disallowing direct
-CPU execution and permanent `merge_adapter` updates), allocate contiguous
-per-rank device buffers preserving block-pool compatibility across streaming
-refills on CUDA activation, and support active LoRA and dense adapter merges on
-`RowwiseParallel` layers, bias-free `nn.Linear` avoids PyTorch DTensor's linear
-decomposition falling back to all-gathering `Shard(1)` quantized weights). Each
+CPU execution and permanent `merge_adapter` updates; bound `ModelOffloader`
+shells also reject `merge_adapter` regardless of placement), allocate contiguous
+per-rank device buffers (expanding tile-grid scale views back to contiguous
+swizzled shapes) preserving block-pool compatibility across streaming refills
+on CUDA activation, and support active LoRA and dense adapter merges on CUDA
+(in `RowwiseParallel` layers, bias-free `nn.Linear` avoids PyTorch DTensor's
+linear decomposition falling back to all-gathering `Shard(1)` quantized weights). Each
 rank selects its portion of plain host-backed LoRA factors or dense deltas
 before staging; merging requires no collective. Full adapter tensors remain in
 host memory. DTensor adapter factors and deltas, `DTensor` registered buffers

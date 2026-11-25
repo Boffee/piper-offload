@@ -1946,7 +1946,7 @@ def _assert_2d_quantized_rank(
         assert requires_activation(f8_param) and requires_activation(cr_param)
         with pytest.raises(RuntimeError, match="requires CUDA activation"):
             f8_param.to_local().clone()
-        with pytest.raises(ValueError, match="Permanent updates to projected quantized shards are unsupported"):
+        with pytest.raises(ValueError, match="already bound to a live ModelOffloader"):
             merge_adapter(shell, [(delta, 0.5)])
         with pytest.raises(ValueError, match="cannot be captured directly"):
             HostParam(shell.get_parameter("f8"))
@@ -2472,3 +2472,294 @@ class TestModelStoreDTensorProjection:
         assert not dist.is_initialized()
         resting = cpu_mesh_for(fake_cuda)
         assert resting.device_type == "cpu"
+
+def _build_2d_packed_swizzled_fixtures(
+    mx_mod: Any,
+    nv_mod: Any,
+    cr_mod: Any,
+) -> tuple[ModelStore, ModelStore, dict[str, Any], dict[str, tuple[int, ...]], Adapter]:
+    from piper_offload import ParameterDelta
+
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    mx_dtype = fp4_dtype if fp4_dtype is not None else torch.float8_e4m3fn
+    mx_global = mx_mod.MXTensor.to_mx(
+        torch.randn(512, 256, dtype=torch.bfloat16), mx_dtype, block_size=32, is_swizzled_scales=True
+    )
+    nv_global = nv_mod.NVFP4Tensor.to_nvfp4(
+        torch.randn(512, 256, dtype=torch.bfloat16),
+        per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
+        is_swizzled_scales=True,
+        use_triton_kernel=False,
+    )
+    cr_raw = cr_mod.ConvRotNVFP4Tensor.from_torchao(
+        nv_mod.NVFP4Tensor.to_nvfp4(
+            torch.randn(512, 256, dtype=torch.bfloat16),
+            per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+        ),
+        group_size=64,
+    )
+    cr_global = cr_mod.ConvRotNVFP4Tensor(
+        (((cr_raw.qdata & 0x0F) << 4) | (cr_raw.qdata >> 4)).to(torch.uint8),
+        cr_raw.scale,
+        cr_raw.block_size,
+        cr_raw.orig_dtype,
+        cr_raw.group_size,
+        cr_raw.per_tensor_scale,
+        None,
+        True,
+        False,
+        None,
+        high_first=True,
+    )
+    proto = nn.Module()
+    proto.mx = nn.Parameter(mx_global, requires_grad=False)
+    proto.nv = nn.Parameter(nv_global, requires_grad=False)
+    proto.cr = nn.Parameter(cr_global, requires_grad=False)
+    proto.requires_grad_(False)
+    store = ModelStore.from_module(proto)
+    ptrs = {
+        k: tuple(t.untyped_storage().data_ptr() for t in store._module_store.params[k].storage_tensors())
+        for k in ("mx", "nv", "cr")
+    }
+    bad_proto = nn.Module()
+    bad_proto.mx = nn.Parameter(
+        mx_mod.MXTensor.to_mx(
+            torch.randn(256, 128, dtype=torch.bfloat16), mx_dtype, block_size=32, is_swizzled_scales=True
+        ),
+        requires_grad=False,
+    )
+    bad_store = ModelStore.from_module(bad_proto)
+    delta = Adapter({"nv": ParameterDelta.from_tensors(dense=torch.randn(512, 256, dtype=torch.bfloat16) * 0.02)})
+    return store, bad_store, {"mx": mx_global, "nv": nv_global, "cr": cr_global}, ptrs, delta
+
+
+def _assert_cpu_projected_dequantize(
+    hp: Any,
+    glb: Any,
+    offsets: tuple[int, ...],
+    local_shape: tuple[int, ...],
+) -> None:
+    hs = cast(Any, hp.host_state)
+    inner_state = hs.inner_state
+    slots: list[torch.Tensor | None] = []
+    targets = inner_state.target_shapes
+    for idx, t in enumerate(inner_state.storage):
+        if t is None:
+            slots.append(None)
+            continue
+        ts = None if targets is None else targets[idx]
+        c = t.contiguous()
+        slots.append(c if ts is None else c.view(ts))
+    rebuilt = hs.inner._reconstruct(tuple(slots), inner_state.meta)
+    ref = glb.dequantize().narrow(0, offsets[0], local_shape[0]).narrow(1, offsets[1], local_shape[1])
+    torch.testing.assert_close(rebuilt.dequantize(), ref, rtol=0, atol=0)
+
+
+def _assert_2d_packed_swizzled_rank(
+    *,
+    store: ModelStore,
+    bad_store: ModelStore,
+    globals_map: dict[str, Any],
+    ptrs: dict[str, tuple[int, ...]],
+    delta: Adapter,
+    cuda_lock: threading.Lock,
+) -> tuple[int, tuple[int, ...]]:
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    from piper_offload import merge_adapter, requires_activation
+    from piper_offload.dtensor_adapter import _local_shape_and_offsets
+    from piper_offload.host_param import HostParam
+
+    mesh = DeviceMesh("cpu", [[0, 1], [2, 3]])
+    coord = tuple(mesh.get_coordinate() or ())
+    placements = (Shard(0), Shard(1))
+    local_shape, offsets = _local_shape_and_offsets((512, 256), tuple(mesh.shape), coord, placements)
+    shell = nn.Module()
+    for name in ("mx", "nv", "cr"):
+        shell.register_parameter(
+            name,
+            nn.Parameter(
+                _make_meta_dtensor_param(mesh, list(placements), global_shape=(512, 256), local_shape=local_shape).data,
+                requires_grad=False,
+            ),
+        )
+    offloader = store.bind(shell)
+    try:
+        rank_hps = host_component(offloader)._instance.params
+        expected_bytes = sum(
+            sum(t.numel() * t.element_size() for t in rank_hps[k].storage_tensors()) for k in ("mx", "nv", "cr")
+        )
+        assert offloader.cache_bytes == expected_bytes < store.cache_bytes
+        for name, glb in globals_map.items():
+            assert requires_activation(cast(DTensor, shell.get_parameter(name).data))
+            hp = rank_hps[name]
+            assert tuple(t.untyped_storage().data_ptr() for t in hp.storage_tensors()) == ptrs[name]
+            _assert_cpu_projected_dequantize(hp, glb, offsets, local_shape)
+            with pytest.raises(ValueError, match="cannot be captured directly"):
+                HostParam(shell.get_parameter(name))
+        with pytest.raises(ValueError, match="already bound to a live ModelOffloader"):
+            merge_adapter(shell, [(delta, 0.5)])
+        if torch.cuda.is_available():
+            with cuda_lock:
+                dev = torch.device("cuda:0")
+                for name, glb in globals_map.items():
+                    hp = rank_hps[name]
+                    hs = cast(Any, hp.host_state)
+                    gs = cast(Any, hp.allocate_gpu_storage(dev))
+                    hp.copy_to_gpu(gs, non_blocking=False)
+                    loc = cast(Any, hs.inner.gpu_param(hs.inner_state, gs.inner_gpu).data)
+                    assert loc.scale.is_cuda and loc.scale.is_contiguous()
+                    ref = glb.dequantize().narrow(0, offsets[0], local_shape[0]).narrow(1, offsets[1], local_shape[1])
+                    torch.testing.assert_close(loc.dequantize().cpu(), ref, rtol=0, atol=0)
+    finally:
+        offloader.deactivate()
+
+    bad_shell = nn.Module()
+    bad_shell.mx = _make_meta_dtensor_param(mesh, list(placements), global_shape=(256, 128), local_shape=(128, 64))
+    snap = _snapshot_tensors(bad_shell)
+    with pytest.raises(ValueError, match="layout mismatch"):
+        bad_store.bind(bad_shell)
+    _assert_unmutated(bad_shell, snap)
+    return offloader.cache_bytes, offsets
+
+
+def _assert_tied_and_canonical_guard_on_rank(
+    tied_store: ModelStore,
+    canon_store: ModelStore,
+    canon_before: tuple[torch.Tensor, torch.Tensor],
+    nv_3d_store: ModelStore,
+) -> None:
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Replicate, Shard
+
+    from piper_offload import ParameterDelta, merge_adapter
+
+    mesh = DeviceMesh("cpu", [[0, 1], [2, 3]], mesh_dim_names=("ep", "tp"))
+    tp = mesh["tp"]
+    tied_shell = nn.Module()
+    tied_shell.a = _make_meta_dtensor_param(tp, [Shard(1)], global_shape=(256, 256), local_shape=(256, 128))
+    tied_shell.b = tied_shell.a
+    tied_off = tied_store.bind(tied_shell)
+    try:
+        a_hp = host_component(tied_off)._instance.params["a"]
+        assert tied_off.cache_bytes == a_hp.cache_bytes < tied_store.cache_bytes
+    finally:
+        tied_off.deactivate()
+
+    canon_shell = nn.Module()
+    canon_shell.nv = _make_meta_dtensor_param(tp, [Shard(0)], global_shape=(256, 128), local_shape=(128, 128))
+    canon_off = canon_store.bind(canon_shell)
+    try:
+        d = Adapter({"nv": ParameterDelta.from_tensors(dense=torch.randn(256, 128, dtype=torch.bfloat16) * 0.1)})
+        with pytest.raises(ValueError, match="already bound to a live ModelOffloader"):
+            merge_adapter(canon_shell, [(d, 1.0)])
+        store_slots = canon_store._module_store.params["nv"].storage_tensors()
+        assert torch.equal(store_slots[0], canon_before[0])
+        assert torch.equal(store_slots[2], canon_before[1])
+    finally:
+        canon_off.deactivate()
+
+    bad_shells = (
+        ("rep", mesh, [Replicate()], (4, 64, 64)),
+        ("s0", tp, [Shard(0)], (2, 64, 64)),
+        ("s02", mesh, [Shard(0), Shard(2)], (2, 64, 32)),
+    )
+    for _, sub_mesh, pls, lshape in bad_shells:
+        sh = nn.Module()
+        sh.w = nn.Parameter(
+            DTensor.from_local(
+                torch.empty(lshape, device="meta"),
+                sub_mesh,
+                pls,
+                shape=(4, 64, 64),
+                stride=(4096, 64, 1),
+                run_check=False,
+            ),
+            requires_grad=False,
+        )
+        snap = _snapshot_tensors(sh)
+        with pytest.raises(ValueError, match="layout mismatch"):
+            nv_3d_store.bind(sh)
+        _assert_unmutated(sh, snap)
+
+
+class TestModelStorePackedSwizzledDTensorProjection:
+    def test_bind_dtensor_packed_swizzled_2d_mesh_zero_copy_and_rejections(self) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        pytest.importorskip("numpy")
+        mx_mod = pytest.importorskip("torchao.prototype.mx_formats.mx_tensor")
+        nv_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
+        cr_mod = pytest.importorskip("piper_kernels.weights.convrot.nvfp4")
+        from piper_offload.parallel import ParallelExecutor
+
+        torch.manual_seed(19)
+        store, bad_store, globals_map, ptrs, delta = _build_2d_packed_swizzled_fixtures(mx_mod, nv_mod, cr_mod)
+        cuda_lock = threading.Lock()
+        with ParallelExecutor(["cpu"] * 4) as ex:
+            results = ex.run(
+                lambda _rank: _assert_2d_packed_swizzled_rank(
+                    store=store,
+                    bad_store=bad_store,
+                    globals_map=globals_map,
+                    ptrs=ptrs,
+                    delta=delta,
+                    cuda_lock=cuda_lock,
+                )
+            )
+        assert {offsets for _, offsets in results} == {(0, 0), (0, 128), (256, 0), (256, 128)}
+
+    def test_bind_dtensor_tied_canonical_guard_and_torchao_3d_scale_rejection(self) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        pytest.importorskip("numpy")
+        mx_mod = pytest.importorskip("torchao.prototype.mx_formats.mx_tensor")
+        nv_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
+        from piper_offload.parallel import ParallelExecutor
+
+        torch.manual_seed(33)
+        tied_proto = nn.Module()
+        tied_proto.a = nn.Parameter(
+            mx_mod.MXTensor.to_mx(
+                torch.randn(256, 256, dtype=torch.bfloat16), torch.float8_e4m3fn, block_size=32, is_swizzled_scales=True
+            ),
+            requires_grad=False,
+        )
+        tied_proto.b = tied_proto.a
+        tied_store = ModelStore.from_module(tied_proto)
+
+        canon_proto = nn.Module()
+        canon_proto.nv = nn.Parameter(
+            nv_mod.NVFP4Tensor.to_nvfp4(
+                torch.randn(256, 128, dtype=torch.bfloat16),
+                per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
+                is_swizzled_scales=True,
+                use_triton_kernel=False,
+            ),
+            requires_grad=False,
+        )
+        canon_store = ModelStore.from_module(canon_proto)
+        c_slots = canon_store._module_store.params["nv"].storage_tensors()
+        canon_before = (c_slots[0].clone(), c_slots[2].clone())
+
+        base3d = nv_mod.NVFP4Tensor.to_nvfp4(
+            torch.randn(4, 64, 64, dtype=torch.bfloat16), is_swizzled_scales=False, use_triton_kernel=False
+        )
+        bad_3d = nv_mod.NVFP4Tensor(
+            base3d.qdata, base3d.scale, base3d.block_size, base3d.orig_dtype,
+            torch.tensor([0.2, 0.4, 0.6, 0.8], dtype=torch.float32).view(4, 1, 1),
+            None, False, False, None,
+        )
+        nv_3d_proto = nn.Module()
+        nv_3d_proto.w = nn.Parameter(bad_3d, requires_grad=False)
+        nv_3d_store = ModelStore.from_module(nv_3d_proto)
+
+        with ParallelExecutor(["cpu"] * 4) as ex:
+            ex.run(
+                lambda _r: _assert_tied_and_canonical_guard_on_rank(
+                    tied_store, canon_store, canon_before, nv_3d_store
+                )
+            )
