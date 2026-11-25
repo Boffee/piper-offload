@@ -35,6 +35,24 @@ VARIABLE_ROW_CUDA = pytest.mark.skipif(
 )
 
 
+def _supports_2bit_trellis() -> bool:
+    if not torch.cuda.is_available() or not supports_variable_row_trellis():
+        return False
+    try:
+        from piper_kernels.trellis import TrellisLayout
+
+        TrellisLayout(BLOCK_SIZE, 2 * BLOCK_SIZE)
+    except (ImportError, ValueError):
+        return False
+    return True
+
+
+TWO_BIT_VARIABLE_ROW_CUDA = pytest.mark.skipif(
+    not _supports_2bit_trellis(),
+    reason="CUDA/ROCm and piper-kernels 2-bit trellis support required",
+)
+
+
 def _weight(
     seed: int,
     *,
@@ -70,6 +88,8 @@ def _variable_row_weight(
     widths: list[int] | None = None,
     act_scale: float | None = None,
     extra_bytes: int = 0,
+    block_size: int = BLOCK_SIZE,
+    group_size: int = GROUP_SIZE,
 ) -> TrellisParameter:
     """Arbitrary variable-row trellis storage: every bit pattern is a valid walk."""
     generator = torch.Generator().manual_seed(seed)
@@ -86,8 +106,8 @@ def _variable_row_weight(
         bitstreams,
         codes.view(torch.float8_e4m3fn),
         scale,
-        block_size=BLOCK_SIZE,
-        group_size=GROUP_SIZE,
+        block_size=block_size,
+        group_size=group_size,
         act_per_tensor_scale=None if act_scale is None else torch.tensor(act_scale),
         row_widths=row_widths,
     )
@@ -296,12 +316,12 @@ class TestTrellisSource:
                 "mix meta",
             ),
             (
-                {"row_widths": torch.tensor([95] + [128] * (ROWS - 1), dtype=torch.uint8)},
-                r"must be in \[96, 192\]",
+                {"row_widths": torch.tensor([63] + [128] * (ROWS - 1), dtype=torch.uint8)},
+                r"must be in \[64, 192\]",
             ),
             (
                 {"row_widths": torch.tensor([193] + [128] * (ROWS - 1), dtype=torch.uint8)},
-                r"must be in \[96, 192\]",
+                r"must be in \[64, 192\]",
             ),
             (
                 {"bitstreams": torch.zeros(32 * (128 + 160) - 1, dtype=torch.uint8)},
@@ -323,6 +343,28 @@ class TestTrellisSource:
 
         with pytest.raises(ValueError, match=message):
             TrellisParameter(**tensors, block_size=BLOCK_SIZE, group_size=GROUP_SIZE)
+
+    def test_variable_row_accepts_two_bit_floor_across_block_sizes(self) -> None:
+        w256 = _variable_row_weight(2, widths=[64] * (ROWS // 2) + [192] * (ROWS - ROWS // 2))
+        assert w256.row_widths is not None
+        assert int(w256.row_widths.min().item()) == 64
+
+        w16 = _variable_row_weight(
+            20,
+            widths=[4] * (ROWS // 2) + [12] * (ROWS - ROWS // 2),
+            block_size=16,
+            group_size=16,
+        )
+        assert w16.row_widths is not None
+        assert int(w16.row_widths.min().item()) == 4
+
+        with pytest.raises(ValueError, match=r"must be in \[4, 12\]"):
+            _variable_row_weight(
+                21,
+                widths=[3] + [4] * (ROWS - 1),
+                block_size=16,
+                group_size=16,
+            )
 
     def test_variable_row_accepts_padded_bitstreams(self) -> None:
         padded = _variable_row_weight(3, extra_bytes=7)
@@ -668,7 +710,7 @@ class TestTrellisActivation:
     ) -> None:
         import piper_offload.trellis_adapter as ta
 
-        bad_widths = torch.tensor([95] + [128] * (ROWS - 1), dtype=torch.uint8, device="cuda")
+        bad_widths = torch.tensor([63] + [128] * (ROWS - 1), dtype=torch.uint8, device="cuda")
         bitstreams = torch.zeros(32 * (128 + 160), dtype=torch.uint8, device="cuda")
         block_scales = torch.full((ROWS, 1), 0x3C, dtype=torch.uint8, device="cuda").view(
             torch.float8_e4m3fn
@@ -687,7 +729,7 @@ class TestTrellisActivation:
             return real_capture(tensor, **kwargs)  # type: ignore[arg-type]
 
         monkeypatch.setattr(ta, "capture_host_tensor", _spy_capture)
-        with pytest.raises(ValueError, match=r"must be in \[96, 192\]"):
+        with pytest.raises(ValueError, match=r"must be in \[64, 192\]"):
             TrellisAdapter.capture_host(weight)
         assert copied_ptrs == [bad_widths.data_ptr()]
 
@@ -750,6 +792,26 @@ class TestTrellisActivation:
         assert torch.equal(actual.qdata, expected.qdata)
         assert torch.equal(actual.scale, expected.scale)
         assert float(actual.act_per_tensor_scale) == pytest.approx(0.25)
+
+    @TWO_BIT_VARIABLE_ROW_CUDA
+    def test_variable_row_two_bit_activation_and_refill_decode_into_convrot_int8(self) -> None:
+        first = _variable_row_weight(22, blocks=2, widths=[64] * 32 + [128] * 32)
+        second = _variable_row_weight(23, blocks=2, widths=[96] * 32 + [64] * 32)
+        backing = HostParam(first)
+        state = backing.allocate_gpu_storage(torch.device("cuda"))
+        actual = param_representation(backing.make_gpu_param(state))
+
+        backing.copy_to_gpu(state, non_blocking=True)
+        torch.cuda.synchronize()
+        expected_first = _decode(first)
+        assert torch.equal(actual.qdata, expected_first.qdata)
+        assert torch.equal(actual.scale, expected_first.scale)
+
+        HostParam(second).copy_to_gpu(state, non_blocking=True)
+        torch.cuda.synchronize()
+        expected_second = _decode(second)
+        assert torch.equal(actual.qdata, expected_second.qdata)
+        assert torch.equal(actual.scale, expected_second.scale)
 
     @VARIABLE_ROW_CUDA
     def test_variable_row_streaming_blocks_share_target_and_merge_lora(self) -> None:
