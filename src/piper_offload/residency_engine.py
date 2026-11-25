@@ -813,7 +813,12 @@ class ResidencyEngine:
         active = self._active
         if active is None or active.unit_idx != idx:
             return
-        if self._pool is not None and self._pool.budget_bytes == 0:
+        pool = self._pool
+        if (
+            pool is not None
+            and pool.budget_bytes is not None
+            and (pool.budget_bytes == 0 or active.slot.nbytes > pool.budget_bytes)
+        ):
             self._release_active_unit()
 
     def _release_units(self) -> tuple[BaseException | None, BaseException | None]:

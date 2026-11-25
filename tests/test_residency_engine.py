@@ -1415,6 +1415,87 @@ class TestResidencyEngineCuda:
         finally:
             offloader.deactivate()
 
+    @CUDA
+    def test_oversized_unit_under_positive_budget_releases_slot_on_forward_exit(self) -> None:
+        class StagedModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.small = nn.Linear(16, 16, bias=False)
+                self.big = nn.Linear(16, 64, bias=False)
+                self.head = nn.Linear(64, 8, bias=False)
+                self.requires_grad_(False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.head(torch.relu(self.big(torch.relu(self.small(x)))))
+
+        torch.manual_seed(17)
+        model = StagedModel()
+        reference = copy.deepcopy(model).cuda()
+        small_bytes = cast(nn.Linear, model.small).weight.nbytes  # 1024 B; big is 4096 B
+        offloader = ModelOffloader.from_module(
+            model,
+            OffloadConfig(offload_paths=("small", "big"), vram_budget_bytes=small_bytes),
+        )
+        engine = residency_engine(offloader)
+        x = torch.randn(2, 16, device="cuda")
+        expected = reference(x)
+
+        states: dict[str, tuple[bool, int, int, str]] = {}
+        raise_in_big = False
+
+        def after_small(_m: nn.Module, _in: object, _out: object) -> None:
+            assert engine.pool is not None
+            states["after_small"] = (
+                engine._active is not None and engine._active.unit_idx == 0,
+                engine.pool.live_slot_count,
+                engine.pool.used_bytes,
+                cast(nn.Linear, model.small).weight.device.type,
+            )
+
+        def before_big(_m: nn.Module, _in: object) -> None:
+            if raise_in_big:
+                raise RuntimeError("boom inside big")
+
+        def before_head(_m: nn.Module, _in: object) -> None:
+            assert engine.pool is not None
+            states["before_head"] = (
+                engine._active is not None,
+                engine.pool.live_slot_count,
+                engine.pool.used_bytes,
+                cast(nn.Linear, model.big).weight.device.type,
+            )
+
+        try:
+            with activated_model(offloader, "cuda"), torch.inference_mode():
+                h_small = model.small.register_forward_hook(after_small, always_call=True)
+                h_big = model.big.register_forward_pre_hook(before_big, prepend=False)
+                h_head = model.head.register_forward_pre_hook(before_head)
+                try:
+                    out1 = model(x)
+                    assert states["after_small"] == (True, 1, small_bytes, "cuda")
+                    assert states["before_head"] == (False, 0, 0, "cpu")
+                    out2 = model(x)
+                    torch.testing.assert_close(out1, expected, rtol=1e-5, atol=1e-5)
+                    torch.testing.assert_close(out2, expected, rtol=1e-5, atol=1e-5)
+
+                    raise_in_big = True
+                    with pytest.raises(RuntimeError, match="boom inside big"):
+                        _ = model(x)
+                    assert engine._active is None
+                    assert engine.pool is not None
+                    assert engine.pool.live_slot_count == 0
+                    assert engine.pool.used_bytes == 0
+                    assert cast(nn.Linear, model.big).weight.device.type == "cpu"
+
+                    raise_in_big = False
+                    torch.testing.assert_close(model(x), expected, rtol=1e-5, atol=1e-5)
+                finally:
+                    h_small.remove()
+                    h_big.remove()
+                    h_head.remove()
+        finally:
+            offloader.deactivate()
+
     def test_auto_offload_paths_estimates_packed_bytes_for_gguf_trellis_and_projected_shard(
         self,
     ) -> None:

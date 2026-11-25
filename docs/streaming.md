@@ -93,7 +93,7 @@ Trellis decode to larger ConvRot INT8 GPU targets):
 |---|---|---|
 | `None` (default) | Strict 2-slot streaming (one active + one lookahead slot), reusing same-signature allocations. | Minimize weight VRAM regardless of model size. |
 | `0` | Releases the active unit's CUDA slot immediately on unit exit and disables async lookahead. | Tightest possible peak VRAM across non-overlapping stages. |
-| `0 < budget < total` | Retains hot units up to `budget`, evicting furthest-future-use idle slots (Belady MIN); async lookahead runs when `active_bytes + next_bytes <= budget` (if `budget` is smaller than one active unit, forward still runs and frees idle slots on exit). | Accelerate multi-step or looped workloads within a fixed weight budget. |
+| `0 < budget < total` | Retains hot units up to `budget`, evicting furthest-future-use idle slots (Belady MIN); async lookahead runs when `active_bytes + next_bytes <= budget` (if `budget` is smaller than one active unit, forward still runs and releases the oversized slot on unit exit). | Accelerate multi-step or looped workloads within a fixed weight budget. |
 | `budget >= total` | Preloads all offloaded units on activation using pageable (non-pinned) transfers and no lookahead thread. | Weights fit cleanly in budget, avoiding host pinning and async lookahead while keeping unit compilation. |
 
 Offload learns arbitrary execution orders (sequential, reverse, skipped, looped,
