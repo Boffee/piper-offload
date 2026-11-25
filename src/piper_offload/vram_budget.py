@@ -131,6 +131,15 @@ class BudgetTenantHandle:
         """Evict strictly lower-retention tenants if needed, then return new ceiling."""
         return self._budget.request_bytes(self, nbytes)
 
+    def try_claim(
+        self,
+        nbytes: int,
+        *,
+        name: str | None = None,
+    ) -> VramReservation | None:
+        """Atomically claim an additional ``nbytes`` under this budget, or return ``None``."""
+        return self._budget.try_claim(self, nbytes, name=name)
+
     def unregister(self) -> None:
         """Detach this tenant from the budget (idempotent)."""
         self._budget.unregister_tenant(self)
@@ -439,6 +448,42 @@ class VramBudget:
             )
             if freed <= 0:
                 return self.ceiling_for(target_id)
+
+    def try_claim(
+        self,
+        tenant: BudgetTenantHandle | int,
+        nbytes: int,
+        *,
+        name: str | None = None,
+    ) -> VramReservation | None:
+        """Atomically reserve an additional ``nbytes`` for ``tenant``, or return ``None``."""
+        requested = _validate_nonneg_int(nbytes, name="nbytes")
+        if name is not None and (not isinstance(name, str) or not name):
+            raise ValueError("Claim name must be a non-empty string or None.")
+        while True:
+            with self._lock:
+                target = self._resolve_tenant_unlocked(tenant)
+                claim_name = f"{target.name}.claim" if name is None else name
+                limit = self._effective_limit_unlocked()
+                used = self._used_bytes_unlocked()
+                if limit is None or used + requested <= limit:
+                    return self._create_reservation_unlocked(claim_name, requested)
+                deficit = used + requested - limit
+                target_id = target.tenant_id
+                target_priority = target.priority
+            freed = self._evict_step(
+                deficit,
+                requester_priority=target_priority,
+                exclude_id=target_id,
+            )
+            if freed <= 0:
+                with self._lock:
+                    target = self._resolve_tenant_unlocked(tenant)
+                    limit = self._effective_limit_unlocked()
+                    used = self._used_bytes_unlocked()
+                    if limit is None or used + requested <= limit:
+                        return self._create_reservation_unlocked(claim_name, requested)
+                    return None
 
     def _ceiling_for_unlocked(self, target: _TenantRecord) -> int | None:
         limit = self._effective_limit_unlocked()

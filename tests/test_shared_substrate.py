@@ -758,6 +758,282 @@ def test_vram_budget_yield_to_peers_ownership_concurrent_retry_and_no_progress()
         stuck_budget.reserve(50, name="blocked")
 
 
+def test_vram_budget_try_claim_atomic_eviction_and_validation() -> None:
+    budget = VramBudget(100)
+    peer_bytes = [80]
+    strict_bytes = [20]
+
+    def evict_peer(ask: int) -> int:
+        freed = min(ask, peer_bytes[0])
+        peer_bytes[0] -= freed
+        return freed
+
+    h_strict = budget.register_tenant(
+        "strict_kv",
+        priority=10,
+        evict_cb=lambda ask: ask,
+        usage_fn=lambda: strict_bytes[0],
+        yield_to_peers=False,
+    )
+    h_peer = budget.register_tenant(
+        "yielding_weights",
+        priority=10,
+        evict_cb=evict_peer,
+        usage_fn=lambda: peer_bytes[0],
+        yield_to_peers=True,
+    )
+    h_caller = budget.register_tenant(
+        "caller",
+        priority=10,
+        usage_fn=lambda: 0,
+        yield_to_peers=True,
+    )
+
+    # Atomic claim evicts yielding peer but leaves non-yielding strict peer alone.
+    claim = h_caller.try_claim(80, name="slot_claim")
+    assert claim is not None
+    assert peer_bytes[0] == 0
+    assert strict_bytes[0] == 20
+    assert budget.used_bytes == 100
+    assert budget.available_bytes == 0
+
+    # Exhausted budget returns None rather than raising or overshooting.
+    assert h_caller.try_claim(1) is None
+
+    claim.release()
+    assert budget.available_bytes == 80
+
+    # Concurrent reservation release during eviction retry lets try_claim succeed.
+    other = VramBudget(50)
+    h_other = other.register_tenant("other", usage_fn=lambda: 0)
+    with pytest.raises(ValueError, match="does not belong"):
+        budget.try_claim(h_other, 10)
+    with pytest.raises(TypeError, match="BudgetTenantHandle or int"):
+        budget.try_claim(True, 10)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="non-negative"):
+        h_caller.try_claim(-1)
+
+    blocker = other.reserve(80 if False else 40, name="blocker")
+    other_usage = [10]
+    other.register_tenant(
+        "releaser",
+        priority=10,
+        evict_cb=lambda _ask: (blocker.release(), 0)[1],
+        usage_fn=lambda: other_usage[0],
+        yield_to_peers=True,
+    )
+    retry_claim = h_other.try_claim(40)
+    assert retry_claim is not None
+    assert retry_claim.nbytes == 40
+    retry_claim.release()
+    h_strict.unregister()
+    h_peer.unregister()
+    h_caller.unregister()
+
+
+def _setup_fake_elastic_pools(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    limit_bytes: int,
+    slot_bytes: int = 80,
+):
+    import time
+    from piper_offload import vram_pool as vp
+
+    class _FakeLease:
+        def __init__(self, target_bytes: int) -> None:
+            self.target = target_bytes
+            self.is_staged = True
+
+        def close(self) -> None:
+            pass
+
+    @dataclass(frozen=True)
+    class _FakePlan:
+        sig: str
+        nbytes: int = slot_bytes
+
+    def _fake_allocate(
+        plan: object,
+        _device: object,
+        *,
+        allocation_stream: object = None,
+        buffer_names: object = None,
+    ) -> _FakeLease:
+        del allocation_stream, buffer_names
+        time.sleep(0.01)
+        return _FakeLease(cast(_FakePlan, plan).nbytes)
+
+    monkeypatch.setattr(vp.CudaTargetLease, "allocate", _fake_allocate)
+    monkeypatch.setattr(vp, "estimate_plan_gpu_bytes", lambda plan: cast(_FakePlan, plan).nbytes)
+    monkeypatch.setattr(vp, "target_gpu_bytes", lambda target: cast(int, target))
+    monkeypatch.setattr(
+        vp,
+        "plan_target_signature",
+        lambda plan: cast(_FakePlan, plan).sig,
+    )
+
+    budget = VramBudget(limit_bytes)
+
+    def _make_pool(name: str, static_budget: int | None = None):
+        pool = vp.ElasticVramPool(torch.device("cpu"), vram_budget_bytes=static_budget)
+        handle = budget.register_tenant(
+            name,
+            priority=10,
+            evict_cb=lambda needed: pool.evict_idle_bytes(
+                needed,
+                distance_fn=lambda _idx: 1.0,
+            ),
+            usage_fn=lambda: pool.used_bytes,
+            yield_to_peers=True,
+        )
+        pool.set_budget_callbacks(
+            budget_fn=handle.ceiling_bytes,
+            claim_bytes_fn=handle.try_claim,
+        )
+        return pool, handle
+
+    return budget, _make_pool, _FakePlan
+
+
+def test_concurrent_two_pool_lookahead_and_reserve_never_overshoot_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget, make_pool, fake_plan_cls = _setup_fake_elastic_pools(
+        monkeypatch,
+        limit_bytes=100,
+        slot_bytes=80,
+    )
+    pool_a, h_a = make_pool("model_a")
+    pool_b, h_b = make_pool("model_b")
+    stream = cast(torch.cuda.Stream, object())
+    try:
+        # Codex reproducer: simultaneous 80B lookahead checkouts on 100B budget.
+        for round_idx in range(4):
+            barrier = threading.Barrier(2)
+            results: list[object] = []
+            errors: list[BaseException] = []
+
+            def _worker(
+                pool=pool_a,
+                idx: int = round_idx,
+                b: threading.Barrier = barrier,
+                res: list[object] = results,
+                err: list[BaseException] = errors,
+            ) -> None:
+                try:
+                    b.wait(timeout=5.0)
+                    slot, _ = pool.checkout(
+                        idx,
+                        cast(object, fake_plan_cls(f"sig_{idx}")),  # type: ignore[arg-type]
+                        stream,
+                        distance_fn=lambda _i: 1.0,
+                        is_lookahead=True,
+                    )
+                    res.append(slot)
+                except BaseException as exc:  # pragma: no cover
+                    err.append(exc)
+
+            t1 = threading.Thread(target=_worker, args=(pool_a, round_idx * 2))
+            t2 = threading.Thread(target=_worker, args=(pool_b, round_idx * 2 + 1))
+            t1.start()
+            t2.start()
+            t1.join(timeout=5.0)
+            t2.join(timeout=5.0)
+            assert not errors
+            admitted = [s for s in results if s is not None]
+            assert len(admitted) <= 1
+            assert budget.used_bytes <= 100
+            pool_a.close_all()
+            pool_b.close_all()
+
+        # Concurrent lookahead checkout vs VramBudget.reserve(80) cannot both succeed.
+        barrier2 = threading.Barrier(2)
+        lookahead_slot: list[object] = []
+        reserved: list[VramReservation] = []
+
+        def _reserve_worker() -> None:
+            barrier2.wait(timeout=5.0)
+            with contextlib.suppress(VramBudgetExhaustedError):
+                reserved.append(budget.reserve(80, name="kv"))
+
+        t_res = threading.Thread(target=_reserve_worker)
+        t_res.start()
+        barrier2.wait(timeout=5.0)
+        slot, _ = pool_a.checkout(
+            0,
+            cast(object, fake_plan_cls("sig_r")),  # type: ignore[arg-type]
+            stream,
+            distance_fn=lambda _i: 1.0,
+            is_lookahead=True,
+        )
+        lookahead_slot.append(slot)
+        t_res.join(timeout=5.0)
+        assert not (lookahead_slot[0] is not None and len(reserved) == 1)
+        assert budget.used_bytes <= 100
+        for r in reserved:
+            r.release()
+    finally:
+        pool_a.close_all()
+        pool_b.close_all()
+        h_a.unregister()
+        h_b.unregister()
+
+
+def test_heterogeneous_own_idle_reclaim_races_safely_against_peer_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget, make_pool, fake_plan_cls = _setup_fake_elastic_pools(
+        monkeypatch,
+        limit_bytes=100,
+        slot_bytes=80,
+    )
+    pool_a, h_a = make_pool("model_a")
+    pool_b, h_b = make_pool("model_b")
+    stream = cast(torch.cuda.Stream, object())
+    try:
+        slot_0, _ = pool_a.checkout(
+            0,
+            cast(object, fake_plan_cls("sig_A")),  # type: ignore[arg-type]
+            stream,
+            distance_fn=lambda _i: 1.0,
+            is_lookahead=False,
+        )
+        assert slot_0 is not None
+        pool_a.return_slot(slot_0, staged_unit_idx=0, distance_fn=lambda _i: 1.0)
+        assert budget.used_bytes == 80
+
+        # pool_a checks out incompatible sig_B (must evict own sig_A and reclaim) while pool_b races.
+        barrier = threading.Barrier(2)
+        admitted: list[object] = []
+
+        def _race(pool, unit_idx: int, sig: str) -> None:
+            barrier.wait(timeout=5.0)
+            s, _ = pool.checkout(
+                unit_idx,
+                cast(object, fake_plan_cls(sig)),  # type: ignore[arg-type]
+                stream,
+                distance_fn=lambda _i: 1.0,
+                is_lookahead=True,
+            )
+            if s is not None:
+                admitted.append(s)
+
+        t1 = threading.Thread(target=_race, args=(pool_a, 1, "sig_B"))
+        t2 = threading.Thread(target=_race, args=(pool_b, 2, "sig_C"))
+        t1.start()
+        t2.start()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+        assert len(admitted) <= 1
+        assert budget.used_bytes <= 100
+    finally:
+        pool_a.close_all()
+        pool_b.close_all()
+        h_a.unregister()
+        h_b.unregister()
+
+
 @CUDA
 def test_vram_budget_option_b_resident_reservation_and_failure_recovery() -> None:
     torch.manual_seed(0)
@@ -936,7 +1212,8 @@ def test_vram_budget_activation_validation_and_static_cap_no_over_evict() -> Non
         peer_bytes[0] -= freed
         return freed
 
-    wide_budget = VramBudget(2 * unit_bytes + 6 * unit_bytes)
+    # Tight static cap with zero excess shared headroom must still reuse own idle slots without evicting peers.
+    wide_budget = VramBudget(2 * unit_bytes + 3 * unit_bytes + 2 * unit_bytes)
     peer_handle = wide_budget.register_tenant(
         "lower_retention_peer",
         priority=20,
@@ -949,6 +1226,7 @@ def test_vram_budget_activation_validation_and_static_cap_no_over_evict() -> Non
         vram_budget=wide_budget,
         vram_budget_bytes=2 * unit_bytes,
     ), torch.inference_mode():
+        torch.testing.assert_close(model_a(x).cpu(), expected_a, rtol=0, atol=0)
         torch.testing.assert_close(model_a(x).cpu(), expected_a, rtol=0, atol=0)
     assert peer_evicts == 0
     assert peer_bytes[0] == 3 * unit_bytes

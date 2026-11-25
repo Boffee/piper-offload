@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 
@@ -12,6 +13,10 @@ from .host_module import HostModuleLoadPlan, HostModuleTarget
 from .module_names import group_names
 from .offload_config import validate_vram_budget
 from .target_lease import CudaTargetLease
+
+
+class _CapacityClaim(Protocol):
+    def release(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,12 +131,12 @@ class ElasticVramPool:
         *,
         vram_budget_bytes: int | None,
         budget_fn: Callable[[], int | None] | None = None,
-        request_bytes_fn: Callable[[int], int | None] | None = None,
+        claim_bytes_fn: Callable[[int], _CapacityClaim | None] | None = None,
     ) -> None:
         self._device = device
         self._budget_bytes = validate_vram_budget(vram_budget_bytes)
         self._budget_fn = budget_fn
-        self._request_bytes_fn = request_bytes_fn
+        self._claim_bytes_fn = claim_bytes_fn
         self._lock = threading.Lock()
         self._slots: list[VramSlot] = []
         self._seq = 0
@@ -140,12 +145,12 @@ class ElasticVramPool:
         self,
         *,
         budget_fn: Callable[[], int | None] | None,
-        request_bytes_fn: Callable[[int], int | None] | None,
+        claim_bytes_fn: Callable[[int], _CapacityClaim | None] | None,
     ) -> None:
-        """Bind dynamic budget ceiling/request callbacks prior to pool use."""
+        """Bind dynamic budget ceiling/claim callbacks prior to pool use."""
         with self._lock:
             self._budget_fn = budget_fn
-            self._request_bytes_fn = request_bytes_fn
+            self._claim_bytes_fn = claim_bytes_fn
 
     def _dynamic_budget_bytes(self) -> int | None:
         dynamic = None if self._budget_fn is None else self._budget_fn()
@@ -171,6 +176,15 @@ class ElasticVramPool:
 
     def _used_bytes_locked(self) -> int:
         return sum(slot.nbytes for slot in self._slots)
+
+    def _checked_out_bytes_locked(self) -> int:
+        return sum(slot.nbytes for slot in self._slots if slot.checked_out)
+
+    def _checkout_slot_locked(self, slot: VramSlot) -> VramSlot:
+        slot.staged_unit_idx = None
+        slot.checked_out = True
+        slot.last_used_seq = self._next_seq()
+        return slot
 
     @property
     def live_slot_count(self) -> int:
@@ -417,6 +431,251 @@ class ElasticVramPool:
                 return slot
         return None
 
+    def _reclaim_for_budget_locked(
+        self,
+        sig: UnitSignature,
+        *,
+        needed_bytes: int,
+        target_budget: int,
+        ceiling: int | None,
+        distance_fn: Callable[[int], float],
+    ) -> VramSlot | None:
+        while self._used_bytes_locked() + needed_bytes > target_budget:
+            idle = self._idle_slots()
+            if not idle:
+                break
+            victim = self._pick_victim(idle, distance_fn)
+            if (
+                victim.signature == sig
+                and self._used_bytes_locked() <= target_budget
+                and (ceiling is None or self._used_bytes_locked() <= ceiling)
+            ):
+                return self._checkout_slot_locked(victim)
+            self._close_slot(victim)
+        return None
+
+    def _try_streaming_reuse_locked(
+        self,
+        sig: UnitSignature,
+        *,
+        distance_fn: Callable[[int], float],
+        is_lookahead: bool,
+    ) -> tuple[VramSlot | None, bool, bool]:
+        matching_idle = [s for s in self._idle_slots() if s.signature == sig]
+        if matching_idle:
+            slot = self._pick_victim(matching_idle, distance_fn)
+            self._trim_to_budget_locked(distance_fn, budget=None, exclude=slot)
+            return self._checkout_slot_locked(slot), False, True
+        while len(self._slots) >= 2:
+            idle = self._idle_slots()
+            if not idle:
+                if is_lookahead:
+                    return None, False, True
+                raise RuntimeError(
+                    "Streaming VRAM pool ceiling (2 slots) reached with no idle slot."
+                )
+            self._close_slot(self._pick_victim(idle, distance_fn))
+        return None, False, False
+
+    def _try_budgeted_reuse_locked(
+        self,
+        sig: UnitSignature,
+        *,
+        distance_fn: Callable[[int], float],
+        is_lookahead: bool,
+        needed_bytes: int,
+        budget: int,
+    ) -> tuple[VramSlot | None, bool, bool]:
+        self._trim_to_budget_locked(distance_fn, budget=budget)
+        unstaged = [
+            s
+            for s in self._idle_slots()
+            if s.signature == sig and (s.staged_unit_idx is None or not s.lease.is_staged)
+        ]
+        if unstaged and self._used_bytes_locked() <= budget:
+            return self._checkout_slot_locked(unstaged[0]), False, True
+        if self._budget_bytes is not None:
+            if (
+                is_lookahead
+                and self._checked_out_bytes_locked() + needed_bytes > self._budget_bytes
+            ):
+                return None, False, True
+            reused = self._reclaim_for_budget_locked(
+                sig,
+                needed_bytes=needed_bytes,
+                target_budget=self._budget_bytes,
+                ceiling=budget,
+                distance_fn=distance_fn,
+            )
+            if reused is not None:
+                return reused, False, True
+            if is_lookahead and self._used_bytes_locked() + needed_bytes > self._budget_bytes:
+                return None, False, True
+        return None, False, False
+
+    def _try_local_reuse_locked(
+        self,
+        unit_idx: int,
+        sig: UnitSignature,
+        *,
+        distance_fn: Callable[[int], float],
+        is_lookahead: bool,
+        needed_bytes: int,
+        budget: int | None,
+    ) -> tuple[VramSlot | None, bool, bool]:
+        hit = self._find_cached_hit_locked(unit_idx, distance_fn, budget=budget)
+        if hit is not None:
+            return hit, True, True
+        if budget is None:
+            return self._try_streaming_reuse_locked(
+                sig,
+                distance_fn=distance_fn,
+                is_lookahead=is_lookahead,
+            )
+        return self._try_budgeted_reuse_locked(
+            sig,
+            distance_fn=distance_fn,
+            is_lookahead=is_lookahead,
+            needed_bytes=needed_bytes,
+            budget=budget,
+        )
+
+    def _allocate_under_claim_locked(
+        self,
+        unit_idx: int,
+        sig: UnitSignature,
+        plan: HostModuleLoadPlan,
+        stream: torch.cuda.Stream,
+        *,
+        distance_fn: Callable[[int], float],
+        is_lookahead: bool,
+        needed_bytes: int,
+        was_streaming: bool,
+    ) -> tuple[VramSlot | None, bool]:
+        hit = self._find_cached_hit_locked(unit_idx, distance_fn, budget=self._budget_bytes)
+        if hit is not None:
+            return hit, True
+        if self._budget_bytes is not None:
+            self._trim_to_budget_locked(distance_fn, budget=self._budget_bytes)
+            if is_lookahead and self._checked_out_bytes_locked() + needed_bytes > self._budget_bytes:
+                return None, False
+            reused = self._reclaim_for_budget_locked(
+                sig,
+                needed_bytes=needed_bytes,
+                target_budget=self._budget_bytes,
+                ceiling=self._budget_bytes,
+                distance_fn=distance_fn,
+            )
+            if reused is not None:
+                return reused, False
+            if is_lookahead and self._used_bytes_locked() + needed_bytes > self._budget_bytes:
+                return None, False
+        elif was_streaming:
+            while len(self._slots) >= 2:
+                idle = self._idle_slots()
+                if not idle:
+                    if is_lookahead:
+                        return None, False
+                    break
+                self._close_slot(self._pick_victim(idle, distance_fn))
+        return self._allocate_slot(plan, sig, stream), False
+
+    def _reclaim_own_slots_on_denial_locked(
+        self,
+        unit_idx: int,
+        sig: UnitSignature,
+        *,
+        distance_fn: Callable[[int], float],
+        is_lookahead: bool,
+        needed_bytes: int,
+        eff_budget: int | None,
+    ) -> tuple[VramSlot | None, bool, int, bool]:
+        before_used = self._used_bytes_locked()
+        hit = self._find_cached_hit_locked(unit_idx, distance_fn, budget=eff_budget)
+        if hit is not None:
+            return hit, True, 0, False
+        if eff_budget is not None:
+            self._trim_to_budget_locked(distance_fn, budget=eff_budget)
+            if is_lookahead and self._checked_out_bytes_locked() + needed_bytes > eff_budget:
+                return None, False, 0, True
+        while before_used - self._used_bytes_locked() < needed_bytes:
+            idle = self._idle_slots()
+            if not idle:
+                break
+            victim = self._pick_victim(idle, distance_fn)
+            if victim.signature == sig and (
+                eff_budget is None or self._used_bytes_locked() <= eff_budget
+            ):
+                return self._checkout_slot_locked(victim), False, 0, False
+            self._close_slot(victim)
+        return None, False, max(0, before_used - self._used_bytes_locked()), False
+
+    def _checkout_with_claim(
+        self,
+        unit_idx: int,
+        sig: UnitSignature,
+        plan: HostModuleLoadPlan,
+        stream: torch.cuda.Stream,
+        *,
+        distance_fn: Callable[[int], float],
+        is_lookahead: bool,
+        needed_bytes: int,
+        claim_fn: Callable[[int], _CapacityClaim | None],
+    ) -> tuple[VramSlot | None, bool]:
+        budget = self.budget_bytes
+        with self._lock:
+            slot, hit, handled = self._try_local_reuse_locked(
+                unit_idx,
+                sig,
+                distance_fn=distance_fn,
+                is_lookahead=is_lookahead,
+                needed_bytes=needed_bytes,
+                budget=budget,
+            )
+        if handled:
+            return slot, hit
+
+        was_streaming = budget is None
+        while True:
+            claim = claim_fn(needed_bytes)
+            if claim is not None:
+                try:
+                    with self._lock:
+                        return self._allocate_under_claim_locked(
+                            unit_idx,
+                            sig,
+                            plan,
+                            stream,
+                            distance_fn=distance_fn,
+                            is_lookahead=is_lookahead,
+                            needed_bytes=needed_bytes,
+                            was_streaming=was_streaming,
+                        )
+                finally:
+                    claim.release()
+
+            eff_budget = self.budget_bytes
+            with self._lock:
+                slot, hit, freed_own, exhausted = self._reclaim_own_slots_on_denial_locked(
+                    unit_idx,
+                    sig,
+                    distance_fn=distance_fn,
+                    is_lookahead=is_lookahead,
+                    needed_bytes=needed_bytes,
+                    eff_budget=eff_budget,
+                )
+            if slot is not None:
+                return slot, hit
+            if exhausted:
+                return None, False
+            if freed_own <= 0:
+                break
+
+        if is_lookahead:
+            return None, False
+        with self._lock:
+            return self._allocate_slot(plan, sig, stream), False
+
     def checkout(
         self,
         unit_idx: int,
@@ -434,32 +693,20 @@ class ElasticVramPool:
         """
         sig = plan_target_signature(plan)
         needed_bytes = estimate_plan_gpu_bytes(plan)
-        dynamic = self._dynamic_budget_bytes()
-        if (
-            self._request_bytes_fn is not None
-            and dynamic is not None
-            and not self.has_cached_unit(unit_idx)
-        ):
-            slots = tuple(self._slots)
-            used = sum(s.nbytes for s in slots)
-            skip_for_static_lookahead = False
-            if is_lookahead and self._budget_bytes is not None:
-                checked_out_bytes = sum(s.nbytes for s in slots if s.checked_out)
-                if checked_out_bytes + needed_bytes > self._budget_bytes:
-                    skip_for_static_lookahead = True
-            desired_total = used + needed_bytes
-            if self._budget_bytes is not None:
-                desired_total = min(self._budget_bytes, desired_total)
-            request_delta = max(0, desired_total - used)
-            if (
-                not skip_for_static_lookahead
-                and desired_total > dynamic
-                and request_delta > 0
-            ):
-                self._request_bytes_fn(request_delta)
-                dynamic = self._dynamic_budget_bytes()
-        budget = self._combine_budget(dynamic)
+        claim_fn = self._claim_bytes_fn
+        if claim_fn is not None:
+            return self._checkout_with_claim(
+                unit_idx,
+                sig,
+                plan,
+                stream,
+                distance_fn=distance_fn,
+                is_lookahead=is_lookahead,
+                needed_bytes=needed_bytes,
+                claim_fn=claim_fn,
+            )
 
+        budget = self.budget_bytes
         with self._lock:
             hit = self._find_cached_hit_locked(unit_idx, distance_fn, budget=budget)
             if hit is not None:

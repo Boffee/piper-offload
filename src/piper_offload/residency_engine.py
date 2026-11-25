@@ -567,7 +567,7 @@ class ResidencyEngine:
             self._budget_handle = handle
             pool.set_budget_callbacks(
                 budget_fn=handle.ceiling_bytes,
-                request_bytes_fn=handle.request_bytes,
+                claim_bytes_fn=handle.try_claim,
             )
         self._pool = pool
 
