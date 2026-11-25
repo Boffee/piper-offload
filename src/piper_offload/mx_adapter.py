@@ -27,6 +27,7 @@ from typing import Any, Literal
 
 import torch
 
+from ._block_scale_projection import project_block_scaled_storage
 from ._dense_merge import merge_dense_requantize_
 from ._torchao_mx import (
     create_mx_tensor,
@@ -37,7 +38,11 @@ from ._torchao_mx import (
     validate_layout,
 )
 from .tensor_adapters import metadata_key
-from .torchao_structured_adapter import TorchaoStructuredAdapter, copy_storage_into
+from .torchao_structured_adapter import (
+    TorchaoHost,
+    TorchaoStructuredAdapter,
+    copy_storage_into,
+)
 
 try:
     from ._triton_mx_lora import (
@@ -280,6 +285,42 @@ class MxAdapter(TorchaoStructuredAdapter[_MxMeta]):
     @staticmethod
     def _compute_dtype(t: Any) -> torch.dtype:  # noqa: ANN401
         return t.orig_dtype
+
+    @classmethod
+    def project_shard(
+        cls,
+        state: TorchaoHost[_MxMeta],
+        *,
+        offsets: tuple[int, ...],
+        local_shape: tuple[int, ...],
+    ) -> tuple[TorchaoHost[_MxMeta], tuple[object, ...]]:
+        """Project a zero-copy ``MXTensor`` shard from ``state``."""
+        qdata, scale = state.storage
+        if qdata is None or scale is None:
+            raise RuntimeError(f"{cls.__name__} host state is missing qdata or scale.")
+        q_view, scale_view, target_q_shape, target_scale_shape = (
+            project_block_scaled_storage(
+                adapter_name_label=cls.__name__,
+                qdata=qdata,
+                scale=scale,
+                logical_shape=state.logical_shape,
+                offsets=offsets,
+                local_shape=local_shape,
+                block_size=state.meta.block_size,
+                is_packed_fp4=(
+                    _FP4_ELEM_DTYPE is not None
+                    and state.meta.elem_dtype == _FP4_ELEM_DTYPE
+                ),
+                is_swizzled_scales=state.meta.is_swizzled_scales,
+                per_leading_swizzle_tiles=False,
+            )
+        )
+        return cls._finalize_projected_shard(
+            (q_view, scale_view),
+            state.meta,
+            local_shape,
+            target_shapes=(target_q_shape, target_scale_shape),
+        )
 
     # --- capabilities beyond inference movement ---------------------------
 

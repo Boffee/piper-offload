@@ -1,6 +1,7 @@
 """Tests for ``piper_offload.host_param.HostParam``."""
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -488,3 +489,385 @@ class TestDTensorProjection:
 
         with ParallelExecutor(["cpu", "cpu"]) as ex:
             ex.run(verify)
+
+def _make_meta_shard_dtensor(
+    mesh: object,
+    global_shape: tuple[int, ...],
+    local_shape: tuple[int, ...],
+    placements: list[object],
+) -> nn.Parameter:
+    from torch.distributed.tensor import DTensor
+
+    stride = tuple(
+        1 if i == len(global_shape) - 1 else int(torch.tensor(global_shape[i + 1 :]).prod().item())
+        for i in range(len(global_shape))
+    )
+    dt = DTensor.from_local(
+        torch.empty(local_shape, device="meta"),
+        mesh,
+        placements,
+        shape=global_shape,
+        stride=stride,
+        run_check=False,
+    )
+    return nn.Parameter(dt, requires_grad=False)
+
+
+def _build_convrot_nvfp4_high_first(rows: int = 128, cols: int = 128, group_size: int = 64) -> torch.Tensor:
+    nvfp4_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
+    convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.nvfp4")
+    nv_w = torch.randn(rows, cols, dtype=torch.bfloat16)
+    nv_base = nvfp4_mod.NVFP4Tensor.to_nvfp4(
+        nv_w,
+        per_tensor_scale=nvfp4_mod.per_tensor_amax_to_scale(nv_w.abs().amax().to(torch.float32)),
+        is_swizzled_scales=True,
+        use_triton_kernel=False,
+        act_quant_kwargs=nvfp4_mod.QuantizeTensorToNVFP4Kwargs(
+            block_size=16, is_swizzled_scales=True, use_dynamic_per_tensor_scale=True, use_triton_kernel=False
+        ),
+    )
+    cr_raw = convrot_mod.ConvRotNVFP4Tensor.from_torchao(nv_base, group_size=group_size)
+    return convrot_mod.ConvRotNVFP4Tensor(
+        (((cr_raw.qdata & 0x0F) << 4) | (cr_raw.qdata >> 4)).to(torch.uint8),
+        cr_raw.scale,
+        cr_raw.block_size,
+        cr_raw.orig_dtype,
+        cr_raw.group_size,
+        cr_raw.per_tensor_scale,
+        torch.tensor(0.25, dtype=torch.float32),
+        cr_raw.is_swizzled_scales,
+        cr_raw.use_triton_kernel,
+        cr_raw.act_quant_kwargs,
+        high_first=True,
+    )
+
+
+def _reconstruct_projected_cpu(adapter_cls: Any, state: Any) -> torch.Tensor:
+    slots: list[torch.Tensor | None] = []
+    targets = state.target_shapes
+    for idx, tensor in enumerate(state.storage):
+        if tensor is None:
+            slots.append(None)
+            continue
+        t_shape = None if targets is None else targets[idx]
+        contiguous = tensor.contiguous()
+        slots.append(contiguous if t_shape is None else contiguous.view(t_shape))
+    return adapter_cls._reconstruct(tuple(slots), state.meta)
+
+
+def _assert_unbound_projected_merge_rejected(projected_param: nn.Parameter) -> None:
+    from piper_offload import Adapter, ParameterDelta, merge_adapter
+
+    unbound = nn.Module()
+    unbound.w = projected_param
+    delta = Adapter(
+        {"w": ParameterDelta.from_tensors(dense=torch.randn(128, 128, dtype=torch.bfloat16) * 0.02)}
+    )
+    with pytest.raises(ValueError, match="Permanent updates to projected quantized shards are unsupported"):
+        merge_adapter(unbound, [(delta, 0.5)])
+
+
+def _assert_mx_shard_rejections(mx_mod: Any) -> None:
+    from piper_offload.mx_adapter import MxAdapter
+    from piper_offload.torchao_structured_adapter import TorchaoHost
+
+    mx_swiz = MxAdapter.capture_host(
+        mx_mod.MXTensor.to_mx(
+            torch.randn(256, 256, dtype=torch.bfloat16), torch.float8_e4m3fn, block_size=32, is_swizzled_scales=True
+        )
+    )
+    mx_unswiz = MxAdapter.capture_host(
+        mx_mod.MXTensor.to_mx(
+            torch.randn(64, 64, dtype=torch.bfloat16), torch.float8_e4m3fn, block_size=32, is_swizzled_scales=False
+        )
+    )
+    with pytest.raises(ValueError, match="empty shard"):
+        MxAdapter.project_shard(mx_swiz, offsets=(0, 0), local_shape=(0, 256))
+    with pytest.raises(ValueError, match="block_size must be positive"):
+        bad_bs = TorchaoHost(storage=mx_unswiz.storage, meta=type(mx_unswiz.meta)(
+            mx_unswiz.meta.elem_dtype, 0, mx_unswiz.meta.orig_dtype,
+            mx_unswiz.meta.kernel_preference, mx_unswiz.meta.act_quant_kwargs, False,
+        ), logical_shape=mx_unswiz.logical_shape)
+        MxAdapter.project_shard(bad_bs, offsets=(0, 0), local_shape=(64, 64))
+    with pytest.raises(ValueError, match="block_size"):
+        MxAdapter.project_shard(mx_unswiz, offsets=(0, 16), local_shape=(64, 16))
+    with pytest.raises(ValueError, match=r"swizzled Shard\(0\)"):
+        MxAdapter.project_shard(mx_swiz, offsets=(0, 0), local_shape=(64, 256))
+    with pytest.raises(ValueError, match=r"swizzled Shard\(1\)"):
+        MxAdapter.project_shard(mx_swiz, offsets=(0, 0), local_shape=(256, 64))
+    bad_mx = TorchaoHost(
+        storage=(mx_swiz.storage[0].t(), mx_swiz.storage[1]), meta=mx_swiz.meta, logical_shape=mx_swiz.logical_shape
+    )
+    with pytest.raises(ValueError, match="contiguous"):
+        MxAdapter.project_shard(bad_mx, offsets=(0, 0), local_shape=(128, 256))
+    for shape, local in (((2, 255, 128), (1, 255, 128)), ((4, 100, 128), (2, 100, 128))):
+        mx_nd = MxAdapter.capture_host(
+            mx_mod.MXTensor.to_mx(
+                torch.randn(*shape, dtype=torch.bfloat16), torch.float8_e4m3fn, block_size=32, is_swizzled_scales=True
+            )
+        )
+        with pytest.raises(ValueError, match="flattened N-D swizzled scales"):
+            MxAdapter.project_shard(mx_nd, offsets=(shape[0] // 2, 0, 0), local_shape=local)
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is not None:
+        mx_fp4 = MxAdapter.capture_host(
+            mx_mod.MXTensor.to_mx(
+                torch.randn(64, 64, dtype=torch.bfloat16), fp4_dtype, block_size=32, is_swizzled_scales=False
+            )
+        )
+        with pytest.raises(ValueError, match="even for packed FP4"):
+            MxAdapter.project_shard(mx_fp4, offsets=(0, 1), local_shape=(64, 31))
+
+
+def _assert_nvfp4_and_convrot_rejections(nv_mod: Any, cr_mod: Any) -> None:
+    from dataclasses import replace
+
+    from piper_offload.nvfp4_adapter import Nvfp4Adapter
+    from piper_offload.piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
+    from piper_offload.torchao_structured_adapter import TorchaoHost
+
+    piper_nv = pytest.importorskip("piper_kernels.weights.nvfp4")
+    nv_swiz = Nvfp4Adapter.capture_host(
+        nv_mod.NVFP4Tensor.to_nvfp4(torch.randn(256, 128, dtype=torch.bfloat16), is_swizzled_scales=True)
+    )
+    with pytest.raises(ValueError, match="block_size"):
+        Nvfp4Adapter.project_shard(nv_swiz, offsets=(0, 8), local_shape=(256, 8))
+    with pytest.raises(ValueError, match=r"swizzled Shard\(0\)"):
+        Nvfp4Adapter.project_shard(nv_swiz, offsets=(0, 0), local_shape=(64, 128))
+    with pytest.raises(ValueError, match=r"swizzled Shard\(1\)"):
+        Nvfp4Adapter.project_shard(nv_swiz, offsets=(0, 0), local_shape=(256, 32))
+    nv_nd = Nvfp4Adapter.capture_host(
+        nv_mod.NVFP4Tensor.to_nvfp4(torch.randn(2, 255, 128, dtype=torch.bfloat16), is_swizzled_scales=True)
+    )
+    with pytest.raises(ValueError, match="flattened N-D swizzled scales"):
+        Nvfp4Adapter.project_shard(nv_nd, offsets=(1, 0, 0), local_shape=(1, 255, 128))
+
+    b4 = nv_mod.NVFP4Tensor.to_nvfp4(torch.randn(4, 100, 128, dtype=torch.bfloat16), is_swizzled_scales=True)
+    p4_state = Nvfp4Adapter.capture_host(piper_nv.PiperNVFP4Tensor(
+        b4.qdata.view(2, 2, 100, 64), b4.scale.view(2, 2, *b4.scale.shape[1:]), b4.block_size, b4.orig_dtype,
+        None, None, True, False, None,
+    ))
+    with pytest.raises(ValueError, match="flattened N-D swizzled scales"):
+        Nvfp4Adapter.project_shard(p4_state, offsets=(1, 0, 0, 0), local_shape=(1, 2, 100, 128))
+
+    for bad_pts in (torch.tensor([1.0]), torch.tensor([[1.0]]), torch.ones(4)):
+        bad_nv = TorchaoHost(
+            storage=(b4.qdata, b4.scale, bad_pts, None), meta=p4_state.meta, logical_shape=(4, 100, 128)
+        )
+        with pytest.raises(ValueError, match="per_tensor_scale shape"):
+            Nvfp4Adapter.project_shard(bad_nv, offsets=(0, 0, 0), local_shape=(2, 100, 128))
+
+    bad_act = TorchaoHost(
+        storage=(nv_swiz.storage[0], nv_swiz.storage[1], None, torch.ones(2, 1, 1)),
+        meta=nv_swiz.meta,
+        logical_shape=nv_swiz.logical_shape,
+    )
+    with pytest.raises(ValueError, match="act_per_tensor_scale shape"):
+        Nvfp4Adapter.project_shard(bad_act, offsets=(0, 0), local_shape=(128, 128))
+
+    cr = PiperConvRotNVFP4Adapter.capture_host(cr_mod.ConvRotNVFP4Tensor.from_torchao(
+        nv_mod.NVFP4Tensor.to_nvfp4(torch.randn(256, 128, dtype=torch.bfloat16), is_swizzled_scales=False),
+        group_size=64,
+    ))
+    with pytest.raises(ValueError, match="rotation group_size"):
+        PiperConvRotNVFP4Adapter.project_shard(cr, offsets=(0, 16), local_shape=(256, 32))
+    with pytest.raises(ValueError, match="group_size must be positive"):
+        bad_cr = TorchaoHost(storage=cr.storage, meta=replace(cr.meta, group_size=0), logical_shape=cr.logical_shape)
+        PiperConvRotNVFP4Adapter.project_shard(bad_cr, offsets=(0, 0), local_shape=(256, 64))
+    with pytest.raises(ValueError, match="only supports 2-D"):
+        PiperConvRotNVFP4Adapter.project_shard(
+            TorchaoHost(storage=cr.storage, meta=cr.meta, logical_shape=(2, 128, 128)),
+            offsets=(0, 0, 0),
+            local_shape=(1, 128, 128),
+        )
+    with pytest.raises(ValueError, match="negative dimensions"):
+        Nvfp4Adapter._finalize_projected_shard(
+            nv_swiz.storage, nv_swiz.meta, nv_swiz.logical_shape, target_shapes=((-256, -64), None, None, None)
+        )
+
+
+class TestDTensorProjectionPacked:
+    def test_project_dtensor_mx_and_convrot_nvfp4_shards(self) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        pytest.importorskip("numpy")
+        mx_mod = pytest.importorskip("torchao.prototype.mx_formats.mx_tensor")
+        from torch.distributed.tensor import Shard, init_device_mesh
+
+        from piper_offload import requires_activation
+        from piper_offload.parallel import ParallelExecutor
+
+        torch.manual_seed(7)
+        fp8_mx = mx_mod.MXTensor.to_mx(
+            torch.randn(64, 64, dtype=torch.bfloat16), torch.float8_e4m3fn, block_size=32, is_swizzled_scales=False
+        )
+        fp8_hp = HostParam(fp8_mx)
+        fp8_ptrs = tuple(t.untyped_storage().data_ptr() for t in fp8_hp.storage_tensors())
+
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        packed_hp = (
+            None
+            if fp4_dtype is None
+            else HostParam(
+                mx_mod.MXTensor.to_mx(
+                    torch.randn(256, 256, dtype=torch.bfloat16), fp4_dtype, block_size=32, is_swizzled_scales=True
+                )
+            )
+        )
+        packed_ptrs = (
+            () if packed_hp is None else tuple(t.untyped_storage().data_ptr() for t in packed_hp.storage_tensors())
+        )
+        cr_hp = HostParam(_build_convrot_nvfp4_high_first())
+        cr_ptrs = tuple(t.untyped_storage().data_ptr() for t in cr_hp.storage_tensors())
+
+        def verify(rank: int) -> None:
+            mesh = init_device_mesh("cpu", (2,))
+            meta_s0 = _make_meta_shard_dtensor(mesh, (64, 64), (32, 64), [Shard(0)])
+            proj_s0 = HostParam.project_dtensor(fp8_hp, meta_s0).make_cpu_param()
+            assert not requires_activation(proj_s0)
+            s0_loc = proj_s0.to_local()
+            assert tuple(t.untyped_storage().data_ptr() for t in (s0_loc.qdata, s0_loc.scale)) == fp8_ptrs
+            torch.testing.assert_close(
+                s0_loc.dequantize(), fp8_mx.dequantize().chunk(2, dim=0)[rank], rtol=0, atol=0
+            )
+
+            meta_s1 = _make_meta_shard_dtensor(mesh, (64, 64), (64, 32), [Shard(1)])
+            proj_s1_hp = HostParam.project_dtensor(fp8_hp, meta_s1)
+            assert requires_activation(proj_s1_hp.make_cpu_param())
+            assert tuple(t.untyped_storage().data_ptr() for t in proj_s1_hp.storage_tensors()) == fp8_ptrs
+
+            if packed_hp is not None:
+                pm0 = _make_meta_shard_dtensor(mesh, (256, 256), (128, 256), [Shard(0)])
+                p_s0 = HostParam.project_dtensor(packed_hp, pm0).make_cpu_param()
+                assert not requires_activation(p_s0)
+                assert tuple(p_s0.to_local().scale.shape) == (32, 32)
+                pm1 = _make_meta_shard_dtensor(mesh, (256, 256), (256, 128), [Shard(1)])
+                p_s1_hp = HostParam.project_dtensor(packed_hp, pm1)
+                assert requires_activation(p_s1_hp.make_cpu_param())
+                assert tuple(p_s1_hp.storage_tensors()[1].shape) == (2, 1, 512)
+                assert p_s1_hp.host_state.inner_state.target_shapes == ((256, 64), (64, 16))
+                assert tuple(t.untyped_storage().data_ptr() for t in p_s1_hp.storage_tensors()) == packed_ptrs
+
+            cm1 = _make_meta_shard_dtensor(mesh, (128, 128), (128, 64), [Shard(1)])
+            cr_s1_hp = HostParam.project_dtensor(cr_hp, cm1)
+            assert requires_activation(cr_s1_hp.make_cpu_param())
+            assert tuple(t.untyped_storage().data_ptr() for t in cr_s1_hp.storage_tensors()) == cr_ptrs
+            assert cr_s1_hp.host_state.inner_state.meta.high_first is True
+            _assert_unbound_projected_merge_rejected(cr_s1_hp.make_cpu_param())
+
+        with ParallelExecutor(["cpu", "cpu"]) as ex:
+            ex.run(verify)
+
+    def test_project_dtensor_nvfp4_3d_per_expert_and_high_first_shards(self) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        pytest.importorskip("numpy")
+        nvfp4_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
+        piper_nv = pytest.importorskip("piper_kernels.weights.nvfp4")
+        from torch.distributed.device_mesh import DeviceMesh
+        from torch.distributed.tensor import Shard
+
+        from piper_offload import requires_activation
+        from piper_offload.parallel import ParallelExecutor
+
+        torch.manual_seed(17)
+        base_3d = nvfp4_mod.NVFP4Tensor.to_nvfp4(
+            torch.randn(4, 64, 64, dtype=torch.bfloat16),
+            per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
+            is_swizzled_scales=False,
+            use_triton_kernel=False,
+        )
+        nv_3d = piper_nv.PiperNVFP4Tensor(
+            base_3d.qdata,
+            base_3d.scale,
+            base_3d.block_size,
+            base_3d.orig_dtype,
+            torch.tensor([0.2, 0.4, 0.6, 0.8], dtype=torch.float32).view(4, 1, 1),
+            torch.tensor(0.125, dtype=torch.float32),
+            False,
+            False,
+            None,
+            high_first=True,
+        )
+        hp_3d = HostParam(nv_3d)
+        ptrs_3d = tuple(t.untyped_storage().data_ptr() for t in hp_3d.storage_tensors())
+
+        nv_tail = nvfp4_mod.NVFP4Tensor.to_nvfp4(
+            torch.randn(192, 128, dtype=torch.bfloat16),
+            per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+        )
+        hp_tail = HostParam(nv_tail)
+        ptrs_tail = tuple(t.untyped_storage().data_ptr() for t in hp_tail.storage_tensors())
+
+        def verify(_rank: int) -> None:
+            mesh = DeviceMesh("cpu", [[0, 1], [2, 3]], mesh_dim_names=("ep", "tp"))
+            meta_3d = _make_meta_shard_dtensor(mesh, (4, 64, 64), (2, 64, 32), [Shard(0), Shard(2)])
+            proj_3d = HostParam.project_dtensor(hp_3d, meta_3d)
+            assert requires_activation(proj_3d.make_cpu_param())
+            assert tuple(t.untyped_storage().data_ptr() for t in proj_3d.storage_tensors()) == ptrs_3d
+            assert tuple(proj_3d.storage_tensors()[2].shape) == (2, 1, 1)
+            assert proj_3d.host_state.inner_state.meta.high_first is True
+
+            meta_tail = _make_meta_shard_dtensor(mesh["tp"], (192, 128), (192, 64), [Shard(1)])
+            proj_tail = HostParam.project_dtensor(hp_tail, meta_tail)
+            assert requires_activation(proj_tail.make_cpu_param())
+            assert tuple(t.untyped_storage().data_ptr() for t in proj_tail.storage_tensors()) == ptrs_tail
+            assert tuple(proj_tail.storage_tensors()[1].shape) == (2, 1, 512)
+            assert proj_tail.host_state.inner_state.target_shapes == ((192, 32), (64, 16), (), None)
+
+        with ParallelExecutor(["cpu"] * 4) as ex:
+            ex.run(verify)
+
+    def test_packed_swizzled_shard_projection_rejections(self) -> None:
+        pytest.importorskip("numpy")
+        mx_mod = pytest.importorskip("torchao.prototype.mx_formats.mx_tensor")
+        nv_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
+        cr_mod = pytest.importorskip("piper_kernels.weights.convrot.nvfp4")
+        torch.manual_seed(23)
+        _assert_mx_shard_rejections(mx_mod)
+        _assert_nvfp4_and_convrot_rejections(nv_mod, cr_mod)
+
+    def test_swizzled_quadrant_and_3d_uneven_cpu_dequantize_parity(self) -> None:
+        pytest.importorskip("numpy")
+        mx_mod = pytest.importorskip("torchao.prototype.mx_formats.mx_tensor")
+        nv_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
+        piper_nv = pytest.importorskip("piper_kernels.weights.nvfp4")
+        from piper_offload.mx_adapter import MxAdapter
+        from piper_offload.nvfp4_adapter import Nvfp4Adapter
+
+        torch.manual_seed(29)
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        mx_dt = fp4_dtype if fp4_dtype is not None else torch.float8_e4m3fn
+        mx_w = mx_mod.MXTensor.to_mx(
+            torch.randn(192, 160, dtype=torch.bfloat16), mx_dt, block_size=32, is_swizzled_scales=True
+        )
+        mx_state = MxAdapter.capture_host(mx_w)
+        mx_ref = mx_w.dequantize()
+        for off, loc in (((0, 0), (128, 128)), ((0, 128), (128, 32)), ((128, 0), (64, 128)), ((128, 128), (64, 32))):
+            proj, _ = MxAdapter.project_shard(mx_state, offsets=off, local_shape=loc)
+            rebuilt = _reconstruct_projected_cpu(MxAdapter, proj)
+            ref = mx_ref[off[0] : off[0] + loc[0], off[1] : off[1] + loc[1]]
+            torch.testing.assert_close(rebuilt.dequantize(), ref, rtol=0, atol=0)
+
+        p3_raw = piper_nv.PiperNVFP4Tensor.from_hp(
+            torch.randn(4, 192, 80, dtype=torch.bfloat16),
+            per_tensor_scale=torch.tensor([0.2, 0.4, 0.6, 0.8], dtype=torch.float32).view(4, 1, 1),
+            is_swizzled_scales=True,
+        )
+        p3 = piper_nv.PiperNVFP4Tensor(
+            (((p3_raw.qdata & 0x0F) << 4) | (p3_raw.qdata >> 4)).to(torch.uint8),
+            p3_raw.scale, p3_raw.block_size, p3_raw.orig_dtype, p3_raw.per_tensor_scale,
+            torch.tensor(0.25, dtype=torch.float32), True, False, None, high_first=True,
+        )
+        p3_state = Nvfp4Adapter.capture_host(p3)
+        p3_ref = p3.dequantize()
+        for off, loc in (((2, 128, 64), (2, 64, 16)), ((1, 0, 0), (2, 128, 64))):
+            proj, _ = Nvfp4Adapter.project_shard(p3_state, offsets=off, local_shape=loc)
+            rebuilt = _reconstruct_projected_cpu(Nvfp4Adapter, proj)
+            assert rebuilt.high_first is True
+            assert tuple(rebuilt.per_tensor_scale.shape) == (loc[0], 1, 1)
+            ref = p3_ref[off[0] : off[0] + loc[0], off[1] : off[1] + loc[1], off[2] : off[2] + loc[2]]
+            torch.testing.assert_close(rebuilt.dequantize(), ref, rtol=0, atol=0)
+        _ = nv_mod

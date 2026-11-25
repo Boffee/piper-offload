@@ -24,6 +24,7 @@ from torch import nn
 from ._dtensor import local_shard
 from ._parameter_update import ParameterUpdatePlan, merge_target_id, plan_merge_targets
 from .adapter import Adapter, AdapterTargetUpdates, active_adapter_pairs, group_adapter_updates
+from .composite_component import reserve_shell
 from .host_module import install_parameters
 from .pin_manager import host_pin_manager
 from .tensor_adapter_registry import (
@@ -134,33 +135,36 @@ def merge_adapter(
     active = active_adapter_pairs(adapters)
     if not active:
         return 0
-    params_by_target = dict(model.named_parameters(remove_duplicate=False))
-    updates = group_adapter_updates(active, params_by_target.keys())
-    merge_ops = _build_merge_ops(params_by_target, updates, stochastic_rounding=stochastic_rounding)
+    with reserve_shell(model):
+        params_by_target = dict(model.named_parameters(remove_duplicate=False))
+        updates = group_adapter_updates(active, params_by_target.keys())
+        merge_ops = _build_merge_ops(
+            params_by_target, updates, stochastic_rounding=stochastic_rounding
+        )
 
-    # Preflight every operation before applying any of them. This catches all
-    # expected name, shape, and adapter-capability errors without leaving a
-    # permanently half-merged model.
-    # Validation and application both stage adapter sources onto a CUDA
-    # target asynchronously, so the sources are leased, pageable, until the
-    # device has synchronized; a failed step may already have enqueued copies.
-    # If the synchronization itself fails the context is unusable and no
-    # later call could retry it, so the lease closes with this function.
-    devices = {op.param.device for op in merge_ops if op.param.device.type == "cuda"}
-    sources = (
-        tensor
-        for op in merge_ops
-        if op.plan.update is not None
-        for tensor in op.plan.update.storage_tensors()
-    )
-    with host_pin_manager.acquire(sources, pin=False) if devices else contextlib.nullcontext():
-        try:
-            targets = [op.prepare(params_by_target) for op in merge_ops]
-            for op, target in zip(merge_ops, targets, strict=True):
-                op.apply(model, target)
-        finally:
-            for device in devices:
-                torch.cuda.synchronize(device)
+        # Preflight every operation before applying any of them. This catches all
+        # expected name, shape, and adapter-capability errors without leaving a
+        # permanently half-merged model.
+        # Validation and application both stage adapter sources onto a CUDA
+        # target asynchronously, so the sources are leased, pageable, until the
+        # device has synchronized; a failed step may already have enqueued copies.
+        # If the synchronization itself fails the context is unusable and no
+        # later call could retry it, so the lease closes with this function.
+        devices = {op.param.device for op in merge_ops if op.param.device.type == "cuda"}
+        sources = (
+            tensor
+            for op in merge_ops
+            if op.plan.update is not None
+            for tensor in op.plan.update.storage_tensors()
+        )
+        with host_pin_manager.acquire(sources, pin=False) if devices else contextlib.nullcontext():
+            try:
+                targets = [op.prepare(params_by_target) for op in merge_ops]
+                for op, target in zip(merge_ops, targets, strict=True):
+                    op.apply(model, target)
+            finally:
+                for device in devices:
+                    torch.cuda.synchronize(device)
 
     logger.info("merge_adapter: merged %d unique parameters", len(merge_ops))
     return len(merge_ops)

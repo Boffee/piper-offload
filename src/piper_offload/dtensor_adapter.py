@@ -27,7 +27,8 @@ tensor-parallel concerns out of format-specific quant adapters.
 Dense ``Replicate`` and contiguous ``Shard(dim)`` tensors across 1D and N-D
 meshes can also be projected from a full plain host parameter or a supported
 non-``nn.Parameter``-subclass quantized host parameter (such as TorchAO
-``Float8Tensor`` or 2-D Piper ``ConvRotInt8Tensor`` via
+``Float8Tensor``, ``MXTensor``, ``NVFP4Tensor``, Piper ``PiperNVFP4Tensor``,
+or 2-D Piper ``ConvRotInt8Tensor`` / ``ConvRotNVFP4Tensor`` via
 :class:`~piper_offload.tensor_adapters.ShardProjectionTensorAdapter`). The
 target DTensor supplies only its distributed layout and may use a meta local
 tensor; host storage remains a zero-copy view or alias of the original host
@@ -429,7 +430,7 @@ def _validate_dtensor_wrapping(
                 rebuild_dtensor(local, cpu_mesh, placements, shape, stride),
                 requires_grad=False,
             )
-        except (NotImplementedError, RuntimeError, IndexError) as exc:
+        except (AssertionError, NotImplementedError, RuntimeError, IndexError) as exc:
             raise NotImplementedError(
                 f"DTensor {mode} projection requires a local tensor representation "
                 f"compatible with DTensor wrapping ({type(local).__name__}): {exc}"
@@ -441,7 +442,7 @@ def _validate_dtensor_wrapping(
                 rebuild_dtensor(meta_tensor, cpu_mesh, placements, shape, stride),
                 requires_grad=False,
             )
-        except (NotImplementedError, RuntimeError, IndexError) as exc:
+        except (AssertionError, NotImplementedError, RuntimeError, IndexError) as exc:
             raise NotImplementedError(
                 f"DTensor {mode} projection requires an active local tensor "
                 f"representation compatible with DTensor wrapping ({type(meta_tensor).__name__}): {exc}"

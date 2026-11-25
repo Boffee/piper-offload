@@ -22,11 +22,13 @@ so choosing merge vs routed (non-destructive) LoRA is the caller's
 tradeoff.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
 
+from ._block_scale_projection import project_nvfp4_storage
 from ._dense_merge import merge_dense_requantize_
 from ._torchao_nvfp4 import (
     create_nvfp4_tensor,
@@ -34,10 +36,15 @@ from ._torchao_nvfp4 import (
     is_nvfp4_tensor,
     requantize_nvfp4_tensor,
     require_nvfp4_tensor,
+    uses_per_expert_nvfp4_swizzle,
     validate_layout,
 )
 from .tensor_adapters import metadata_key
-from .torchao_structured_adapter import TorchaoStructuredAdapter, copy_storage_into
+from .torchao_structured_adapter import (
+    TorchaoHost,
+    TorchaoStructuredAdapter,
+    copy_storage_into,
+)
 
 try:
     from ._triton_nvfp4_lora import (
@@ -271,6 +278,34 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
     def _compute_dtype(t: Any) -> torch.dtype:  # noqa: ANN401
         return t.orig_dtype
 
+    @classmethod
+    def project_shard(
+        cls,
+        state: TorchaoHost[_Nvfp4Meta],
+        *,
+        offsets: tuple[int, ...],
+        local_shape: tuple[int, ...],
+    ) -> tuple[TorchaoHost[_Nvfp4Meta], tuple[object, ...]]:
+        """Project a zero-copy NVFP4 shard from ``state``."""
+        storage, target_shapes = project_nvfp4_storage(
+            adapter_name_label=cls.__name__,
+            storage=state.storage,
+            logical_shape=state.logical_shape,
+            offsets=offsets,
+            local_shape=local_shape,
+            block_size=state.meta.block_size,
+            is_swizzled_scales=state.meta.is_swizzled_scales,
+            per_leading_swizzle_tiles=uses_per_expert_nvfp4_swizzle(
+                state.meta.wrapper_type, len(state.logical_shape)
+            ),
+        )
+        return cls._finalize_projected_shard(
+            storage,
+            state.meta,
+            local_shape,
+            target_shapes=target_shapes,
+        )
+
     # --- capabilities beyond inference movement ---------------------------
 
     @staticmethod
@@ -313,6 +348,18 @@ class Nvfp4Adapter(TorchaoStructuredAdapter[_Nvfp4Meta]):
                 f"Cannot merge {label} into an NVFP4 weight with a non-scalar "
                 "per_tensor_scale (e.g. per-expert grouped/MoE scales)"
                 f"{precision}"
+            )
+        if (
+            nv.is_swizzled_scales
+            and nv.ndim >= 3
+            and not uses_per_expert_nvfp4_swizzle(type(nv), nv.ndim)
+            and math.prod(nv.shape[:-2]) > 1
+            and nv.shape[-2] % 128 != 0
+        ):
+            raise ValueError(
+                f"Cannot merge {label} into a flattened N-D swizzled NVFP4 weight "
+                f"with shape {tuple(nv.shape)}: row dimension {nv.shape[-2]} must "
+                "divide evenly by 128 when leading dimensions have size > 1."
             )
 
     @staticmethod

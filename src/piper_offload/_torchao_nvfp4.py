@@ -9,6 +9,7 @@ the adapter only preserves, moves, and (for LoRA merge) re-encodes those
 already-quantized tensors.
 """
 
+import math
 from typing import Any, cast
 
 import torch
@@ -39,6 +40,7 @@ try:
         NVFP4Tensor,
         per_tensor_amax_to_scale,
     )
+    from torchao.prototype.mx_formats.utils import to_blocked
 
     TORCHAO_NVFP4_AVAILABLE = True
 except ImportError:
@@ -47,7 +49,25 @@ except ImportError:
     f4_unpacked_to_f32: Any = None
     pack_uint4: Any = None
     per_tensor_amax_to_scale: Any = None
+    to_blocked: Any = None
     unpack_uint4: Any = None
+
+try:
+    from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor as _PiperNVFP4Tensor
+except ImportError:
+    _PiperNVFP4Tensor = None
+
+
+def is_piper_nvfp4_type(wrapper_type: type[object]) -> bool:
+    """Return whether ``wrapper_type`` is ``PiperNVFP4Tensor`` (or a subclass)."""
+    return isinstance(_PiperNVFP4Tensor, type) and issubclass(
+        wrapper_type, _PiperNVFP4Tensor
+    )
+
+
+def uses_per_expert_nvfp4_swizzle(wrapper_type: type[object], ndim: int) -> bool:
+    """Return whether 128x4 swizzled scales pad each leading slice independently."""
+    return ndim == 3 and is_piper_nvfp4_type(wrapper_type)
 
 
 def is_nvfp4_tensor(t: object) -> bool:
@@ -195,29 +215,62 @@ def requantize_nvfp4_tensor(
         # encodes an all-zero weight identically — every block scale is 0 —
         # so the result is an exact zero tensor.
         per_tensor_scale = per_tensor_amax_to_scale(t.detach().abs().max()).clamp_min(torch.finfo(torch.float32).eps)
+    per_expert_swizzle = nv.is_swizzled_scales and uses_per_expert_nvfp4_swizzle(
+        type(nv), t.ndim
+    )
+    if (
+        nv.is_swizzled_scales
+        and not per_expert_swizzle
+        and t.ndim >= 3
+        and math.prod(t.shape[:-2]) > 1
+        and t.shape[-2] % 128 != 0
+    ):
+        raise ValueError(
+            f"Cannot requantize flattened N-D swizzled NVFP4 tensor with shape "
+            f"{tuple(t.shape)}: row dimension {t.shape[-2]} must divide evenly by "
+            "128 when leading dimensions have size > 1."
+        )
     out = NVFP4Tensor.to_nvfp4(
         t.to(dtype=nv.orig_dtype),
         block_size=nv.block_size,
         per_tensor_scale=per_tensor_scale,
         act_per_tensor_scale=nv.act_per_tensor_scale,
-        is_swizzled_scales=nv.is_swizzled_scales,
+        is_swizzled_scales=False if per_expert_swizzle else nv.is_swizzled_scales,
         use_triton_kernel=False,
         act_quant_kwargs=nv.act_quant_kwargs,
     )
     if rounding_seed is not None:
         _stochastic_recode_nvfp4_(out, t, rounding_seed=rounding_seed)
+    scale = out.scale
+    if per_expert_swizzle:
+        if to_blocked is None:
+            raise RuntimeError("torchao.prototype.mx_formats.utils.to_blocked is required")
+        rows, cols = t.shape[-2:]
+        scale_shape = (
+            t.shape[0],
+            ((rows + 127) // 128) * 32,
+            (((cols // nv.block_size) + 3) // 4) * 16,
+        )
+        scale = torch.stack([to_blocked(expert) for expert in scale]).reshape(scale_shape)
+    out_per_tensor_scale = out.per_tensor_scale
+    if (
+        out_per_tensor_scale is not None
+        and nv.per_tensor_scale is not None
+        and tuple(out_per_tensor_scale.shape) != tuple(nv.per_tensor_scale.shape)
+    ):
+        out_per_tensor_scale = out_per_tensor_scale.reshape(nv.per_tensor_scale.shape)
     high_first = getattr(nv, "high_first", None)
     qdata = out.qdata
     if high_first:
         qdata = _swap_packed_pairs(qdata)
     return create_nvfp4_tensor(
         qdata,
-        out.scale,
+        scale,
         out.block_size,
         out.orig_dtype,
-        out.per_tensor_scale,
+        out_per_tensor_scale,
         out.act_per_tensor_scale,
-        out.is_swizzled_scales,
+        nv.is_swizzled_scales,
         out.use_triton_kernel,
         out.act_quant_kwargs,
         wrapper_type=type(nv),

@@ -1576,3 +1576,359 @@ class TestQuantizedShardProjection:
             assert not mat2.is_inference()
             assert not local_shard(mat1).is_inference()
             assert not local_shard(mat2).is_inference()
+
+def _verify_shard1_streaming_lin(
+    tp_mesh: Any,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    global_shape: tuple[int, int],
+    merge_obj: Adapter,
+) -> None:
+    from torch.distributed.tensor import DTensor, Shard
+
+    from piper_offload import host_pin_manager
+
+    rows, cols = global_shape
+    mod = nn.Module()
+    mod.blocks = nn.ModuleList([
+        nn.Linear(cols, rows, bias=False, dtype=torch.bfloat16).eval().requires_grad_(False),
+        nn.Linear(cols, rows, bias=False, dtype=torch.bfloat16).eval().requires_grad_(False),
+    ])
+    mod.blocks[0].weight = nn.Parameter(w0, requires_grad=False)
+    mod.blocks[1].weight = nn.Parameter(w1, requires_grad=False)
+    store = ModelStore.from_module(mod)
+    shell = nn.Module()
+    shell.blocks = nn.ModuleList([
+        nn.Linear(cols, rows, bias=False, device="meta"),
+        nn.Linear(cols, rows, bias=False, device="meta"),
+    ])
+    for blk in shell.blocks:
+        blk.weight = nn.Parameter(
+            DTensor.from_local(
+                torch.empty(global_shape, device="meta"),
+                tp_mesh,
+                [Shard(1)],
+                shape=global_shape,
+                stride=(cols, 1),
+                run_check=False,
+            ),
+            requires_grad=False,
+        )
+    off = store.bind(
+        shell,
+        OffloadConfig(block_paths=("blocks",), block_mode="streaming"),
+    )
+    try:
+        x = torch.randn(2, cols, device="cuda", dtype=torch.bfloat16)
+        x_dt = DTensor.from_local(x, tp_mesh, [Shard(1)], run_check=False)
+        with activated_model(ModelOffloader.from_module(mod), "cuda") as ref_active, torch.inference_mode():
+            exp0 = ref_active.blocks[0](x)
+        with activated_model(off, "cuda") as active:
+            y0 = active.blocks[0](x_dt).to_local()
+            y1 = active.blocks[1](x_dt).to_local()
+            torch.testing.assert_close(y0, exp0, rtol=4e-2, atol=4e-2)
+            assert torch.isfinite(y1).all()
+        with activated_model(
+            off, "cuda", adapters=[merge_obj], adapter_strengths=[0.5], adapter_mode="merge"
+        ) as active:
+            y0_m = active.blocks[0](x_dt).to_local()
+            assert torch.isfinite(y0_m).all() and not torch.allclose(y0_m, y0, atol=1e-2)
+            assert torch.isfinite(active.blocks[1](x_dt).to_local()).all()
+    finally:
+        off.deactivate()
+        host_pin_manager.clear()
+
+
+class TestPackedAndSwizzledShardProjection:
+    def test_mx_shard_projection_unswizzled_swizzled_and_cuda_lifecycle(self, tp_mesh: Any) -> None:
+        from torchao.prototype.mx_formats.mx_tensor import MXTensor, QuantizeTensorToMXKwargs
+        from torchao.quantization.quantize_.common import KernelPreference
+
+        from piper_offload import host_pin_manager
+        from piper_offload.mx_adapter import MxAdapter
+
+        host_pin_manager.clear()
+        torch.manual_seed(31)
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        elem_dtype = fp4_dtype if fp4_dtype is not None else torch.float8_e4m3fn
+        act_kw = QuantizeTensorToMXKwargs(
+            elem_dtype=elem_dtype, block_size=32, is_swizzled_scales=True, kernel_preference=KernelPreference.EMULATED
+        )
+        w = torch.randn(192, 160, dtype=torch.bfloat16)
+        mx_swiz = MXTensor.to_mx(
+            w,
+            elem_dtype,
+            block_size=32,
+            kernel_preference=KernelPreference.EMULATED,
+            act_quant_kwargs=act_kw,
+            is_swizzled_scales=True,
+        )
+        state = MxAdapter.capture_host(mx_swiz)
+        proj_col, _ = MxAdapter.project_shard(state, offsets=(0, 128), local_shape=(192, 32))
+        assert proj_col.target_shapes == ((192, 16 if fp4_dtype is not None else 32), (64, 16))
+        assert tuple(proj_col.storage[1].shape) == (2, 1, 512)
+        assert proj_col.storage[1].untyped_storage().data_ptr() == state.storage[1].untyped_storage().data_ptr()
+
+        gpu = MxAdapter.alloc_gpu(proj_col, torch.device("cuda"))
+        try:
+            with host_pin_manager.acquire(MxAdapter.storage_tensors(proj_col), pin=True):
+                MxAdapter.copy_to_gpu(proj_col, gpu, non_blocking=True)
+            torch.cuda.synchronize()
+            mx_gpu = MxAdapter.gpu_param(proj_col, gpu).data
+            ref_tail = MXTensor.to_mx(
+                w[:, 128:160].contiguous(),
+                elem_dtype,
+                block_size=32,
+                kernel_preference=KernelPreference.EMULATED,
+                is_swizzled_scales=True,
+            )
+            assert tuple(mx_gpu.scale.shape) == (64, 16)
+            assert torch.equal(mx_gpu.scale.cpu().view(torch.uint8), ref_tail.scale.view(torch.uint8))
+            assert torch.equal(mx_gpu.qdata.cpu().view(torch.uint8), ref_tail.qdata.view(torch.uint8))
+        finally:
+            host_pin_manager.clear()
+
+        u_kw = QuantizeTensorToMXKwargs(
+            elem_dtype=torch.float8_e4m3fn, block_size=32, kernel_preference=KernelPreference.EMULATED
+        )
+        u_mx = MXTensor.to_mx(
+            torch.randn(128, 128, dtype=torch.bfloat16),
+            torch.float8_e4m3fn,
+            block_size=32,
+            kernel_preference=KernelPreference.EMULATED,
+            act_quant_kwargs=u_kw,
+            is_swizzled_scales=False,
+        )
+        u_state = MxAdapter.capture_host(u_mx)
+        u_proj, _ = MxAdapter.project_shard(u_state, offsets=(0, 64), local_shape=(128, 64))
+        assert u_proj.storage[0].untyped_storage().data_ptr() == u_state.storage[0].untyped_storage().data_ptr()
+
+        lin_w0 = MXTensor.to_mx(
+            torch.randn(128, 128, dtype=torch.bfloat16),
+            elem_dtype,
+            block_size=32,
+            kernel_preference=KernelPreference.EMULATED,
+            act_quant_kwargs=act_kw,
+            is_swizzled_scales=True,
+        )
+        lin_w1 = MXTensor.to_mx(
+            torch.randn(128, 128, dtype=torch.bfloat16),
+            elem_dtype,
+            block_size=32,
+            kernel_preference=KernelPreference.EMULATED,
+            act_quant_kwargs=act_kw,
+            is_swizzled_scales=True,
+        )
+        lora = Adapter.from_state_dict({
+            "blocks.0.lora_A.weight": torch.randn(4, 128, dtype=torch.bfloat16) * 0.05,
+            "blocks.0.lora_B.weight": torch.randn(128, 4, dtype=torch.bfloat16) * 0.05,
+        })
+        _verify_shard1_streaming_lin(tp_mesh, lin_w0, lin_w1, (128, 128), lora)
+
+    def test_nvfp4_and_piper_nvfp4_shard_projection_and_cuda_lifecycle(self, tp_mesh: Any) -> None:
+        from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
+        from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+
+        from piper_offload import host_pin_manager
+        from piper_offload.nvfp4_adapter import Nvfp4Adapter
+
+        host_pin_manager.clear()
+        torch.manual_seed(37)
+        w2d = torch.randn(192, 160, dtype=torch.bfloat16)
+        gs2d = torch.tensor(0.5, dtype=torch.float32)
+        nv2d = NVFP4Tensor.to_nvfp4(w2d, per_tensor_scale=gs2d, is_swizzled_scales=True, use_triton_kernel=False)
+        proj2d, _ = Nvfp4Adapter.project_shard(
+            Nvfp4Adapter.capture_host(nv2d), offsets=(0, 128), local_shape=(192, 32)
+        )
+        assert proj2d.target_shapes == ((192, 16), (64, 16), (), None)
+        gpu2d = Nvfp4Adapter.alloc_gpu(proj2d, torch.device("cuda"))
+        Nvfp4Adapter.copy_to_gpu(proj2d, gpu2d, non_blocking=False)
+        nv2d_gpu = Nvfp4Adapter.gpu_param(proj2d, gpu2d).data
+        ref2d = NVFP4Tensor.to_nvfp4(
+            w2d[:, 128:160].contiguous(),
+            per_tensor_scale=gs2d,
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+        )
+        assert torch.equal(nv2d_gpu.scale.cpu().view(torch.uint8), ref2d.scale.view(torch.uint8))
+        assert torch.equal(nv2d_gpu.qdata.cpu().view(torch.uint8), ref2d.qdata.view(torch.uint8))
+
+        base3d = NVFP4Tensor.to_nvfp4(
+            torch.randn(4, 256, 128, dtype=torch.bfloat16),
+            per_tensor_scale=gs2d,
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+        )
+        p3d = PiperNVFP4Tensor(
+            base3d.qdata,
+            base3d.scale,
+            base3d.block_size,
+            base3d.orig_dtype,
+            torch.tensor([0.2, 0.4, 0.6, 0.8], dtype=torch.float32).view(4, 1, 1),
+            torch.tensor(0.25, dtype=torch.float32),
+            True,
+            False,
+            None,
+            high_first=True,
+        )
+        proj3d, _ = Nvfp4Adapter.project_shard(
+            Nvfp4Adapter.capture_host(p3d), offsets=(2, 0, 64), local_shape=(2, 256, 64)
+        )
+        assert proj3d.target_shapes == ((2, 256, 32), (2, 64, 16), (2, 1, 1), ())
+        gpu3d = Nvfp4Adapter.alloc_gpu(proj3d, torch.device("cuda"))
+        try:
+            with host_pin_manager.acquire(Nvfp4Adapter.storage_tensors(proj3d), pin=True):
+                Nvfp4Adapter.copy_to_gpu(proj3d, gpu3d, non_blocking=True)
+            torch.cuda.synchronize()
+            rebuilt = Nvfp4Adapter.gpu_param(proj3d, gpu3d).data
+            assert rebuilt.high_first is True and tuple(rebuilt.scale.shape) == (2, 64, 16)
+            torch.testing.assert_close(rebuilt.dequantize().cpu(), p3d.dequantize()[2:4, :, 64:128], rtol=0, atol=0)
+        finally:
+            host_pin_manager.clear()
+
+        nv_b0 = NVFP4Tensor.to_nvfp4(
+            torch.randn(256, 128, dtype=torch.bfloat16),
+            per_tensor_scale=gs2d,
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+        )
+        nv_b1 = NVFP4Tensor.to_nvfp4(
+            torch.randn(256, 128, dtype=torch.bfloat16),
+            per_tensor_scale=gs2d,
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+        )
+        dense = Adapter(
+            {"blocks.0.weight": ParameterDelta.from_tensors(dense=torch.randn(256, 128, dtype=torch.bfloat16) * 0.02)}
+        )
+        _verify_shard1_streaming_lin(
+            tp_mesh, PiperNVFP4Tensor.from_torchao(nv_b0), PiperNVFP4Tensor.from_torchao(nv_b1), (256, 128), dense
+        )
+
+    def test_convrot_nvfp4_shard_projection_and_cuda_lifecycle(self, tp_mesh: Any) -> None:
+        from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
+        from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+
+        from piper_offload import host_pin_manager
+        from piper_offload.piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
+
+        host_pin_manager.clear()
+        torch.manual_seed(41)
+        cr_unswiz = ConvRotNVFP4Tensor.from_torchao(
+            NVFP4Tensor.to_nvfp4(
+                torch.randn(128, 128, dtype=torch.bfloat16),
+                per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
+                is_swizzled_scales=False,
+                use_triton_kernel=False,
+            ),
+            group_size=64,
+        )
+        u_state = PiperConvRotNVFP4Adapter.capture_host(cr_unswiz)
+        u_s0, _ = PiperConvRotNVFP4Adapter.project_shard(u_state, offsets=(17, 0), local_shape=(19, 128))
+        assert not requires_activation(PiperConvRotNVFP4Adapter.cpu_param(u_s0))
+        u_s1, _ = PiperConvRotNVFP4Adapter.project_shard(u_state, offsets=(0, 64), local_shape=(128, 64))
+        u_gpu = PiperConvRotNVFP4Adapter.alloc_gpu(u_s1, torch.device("cuda"))
+        with host_pin_manager.acquire(PiperConvRotNVFP4Adapter.storage_tensors(u_s1), pin=True):
+            PiperConvRotNVFP4Adapter.copy_to_gpu(u_s1, u_gpu, non_blocking=True)
+        torch.cuda.synchronize()
+        rebuilt_u = PiperConvRotNVFP4Adapter.gpu_param(u_s1, u_gpu).data
+        u_ref = cr_unswiz.dequantize()[:, 64:128]
+        torch.testing.assert_close(rebuilt_u.dequantize().cpu(), u_ref, rtol=0, atol=0)
+        lora_b = torch.randn(128, 4, device="cuda", dtype=torch.bfloat16) * 0.05
+        lora_a = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16) * 0.05
+        PiperConvRotNVFP4Adapter.merge_lora_(rebuilt_u, lora_b, lora_a, 0.5)
+        u_merged = rebuilt_u.dequantize().cpu()
+        assert torch.isfinite(u_merged).all() and not torch.allclose(u_merged, u_ref, atol=1e-2)
+        torch.testing.assert_close(u_merged, u_ref + 0.5 * (lora_b @ lora_a).cpu(), rtol=3e-1, atol=4e-1)
+        host_pin_manager.clear()
+
+        sw_b0 = NVFP4Tensor.to_nvfp4(
+            torch.randn(256, 128, dtype=torch.bfloat16),
+            per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+        )
+        sw_b1 = NVFP4Tensor.to_nvfp4(
+            torch.randn(256, 128, dtype=torch.bfloat16),
+            per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+        )
+        dense = Adapter(
+            {"blocks.0.weight": ParameterDelta.from_tensors(dense=torch.randn(256, 128, dtype=torch.bfloat16) * 0.1)}
+        )
+        _verify_shard1_streaming_lin(
+            tp_mesh,
+            ConvRotNVFP4Tensor.from_torchao(sw_b0, group_size=64),
+            ConvRotNVFP4Tensor.from_torchao(sw_b1, group_size=64),
+            (256, 128),
+            dense,
+        )
+
+    def test_mapped_checkpoint_swizzled_pin_manager_cuda_copy(self, tmp_path: Any) -> None:
+        from torchao.prototype.mx_formats.mx_tensor import MXTensor
+        from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+
+        from piper_offload import MappedCheckpoint, host_pin_manager
+        from piper_offload.mx_adapter import MxAdapter
+        from piper_offload.nvfp4_adapter import Nvfp4Adapter
+        from tests.test_model_store import _write_safetensors
+
+        host_pin_manager.clear()
+        torch.manual_seed(57)
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        mx_dt = fp4_dtype if fp4_dtype is not None else torch.float8_e4m3fn
+        mx_w = MXTensor.to_mx(
+            torch.randn(256, 256, dtype=torch.bfloat16), mx_dt, block_size=32, is_swizzled_scales=True
+        )
+        nv_w = NVFP4Tensor.to_nvfp4(
+            torch.randn(256, 128, dtype=torch.bfloat16),
+            per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+        )
+        ckpt_path = tmp_path / "swiz.safetensors"
+        _write_safetensors(
+            ckpt_path,
+            {
+                "pad": torch.ones(17, dtype=torch.uint8),
+                "mx_q": mx_w.qdata,
+                "mx_s": mx_w.scale,
+                "nv_q": nv_w.qdata,
+                "nv_s": nv_w.scale,
+            },
+        )
+        ckpt = MappedCheckpoint(ckpt_path)
+        try:
+            mx_q = ckpt.get_tensor("mx_q")
+            mx_mapped = MXTensor(
+                mx_q, ckpt.get_tensor("mx_s"), mx_w.elem_dtype, mx_w.block_size, mx_w.orig_dtype,
+                mx_w.kernel_preference, mx_w.act_quant_kwargs, True,
+            )
+            nv_mapped = NVFP4Tensor(
+                ckpt.get_tensor("nv_q"), ckpt.get_tensor("nv_s"), nv_w.block_size, nv_w.orig_dtype,
+                torch.tensor(0.5, dtype=torch.float32), None, True, False, None,
+            )
+            mx_proj, _ = MxAdapter.project_shard(
+                MxAdapter.capture_host(mx_mapped), offsets=(0, 128), local_shape=(256, 128)
+            )
+            nv_proj, _ = Nvfp4Adapter.project_shard(
+                Nvfp4Adapter.capture_host(nv_mapped), offsets=(0, 64), local_shape=(256, 64)
+            )
+            assert mx_proj.storage[1].storage_offset() == 512 and tuple(mx_proj.storage[1].shape) == (2, 1, 512)
+            assert nv_proj.storage[1].storage_offset() == 512 and tuple(nv_proj.storage[1].shape) == (2, 1, 512)
+            mx_gpu = MxAdapter.alloc_gpu(mx_proj, torch.device("cuda"))
+            nv_gpu = Nvfp4Adapter.alloc_gpu(nv_proj, torch.device("cuda"))
+            with host_pin_manager.acquire(
+                (*MxAdapter.storage_tensors(mx_proj), *Nvfp4Adapter.storage_tensors(nv_proj)), pin=True
+            ):
+                MxAdapter.copy_to_gpu(mx_proj, mx_gpu, non_blocking=True)
+                Nvfp4Adapter.copy_to_gpu(nv_proj, nv_gpu, non_blocking=True)
+            torch.cuda.synchronize()
+            mx_rec = MxAdapter.gpu_param(mx_proj, mx_gpu).data
+            nv_rec = Nvfp4Adapter.gpu_param(nv_proj, nv_gpu).data
+            torch.testing.assert_close(mx_rec.dequantize().cpu(), mx_w.dequantize()[:, 128:256], rtol=0, atol=0)
+            torch.testing.assert_close(nv_rec.dequantize().cpu(), nv_w.dequantize()[:, 64:128], rtol=0, atol=0)
+        finally:
+            host_pin_manager.clear()
+            ckpt.close()

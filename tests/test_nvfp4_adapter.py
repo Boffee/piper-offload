@@ -989,3 +989,49 @@ class TestNvfp4Adapter:
             assert y.dtype is torch.bfloat16
         finally:
             offloader.deactivate()
+
+
+def test_3d_piper_nvfp4_swizzled_dense_merge_and_plain_nd_rejection() -> None:
+    pytest.importorskip("numpy")
+    nvfp4_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
+    piper_nv = pytest.importorskip("piper_kernels.weights.nvfp4")
+
+    torch.manual_seed(43)
+    for shape in ((2, 192, 128), (2, 255, 128)):
+        hp_weight = torch.randn(*shape, dtype=torch.bfloat16)
+        piper_t = piper_nv.PiperNVFP4Tensor.from_hp(
+            hp_weight,
+            per_tensor_scale=nvfp4_mod.per_tensor_amax_to_scale(hp_weight.abs().max().to(torch.float32)),
+            is_swizzled_scales=True,
+        )
+        before = piper_t.dequantize()
+        Nvfp4Adapter.validate_dense_merge_target(piper_t)
+        Nvfp4Adapter.merge_dense_(piper_t, torch.zeros_like(hp_weight), 0.0)
+        for expert in range(2):
+            exp_zero = nvfp4_mod.NVFP4Tensor.to_nvfp4(
+                before[expert],
+                per_tensor_scale=piper_t.per_tensor_scale,
+                is_swizzled_scales=True,
+                use_triton_kernel=False,
+            ).dequantize()
+            torch.testing.assert_close(piper_t.dequantize()[expert], exp_zero, rtol=0, atol=0)
+
+        delta = torch.randn_like(hp_weight) * 0.25
+        pre_merge = piper_t.dequantize()
+        Nvfp4Adapter.merge_dense_(piper_t, delta, 0.5)
+        after = piper_t.dequantize()
+        assert torch.isfinite(after).all() and not torch.allclose(after, pre_merge, atol=1e-2)
+        for expert in range(2):
+            exp_merged = nvfp4_mod.NVFP4Tensor.to_nvfp4(
+                pre_merge[expert] + 0.5 * delta[expert],
+                per_tensor_scale=piper_t.per_tensor_scale,
+                is_swizzled_scales=True,
+                use_triton_kernel=False,
+            ).dequantize()
+            torch.testing.assert_close(after[expert], exp_merged, rtol=0, atol=0)
+
+    plain_nd = nvfp4_mod.NVFP4Tensor.to_nvfp4(
+        torch.randn(2, 255, 128, dtype=torch.bfloat16), is_swizzled_scales=True, use_triton_kernel=False
+    )
+    with pytest.raises(ValueError, match="flattened N-D swizzled NVFP4 weight"):
+        Nvfp4Adapter.validate_dense_merge_target(plain_nd)

@@ -272,8 +272,9 @@ Scalar strengths are finite-checked.
 
 ## Make an application permanent
 
-Use `merge_adapter()` on a model before handing it to a cache when the adapter
-should become part of its host weights. Continuing with the factories above:
+Use `merge_adapter()` on an unbound model before handing it to a cache when the
+adapter should become part of its host weights (models or submodules owned by a
+live `ModelOffloader` raise `ValueError`). Continuing with the factories above:
 
 ```python
 from piper_offload import Adapter, merge_adapter

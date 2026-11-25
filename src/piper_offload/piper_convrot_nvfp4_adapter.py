@@ -11,6 +11,7 @@ from typing import Any
 
 import torch
 
+from ._block_scale_projection import project_nvfp4_storage
 from ._piper_convrot_nvfp4 import (
     create_convrot_nvfp4_tensor,
     is_convrot_nvfp4_tensor,
@@ -18,7 +19,7 @@ from ._piper_convrot_nvfp4 import (
     validate_layout,
 )
 from .tensor_adapters import metadata_key
-from .torchao_structured_adapter import TorchaoStructuredAdapter
+from .torchao_structured_adapter import TorchaoHost, TorchaoStructuredAdapter
 
 
 @dataclass(slots=True, frozen=True)
@@ -114,6 +115,48 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
     @staticmethod
     def _compute_dtype(t: Any) -> torch.dtype:  # noqa: ANN401
         return t.orig_dtype
+
+    @classmethod
+    def project_shard(
+        cls,
+        state: TorchaoHost[_PiperConvRotNVFP4Meta],
+        *,
+        offsets: tuple[int, ...],
+        local_shape: tuple[int, ...],
+    ) -> tuple[TorchaoHost[_PiperConvRotNVFP4Meta], tuple[object, ...]]:
+        """Project a zero-copy 2-D ``ConvRotNVFP4Tensor`` shard from ``state``."""
+        if len(state.logical_shape) != 2:
+            raise ValueError(
+                f"{cls.__name__} shard projection only supports 2-D tensors, "
+                f"got shape {state.logical_shape}."
+            )
+        group_size = state.meta.group_size
+        if group_size <= 0:
+            raise ValueError(
+                f"{cls.__name__} rotation group_size must be positive, got {group_size}."
+            )
+        storage, target_shapes = project_nvfp4_storage(
+            adapter_name_label=cls.__name__,
+            storage=state.storage,
+            logical_shape=state.logical_shape,
+            offsets=offsets,
+            local_shape=local_shape,
+            block_size=state.meta.block_size,
+            is_swizzled_scales=state.meta.is_swizzled_scales,
+            per_leading_swizzle_tiles=False,
+        )
+        col_off, local_cols = offsets[1], local_shape[1]
+        if col_off % group_size != 0 or local_cols % group_size != 0:
+            raise ValueError(
+                f"{cls.__name__} Shard(1) offset/width ({col_off}, {local_cols}) "
+                f"must align to rotation group_size {group_size}."
+            )
+        return cls._finalize_projected_shard(
+            storage,
+            state.meta,
+            local_shape,
+            target_shapes=target_shapes,
+        )
 
     @staticmethod
     def dequantize(t: torch.Tensor) -> torch.Tensor:
