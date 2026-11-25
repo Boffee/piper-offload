@@ -15,9 +15,11 @@ import torch
 from torch import nn
 
 from .adapter import AdapterMode, resolve_adapter_strengths
+from .device_transfer import DeviceTransferContext
 from .offload_config import _USE_CONFIG_BUDGET, _UseConfigBudget
 from .resource_cache import ResourceCache
 from .resource_specs import AdapterSpec, ModelSpec
+from .vram_budget import VramBudget
 
 
 class ModelCache(ResourceCache):
@@ -47,12 +49,20 @@ class ModelCache(ResourceCache):
         adapter_mode: AdapterMode = "merge",
         stochastic_rounding: bool = True,
         vram_budget_bytes: int | _UseConfigBudget | None = _USE_CONFIG_BUDGET,
+        vram_budget: VramBudget | None = None,
+        transfer_context: DeviceTransferContext | None = None,
     ) -> Generator[M]:
         """Lease dependencies and activate a cached model runtime.
 
         ``vram_budget_bytes`` optionally overrides the model spec's configured
         ``OffloadConfig.vram_budget_bytes`` for this activation only; omitting
-        it uses the configured default on every run.
+        it uses the configured default on every run. Passing ``vram_budget``
+        (:class:`VramBudget`) on CUDA (ignored on CPU) reserves non-offloaded
+        resident weights (raising :class:`VramBudgetExhaustedError` if they do
+        not fit) and registers offloaded units as a yielding peer tenant capped
+        at ``min(vram_budget_bytes, dynamic_ceiling)``; ``transfer_context``
+        shares an open per-device :class:`DeviceTransferContext` matching
+        ``device``.
         ``adapter_strengths`` defaults to one for each adapter and, when
         supplied, must have the same length as ``adapter_specs``. Repeated resource keys
         contribute once per occurrence. Exact-zero strengths are inactive and
@@ -74,6 +84,8 @@ class ModelCache(ResourceCache):
                 adapter_mode=adapter_mode,
                 stochastic_rounding=stochastic_rounding,
                 vram_budget_bytes=vram_budget_bytes,
+                vram_budget=vram_budget,
+                transfer_context=transfer_context,
             )
             try:
                 yield cast(M, offloader.value)

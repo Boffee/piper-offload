@@ -7,6 +7,25 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Added the shared Layer 1 residency substrate (available from submodules, with user
+  coordination types `VramBudget`, `VramReservation`, `VramBudgetExhaustedError`, and
+  `DeviceTransferContext` exported from top-level `piper_offload`): multi-reader and atomic
+  write-once GPU-born `StreamLease` (`produce_with`, `stream_lease.py`, composed inside
+  `CudaTargetLease`), reusable per-device `DeviceTransferContext` with `ensure_stream()`
+  and borrower reference tracking (`device_transfer.py`), thread-safe `VramBudget` /
+  `VramReservation` / `BudgetTenantHandle` coordinator using live `usage_fn` accounting
+  and opt-in `yield_to_peers` sharing (`vram_budget.py`), thread-safe aligned
+  single-`torch.uint8` `Uint8DualArena` (`blocking_low_slices`) paired with
+  `TypedSidePool` / `StructuredSidePool` / `KvMetadataPool` side pools (`dual_arena.py`),
+  and `BufferSpec` / `GpuAllocator` / `ArenaBindableTensorAdapter` /
+  `SliceableTensorAdapter` contracts (including `RegularAdapter.gpu_specs`, strictly
+  validated `bind_gpu`, and zero-copy `slice_host`).
+- Wired optional `vram_budget` and `transfer_context` parameters into `ResidencyEngine`,
+  `ModelOffloader`, and `ModelCache`, and added re-entrant `no_record_trace()` to
+  `ModelOffloader` and `ResidencyEngine`. CUDA activations given a `VramBudget`
+  automatically reserve resident non-offloaded weights, register offloaded units as a
+  peer-yielding tenant, and coordinate dynamic eviction (`evict_idle_bytes()`) in
+  thread-safe `ElasticVramPool`.
 - Added `auto_offload_paths(model, min_unit_bytes=...)` to automatically
   discover outermost `nn.ModuleList` containers and large callable standalone
   submodules for offloading while skipping non-callable containers and tied

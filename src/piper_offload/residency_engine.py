@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
+import threading
 import weakref
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
@@ -18,14 +20,17 @@ from ._devices import canonical_device
 from ._transfer_priority import background_transfers
 from ._working_set import WorkingSetState
 from .block_compile import BlockCompileConfig, _BlockCompileState
+from .device_transfer import DeviceTransferContext
 from .host_module import HostModuleInstance, HostModuleLoadPlan, ParameterOverride
 from .offload_config import _USE_CONFIG_BUDGET, _UseConfigBudget, validate_vram_budget
 from .target_lease import CudaTargetLease
+from .vram_budget import BudgetTenantHandle, VramBudget, VramReservation
 from .vram_pool import (
     ElasticVramPool,
     VramSlot,
     estimate_plan_gpu_bytes,
     plan_target_signature,
+    target_gpu_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,20 +65,6 @@ def _wait_for_prefetch(future: Future[None]) -> None:
         raise
 
 
-def _shutdown_executor(executor: ThreadPoolExecutor) -> None:
-    """Shut down ``executor`` and wait for its worker thread even if interrupted."""
-    interrupt: BaseException | None = None
-    while True:
-        try:
-            executor.shutdown(wait=True)
-            break
-        except BaseException as exc:
-            if interrupt is None:
-                interrupt = exc
-    if interrupt is not None:
-        raise interrupt
-
-
 class _ExecutionPredictor:
     """Online execution-order trace predictor and Belady MIN distance estimator.
 
@@ -104,6 +95,7 @@ class _ExecutionPredictor:
         self._unit_steps: dict[int, deque[int]] = {}
         self._forecast_offset = 0
         self._rollout_tail: tuple[int, ...] = ()
+        self._lock = threading.Lock()
 
     def _invalidate_forecast(self) -> None:
         self._forecast = None
@@ -128,48 +120,49 @@ class _ExecutionPredictor:
 
     def record(self, unit_idx: int) -> None:
         """Record execution of ``unit_idx`` and advance or invalidate cached distances."""
-        seq = self._seq
-        self._seq += 1
-        hist = self._history
-        hlen = len(hist)
-        changed = False
-        if hlen > 0:
-            tail = tuple(hist[i] for i in range(max(0, hlen - 4), hlen))
-            for k in range(1, len(tail) + 1):
-                changed |= self._update_table(k, tail[-k:], unit_idx, seq)
-        hist.append(unit_idx)
-        if len(hist) > self._max_history:
-            evicted = hist.popleft()
-            evict_seq = seq - self._max_history
-            head = tuple(hist[i] for i in range(min(4, len(hist))))
-            for k in range(1, len(head) + 1):
-                changed |= self._evict_table(
-                    k,
-                    (evicted, *head[: k - 1]),
-                    head[k - 1],
-                    evict_seq + k,
-                )
+        with self._lock:
+            seq = self._seq
+            self._seq += 1
+            hist = self._history
+            hlen = len(hist)
+            changed = False
+            if hlen > 0:
+                tail = tuple(hist[i] for i in range(max(0, hlen - 4), hlen))
+                for k in range(1, len(tail) + 1):
+                    changed |= self._update_table(k, tail[-k:], unit_idx, seq)
+            hist.append(unit_idx)
+            if len(hist) > self._max_history:
+                evicted = hist.popleft()
+                evict_seq = seq - self._max_history
+                head = tuple(hist[i] for i in range(min(4, len(hist))))
+                for k in range(1, len(head) + 1):
+                    changed |= self._evict_table(
+                        k,
+                        (evicted, *head[: k - 1]),
+                        head[k - 1],
+                        evict_seq + k,
+                    )
 
-        if (
-            not changed
-            and self._forecast is not None
-            and len(self._forecast) > 0
-            and len(hist) >= 4
-            and self._forecast[0] == unit_idx
-        ):
-            self._forecast.popleft()
-            old_state = self._forecast_states.popleft()
-            if old_state is not None:
-                self._seen_states.discard(old_state)
-            self._forecast_offset += 1
-            steps = self._unit_steps.get(unit_idx)
-            if steps is not None:
-                steps.popleft()
-                if not steps:
-                    del self._unit_steps[unit_idx]
-            self._extend_forecast()
-        else:
-            self._invalidate_forecast()
+            if (
+                not changed
+                and self._forecast is not None
+                and len(self._forecast) > 0
+                and len(hist) >= 4
+                and self._forecast[0] == unit_idx
+            ):
+                self._forecast.popleft()
+                old_state = self._forecast_states.popleft()
+                if old_state is not None:
+                    self._seen_states.discard(old_state)
+                self._forecast_offset += 1
+                steps = self._unit_steps.get(unit_idx)
+                if steps is not None:
+                    steps.popleft()
+                    if not steps:
+                        del self._unit_steps[unit_idx]
+                self._extend_forecast()
+            else:
+                self._invalidate_forecast()
 
     def _predict_from_tail(self, tail: tuple[int, ...]) -> int:
         for k in range(min(4, len(tail)), 0, -1):
@@ -183,18 +176,19 @@ class _ExecutionPredictor:
 
     def next_after(self, unit_idx: int) -> int | None:
         """Predict the next unit likely to execute after ``unit_idx``."""
-        if self._num_units <= 1:
-            return None
-        hist = self._history
-        if hist and hist[-1] == unit_idx:
-            hlen = len(hist)
-            tail = tuple(hist[i] for i in range(max(0, hlen - 4), hlen))
-        else:
-            tail = (unit_idx,)
-        nxt = self._predict_from_tail(tail)
-        if nxt == unit_idx:
-            return None
-        return nxt
+        with self._lock:
+            if self._num_units <= 1:
+                return None
+            hist = self._history
+            if hist and hist[-1] == unit_idx:
+                hlen = len(hist)
+                tail = tuple(hist[i] for i in range(max(0, hlen - 4), hlen))
+            else:
+                tail = (unit_idx,)
+            nxt = self._predict_from_tail(tail)
+            if nxt == unit_idx:
+                return None
+            return nxt
 
     def _extend_forecast(self) -> None:
         assert self._forecast is not None
@@ -243,11 +237,12 @@ class _ExecutionPredictor:
 
     def distance(self, unit_idx: int) -> float:
         """Estimated forward steps until ``unit_idx`` is next used (``inf`` if far)."""
-        self._ensure_forecast()
-        steps = self._unit_steps.get(unit_idx)
-        if not steps:
-            return float("inf")
-        return float(steps[0] - self._forecast_offset)
+        with self._lock:
+            self._ensure_forecast()
+            steps = self._unit_steps.get(unit_idx)
+            if not steps:
+                return float("inf")
+            return float(steps[0] - self._forecast_offset)
 
 
 @dataclass(slots=True)
@@ -300,6 +295,7 @@ class ResidencyEngine:
 
         self._resident_plan: HostModuleLoadPlan | None = None
         self._resident_lease: CudaTargetLease | None = None
+        self._resident_reservation: VramReservation | None = None
         self._resident_transfer = _pin_manager.TransferLease()
         self._resident_use_hook: torch.utils.hooks.RemovableHandle | None = None
 
@@ -310,9 +306,20 @@ class ResidencyEngine:
         self._lookahead: _LookaheadTask | None = None
         self._pin_lease: _pin_manager.PinLease | None = None
         self._units_transfer = _pin_manager.TransferLease()
-        self._copy_stream: torch.cuda.Stream | None = None
-        self._executor: ThreadPoolExecutor | None = None
+        self._transfer_context: DeviceTransferContext | None = None
+        self._owns_transfer_context = False
+        self._transfer_context_borrowed = False
+        self._budget_handle: BudgetTenantHandle | None = None
+        self._no_record_trace_depth = 0
         self._unit_hooks: list[torch.utils.hooks.RemovableHandle] = []
+
+    @property
+    def _copy_stream(self) -> torch.cuda.Stream | None:
+        return None if self._transfer_context is None else self._transfer_context.copy_stream
+
+    @property
+    def _executor(self) -> ThreadPoolExecutor | None:
+        return None if self._transfer_context is None else self._transfer_context.executor
 
     @property
     def active_device(self) -> torch.device | None:
@@ -357,11 +364,33 @@ class ResidencyEngine:
             self._working_set_state is not WorkingSetState.RELEASED
             or self._block_compile.installed
             or self._resident_lease is not None
+            or self._resident_reservation is not None
             or (self._pool is not None and self._pool.live_slot_count > 0)
             or self._pin_lease is not None
+            or self._budget_handle is not None
+            or (
+                self._owns_transfer_context
+                and self._transfer_context is not None
+                and self._transfer_context.is_open
+            )
+            or self._transfer_context_borrowed
             or self._resident_transfer.open
             or self._units_transfer.open
         )
+
+    @property
+    def is_recording_trace(self) -> bool:
+        """Whether unit forwards currently record execution-trace history."""
+        return self._no_record_trace_depth == 0
+
+    @contextlib.contextmanager
+    def no_record_trace(self) -> Iterator[None]:
+        """Temporarily suppress execution-trace history recording (re-entrant)."""
+        self._no_record_trace_depth += 1
+        try:
+            yield
+        finally:
+            self._no_record_trace_depth -= 1
 
     def _distance_fn(self) -> Callable[[int], float]:
         predictor = self._predictor
@@ -373,6 +402,11 @@ class ResidencyEngine:
         if self._pin_lease is not None:
             self._pin_lease.close()
             self._pin_lease = None
+
+    def _unregister_budget_handle(self) -> None:
+        if self._budget_handle is not None:
+            self._budget_handle.unregister()
+            self._budget_handle = None
 
     def _remove_resident_use_hook(self) -> None:
         hook = self._resident_use_hook
@@ -399,11 +433,10 @@ class ResidencyEngine:
                 self._all_unit_storage_tensors(),
                 pin=True,
             )
-        if self._copy_stream is None:
-            self._copy_stream = torch.cuda.Stream(device=device, priority=-1)
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers=1)
-        return self._copy_stream, self._executor
+        if self._transfer_context is None:
+            self._transfer_context = DeviceTransferContext(device)
+            self._owns_transfer_context = True
+        return self._transfer_context.ensure()
 
     def _install_resident_use_hook(self) -> None:
         if self._resident is None or self._resident_lease is None:
@@ -465,6 +498,8 @@ class ResidencyEngine:
         active_device: torch.device,
         resident_plan: HostModuleLoadPlan | None,
         stream: torch.cuda.Stream,
+        *,
+        vram_budget: VramBudget | None = None,
     ) -> None:
         if (
             resident_plan is None
@@ -472,6 +507,12 @@ class ResidencyEngine:
             or not (resident_plan.loads or self._resident.buffers)
         ):
             return
+        if vram_budget is not None:
+            est_bytes = estimate_plan_gpu_bytes(resident_plan)
+            self._resident_reservation = vram_budget.reserve(
+                est_bytes,
+                name="residency_engine.resident",
+            )
         self._resident_transfer.start(
             _pin_manager.host_pin_manager,
             resident_plan.storage_tensors(),
@@ -483,6 +524,10 @@ class ResidencyEngine:
             allocation_stream=stream,
         )
         self._resident_lease = lease
+        if self._resident_reservation is not None:
+            actual_bytes = target_gpu_bytes(lease.target)
+            if actual_bytes != self._resident_reservation.nbytes:
+                self._resident_reservation.resize(actual_bytes)
         lease.stage(resident_plan, stream, non_blocking=True)
         stream.synchronize()
         self._resident_transfer.close()
@@ -497,20 +542,39 @@ class ResidencyEngine:
         stream: torch.cuda.Stream,
         *,
         vram_budget_bytes: int | None,
+        vram_budget: VramBudget | None,
         compile_blocks: bool,
     ) -> None:
         if not self._units:
             return
-        self._predictor = _ExecutionPredictor(len(self._units))
+        predictor = _ExecutionPredictor(len(self._units))
+        self._predictor = predictor
         pool = ElasticVramPool(
             active_device,
             vram_budget_bytes=vram_budget_bytes,
         )
+        if vram_budget is not None:
+            handle = vram_budget.register_tenant(
+                "residency_engine",
+                priority=10,
+                evict_cb=lambda needed: pool.evict_idle_bytes(
+                    needed,
+                    distance_fn=predictor.distance,
+                ),
+                usage_fn=lambda: pool.used_bytes,
+                yield_to_peers=True,
+            )
+            self._budget_handle = handle
+            pool.set_budget_callbacks(
+                budget_fn=handle.ceiling_bytes,
+                request_bytes_fn=handle.request_bytes,
+            )
         self._pool = pool
 
         total_unit_bytes = sum(estimate_plan_gpu_bytes(plan) for plan in unit_plans)
         all_resident = (
-            vram_budget_bytes is not None
+            vram_budget is None
+            and vram_budget_bytes is not None
             and total_unit_bytes <= vram_budget_bytes
         )
         if all_resident:
@@ -568,6 +632,8 @@ class ResidencyEngine:
         resident_overrides: Mapping[str, ParameterOverride] | None = None,
         unit_overrides: Sequence[Mapping[str, ParameterOverride] | None] | None = None,
         vram_budget_bytes: int | _UseConfigBudget | None = _USE_CONFIG_BUDGET,
+        vram_budget: VramBudget | None = None,
+        transfer_context: DeviceTransferContext | None = None,
     ) -> None:
         """Activate residency on ``device`` (CPU or CUDA)."""
         if self.failed:
@@ -584,10 +650,26 @@ class ResidencyEngine:
             if isinstance(vram_budget_bytes, _UseConfigBudget)
             else validate_vram_budget(vram_budget_bytes)
         )
+        if vram_budget is not None and not isinstance(vram_budget, VramBudget):
+            raise TypeError(
+                f"vram_budget must be a VramBudget or None; got {type(vram_budget).__name__}."
+            )
+        if transfer_context is not None and not isinstance(
+            transfer_context, DeviceTransferContext
+        ):
+            raise TypeError(
+                "transfer_context must be a DeviceTransferContext or None; "
+                f"got {type(transfer_context).__name__}."
+            )
         active_device = canonical_device(device)
         if active_device.type not in ("cpu", "cuda"):
             raise ValueError(
                 f"ResidencyEngine supports CUDA or CPU; got {active_device}."
+            )
+        if transfer_context is not None and transfer_context.device != active_device:
+            raise ValueError(
+                f"transfer_context device {transfer_context.device} does not match "
+                f"activation device {active_device}."
             )
 
         per_unit_overrides = (
@@ -624,13 +706,24 @@ class ResidencyEngine:
         self._working_set_state = WorkingSetState.CHANGING
 
         try:
+            if transfer_context is not None:
+                transfer_context._acquire_borrow()
+                self._transfer_context = transfer_context
+                self._owns_transfer_context = False
+                self._transfer_context_borrowed = True
             stream = torch.cuda.current_stream(active_device)
-            self._activate_resident_cuda(active_device, resident_plan, stream)
+            self._activate_resident_cuda(
+                active_device,
+                resident_plan,
+                stream,
+                vram_budget=vram_budget,
+            )
             self._activate_units_cuda(
                 active_device,
                 unit_plans,
                 stream,
                 vram_budget_bytes=session_budget,
+                vram_budget=vram_budget,
                 compile_blocks=compile_blocks,
             )
         except BaseException:
@@ -682,7 +775,8 @@ class ResidencyEngine:
         assert self._predictor is not None
         assert self._pool is not None
         current_stream = torch.cuda.current_stream(device)
-        self._predictor.record(idx)
+        if self._no_record_trace_depth == 0:
+            self._predictor.record(idx)
         active.slot.lease.record_stream(current_stream)
         if self._lookahead is None and self._pool.budget_bytes != 0:
             next_idx = self._predictor.next_after(idx)
@@ -707,7 +801,8 @@ class ResidencyEngine:
         if self._reuse_active_unit(idx, device):
             return
 
-        self._predictor.record(idx)
+        if self._no_record_trace_depth == 0:
+            self._predictor.record(idx)
         current_stream = torch.cuda.current_stream(device)
 
         slot: VramSlot | None = None
@@ -814,12 +909,10 @@ class ResidencyEngine:
         if active is None or active.unit_idx != idx:
             return
         pool = self._pool
-        if (
-            pool is not None
-            and pool.budget_bytes is not None
-            and (pool.budget_bytes == 0 or active.slot.nbytes > pool.budget_bytes)
-        ):
-            self._release_active_unit()
+        if pool is not None:
+            budget = pool.budget_bytes
+            if budget is not None and (budget == 0 or active.slot.nbytes > budget):
+                self._release_active_unit()
 
     def _release_units(self) -> tuple[BaseException | None, BaseException | None]:
         cleanup_error: BaseException | None = None
@@ -841,28 +934,45 @@ class ResidencyEngine:
                 prefetch_error = self._drain_lookahead()
 
             _capture(_drain)
-        if self._executor is not None:
-            executor, self._executor = self._executor, None
-            _capture(lambda: _shutdown_executor(executor))
+        if self._owns_transfer_context and self._transfer_context is not None:
+            _capture(self._transfer_context._shutdown_executor)
         _capture(self._release_active_unit)
         _capture(self._units_transfer.finish)
         if self._pool is not None:
             pool = self._pool
             _capture(pool.close_all if self._active is None else pool.close_idle)
             if pool.live_slot_count == 0:
+                self._unregister_budget_handle()
                 self._pool = None
+        else:
+            self._unregister_budget_handle()
         if (
-            self._executor is None
-            and self._lookahead is None
+            self._lookahead is None
             and self._active is None
             and self._pool is None
             and not self._units_transfer.open
         ):
-            _capture(self._close_pin_lease)
-            if self._pin_lease is None:
-                self._copy_stream = None
-                self._predictor = None
-                self._unit_plans = ()
+            if self._owns_transfer_context and self._transfer_context is not None:
+                _capture(self._transfer_context.close)
+                if self._transfer_context.is_closed:
+                    self._transfer_context = None
+                    self._owns_transfer_context = False
+            owns_open_ctx = (
+                self._owns_transfer_context and self._transfer_context is not None
+            )
+            if not owns_open_ctx:
+                _capture(self._close_pin_lease)
+                if self._pin_lease is None:
+                    if (
+                        self._transfer_context_borrowed
+                        and self._transfer_context is not None
+                    ):
+                        self._transfer_context._release_borrow()
+                        self._transfer_context_borrowed = False
+                    if not self._owns_transfer_context:
+                        self._transfer_context = None
+                    self._predictor = None
+                    self._unit_plans = ()
         return cleanup_error, prefetch_error
 
     def _release_resident(self) -> BaseException | None:
@@ -891,6 +1001,9 @@ class ResidencyEngine:
             _capture(_close_resident)
         else:
             self._resident_plan = None
+        if self._resident_lease is None and self._resident_reservation is not None:
+            self._resident_reservation.release()
+            self._resident_reservation = None
         return cleanup_error
 
     def release(self) -> None:
@@ -903,13 +1016,19 @@ class ResidencyEngine:
         resident_error = self._release_resident()
         cleanup_error = unit_error if unit_error is not None else resident_error
 
+        owns_open_ctx = (
+            self._owns_transfer_context and self._transfer_context is not None
+        )
         all_released = (
-            self._executor is None
+            not owns_open_ctx
+            and not self._transfer_context_borrowed
             and self._lookahead is None
             and self._active is None
             and self._pool is None
             and self._pin_lease is None
+            and self._budget_handle is None
             and self._resident_lease is None
+            and self._resident_reservation is None
             and not self._units_transfer.open
             and not self._resident_transfer.open
         )

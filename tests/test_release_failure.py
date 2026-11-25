@@ -23,9 +23,11 @@ from torch import nn
 from piper_offload import (
     Adapter,
     BlockCompileConfig,
+    DeviceTransferContext,
     ModelOffloader,
     ModelRuntimeFailedError,
     OffloadConfig,
+    VramBudget,
 )
 from piper_offload.block_compile import _BlockCompileState
 from piper_offload.host_module import HostModuleInstance, HostModuleLoadPlan
@@ -70,6 +72,8 @@ class _Config:
     vram_budget_bytes: int | None = None
     compiled: bool = False
     routed: bool = False
+    use_vram_budget: bool = False
+    use_transfer_context: bool = False
 
     def offloader(self, model: nn.Module) -> ModelOffloader:
         return ModelOffloader.from_module(
@@ -101,6 +105,8 @@ _CONFIGS = (
     pytest.param(_Config(("blocks",), 0), id="zero-budget"),
     pytest.param(_Config(("blocks",), 2 * _UNIT_BYTES), id="partial-cache"),
     pytest.param(_Config(("blocks",), 1024 * 1024 * 1024), id="all-resident"),
+    pytest.param(_Config(("blocks",), None, use_vram_budget=True), id="shared-budget"),
+    pytest.param(_Config(("blocks",), None, use_transfer_context=True), id="shared-transfer-context"),
     pytest.param(_Config(("embed", "blocks"), None, compiled=True), id="mixed-compiled"),
     pytest.param(_Config(("blocks",), None, routed=True), id="streaming-routed"),
 )
@@ -176,33 +182,63 @@ def test_failed_release_step_is_reported(
     adapters = config.adapters()
     offloader = config.offloader(model)
     x = torch.randn(2, _WIDTH, device="cuda")
+    budget = VramBudget(4 * _UNIT_BYTES) if config.use_vram_budget else None
+    transfer_ctx = (
+        DeviceTransferContext("cuda") if config.use_transfer_context else None
+    )
 
-    offloader.activate("cuda", adapters=adapters, adapter_mode="routed")
-    with torch.inference_mode():
-        expected = model(x).cpu()
-    raised: BaseException | None = None
-    with pytest.MonkeyPatch.context() as patch:
-        _fail(patch, step, error, occurrence=occurrence)
-        try:
-            offloader.deactivate()
-        except (RuntimeError, Interrupt) as exc:
-            raised = exc
+    try:
+        offloader.activate(
+            "cuda",
+            adapters=adapters,
+            adapter_mode="routed",
+            vram_budget=budget,
+            transfer_context=transfer_ctx,
+        )
+        with torch.inference_mode():
+            expected = model(x).cpu()
+        raised: BaseException | None = None
+        with pytest.MonkeyPatch.context() as patch:
+            _fail(patch, step, error, occurrence=occurrence)
+            try:
+                offloader.deactivate()
+            except (RuntimeError, Interrupt) as exc:
+                raised = exc
 
-    assert offloader.active_device is None
-    # Every synchronization and host restore during deactivation is a release
-    # step, so a failure must keep what that step could not free and report it.
-    assert offloader.failed == (raised is not None)
-    if raised is None:
-        # The occurrence did not exist: nothing failed, so nothing was kept.
+        assert offloader.active_device is None
+        # Every synchronization and host restore during deactivation is a release
+        # step, so a failure must keep what that step could not free and report it.
+        assert offloader.failed == (raised is not None)
+        if raised is None:
+            # The occurrence did not exist: nothing failed, so nothing was kept.
+            assert _on_device(model) == []
+            assert offloader._routed_lease is None
+
+        # The next activation retries whatever was kept, then runs as before.
+        with (
+            activated_model(
+                offloader,
+                "cuda",
+                adapters=adapters,
+                adapter_mode="routed",
+                vram_budget=budget,
+                transfer_context=transfer_ctx,
+            ),
+            torch.inference_mode(),
+        ):
+            actual = model(x).cpu()
+        assert not offloader.failed
         assert _on_device(model) == []
-        assert offloader._routed_lease is None
-
-    # The next activation retries whatever was kept, then runs as before.
-    with activated_model(offloader, "cuda", adapters=adapters, adapter_mode="routed"), torch.inference_mode():
-        actual = model(x).cpu()
-    assert not offloader.failed
-    assert _on_device(model) == []
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if budget is not None:
+            assert budget.used_bytes == 0
+        if transfer_ctx is not None:
+            assert transfer_ctx.borrower_count == 0
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        if offloader.failed or offloader.active_device is not None:
+            offloader.deactivate()
+        if transfer_ctx is not None:
+            transfer_ctx.close()
 
 
 @CUDA
@@ -519,3 +555,148 @@ def test_unit_release_failure_still_releases_resident_weights(
     assert _on_device(model) == []
     with activated_model(offloader, "cuda"), torch.inference_mode():
         torch.testing.assert_close(model(x).cpu(), expected, rtol=0, atol=0)
+
+
+@CUDA
+def test_vram_budget_and_borrowed_context_retained_until_release_retry_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from piper_offload.vram_pool import ElasticVramPool
+
+    torch.manual_seed(0)
+    model = _Model()
+    offloader = _Config(("blocks",), None).offloader(model)
+    engine = residency_engine(offloader)
+    budget = VramBudget(4 * _UNIT_BYTES)
+    ctx = DeviceTransferContext("cuda")
+    x = torch.randn(2, _WIDTH, device="cuda")
+
+    try:
+        offloader.activate("cuda", vram_budget=budget, transfer_context=ctx)
+        with torch.inference_mode():
+            expected = model(x).cpu()
+
+        original_close_all = ElasticVramPool.close_all
+        pool_failed_once = False
+
+        def fail_pool_once(pool: ElasticVramPool) -> None:
+            nonlocal pool_failed_once
+            if not pool_failed_once:
+                pool_failed_once = True
+                raise Interrupt("injected pool close failure")
+            original_close_all(pool)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(ElasticVramPool, "close_all", fail_pool_once)
+            with pytest.raises(Interrupt, match="injected pool close failure"):
+                offloader.deactivate()
+
+        assert offloader.failed
+        assert engine._budget_handle is not None
+        assert ctx.borrower_count == 1
+        with pytest.raises(RuntimeError, match="active borrowers"):
+            ctx.close()
+
+        offloader.deactivate()
+        assert not offloader.failed
+        assert budget.used_bytes == 0
+        assert ctx.borrower_count == 0
+        with activated_model(offloader, "cuda", vram_budget=budget, transfer_context=ctx):
+            with torch.inference_mode():
+                torch.testing.assert_close(model(x).cpu(), expected, rtol=0, atol=0)
+    finally:
+        if offloader.failed or offloader.active_device is not None:
+            offloader.deactivate()
+        ctx.close()
+
+
+@CUDA
+def test_resident_reservation_and_borrowed_context_retained_until_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from piper_offload.target_lease import CudaTargetLease
+
+    torch.manual_seed(0)
+    model = _Model()
+    offloader = _Config(("blocks",), None).offloader(model)
+    engine = residency_engine(offloader)
+    budget = VramBudget(4 * _UNIT_BYTES)
+    ctx = DeviceTransferContext("cuda")
+    x = torch.randn(2, _WIDTH, device="cuda")
+
+    try:
+        offloader.activate("cuda", vram_budget=budget, transfer_context=ctx)
+        with torch.inference_mode():
+            expected = model(x).cpu()
+
+        original_lease_close = CudaTargetLease.close
+        res_failed_once = False
+
+        def fail_resident_once(lease: CudaTargetLease) -> None:
+            nonlocal res_failed_once
+            if lease is engine._resident_lease and not res_failed_once:
+                res_failed_once = True
+                raise Interrupt("injected resident close failure")
+            original_lease_close(lease)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(CudaTargetLease, "close", fail_resident_once)
+            with pytest.raises(Interrupt, match="injected resident close failure"):
+                offloader.deactivate()
+
+        assert offloader.failed
+        assert engine._resident_reservation is not None
+        assert budget.reserved_bytes == 2 * _UNIT_BYTES
+        assert ctx.borrower_count == 0
+
+        offloader.deactivate()
+        assert not offloader.failed
+        assert budget.used_bytes == 0
+        assert ctx.borrower_count == 0
+        assert _on_device(model) == []
+        with activated_model(offloader, "cuda", vram_budget=budget, transfer_context=ctx):
+            with torch.inference_mode():
+                torch.testing.assert_close(model(x).cpu(), expected, rtol=0, atol=0)
+    finally:
+        if offloader.failed or offloader.active_device is not None:
+            offloader.deactivate()
+        ctx.close()
+
+
+@CUDA
+def test_return_slot_budget_query_interrupt_does_not_wedge_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(0)
+    model = _Model()
+    offloader = _Config(("blocks",), None).offloader(model)
+    engine = residency_engine(offloader)
+    budget = VramBudget(4 * _UNIT_BYTES)
+    x = torch.randn(2, _WIDTH, device="cuda")
+
+    with activated_model(offloader, "cuda", vram_budget=budget), torch.inference_mode():
+        expected = model(x).cpu()
+        assert engine._active is not None
+        assert engine.pool is not None
+        released_slot = engine._active.slot
+
+        original_ceiling_for = VramBudget.ceiling_for
+        raised_once = False
+
+        def flaky_ceiling(self_budget: VramBudget, tenant: object) -> int | None:
+            nonlocal raised_once
+            if not raised_once:
+                raised_once = True
+                raise Interrupt("injected ceiling interrupt")
+            return original_ceiling_for(self_budget, tenant)  # type: ignore[arg-type]
+
+        with monkeypatch.context() as patch:
+            patch.setattr(VramBudget, "ceiling_for", flaky_ceiling)
+            with pytest.raises(Interrupt, match="injected ceiling interrupt"):
+                engine._release_active_unit()
+
+        assert engine._active is None
+        assert not released_slot.checked_out
+        actual = model(x).cpu()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert budget.used_bytes == 0

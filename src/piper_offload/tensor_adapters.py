@@ -24,6 +24,7 @@ capability protocols, and plain tensor implementation live here; built-in and
 external adapter selection lives in :mod:`tensor_adapter_registry`.
 """
 
+import math
 from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
@@ -32,16 +33,20 @@ from typing import Any, Literal, Protocol, cast, runtime_checkable
 import torch
 from torch import nn
 
+from ._devices import canonical_device
 from .pin_manager import transfer_
 
 __all__ = [
+    "ArenaBindableTensorAdapter",
     "BindTargetTensorAdapter",
     "BroadcastMergeTensorAdapter",
+    "BufferSpec",
     "DenseMergeTargetValidationTensorAdapter",
     "DenseMergeTensorAdapter",
     "DenseMergeValidationTensorAdapter",
     "DequantRequantTensorAdapter",
     "DequantizeTensorAdapter",
+    "GpuAllocator",
     "GpuTargetBytesTensorAdapter",
     "LoRAMergeTensorAdapter",
     "LoRAMergeValidationTensorAdapter",
@@ -49,6 +54,7 @@ __all__ = [
     "MergeLocalityTensorAdapter",
     "PermanentUpdateValidationTensorAdapter",
     "ShardProjectionTensorAdapter",
+    "SliceableTensorAdapter",
     "TensorAdapter",
     "TensorCopyIntoAdapter",
     "accepts_bind_target",
@@ -589,6 +595,111 @@ class ShardProjectionTensorAdapter[HostStateT, GpuStateT](
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class BufferSpec:
+    """Typed description of one device buffer required by an offloaded state."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    alignment: int = 256
+    arena_eligible: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("BufferSpec name must be a non-empty string.")
+        if not isinstance(self.shape, tuple):
+            raise ValueError(f"BufferSpec shape must be a tuple; got {self.shape!r}.")
+        for dim in self.shape:
+            if isinstance(dim, bool) or not isinstance(dim, int) or dim < 0:
+                raise ValueError(
+                    f"BufferSpec dimensions must be non-negative ints; got {self.shape!r}."
+                )
+        if not isinstance(self.dtype, torch.dtype):
+            raise ValueError(
+                f"BufferSpec dtype must be a torch.dtype; got {self.dtype!r}."
+            )
+        if (
+            isinstance(self.alignment, bool)
+            or not isinstance(self.alignment, int)
+            or self.alignment <= 0
+            or (self.alignment & (self.alignment - 1)) != 0
+        ):
+            raise ValueError(
+                f"alignment must be a positive power-of-two int; got {self.alignment!r}."
+            )
+        if not isinstance(self.arena_eligible, bool):
+            raise ValueError(
+                f"arena_eligible must be a bool; got {self.arena_eligible!r}."
+            )
+        if self.arena_eligible:
+            if self.dtype is not torch.uint8:
+                raise ValueError(
+                    f"Only torch.uint8 buffers are arena_eligible; got {self.dtype}."
+                )
+            if self.nbytes <= 0:
+                raise ValueError("Zero-byte buffers cannot be marked arena_eligible.")
+            if self.alignment < 16:
+                raise ValueError(
+                    f"arena_eligible buffers require alignment >= 16; got {self.alignment}."
+                )
+
+    @property
+    def nbytes(self) -> int:
+        """Exact unpadded payload size in bytes."""
+        numel = math.prod(self.shape)
+        return numel * torch.empty((), dtype=self.dtype).element_size()
+
+
+@runtime_checkable
+class GpuAllocator(Protocol):
+    """Allocator interface mapping a :class:`BufferSpec` onto a target GPU tensor."""
+
+    def allocate(self, spec: BufferSpec, *, device: torch.device) -> torch.Tensor:
+        """Allocate or slice a compatible tensor on ``device`` for ``spec``."""
+        ...
+
+
+@runtime_checkable
+class ArenaBindableTensorAdapter[HostStateT, GpuStateT](
+    TensorAdapter[HostStateT, GpuStateT],
+    Protocol,
+):
+    """Optional capability: describe and bind GPU storage via a caller-owned allocator."""
+
+    @staticmethod
+    def gpu_specs(state: HostStateT) -> tuple[BufferSpec, ...]:
+        """Return per-buffer allocation requirements for ``state``."""
+        ...
+
+    @staticmethod
+    def bind_gpu(
+        state: HostStateT,
+        allocator: GpuAllocator,
+        device: torch.device,
+    ) -> GpuStateT:
+        """Construct ``GpuStateT`` using storage provisioned by ``allocator``."""
+        ...
+
+
+@runtime_checkable
+class SliceableTensorAdapter[HostStateT, GpuStateT](
+    TensorAdapter[HostStateT, GpuStateT],
+    Protocol,
+):
+    """Optional capability: slice a stacked host tensor along ``dim`` without copying."""
+
+    @staticmethod
+    def slice_host(
+        state: HostStateT,
+        index: int,
+        *,
+        dim: int = 0,
+    ) -> HostStateT:
+        """Return a zero-copy host view at ``index`` along ``dim``."""
+        ...
+
+
 def is_plain_meta_placeholder(
     target: torch.Tensor,
     logical_shape: tuple[int, ...],
@@ -998,6 +1109,101 @@ class RegularAdapter:
     @staticmethod
     def cache_bytes(state: _RegularHost) -> int:
         return state.data.numel() * state.data.element_size()
+
+    @staticmethod
+    def gpu_specs(state: _RegularHost) -> tuple[BufferSpec, ...]:
+        return (
+            BufferSpec(
+                name="data",
+                shape=tuple(state.data.shape),
+                dtype=state.data.dtype,
+                arena_eligible=(state.data.dtype is torch.uint8 and state.data.numel() > 0),
+            ),
+        )
+
+    @staticmethod
+    def bind_gpu(
+        state: _RegularHost,
+        allocator: GpuAllocator,
+        device: torch.device,
+    ) -> _RegularGpu:
+        spec = RegularAdapter.gpu_specs(state)[0]
+        expected_device = canonical_device(device)
+        allocated = allocator.allocate(spec, device=expected_device)
+        if type(allocated) is not torch.Tensor or allocated.layout is not torch.strided:
+            raise ValueError(
+                "GpuAllocator returned incompatible buffer for RegularAdapter: "
+                f"expected plain strided torch.Tensor, got {type(allocated).__name__} "
+                f"(layout={allocated.layout})."
+            )
+        if (
+            canonical_device(allocated.device) != expected_device
+            or tuple(allocated.shape) != spec.shape
+            or allocated.dtype != spec.dtype
+        ):
+            raise ValueError(
+                "GpuAllocator returned incompatible buffer for RegularAdapter: "
+                f"expected ({expected_device}, {spec.shape}, {spec.dtype}), "
+                f"got ({canonical_device(allocated.device)}, {tuple(allocated.shape)}, {allocated.dtype})."
+            )
+        if not allocated.is_contiguous():
+            raise ValueError(
+                "GpuAllocator returned non-contiguous buffer for RegularAdapter."
+            )
+        if allocated.requires_grad:
+            raise ValueError(
+                "GpuAllocator returned buffer with requires_grad=True for RegularAdapter."
+            )
+        if allocated.is_inference():
+            raise ValueError(
+                "GpuAllocator returned inference-mode buffer for RegularAdapter."
+            )
+        if allocated.is_conj() or allocated.is_neg():
+            raise ValueError(
+                "GpuAllocator returned conjugated or negated buffer for RegularAdapter."
+            )
+        if spec.nbytes > 0:
+            if (
+                allocated.device.type == "cuda"
+                and allocated.data_ptr() % spec.alignment != 0
+            ):
+                raise ValueError(
+                    "GpuAllocator returned unaligned CUDA buffer for RegularAdapter: "
+                    f"data_ptr={allocated.data_ptr()} is not aligned to {spec.alignment} bytes."
+                )
+            if (
+                allocated.device == state.data.device
+                and allocated.untyped_storage().data_ptr()
+                == state.data.untyped_storage().data_ptr()
+            ):
+                raise ValueError(
+                    "GpuAllocator returned buffer aliasing captured host storage for RegularAdapter."
+                )
+        return _RegularGpu(data=allocated)
+
+    @staticmethod
+    def slice_host(
+        state: _RegularHost,
+        index: int,
+        *,
+        dim: int = 0,
+    ) -> _RegularHost:
+        if state.data.ndim == 0:
+            raise ValueError("Cannot slice a scalar RegularAdapter host tensor.")
+        if isinstance(dim, bool) or not isinstance(dim, int):
+            raise TypeError(f"dim must be an int; got {dim!r}.")
+        if dim < -state.data.ndim or dim >= state.data.ndim:
+            raise IndexError(
+                f"Dimension {dim} out of range for tensor with {state.data.ndim} dims."
+            )
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError(f"index must be an int; got {index!r}.")
+        dim_size = state.data.shape[dim]
+        if index < -dim_size or index >= dim_size:
+            raise IndexError(
+                f"Index {index} out of range for dimension {dim} of size {dim_size}."
+            )
+        return RegularAdapter.capture_host_view(state.data.select(dim, index))
 
 
 def adapter_name(adapter: TensorAdapter[Any, Any]) -> str:
