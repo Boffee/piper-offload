@@ -213,9 +213,8 @@ on CUDA activation, and support active LoRA and dense adapter merges on CUDA
 linear decomposition falling back to all-gathering `Shard(1)` quantized weights). Each
 rank selects its portion of plain host-backed LoRA factors or dense deltas
 before staging; merging requires no collective. Full adapter tensors remain in
-host memory. DTensor adapter factors and deltas, `DTensor` registered buffers
-against plain buffer stores, and `block_mode="rolling"` on projected DTensor
-block groups are not accepted. Local shards must carry their tensor
+host memory. DTensor adapter factors and deltas, and `DTensor` registered
+buffers against plain buffer stores, are not accepted. Local shards must carry their tensor
 representation independently of an `nn.Parameter` wrapper.
 See [dtensor_adapter.py](../src/piper_offload/dtensor_adapter.py) for supported
 host projections and reconstruction.

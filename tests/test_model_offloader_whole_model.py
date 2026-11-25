@@ -11,10 +11,10 @@ from piper_offload import (
     ModelStore,
     ResourceBinding,
 )
-from piper_offload.host_component import HostComponent
+from piper_offload.residency_engine import ResidencyEngine
 from piper_offload.host_module import HostModuleStore, ParameterOverride
 
-from tests.conftest import CallbackParameterTransform, activated_model, host_component
+from tests.conftest import CallbackParameterTransform, activated_model, resident_instance
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -28,11 +28,15 @@ def _make_simple_model() -> nn.Module:
 
 
 def _unique_host_param_count(pw: ModelOffloader) -> int:
-    return len({id(host) for host in host_component(pw)._instance.params.values()})
+    resident = resident_instance(pw)
+    assert resident is not None
+    return len({id(host) for host in resident.params.values()})
 
 
 def _unique_host_buffer_count(pw: ModelOffloader) -> int:
-    return len({id(host) for host in host_component(pw)._instance.buffers.values()})
+    resident = resident_instance(pw)
+    assert resident is not None
+    return len({id(host) for host in resident.buffers.values()})
 
 
 # ---------------------------------------------------------------------------
@@ -51,23 +55,21 @@ class TestResourceBindingConformance:
         finally:
             pw.deactivate()
 
-    def test_component_is_not_top_level_binding(self) -> None:
+    def test_engine_is_not_top_level_binding(self) -> None:
         model = _make_simple_model()
         offloader = ModelOffloader.from_module(model)
         try:
-            component = host_component(offloader)
-            assert component is not None
-            assert not isinstance(component, ResourceBinding)
+            assert not isinstance(offloader._engine, ResourceBinding)
         finally:
             offloader.deactivate()
 
-    def test_offloader_constructor_requires_bound_composite(self) -> None:
-        with pytest.raises(TypeError, match="composite"):
+    def test_offloader_constructor_requires_bound_partition(self) -> None:
+        with pytest.raises(TypeError, match="partition"):
             cast(Any, ModelOffloader)(_make_simple_model())
 
 
-class TestHostComponentBind:
-    def test_bind_allows_empty_noop_component(self) -> None:
+class TestResidencyEngineResident:
+    def test_bind_allows_empty_noop_engine(self) -> None:
         module = nn.Module()
         module.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         module.register_buffer("running", torch.randn(2))
@@ -82,13 +84,18 @@ class TestHostComponentBind:
         assert not store.params
         assert not store.buffers
 
-        component = HostComponent(store.bind(module))
+        engine = ResidencyEngine(
+            resident=store.bind(module),
+            units=(),
+            unit_paths=(),
+        )
         try:
-            assert component.param_names == frozenset()
-            assert component.buffer_names == frozenset()
-            component.activate(torch.device("cpu"))
+            assert engine.resident is not None
+            assert not engine.resident.params
+            assert not engine.resident.buffers
+            engine.activate(torch.device("cpu"))
         finally:
-            component.deactivate()
+            engine.deactivate()
 
     def test_cuda_use_hook_tracks_the_forward_stream(
         self,
@@ -102,12 +109,16 @@ class TestHostComponentBind:
                 self.used.append(stream)
 
         model = _make_simple_model()
-        component = HostComponent(HostModuleStore.from_module(model).bind(model))
+        engine = ResidencyEngine(
+            resident=HostModuleStore.from_module(model).bind(model),
+            units=(),
+            unit_paths=(),
+        )
         lease = Lease()
         forward_stream = object()
-        component._lease = cast(Any, lease)
-        component._active_device = torch.device("cuda")
-        component._install_use_hook()
+        engine._resident_lease = cast(Any, lease)
+        engine._active_device = torch.device("cuda")
+        engine._install_resident_use_hook()
         monkeypatch.setattr(
             torch.cuda,
             "current_stream",
@@ -117,12 +128,12 @@ class TestHostComponentBind:
             model(torch.randn(1, 8))
             assert lease.used == [forward_stream]
         finally:
-            component._remove_use_hook()
-            component._lease = None
-            component._active_device = None
-            component.deactivate()
+            engine._remove_resident_use_hook()
+            engine._resident_lease = None
+            engine._active_device = None
+            engine.deactivate()
 
-    def test_binds_existing_store_to_multiple_components(self) -> None:
+    def test_binds_existing_store_to_multiple_offloaders(self) -> None:
         prototype = nn.Module()
         prototype.weight = nn.Parameter(torch.randn(2, 2), requires_grad=False)
         prototype.register_buffer("running", torch.randn(2))
@@ -135,16 +146,16 @@ class TestHostComponentBind:
         second = store.bind(second_model)
 
         try:
-            first_resident = host_component(first)
-            second_resident = host_component(second)
+            first_resident = resident_instance(first)
+            second_resident = resident_instance(second)
             assert first_resident is not None
             assert second_resident is not None
             assert store.param_names == frozenset({"weight"})
-            assert first_resident.param_names == store.param_names
-            assert second_resident.param_names == store.param_names
+            assert first.param_names == store.param_names
+            assert second.param_names == store.param_names
             assert store.buffer_names == frozenset({"running"})
-            assert first_resident.buffer_names == store.buffer_names
-            assert second_resident.buffer_names == store.buffer_names
+            assert first.buffer_names == store.buffer_names
+            assert second.buffer_names == store.buffer_names
 
             assert prototype.weight.data_ptr() == second_model.weight.data_ptr()
             assert prototype.weight is not second_model.weight
@@ -167,32 +178,40 @@ class TestHostComponentBind:
         with pytest.raises(ValueError, match="Param 'weight' layout mismatch"):
             store.bind(target)
 
-    def test_cpu_acquire_and_release_are_noops(self) -> None:
+    def test_cpu_release_is_noop(self) -> None:
         model = _make_simple_model()
-        component = HostComponent(HostModuleStore.from_module(model).bind(model))
+        engine = ResidencyEngine(
+            resident=HostModuleStore.from_module(model).bind(model),
+            units=(),
+            unit_paths=(),
+        )
         try:
-            component.activate(torch.device("cpu"))
-            component.release()
-            component.acquire()
+            engine.activate(torch.device("cpu"))
+            engine.release()
 
-            assert component._active_device == torch.device("cpu")
-            assert component._lease is None
+            assert engine.active_device == torch.device("cpu")
+            assert engine._resident_lease is None
             assert all(not param.is_pinned() for param in model.parameters())
         finally:
-            component.deactivate()
+            engine.deactivate()
 
-    def test_acquire_requires_active_session(self) -> None:
+    def test_double_activate_requires_deactivate(self) -> None:
         model = _make_simple_model()
-        component = HostComponent(HostModuleStore.from_module(model).bind(model))
+        engine = ResidencyEngine(
+            resident=HostModuleStore.from_module(model).bind(model),
+            units=(),
+            unit_paths=(),
+        )
         try:
-            component.release()
-            with pytest.raises(RuntimeError, match="active session"):
-                component.acquire()
+            engine.activate(torch.device("cpu"))
+            engine.release()
+            with pytest.raises(RuntimeError, match="already active"):
+                engine.activate(torch.device("cpu"))
         finally:
-            component.deactivate()
+            engine.deactivate()
 
     @CUDA
-    def test_cuda_working_set_can_release_and_reacquire(self) -> None:
+    def test_cuda_working_set_can_deactivate_and_reactivate(self) -> None:
         torch.manual_seed(42)
         eager = _make_simple_model()
         model = _make_simple_model()
@@ -201,35 +220,37 @@ class TestHostComponentBind:
         with torch.inference_mode():
             expected = eager(value)
 
-        component = HostComponent(HostModuleStore.from_module(model).bind(model))
+        engine = ResidencyEngine(
+            resident=HostModuleStore.from_module(model).bind(model),
+            units=(),
+            unit_paths=(),
+        )
         copied: list[torch.device] = []
-        try:
-            component.activate(
-                torch.device("cuda"),
-                parameter_overrides={
-                    "0.weight": ParameterOverride(
-                        update=CallbackParameterTransform(
-                            lambda param: copied.append(param.device)
-                        )
-                    )
-                },
+        overrides = {
+            "0.weight": ParameterOverride(
+                update=CallbackParameterTransform(
+                    lambda param: copied.append(param.device)
+                )
             )
-            assert component._lease is not None
+        }
+        try:
+            engine.activate(torch.device("cuda"), resident_overrides=overrides)
+            assert engine._resident_lease is not None
             assert [device.type for device in copied] == ["cuda"]
             assert model._forward_pre_hooks
             assert all(param.is_cuda for param in model.parameters())
 
-            component.release()
-            component.release()
-            assert component._active_device is not None
-            assert component._active_device.type == "cuda"
-            assert component._lease is None
+            engine.release()
+            engine.release()
+            assert engine.active_device is not None
+            assert engine.active_device.type == "cuda"
+            assert engine._resident_lease is None
             assert not model._forward_pre_hooks
             assert all(not param.is_pinned() for param in model.parameters())
+            engine.deactivate()
 
-            component.acquire()
-            component.acquire()
-            assert component._lease is not None
+            engine.activate(torch.device("cuda"), resident_overrides=overrides)
+            assert engine._resident_lease is not None
             assert [device.type for device in copied] == ["cuda", "cuda"]
             assert model._forward_pre_hooks
             with torch.inference_mode():
@@ -237,10 +258,10 @@ class TestHostComponentBind:
             torch.cuda.synchronize()
             torch.testing.assert_close(actual, expected)
         finally:
-            component.deactivate()
+            engine.deactivate()
 
-        assert component._active_device is None
-        assert component._lease is None
+        assert engine.active_device is None
+        assert engine._resident_lease is None
         assert all(not param.is_pinned() for param in model.parameters())
 
 
@@ -449,7 +470,7 @@ class TestTiedWeightDedup:
             # After construction, both names reference the same Parameter
             # object, preserving tying at the strongest level.
             assert m.embed._parameters["weight"] is m.head._parameters["weight"]
-            host = host_component(pw)._instance.params["embed.weight"]
+            host = resident_instance(pw).params["embed.weight"]
             # The materialized CPU wrapper is installed onto the module (the
             # instance no longer caches it); both tied leaves share it.
             cpu_param = m.embed.weight
@@ -573,7 +594,7 @@ class TestSharedSubmoduleAlias:
             # One host buffer backing covers both alias paths.
             assert _unique_host_buffer_count(pw) == 1
             assert pw.buffer_names == {"a.buf", "b.buf"}
-            host_buffer = host_component(pw)._instance.buffers["a.buf"]
+            host_buffer = resident_instance(pw).buffers["a.buf"]
             assert not host_buffer.tensor.is_pinned()
             # Both module entries reference the SAME host tensor.
             assert m.a.buf is host_buffer.tensor
@@ -596,7 +617,7 @@ class TestSharedSubmoduleAlias:
         pw = ModelOffloader.from_module(m)
         try:
             assert _unique_host_buffer_count(pw) == 1
-            host_buffer = host_component(pw)._instance.buffers["a.buf"]
+            host_buffer = resident_instance(pw).buffers["a.buf"]
             assert m.a.buf is host_buffer.tensor
             assert m.b.buf is host_buffer.tensor
         finally:
@@ -622,7 +643,7 @@ class TestSharedSubmoduleAlias:
         pw = ModelOffloader.from_module(m)
         try:
             assert _unique_host_buffer_count(pw) == 1
-            host_buffer = host_component(pw)._instance.buffers["a.buf"]
+            host_buffer = resident_instance(pw).buffers["a.buf"]
             assert m.a.buf is host_buffer.tensor
             assert m.b.buf is host_buffer.tensor
             assert not m.a.buf.is_pinned()

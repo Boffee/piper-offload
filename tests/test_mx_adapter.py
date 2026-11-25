@@ -14,11 +14,12 @@ from piper_offload import (
     merge_adapter,
 )
 from piper_offload._torchao_mx import is_supported_mx_elem_dtype
-from piper_offload.mx_adapter import MxAdapter
 from piper_offload.host_param import HostParam
-from piper_offload.block_component import _param_target_layout
+from piper_offload.mx_adapter import MxAdapter
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from tests.conftest import activated_model
+
+_param_target_layout = HostParam.target_layout_for
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -842,7 +843,7 @@ class TestMxAdapter:
             )
         offloader = ModelOffloader.from_module(
             model,
-            OffloadConfig(block_paths=("blocks",)),
+            OffloadConfig(offload_paths=("blocks",)),
         )
         lora = Adapter.from_state_dict(
             state_dict={
@@ -922,7 +923,7 @@ class TestMxAdapter:
 
         offloader = ModelOffloader.from_module(
             model,
-            OffloadConfig(block_paths=("blocks",)),
+            OffloadConfig(offload_paths=("blocks",)),
         )
         try:
             x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
@@ -934,14 +935,25 @@ class TestMxAdapter:
                 adapter_mode="merge",
                 stochastic_rounding=False,
             ) as active:
-                merged = active.blocks[0].weight.data
-                assert isinstance(merged, mx_cls)
-                torch.testing.assert_close(
-                    merged.dequantize(mx.orig_dtype).to(torch.float32),
-                    expected.dequantize(mx.orig_dtype).to(torch.float32),
-                )
-                y = active(x)
-                torch.cuda.synchronize()
+                ran = False
+
+                def _check_merged(mod: nn.Module, _inputs: object) -> None:
+                    nonlocal ran
+                    merged = mod.weight.data
+                    assert isinstance(merged, mx_cls)
+                    torch.testing.assert_close(
+                        merged.dequantize(mx.orig_dtype).to(torch.float32),
+                        expected.dequantize(mx.orig_dtype).to(torch.float32),
+                    )
+                    ran = True
+
+                handle = active.blocks[0].register_forward_pre_hook(_check_merged)
+                try:
+                    y = active(x)
+                    torch.cuda.synchronize()
+                finally:
+                    handle.remove()
+                assert ran
             assert y.shape == (8, 64)
         finally:
             offloader.deactivate()

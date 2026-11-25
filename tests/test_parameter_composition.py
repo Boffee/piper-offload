@@ -376,8 +376,15 @@ def test_scaled_convrot_value_with_loras_uses_one_native_merge(application, kind
 
 
 @CUDA
-@pytest.mark.parametrize("mode", ["resident", "streaming", "rolling"])
-def test_composed_values_reload_across_block_uses(mode):
+@pytest.mark.parametrize(
+    ("vram_budget_bytes", "compiled"),
+    [
+        (1024 * 1024 * 1024, False),
+        (None, False),
+        (None, True),
+    ],
+)
+def test_composed_values_reload_across_block_uses(vram_budget_bytes, compiled):
     # Give this compiled case its own forward code, so unrelated tests do
     # not consume its Dynamo recompilation budget.
     class Block(nn.Linear):
@@ -389,9 +396,9 @@ def test_composed_values_reload_across_block_uses(mode):
     offloader = ModelOffloader.from_module(
         model,
         OffloadConfig(
-            block_paths=("blocks",),
-            block_mode=mode,
-            block_compile=BlockCompileConfig(fullgraph=True, dynamic=False) if mode == "rolling" else None,
+            offload_paths=("blocks",),
+            vram_budget_bytes=vram_budget_bytes,
+            block_compile=BlockCompileConfig(fullgraph=True, dynamic=False) if compiled else None,
         ),
     )
     values = {f"blocks.{i}.weight": torch.eye(4) * (i + 1) for i in range(2)}

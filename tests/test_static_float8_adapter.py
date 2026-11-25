@@ -16,9 +16,10 @@ from piper_offload import (
 from piper_offload.float8_adapter import Float8Adapter
 from piper_offload.host_param import HostParam
 from piper_offload.static_float8_adapter import StaticFloat8Adapter
-from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from tests.conftest import activated_model
+
+_param_target_layout = HostParam.target_layout_for
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -663,7 +664,7 @@ class TestStaticFloat8Adapter:
         for mode in ("merge", "routed"):
             model = make_model()
             calibrated_scale = model.blocks[0].weight.data.act_quant_scale.clone()
-            offloader = ModelOffloader.from_module(model, OffloadConfig(block_paths=("blocks",)))
+            offloader = ModelOffloader.from_module(model, OffloadConfig(offload_paths=("blocks",)))
             try:
                 x = torch.randn(2, 8, 64, dtype=torch.bfloat16, device="cuda")
                 with activated_model(
@@ -720,7 +721,7 @@ class TestStaticFloat8Adapter:
         eager_model = M(weights)
         eager_offloader = ModelOffloader.from_module(
             eager_model,
-            OffloadConfig(block_paths=("blocks",)),
+            OffloadConfig(offload_paths=("blocks",)),
         )
         try:
             with activated_model(eager_offloader, "cuda"):
@@ -733,7 +734,7 @@ class TestStaticFloat8Adapter:
         compiled_offloader = ModelOffloader.from_module(
             compiled_model,
             OffloadConfig(
-                block_paths=("blocks",),
+                offload_paths=("blocks",),
                 block_compile=BlockCompileConfig(),
             ),
         )

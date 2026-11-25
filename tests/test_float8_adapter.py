@@ -15,9 +15,10 @@ from piper_offload import (
 )
 from piper_offload.float8_adapter import Float8Adapter
 from piper_offload.host_param import HostParam
-from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import tensor_id
 from tests.conftest import activated_model
+
+_param_target_layout = HostParam.target_layout_for
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -957,7 +958,7 @@ class TestFloat8Adapter:
 
         offloader = ModelOffloader.from_module(
             model,
-            OffloadConfig(block_paths=("blocks",)),
+            OffloadConfig(offload_paths=("blocks",)),
         )
         try:
             x = torch.randn(8, 16, dtype=torch.bfloat16, device="cuda")
@@ -968,15 +969,26 @@ class TestFloat8Adapter:
                 adapter_strengths=[0.5],
                 adapter_mode="merge",
             ) as active:
-                merged = active.blocks[0].weight.data
-                assert isinstance(merged, float8_tensor_cls)
-                _assert_float8_merge_close(
-                    merged,
-                    expected,
-                    merged.qdata.dtype,
-                )
-                y = active(x)
-                torch.cuda.synchronize()
+                ran = False
+
+                def _check_merged(mod: nn.Module, _inputs: object) -> None:
+                    nonlocal ran
+                    merged = mod.weight.data
+                    assert isinstance(merged, float8_tensor_cls)
+                    _assert_float8_merge_close(
+                        merged,
+                        expected,
+                        merged.qdata.dtype,
+                    )
+                    ran = True
+
+                handle = active.blocks[0].register_forward_pre_hook(_check_merged)
+                try:
+                    y = active(x)
+                    torch.cuda.synchronize()
+                finally:
+                    handle.remove()
+                assert ran
             assert y.shape == (8, 16)
         finally:
             offloader.deactivate()

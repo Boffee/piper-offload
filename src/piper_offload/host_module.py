@@ -362,8 +362,8 @@ class HostModuleLoadPlan:
         _validate_cuda_device(device)
         params = self.sources
         buffers = _select_known_names(self.instance.buffers, buffer_names)
-        # Active CUDA targets across resident, transient, streaming, and rolling
-        # runtimes must stay non-inference tensors so refills, merges, and wrapper
+        # Active CUDA targets across resident and offloaded residency modes
+        # must stay non-inference tensors so refills, merges, and wrapper
         # reconstruction work regardless of the caller's inference_mode context.
         with torch.inference_mode(False):
             return HostModuleTarget(

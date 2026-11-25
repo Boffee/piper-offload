@@ -1432,7 +1432,7 @@ def test_two_gpu_shared_model_store_concurrent_offloader_streaming() -> None:
         expected_sum = cpu_ref(x_cpu) * 2.0
 
     store = ModelStore.from_module(cpu_ref)
-    config = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+    config = OffloadConfig(offload_paths=("blocks",))
 
     shell_0 = _StreamableModel(width=8, num_blocks=2).to("meta")
     shell_1 = _StreamableModel(width=8, num_blocks=2).to("meta")
@@ -2389,7 +2389,7 @@ def test_two_gpu_model_store_bind_tp_meta_shell_streaming_and_mmap(
         expected = ref(x)
 
     ckpt, cache, spec = _build_cached_tp_store(tmp_path, ref)
-    cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming", block_compile=block_compile)
+    cfg = OffloadConfig(offload_paths=("blocks",), block_compile=block_compile)
     offloaders: list[ModelOffloader | None] = [None, None]
     try:
         with cache.lease(spec) as store:
@@ -2491,7 +2491,7 @@ def test_two_gpu_model_store_bind_tp_meta_shell_lora_and_p2p() -> None:
         expected_routed = routed_ref(x)
 
     store = ModelStore.from_module(ref)
-    cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+    cfg = OffloadConfig(offload_paths=("blocks",))
     transport = "p2p" if _HAS_TWO_GPU_P2P else "host_staged"
 
     with ParallelExecutor(["cuda:0", "cuda:1"], transport=transport, staging_bytes=64 * 1024) as ex:
@@ -2720,7 +2720,7 @@ def test_two_gpu_model_store_bind_tp_convrot_int8_streaming_and_lora_merge(
     )
 
     store = ModelStore.from_module(ref)
-    cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+    cfg = OffloadConfig(offload_paths=("blocks",))
     transport = "p2p" if _HAS_TWO_GPU_P2P else "host_staged"
     fc1_ptrs = tuple(
         t.untyped_storage().data_ptr()
@@ -2837,7 +2837,7 @@ def test_two_gpu_model_store_bind_tp_float8(granularity_name: str) -> None:
     )
 
     store = ModelStore.from_module(ref)
-    cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+    cfg = OffloadConfig(offload_paths=("blocks",))
     transport = "p2p" if _HAS_TWO_GPU_P2P else "host_staged"
     fc2_qdata_ptr = store._module_store.params["blocks.0.fc2.weight"].storage_tensors()[0].untyped_storage().data_ptr()
     offloaders: list[ModelOffloader | None] = [None, None]
@@ -3203,7 +3203,7 @@ def test_two_gpu_model_store_bind_tp_mx(use_fp4: bool) -> None:
     store, expected, expected_merged = _build_mx_tp_references(
         dim, elem_dtype=elem_dtype, lora_state=lora_state, x=x
     )
-    cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+    cfg = OffloadConfig(offload_paths=("blocks",))
     transport = "p2p" if _HAS_TWO_GPU_P2P else "host_staged"
     fc2_scale_ptr = store._module_store.params["blocks.0.fc2.weight"].storage_tensors()[1].untyped_storage().data_ptr()
     offloaders: list[ModelOffloader | None] = [None, None]
@@ -3352,7 +3352,7 @@ def test_two_gpu_model_store_bind_tp_nvfp4_and_convrot_nvfp4() -> None:
     nv_store, cr_store, nv_exp, cr_exp, nv_exp_m, cr_exp_m = _build_nvfp4_and_convrot_tp_references(
         dim, dense_fc1=dense_fc1, dense_fc2=dense_fc2, x=x
     )
-    cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+    cfg = OffloadConfig(offload_paths=("blocks",))
     transport = "p2p" if _HAS_TWO_GPU_P2P else "host_staged"
     offloaders: list[list[ModelOffloader]] = [[], []]
     try:
@@ -3441,7 +3441,7 @@ def test_two_gpu_model_store_bind_tp_torchao_nvfp4_and_lora_merge() -> None:
     )
     with activated_model(ModelOffloader.from_module(ao_ref), "cuda:0") as ref_m, torch.inference_mode():
         ao_exp = ref_m(x.to("cuda:0")).cpu()
-    cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+    cfg = OffloadConfig(offload_paths=("blocks",))
     transport = "p2p" if _HAS_TWO_GPU_P2P else "host_staged"
     offloaders: list[list[ModelOffloader]] = [[], []]
     try:

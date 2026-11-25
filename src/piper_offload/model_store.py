@@ -5,9 +5,9 @@ from typing import Self
 
 from torch import nn
 
-from .composite_component import _bind_module_store, reserve_shell
 from .host_module import HostModuleStore
 from .model_offloader import ModelOffloader
+from .model_partition import _bind_module_store, reserve_shell
 from .offload_config import OffloadConfig, resolve_offload_config
 
 
@@ -76,12 +76,13 @@ class ModelStore:
         rank-local projection sharing this store's underlying host backing, and
         the returned offloader reports the rank-local ``cache_bytes``.
         Extra unmanaged parameters anywhere on ``model`` (including inside
-        occupied blocks) are permitted, ignored, and stay on the caller's
-        device, whereas extra non-empty blocks inside a configured block list
-        are rejected so no block silently remains unstreamed.
+        occupied units) are permitted, ignored, and stay on the caller's
+        device, whereas extra non-empty modules or blocks inside configured
+        ``offload_paths`` are rejected so no offloaded unit silently remains
+        unstreamed.
         """
         resolved = resolve_offload_config(config)
-        composite, claim, resolved_store = _bind_module_store(
+        partition, claim, resolved_store = _bind_module_store(
             self._module_store,
             model,
             resolved,
@@ -89,7 +90,7 @@ class ModelStore:
         try:
             return ModelOffloader(
                 model,
-                composite=composite,
+                partition=partition,
                 cache_bytes=resolved_store.cache_bytes,
                 _shell_claim=claim,
             )

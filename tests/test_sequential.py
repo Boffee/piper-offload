@@ -220,8 +220,7 @@ def test_model_forward(executor, compiled, streamed):
             offloader = ModelOffloader.from_module(
                 module,
                 OffloadConfig(
-                    block_paths=("blocks",),
-                    block_mode="streaming",
+                    offload_paths=("blocks",),
                     block_compile=config,
                 ),
             )

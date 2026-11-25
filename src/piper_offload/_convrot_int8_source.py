@@ -135,4 +135,18 @@ class ConvRotInt8SourceAdapter:
         )
 
 
-__all__ = ["ConvRotInt8GpuTarget", "ConvRotInt8SourceAdapter", "stage_packed_tensors"]
+def convrot_int8_target_bytes(
+    rows: int,
+    features: int,
+    act_scale: torch.Tensor | None = None,
+) -> int:
+    """Unique GPU target bytes allocated for a ConvRot INT8 target."""
+    return rows * features + rows * 4 + (0 if act_scale is None else act_scale.nbytes)
+
+
+__all__ = [
+    "ConvRotInt8GpuTarget",
+    "ConvRotInt8SourceAdapter",
+    "convrot_int8_target_bytes",
+    "stage_packed_tensors",
+]

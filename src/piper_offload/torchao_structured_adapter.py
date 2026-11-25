@@ -165,6 +165,10 @@ class _ProjectedTorchaoShard(torch.Tensor):
         tensor._layout_signature = layout_signature
         return tensor
 
+    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return the underlying host storage tensors backing this projected shard."""
+        return tuple(t for t in self._state.storage if t is not None)
+
     def __repr__(self, *, tensor_contents: object = None) -> str:
         del tensor_contents
         return (

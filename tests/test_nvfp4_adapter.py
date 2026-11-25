@@ -15,11 +15,12 @@ from piper_offload import (
     ScaledLoRAFactor,
     merge_adapter,
 )
-from piper_offload.nvfp4_adapter import Nvfp4Adapter
 from piper_offload.host_param import HostParam
+from piper_offload.nvfp4_adapter import Nvfp4Adapter
 from piper_offload.tensor_adapter_registry import tensor_id
-from piper_offload.block_component import _param_target_layout
 from tests.conftest import activated_model
+
+_param_target_layout = HostParam.target_layout_for
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -904,7 +905,7 @@ class TestNvfp4Adapter:
 
         offloader = ModelOffloader.from_module(
             model,
-            OffloadConfig(block_paths=("blocks",)),
+            OffloadConfig(offload_paths=("blocks",)),
         )
         try:
             x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
@@ -915,13 +916,24 @@ class TestNvfp4Adapter:
                 adapter_strengths=[0.5],
                 adapter_mode="merge",
             ) as active:
-                merged = active.blocks[0].weight.data
-                assert type(merged) is piper_nvfp4_type
-                # Triton's tiled BF16 update can move a handful of values
-                # across an FP4 rounding boundary relative to addmm.
-                _assert_triton_nvfp4_close(merged, expected)
-                y = active(x)
-                torch.cuda.synchronize()
+                ran = False
+
+                def _check_merged(mod: nn.Module, _inputs: object) -> None:
+                    nonlocal ran
+                    merged = mod.weight.data
+                    assert type(merged) is piper_nvfp4_type
+                    # Triton's tiled BF16 update can move a handful of values
+                    # across an FP4 rounding boundary relative to addmm.
+                    _assert_triton_nvfp4_close(merged, expected)
+                    ran = True
+
+                handle = active.blocks[0].register_forward_pre_hook(_check_merged)
+                try:
+                    y = active(x)
+                    torch.cuda.synchronize()
+                finally:
+                    handle.remove()
+                assert ran
             assert y.shape == (8, 64)
         finally:
             offloader.deactivate()
@@ -966,7 +978,7 @@ class TestNvfp4Adapter:
             )
         offloader = ModelOffloader.from_module(
             model,
-            OffloadConfig(block_paths=("blocks",)),
+            OffloadConfig(offload_paths=("blocks",)),
         )
         lora = Adapter.from_state_dict(
             state_dict={

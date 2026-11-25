@@ -244,9 +244,7 @@ update does not tie the model parameters.
 
 An unpopulated placeholder consumes no host backing and receives no storage of
 its own. The caller must avoid executing any path that needs it. Deactivation
-restores the meta parameter. All block modes support values; inactive rolling
-blocks may reference another block's reusable slot, whose contents are
-unspecified.
+restores the meta parameter.
 
 Values remain unchanged at any nonzero adapter strength by default. Opt into
 scaling with `AdapterSpec(scale_parameter_values=True)`, or per target with

@@ -812,7 +812,7 @@ class TestTrellisActivation:
 
         offloader = ModelOffloader.from_module(
             model,
-            OffloadConfig(block_paths=("blocks",), block_mode="streaming"),
+            OffloadConfig(offload_paths=("blocks",)),
         )
         offloader.activate(
             "cuda",
@@ -896,7 +896,7 @@ class TestTrellisActivation:
 
         offloader = ModelOffloader.from_module(
             model,
-            OffloadConfig(block_paths=("blocks",), block_mode="streaming"),
+            OffloadConfig(offload_paths=("blocks",)),
         )
         offloader.activate(
             "cuda",

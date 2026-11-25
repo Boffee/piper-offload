@@ -50,9 +50,11 @@ yields its model, then deactivates it and releases leases in reverse order.
 Use the yielded model inside that context. Retaining a Python reference after
 exit does not keep it active and can prevent its host storage from being freed.
 
-To configure block residency, pass `config=OffloadConfig(...)` to
-`ModelSpec`; see [streaming](streaming.md). To attach cached updates, pass
-`adapter_specs` to `use()`; see [adapters](adapters.md).
+To configure unit offloading and default VRAM budgets, pass `config=OffloadConfig(...)`
+to `ModelSpec`; see [streaming](streaming.md). Pass `vram_budget_bytes=...` to
+`cache.use()` or `ModelOffloader.activate()` to override that weight budget for
+a single activation. To attach cached updates, pass `adapter_specs` to `use()`;
+see [adapters](adapters.md).
 
 ## Ownership and persistent state
 
@@ -136,7 +138,7 @@ del offloader, model
 Access the bound model while it is active. Successful activations require
 matching deactivation.
 
-Preflight validation failures (such as trainable parameters, incompatible group
+Preflight validation failures (such as trainable parameters, incompatible offload
 paths, or an already-owned shell) leave the model untouched. If construction
 fails after capture or installation begins, discard the partially modified
 model and build a fresh one. If activation fails, the offloader rolls back the
@@ -161,9 +163,9 @@ config=...)`. Each `ModelOffloader` owns its bound shell exclusively; binding
 another offloader onto a shell with a live binding is rejected. Preflight
 validation rejections leave the target shell untouched, whereas a failure mid-way
 through installation requires discarding that shell and binding a fresh one. Extra
-unmanaged parameters on the target shell (including inside occupied blocks)
-are ignored and stay on the caller-selected device, while extra non-empty blocks
-inside configured block lists are rejected:
+unmanaged parameters on the target shell (including inside occupied units)
+are ignored and stay on the caller-selected device, while extra non-empty
+modules or blocks inside configured `offload_paths` are rejected:
 
 ```python
 import torch

@@ -31,10 +31,8 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from piper_offload import BlockCompileConfig, BlockMode, ModelOffloader, OffloadConfig, PinLease, host_pin_manager
+from piper_offload import BlockCompileConfig, ModelOffloader, OffloadConfig, PinLease, host_pin_manager
 from piper_offload._host_registration import RuntimeHostRegistration
-from piper_offload.block_component import _host_transfer_tensors
-from piper_offload.streaming_runtime import StreamingBlockRuntime
 
 GIB = 1024**3
 
@@ -87,10 +85,10 @@ def _instrument_registration() -> Generator[_TimedRegistration]:
     host_pin_manager._backend = backend
     original_acquire = host_pin_manager.acquire
 
-    def measured_acquire(tensors: Iterable[torch.Tensor]) -> PinLease:
+    def measured_acquire(tensors: Iterable[torch.Tensor], *, pin: bool = True) -> PinLease:
         start = time.perf_counter()
         try:
-            return original_acquire(tensors)
+            return original_acquire(tensors, pin=pin)
         finally:
             backend.totals.acquire_ms += (time.perf_counter() - start) * 1000
 
@@ -161,23 +159,23 @@ class _Subject:
     reference: torch.Tensor | None = None
 
 
-def _build_subject(name: str, mode: BlockMode, representation: str, args: argparse.Namespace) -> _Subject:
+def _build_subject(name: str, mode: str, representation: str, args: argparse.Namespace) -> _Subject:
     torch.manual_seed(args.seed + (name == "B"))
     model = _Model(args.blocks, args.width, representation, getattr(torch, args.dtype))
     offloader = ModelOffloader.from_module(
         model,
         config=OffloadConfig(
-            block_paths=("blocks",),
-            block_mode=mode,
+            offload_paths=("blocks",),
+            vram_budget_bytes=None if mode == "streaming" else 1 << 40,
             block_compile=BlockCompileConfig(fullgraph=True, dynamic=False),
         ),
     )
     # Benchmark-only inspection of the actual captured allocations, including
     # quant metadata. Merge page intervals without allocating a set per page.
     stores: dict[int, int] = {}
-    for component in offloader._composite.blocks:
-        plans = [instance.resolve_load_plan() for instance in component._block_instances]
-        for tensor in _host_transfer_tensors(plans):
+    plans = [unit.resolve_load_plan() for unit in offloader._engine.units]
+    for plan in plans:
+        for tensor in plan.storage_tensors():
             if tensor.numel():
                 storage = tensor.untyped_storage()
                 stores[storage.data_ptr()] = storage.nbytes()
@@ -192,11 +190,9 @@ def _build_subject(name: str, mode: BlockMode, representation: str, args: argpar
 def _finish_work(subject: _Subject, device: torch.device) -> None:
     # GPU synchronization alone can miss a wraparound copy that the CPU
     # prefetch worker has not enqueued yet. Account for the complete traversal.
-    for component in subject.offloader._composite.blocks:
-        runtime = component._active_runtime
-        if isinstance(runtime, StreamingBlockRuntime):
-            for future in tuple(runtime._pending.values()):
-                future.result()
+    lookahead = subject.offloader._engine._lookahead
+    if lookahead is not None:
+        lookahead.future.result()
     torch.cuda.synchronize(device)
 
 
@@ -246,13 +242,11 @@ def _session(
     try:
         activation = _phase(activate, backend)
         active = host_pin_manager.stats
-        leases: list[PinLease] = []
-        for component in subject.offloader._composite.blocks:
-            lease = component._pin_lease
-            assert lease is not None
-            leases.append(lease)
-        registered_bytes = sum(lease.registered_bytes for lease in leases)
-        pageable_bytes = sum(lease.pageable_bytes for lease in leases)
+        lease = subject.offloader._engine._pin_lease
+        registered_bytes = lease.registered_bytes if lease is not None else 0
+        pageable_bytes = (
+            lease.pageable_bytes if lease is not None else subject.storage_bytes
+        )
         with torch.inference_mode():
             passes = [_phase(forward, backend) for _ in range(forwards)]
         peak_gpu_bytes = torch.cuda.max_memory_allocated(value.device)
@@ -363,7 +357,7 @@ def _save(report: dict[str, Any], path: Path | None) -> None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--modes", nargs="+", choices=("streaming", "rolling"), default=["streaming", "rolling"])
+    parser.add_argument("--modes", nargs="+", choices=("streaming", "resident"), default=["streaming"])
     parser.add_argument("--representations", nargs="+", choices=("dense", "convrot-int8"), default=["dense"])
     parser.add_argument("--blocks", type=int, default=16)
     parser.add_argument("--width", type=int, default=2048)
@@ -390,7 +384,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _run_models(
-    mode: BlockMode,
+    mode: str,
     representation: str,
     value: torch.Tensor,
     backend: _TimedRegistration,

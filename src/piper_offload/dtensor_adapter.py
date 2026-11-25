@@ -94,7 +94,23 @@ from .tensor_adapters import (
     accepts_bind_target,
     adapter_name,
 )
+from .tensor_adapters import (
+    gpu_target_bytes as _gpu_target_bytes,
+)
 from .torchao_structured_adapter import _ProjectedTorchaoShard
+
+
+def _mesh_target_key(mesh: Any) -> tuple[object, ...]:  # noqa: ANN401
+    """Target-pool mesh key preserving dim names and initialized process groups."""
+    group_ids: list[int | None] = []
+    for dim in range(mesh.ndim):
+        try:
+            group = mesh.get_group(dim)
+        except Exception:
+            group_ids.append(None)
+        else:
+            group_ids.append(id(group))
+    return (mesh_signature(mesh), mesh.mesh_dim_names, tuple(group_ids))
 
 
 @dataclass(slots=True)
@@ -599,7 +615,7 @@ class DTensorAdapter:
             inner.layout_signature(local),
             tuple(dt.shape),
             dt.stride(),
-            mesh_signature(dt.device_mesh),
+            _mesh_target_key(dt.device_mesh),
             placements_key(dt.placements),
         )
 
@@ -611,7 +627,7 @@ class DTensorAdapter:
             state.inner_layout_signature,
             tuple(cast(Any, state.shape)),
             state.stride,
-            mesh_signature(cast(Any, state.mesh)),
+            _mesh_target_key(cast(Any, state.mesh)),
             placements_key(state.placements),
         )
 
@@ -1021,3 +1037,7 @@ class DTensorAdapter:
         # Local shard bytes only — the DTensor's global numel would
         # over-account host memory by the world size.
         return state.inner.cache_bytes(state.inner_state)
+
+    @staticmethod
+    def gpu_target_bytes(state: _DTensorHost) -> int:
+        return _gpu_target_bytes(state.inner, state.inner_state)

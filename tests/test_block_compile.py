@@ -7,17 +7,12 @@ import torch
 from torch import nn
 
 from piper_offload import (
-    BlockCompileConfig,
-    BlockMode,
     Adapter,
+    BlockCompileConfig,
     ModelOffloader,
     ModelSpec,
     OffloadConfig,
 )
-from piper_offload.resident_runtime import ResidentBlockRuntime
-from piper_offload.rolling_compile import rolling_inductor_backend
-from piper_offload.rolling_runtime import RollingBlockRuntime
-from piper_offload.streaming_runtime import StreamingBlockRuntime
 from tests._block_compile_helpers import (
     _Block,
     _BlockModel,
@@ -25,7 +20,7 @@ from tests._block_compile_helpers import (
 )
 from tests.conftest import (
     activated_model,
-    block_components,
+    residency_engine,
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -45,14 +40,6 @@ class _TwoGroupModel(nn.Module):
         for block in self.second_blocks:
             x = block(x)
         return x
-
-
-class _MixedLayoutGroupModel(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.homogeneous_blocks = nn.ModuleList([_Block(8), _Block(8)])
-        self.heterogeneous_blocks = nn.ModuleList([_Block(8), _Block(16)])
-        self.requires_grad_(False)
 
 
 class _CompileSpy:
@@ -87,81 +74,18 @@ class TestBlockCompileConfig:
         assert config.fullgraph is False
         assert config.options is None
 
-    def test_rolling_requires_fullgraph(self) -> None:
-        with pytest.raises(ValueError, match="requires.*fullgraph=True"):
-            _make_offloader(
-                _BlockModel(),
-                block_mode="rolling",
-                block_compile=BlockCompileConfig(),
-            )
-
-    def test_rolling_requires_compile_config(self) -> None:
-        with pytest.raises(ValueError, match="requires BlockCompileConfig"):
-            _make_offloader(
-                _BlockModel(),
-                block_mode="rolling",
-            )
-
-    def test_auto_without_fullgraph_uses_streaming(self) -> None:
-        offloader = _make_offloader(
-            _BlockModel(),
-            block_mode="auto",
-        )
-        try:
-            component = block_components(offloader)[0]
-            assert component.block_mode == "streaming"
-            assert isinstance(component._runtime, StreamingBlockRuntime)
-        finally:
-            offloader.deactivate()
-
-    def test_auto_resolves_each_group_independently(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        spy = _CompileSpy()
-        monkeypatch.setattr(torch, "compile", spy)
-        offloader = _make_offloader(
-            _MixedLayoutGroupModel(),
-            block_paths=["homogeneous_blocks", "heterogeneous_blocks"],
-            block_mode="auto",
-            block_compile=BlockCompileConfig(fullgraph=True),
-        )
-        try:
-            homogeneous, heterogeneous = block_components(offloader)
-            assert homogeneous.block_mode == "rolling"
-            assert isinstance(homogeneous._runtime, RollingBlockRuntime)
-            assert heterogeneous.block_mode == "streaming"
-            assert isinstance(heterogeneous._runtime, StreamingBlockRuntime)
-            assert [kwargs["backend"] for _fn, kwargs in spy.calls] == [
-                rolling_inductor_backend,
-                rolling_inductor_backend,
-                "inductor",
-                "inductor",
-            ]
-        finally:
-            offloader.deactivate()
-
-    def test_strict_rolling_rejects_heterogeneous_group(self) -> None:
-        with pytest.raises(NotImplementedError, match="identical parameter layouts"):
-            _make_offloader(
-                _MixedLayoutGroupModel(),
-                block_paths=["heterogeneous_blocks"],
-                block_mode="rolling",
-                block_compile=BlockCompileConfig(fullgraph=True),
-            )
-
-    def test_compile_without_block_paths_is_unused(self) -> None:
+    def test_compile_without_offload_paths_is_unused(self) -> None:
         model = nn.Linear(4, 4, bias=False).requires_grad_(False)
         offloader = ModelOffloader.from_module(
             model,
             OffloadConfig(block_compile=BlockCompileConfig()),
         )
         try:
-            assert not block_components(offloader)
+            assert not residency_engine(offloader).units
         finally:
             offloader.deactivate()
 
-    def test_model_spec_passes_config_to_bound_component(
+    def test_model_spec_passes_config_to_bound_engine(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -178,16 +102,16 @@ class TestBlockCompileConfig:
             estimated_cache_bytes=1024,
             factory=_BlockModel,
             config=OffloadConfig(
-                transient_block_paths=("blocks",),
+                offload_paths=("blocks",),
                 block_compile=config,
             ),
         )
 
         offloader = spec.build_store()
         try:
-            block_component = block_components(offloader)[0]
-            assert block_component.block_compile is config
-            assert offloader._composite.transient_blocks == (block_component,)
+            engine = residency_engine(offloader)
+            assert engine.block_compile is config
+            assert len(engine.units) == 2
             assert len(spy.calls) == 2
             assert all(
                 kwargs
@@ -205,7 +129,7 @@ class TestBlockCompileConfig:
         finally:
             offloader.deactivate()
 
-    def test_model_spec_can_compile_resident_blocks(
+    def test_model_spec_can_compile_budgeted_all_resident_blocks(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -216,43 +140,16 @@ class TestBlockCompileConfig:
             estimated_cache_bytes=1024,
             factory=_BlockModel,
             config=OffloadConfig(
-                block_paths=("blocks",),
-                block_mode="resident",
+                offload_paths=("blocks",),
+                vram_budget_bytes=1024 * 1024 * 1024,
                 block_compile=BlockCompileConfig(),
             ),
         )
 
         offloader = spec.build_store()
         try:
-            components = block_components(offloader)
-            assert len(components) == 1
-            assert isinstance(
-                components[0]._runtime,
-                ResidentBlockRuntime,
-            )
+            assert len(residency_engine(offloader).units) == 2
             assert len(spy.calls) == 2
-        finally:
-            offloader.deactivate()
-
-    def test_resident_mode_applies_to_transient_block_paths(self) -> None:
-        model = _TwoGroupModel()
-        offloader = _make_offloader(
-            model,
-            block_paths=["first_blocks"],
-            transient_block_paths=("second_blocks",),
-            block_mode="resident",
-        )
-        try:
-            resident, transient = block_components(offloader)
-            assert isinstance(
-                resident._runtime,
-                ResidentBlockRuntime,
-            )
-            assert isinstance(
-                transient._runtime,
-                ResidentBlockRuntime,
-            )
-            assert offloader._composite.transient_blocks == (transient,)
         finally:
             offloader.deactivate()
 
@@ -278,7 +175,7 @@ class TestBlockCompileConfig:
             block_compile=BlockCompileConfig(options={"max_autotune": False}),
         )
         try:
-            assert block_components(offloader)[0].block_compile is not None
+            assert residency_engine(offloader).block_compile is not None
         finally:
             offloader.deactivate()
 
@@ -326,7 +223,7 @@ class TestCompiledForwardConstruction:
         finally:
             offloader.deactivate()
 
-    def test_one_config_applies_to_multiple_block_groups(
+    def test_one_config_applies_to_multiple_offload_groups(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -337,44 +234,36 @@ class TestCompiledForwardConstruction:
 
         offloader = _make_offloader(
             model,
-            block_paths=["first_blocks", "second_blocks"],
+            offload_paths=["first_blocks", "second_blocks"],
             block_compile=config,
         )
         try:
-            streamers = block_components(offloader)
-            assert len(streamers) == 2
-            assert all(streamer.block_compile is config for streamer in streamers)
+            engine = residency_engine(offloader)
+            assert len(engine.units) == 4
+            assert engine.block_compile is config
             assert len(spy.calls) == 4
         finally:
             offloader.deactivate()
 
 
 class TestCompiledForwardLifecycle:
-    @pytest.mark.parametrize("block_mode", ["streaming", "resident", "rolling", "auto"])
-    @pytest.mark.parametrize("transient", [False, True])
+    @pytest.mark.parametrize("vram_budget_bytes", [None, 1024 * 1024 * 1024])
     def test_cpu_activation_compiles_without_cuda_resources(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        block_mode: BlockMode,
-        transient: bool,
+        vram_budget_bytes: int | None,
     ) -> None:
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
         model = _BlockModel()
         offloader = _make_offloader(
             model,
-            block_mode=block_mode,
+            vram_budget_bytes=vram_budget_bytes,
             block_compile=BlockCompileConfig(fullgraph=True),
-            transient_block_paths=("blocks",) if transient else (),
         )
-        component = block_components(offloader)[0]
+        engine = residency_engine(offloader)
         pointers = [param.data_ptr() for param in model.parameters()]
 
-        def forbid_acquire(*args: object, **kwargs: object) -> None:
-            pytest.fail("CPU compilation must not acquire CUDA resources")
-
-        monkeypatch.setattr(component._runtime, "acquire", forbid_acquire)
-        monkeypatch.setattr(component._eager_runtime, "acquire", forbid_acquire)
         try:
             for _ in range(2):
                 with activated_model(offloader, "cpu"):
@@ -382,29 +271,35 @@ class TestCompiledForwardLifecycle:
                         model(torch.randn(2, 8))
                     assert all("forward" in block.__dict__ for block in model.blocks)
                     assert [param.data_ptr() for param in model.parameters()] == pointers
-                    assert component._active_runtime is None
-                    assert component._pin_lease is None
-                    assert not component._transfer.open
+                    assert engine.pool is None
+                    assert engine._pin_lease is None
+                    assert not engine._units_transfer.open
                     assert all(kwargs["backend"] == "inductor" for _fn, kwargs in spy.calls[-2:])
                 assert all("forward" not in block.__dict__ for block in model.blocks)
             assert spy.executions == 4
-            assert len(spy.calls) == (4 if block_mode in ("rolling", "auto") else 2)
+            assert len(spy.calls) == 2
         finally:
             offloader.deactivate()
 
-    @pytest.mark.parametrize("block_mode", ["streaming", "resident", "rolling", "auto"])
-    def test_cpu_compile_bypass_is_temporary(self, monkeypatch, block_mode):
+    @pytest.mark.parametrize("vram_budget_bytes", [None, 1024 * 1024 * 1024])
+    def test_cpu_compile_bypass_is_temporary(self, monkeypatch, vram_budget_bytes):
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
         model = _BlockModel()
         offloader = _make_offloader(
-            model, block_mode=block_mode, block_compile=BlockCompileConfig(fullgraph=True),
+            model,
+            vram_budget_bytes=vram_budget_bytes,
+            block_compile=BlockCompileConfig(fullgraph=True),
         )
-        component = block_components(offloader)[0]
+        engine = residency_engine(offloader)
         for compile_blocks in (False, True, False):
-            with component.use("cpu", compile_blocks=compile_blocks), torch.inference_mode():
-                model(torch.randn(2, 8))
-                assert all(("forward" in block.__dict__) == compile_blocks for block in model.blocks)
+            engine.activate("cpu", compile_blocks=compile_blocks)
+            try:
+                with torch.inference_mode():
+                    model(torch.randn(2, 8))
+                    assert all(("forward" in block.__dict__) == compile_blocks for block in model.blocks)
+            finally:
+                engine.deactivate()
             assert all("forward" not in block.__dict__ for block in model.blocks)
         assert spy.executions == 2
 
@@ -419,7 +314,7 @@ class TestCompiledForwardLifecycle:
         assert not spy.calls
 
     @CUDA
-    def test_resident_blocks_compile_without_prefetching(
+    def test_all_resident_units_compile_without_prefetching(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -428,26 +323,23 @@ class TestCompiledForwardLifecycle:
         model = _BlockModel()
         offloader = _make_offloader(
             model,
-            block_mode="resident",
+            vram_budget_bytes=1024 * 1024 * 1024,
             block_compile=BlockCompileConfig(),
         )
-        streamer = block_components(offloader)[0]
-        runtime = streamer._runtime
+        engine = residency_engine(offloader)
         try:
-            assert isinstance(runtime, ResidentBlockRuntime)
             with activated_model(offloader, "cuda"):
-                assert runtime.acquired
-                assert len(runtime._leases) == len(model.blocks)
-                leases = tuple(runtime._leases)
-                assert not hasattr(runtime, "_executor")
-                assert not hasattr(runtime, "_stream")
-                assert not hasattr(runtime, "_hooks")
+                assert engine.pool is not None
+                assert engine.pool.live_slot_count == len(model.blocks)
+                slots = tuple(engine.pool._slots)
+                assert engine._executor is None
+                assert engine._copy_stream is None
+                assert engine._pin_lease is None
                 assert all("forward" in block.__dict__ for block in model.blocks)
-                assert all(param.device.type == "cuda" for param in model.parameters())
                 with torch.inference_mode():
                     model(torch.randn(2, 8, device="cuda"))
                     model(torch.randn(2, 8, device="cuda"))
-                assert tuple(runtime._leases) == leases
+                assert tuple(engine.pool._slots) == slots
             assert spy.executions == 4
             assert all("forward" not in block.__dict__ for block in model.blocks)
             assert all(param.device.type == "cpu" for param in model.parameters())
@@ -468,29 +360,28 @@ class TestCompiledForwardLifecycle:
             model,
             block_compile=BlockCompileConfig(),
         )
-        streamer = block_components(offloader)[0]
-        runtime = streamer._runtime
-        original_before = runtime._before_block_forward
+        engine = residency_engine(offloader)
+        original_before = engine._before_unit_forward
 
         def record_before(*args: object, **kwargs: object) -> None:
             events.append("stream")
             original_before(*args, **kwargs)
 
-        monkeypatch.setattr(runtime, "_before_block_forward", record_before)
+        monkeypatch.setattr(engine, "_before_unit_forward", record_before)
         try:
             with activated_model(offloader, "cuda"):
-                assert streamer._active_runtime is runtime
+                assert engine.pool is not None
                 assert all("forward" in block.__dict__ for block in model.blocks)
                 with torch.inference_mode():
                     model(torch.randn(2, 8, device="cuda"))
             assert events == ["stream", "compiled", "stream", "compiled"]
-            assert streamer._active_runtime is None
+            assert engine.pool is None
             assert all("forward" not in block.__dict__ for block in model.blocks)
         finally:
             offloader.deactivate()
 
     @CUDA
-    def test_compiled_forwards_remain_installed_across_release_acquire(
+    def test_compiled_forwards_remain_installed_across_release(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -501,19 +392,17 @@ class TestCompiledForwardLifecycle:
             model,
             block_compile=BlockCompileConfig(),
         )
-        streamer = block_components(offloader)[0]
-        runtime = streamer._runtime
+        engine = residency_engine(offloader)
         try:
             with activated_model(offloader, "cuda"):
-                assert runtime.acquired
+                assert engine.pool is not None
                 assert all("forward" in block.__dict__ for block in model.blocks)
 
-                streamer.release()
-                assert not runtime.acquired
+                engine.release()
+                assert engine.pool is None
                 assert all("forward" in block.__dict__ for block in model.blocks)
-
-                streamer.acquire()
-                assert runtime.acquired
+            assert all("forward" not in block.__dict__ for block in model.blocks)
+            with activated_model(offloader, "cuda"):
                 assert all("forward" in block.__dict__ for block in model.blocks)
                 with torch.inference_mode():
                     model(torch.randn(2, 8, device="cuda"))
@@ -553,36 +442,34 @@ class TestCompiledForwardLifecycle:
             offloader.deactivate()
 
     @CUDA
-    def test_transient_block_path_retains_compiled_forwards(
+    def test_zero_budget_retains_compiled_forwards(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
         model = _BlockModel()
+        x = torch.randn(2, 8)
+        with torch.inference_mode():
+            expected = model(x)
         offloader = _make_offloader(
             model,
+            vram_budget_bytes=0,
             block_compile=BlockCompileConfig(),
-            transient_block_paths=("blocks",),
         )
-        streamer = block_components(offloader)[0]
-        runtime = streamer._runtime
-        root_states: list[bool] = []
-        remove_observer = offloader.register_forward_hook(
-            "",
-            lambda _module, _args, _output: root_states.append(runtime.acquired),
-        )
+        engine = residency_engine(offloader)
         try:
             with activated_model(offloader, "cuda"):
+                x_cuda = x.cuda()
                 for _ in range(2):
                     with torch.inference_mode():
-                        model(torch.randn(2, 8, device="cuda"))
-                    assert runtime.acquired
+                        actual = model(x_cuda)
+                    torch.testing.assert_close(actual.cpu(), expected)
+                    assert engine.pool is not None and engine.pool.live_slot_count == 0
                     assert all("forward" in block.__dict__ for block in model.blocks)
-                assert root_states == [False, False]
+            assert spy.executions == 4
             assert all("forward" not in block.__dict__ for block in model.blocks)
         finally:
-            remove_observer()
             offloader.deactivate()
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -614,22 +501,22 @@ class TestCompiledForwardLifecycle:
             offloader.deactivate()
 
     @pytest.mark.parametrize("device", DEVICES)
-    @pytest.mark.parametrize("block_mode", ["streaming", "resident", "rolling", "auto"])
+    @pytest.mark.parametrize("vram_budget_bytes", [None, 1024 * 1024 * 1024])
     def test_activation_failure_restores_original_forwards(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        block_mode: BlockMode,
+        vram_budget_bytes: int | None,
         device: str,
     ) -> None:
         monkeypatch.setattr(torch, "compile", _CompileSpy())
         model = _BlockModel()
         offloader = _make_offloader(
             model,
-            block_mode=block_mode,
+            vram_budget_bytes=vram_budget_bytes,
             block_compile=BlockCompileConfig(fullgraph=True),
         )
-        streamer = block_components(offloader)[0]
-        compile_state = streamer._block_compile
+        engine = residency_engine(offloader)
+        compile_state = engine._block_compile
         state_type = type(compile_state)
         original_install = state_type.install
 
@@ -647,7 +534,6 @@ class TestCompiledForwardLifecycle:
 
         assert offloader.active_device is None
         assert not compile_state.installed
-        assert streamer._inductor_compile is None or not streamer._inductor_compile.installed
         assert all("forward" not in block.__dict__ for block in model.blocks)
 
         with activated_model(offloader, device):
@@ -808,11 +694,11 @@ class TestCompiledLoRA:
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
 
     @pytest.mark.parametrize("device", DEVICES)
-    @pytest.mark.parametrize("block_mode", ["streaming", "resident"])
+    @pytest.mark.parametrize("vram_budget_bytes", [None, 1024 * 1024 * 1024])
     def test_routed_bypass_is_model_wide_and_temporary(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        block_mode: BlockMode,
+        vram_budget_bytes: int | None,
         device: str,
     ) -> None:
         spy = _CompileSpy()
@@ -826,8 +712,8 @@ class TestCompiledLoRA:
         )
         offloader = _make_offloader(
             model,
-            block_paths=["first_blocks", "second_blocks"],
-            block_mode=block_mode,
+            offload_paths=["first_blocks", "second_blocks"],
+            vram_budget_bytes=vram_budget_bytes,
             block_compile=BlockCompileConfig(),
         )
         x = torch.randn(2, 8, device=device)

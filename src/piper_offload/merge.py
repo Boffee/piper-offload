@@ -24,8 +24,8 @@ from torch import nn
 from ._dtensor import local_shard
 from ._parameter_update import ParameterUpdatePlan, merge_target_id, plan_merge_targets
 from .adapter import Adapter, AdapterTargetUpdates, active_adapter_pairs, group_adapter_updates
-from .composite_component import reserve_shell
 from .host_module import install_parameters
+from .model_partition import reserve_shell
 from .pin_manager import host_pin_manager
 from .tensor_adapter_registry import (
     param_representation,

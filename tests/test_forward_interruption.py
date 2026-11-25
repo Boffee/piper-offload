@@ -2,7 +2,7 @@
 
 Scheduling hooks must act on installed state rather than assume the previous
 hook ran; see the scheduling-hooks section of ``docs/development.md``. Each
-configuration exercises one scheduler. A new block mode, transient variant, or
+configuration exercises one scheduler. A new offloaded residency configuration or
 hook-driven adapter path joins ``_CONFIGS``; a new way for hooks to miss each
 other joins ``_INTERRUPTIONS``.
 """
@@ -18,7 +18,6 @@ from torch import nn
 from piper_offload import (
     Adapter,
     BlockCompileConfig,
-    BlockMode,
     ModelOffloader,
     OffloadConfig,
     host_pin_manager,
@@ -35,19 +34,24 @@ type _Interruption = Literal[
     "error_after_block",
     "error_in_layer",
     "interrupt_in_layer",
+    "error_in_unit",
+    "interrupt_in_unit",
     "skipped_block",
     "direct_call",
 ]
 _INTERRUPTIONS: tuple[_Interruption, ...] = (
-    # Leaves block schedulers mid-traversal and the transient path released.
+    # Leaves the residency engine mid-traversal.
     "error_after_block",
-    # Raise inside the resident head after its routed pre-hook staged and after
-    # transient parts released. ``always_call`` post-hooks run for an
-    # ``Exception`` but not for an interrupt.
+    # Raise inside the resident head after its routed pre-hook staged.
+    # ``always_call`` post-hooks run for an ``Exception`` but not for an interrupt.
     "error_in_layer",
     "interrupt_in_layer",
+    # Raise inside an offloaded unit's forward so unit hooks unwind via
+    # ``always_call`` (Exception) or must recover cleanly on next use (Interrupt).
+    "error_in_unit",
+    "interrupt_in_unit",
     "skipped_block",
-    # Run the transient path and the final block outside the root forward.
+    # Run the final offloaded unit directly outside the root forward.
     "direct_call",
 )
 
@@ -87,36 +91,38 @@ class _Model(nn.Module):
 @dataclass(frozen=True)
 class _Config:
     device: str
-    block_mode: BlockMode
-    transient: bool = False
+    offload_paths: tuple[str, ...] = ("blocks",)
+    vram_budget_bytes: int | None = None
+    compiled: bool = False
     routed: bool = False
 
     def offloader(self, model: nn.Module) -> ModelOffloader:
         return ModelOffloader.from_module(
             model,
             OffloadConfig(
-                block_paths=() if self.transient else ("blocks",),
-                transient_block_paths=("blocks",) if self.transient else (),
-                transient_paths=("embed",) if self.transient else (),
-                block_mode=self.block_mode,
+                offload_paths=self.offload_paths,
+                vram_budget_bytes=self.vram_budget_bytes,
                 block_compile=(
                     BlockCompileConfig(dynamic=False, fullgraph=True)
-                    if self.block_mode == "rolling"
+                    if self.compiled
                     else None
                 ),
             ),
         )
 
 
+_UNIT_BYTES = _WIDTH * _WIDTH * 4
+
 _CONFIGS = (
-    pytest.param(_Config("cuda", "streaming"), marks=CUDA, id="streaming"),
-    pytest.param(_Config("cuda", "streaming", transient=True), marks=CUDA, id="streaming-transient"),
-    pytest.param(_Config("cuda", "resident", transient=True), marks=CUDA, id="resident-transient"),
-    pytest.param(_Config("cuda", "rolling"), marks=CUDA, id="rolling"),
-    pytest.param(_Config("cuda", "rolling", transient=True), marks=CUDA, id="rolling-transient"),
-    pytest.param(_Config("cuda", "streaming", routed=True), marks=CUDA, id="streaming-routed"),
-    # CPU activation schedules no blocks, but routed hooks still stage factors.
-    pytest.param(_Config("cpu", "streaming", routed=True), id="cpu-routed"),
+    pytest.param(_Config("cuda", ("blocks",), None), marks=CUDA, id="streaming"),
+    pytest.param(_Config("cuda", ("blocks",), 0), marks=CUDA, id="zero-budget"),
+    pytest.param(_Config("cuda", ("embed", "blocks"), None), marks=CUDA, id="mixed-paths"),
+    pytest.param(_Config("cuda", ("blocks",), 2 * _UNIT_BYTES), marks=CUDA, id="partial-cache"),
+    pytest.param(_Config("cuda", ("embed", "blocks"), 1024 * 1024 * 1024), marks=CUDA, id="all-resident"),
+    pytest.param(_Config("cuda", ("blocks",), None, compiled=True), marks=CUDA, id="compiled"),
+    pytest.param(_Config("cuda", ("blocks",), None, routed=True), marks=CUDA, id="streaming-routed"),
+    # CPU activation schedules no CUDA units, but routed hooks still stage factors.
+    pytest.param(_Config("cpu", ("blocks",), None, routed=True), id="cpu-routed"),
 )
 
 
@@ -145,13 +151,23 @@ def _interrupt(model: _Model, x: torch.Tensor, interruption: _Interruption) -> N
         finally:
             model.fail_after_middle = False
     else:
-        error = Interrupt if interruption == "interrupt_in_layer" else RuntimeError
+        error = (
+            Interrupt
+            if interruption in ("interrupt_in_layer", "interrupt_in_unit")
+            else RuntimeError
+        )
+        target: nn.Module
+        if interruption in ("error_in_unit", "interrupt_in_unit"):
+            block = model.blocks[_MIDDLE]
+            target = block if "forward" in block.__dict__ else block.proj
+        else:
+            target = model.head
 
         def fail(_module: nn.Module, _args: tuple[object, ...]) -> None:
             raise error("simulated interruption")
 
         # Registered after activation, so it runs after any routed pre-hook.
-        handle = model.head.register_forward_pre_hook(fail)
+        handle = target.register_forward_pre_hook(fail)
         try:
             with pytest.raises(error, match="simulated interruption"):
                 model(x)
@@ -174,7 +190,7 @@ def test_next_forward_recovers_from_interruption(
     config: _Config,
     interruption: _Interruption,
 ) -> None:
-    if config.block_mode == "rolling":
+    if config.compiled:
         # Keep compiled variants below Dynamo's frame limit.
         torch.compiler.reset()
         request.addfinalizer(torch.compiler.reset)

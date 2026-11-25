@@ -25,7 +25,6 @@ maps implementation ownership and extension points.
 from ._host_registration import HostRegistrationError
 from .adapter import Adapter, AdapterMode, AdapterTarget
 from .block_compile import BlockCompileConfig
-from .block_mode import BlockMode
 from .checkpoint import CheckpointError, FileSlice, MappedCheckpoint, file_slice
 from .gguf_parameter import GgufParameter
 from .lora import LoRAFactor, LoRATransform, ScaledLoRAFactor
@@ -34,7 +33,7 @@ from .model_cache import ModelCache
 from .model_offloader import ModelOffloader, ModelRuntimeFailedError, ModelRuntimeInUseError
 from .model_store import ModelStore
 from .mps_weights import MpsWeights
-from .offload_config import OffloadConfig
+from .offload_config import OffloadConfig, auto_offload_paths
 from .parameter_delta import ParameterDelta, ParameterDeltaTransform, ScaledParameterDelta
 from .parameter_transform import ParameterTransform
 from .parameter_value import (
@@ -78,7 +77,6 @@ __all__ = [
     "AdapterSpec",
     "AdapterTarget",
     "BlockCompileConfig",
-    "BlockMode",
     "CacheError",
     "CheckpointError",
     "DuplicateResourceKeyError",
@@ -125,6 +123,7 @@ __all__ = [
     "ScaledParameterValue",
     "TensorAdapter",
     "TrellisParameter",
+    "auto_offload_paths",
     "derive_seed",
     "file_slice",
     "host_pin_manager",

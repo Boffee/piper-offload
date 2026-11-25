@@ -28,8 +28,7 @@ compilation, or quantized operations. For relay changes that depend on rank
 coordination, exercise the affected transport with multiple processes.
 
 For performance claims, compare the same workload and configuration on the
-same hardware. The [rolling benchmark](../benchmarks/benchmark_rolling_compile.py)
-checks outputs before comparing latency and allocator residency.
+same hardware, checking outputs before comparing latency and allocator residency.
 
 ## Writing tests
 
@@ -80,8 +79,9 @@ Keep latency and throughput measurements in [benchmarks](../benchmarks).
 | Checkpoint reader | Validate file headers, map tensor storage read-only, and record its file slice | [checkpoint.py](../src/piper_offload/checkpoint.py) |
 | Model cache | Lease adapters and a model, then activate the model for a use | [model_cache.py](../src/piper_offload/model_cache.py) |
 | Model store and offload config | Capture flat frozen host backing once and configure/bind offload topologies | [model_store.py](../src/piper_offload/model_store.py), [offload_config.py](../src/piper_offload/offload_config.py) |
-| Model offloader | Coordinate bound host/block components, hooks, activation, and deactivation | [model_offloader.py](../src/piper_offload/model_offloader.py) |
-| Internal components | Own host state and device working sets composed by `ModelStore` and `ModelOffloader` | [host_component.py](../src/piper_offload/host_component.py), [block_component.py](../src/piper_offload/block_component.py), [composite_component.py](../src/piper_offload/composite_component.py) |
+| Model offloader | Coordinate shell ownership, adapter hooks, activation, and dynamic VRAM controls | [model_offloader.py](../src/piper_offload/model_offloader.py) |
+| Model partition | Partition resident state and offloaded units with cross-boundary alias validation | [model_partition.py](../src/piper_offload/model_partition.py) |
+| Elastic VRAM pool & residency engine | Capacity-bounded GPU slot reuse (Belady MIN), trace lookahead, and hook lifecycle | [vram_pool.py](../src/piper_offload/vram_pool.py), [residency_engine.py](../src/piper_offload/residency_engine.py) |
 | Host parameters and tensor adapters | Capture, account for, transfer, and reconstruct each tensor representation | [host_param.py](../src/piper_offload/host_param.py), [tensor_adapters.py](../src/piper_offload/tensor_adapters.py) |
 | Model adapters | Immutable LoRA, delta, and value resources applied through load plans or hooks | [adapter.py](../src/piper_offload/adapter.py), [merge.py](../src/piper_offload/merge.py) |
 | Parameter updates | Select merge targets and sources, validate them, and plan arithmetic for activation and permanent merge | [_parameter_update.py](../src/piper_offload/_parameter_update.py), [lora.py](../src/piper_offload/lora.py) |
@@ -90,7 +90,7 @@ Keep latency and throughput measurements in [benchmarks](../benchmarks).
 | Relay process group | Coordinate collectives, point-to-point operations, and host staging across ranks | [communication.py](../src/piper_offload/communication.py) |
 | In-process multi-rank executors | Coordinate concurrent or serialized multi-rank threads, runtime isolation, and local transports | [sequential.py](../src/piper_offload/sequential.py), [parallel.py](../src/piper_offload/parallel.py), [_sequential_runtime.py](../src/piper_offload/_sequential_runtime.py), [_parallel_collectives.py](../src/piper_offload/_parallel_collectives.py) |
 | Memory components | Owned checkpoint copies, platform allocation, and Windows retention | [_copy_memory.py](../src/piper_offload/_copy_memory.py), [_copy_memory_windows.py](../src/piper_offload/_copy_memory_windows.py), [_host_memory.py](../src/piper_offload/_host_memory.py) |
-| Block compilation | Compile declared block forwards and schedule rolling transfers | [block_compile.py](../src/piper_offload/block_compile.py), [rolling_compile.py](../src/piper_offload/rolling_compile.py) |
+| Block compilation | Compile declared offloaded unit forwards | [block_compile.py](../src/piper_offload/block_compile.py) |
 
 A resource *spec* builds a *store*. Capture establishes its `cache_bytes`.
 A resource lease protects that store from eviction. A pin lease protects
@@ -98,10 +98,10 @@ storage used by a transfer. The runtime decides whether to request registration
 under the [transfer pinning policy](memory.md#set-the-pin-budget).
 
 A *binding* adds a device lifecycle to a store. `ModelOffloader` implements
-both. Its host components manage non-streamed state and transient modules.
-Its block components manage declared block lists. Each component owns a device
-working set that it can release and reacquire within one activation, or *session*.
-Deactivation releases device state and retains captured host state.
+both. `ModelPartition` splits non-offloaded resident weights from offloaded units,
+and `ResidencyEngine` orchestrates their CUDA lifecycle and `ElasticVramPool`
+slots during an activation *session*. Deactivation releases device state and
+retains captured host state.
 
 An `Adapter` is an immutable model-update resource. A *tensor adapter*
 interprets the CPU representation (*host state*) held by a `HostParam` and
@@ -119,24 +119,23 @@ frames and any tensors they reference.
 
 ### Scheduling hooks
 
-Transient release, block streaming, rolling refill, and routed LoRA staging
-run from module forward hooks. A hook must work even if an earlier hook was
-skipped or interrupted.
+Unit offloading and routed LoRA staging run from module forward hooks. A hook
+must work even if an earlier hook was skipped or interrupted.
 
 - A forward that raises skips ordinary post-hooks. `always_call` handles
   `Exception`. A `KeyboardInterrupt` or cancellation outside that hierarchy
   can skip even those hooks.
 - Callers can invoke a submodule directly, without the root model's hooks.
-- Models skip or reorder blocks, for example for skip-layer guidance.
+- Models skip, reorder, or loop units dynamically.
 
 Act on the state actually installed.
 
 1. Mark a multi-step transition in progress before the first step. Commit it
    only after the last. A call that finds an unfinished transition releases
    first. Idempotent release steps finish an interrupted release or roll back
-   an interrupted acquire. Components record this in
-   [`WorkingSetState`](../src/piper_offload/_working_set.py). Streaming block
-   switches and rolling refills follow the same rule.
+   an interrupted acquire. The engine records this in
+   [`WorkingSetState`](../src/piper_offload/_working_set.py). Unit switches
+   in `ResidencyEngine` follow the same rule.
 2. Re-establish the working set where it is used. Replace call-scoped state
    on the next call so interrupted forwards cannot accumulate it.
 3. Hand storage back only once its last user has finished. If detaching a
@@ -192,8 +191,11 @@ implementation in [resource_cache.py](../src/piper_offload/resource_cache.py).
    Route every physical host-to-device copy through `transfer_()` so the transfer
    uses the storage the pin manager prepared. See [custom transfers](memory.md#custom-transfers).
 2. Implement the capabilities the format supports. Bind-target relaxation
-   (`BindTargetTensorAdapter`), representation-preserving copy, conversion, and
-   merge are separate protocols.
+   (`BindTargetTensorAdapter`), decoded GPU target sizing
+   (`GpuTargetBytesTensorAdapter`, required when active GPU target allocation
+   bytes differ from resting host `cache_bytes` so `vram_budget_bytes` stays
+   accurate), representation-preserving copy, conversion, and merge are separate
+   protocols.
    For factorized or dense merge, the merge and preflight
    docstrings specify rounding, coefficients, broadcasting, locality, and
    storage preservation. See the [caller contract](adapters.md#broadcast-additive-updates)

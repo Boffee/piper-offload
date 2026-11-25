@@ -54,8 +54,11 @@ cache.clear()
 ```
 
 Each `use()` activates the model and deactivates it on exit. Place inputs on
-the compute device yourself. For a model larger than VRAM, configure its block
-lists with `ModelSpec(..., config=OffloadConfig(block_paths=("transformer_blocks",)))`; see
+the compute device yourself. For a model larger than VRAM, configure offloaded
+modules with
+`ModelSpec(..., config=OffloadConfig(offload_paths=("transformer_blocks",)))`
+(optionally with `vram_budget_bytes=...`, or discover paths from an instantiated
+model with `auto_offload_paths(model)`); see
 [streaming](https://github.com/Boffee/piper-offload/blob/main/docs/streaming.md) for the required model structure.
 
 ## Fit and limitations

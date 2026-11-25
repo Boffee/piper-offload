@@ -42,6 +42,7 @@ __all__ = [
     "DenseMergeValidationTensorAdapter",
     "DequantRequantTensorAdapter",
     "DequantizeTensorAdapter",
+    "GpuTargetBytesTensorAdapter",
     "LoRAMergeTensorAdapter",
     "LoRAMergeValidationTensorAdapter",
     "LogicalShapeTensorAdapter",
@@ -54,6 +55,7 @@ __all__ = [
     "adapter_name",
     "capture_host_tensor",
     "empty_like_strided",
+    "gpu_target_bytes",
     "host_state_is_owned",
     "is_plain_meta_placeholder",
     "matches_layout_signature",
@@ -246,6 +248,29 @@ class LogicalShapeTensorAdapter[HostStateT, GpuStateT](
     def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
         """Return the dense logical shape represented by ``t``."""
         ...
+
+
+@runtime_checkable
+class GpuTargetBytesTensorAdapter[HostStateT, GpuStateT](
+    TensorAdapter[HostStateT, GpuStateT],
+    Protocol,
+):
+    """Optional capability for adapters whose GPU target size differs from host ``cache_bytes``."""
+
+    @staticmethod
+    def gpu_target_bytes(state: HostStateT) -> int:
+        """Return unique GPU storage bytes allocated by :meth:`alloc_gpu` for ``state``."""
+        ...
+
+
+def gpu_target_bytes[HostStateT](
+    adapter: TensorAdapter[HostStateT, Any],
+    state: HostStateT,
+) -> int:
+    """Return GPU target storage bytes for ``state``, defaulting to ``cache_bytes``."""
+    if isinstance(adapter, GpuTargetBytesTensorAdapter):
+        return adapter.gpu_target_bytes(state)
+    return adapter.cache_bytes(state)
 
 
 @runtime_checkable

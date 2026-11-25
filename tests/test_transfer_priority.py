@@ -578,7 +578,7 @@ def test_single_gpu_streaming_lookahead_skips_chunk_syncs_without_foreground_pro
     model = _BlockModel()
     offloader = ModelOffloader.from_module(
         model,
-        OffloadConfig(block_paths=("blocks",)),
+        OffloadConfig(offload_paths=("blocks",)),
     )
     x = torch.randn(2, 64, device="cuda")
 
@@ -661,7 +661,7 @@ def test_mid_block_foreground_transfer_yields_lookahead_with_producer(
     model = _TwoBlockModel()
     offloader = ModelOffloader.from_module(
         model,
-        OffloadConfig(block_paths=("blocks",)),
+        OffloadConfig(offload_paths=("blocks",)),
     )
     x = torch.randn(2, 256, device="cuda")
 

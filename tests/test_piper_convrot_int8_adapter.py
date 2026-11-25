@@ -25,7 +25,6 @@ from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from piper_offload.dtensor_adapter import DTensorAdapter
 from piper_offload.host_module import HostModuleStore
 from piper_offload.host_param import HostParam
-from piper_offload.block_component import _param_target_layout
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
     DequantRequantTensorAdapter,
@@ -37,6 +36,8 @@ from piper_offload.tensor_adapters import (
     TensorCopyIntoAdapter,
 )
 from tests.conftest import activated_model
+
+_param_target_layout = HostParam.target_layout_for
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -210,7 +211,7 @@ class TestPiperConvRotInt8Adapter:
         model.blocks = nn.ModuleList([Block(), Block()])
         first_source_ref = weakref.ref(model.blocks[0].weight)
         watched_ref = first_source_ref
-        offloader = ModelOffloader.from_module(model, OffloadConfig(block_paths=("blocks",)))
+        offloader = ModelOffloader.from_module(model, OffloadConfig(offload_paths=("blocks",)))
         assert calls == 2
         assert first_source_ref() is None
         offloader.deactivate()
@@ -782,8 +783,7 @@ class TestPiperConvRotInt8Adapter:
         offloader = ModelOffloader.from_module(
             model,
             OffloadConfig(
-                block_paths=("blocks",),
-                block_mode="rolling",
+                offload_paths=("blocks",),
                 block_compile=BlockCompileConfig(dynamic=False, fullgraph=True),
             ),
         )
@@ -798,12 +798,18 @@ class TestPiperConvRotInt8Adapter:
 
     @CUDA
     @pytest.mark.parametrize(
-        "block_mode",
-        ["resident", "streaming", "rolling", "auto"],
+        ("vram_budget_bytes", "compiled"),
+        [
+            (1024 * 1024 * 1024, False),
+            (None, False),
+            (None, True),
+            (1024 * 1024 * 1024, True),
+        ],
     )
-    def test_quantized_parameter_values_work_in_every_block_mode(
+    def test_quantized_parameter_values_work_in_every_offload_mode(
         self,
-        block_mode: str,
+        vram_budget_bytes: int | None,
+        compiled: bool,
     ) -> None:
         convrot_cls = _convrot_cls()
 
@@ -839,15 +845,13 @@ class TestPiperConvRotInt8Adapter:
         )
         model = M()
         compile_config = (
-            BlockCompileConfig(dynamic=False, fullgraph=True)
-            if block_mode in {"rolling", "auto"}
-            else None
+            BlockCompileConfig(dynamic=False, fullgraph=True) if compiled else None
         )
         offloader = ModelOffloader.from_module(
             model,
             OffloadConfig(
-                block_paths=("blocks",),
-                block_mode=block_mode,  # type: ignore[arg-type]
+                offload_paths=("blocks",),
+                vram_budget_bytes=vram_budget_bytes,
                 block_compile=compile_config,
             ),
         )
@@ -932,7 +936,7 @@ class TestPiperConvRotInt8Adapter:
 
         offloader = ModelOffloader.from_module(
             model,
-            OffloadConfig(block_paths=("blocks",)),
+            OffloadConfig(offload_paths=("blocks",)),
         )
         try:
             inputs = torch.randn(
@@ -949,12 +953,23 @@ class TestPiperConvRotInt8Adapter:
                 adapter_mode="merge",
                 stochastic_rounding=False,
             ) as active:
-                merged = active.blocks[0].weight.data
-                assert isinstance(merged, convrot_cls)
-                assert torch.equal(merged.qdata, expected.qdata)
-                assert torch.equal(merged.scale, expected.scale)
-                output = active(inputs)
-                torch.cuda.synchronize()
+                ran = False
+
+                def _check_merged(mod: nn.Module, _inputs: object) -> None:
+                    nonlocal ran
+                    merged = mod.weight.data
+                    assert isinstance(merged, convrot_cls)
+                    assert torch.equal(merged.qdata, expected.qdata)
+                    assert torch.equal(merged.scale, expected.scale)
+                    ran = True
+
+                handle = active.blocks[0].register_forward_pre_hook(_check_merged)
+                try:
+                    output = active(inputs)
+                    torch.cuda.synchronize()
+                finally:
+                    handle.remove()
+                assert ran
             assert output.shape == (4, 64)
         finally:
             offloader.deactivate()
@@ -989,7 +1004,7 @@ class TestPiperConvRotInt8Adapter:
                 "blocks.0.lora_B.weight": torch.randn(64, 4),
             }
         )
-        offloader = ModelOffloader.from_module(model, OffloadConfig(block_paths=("blocks",)))
+        offloader = ModelOffloader.from_module(model, OffloadConfig(offload_paths=("blocks",)))
 
         samples: list[torch.Tensor] = []
         for _ in range(2):

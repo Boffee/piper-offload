@@ -13,13 +13,11 @@ from piper_offload import (
     ScaledLoRAFactor,
     merge_adapter,
 )
-from piper_offload.block_component import _param_target_layout
-from piper_offload.nvfp4_adapter import Nvfp4Adapter
 from piper_offload.host_param import HostParam
+from piper_offload.nvfp4_adapter import Nvfp4Adapter
 from piper_offload.piper_convrot_nvfp4_adapter import (
     PiperConvRotNVFP4Adapter,
 )
-from piper_offload.rolling_runtime import _ROLLING_ADAPTER_TYPES
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
     DequantRequantTensorAdapter,
@@ -31,6 +29,8 @@ from piper_offload.tensor_adapters import (
     TensorCopyIntoAdapter,
 )
 from tests.conftest import activated_model
+
+_param_target_layout = HostParam.target_layout_for
 
 
 def _exact_sm120_available() -> bool:
@@ -385,7 +385,6 @@ class TestPiperConvRotNVFP4Adapter:
         assert isinstance(adapter, DequantizeTensorAdapter)
         assert not isinstance(adapter, DequantRequantTensorAdapter)
         assert not isinstance(adapter, TensorCopyIntoAdapter)
-        assert PiperConvRotNVFP4Adapter in _ROLLING_ADAPTER_TYPES
 
     def test_validates_mutated_rotation_metadata(self) -> None:
         convrot, _dense = _make_convrot_nvfp4()

@@ -6,7 +6,7 @@ weights. Before that, the pool was templated off block 0 and a hard layout
 check rejected any block that differed — the case these tests cover.
 """
 
-from tests.conftest import activated_model, block_components
+from tests.conftest import activated_model, offloaded_units
 
 from collections.abc import Sequence
 
@@ -15,7 +15,7 @@ import torch
 from torch import nn
 
 from piper_offload import ModelOffloader, OffloadConfig
-from piper_offload.streaming_runtime import _plan_target_signature
+from piper_offload.vram_pool import plan_target_signature
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -53,17 +53,11 @@ def _frozen_model(dim: int, dtypes: Sequence[torch.dtype]) -> _Model:
     return model
 
 
-def _block_component(offloader: object):
-    components = block_components(offloader)  # type: ignore[attr-defined]
-    assert len(components) == 1
-    return components[0]
-
-
 def _signatures(offloader: object) -> tuple[object, ...]:
-    component = _block_component(offloader)
+    units = offloaded_units(offloader)  # type: ignore[arg-type]
     return tuple(
-        _plan_target_signature(instance.resolve_load_plan())
-        for instance in component._block_instances
+        plan_target_signature(instance.resolve_load_plan())
+        for instance in units
     )
 
 
@@ -83,7 +77,7 @@ def test_heterogeneous_block_list_builds_and_partitions_signatures() -> None:
     # differs from block 0 ...") right here.
     offloader = ModelOffloader.from_module(
         model,
-        OffloadConfig(block_paths=("blocks",)),
+        OffloadConfig(offload_paths=("blocks",)),
     )
 
     signatures = _signatures(offloader)
@@ -99,7 +93,7 @@ def test_signature_distinguishes_each_dtype() -> None:
     model = _frozen_model(16, [torch.float32, torch.float16, torch.bfloat16])
     offloader = ModelOffloader.from_module(
         model,
-        OffloadConfig(block_paths=("blocks",)),
+        OffloadConfig(offload_paths=("blocks",)),
     )
     signatures = _signatures(offloader)
     assert len(set(signatures)) == 3
@@ -123,7 +117,7 @@ def test_cuda_streams_mixed_dtype_blocks_matches_reference() -> None:
 
     offloader = ModelOffloader.from_module(
         model,
-        OffloadConfig(block_paths=("blocks",)),
+        OffloadConfig(offload_paths=("blocks",)),
     )
 
     with torch.no_grad(), activated_model(offloader, "cuda") as bound:
@@ -144,7 +138,7 @@ def test_cuda_morphing_pool_handles_repeated_iterations() -> None:
 
     offloader = ModelOffloader.from_module(
         model,
-        OffloadConfig(block_paths=("blocks",)),
+        OffloadConfig(offload_paths=("blocks",)),
     )
 
     with torch.no_grad(), activated_model(offloader, "cuda") as bound:
@@ -213,7 +207,7 @@ def test_cuda_streams_mixed_quant_and_plain_blocks() -> None:
 
     offloader = ModelOffloader.from_module(
         model,
-        OffloadConfig(block_paths=("blocks",)),
+        OffloadConfig(offload_paths=("blocks",)),
     )
     assert len(set(_signatures(offloader))) == 2
 

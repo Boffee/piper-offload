@@ -47,7 +47,7 @@ from piper_offload.tensor_adapter_registry import (
     select_adapter,
     tensor_id,
 )
-from tests.conftest import activated_model, host_component
+from tests.conftest import activated_model, resident_instance
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -354,7 +354,7 @@ class TestDTensorAdapter:
                 self.blocks = nn.ModuleList(blocks)
 
         net = Net([Block(_dtensor_weight(tp_mesh)[0]), Block(_dtensor_weight(tp_mesh)[0])])
-        pw = ModelOffloader.from_module(net, OffloadConfig(block_paths=("blocks",)))
+        pw = ModelOffloader.from_module(net, OffloadConfig(offload_paths=("blocks",)))
         try:
             # resting: a DTensor on a CPU mesh (local on the host)
             resting = net.blocks[0].weight.data
@@ -1123,6 +1123,35 @@ class TestDTensorAdapter:
         with pytest.raises(ValueError, match="layout mismatch"):
             store.bind(bad_local)
 
+    def test_layout_signature_distinguishes_mesh_dim_names_and_process_groups(
+        self,
+        tp_mesh: Any,
+    ) -> None:
+        import torch.distributed as dist
+        from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, init_device_mesh
+
+        other_name_mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("tp_alt",))
+        pg = dist.new_group([0])
+        distinct_pg_mesh = DeviceMesh.from_group(pg, "cuda", mesh_dim_names=("tp",))
+        try:
+            local = torch.zeros(4, 4, device="cuda")
+            dt_base = DTensor.from_local(local, tp_mesh, [Replicate()], run_check=False)
+            dt_alt = DTensor.from_local(local, other_name_mesh, [Replicate()], run_check=False)
+            dt_pg = DTensor.from_local(local, distinct_pg_mesh, [Replicate()], run_check=False)
+
+            assert DTensorAdapter.layout_signature(dt_base) != DTensorAdapter.layout_signature(dt_alt)
+            assert DTensorAdapter.layout_signature(dt_base) != DTensorAdapter.layout_signature(dt_pg)
+
+            host_base = DTensorAdapter.capture_host(dt_base)
+            host_alt = DTensorAdapter.capture_host(dt_alt)
+            assert DTensorAdapter.layout_signature_from_host(host_base) == DTensorAdapter.layout_signature(dt_base)
+            assert (
+                DTensorAdapter.layout_signature_from_host(host_base)
+                != DTensorAdapter.layout_signature_from_host(host_alt)
+            )
+        finally:
+            dist.destroy_process_group(pg)
+
 
 class TestQuantizedShardProjection:
     """Zero-copy quantized DTensor Shard(dim) projection, activation, merge, and rejections."""
@@ -1363,10 +1392,10 @@ class TestQuantizedShardProjection:
         parallelize_module(shell, tp_mesh, {"fc": RowwiseParallel()})
         shell.requires_grad_(False)
         offloader = store.bind(shell)
-        comp = host_component(offloader)
-        assert comp is not None
+        resident = resident_instance(offloader)
+        assert resident is not None
         resting_sig = DTensorAdapter.layout_signature(shell.fc.weight.data)
-        cached_sig = comp._instance.params["fc.weight"].target_layout[1]
+        cached_sig = resident.params["fc.weight"].target_layout[1]
 
         lora = Adapter.from_state_dict(
             {
@@ -1537,10 +1566,10 @@ class TestQuantizedShardProjection:
         parallelize_module(shell, tp_mesh, {"fc1": ColwiseParallel(), "fc2": RowwiseParallel()})
         shell.requires_grad_(False)
         offloader = store.bind(shell)
-        comp = host_component(offloader)
-        assert comp is not None
-        hp1 = comp._instance.params["fc1.weight"]
-        hp2 = comp._instance.params["fc2.weight"]
+        resident = resident_instance(offloader)
+        assert resident is not None
+        hp1 = resident.params["fc1.weight"]
+        hp2 = resident.params["fc2.weight"]
 
         lora = Adapter.from_state_dict(
             {
@@ -1616,7 +1645,7 @@ def _verify_shard1_streaming_lin(
         )
     off = store.bind(
         shell,
-        OffloadConfig(block_paths=("blocks",), block_mode="streaming"),
+        OffloadConfig(offload_paths=("blocks",)),
     )
     try:
         x = torch.randn(2, cols, device="cuda", dtype=torch.bfloat16)
