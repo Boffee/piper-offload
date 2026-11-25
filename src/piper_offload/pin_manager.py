@@ -21,12 +21,13 @@ page-aligned copy, filling it from the file with parallel reads, and
 registering that. Evicting the copy unregisters and frees it, so the RAM
 returns; on Windows an optional offered tier (``max_offered_bytes``) instead
 offers an evicted copy's pages to the OS, which may discard them, and a later
-pin reclaims them and refills only what was discarded. Transfers reach the
-copy through ``transfer_``, which resolves each
-source tensor at copy time; an asynchronous transfer of pinned storage
-outside a lease raises, since eviction is safe only because every such
-reader holds one, while a synchronous one completes under the manager's
-lock. Other storage, anonymous memory and mappings without provenance,
+pin reclaims them and refills only what was discarded. Transfers reach the copy
+through ``transfer_``, using pre-resolved views cached for open leases when
+available (avoiding lock contention and wrapper allocations on hot asynchronous
+transfers) or resolving each source tensor at copy time; an asynchronous transfer
+of pinned storage outside a lease raises, since eviction is safe only because
+every such reader holds one, while a synchronous one completes under the
+manager's lock. Other storage, anonymous memory and mappings without provenance,
 registers where it is, as before.
 Piper never writes into a file mapping: ``merge_adapter`` copies its targets out
 before merging.
@@ -152,11 +153,92 @@ class _Pageable:
     leases: int = 0
 
 
+class _SortedPointers:
+    """Sorted set of unique storage start addresses with O(log N) neighbor queries and bounded buckets."""
+
+    __slots__ = ("_buckets", "_maxes")
+    _LOAD = 256
+
+    def __init__(self) -> None:
+        self._buckets: list[list[int]] = []
+        self._maxes: list[int] = []
+
+    def add(self, pointer: int) -> None:
+        if not self._buckets:
+            self._buckets.append([pointer])
+            self._maxes.append(pointer)
+            return
+        bucket_idx = bisect_left(self._maxes, pointer)
+        if bucket_idx == len(self._buckets):
+            bucket_idx -= 1
+            bucket = self._buckets[bucket_idx]
+            bucket.append(pointer)
+            self._maxes[bucket_idx] = pointer
+        else:
+            bucket = self._buckets[bucket_idx]
+            pos = bisect_left(bucket, pointer)
+            if pos < len(bucket) and bucket[pos] == pointer:
+                return
+            bucket.insert(pos, pointer)
+        if len(bucket) > self._LOAD * 2:
+            mid = len(bucket) // 2
+            right = bucket[mid:]
+            del bucket[mid:]
+            self._maxes[bucket_idx] = bucket[-1]
+            self._buckets.insert(bucket_idx + 1, right)
+            self._maxes.insert(bucket_idx + 1, right[-1])
+
+    def remove(self, pointer: int) -> None:
+        if not self._buckets:
+            raise KeyError(pointer)
+        bucket_idx = bisect_left(self._maxes, pointer)
+        if bucket_idx == len(self._buckets):
+            raise KeyError(pointer)
+        bucket = self._buckets[bucket_idx]
+        pos = bisect_left(bucket, pointer)
+        if pos == len(bucket) or bucket[pos] != pointer:
+            raise KeyError(pointer)
+        bucket.pop(pos)
+        if not bucket:
+            del self._buckets[bucket_idx]
+            del self._maxes[bucket_idx]
+            return
+        self._maxes[bucket_idx] = bucket[-1]
+        if len(bucket) < self._LOAD // 2 and len(self._buckets) > 1:
+            if bucket_idx + 1 < len(self._buckets) and len(bucket) + len(self._buckets[bucket_idx + 1]) <= self._LOAD:
+                right = self._buckets.pop(bucket_idx + 1)
+                del self._maxes[bucket_idx + 1]
+                bucket.extend(right)
+                self._maxes[bucket_idx] = bucket[-1]
+            elif bucket_idx > 0 and len(self._buckets[bucket_idx - 1]) + len(bucket) <= self._LOAD:
+                left = self._buckets[bucket_idx - 1]
+                left.extend(bucket)
+                del self._buckets[bucket_idx]
+                del self._maxes[bucket_idx]
+                self._maxes[bucket_idx - 1] = left[-1]
+
+    def neighbors(self, pointer: int) -> tuple[int, ...]:
+        if not self._buckets:
+            return ()
+        bucket_idx = bisect_left(self._maxes, pointer)
+        if bucket_idx == len(self._buckets):
+            return (self._maxes[-1],)
+        bucket = self._buckets[bucket_idx]
+        pos = bisect_left(bucket, pointer)
+        current = bucket[pos]
+        if pos > 0:
+            return (bucket[pos - 1], current)
+        if bucket_idx > 0:
+            return (self._maxes[bucket_idx - 1], current)
+        return (current,)
+
+
 @dataclass(slots=True)
 class _LeaseState:
     registrations: deque[_Registration]
     pageable: deque[int]
     tensors: tuple[torch.Tensor, ...]
+    view_ids: deque[int]
 
 
 class PinLease:
@@ -309,7 +391,7 @@ class PinManager:
         self._pending: dict[int, _Pending] = {}
         self._pending_changed = threading.Condition(self._lock)
         # All pinned, pending, and leased pageable ranges.
-        self._starts: list[int] = []
+        self._starts = _SortedPointers()
         self._idle: OrderedDict[int, None] = OrderedDict()
         # Disjoint byte ranges can share only their boundary pages. Counting
         # only those endpoints avoids one dictionary item per page of a large model.
@@ -318,6 +400,7 @@ class PinManager:
         self._registration_failures = 0
         self._unregistration_failures = 0
         self._leases: dict[int, _LeaseState] = {}
+        self._leased_views: dict[int, tuple[torch.Tensor, int]] = {}
         self._next_lease = 0
         # Capture the dictionaries rather than self: the memory component's
         # commitment watcher must not retain the manager.
@@ -530,8 +613,20 @@ class PinManager:
         if pageable is None:
             pageable = _Pageable(request.storage.nbytes())
             self._pageable[pointer] = pageable
-            self._starts.insert(bisect_left(self._starts, pointer), pointer)
+            self._starts.add(pointer)
         pageable.leases += 1
+
+    def _release_views(self, view_ids: deque[int]) -> None:
+        while view_ids:
+            tid = view_ids.popleft()
+            entry = self._leased_views.get(tid)
+            if entry is None:
+                continue
+            view, count = entry
+            if count > 1:
+                self._leased_views[tid] = (view, count - 1)
+            else:
+                del self._leased_views[tid]
 
     def _open_lease(self, requests: dict[int, _Request], held: dict[int, _Registration]) -> PinLease:
         key = self._next_lease
@@ -539,27 +634,65 @@ class PinManager:
         pageable_pointers = () if len(held) == len(requests) else tuple(
             pointer for pointer in requests if pointer not in held
         )
-        self._leases[key] = _LeaseState(
-            deque(held.values()),
-            deque(pageable_pointers),
-            tuple(tensor for request in requests.values() for tensor in request.tensors),
-        )
-        _live_managers.add(self)
         registered = sum(registration.size for registration in held.values())
         pageable_bytes = (
             sum(requests[pointer].storage.nbytes() for pointer in pageable_pointers) if pageable_pointers else 0
         )
-        return PinLease(self, key, registered, pageable_bytes)
+        prepared: list[tuple[int, tuple[torch.Tensor, int] | None, tuple[torch.Tensor, int]]] = []
+        view_ids: deque[int] = deque()
+        prev: tuple[torch.Tensor, int] | None = None
+        nxt: tuple[torch.Tensor, int] | None = None
+        committed_entry: tuple[torch.Tensor, int] | None = None
+        try:
+            for pointer, request in requests.items():
+                registration = held.get(pointer)
+                copy = registration.copy if registration is not None else None
+                for tensor in request.tensors:
+                    tid = id(tensor)
+                    prev = self._leased_views.get(tid)
+                    nxt = (tensor if copy is None else copy.view(tensor), 1) if prev is None else (prev[0], prev[1] + 1)
+                    prepared.append((tid, prev, nxt))
+                    view_ids.append(tid)
+            state = _LeaseState(
+                deque(held.values()),
+                deque(pageable_pointers),
+                tuple(tensor for request in requests.values() for tensor in request.tensors),
+                view_ids,
+            )
+            lease = PinLease(self, key, registered, pageable_bytes)
+            for tid, _prev, committed_entry in prepared:
+                self._leased_views[tid] = committed_entry
+            self._leases[key] = state
+            _live_managers.add(self)
+            return lease
+        except BaseException:
+            self._leases.pop(key, None)
+            while prepared:
+                tid, prev_entry, _ = prepared.pop()
+                if prev_entry is None:
+                    self._leased_views.pop(tid, None)
+                else:
+                    self._leased_views[tid] = prev_entry
+            # Clear local view references before unwinding so acquire()'s rollback
+            # sees zero live Copy.view exports while freeing or offering copies.
+            prev = None
+            nxt = None
+            committed_entry = None
+            prev_entry = None
+            _ = None
+            self._drop_lifetime_root_if_empty()
+            raise
 
     def transfer(self, destination: torch.Tensor, source: torch.Tensor, *, non_blocking: bool) -> None:
         """Copy ``source`` into ``destination``, reading ``source``'s pinned copy when one exists.
 
-        A synchronous transfer has completed when this returns and runs under
-        the manager's lock, so nothing can evict its source meanwhile. An
-        asynchronous one, a non-blocking copy to a CUDA device, may still be
-        in flight afterwards, so it must run under a lease that holds the
-        source, and raises otherwise: eviction is safe only because every
-        such reader holds one. Pageable storage copies as is. Inside
+        Asynchronous transfers whose exact source tensor is currently held by
+        an open lease use its pre-resolved copy view without acquiring the
+        manager lock; derived sub-views and unleased transfers fall back to
+        checking registrations under the lock and raise if an asynchronous
+        transfer reads registered storage without an active lease. A
+        synchronous transfer completes under the manager's lock so nothing can
+        evict its source meanwhile. Pageable storage copies as is. Inside
         :func:`~piper_offload._transfer_priority.background_transfers`, an
         asynchronous transfer targeting a device with an active foreground
         producer or foreground transfer waits for foreground transfers and has
@@ -573,22 +706,33 @@ class PinManager:
             destination.copy_(source, non_blocking=non_blocking)
             return
         asynchronous = non_blocking and destination.device.type == "cuda"
+        if asynchronous:
+            entry = self._leased_views.get(id(source))
+            if entry is not None:
+                # Active leases retain both the source tensor identity and its
+                # resolved copy view through completion, so no lock is needed.
+                transfer_priority.copy_host_to_device(destination, entry[0])
+                return
         with self._lock:
-            registration = self._registrations.get(source.untyped_storage().data_ptr())
-            view = source
-            if registration is not None:
-                if asynchronous and registration.leases == 0:
-                    raise RuntimeError(
-                        "Asynchronous transfer of pinned host storage outside a lease; acquire one "
-                        "over the tensors first (pin=False for a one-time transfer) and keep it "
-                        "until the transfer has completed."
-                    )
-                if registration.copy is not None:
-                    view = registration.copy.view(source)
+            entry = self._leased_views.get(id(source))
+            if entry is not None:
+                view = entry[0]
+            else:
+                registration = self._registrations.get(source.untyped_storage().data_ptr())
+                view = source
+                if registration is not None:
+                    if asynchronous and registration.leases == 0:
+                        raise RuntimeError(
+                            "Asynchronous transfer of pinned host storage outside a lease; acquire one "
+                            "over the tensors first (pin=False for a one-time transfer) and keep it "
+                            "until the transfer has completed."
+                        )
+                    if registration.copy is not None:
+                        view = registration.copy.view(source)
             if not asynchronous:
                 destination.copy_(view, non_blocking=non_blocking)
                 return
-        # The lease keeps the registration, so the copy itself needs no lock.
+        # Fallback validation and view resolution finished under the lock.
         transfer_priority.copy_host_to_device(destination, view)
 
     def clear(self) -> None:
@@ -641,8 +785,7 @@ class PinManager:
         prior_end = 0
         for pointer in sorted(requests):
             end = pointer + requests[pointer].storage.nbytes()
-            index = bisect_left(self._starts, pointer)
-            neighbors = self._starts[max(0, index - 1):index + 1]
+            neighbors = self._starts.neighbors(pointer)
             if pointer < prior_end:
                 raise ValueError("Overlapping host storage ranges must use views of one storage")
             for other in neighbors:
@@ -905,7 +1048,7 @@ class PinManager:
             logger.warning("Host unregistration failed; retaining storage and budget reservation: %s", str(error))
             return False
         del self._registrations[registration.pointer]
-        self._starts.pop(bisect_left(self._starts, registration.pointer))
+        self._starts.remove(registration.pointer)
         self._idle.pop(registration.pointer, None)
         copy = registration.copy
         if copy is None:
@@ -947,7 +1090,7 @@ class PinManager:
             pageable.leases -= 1
             if pageable.leases == 0:
                 del self._pageable[pointer]
-                self._starts.pop(bisect_left(self._starts, pointer))
+                self._starts.remove(pointer)
 
     def _close_lease(self, key: int) -> None:
         with self._lock:
@@ -955,6 +1098,7 @@ class PinManager:
             if state is None:
                 return
             try:
+                self._release_views(state.view_ids)
                 self._release_pageable(state.pageable)
                 retired = self._release_registrations(state.registrations)
                 del self._leases[key]

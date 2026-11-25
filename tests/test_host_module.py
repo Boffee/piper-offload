@@ -16,6 +16,7 @@ from piper_offload import (
     ModelStore,
     OffloadConfig,
     TrellisParameter,
+    host_module as host_module_mod,
     register_adapter,
 )
 from piper_offload._dtensor import DTENSOR_AVAILABLE
@@ -1563,4 +1564,139 @@ class TestQuantizedMetaPlaceholderBind:
         with activated_model(proto_off, "cuda"):
             expected = proto.blocks[1](proto.blocks[0](proto.head(x)))
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_host_module_instance_caches_slots_and_host_wrappers_across_switches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def make_module() -> nn.Module:
+        mod = nn.Module()
+        mod.attn = nn.Module()
+        shared = nn.Parameter(torch.arange(4, dtype=torch.float32), requires_grad=False)
+        mod.attn.left = shared
+        mod.attn.right = shared
+        mod.attn.register_buffer("inv_freq", torch.tensor([1.0, 2.0]), persistent=False)
+        return mod
+
+    m1 = make_module()
+    m2 = make_module()
+    store = HostModuleStore.from_module(m1)
+    inst1 = HostModuleInstance(module=m1, params=store.params, buffers=store.buffers)
+    inst2 = HostModuleInstance(module=m2, params=store.params, buffers=store.buffers)
+
+    # Reuse RegularAdapter target allocations on CPU for portable verification without CUDA.
+    shared_target = HostParamTarget(
+        object(),
+        nn.Parameter(torch.zeros(4), requires_grad=False),
+        store.params["attn.left"],
+    )
+    target = HostModuleTarget(
+        param_targets={
+            "attn.left": shared_target,
+            "attn.right": shared_target,
+        },
+        buffer_targets={
+            "attn.inv_freq": HostBufferTarget(torch.zeros(2)),
+        },
+    )
+
+    resolve_calls = 0
+    original_resolve = host_module_mod.resolve_parent_leaf
+
+    def counting_resolve(root: nn.Module, name: str) -> tuple[nn.Module, str]:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return original_resolve(root, name)
+
+    monkeypatch.setattr(host_module_mod, "resolve_parent_leaf", counting_resolve)
+
+    inst1.install_target(target)
+    inst1.install_host()
+    first_left = m1.attn.left
+    assert m1.attn.right is first_left
+    assert "inv_freq" in m1.attn._non_persistent_buffers_set
+    # First cycle resolves the 2 params + 1 buffer once each.
+    assert resolve_calls == 3
+
+    for _ in range(4):
+        inst1.install_target(target)
+        assert m1.attn.left is target.param_targets["attn.left"].param
+        assert m1.attn.inv_freq is target.buffer_targets["attn.inv_freq"].tensor
+        inst1.install_host()
+        assert m1.attn.left is first_left
+        assert m1.attn.right is first_left
+        assert m1.attn.inv_freq is store.buffers["attn.inv_freq"].tensor
+
+    assert resolve_calls == 3
+
+    # Distinct bound instances still get distinct per-instance CPU wrappers.
+    inst2.install_host()
+    assert resolve_calls == 6
+    assert m2.attn.left is not first_left
+    assert m2.attn.left is m2.attn.right
+
+
+def test_copy_to_target_handles_partial_targets_and_empty_buffers() -> None:
+    from types import SimpleNamespace
+
+    module = nn.Module()
+    module.first = nn.Parameter(torch.full((2,), 3.0), requires_grad=False)
+    module.second = nn.Parameter(torch.full((2,), 7.0), requires_grad=False)
+    module.register_buffer("running", torch.full((2,), 9.0))
+    store = HostModuleStore.from_module(module)
+    instance = store.bind(module)
+    plan = instance.resolve_load_plan()
+    dst_second = torch.zeros(2)
+    partial_target = HostModuleTarget(
+        param_targets={
+            "second": HostParamTarget(
+                SimpleNamespace(data=dst_second),
+                nn.Parameter(dst_second, requires_grad=False),
+                store.params["second"],
+            ),
+        },
+        buffer_targets={},
+    )
+
+    plan.copy_to_target(partial_target)
+    instance.install_target(partial_target)
+
+    torch.testing.assert_close(module.second, torch.full((2,), 7.0))
+    assert module.first is not None
+    torch.testing.assert_close(module.first, torch.full((2,), 3.0))
+    torch.testing.assert_close(module.running, torch.full((2,), 9.0))
+
+
+def test_install_raises_if_cached_param_or_buffer_slot_is_removed() -> None:
+    module = nn.Module()
+    module.weight = nn.Parameter(torch.ones(2), requires_grad=False)
+    module.register_buffer("running", torch.ones(2))
+    store = HostModuleStore.from_module(module)
+    instance = store.bind(module)
+    target = HostModuleTarget(
+        param_targets={
+            "weight": HostParamTarget(
+                object(),
+                nn.Parameter(torch.zeros(2), requires_grad=False),
+                store.params["weight"],
+            ),
+        },
+        buffer_targets={
+            "running": HostBufferTarget(torch.zeros(2)),
+        },
+    )
+
+    saved_param = module._parameters.pop("weight")
+    try:
+        with pytest.raises(RuntimeError, match="unexpectedly missing"):
+            instance.install_host()
+    finally:
+        module._parameters["weight"] = saved_param
+
+    saved_buffer = module._buffers.pop("running")
+    try:
+        with pytest.raises(RuntimeError, match="unexpectedly missing"):
+            instance.install_target(target)
+    finally:
+        module._buffers["running"] = saved_buffer
 
