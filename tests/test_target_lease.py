@@ -19,6 +19,17 @@ from tests.conftest import Interrupt
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+def _set_acquired(lease: CudaTargetLease, value: bool) -> None:
+    sl = lease.stream_lease
+    if value:
+        sl._acquired_count = max(1, sl._acquired_count)
+        sl._exclusive = True
+    else:
+        sl._acquired_count = 0
+        sl._exclusive = False
+        sl._stream_readers.clear()
+
+
 @CUDA
 def test_first_pinned_upload_waits_for_prior_work_on_reused_allocation() -> None:
     module = nn.Linear(64, 64, bias=False).requires_grad_(False)
@@ -125,8 +136,8 @@ def test_close_synchronizes_target_work_before_drop() -> None:
         cast(HostModuleTarget, object()),
         cast(torch.cuda.Stream, allocation_stream),
     )
-    lease._ready_event = cast(torch.cuda.Event, ready)
-    lease._acquired = True
+    lease.stream_lease._ready_event = cast(torch.cuda.Event, ready)
+    _set_acquired(lease, True)
     lease.record_stream(cast(torch.cuda.Stream, consumer_stream))
     lease.record_stream(cast(torch.cuda.Stream, side_stream))
 
@@ -156,7 +167,7 @@ def test_failed_close_keeps_the_target_for_a_retry() -> None:
     consumer_stream = Stream(failures=1)
     target = cast(HostModuleTarget, object())
     lease = CudaTargetLease(target, cast(torch.cuda.Stream, allocation_stream))
-    lease._acquired = True
+    _set_acquired(lease, True)
     lease.record_stream(cast(torch.cuda.Stream, consumer_stream))
 
     with pytest.raises(Interrupt):
@@ -206,8 +217,8 @@ def test_restage_waits_for_every_actual_use_stream(
         cast(HostModuleTarget, object()),
         cast(torch.cuda.Stream, allocation_stream),
     )
-    lease._ready_event = cast(torch.cuda.Event, ready)
-    lease._staged = True
+    lease.stream_lease._ready_event = cast(torch.cuda.Event, ready)
+    lease.stream_lease._staged = True
     lease.acquire(cast(torch.cuda.Stream, first_consumer))
     lease.record_stream(cast(torch.cuda.Stream, second_consumer))
     lease.release()
@@ -230,7 +241,7 @@ def test_restage_waits_for_every_actual_use_stream(
     }
     assert copy_stream.waited_streams == []
     assert plan.copied
-    assert lease._ready_event is copy_stream.recorded
+    assert lease.stream_lease._ready_event is copy_stream.recorded
 
 
 def test_close_synchronizes_release_events_and_retries_on_failure() -> None:
@@ -260,7 +271,7 @@ def test_close_synchronizes_release_events_and_retries_on_failure() -> None:
     consumer_stream = Stream(failures=1)
     target = cast(HostModuleTarget, object())
     lease = CudaTargetLease(target, cast(torch.cuda.Stream, allocation_stream))
-    lease._acquired = True
+    _set_acquired(lease, True)
     lease.record_stream(cast(torch.cuda.Stream, consumer_stream))
     lease.release()
 
@@ -448,28 +459,28 @@ def test_stage_failure_preserves_dependencies_and_staged_state(
     copy_stream = FakeStream(record_failures=1)
     target = cast(HostModuleTarget, object())
     lease = CudaTargetLease(target, cast(torch.cuda.Stream, allocation_stream))
-    lease._acquired = True
+    _set_acquired(lease, True)
     lease.record_stream(cast(torch.cuda.Stream, prior_stream))
     lease.release()
     release_event = prior_stream.events[0]
-    lease._acquired = True
+    _set_acquired(lease, True)
     lease.record_stream(cast(torch.cuda.Stream, unrecorded_stream))
-    lease._acquired = False
+    _set_acquired(lease, False)
 
     monkeypatch.setattr(torch.cuda, "stream", lambda _stream: contextlib.nullcontext())
 
     # Record failures during finally leave prior dependencies and staged=False.
     with pytest.raises(Interrupt):
         lease.stage(cast(HostModuleLoadPlan, FakePlan(fail_copy=False)), cast(torch.cuda.Stream, copy_stream))
-    assert not lease._staged
-    assert lease._ready_event is None
-    assert release_event in lease._release_events.values()
-    assert cast(torch.cuda.Stream, unrecorded_stream) in lease._recorded_streams
-    assert cast(torch.cuda.Stream, copy_stream) in lease._recorded_streams
+    assert not lease.is_staged
+    assert lease.stream_lease._ready_event is None
+    assert release_event in lease.stream_lease._release_events.values()
+    assert cast(torch.cuda.Stream, unrecorded_stream) in lease.stream_lease._recorded_streams
+    assert cast(torch.cuda.Stream, copy_stream) in lease.stream_lease._recorded_streams
     # release() is a no-op when unacquired so cleanup dependencies stay intact.
     lease.release()
-    assert cast(torch.cuda.Stream, unrecorded_stream) in lease._recorded_streams
-    assert cast(torch.cuda.Stream, copy_stream) in lease._recorded_streams
+    assert cast(torch.cuda.Stream, unrecorded_stream) in lease.stream_lease._recorded_streams
+    assert cast(torch.cuda.Stream, copy_stream) in lease.stream_lease._recorded_streams
     with pytest.raises(RuntimeError, match="must be staged"):
         lease.acquire(cast(torch.cuda.Stream, prior_stream))
 
@@ -477,10 +488,10 @@ def test_stage_failure_preserves_dependencies_and_staged_state(
     # into a new ready_event and still leaves staged=False.
     with pytest.raises(Interrupt):
         lease.stage(cast(HostModuleLoadPlan, FakePlan(fail_copy=True)), cast(torch.cuda.Stream, copy_stream))
-    assert not lease._staged
-    assert lease._ready_event is copy_stream.events[0]
-    assert lease._release_events == {}
-    assert lease._recorded_streams == set()
+    assert not lease.is_staged
+    assert lease.stream_lease._ready_event is copy_stream.events[0]
+    assert lease.stream_lease._release_events == {}
+    assert lease.stream_lease._recorded_streams == set()
 
     lease.close()
     assert copy_stream.events[0].synchronize_calls == 1
@@ -518,22 +529,22 @@ def test_release_interruption_preserves_remaining_streams() -> None:
     stream_b = Stream()
     target = cast(HostModuleTarget, object())
     lease = CudaTargetLease(target, cast(torch.cuda.Stream, allocation_stream))
-    lease._acquired = True
+    _set_acquired(lease, True)
     lease.record_stream(cast(torch.cuda.Stream, stream_a))
     lease.record_stream(cast(torch.cuda.Stream, stream_b))
 
     with pytest.raises(Interrupt):
         lease.release()
 
-    assert lease._acquired
-    assert len(lease._release_events) == 1
-    assert len(lease._recorded_streams) == 1
+    assert lease.is_acquired
+    assert len(lease.stream_lease._release_events) == 1
+    assert len(lease.stream_lease._recorded_streams) == 1
     with pytest.raises(RuntimeError, match="while it is in use"):
         lease.stage(cast(HostModuleLoadPlan, object()), cast(torch.cuda.Stream, allocation_stream))
 
     lease.close()
 
-    assert not lease._acquired
+    assert not lease.is_acquired
     recorded = [s for s in (stream_a, stream_b) if s.event is not None]
     unrecorded = [s for s in (stream_a, stream_b) if s.event is None]
     assert len(recorded) == 1
@@ -542,21 +553,21 @@ def test_release_interruption_preserves_remaining_streams() -> None:
     assert unrecorded[0].synchronize_calls == 1
     assert allocation_stream.synchronize_calls == 1
 
-    # Retrying release() finishes snapshotting the remaining stream and clears _acquired.
+    # Retrying release() finishes snapshotting the remaining stream and clears acquired state.
     record_calls = 0
     retry_stream_a = Stream()
     retry_stream_b = Stream()
     retry_lease = CudaTargetLease(target, cast(torch.cuda.Stream, allocation_stream))
-    retry_lease._acquired = True
+    _set_acquired(retry_lease, True)
     retry_lease.record_stream(cast(torch.cuda.Stream, retry_stream_a))
     retry_lease.record_stream(cast(torch.cuda.Stream, retry_stream_b))
     with pytest.raises(Interrupt):
         retry_lease.release()
-    assert retry_lease._acquired
+    assert retry_lease.is_acquired
     retry_lease.release()
-    assert not retry_lease._acquired
-    assert retry_lease._recorded_streams == set()
-    assert len(retry_lease._release_events) == 2
+    assert not retry_lease.is_acquired
+    assert retry_lease.stream_lease._recorded_streams == set()
+    assert len(retry_lease.stream_lease._release_events) == 2
     retry_lease.close()
 
 
@@ -597,14 +608,14 @@ def test_acquire_preserves_staged_and_skips_redundant_wait_event(
     target = cast(HostModuleTarget, object())
     lease = CudaTargetLease(target, cast(torch.cuda.Stream, allocation_stream))
     ready_event = cast(torch.cuda.Event, Event())
-    lease._ready_event = ready_event
-    lease._staged = True
+    lease.stream_lease._ready_event = ready_event
+    lease.stream_lease._staged = True
 
     first = lease.acquire(cast(torch.cuda.Stream, stream_a))
     assert first is target
     assert stream_a.wait_calls == [ready_event]
     lease.release()
-    assert lease._staged
+    assert lease.is_staged
 
     # Re-acquiring on the same stream skips redundant wait_event.
     second = lease.acquire(cast(torch.cuda.Stream, stream_a))
@@ -666,8 +677,8 @@ def test_record_stream_orders_distinct_stream_after_ready_event_once(
     target = cast(HostModuleTarget, object())
     lease = CudaTargetLease(target, cast(torch.cuda.Stream, allocation_stream))
     ready_event = cast(torch.cuda.Event, Event())
-    lease._ready_event = ready_event
-    lease._staged = True
+    lease.stream_lease._ready_event = ready_event
+    lease.stream_lease._staged = True
 
     lease.acquire(cast(torch.cuda.Stream, stream_a))
     assert stream_a.wait_calls == [ready_event]
@@ -689,3 +700,54 @@ def test_record_stream_orders_distinct_stream_after_ready_event_once(
     assert stream_b.wait_calls == [ready_event, new_event]
     lease.release()
     lease.close()
+
+
+@CUDA
+def test_allocate_honors_stream_pool_buffer_names_and_default_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = nn.Linear(16, 16, bias=True).requires_grad_(False)
+    module.register_buffer("scale_buf", torch.ones(4))
+    plan = HostModuleStore.from_module(module).bind(module).resolve_load_plan()
+    device = torch.device("cuda")
+    custom_stream = torch.cuda.Stream(device=device)
+    observed: list[tuple[torch.cuda.Stream, object]] = []
+    original_allocate = HostModuleLoadPlan.allocate_target
+
+    def wrapped_allocate(
+        self_plan: HostModuleLoadPlan,
+        dev: torch.device,
+        *,
+        buffer_names: object = None,
+    ) -> HostModuleTarget:
+        observed.append((torch.cuda.current_stream(dev), buffer_names))
+        return original_allocate(
+            self_plan,
+            dev,
+            buffer_names=cast(object, buffer_names),  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(HostModuleLoadPlan, "allocate_target", wrapped_allocate)
+    lease = CudaTargetLease.allocate(
+        plan,
+        device,
+        allocation_stream=custom_stream,
+        buffer_names=("scale_buf",),
+    )
+    try:
+        assert lease.allocation_stream is custom_stream
+        assert set(lease.target.buffer_targets) == {"scale_buf"}
+    finally:
+        lease.close()
+
+    with torch.cuda.stream(custom_stream):
+        default_lease = CudaTargetLease.allocate(plan, device)
+        try:
+            assert default_lease.allocation_stream == torch.cuda.default_stream(device)
+        finally:
+            default_lease.close()
+
+    assert observed == [
+        (custom_stream, ("scale_buf",)),
+        (torch.cuda.default_stream(device), None),
+    ]

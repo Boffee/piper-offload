@@ -94,19 +94,42 @@ Trellis decode to larger ConvRot INT8 GPU targets):
 | `None` (default) | Strict 2-slot streaming (one active + one lookahead slot), reusing same-signature allocations. | Minimize weight VRAM regardless of model size. |
 | `0` | Releases the active unit's CUDA slot immediately on unit exit and disables async lookahead. | Tightest possible peak VRAM across non-overlapping stages. |
 | `0 < budget < total` | Retains hot units up to `budget`, evicting furthest-future-use idle slots (Belady MIN); async lookahead runs when `active_bytes + next_bytes <= budget` (if `budget` is smaller than one active unit, forward still runs and releases the oversized slot on unit exit). | Accelerate multi-step or looped workloads within a fixed weight budget. |
-| `budget >= total` | Preloads all offloaded units on activation using pageable (non-pinned) transfers and no lookahead thread. | Weights fit cleanly in budget, avoiding host pinning and async lookahead while keeping unit compilation. |
+| `budget >= total` | Without a shared `vram_budget`, preloads all offloaded units on activation using pageable (non-pinned) transfers and no lookahead thread; when `vram_budget` is also supplied, keeps units dynamically pooled and evictable with host pinning so peer allocations can reclaim space. | Weights fit cleanly in budget, avoiding host pinning and async lookahead when running standalone. |
 
 Offload learns arbitrary execution orders (sequential, reverse, skipped, looped,
 or multi-branch) via an online suffix predictor (`k <= 4`) and overlaps
 computation with the predicted next unit's H2D copy when budget/ceiling permits.
-When merged adapters (LoRA or deltas) are active, parked cached slots retain
-their merged GPU weights across cache hits without re-merging or re-copying.
+To run speculative or draft passes (such as MTP) without overwriting the
+predictor's main-pass history, wrap the draft forward in
+`with offloader.no_record_trace():`. When merged adapters (LoRA or deltas) are
+active, parked cached slots retain their merged GPU weights across cache hits
+without re-merging or re-copying.
 
 To choose a different budget per inference run without rebuilding `ModelStore`
 or `ModelSpec`, pass `vram_budget_bytes=...` directly to
 `ModelOffloader.activate(..., vram_budget_bytes=...)` or
 `cache.use(..., vram_budget_bytes=...)`; omitted activations fall back to
 `OffloadConfig.vram_budget_bytes`.
+
+### Share VRAM and transfer streams across runtimes
+
+When multiple offloaded models or external GPU pools (such as KV caches or
+arenas) share one CUDA GPU:
+
+- **`vram_budget` (`VramBudget`)**: Pass a shared per-GPU `VramBudget` to
+  `ModelOffloader.activate(..., vram_budget=...)` or `cache.use(..., vram_budget=...)`
+  (ignored on CPU). On CUDA activation, non-offloaded resident weights
+  automatically reserve their actual device bytes (raising
+  `VramBudgetExhaustedError` if they do not fit), and offloaded units register as
+  an evictable tenant (`priority=10`, `yield_to_peers=True`). Idle weight slots
+  yield both to lower-retention reservations/tenants and to equal-priority
+  offloaded models sharing the same `VramBudget`, capped at
+  `min(vram_budget_bytes, dynamic_ceiling)` (or `dynamic_ceiling` when
+  `vram_budget_bytes is None`).
+- **`transfer_context` (`DeviceTransferContext`)**: Pass a shared per-device
+  `DeviceTransferContext(device)` to reuse one CUDA copy stream and lazy staging
+  worker across concurrent models on the same GPU. Active sessions borrow the
+  context (refusing `ctx.close()` until all borrowers deactivate).
 
 ## Yield to collectives
 

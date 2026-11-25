@@ -5,7 +5,11 @@
 - :class:`ModelStore` and :class:`ModelStoreSpec` hold reusable flat host
   backing that binds to compatible models with :class:`OffloadConfig`.
 - :class:`ModelOffloader` provides direct control over one bound model's
-  lifecycle, including whole-model uploads and block streaming.
+  lifecycle, including whole-model uploads, block streaming, and
+  :meth:`~ModelOffloader.no_record_trace` for speculative passes.
+- :class:`VramBudget`, :class:`VramReservation`, :class:`VramBudgetExhaustedError`,
+  and :class:`DeviceTransferContext` coordinate shared per-device CUDA VRAM
+  budgets and reusable async transfer streams/workers across models and pools.
 - :class:`ResourceCache` and :class:`ObjectSpec` support other cached resources.
 - :class:`Adapter` holds reusable model updates; :func:`merge_adapter` applies
   them permanently.
@@ -26,6 +30,7 @@ from ._host_registration import HostRegistrationError
 from .adapter import Adapter, AdapterMode, AdapterTarget
 from .block_compile import BlockCompileConfig
 from .checkpoint import CheckpointError, FileSlice, MappedCheckpoint, file_slice
+from .device_transfer import DeviceTransferContext
 from .gguf_parameter import GgufParameter
 from .lora import LoRAFactor, LoRATransform, ScaledLoRAFactor
 from .merge import merge_adapter
@@ -70,6 +75,11 @@ from .tensor_adapters import (
     transfer_,
 )
 from .trellis_parameter import TrellisParameter
+from .vram_budget import (
+    VramBudget,
+    VramBudgetExhaustedError,
+    VramReservation,
+)
 
 __all__ = [
     "Adapter",
@@ -79,6 +89,7 @@ __all__ = [
     "BlockCompileConfig",
     "CacheError",
     "CheckpointError",
+    "DeviceTransferContext",
     "DuplicateResourceKeyError",
     "EvictionCandidate",
     "EvictionContext",
@@ -123,6 +134,9 @@ __all__ = [
     "ScaledParameterValue",
     "TensorAdapter",
     "TrellisParameter",
+    "VramBudget",
+    "VramBudgetExhaustedError",
+    "VramReservation",
     "auto_offload_paths",
     "derive_seed",
     "file_slice",

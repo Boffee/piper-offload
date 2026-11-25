@@ -6,6 +6,7 @@ optional per-parameter adapter application.
 
 import threading
 from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
 from typing import Self
 
 import torch
@@ -20,6 +21,7 @@ from .adapter import (
     group_adapter_updates,
     resolve_adapter_strengths,
 )
+from .device_transfer import DeviceTransferContext
 from .host_module import ParameterOverride
 from .lora import ScaledLoRAFactor, install_routed_residual_hook
 from .model_partition import ModelPartition, _capture_and_bind, _ShellClaim, claim_shell
@@ -32,6 +34,7 @@ from .offload_config import (
     validate_vram_budget,
 )
 from .pin_manager import PinLease, host_pin_manager
+from .vram_budget import VramBudget
 
 type _ParameterUpdateMap = dict[str, AdapterTargetUpdates]
 
@@ -308,6 +311,45 @@ class ModelOffloader:
             "ModelCache.use(..., device=...)"
         )
 
+    def no_record_trace(self) -> AbstractContextManager[None]:
+        """Temporarily suppress execution-trace history recording (re-entrant).
+
+        Use around speculative/draft passes (such as MTP drafts) so units
+        evaluated during drafting do not overwrite main-pass lookahead prediction
+        history. Safe to enter while inactive; if an exception is raised inside
+        the block, trace recording cleanly unwinds.
+        """
+        return self._engine.no_record_trace()
+
+    def _validate_activation_resources(
+        self,
+        device: torch.device | str | None,
+        *,
+        vram_budget_bytes: int | _UseConfigBudget | None,
+        vram_budget: VramBudget | None,
+        transfer_context: DeviceTransferContext | None,
+    ) -> torch.device:
+        if not isinstance(vram_budget_bytes, _UseConfigBudget):
+            validate_vram_budget(vram_budget_bytes)
+        if vram_budget is not None and not isinstance(vram_budget, VramBudget):
+            raise TypeError(
+                f"vram_budget must be a VramBudget or None; got {type(vram_budget).__name__}."
+            )
+        if transfer_context is not None and not isinstance(
+            transfer_context, DeviceTransferContext
+        ):
+            raise TypeError(
+                "transfer_context must be a DeviceTransferContext or None; "
+                f"got {type(transfer_context).__name__}."
+            )
+        active_device = self._resolve_device(device)
+        if transfer_context is not None and transfer_context.device != active_device:
+            raise ValueError(
+                f"transfer_context device {transfer_context.device} does not match "
+                f"activation device {active_device}."
+            )
+        return active_device
+
     def activate(
         self,
         device: torch.device | str | None = None,
@@ -317,13 +359,23 @@ class ModelOffloader:
         adapter_mode: AdapterMode = "merge",
         stochastic_rounding: bool = True,
         vram_budget_bytes: int | _UseConfigBudget | None = _USE_CONFIG_BUDGET,
+        vram_budget: VramBudget | None = None,
+        transfer_context: DeviceTransferContext | None = None,
     ) -> None:
         """Make the owned model usable on ``device``.
 
         ``vram_budget_bytes`` optionally overrides :attr:`OffloadConfig.vram_budget_bytes`
         for this session only (for example, to pass the free-VRAM budget
         available for offloaded unit weights in this run); omitting it uses the
-        configured default on every activation.
+        configured default on every activation. When a shared ``vram_budget``
+        (:class:`VramBudget`) is supplied on CUDA (ignored on CPU), non-offloaded
+        resident weights automatically acquire a reservation for their actual
+        device bytes (raising :class:`VramBudgetExhaustedError` if they do not
+        fit) and offloaded units register as an evictable pooled tenant
+        (``priority=10``, ``yield_to_peers=True``) capped at
+        ``min(vram_budget_bytes, dynamic_ceiling)``. Pass ``transfer_context``
+        (:class:`DeviceTransferContext`) to reuse an existing open per-device
+        CUDA copy stream and staging worker matching ``device``.
 
         ``adapters`` and their optional ``adapter_strengths`` apply only to this
         activation. Exact-zero strengths are inactive and create no updates.
@@ -348,9 +400,12 @@ class ModelOffloader:
         retries that release; if it fails again, activation raises
         :class:`ModelRuntimeFailedError` before activating any component.
         """
-        if not isinstance(vram_budget_bytes, _UseConfigBudget):
-            validate_vram_budget(vram_budget_bytes)
-        active_device = self._resolve_device(device)
+        active_device = self._validate_activation_resources(
+            device,
+            vram_budget_bytes=vram_budget_bytes,
+            vram_budget=vram_budget,
+            transfer_context=transfer_context,
+        )
         if not self._activation_lock.acquire(blocking=False):
             raise ModelRuntimeInUseError(
                 "ModelOffloader already has an active use; overlapping model activations are not supported"
@@ -390,6 +445,8 @@ class ModelOffloader:
                 resident_overrides=resident_overrides,
                 unit_overrides=unit_overrides,
                 vram_budget_bytes=vram_budget_bytes,
+                vram_budget=vram_budget,
+                transfer_context=transfer_context,
             )
         except BaseException:
             if self._active_device is None:

@@ -53,8 +53,11 @@ exit does not keep it active and can prevent its host storage from being freed.
 To configure unit offloading and default VRAM budgets, pass `config=OffloadConfig(...)`
 to `ModelSpec`; see [streaming](streaming.md). Pass `vram_budget_bytes=...` to
 `cache.use()` or `ModelOffloader.activate()` to override that weight budget for
-a single activation. To attach cached updates, pass `adapter_specs` to `use()`;
-see [adapters](adapters.md).
+a single activation, `vram_budget=VramBudget(...)` to share GPU capacity with
+resident weight reservations and peer pools/models, and
+`transfer_context=DeviceTransferContext(...)` to reuse a per-device CUDA copy
+stream and staging worker. To attach cached updates, pass `adapter_specs` to
+`use()`; see [adapters](adapters.md).
 
 ## Ownership and persistent state
 
@@ -231,6 +234,8 @@ For custom specs and eviction policies, see [Development](development.md#extendi
 | Exception | Meaning |
 |---|---|
 | `ModelRuntimeInUseError` | The model runtime is already active. |
+| `ModelRuntimeFailedError` | Retrying a failed session cleanup during `activate()` failed again. |
+| `VramBudgetExhaustedError` | Resident weight or peer `VramBudget` reservation exceeds effective capacity after evictions. |
 | `ResourceTooLargeError` | Finite-budget admission cannot fit the store; `required`, `used`, and `limit` describe the request. |
 | `ResourceLeasedError` | A mutation would release an actively leased resource. |
 | `ResourceCachedError` | `unregister(..., evict=False)` targets a built store. |
@@ -243,5 +248,7 @@ Signatures and per-method contracts are in
 [`ModelStore`](../src/piper_offload/model_store.py),
 [`OffloadConfig`](../src/piper_offload/offload_config.py),
 [`ModelSpec` and other specs](../src/piper_offload/resource_specs.py),
-[`ModelOffloader`](../src/piper_offload/model_offloader.py), and
+[`ModelOffloader`](../src/piper_offload/model_offloader.py),
+[`VramBudget`](../src/piper_offload/vram_budget.py),
+[`DeviceTransferContext`](../src/piper_offload/device_transfer.py), and
 [`ResourceCache`](../src/piper_offload/resource_cache.py).

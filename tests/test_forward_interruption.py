@@ -18,11 +18,13 @@ from torch import nn
 from piper_offload import (
     Adapter,
     BlockCompileConfig,
+    DeviceTransferContext,
     ModelOffloader,
     OffloadConfig,
+    VramBudget,
     host_pin_manager,
 )
-from tests.conftest import Interrupt, activated_model
+from tests.conftest import Interrupt, activated_model, residency_engine
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -95,6 +97,8 @@ class _Config:
     vram_budget_bytes: int | None = None
     compiled: bool = False
     routed: bool = False
+    use_vram_budget: bool = False
+    use_transfer_context: bool = False
 
     def offloader(self, model: nn.Module) -> ModelOffloader:
         return ModelOffloader.from_module(
@@ -119,6 +123,12 @@ _CONFIGS = (
     pytest.param(_Config("cuda", ("embed", "blocks"), None), marks=CUDA, id="mixed-paths"),
     pytest.param(_Config("cuda", ("blocks",), 2 * _UNIT_BYTES), marks=CUDA, id="partial-cache"),
     pytest.param(_Config("cuda", ("embed", "blocks"), 1024 * 1024 * 1024), marks=CUDA, id="all-resident"),
+    pytest.param(_Config("cuda", ("blocks",), None, use_vram_budget=True), marks=CUDA, id="shared-budget"),
+    pytest.param(
+        _Config("cuda", ("blocks",), None, use_transfer_context=True),
+        marks=CUDA,
+        id="shared-transfer-context",
+    ),
     pytest.param(_Config("cuda", ("blocks",), None, compiled=True), marks=CUDA, id="compiled"),
     pytest.param(_Config("cuda", ("blocks",), None, routed=True), marks=CUDA, id="streaming-routed"),
     # CPU activation schedules no CUDA units, but routed hooks still stage factors.
@@ -200,20 +210,71 @@ def test_next_forward_recovers_from_interruption(
     offloader = config.offloader(model)
     leases = host_pin_manager.stats.active_leases
     x = torch.randn(2, _WIDTH, device=config.device)
+    budget = VramBudget(4 * _UNIT_BYTES) if config.use_vram_budget else None
+    transfer_ctx = (
+        DeviceTransferContext(config.device) if config.use_transfer_context else None
+    )
 
-    with (
-        activated_model(offloader, config.device, adapters=adapters, adapter_mode="routed"),
-        torch.inference_mode(),
-    ):
+    try:
+        with (
+            activated_model(
+                offloader,
+                config.device,
+                adapters=adapters,
+                adapter_mode="routed",
+                vram_budget=budget,
+                transfer_context=transfer_ctx,
+            ),
+            torch.inference_mode(),
+        ):
+            expected = model(x).cpu()
+            settled = _device_bytes(config.device)
+
+            _interrupt(model, x, interruption)
+            actual = model(x).cpu()
+
+            # The forward after an interruption leaves the same working sets,
+            # and nothing an interrupted call staged, on the device.
+            assert _device_bytes(config.device) == settled
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert host_pin_manager.stats.active_leases == leases
+        if budget is not None:
+            assert budget.used_bytes == 0
+        if transfer_ctx is not None:
+            assert transfer_ctx.borrower_count == 0
+    finally:
+        if transfer_ctx is not None:
+            transfer_ctx.close()
+
+
+@CUDA
+@pytest.mark.parametrize("error", [RuntimeError, Interrupt], ids=["error", "interrupt"])
+def test_no_record_trace_recovers_from_interruption(error: type[BaseException]) -> None:
+    torch.manual_seed(0)
+    model = _Model()
+    offloader = _Config("cuda", ("blocks",), 0).offloader(model)
+    x = torch.randn(2, _WIDTH, device="cuda")
+
+    with activated_model(offloader, "cuda"), torch.inference_mode():
+        engine = residency_engine(offloader)
         expected = model(x).cpu()
-        settled = _device_bytes(config.device)
+        assert engine._predictor is not None
+        hist_before = list(engine._predictor._history)
 
-        _interrupt(model, x, interruption)
+        def fail_on_middle(_module: nn.Module, _args: tuple[object, ...]) -> None:
+            raise error("draft interruption")
+
+        handle = model.blocks[_MIDDLE].proj.register_forward_pre_hook(fail_on_middle)
+        try:
+            with pytest.raises(error, match="draft interruption"):
+                with offloader.no_record_trace():
+                    model(x)
+        finally:
+            handle.remove()
+
+        assert engine.is_recording_trace
+        assert list(engine._predictor._history) == hist_before
         actual = model(x).cpu()
 
-        # The forward after an interruption leaves the same working sets,
-        # and nothing an interrupted call staged, on the device.
-        assert _device_bytes(config.device) == settled
-
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert host_pin_manager.stats.active_leases == leases

@@ -1408,7 +1408,7 @@ class TestResidencyEngineCuda:
                 assert active is not None and active.unit_idx == 2
                 with torch.cuda.stream(stream_b):
                     y = model.blocks[2](x)
-                    assert stream_b in active.slot.lease._waited_streams
+                    assert stream_b in active.slot.lease.stream_lease._waited_streams
                 torch.cuda.synchronize()
                 torch.testing.assert_close(y, reference.blocks[2](x), rtol=1e-5, atol=1e-5)
                 torch.testing.assert_close(model(x), expected, rtol=1e-5, atol=1e-5)
