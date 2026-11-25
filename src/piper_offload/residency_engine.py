@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import logging
 import weakref
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -73,84 +74,180 @@ def _shutdown_executor(executor: ThreadPoolExecutor) -> None:
         raise interrupt
 
 
-def _predict_next(
-    history: Sequence[int],
-    tail: Sequence[int],
-    num_units: int,
-) -> int:
-    """Predict the unit following ``tail`` using recent suffix transitions.
-
-    Searches ``history[:-1]`` from most recent to oldest for the longest
-    suffix match (up to length 4), falling back to observed +/-1 stride in
-    declaration order on unseen Step-0 transitions.
-    """
-    hist_len = len(history)
-    max_k = min(4, len(tail), hist_len - 1)
-    for k in range(max_k, 0, -1):
-        pattern = tail[-k:]
-        for start in range(hist_len - 1 - k, -1, -1):
-            matched = True
-            for offset in range(k):
-                if history[start + offset] != pattern[offset]:
-                    matched = False
-                    break
-            if matched:
-                return history[start + k]
-
-    curr = tail[-1]
-    prev = tail[-2] if len(tail) >= 2 else None
-    if prev is not None and prev - curr == 1:
-        return (curr - 1) % num_units
-    return (curr + 1) % num_units
-
-
 class _ExecutionPredictor:
-    """Online execution-order trace predictor and Belady MIN distance estimator."""
+    """Online execution-order trace predictor and Belady MIN distance estimator.
+
+    Indexes observed suffix transitions of length 1..4 inside the bounded
+    history window so both next-unit prediction and Belady distance rollouts run
+    in O(1) per lookup and steady-state traversals advance the cached forecast
+    incrementally in O(1) per unit instead of rebuilding on every step.
+    """
 
     def __init__(self, num_units: int) -> None:
         if num_units <= 0:
             raise ValueError(f"num_units must be positive, got {num_units}.")
         self._num_units = num_units
         self._max_history = max(256, 8 * num_units)
-        self._history: list[int] = []
-        self._cached_distances: dict[int, int] | None = None
+        self._history: deque[int] = deque()
+        self._seq = 0
+        # Map k-gram suffix (k in 1..4) -> (predicted_next_unit, write_seq).
+        self._tables: tuple[dict[tuple[int, ...], tuple[int, int]], ...] = (
+            {},
+            {},
+            {},
+            {},
+            {},
+        )
+        self._forecast: deque[int] | None = None
+        self._forecast_states: deque[tuple[int, int, int, int] | None] = deque()
+        self._seen_states: set[tuple[int, int, int, int]] = set()
+        self._unit_steps: dict[int, deque[int]] = {}
+        self._forecast_offset = 0
+        self._rollout_tail: tuple[int, ...] = ()
+
+    def _invalidate_forecast(self) -> None:
+        self._forecast = None
+        self._forecast_states.clear()
+        self._seen_states.clear()
+        self._unit_steps.clear()
+        self._forecast_offset = 0
+        self._rollout_tail = ()
+
+    def _update_table(self, k: int, pattern: tuple[int, ...], nxt: int, seq: int) -> bool:
+        table = self._tables[k]
+        prev = table.get(pattern)
+        table[pattern] = (nxt, seq)
+        return prev is None or prev[0] != nxt
+
+    def _evict_table(self, k: int, pattern: tuple[int, ...], nxt: int, seq: int) -> bool:
+        table = self._tables[k]
+        if table.get(pattern) == (nxt, seq):
+            del table[pattern]
+            return True
+        return False
 
     def record(self, unit_idx: int) -> None:
-        """Record execution of ``unit_idx`` and invalidate cached distances."""
-        self._history.append(unit_idx)
-        if len(self._history) > self._max_history:
-            del self._history[: len(self._history) - self._max_history]
-        self._cached_distances = None
+        """Record execution of ``unit_idx`` and advance or invalidate cached distances."""
+        seq = self._seq
+        self._seq += 1
+        hist = self._history
+        hlen = len(hist)
+        changed = False
+        if hlen > 0:
+            tail = tuple(hist[i] for i in range(max(0, hlen - 4), hlen))
+            for k in range(1, len(tail) + 1):
+                changed |= self._update_table(k, tail[-k:], unit_idx, seq)
+        hist.append(unit_idx)
+        if len(hist) > self._max_history:
+            evicted = hist.popleft()
+            evict_seq = seq - self._max_history
+            head = tuple(hist[i] for i in range(min(4, len(hist))))
+            for k in range(1, len(head) + 1):
+                changed |= self._evict_table(
+                    k,
+                    (evicted, *head[: k - 1]),
+                    head[k - 1],
+                    evict_seq + k,
+                )
+
+        if (
+            not changed
+            and self._forecast is not None
+            and len(self._forecast) > 0
+            and len(hist) >= 4
+            and self._forecast[0] == unit_idx
+        ):
+            self._forecast.popleft()
+            old_state = self._forecast_states.popleft()
+            if old_state is not None:
+                self._seen_states.discard(old_state)
+            self._forecast_offset += 1
+            steps = self._unit_steps.get(unit_idx)
+            if steps is not None:
+                steps.popleft()
+                if not steps:
+                    del self._unit_steps[unit_idx]
+            self._extend_forecast()
+        else:
+            self._invalidate_forecast()
+
+    def _predict_from_tail(self, tail: tuple[int, ...]) -> int:
+        for k in range(min(4, len(tail)), 0, -1):
+            entry = self._tables[k].get(tail[-k:])
+            if entry is not None:
+                return entry[0]
+        curr = tail[-1]
+        if len(tail) >= 2 and tail[-2] - curr == 1:
+            return (curr - 1) % self._num_units
+        return (curr + 1) % self._num_units
 
     def next_after(self, unit_idx: int) -> int | None:
         """Predict the next unit likely to execute after ``unit_idx``."""
         if self._num_units <= 1:
             return None
-        tail = self._history if self._history and self._history[-1] == unit_idx else [unit_idx]
-        nxt = _predict_next(self._history, tail, self._num_units)
+        hist = self._history
+        if hist and hist[-1] == unit_idx:
+            hlen = len(hist)
+            tail = tuple(hist[i] for i in range(max(0, hlen - 4), hlen))
+        else:
+            tail = (unit_idx,)
+        nxt = self._predict_from_tail(tail)
         if nxt == unit_idx:
             return None
         return nxt
 
-    def _compute_distances(self) -> dict[int, int]:
+    def _extend_forecast(self) -> None:
+        assert self._forecast is not None
         horizon = max(2 * self._num_units, len(self._history), 32)
-        window = list(self._history) if self._history else [self._num_units - 1]
-        distances: dict[int, int] = {}
-        for step in range(1, horizon + 1):
-            nxt = _predict_next(self._history, window, self._num_units)
-            if nxt not in distances:
-                distances[nxt] = step
-            window.append(nxt)
-            if len(window) > self._max_history:
-                del window[: len(window) - self._max_history]
-        return distances
+        tail = self._rollout_tail
+        num_units = self._num_units
+        forecast = self._forecast
+        f_states = self._forecast_states
+        seen = self._seen_states
+        unit_steps = self._unit_steps
+        offset = self._forecast_offset
+        while len(forecast) < horizon and len(unit_steps) < num_units:
+            state: tuple[int, int, int, int] | None = None
+            if len(tail) >= 4:
+                state = (tail[-4], tail[-3], tail[-2], tail[-1])
+                if state in seen:
+                    break
+                seen.add(state)
+            nxt = self._predict_from_tail(tail)
+            abs_step = offset + len(forecast) + 1
+            forecast.append(nxt)
+            f_states.append(state)
+            steps = unit_steps.get(nxt)
+            if steps is None:
+                unit_steps[nxt] = deque((abs_step,))
+            else:
+                steps.append(abs_step)
+            tail = (*tail[-3:], nxt)
+        self._rollout_tail = tail
+
+    def _ensure_forecast(self) -> None:
+        if self._forecast is not None:
+            return
+        hist = self._history
+        if hist:
+            hlen = len(hist)
+            self._rollout_tail = tuple(hist[i] for i in range(max(0, hlen - 4), hlen))
+        else:
+            self._rollout_tail = (self._num_units - 1,)
+        self._forecast = deque()
+        self._forecast_states.clear()
+        self._seen_states.clear()
+        self._unit_steps.clear()
+        self._forecast_offset = 0
+        self._extend_forecast()
 
     def distance(self, unit_idx: int) -> float:
         """Estimated forward steps until ``unit_idx`` is next used (``inf`` if far)."""
-        if self._cached_distances is None:
-            self._cached_distances = self._compute_distances()
-        dist = self._cached_distances.get(unit_idx)
-        return float("inf") if dist is None else float(dist)
+        self._ensure_forecast()
+        steps = self._unit_steps.get(unit_idx)
+        if not steps:
+            return float("inf")
+        return float(steps[0] - self._forecast_offset)
 
 
 @dataclass(slots=True)

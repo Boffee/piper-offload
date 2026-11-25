@@ -173,12 +173,21 @@ class ElasticVramPool:
         candidates: list[VramSlot],
         distance_fn: Callable[[int], float],
     ) -> VramSlot:
-        def _score(slot: VramSlot) -> tuple[int, float, int]:
-            if slot.staged_unit_idx is None or not slot.lease.is_staged:
-                return (1, float("inf"), -slot.last_used_seq)
-            return (0, distance_fn(slot.staged_unit_idx), -slot.last_used_seq)
+        if len(candidates) == 1:
+            return candidates[0]
+        unstaged = [
+            slot
+            for slot in candidates
+            if slot.staged_unit_idx is None or not slot.lease.is_staged
+        ]
+        if unstaged:
+            return min(unstaged, key=lambda slot: slot.last_used_seq)
 
-        return max(candidates, key=_score)
+        def _staged_score(slot: VramSlot) -> tuple[float, int]:
+            assert slot.staged_unit_idx is not None
+            return (distance_fn(slot.staged_unit_idx), -slot.last_used_seq)
+
+        return max(candidates, key=_staged_score)
 
     def _close_slot(self, slot: VramSlot) -> None:
         # Leave slot tracked until lease.close() succeeds so synchronization

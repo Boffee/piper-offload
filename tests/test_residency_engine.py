@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import random
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, cast
@@ -175,6 +176,96 @@ class TestExecutionPredictor:
         d2 = pred.distance(2)
         d3 = pred.distance(3)
         assert d1 < d2 < d3
+
+    def test_indexed_predictor_matches_reference_and_reuses_forecast_in_steady_state(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def ref_predict_next(history: list[int], tail: list[int], num_units: int) -> int:
+            hist_len = len(history)
+            max_k = min(4, len(tail), hist_len - 1)
+            for k in range(max_k, 0, -1):
+                pattern = tail[-k:]
+                for start in range(hist_len - 1 - k, -1, -1):
+                    if history[start : start + k] == pattern:
+                        return history[start + k]
+            curr = tail[-1]
+            prev = tail[-2] if len(tail) >= 2 else None
+            if prev is not None and prev - curr == 1:
+                return (curr - 1) % num_units
+            return (curr + 1) % num_units
+
+        def ref_distances(history: list[int], num_units: int, max_hist: int) -> dict[int, int]:
+            horizon = max(2 * num_units, len(history), 32)
+            window = list(history) if history else [num_units - 1]
+            distances: dict[int, int] = {}
+            for step in range(1, horizon + 1):
+                nxt = ref_predict_next(history, window, num_units)
+                if nxt not in distances:
+                    distances[nxt] = step
+                window.append(nxt)
+                if len(window) > max_hist:
+                    del window[: len(window) - max_hist]
+            return distances
+
+        rng = random.Random(42)
+        cases: list[tuple[int, list[int]]] = [
+            (6, list(range(6)) * 20),
+            (6, list(reversed(range(6))) * 20),
+            (10, [9, 8] + [0, 1, 2] * 100),  # > max_history (256) with evicted acyclic prefix
+            (5, [0, 0, 1, 1, 2, 2, 3, 3, 4, 4] * 30),
+            (6, list(range(6)) * 45 + list(reversed(range(6))) * 20),
+            (5, [rng.randrange(5) for _ in range(300)]),
+        ]
+        for num_units, trace in cases:
+            pred = _ExecutionPredictor(num_units)
+            ref_hist: list[int] = []
+            max_hist = max(256, 8 * num_units)
+            for idx in range(num_units):
+                expected_nxt = ref_predict_next(ref_hist, [idx], num_units)
+                assert pred.next_after(idx) == (None if expected_nxt == idx else expected_nxt)
+            for step, unit_idx in enumerate(trace):
+                pred.record(unit_idx)
+                ref_hist.append(unit_idx)
+                if len(ref_hist) > max_hist:
+                    del ref_hist[: len(ref_hist) - max_hist]
+                expected_nxt = ref_predict_next(
+                    ref_hist,
+                    ref_hist if ref_hist[-1] == unit_idx else [unit_idx],
+                    num_units,
+                )
+                assert pred.next_after(unit_idx) == (None if expected_nxt == unit_idx else expected_nxt), (
+                    f"next_after mismatch at step {step}"
+                )
+                # Exercise both cache priming and steady-state shifts across all units.
+                if step % 3 == 0 or step > max_hist - 5:
+                    exp_dists = ref_distances(ref_hist, num_units, max_hist)
+                    for q in range(num_units):
+                        exp_d = float("inf") if q not in exp_dists else float(exp_dists[q])
+                        assert pred.distance(q) == exp_d, f"distance mismatch at step {step}, q={q}"
+
+        # Steady-state sequential 128-unit pass (both before and after history eviction)
+        # must shift the cached forecast without invalidating or rebuilding it.
+        large = _ExecutionPredictor(128)
+        for _ in range(10):  # 1280 steps > max_history (1024)
+            for idx in range(128):
+                large.record(idx)
+        _ = large.distance(0)
+        invalidations = 0
+        orig_invalidate = large._invalidate_forecast
+
+        def count_invalidate() -> None:
+            nonlocal invalidations
+            invalidations += 1
+            orig_invalidate()
+
+        monkeypatch.setattr(large, "_invalidate_forecast", count_invalidate)
+        for idx in range(128):
+            large.record(idx)
+            assert large.next_after(idx) == (idx + 1) % 128
+            assert large.distance((idx + 2) % 128) == 2.0
+        assert invalidations == 0
+        assert large._forecast is not None
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +471,81 @@ class TestElasticVramPool:
         pool.close_all()
         assert pool.live_slot_count == 0
         assert l1.close_calls == 3
+
+    def test_pick_victim_skips_distance_fn_for_single_or_unstaged_candidates(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _fake_pool_helpers(monkeypatch, lambda target: int(cast(Any, target)))
+
+        class StagedLease:
+            def __init__(self, nbytes: int, *, is_staged: bool = True) -> None:
+                self.is_staged = is_staged
+                self.closed = False
+                self.target = cast(HostModuleTarget, nbytes)
+
+            def close(self) -> None:
+                self.closed = True
+
+        monkeypatch.setattr(
+            CudaTargetLease,
+            "allocate",
+            lambda plan, _d, *, allocation_stream=None: StagedLease(plan.nbytes),
+        )
+
+        def fail_distance(_unit_idx: int) -> float:
+            raise AssertionError("distance_fn must not be called")
+
+        stream = cast(torch.cuda.Stream, object())
+        sig_a = cast(UnitSignature, ("a", 64))
+        sig_b = cast(UnitSignature, ("b", 64))
+        plan_a = cast(HostModuleLoadPlan, _FakePlan(64, sig_a))
+        plan_b = cast(HostModuleLoadPlan, _FakePlan(64, sig_b))
+
+        # 2-slot streaming with one checked-out slot has only 1 idle candidate on every reuse/evict.
+        pool = ElasticVramPool(torch.device("cuda"), vram_budget_bytes=None)
+        s0, _ = pool.checkout(0, plan_a, stream, distance_fn=fail_distance, is_lookahead=False)
+        assert s0 is not None
+        pool.return_slot(s0, staged_unit_idx=0, distance_fn=fail_distance)
+        s1, _ = pool.checkout(1, plan_b, stream, distance_fn=fail_distance, is_lookahead=False)
+        assert s1 is not None
+        # Evicting sole mismatched idle slot s0 never calls fail_distance.
+        s2, hit2 = pool.checkout(2, plan_b, stream, distance_fn=fail_distance, is_lookahead=True)
+        assert s2 is not None and not hit2 and s2 is not s0 and cast(Any, s0.lease).closed
+        pool.return_slot(s1, staged_unit_idx=1, distance_fn=fail_distance)
+        # Reusing sole matching idle slot s1 (while s2 is checked out) never calls fail_distance.
+        s3, hit3 = pool.checkout(3, plan_b, stream, distance_fn=fail_distance, is_lookahead=False)
+        assert not hit3 and s3 is s1 and not cast(Any, s1.lease).closed
+        pool.return_slot(s2, staged_unit_idx=2, distance_fn=fail_distance)
+        pool.return_slot(s3, staged_unit_idx=3, distance_fn=fail_distance)
+        pool.close_all()
+
+        # Multiple candidates where any slot is unstaged skip distance_fn and pick LRU unstaged.
+        s_unstaged_new = VramSlot(
+            lease=cast(CudaTargetLease, StagedLease(64, is_staged=False)),
+            signature=sig_a,
+            nbytes=64,
+            staged_unit_idx=0,
+            last_used_seq=5,
+        )
+        s_unstaged_old = VramSlot(
+            lease=cast(CudaTargetLease, StagedLease(64, is_staged=False)),
+            signature=sig_a,
+            nbytes=64,
+            staged_unit_idx=None,
+            last_used_seq=2,
+        )
+        s_staged_old = VramSlot(
+            lease=cast(CudaTargetLease, StagedLease(64, is_staged=True)),
+            signature=sig_a,
+            nbytes=64,
+            staged_unit_idx=1,
+            last_used_seq=1,
+        )
+        assert ElasticVramPool._pick_victim(
+            [s_staged_old, s_unstaged_new, s_unstaged_old],
+            fail_distance,
+        ) is s_unstaged_old
 
 
 # ---------------------------------------------------------------------------
