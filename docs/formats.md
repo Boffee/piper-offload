@@ -170,18 +170,33 @@ shard. It targets frozen inference with ordinary `Replicate` and contiguous
 `Shard` placements across 1D and N-D CPU or CUDA/HIP `DeviceMesh` topologies.
 When binding an unsharded `ModelStore` onto a `DTensor`-sharded shell, plain
 strided weights project zero-copy local views for any `Replicate` or contiguous
-`Shard(dim)` placement; non-`nn.Parameter`-subclass quantized weights whose
+`Shard(dim)` placement. Non-`nn.Parameter`-subclass quantized weights whose
 tensor subclass supports `DTensor` wrapping (such as TorchAO FP8, MX, NVFP4, or
-Piper ConvRot; formats whose tensor subclass does not support `DTensor`
-wrapping, such as TorchAO `Int8Tensor` or tile-packed INT4, are rejected during
-bind preflight) project zero-copy for all-`Replicate` targets and reject
-sharded placements (`layout mismatch`). Each rank selects its
-portion of plain host-backed LoRA factors or dense deltas before staging; merging
-requires no collective. Full adapter tensors remain in host memory. DTensor
-adapter factors and deltas, `DTensor` registered buffers against plain buffer
-stores, and `block_mode="rolling"` on projected DTensor block groups are not
-accepted. Local shards must carry their tensor representation independently of
-an `nn.Parameter` wrapper.
+Piper ConvRot) project zero-copy for all-`Replicate` targets. For `Shard(dim)`
+placements across 1D and N-D `DeviceMesh` shells, zero-copy projection supports
+TorchAO `Float8Tensor` (`PerTensor`, `PerRow` along any axis, and `PerGroup`
+when shard boundaries align with the group size) and 2-D Piper
+`ConvRotInt8Tensor` (`Shard(0)` on any non-empty split; `Shard(1)` when shard
+offset and local width are aligned to `group_size`, preserving optional scalar
+`act_per_tensor_scale`). Formats without shard projection (`MXTensor`,
+`NVFP4Tensor`, `ConvRotNVFP4Tensor`, and 5-D Conv3D `ConvRotInt8Tensor`),
+empty, misaligned, or transposed quantized shards, and `DTensor`-incompatible
+tensor subclasses (such as TorchAO `Int8Tensor`, tile-packed INT4, or
+`PrototypeFloat8Tensor`) are rejected cleanly with `layout mismatch` during bind
+preflight. Non-canonical projected quantized shards (such as `Shard(1)`) keep
+zero-copy host views under the single store allocation, report
+`requires_activation(param) == True` while resting on CPU (disallowing direct
+CPU execution and permanent `merge_adapter` updates), allocate contiguous
+per-rank device buffers preserving block-pool compatibility across streaming
+refills on CUDA activation, and support active LoRA and dense adapter merges on
+`RowwiseParallel` layers, bias-free `nn.Linear` avoids PyTorch DTensor's linear
+decomposition falling back to all-gathering `Shard(1)` quantized weights). Each
+rank selects its portion of plain host-backed LoRA factors or dense deltas
+before staging; merging requires no collective. Full adapter tensors remain in
+host memory. DTensor adapter factors and deltas, `DTensor` registered buffers
+against plain buffer stores, and `block_mode="rolling"` on projected DTensor
+block groups are not accepted. Local shards must carry their tensor
+representation independently of an `nn.Parameter` wrapper.
 See [dtensor_adapter.py](../src/piper_offload/dtensor_adapter.py) for supported
 host projections and reconstruction.
 

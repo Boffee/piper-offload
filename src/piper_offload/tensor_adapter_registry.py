@@ -13,6 +13,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from ._dtensor import local_shard
 from .dtensor_adapter import DTensorAdapter
 from .float8_adapter import Float8Adapter
 from .gguf_adapter import GgufAdapter
@@ -24,6 +25,10 @@ from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from .piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
 from .static_float8_adapter import StaticFloat8Adapter
 from .tensor_adapters import RegularAdapter, TensorAdapter
+from .torchao_structured_adapter import (
+    _ProjectedTorchaoShard,
+    _ProjectedTorchaoShardAdapter,
+)
 from .trellis_adapter import TrellisAdapter
 
 # DTensorAdapter is always checked before registered and built-in adapters: a
@@ -45,6 +50,7 @@ _BUILTIN_ADAPTERS: tuple[type[TensorAdapter[Any, Any]], ...] = (
     GgufAdapter,
     TrellisAdapter,
     PiperConvRotInt8Adapter,
+    _ProjectedTorchaoShardAdapter,
     RegularAdapter,
 )
 
@@ -148,12 +154,17 @@ def param_representation(param: torch.Tensor) -> torch.Tensor:
 def requires_activation(tensor: torch.Tensor) -> bool:
     """Whether a stored representation needs Offload conversion before module execution.
 
-    Packed GGUF and trellis-coded sources execute as ConvRot targets. Other
-    supported tensors can execute in their stored representation and do not need
-    this conversion.
+    Packed GGUF and trellis-coded sources execute as ConvRot targets, and
+    resting non-canonical projected quantized shards materialize contiguously on
+    CUDA. Other supported tensors can execute in their stored representation
+    and do not need this conversion.
     """
     representation = param_representation(tensor)
-    return GgufAdapter.matches(representation) or TrellisAdapter.matches(representation)
+    return (
+        GgufAdapter.matches(representation)
+        or TrellisAdapter.matches(representation)
+        or isinstance(local_shard(representation), _ProjectedTorchaoShard)
+    )
 
 
 def param_tensor_id(param: nn.Parameter) -> tuple[Any, ...]:

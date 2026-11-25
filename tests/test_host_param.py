@@ -404,6 +404,10 @@ class TestDTensorProjection:
         q_host = HostParam(linear.weight)
         q_ptrs = tuple(t.untyped_storage().data_ptr() for t in q_host.storage_tensors())
 
+        int8_linear = nn.Linear(16, 16, bias=False, dtype=torch.bfloat16).eval().requires_grad_(False)
+        torchao_quant.quantize_(int8_linear, torchao_quant.Int8WeightOnlyConfig())
+        int8_host = HostParam(int8_linear.weight)
+
         class _SubParam(nn.Parameter):
             pass
 
@@ -437,8 +441,30 @@ class TestDTensorProjection:
                 stride=(16, 1),
                 run_check=False,
             )
-            with pytest.raises(NotImplementedError, match="plain tensor sources only"):
-                HostParam.project_dtensor(q_host, nn.Parameter(meta_shard, requires_grad=False))
+            proj_q_s0 = HostParam.project_dtensor(q_host, nn.Parameter(meta_shard, requires_grad=False))
+            assert proj_q_s0.compute_dtype is torch.bfloat16
+            assert proj_q_s0.target_layout[1][0] is type(q_host.adapter)
+            assert tuple(t.untyped_storage().data_ptr() for t in proj_q_s0.storage_tensors()) == q_ptrs
+            assert proj_q_s0.accepts_bind_target(nn.Parameter(meta_shard, requires_grad=False))
+            assert proj_q_s0.accepts_bind_target(proj_q_s0.make_cpu_param())
+
+            meta_shard1 = DTensor.from_local(
+                torch.empty((16, 8), dtype=torch.float32, device="meta"),
+                mesh,
+                [Shard(1)],
+                shape=(16, 16),
+                stride=(16, 1),
+                run_check=False,
+            )
+            proj_q_s1 = HostParam.project_dtensor(q_host, nn.Parameter(meta_shard1, requires_grad=False))
+            assert proj_q_s1.compute_dtype is torch.bfloat16
+            assert proj_q_s1.target_layout[1][0] is type(q_host.adapter)
+            assert tuple(t.untyped_storage().data_ptr() for t in proj_q_s1.storage_tensors()) == q_ptrs
+            assert proj_q_s1.accepts_bind_target(nn.Parameter(meta_shard1, requires_grad=False))
+            assert proj_q_s1.accepts_bind_target(proj_q_s1.make_cpu_param())
+
+            with pytest.raises(NotImplementedError, match="unsupported"):
+                HostParam.project_dtensor(int8_host, nn.Parameter(meta_shard, requires_grad=False))
 
             rep_4x4 = DTensor.from_local(
                 torch.empty((4, 4), dtype=torch.float32, device="meta"),
@@ -448,6 +474,17 @@ class TestDTensorProjection:
             )
             with pytest.raises(NotImplementedError, match="nn.Parameter subclass"):
                 DTensorAdapter.project_host(_ParamSubclassAdapter(), plain_state, rep_4x4)
+
+            shard_4x4 = DTensor.from_local(
+                torch.empty((2, 4), dtype=torch.float32, device="meta"),
+                mesh,
+                [Shard(0)],
+                shape=(4, 4),
+                stride=(4, 1),
+                run_check=False,
+            )
+            with pytest.raises(NotImplementedError, match="nn.Parameter subclass"):
+                DTensorAdapter.project_host(_ParamSubclassAdapter(), plain_state, shard_4x4)
 
         with ParallelExecutor(["cpu", "cpu"]) as ex:
             ex.run(verify)

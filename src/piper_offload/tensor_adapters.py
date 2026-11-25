@@ -47,6 +47,7 @@ __all__ = [
     "LogicalShapeTensorAdapter",
     "MergeLocalityTensorAdapter",
     "PermanentUpdateValidationTensorAdapter",
+    "ShardProjectionTensorAdapter",
     "TensorAdapter",
     "TensorCopyIntoAdapter",
     "accepts_bind_target",
@@ -538,6 +539,31 @@ class BindTargetTensorAdapter[HostStateT, GpuStateT](
         ...
 
 
+@runtime_checkable
+class ShardProjectionTensorAdapter[HostStateT, GpuStateT](
+    TensorAdapter[HostStateT, GpuStateT],
+    Protocol,
+):
+    """Optional capability: project an unsharded host state onto a contiguous shard.
+
+    Adapters implementing this protocol slice or alias the full host backing
+    into a rank-local host state without copying payload bytes, returning
+    ``(projected_state, canonical_inner_layout_signature)``. Formats with
+    quantization block/group structure validate sharding alignment here and
+    derive shard-local metadata and layout signatures.
+    """
+
+    @staticmethod
+    def project_shard(
+        state: HostStateT,
+        *,
+        offsets: tuple[int, ...],
+        local_shape: tuple[int, ...],
+    ) -> tuple[HostStateT, tuple[object, ...]]:
+        """Project a zero-copy rank-local shard from captured host ``state``."""
+        ...
+
+
 def is_plain_meta_placeholder(
     target: torch.Tensor,
     logical_shape: tuple[int, ...],
@@ -631,23 +657,25 @@ def capture_host_tensor(
         return source
 
     # Preserve exact strides for device sources and clone-style layout
-    # normalization for CPU sources. Allocate the final host destination once.
-    if source.device.type != "cpu" and memory_format == torch.preserve_format:
-        host = torch.empty_strided(
-            tuple(source.shape),
-            source.stride(),
-            dtype=source.dtype,
-            device="cpu",
-            pin_memory=False,
-        )
-    else:
-        host = torch.empty_like(
-            source,
-            device="cpu",
-            memory_format=memory_format,
-            pin_memory=False,
-        )
-    host.copy_(source)
+    # normalization for CPU sources. Allocate the final host destination once
+    # outside inference mode so captured buffers are not inference tensors.
+    with torch.inference_mode(False):
+        if source.device.type != "cpu" and memory_format == torch.preserve_format:
+            host = torch.empty_strided(
+                tuple(source.shape),
+                source.stride(),
+                dtype=source.dtype,
+                device="cpu",
+                pin_memory=False,
+            )
+        else:
+            host = torch.empty_like(
+                source,
+                device="cpu",
+                memory_format=memory_format,
+                pin_memory=False,
+            )
+        host.copy_(source)
     return host
 
 
@@ -810,6 +838,34 @@ class RegularAdapter:
     def capture_host_view(view: torch.Tensor) -> _RegularHost:
         """Wrap an existing host view without normalizing or copying it."""
         return _RegularHost(data=view.detach())
+
+    @staticmethod
+    def project_shard(
+        state: _RegularHost,
+        *,
+        offsets: tuple[int, ...],
+        local_shape: tuple[int, ...],
+    ) -> tuple[_RegularHost, tuple[object, ...]]:
+        """Project a zero-copy host view for a contiguous ``DTensor`` shard."""
+        source = state.data
+        if len(offsets) != source.ndim or len(local_shape) != source.ndim:
+            raise ValueError(
+                "Shard projection dimensions must match the source tensor: "
+                f"source={tuple(source.shape)}, offsets={offsets}, local_shape={local_shape}."
+            )
+        local = source
+        for dim, (offset, size) in enumerate(zip(offsets, local_shape, strict=True)):
+            if offset < 0 or size < 0 or offset + size > local.shape[dim]:
+                raise ValueError(
+                    "Shard projection range exceeds source dimensions: "
+                    f"source={tuple(source.shape)}, dim={dim}, offset={offset}, size={size}."
+                )
+            if offset != 0 or size != local.shape[dim]:
+                local = local.narrow(dim, offset, size)
+        return (
+            RegularAdapter.capture_host_view(local),
+            RegularAdapter.layout_signature(local),
+        )
 
     @staticmethod
     def storage_tensors(state: _RegularHost) -> tuple[torch.Tensor, ...]:

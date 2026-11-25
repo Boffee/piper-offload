@@ -25,11 +25,16 @@ delegates the actual update to the local shard's adapter. This keeps
 tensor-parallel concerns out of format-specific quant adapters.
 
 Dense ``Replicate`` and contiguous ``Shard(dim)`` tensors across 1D and N-D
-meshes can also be projected from a full plain host parameter (and
-``Replicate`` tensors from non-``nn.Parameter``-subclass quantized host
-parameters). The target DTensor supplies only its distributed layout and may
-use a meta local tensor; the resting local shard remains a view or alias of the
-original host allocation, including mmap-backed checkpoint storage.
+meshes can also be projected from a full plain host parameter or a supported
+non-``nn.Parameter``-subclass quantized host parameter (such as TorchAO
+``Float8Tensor`` or 2-D Piper ``ConvRotInt8Tensor`` via
+:class:`~piper_offload.tensor_adapters.ShardProjectionTensorAdapter`). The
+target DTensor supplies only its distributed layout and may use a meta local
+tensor; host storage remains a zero-copy view or alias of the original host
+allocation, including mmap-backed checkpoint storage. Non-canonical projected
+shards (such as column-sharded quantized matrices) rest on CPU in a minimal
+zero-allocation placeholder until CUDA activation materializes contiguous
+``1/P`` device shards.
 
 The adapter advertises no full dequantize/requantize or ``copy_into``
 capability. It can expose a dense local shard when the inner adapter can, which
@@ -83,11 +88,12 @@ from .tensor_adapters import (
     LogicalShapeTensorAdapter,
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
-    RegularAdapter,
+    ShardProjectionTensorAdapter,
     TensorAdapter,
     accepts_bind_target,
     adapter_name,
 )
+from .torchao_structured_adapter import _ProjectedTorchaoShard
 
 
 @dataclass(slots=True)
@@ -247,7 +253,7 @@ def _layout_context(
         tuple(dt.placements),
     )
 
-    local = dt.to_local()
+    local = local_shard(dt)
     inner = _select(local)
     actual_local_shape = _logical_shape(local, inner)
     if actual_local_shape != local_shape:
@@ -385,6 +391,63 @@ def require_initialized_mesh(mesh: Any) -> None:  # noqa: ANN401
             ) from exc
 
 
+def _source_tensor_data(
+    source_adapter: TensorAdapter[Any, Any],
+    source_state: object,
+    *,
+    mode: str,
+) -> torch.Tensor:
+    source_cpu = source_adapter.cpu_param(source_state)
+    if (
+        issubclass(type(source_cpu), nn.Parameter)
+        and type(source_cpu) is not nn.Parameter
+    ) or issubclass(type(source_cpu.data), nn.Parameter):
+        raise NotImplementedError(
+            f"DTensor {mode} projection supports adapters whose local shard "
+            "reconstructs without an nn.Parameter subclass wrapper."
+        )
+    return source_cpu.data
+
+
+def _validate_dtensor_wrapping(
+    local: torch.Tensor,
+    cpu_mesh: Any,  # noqa: ANN401
+    placements: tuple[object, ...],
+    shape: Any,  # noqa: ANN401
+    stride: tuple[int, ...],
+    *,
+    mode: str,
+) -> None:
+    """Preflight DTensor and Parameter wrapping before model mutation."""
+    if type(local) is not torch.Tensor:
+        try:
+            # Validate during preflight that DTensor wrapping and Parameter
+            # wrapping succeed for this tensor subclass (e.g. Int8Tensor lacks
+            # aten.view and would otherwise fail late during install_host after
+            # earlier components mutated the shell).
+            nn.Parameter(
+                rebuild_dtensor(local, cpu_mesh, placements, shape, stride),
+                requires_grad=False,
+            )
+        except (NotImplementedError, RuntimeError, IndexError) as exc:
+            raise NotImplementedError(
+                f"DTensor {mode} projection requires a local tensor representation "
+                f"compatible with DTensor wrapping ({type(local).__name__}): {exc}"
+            ) from exc
+    if isinstance(local, _ProjectedTorchaoShard):
+        meta_tensor = local._meta_tensor
+        try:
+            nn.Parameter(
+                rebuild_dtensor(meta_tensor, cpu_mesh, placements, shape, stride),
+                requires_grad=False,
+            )
+        except (NotImplementedError, RuntimeError, IndexError) as exc:
+            raise NotImplementedError(
+                f"DTensor {mode} projection requires an active local tensor "
+                f"representation compatible with DTensor wrapping ({type(meta_tensor).__name__}): {exc}"
+            ) from exc
+
+
 def _project_replicated_host(
     source_adapter: TensorAdapter[Any, Any],
     source_state: object,
@@ -392,19 +455,14 @@ def _project_replicated_host(
     placements: tuple[object, ...],
 ) -> _DTensorHost:
     """Project an unsharded host backing onto an all-``Replicate`` DTensor."""
-    source_cpu = source_adapter.cpu_param(source_state)
-    if (
-        issubclass(type(source_cpu), nn.Parameter)
-        and type(source_cpu) is not nn.Parameter
-    ) or issubclass(type(source_cpu.data), nn.Parameter):
-        raise NotImplementedError(
-            "DTensor Replicate projection supports adapters whose local shard "
-            "reconstructs without an nn.Parameter subclass wrapper."
-        )
-    source_data = source_cpu.data
+    source_data = _source_tensor_data(
+        source_adapter,
+        source_state,
+        mode="Replicate",
+    )
     if tuple(source_data.shape) != tuple(dt.shape):
         raise ValueError("DTensor projection source and target shapes must match.")
-    target_local = dt.to_local()
+    target_local = local_shard(dt)
     inner_layout_signature = source_adapter.layout_signature(source_data)
     if not accepts_bind_target(
         source_adapter,
@@ -417,21 +475,14 @@ def _project_replicated_host(
         )
     cpu_mesh = cpu_mesh_for(dt.device_mesh)
     stride = source_data.stride()
-    if type(source_data) is not torch.Tensor:
-        try:
-            # Validate during preflight that DTensor wrapping and Parameter
-            # wrapping succeed for this tensor subclass (e.g. Int8Tensor lacks
-            # aten.view and would otherwise fail late during install_host after
-            # earlier components mutated the shell).
-            nn.Parameter(
-                rebuild_dtensor(source_data, cpu_mesh, placements, dt.shape, stride),
-                requires_grad=False,
-            )
-        except (NotImplementedError, RuntimeError) as exc:
-            raise NotImplementedError(
-                "DTensor Replicate projection requires a local tensor representation "
-                f"compatible with DTensor wrapping ({type(source_data).__name__}): {exc}"
-            ) from exc
+    _validate_dtensor_wrapping(
+        source_data,
+        cpu_mesh,
+        placements,
+        dt.shape,
+        stride,
+        mode="Replicate",
+    )
     return _DTensorHost(
         inner=source_adapter,
         inner_state=source_state,
@@ -452,42 +503,53 @@ def _project_sharded_host(
     local_shape: tuple[int, ...],
     offsets: tuple[int, ...],
 ) -> _DTensorHost:
-    """Project a zero-copy view of a plain tensor onto a sharded DTensor."""
-    if not isinstance(source_adapter, RegularAdapter):
+    """Project a zero-copy view of a host parameter onto a sharded DTensor."""
+    if not isinstance(source_adapter, ShardProjectionTensorAdapter):
         raise NotImplementedError(
-            "DTensor shard projection currently supports plain tensor sources only."
+            f"DTensor shard projection is unsupported for {adapter_name(source_adapter)}."
         )
-    (source_tensor,) = source_adapter.storage_tensors(cast(Any, source_state))
-    if tuple(source_tensor.shape) != tuple(dt.shape):
+    source_data = _source_tensor_data(
+        source_adapter,
+        source_state,
+        mode="Shard",
+    )
+    if tuple(source_data.shape) != tuple(dt.shape):
         raise ValueError("DTensor projection source and target shapes must match.")
-    target_local = dt.to_local()
-    if type(target_local) is not torch.Tensor:
-        raise NotImplementedError(
-            "DTensor projection currently supports plain tensor local targets only."
-        )
-    if target_local.layout is not torch.strided:
+    inner_state, inner_layout_signature = source_adapter.project_shard(
+        source_state,
+        offsets=offsets,
+        local_shape=local_shape,
+    )
+    target_local = local_shard(dt)
+    if not accepts_bind_target(
+        source_adapter,
+        inner_state,
+        inner_layout_signature,
+        target_local,
+    ):
         raise ValueError(
-            "DTensor projection local target must use a strided layout; "
-            f"got {target_local.layout}."
+            "DTensor projection local target does not match the projected shard layout."
         )
-    if tuple(target_local.shape) != local_shape:
-        raise ValueError(
-            "DTensor projection local source and target shapes must match: "
-            f"expected {local_shape}, got {tuple(target_local.shape)}."
-        )
-    local = source_tensor
-    for dim, (offset, size) in enumerate(zip(offsets, local_shape, strict=True)):
-        if offset != 0 or size != local.shape[dim]:
-            local = local.narrow(dim, offset, size)
+    cpu_mesh = cpu_mesh_for(dt.device_mesh)
+    stride = source_data.stride()
+    local_cpu = source_adapter.cpu_param(inner_state).data
+    _validate_dtensor_wrapping(
+        local_cpu,
+        cpu_mesh,
+        placements,
+        dt.shape,
+        stride,
+        mode="Shard",
+    )
     return _DTensorHost(
         inner=source_adapter,
-        inner_state=source_adapter.capture_host_view(local),
-        inner_layout_signature=source_adapter.layout_signature(local),
+        inner_state=inner_state,
+        inner_layout_signature=inner_layout_signature,
         mesh=dt.device_mesh,
-        cpu_mesh=cpu_mesh_for(dt.device_mesh),
+        cpu_mesh=cpu_mesh,
         placements=placements,
         shape=dt.shape,
-        stride=source_tensor.stride(),
+        stride=stride,
     )
 
 
@@ -506,7 +568,7 @@ class DTensorAdapter:
         # so without these, the second would rebuild with the wrong global
         # metadata.
         dt = require_dtensor(t)
-        local = dt.to_local()
+        local = local_shard(dt)
         return (
             "dtensor",
             _select(local).tensor_id(local),
@@ -524,10 +586,15 @@ class DTensorAdapter:
         # pool target reused across such blocks would carry the wrong shape.
         # Tag with type(inner) so distinct inner adapters cannot collide.
         dt = require_dtensor(t)
-        local = dt.to_local()
+        local = local_shard(dt)
         inner = _select(local)
+        inner_type = (
+            local._adapter_cls
+            if isinstance(local, _ProjectedTorchaoShard)
+            else type(inner)
+        )
         return (
-            type(inner),
+            inner_type,
             inner.layout_signature(local),
             tuple(dt.shape),
             dt.stride(),
@@ -550,7 +617,7 @@ class DTensorAdapter:
     @staticmethod
     def capture_host(t: torch.Tensor) -> _DTensorHost:
         dt = require_dtensor(t)
-        local = dt.to_local()
+        local = local_shard(dt)
         if issubclass(type(local), nn.Parameter):
             # A Parameter subclass may carry state that gpu_param would
             # lose through .data. Check actual inheritance because DTensor
@@ -596,7 +663,7 @@ class DTensorAdapter:
             state.inner,
             state.inner_state,
             state.inner_layout_signature,
-            dt.to_local(),
+            local_shard(dt),
         )
 
     @staticmethod
@@ -651,15 +718,16 @@ class DTensorAdapter:
         # CPU mesh captured at construction so deactivation neither allocates
         # GPU memory nor requires an active distributed context. The local
         # aliases the inner adapter's host storage.
-        local = state.inner.cpu_param(state.inner_state).data
-        dt = rebuild_dtensor(
-            local,
-            state.cpu_mesh,
-            state.placements,
-            state.shape,
-            state.stride,
-        )
-        return nn.Parameter(dt, requires_grad=False)
+        with torch.inference_mode(False):
+            local = state.inner.cpu_param(state.inner_state).data
+            dt = rebuild_dtensor(
+                local,
+                state.cpu_mesh,
+                state.placements,
+                state.shape,
+                state.stride,
+            )
+            return nn.Parameter(dt, requires_grad=False)
 
     @staticmethod
     def alloc_gpu(state: _DTensorHost, device: torch.device) -> _DTensorGpu:
@@ -674,9 +742,10 @@ class DTensorAdapter:
         # replay the distributed wrapper. run_check=False: pure local rebuild,
         # never a collective. The local already lives on the mesh device, so
         # from_local aliases it (no copy) — the reused wrapper sees refills.
-        local = host.inner.gpu_param(host.inner_state, gpu_state.inner_gpu).data
-        dt = rebuild_dtensor(local, host.mesh, host.placements, host.shape, host.stride)
-        return nn.Parameter(dt, requires_grad=False)
+        with torch.inference_mode(False):
+            local = host.inner.gpu_param(host.inner_state, gpu_state.inner_gpu).data
+            dt = rebuild_dtensor(local, host.mesh, host.placements, host.shape, host.stride)
+            return nn.Parameter(dt, requires_grad=False)
 
     @staticmethod
     def copy_to_gpu(src: _DTensorHost, dst: _DTensorGpu, *, non_blocking: bool = False) -> None:

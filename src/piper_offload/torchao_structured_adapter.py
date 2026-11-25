@@ -29,12 +29,19 @@ advertises exactly those capabilities.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NoReturn, cast
 
 import torch
 from torch import nn
 
 from .tensor_adapters import (
+    DenseMergeTargetValidationTensorAdapter,
+    DenseMergeTensorAdapter,
+    DenseMergeValidationTensorAdapter,
+    DequantizeTensorAdapter,
+    LoRAMergeTensorAdapter,
+    LoRAMergeValidationTensorAdapter,
+    adapter_name,
     capture_host_tensor,
     empty_like_strided,
     is_plain_meta_placeholder,
@@ -48,8 +55,19 @@ __all__ = [
     "TorchaoGpu",
     "TorchaoHost",
     "TorchaoStructuredAdapter",
+    "_ProjectedTorchaoShard",
+    "_ProjectedTorchaoShardAdapter",
     "copy_storage",
 ]
+
+
+def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    strides = [1] * len(shape)
+    running = 1
+    for idx in range(len(shape) - 1, -1, -1):
+        strides[idx] = running
+        running *= shape[idx]
+    return tuple(strides)
 
 
 @dataclass(slots=True, frozen=True)
@@ -61,11 +79,308 @@ class TorchaoHost[MetaT]:
     optional tensor (e.g. NVFP4 global scales). ``meta`` is the immutable
     metadata snapshot used to rebuild the wrapper on each move, and
     ``logical_shape`` is the dense wrapper shape preserved across offload.
+    When ``contiguous_gpu`` is ``True`` (e.g., non-canonical projected host
+    views such as ``Shard(1)``), CPU stays behind
+    :class:`_ProjectedTorchaoShard` and device activation allocates contiguous
+    buffers matching each slot's shape.
     """
 
     storage: tuple[torch.Tensor | None, ...]
     meta: MetaT
     logical_shape: tuple[int, ...]
+    contiguous_gpu: bool = False
+
+
+class _ProjectedTorchaoShard(torch.Tensor):
+    """Resting CPU placeholder for a non-canonical projected quantized shard.
+
+    Keeps zero-copy host views inside :class:`TorchaoHost` while presenting a
+    non-meta CPU local tensor of the exact shard shape and compute dtype to
+    :class:`~piper_offload.dtensor_adapter.DTensorAdapter` and update preflight.
+    """
+
+    _adapter_cls: type[TorchaoStructuredAdapter[Any]]
+    _state: TorchaoHost[Any]
+    _meta_tensor: torch.Tensor
+    _layout_signature: tuple[object, ...]
+
+    @staticmethod
+    def __new__(
+        cls: type[_ProjectedTorchaoShard],
+        adapter_cls: type[TorchaoStructuredAdapter[Any]],
+        state: TorchaoHost[Any],
+        meta_tensor: torch.Tensor,
+        layout_signature: tuple[object, ...],
+    ) -> _ProjectedTorchaoShard:
+        tensor = cast(
+            _ProjectedTorchaoShard,
+            torch.Tensor._make_wrapper_subclass(  # type: ignore[attr-defined]
+                cls,
+                tuple(meta_tensor.shape),
+                dtype=meta_tensor.dtype,
+                device=torch.device("cpu"),
+                requires_grad=False,
+            ),
+        )
+        tensor._adapter_cls = adapter_cls
+        tensor._state = state
+        tensor._meta_tensor = meta_tensor
+        tensor._layout_signature = layout_signature
+        return tensor
+
+    def __repr__(self, *, tensor_contents: object = None) -> str:
+        del tensor_contents
+        return (
+            f"_ProjectedTorchaoShard(adapter={self._adapter_cls.__name__}, "
+            f"shape={tuple(self.shape)}, dtype={self.dtype})"
+        )
+
+    @classmethod
+    def __torch_dispatch__(  # type: ignore[override]
+        cls,
+        func: object,
+        _types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        _kwargs: dict[str, object] | None = None,
+    ) -> _ProjectedTorchaoShard:
+        if args and isinstance(args[0], cls):
+            target = args[0]
+            identity_view = (
+                (
+                    func in (torch.ops.aten.view.default, torch.ops.aten._unsafe_view.default)
+                    and tuple(cast(tuple[int, ...] | list[int], args[1])) == tuple(target.shape)
+                )
+                or (
+                    func == torch.ops.aten.view_as.default
+                    and tuple(cast(torch.Tensor, args[1]).shape) == tuple(target.shape)
+                )
+                or func in (torch.ops.aten.alias.default, torch.ops.aten.detach.default)
+            )
+            if identity_view:
+                return cls(
+                    target._adapter_cls,
+                    target._state,
+                    target._meta_tensor,
+                    target._layout_signature,
+                )
+        raise RuntimeError(
+            "Projected quantized shard requires CUDA activation before "
+            f"executing {func}."
+        )
+
+
+def _require_projected_shard(t: torch.Tensor) -> _ProjectedTorchaoShard:
+    if not isinstance(t, _ProjectedTorchaoShard):
+        raise TypeError(
+            f"expected _ProjectedTorchaoShard, got {type(t).__name__}"
+        )
+    return t
+
+
+class _ProjectedTorchaoShardAdapter:
+    """Internal adapter matched when inspecting a resting projected shard."""
+
+    @staticmethod
+    def matches(t: torch.Tensor) -> bool:
+        return isinstance(t, _ProjectedTorchaoShard)
+
+    @staticmethod
+    def tensor_id(t: torch.Tensor) -> tuple[object, ...]:
+        shard = _require_projected_shard(t)
+        return (
+            "projected-torchao",
+            shard._adapter_cls._TAG,
+            *(optional_tensor_id(s) for s in shard._state.storage),
+            shard._layout_signature,
+        )
+
+    @staticmethod
+    def layout_signature(t: torch.Tensor) -> tuple[object, ...]:
+        return _require_projected_shard(t)._layout_signature
+
+    @staticmethod
+    def logical_shape(t: torch.Tensor) -> tuple[int, ...]:
+        return tuple(_require_projected_shard(t).shape)
+
+    @staticmethod
+    def compute_dtype(t: torch.Tensor) -> torch.dtype:
+        return _require_projected_shard(t).dtype
+
+    @staticmethod
+    def capture_host(t: torch.Tensor) -> NoReturn:
+        _require_projected_shard(t)
+        raise ValueError(
+            "Resting projected quantized shards cannot be captured directly "
+            "into host state; bind from the originating store or activate on CUDA."
+        )
+
+    @staticmethod
+    def storage_tensors(state: object) -> NoReturn:
+        del state
+        raise RuntimeError(
+            "Resting projected quantized shards do not expose direct host capture state."
+        )
+
+    @staticmethod
+    def cpu_param(state: object) -> NoReturn:
+        del state
+        raise RuntimeError(
+            "Resting projected quantized shards do not expose direct host capture state."
+        )
+
+    @staticmethod
+    def alloc_gpu(state: object, device: torch.device) -> NoReturn:
+        del state, device
+        raise RuntimeError(
+            "Resting projected quantized shards must be activated via their owning store."
+        )
+
+    @staticmethod
+    def gpu_param(host: object, gpu_state: object) -> NoReturn:
+        del host, gpu_state
+        raise RuntimeError(
+            "Resting projected quantized shards must be activated via their owning store."
+        )
+
+    @staticmethod
+    def copy_to_gpu(
+        src: object,
+        dst: object,
+        *,
+        non_blocking: bool = False,
+    ) -> NoReturn:
+        del src, dst, non_blocking
+        raise RuntimeError(
+            "Resting projected quantized shards must be activated via their owning store."
+        )
+
+    @staticmethod
+    def cache_bytes(state: object) -> int:
+        del state
+        raise RuntimeError(
+            "Resting projected quantized shards do not expose direct host capture state."
+        )
+
+    @staticmethod
+    def validate_permanent_update() -> NoReturn:
+        raise ValueError(
+            "Permanent updates to projected quantized shards are unsupported; "
+            "use activation-time adapter merge instead."
+        )
+
+    @staticmethod
+    def dequantize(t: torch.Tensor) -> NoReturn:
+        shard = _require_projected_shard(t)
+        adapter = shard._adapter_cls()
+        if not isinstance(adapter, DequantizeTensorAdapter):
+            raise ValueError(
+                f"{adapter_name(adapter)} does not support dequantize."
+            )
+        raise RuntimeError(
+            "Projected quantized shard must be activated on CUDA before "
+            "dequantizing."
+        )
+
+    @staticmethod
+    def validate_lora_merge(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        alpha: float,
+        *,
+        beta: float = 1.0,
+        rounding_seed: int | None = None,
+    ) -> None:
+        shard = _require_projected_shard(target)
+        adapter = shard._adapter_cls()
+        if not isinstance(adapter, LoRAMergeTensorAdapter):
+            raise ValueError(
+                f"{adapter_name(adapter)} does not support LoRA merge. "
+                "Use routed LoRA for this tensor type."
+            )
+        if isinstance(adapter, LoRAMergeValidationTensorAdapter):
+            adapter.validate_lora_merge(
+                shard._meta_tensor,
+                b,
+                a,
+                alpha,
+                beta=beta,
+                rounding_seed=rounding_seed,
+            )
+
+    @staticmethod
+    def merge_lora_(
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        alpha: float,
+        *,
+        beta: float = 1.0,
+        rounding_seed: int | None = None,
+    ) -> NoReturn:
+        del b, a, alpha, beta, rounding_seed
+        _require_projected_shard(target)
+        raise RuntimeError(
+            "Projected quantized shard must be activated on CUDA before merging LoRA."
+        )
+
+    @staticmethod
+    def validate_dense_merge_target(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> bool:
+        shard = _require_projected_shard(target)
+        adapter = shard._adapter_cls()
+        if not isinstance(adapter, DenseMergeTensorAdapter):
+            raise ValueError(
+                f"{adapter_name(adapter)} does not support dense parameter merge."
+            )
+        if isinstance(adapter, DenseMergeTargetValidationTensorAdapter):
+            return adapter.validate_dense_merge_target(
+                shard._meta_tensor,
+                rounding_seed=rounding_seed,
+            )
+        return isinstance(adapter, DenseMergeValidationTensorAdapter)
+
+    @staticmethod
+    def validate_dense_merge(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        alpha: float,
+        *,
+        beta: float = 1.0,
+        rounding_seed: int | None = None,
+    ) -> None:
+        shard = _require_projected_shard(target)
+        adapter = shard._adapter_cls()
+        if not isinstance(adapter, DenseMergeTensorAdapter):
+            raise ValueError(
+                f"{adapter_name(adapter)} does not support dense parameter merge."
+            )
+        if isinstance(adapter, DenseMergeValidationTensorAdapter):
+            adapter.validate_dense_merge(
+                shard._meta_tensor,
+                update,
+                alpha,
+                beta=beta,
+                rounding_seed=rounding_seed,
+            )
+
+    @staticmethod
+    def merge_dense_(
+        target: torch.Tensor,
+        update: torch.Tensor,
+        alpha: float,
+        *,
+        beta: float = 1.0,
+        rounding_seed: int | None = None,
+    ) -> NoReturn:
+        del update, alpha, beta, rounding_seed
+        _require_projected_shard(target)
+        raise RuntimeError(
+            "Projected quantized shard must be activated on CUDA before merging dense updates."
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -251,6 +566,54 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         )
 
     @classmethod
+    def _meta_representation(cls, state: TorchaoHost[MetaT]) -> torch.Tensor:
+        """Build a 0-byte ``meta`` wrapper with canonical target buffer shapes."""
+        meta_storage = tuple(
+            torch.empty(tuple(s.shape), dtype=s.dtype, device="meta")
+            if s is not None
+            else None
+            for s in state.storage
+        )
+        return cls._reconstruct(meta_storage, state.meta)
+
+    @classmethod
+    def _finalize_projected_shard(
+        cls,
+        storage: tuple[torch.Tensor | None, ...],
+        meta: MetaT,
+        logical_shape: tuple[int, ...],
+    ) -> tuple[TorchaoHost[MetaT], tuple[object, ...]]:
+        """Build zero-copy projected host state and its canonical layout signature.
+
+        Contiguous views stay native host wrappers on CPU; non-contiguous
+        views keep zero-copy slices in ``storage`` while marking
+        ``contiguous_gpu=True`` for contiguous device allocation.
+        """
+        canonical_host = all(
+            s is None
+            or (s.is_contiguous() and s.stride() == _contiguous_strides(tuple(s.shape)))
+            for s in storage
+        )
+        host = TorchaoHost(
+            storage=storage,
+            meta=meta,
+            logical_shape=logical_shape,
+            contiguous_gpu=not canonical_host,
+        )
+        probe = (
+            cls._reconstruct(storage, meta)
+            if canonical_host
+            else cls._meta_representation(host)
+        )
+        cls._validate_layout(probe)
+        if tuple(probe.shape) != logical_shape:
+            raise ValueError(
+                f"{cls.__name__} projected logical shape {tuple(probe.shape)} "
+                f"does not match target shard shape {logical_shape}."
+            )
+        return host, cls.layout_signature(probe)
+
+    @classmethod
     def accepts_bind_target(
         cls,
         state: TorchaoHost[MetaT],
@@ -258,9 +621,15 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         *,
         layout_signature: object,
     ) -> bool:
-        return is_plain_meta_placeholder(
-            target, state.logical_shape
-        ) or matches_layout_signature(cls, layout_signature, target)
+        return (
+            is_plain_meta_placeholder(target, state.logical_shape)
+            or (
+                isinstance(target, _ProjectedTorchaoShard)
+                and target._adapter_cls is cls
+                and target._layout_signature == layout_signature
+            )
+            or matches_layout_signature(cls, layout_signature, target)
+        )
 
     @staticmethod
     def storage_tensors(state: TorchaoHost[MetaT]) -> tuple[torch.Tensor, ...]:
@@ -268,6 +637,17 @@ class TorchaoStructuredAdapter[MetaT](ABC):
 
     @classmethod
     def cpu_param(cls, state: TorchaoHost[MetaT]) -> nn.Parameter:
+        if state.contiguous_gpu:
+            meta_tensor = cls._meta_representation(state)
+            return nn.Parameter(
+                _ProjectedTorchaoShard(
+                    cls,
+                    state,
+                    meta_tensor,
+                    cls.layout_signature(meta_tensor),
+                ),
+                requires_grad=False,
+            )
         return nn.Parameter(
             cls._reconstruct(state.storage, state.meta),
             requires_grad=False,
@@ -277,6 +657,15 @@ class TorchaoStructuredAdapter[MetaT](ABC):
     def alloc_gpu(
         cls, state: TorchaoHost[MetaT], device: torch.device
     ) -> TorchaoGpu:
+        if state.contiguous_gpu:
+            return TorchaoGpu(
+                storage=tuple(
+                    torch.empty(tuple(s.shape), dtype=s.dtype, device=device)
+                    if s is not None
+                    else None
+                    for s in state.storage
+                )
+            )
         return TorchaoGpu(
             storage=tuple(
                 empty_like_strided(s, device) if s is not None else None

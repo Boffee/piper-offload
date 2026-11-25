@@ -28,7 +28,7 @@ from ._piper_convrot_int8 import (
     require_convrot_int8_tensor,
     validate_layout,
 )
-from .torchao_structured_adapter import TorchaoStructuredAdapter
+from .torchao_structured_adapter import TorchaoHost, TorchaoStructuredAdapter
 
 
 @dataclass(slots=True, frozen=True)
@@ -91,6 +91,82 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
     @staticmethod
     def _compute_dtype(t: Any) -> torch.dtype:  # noqa: ANN401
         return t.dtype
+
+    @classmethod
+    def project_shard(
+        cls,
+        state: TorchaoHost[_PiperConvRotInt8Meta],
+        *,
+        offsets: tuple[int, ...],
+        local_shape: tuple[int, ...],
+    ) -> tuple[TorchaoHost[_PiperConvRotInt8Meta], tuple[object, ...]]:
+        """Project a zero-copy host shard for 2-D ``ConvRotInt8Tensor`` weights."""
+        qdata, scale, act_per_tensor_scale = state.storage
+        assert qdata is not None
+        assert scale is not None
+        global_shape = state.logical_shape
+        group_size = state.meta.group_size
+        if len(global_shape) != 2 or qdata.ndim != 2:
+            raise ValueError(
+                "ConvRot INT8 DTensor shard projection supports 2-D matrices "
+                f"only; got shape {global_shape}."
+            )
+        if len(offsets) != 2 or len(local_shape) != 2:
+            raise ValueError(
+                "ConvRot INT8 shard projection requires 2-D offsets and shape; "
+                f"got offsets={offsets}, local_shape={local_shape}."
+            )
+        global_rows, global_cols = global_shape
+        row_offset, col_offset = offsets
+        local_rows, local_cols = local_shape
+        if local_rows <= 0 or local_cols <= 0:
+            raise ValueError(
+                "ConvRot INT8 DTensor shard projection requires non-empty local "
+                f"shards; got local_shape={local_shape}."
+            )
+        if (
+            row_offset < 0
+            or row_offset + local_rows > global_rows
+            or col_offset < 0
+            or col_offset + local_cols > global_cols
+        ):
+            raise ValueError(
+                "ConvRot INT8 shard projection range exceeds weight shape: "
+                f"global_shape={global_shape}, offsets={offsets}, local_shape={local_shape}."
+            )
+        if (
+            not qdata.is_contiguous()
+            or not scale.is_contiguous()
+            or tuple(qdata.shape) != global_shape
+            or tuple(scale.shape) != (global_rows, 1)
+        ):
+            raise ValueError(
+                "ConvRot INT8 DTensor shard projection requires contiguous, "
+                "untransposed qdata and scale storage; "
+                f"got qdata={tuple(qdata.shape)}, scale={tuple(scale.shape)}."
+            )
+        if (col_offset != 0 or local_cols != global_cols) and (
+            col_offset % group_size != 0 or local_cols % group_size != 0
+        ):
+            raise ValueError(
+                "ConvRot INT8 Shard(1) projection along columns "
+                f"(offset={col_offset}, size={local_cols}) must align to "
+                f"rotation group_size {group_size}."
+            )
+
+        qdata_local = qdata
+        scale_local = scale
+        if row_offset != 0 or local_rows != global_rows:
+            qdata_local = qdata_local.narrow(0, row_offset, local_rows)
+            scale_local = scale_local.narrow(0, row_offset, local_rows)
+        if col_offset != 0 or local_cols != global_cols:
+            qdata_local = qdata_local.narrow(1, col_offset, local_cols)
+
+        return cls._finalize_projected_shard(
+            (qdata_local, scale_local, act_per_tensor_scale),
+            state.meta,
+            local_shape,
+        )
 
     @staticmethod
     def dequantize(t: torch.Tensor) -> torch.Tensor:

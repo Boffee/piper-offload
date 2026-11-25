@@ -21,6 +21,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from ._dtensor import local_shard
 from ._parameter_update import ParameterUpdatePlan, merge_target_id, plan_merge_targets
 from .adapter import Adapter, AdapterTargetUpdates, active_adapter_pairs, group_adapter_updates
 from .host_module import install_parameters
@@ -61,12 +62,13 @@ class _MergeOp:
                 f"found trainable parameter(s): {', '.join(repr(name) for name in trainable_aliases)}."
             )
         if self.plan.update is not None:
-            adapter = (
-                self.plan.source.adapter
-                if self.plan.source is not None
-                else select_adapter(param_representation(self.param))
-            )
-            _validate_permanent_update(adapter)
+            if self.plan.source is not None:
+                _validate_permanent_update(self.plan.source.adapter)
+            else:
+                representation = param_representation(self.param)
+                _validate_permanent_update(select_adapter(representation))
+                if (inner := local_shard(representation)) is not representation:
+                    _validate_permanent_update(select_adapter(inner))
         self.plan.validate_parameter(self.param)
 
         return self.plan.source.clone_cpu_param() if self.plan.source is not None else _writable_parameter(self.param)
