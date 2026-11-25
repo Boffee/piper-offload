@@ -37,7 +37,7 @@ from ._torchao_float8 import (
     validate_layout,
 )
 from .tensor_adapters import metadata_key
-from .torchao_structured_adapter import TorchaoStructuredAdapter
+from .torchao_structured_adapter import TorchaoHost, TorchaoStructuredAdapter
 
 try:
     from . import _triton_float8_lora
@@ -147,6 +147,100 @@ def _torch_merge_float8_lora_(
     target_f8.scale.copy_(source_f8.scale)
 
 
+def _validate_float8_shard_geometry(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    global_shape: tuple[int, ...],
+    block_size: tuple[int, ...],
+    offsets: tuple[int, ...],
+    local_shape: tuple[int, ...],
+) -> None:
+    ndim = len(global_shape)
+    if (
+        len(offsets) != ndim
+        or len(local_shape) != ndim
+        or len(block_size) != ndim
+    ):
+        raise ValueError(
+            "Float8 shard projection dimensions must match weight rank: "
+            f"global_shape={global_shape}, block_size={block_size}, "
+            f"offsets={offsets}, local_shape={local_shape}."
+        )
+    if any(size <= 0 for size in local_shape):
+        raise ValueError(
+            "Float8 DTensor shard projection requires non-empty local "
+            f"shards; got local_shape={local_shape}."
+        )
+    if any(
+        offset < 0 or offset + size > global_size
+        for offset, size, global_size in zip(
+            offsets, local_shape, global_shape, strict=True
+        )
+    ):
+        raise ValueError(
+            "Float8 shard projection range exceeds global weight shape: "
+            f"global_shape={global_shape}, offsets={offsets}, local_shape={local_shape}."
+        )
+    if (
+        not qdata.is_contiguous()
+        or not scale.is_contiguous()
+        or tuple(qdata.shape) != global_shape
+    ):
+        raise ValueError(
+            "Float8 DTensor shard projection requires contiguous, "
+            "untransposed qdata and scale storage matching global_shape; "
+            f"got qdata={tuple(qdata.shape)} (contiguous={qdata.is_contiguous()}), "
+            f"scale={tuple(scale.shape)} (contiguous={scale.is_contiguous()})."
+        )
+    if any(
+        block <= 0 or global_size % block != 0
+        for global_size, block in zip(global_shape, block_size, strict=True)
+    ):
+        raise ValueError(
+            f"Float8 block_size {block_size} does not divide global_shape {global_shape}."
+        )
+
+
+def _project_float8_scale(
+    scale: torch.Tensor,
+    *,
+    global_shape: tuple[int, ...],
+    block_size: tuple[int, ...],
+    offsets: tuple[int, ...],
+    local_shape: tuple[int, ...],
+) -> tuple[torch.Tensor, tuple[int, ...]]:
+    if block_size == global_shape and scale.numel() == 1:
+        return scale, local_shape
+
+    expected_scale_shape = tuple(
+        global_size // block
+        for global_size, block in zip(global_shape, block_size, strict=True)
+    )
+    if tuple(scale.shape) != expected_scale_shape:
+        raise ValueError(
+            "Float8 scale shape does not match block grid: "
+            f"expected {expected_scale_shape}, got {tuple(scale.shape)}."
+        )
+    scale_local = scale
+    block_dims = list(block_size)
+    for dim, (offset, size, global_size, block) in enumerate(
+        zip(offsets, local_shape, global_shape, block_size, strict=True)
+    ):
+        if offset == 0 and size == global_size:
+            continue
+        if block == global_size:
+            block_dims[dim] = size
+            continue
+        if offset % block != 0 or size % block != 0:
+            raise ValueError(
+                f"Float8 shard along dim {dim} (offset={offset}, size={size}) "
+                f"must align to quantization block_size {block}."
+            )
+        scale_local = scale_local.narrow(dim, offset // block, size // block)
+    return scale_local, tuple(block_dims)
+
+
 @dataclass(slots=True, frozen=True)
 class _Float8Meta:
     """Reconstruction metadata snapshot for a TorchAO scaled-fp8 tensor."""
@@ -231,6 +325,55 @@ class Float8Adapter(TorchaoStructuredAdapter[_Float8Meta]):
     @staticmethod
     def _compute_dtype(t: Any) -> torch.dtype:  # noqa: ANN401
         return t.dtype
+
+    @classmethod
+    def project_shard(
+        cls,
+        state: TorchaoHost[_Float8Meta],
+        *,
+        offsets: tuple[int, ...],
+        local_shape: tuple[int, ...],
+    ) -> tuple[TorchaoHost[_Float8Meta], tuple[object, ...]]:
+        """Project a zero-copy host shard for ``Float8Tensor`` weights."""
+        qdata, scale = state.storage
+        assert qdata is not None
+        assert scale is not None
+        global_shape = state.logical_shape
+        block_size = state.meta.block_size
+        _validate_float8_shard_geometry(
+            qdata,
+            scale,
+            global_shape=global_shape,
+            block_size=block_size,
+            offsets=offsets,
+            local_shape=local_shape,
+        )
+
+        qdata_local = qdata
+        for dim, (offset, size) in enumerate(zip(offsets, local_shape, strict=True)):
+            if offset != 0 or size != qdata_local.shape[dim]:
+                qdata_local = qdata_local.narrow(dim, offset, size)
+
+        scale_local, new_block_size = _project_float8_scale(
+            scale,
+            global_shape=global_shape,
+            block_size=block_size,
+            offsets=offsets,
+            local_shape=local_shape,
+        )
+
+        meta = _Float8Meta(
+            block_size=new_block_size,
+            mm_config=state.meta.mm_config,
+            act_quant_kwargs=state.meta.act_quant_kwargs,
+            kernel_preference=state.meta.kernel_preference,
+            dtype=state.meta.dtype,
+        )
+        return cls._finalize_projected_shard(
+            (qdata_local, scale_local),
+            meta,
+            local_shape,
+        )
 
     # --- capabilities beyond inference movement ---------------------------
 

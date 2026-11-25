@@ -107,14 +107,11 @@ class _TargetPool:
         free = self._free.get(signature)
         if free:
             return free.pop()
-        # The prefetch worker refills pooled targets outside the caller's
-        # inference mode, which cannot update inference tensors in place.
-        with torch.inference_mode(False):
-            return CudaTargetLease.allocate(
-                plan,
-                self._device,
-                allocation_stream=stream,
-            )
+        return CudaTargetLease.allocate(
+            plan,
+            self._device,
+            allocation_stream=stream,
+        )
 
     def release(
         self,

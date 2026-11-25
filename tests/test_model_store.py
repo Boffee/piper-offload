@@ -1874,6 +1874,114 @@ def _build_valid_tied_shell(mesh: Any) -> nn.Module:
     return m
 
 
+def _assert_2d_quantized_cuda_staging(
+    *,
+    f8_hp: Any,
+    cr_hp: Any,
+    resting_sigs: tuple[tuple[Any, ...], tuple[Any, ...]],
+    f8_global: Any,
+    cr_global: Any,
+    offsets: tuple[int, ...],
+    local_shape: tuple[int, ...],
+    cuda_lock: threading.Lock,
+) -> None:
+    cuda_dev = torch.device("cuda:0")
+    with cuda_lock:
+        f8_gpu_state = cast(Any, f8_hp.allocate_gpu_storage(cuda_dev))
+        cr_gpu_state = cast(Any, cr_hp.allocate_gpu_storage(cuda_dev))
+        f8_hp.copy_to_gpu(f8_gpu_state, non_blocking=False)
+        cr_hp.copy_to_gpu(cr_gpu_state, non_blocking=False)
+        f8_host_state = cast(Any, f8_hp.host_state)
+        cr_host_state = cast(Any, cr_hp.host_state)
+        f8_local = cast(Any, f8_host_state.inner.gpu_param(f8_host_state.inner_state, f8_gpu_state.inner_gpu).data)
+        cr_local = cast(Any, cr_host_state.inner.gpu_param(cr_host_state.inner_state, cr_gpu_state.inner_gpu).data)
+        assert f8_host_state.inner.layout_signature(f8_local) == resting_sigs[0][1]
+        assert cr_host_state.inner.layout_signature(cr_local) == resting_sigs[1][1]
+        assert f8_local.qdata.is_cuda and f8_local.qdata.is_contiguous() and f8_local.scale.is_contiguous()
+        assert cr_local.qdata.is_cuda and cr_local.qdata.is_contiguous() and cr_local.scale.is_contiguous()
+        f8_ref = f8_global.dequantize().narrow(0, offsets[0], local_shape[0]).narrow(1, offsets[1], local_shape[1])
+        cr_ref = cr_global.dequantize().narrow(0, offsets[0], local_shape[0]).narrow(1, offsets[1], local_shape[1])
+        torch.testing.assert_close(f8_local.dequantize().cpu(), f8_ref, rtol=0, atol=0)
+        torch.testing.assert_close(cr_local.dequantize().cpu(), cr_ref, rtol=0, atol=0)
+
+
+def _assert_2d_quantized_rank(
+    *,
+    store: ModelStore,
+    f8_global: Any,
+    cr_global: Any,
+    f8_ptrs: tuple[int, ...],
+    cr_ptrs: tuple[int, ...],
+    delta: Adapter,
+    cuda_lock: threading.Lock,
+) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    from piper_offload import merge_adapter, requires_activation
+    from piper_offload.dtensor_adapter import DTensorAdapter, _local_shape_and_offsets
+    from piper_offload.host_param import HostParam
+
+    mesh = DeviceMesh("cpu", [[0, 1], [2, 3]])
+    coord = tuple(mesh.get_coordinate() or ())
+    placements = (Shard(0), Shard(1))
+    local_shape, offsets = _local_shape_and_offsets((16, 64), tuple(mesh.shape), coord, placements)
+
+    shell = nn.Module()
+    for name in ("f8", "cr"):
+        meta_dt = DTensor.from_local(
+            torch.empty(local_shape, dtype=torch.float32, device="meta"),
+            mesh,
+            list(placements),
+            shape=(16, 64),
+            stride=(64, 1),
+            run_check=False,
+        )
+        shell.register_parameter(name, nn.Parameter(meta_dt, requires_grad=False))
+
+    offloader = store.bind(shell)
+    try:
+        f8_param = cast(DTensor, shell.get_parameter("f8").data)
+        cr_param = cast(DTensor, shell.get_parameter("cr").data)
+        assert requires_activation(f8_param) and requires_activation(cr_param)
+        with pytest.raises(RuntimeError, match="requires CUDA activation"):
+            f8_param.to_local().clone()
+        with pytest.raises(ValueError, match="Permanent updates to projected quantized shards are unsupported"):
+            merge_adapter(shell, [(delta, 0.5)])
+        with pytest.raises(ValueError, match="cannot be captured directly"):
+            HostParam(shell.get_parameter("f8"))
+        f8_hp = host_component(offloader)._instance.params["f8"]
+        cr_hp = host_component(offloader)._instance.params["cr"]
+        assert tuple(t.untyped_storage().data_ptr() for t in f8_hp.storage_tensors()) == f8_ptrs
+        assert tuple(t.untyped_storage().data_ptr() for t in cr_hp.storage_tensors()) == cr_ptrs
+        assert f8_hp.cache_bytes == store._module_store.params["f8"].cache_bytes // 4
+        assert cr_hp.cache_bytes == (8 * 32) + (8 * 4)
+
+        resting_sigs = (
+            DTensorAdapter.layout_signature(f8_param),
+            DTensorAdapter.layout_signature(cr_param),
+        )
+        with activated_model(offloader, "cpu") as active_cpu:
+            assert requires_activation(cast(DTensor, active_cpu.get_parameter("f8").data))
+            active_cr_sig = DTensorAdapter.layout_signature(cast(DTensor, active_cpu.get_parameter("cr").data))
+            assert active_cr_sig == resting_sigs[1]
+
+        if torch.cuda.is_available():
+            _assert_2d_quantized_cuda_staging(
+                f8_hp=f8_hp,
+                cr_hp=cr_hp,
+                resting_sigs=resting_sigs,
+                f8_global=f8_global,
+                cr_global=cr_global,
+                offsets=offsets,
+                local_shape=local_shape,
+                cuda_lock=cuda_lock,
+            )
+        return offloader.cache_bytes, local_shape, offsets
+    finally:
+        offloader.deactivate()
+
+
 class TestModelStoreDTensorProjection:
     def test_bind_projects_parallelize_module_meta_shells_and_shares_mmap(
         self, tmp_path: Path,
@@ -2161,17 +2269,24 @@ class TestModelStoreDTensorProjection:
         with ParallelExecutor(["cpu", "cpu"]) as ex:
             ex.run(verify)
 
-    def test_bind_dtensor_quantized_replicate_accepted_and_shard_rejected(self) -> None:
+    def test_bind_dtensor_quantized_replicate_and_shard_projection(self) -> None:
         if not DTENSOR_AVAILABLE:
             pytest.skip("DTensor required")
         torchao_quant = pytest.importorskip("torchao.quantization")
-        from torch.distributed.tensor import Replicate, Shard, init_device_mesh
+        from torch.distributed.tensor import DTensor, Replicate, Shard, init_device_mesh
 
+        from piper_offload import requires_activation
         from piper_offload.parallel import ParallelExecutor
 
         q_mod = nn.Linear(16, 16, bias=False, dtype=torch.bfloat16).eval().requires_grad_(False)
         torchao_quant.quantize_(q_mod, torchao_quant.Float8WeightOnlyConfig())
         q_store = ModelStore.from_module(q_mod)
+        q_host = q_store._module_store.params["weight"].storage_tensors()
+        q_ptrs = tuple(t.untyped_storage().data_ptr() for t in q_host)
+
+        int8_mod = nn.Linear(16, 16, bias=False, dtype=torch.bfloat16).eval().requires_grad_(False)
+        torchao_quant.quantize_(int8_mod, torchao_quant.Int8WeightOnlyConfig())
+        int8_store = ModelStore.from_module(int8_mod)
 
         def verify(_rank: int) -> None:
             mesh = init_device_mesh("cpu", (2,))
@@ -2179,14 +2294,31 @@ class TestModelStoreDTensorProjection:
             rep_shell.weight = _make_meta_dtensor_param(mesh, [Replicate()], global_shape=(16, 16))
             rep_offloader = q_store.bind(rep_shell)
             assert rep_offloader.model.weight.placements == (Replicate(),)
+            assert not requires_activation(rep_offloader.model.weight)
             rep_offloader.deactivate()
 
-            shard_shell = nn.Linear(16, 16, bias=False, device="meta")
-            shard_shell.weight = _make_meta_dtensor_param(mesh, [Shard(0)], global_shape=(16, 16), local_shape=(8, 16))
-            snap = _snapshot_tensors(shard_shell)
+            s0_shell = nn.Linear(16, 16, bias=False, device="meta")
+            s0_shell.weight = _make_meta_dtensor_param(mesh, [Shard(0)], global_shape=(16, 16), local_shape=(8, 16))
+            s0_offloader = q_store.bind(s0_shell)
+            assert s0_offloader.model.weight.placements == (Shard(0),)
+            assert not requires_activation(s0_offloader.model.weight)
+            s0_local = s0_offloader.model.weight.to_local()
+            assert (s0_local.qdata.untyped_storage().data_ptr(), s0_local.scale.untyped_storage().data_ptr()) == q_ptrs
+            s0_offloader.deactivate()
+
+            s1_shell = nn.Linear(16, 16, bias=False, device="meta")
+            s1_shell.weight = _make_meta_dtensor_param(mesh, [Shard(1)], global_shape=(16, 16), local_shape=(16, 8))
+            s1_offloader = q_store.bind(s1_shell)
+            assert isinstance(s1_offloader.model.weight.data, DTensor)
+            assert requires_activation(s1_offloader.model.weight)
+            s1_offloader.deactivate()
+
+            int8_shell = nn.Linear(16, 16, bias=False, device="meta")
+            int8_shell.weight = _make_meta_dtensor_param(mesh, [Shard(0)], global_shape=(16, 16), local_shape=(8, 16))
+            snap = _snapshot_tensors(int8_shell)
             with pytest.raises(ValueError, match="layout mismatch"):
-                q_store.bind(shard_shell)
-            _assert_unmutated(shard_shell, snap)
+                int8_store.bind(int8_shell)
+            _assert_unmutated(int8_shell, snap)
 
         with ParallelExecutor(["cpu", "cpu"]) as ex:
             ex.run(verify)
@@ -2248,6 +2380,51 @@ class TestModelStoreDTensorProjection:
 
         with ParallelExecutor(["cpu", "cpu"]) as ex:
             ex.run(verify)
+
+    def test_bind_dtensor_quantized_2d_mesh_zero_copy_and_per_rank_bytes(self) -> None:
+        if not DTENSOR_AVAILABLE:
+            pytest.skip("DTensor required")
+        pytest.importorskip("torchao.quantization")
+        convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
+        from torchao.quantization.granularity import PerGroup
+        from torchao.quantization.quantize_.workflows.float8.float8_tensor import Float8Tensor
+
+        from piper_offload import ParameterDelta
+        from piper_offload.parallel import ParallelExecutor
+
+        torch.manual_seed(11)
+        f8_global = Float8Tensor.from_hp(torch.randn(16, 64, dtype=torch.bfloat16), granularity=PerGroup(16))
+        cr_global = convrot_mod.ConvRotInt8Tensor.from_hp(torch.randn(16, 64, dtype=torch.bfloat16), group_size=16)
+
+        proto = nn.Module()
+        proto.f8 = nn.Parameter(f8_global, requires_grad=False)
+        proto.cr = nn.Parameter(cr_global, requires_grad=False)
+        proto.requires_grad_(False)
+        store = ModelStore.from_module(proto)
+        f8_ptrs = tuple(t.untyped_storage().data_ptr() for t in store._module_store.params["f8"].storage_tensors())
+        cr_ptrs = tuple(t.untyped_storage().data_ptr() for t in store._module_store.params["cr"].storage_tensors())
+        cuda_lock = threading.Lock()
+        delta = Adapter(
+            {
+                "f8": ParameterDelta.from_tensors(dense=torch.randn(16, 64, dtype=torch.bfloat16) * 0.05),
+                "cr": ParameterDelta.from_tensors(dense=torch.randn(16, 64, dtype=torch.bfloat16) * 0.05),
+            }
+        )
+
+        with ParallelExecutor(["cpu"] * 4) as ex:
+            results = ex.run(
+                lambda _rank: _assert_2d_quantized_rank(
+                    store=store,
+                    f8_global=f8_global,
+                    cr_global=cr_global,
+                    f8_ptrs=f8_ptrs,
+                    cr_ptrs=cr_ptrs,
+                    delta=delta,
+                    cuda_lock=cuda_lock,
+                )
+            )
+        assert all(bytes_count < store.cache_bytes for bytes_count, _, _ in results)
+        assert {offsets for _, _, offsets in results} == {(0, 0), (0, 32), (8, 0), (8, 32)}
 
     def test_bind_dtensor_preflight_atomic_on_unwrappable_quant_replicate_and_cpu_mesh_post_close(self) -> None:
         if not DTENSOR_AVAILABLE:

@@ -4,7 +4,6 @@ Supports whole-model host bulk offload or block streaming, with optional
 per-parameter adapter application.
 """
 
-import contextlib
 import threading
 import weakref
 from collections.abc import Callable, Sequence
@@ -280,14 +279,10 @@ class ModelOffloader:
         component_refs = tuple(weakref.ref(component) for component in components)
 
         def reacquire() -> None:
-            # A model hook inherits the caller's inference-mode context.
-            # Reusable targets must remain mutable because later prefetch
-            # threads refill them outside that context.
-            with torch.inference_mode(False):
-                for component_ref in component_refs:
-                    component = component_ref()
-                    if component is not None:
-                        component.acquire()
+            for component_ref in component_refs:
+                component = component_ref()
+                if component is not None:
+                    component.acquire()
 
         def reacquire_before_forward(
             _module: nn.Module,
@@ -456,15 +451,11 @@ class ModelOffloader:
             schedule_transient = active_device.type == "cuda" and (
                 bool(self._composite.transient) or bool(self._composite.transient_blocks)
             )
-            activation_context = torch.inference_mode(False) if schedule_transient else contextlib.nullcontext()
-            # Reusable transient targets must be mutable even if the caller
-            # activates the offloader from inside inference mode.
-            with activation_context:
-                self._composite.activate(
-                    active_device,
-                    compile_blocks=not (updates and adapter_mode == "routed"),
-                    parameter_overrides=parameter_overrides,
-                )
+            self._composite.activate(
+                active_device,
+                compile_blocks=not (updates and adapter_mode == "routed"),
+                parameter_overrides=parameter_overrides,
+            )
             if schedule_transient:
                 self._install_transient_hooks()
         except BaseException:

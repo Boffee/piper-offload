@@ -16,7 +16,7 @@ import time
 import weakref
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -36,12 +36,15 @@ from piper_offload import (
     ModelStore,
     ModelStoreSpec,
     OffloadConfig,
+    ParameterDelta,
     checkpoint as checkpoint_mod,
+    requires_activation,
     _parallel_collectives,
     _sequential_runtime,
     _transfer_priority,
     parallel as parallel_mod,
 )
+from piper_offload._dtensor import local_shard
 from piper_offload._mapped_file import MappedFile
 from piper_offload.parallel import ParallelExecutor
 from piper_offload.pin_manager import host_pin_manager
@@ -2561,3 +2564,533 @@ def test_cuda_parallel_executor_scopes_foreground_producer_to_its_devices() -> N
     assert not _transfer_priority.should_yield(dev0)
     assert not _transfer_priority.should_yield(dev1)
     assert _transfer_priority._foreground.device_producers == {}
+
+
+class _QuantTPBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        *,
+        bias: bool = True,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim * 2, bias=bias, device=device, dtype=dtype)
+        # PyTorch DTensor's linear decomposition lacks Partial + Replicate for RowwiseParallel bias=True.
+        self.fc2 = nn.Linear(dim * 2, dim, bias=False, device=device, dtype=dtype)
+        self.norm = nn.LayerNorm(dim, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.fc2(torch.relu(self.fc1(x)))) + x
+
+
+class _QuantTPModel(nn.Module):
+    def __init__(
+        self,
+        dim: int = 128,
+        num_blocks: int = 2,
+        *,
+        bias: bool = True,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [_QuantTPBlock(dim, bias=bias, device=device, dtype=dtype) for _ in range(num_blocks)]
+        )
+        self.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
+def _build_convrot_tp_reference(
+    dim: int,
+    *,
+    use_static_act_scale: bool,
+    lora_state: dict[str, torch.Tensor],
+    lora_strength: float,
+    x: torch.Tensor,
+) -> tuple[_QuantTPModel, torch.Tensor, torch.Tensor]:
+    convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
+    convrot_cls = convrot_mod.ConvRotInt8Tensor
+
+    ref = _QuantTPModel(dim=dim, num_blocks=2, bias=True, device="cpu", dtype=torch.bfloat16)
+    for block in ref.blocks:
+        act1 = torch.tensor(3.0, dtype=torch.float32) if use_static_act_scale else None
+        act2 = torch.tensor(3.0, dtype=torch.float32) if use_static_act_scale else None
+        block.fc1.weight = nn.Parameter(
+            convrot_cls.from_hp(block.fc1.weight.data, group_size=64, act_per_tensor_scale=act1),
+            requires_grad=False,
+        )
+        block.fc2.weight = nn.Parameter(
+            convrot_cls.from_hp(block.fc2.weight.data, group_size=64, act_per_tensor_scale=act2),
+            requires_grad=False,
+        )
+
+    with torch.inference_mode():
+        expected = copy.deepcopy(ref).to("cuda:0")(x.to("cuda:0")).cpu()
+
+    merged_ref = copy.deepcopy(ref).to("cuda:0")
+    merged_ref.blocks[0].fc1.weight.addmm_(
+        lora_state["blocks.0.fc1.lora_B.weight"].to("cuda:0"),
+        lora_state["blocks.0.fc1.lora_A.weight"].to("cuda:0"),
+        alpha=lora_strength,
+    )
+    merged_ref.blocks[1].fc2.weight.addmm_(
+        lora_state["blocks.1.fc2.lora_B.weight"].to("cuda:0"),
+        lora_state["blocks.1.fc2.lora_A.weight"].to("cuda:0"),
+        alpha=lora_strength,
+    )
+    with torch.inference_mode():
+        expected_merged = merged_ref(x.to("cuda:0")).cpu()
+    del merged_ref
+    return ref, expected, expected_merged
+
+
+def _assert_convrot_tp_rank_contract(
+    rank: int,
+    *,
+    store: ModelStore,
+    shell: nn.Module,
+    off: ModelOffloader,
+    fc1_ptrs: tuple[int, ...],
+    fc2_qdata_nbytes: int,
+    lora: Adapter,
+    strength: float,
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert not requires_activation(shell.blocks[0].fc1.weight)
+    assert requires_activation(shell.blocks[0].fc2.weight)
+    assert off.cache_bytes < store.cache_bytes
+    s0_local = shell.blocks[0].fc1.weight.to_local()
+    assert (
+        s0_local.qdata.untyped_storage().data_ptr(),
+        s0_local.scale.untyped_storage().data_ptr(),
+    ) == fc1_ptrs[:2]
+
+    dev = torch.device(f"cuda:{rank}")
+    x_local = x.chunk(2, dim=1)[rank].to(dev)
+    with activated_model(off, dev) as model:
+        fc2_local = local_shard(model.blocks[0].fc2.weight)
+        assert fc2_local.qdata.is_cuda and fc2_local.qdata.is_contiguous()
+        assert fc2_local.qdata.untyped_storage().nbytes() == fc2_qdata_nbytes // 2
+        with torch.inference_mode():
+            y_base = model(x_local).cpu()
+
+    with activated_model(
+        off,
+        dev,
+        adapters=[lora],
+        adapter_strengths=[strength],
+        adapter_mode="merge",
+    ) as model, torch.inference_mode():
+        y_merged = model(x_local).cpu()
+
+    return y_base, y_merged
+
+
+@TWO_GPUS
+@pytest.mark.parametrize("use_static_act_scale", [False, True], ids=["dynamic", "static_act"])
+def test_two_gpu_model_store_bind_tp_convrot_int8_streaming_and_lora_merge(
+    use_static_act_scale: bool,
+) -> None:
+    host_pin_manager.clear()
+    torch.manual_seed(41 + int(use_static_act_scale))
+    dim = 128
+    lora_rank = 4
+    x = torch.randn(2, 4, dim, dtype=torch.bfloat16)
+    lora_state = {
+        "blocks.0.fc1.lora_A.weight": torch.randn(lora_rank, dim, dtype=torch.bfloat16) * 0.05,
+        "blocks.0.fc1.lora_B.weight": torch.randn(dim * 2, lora_rank, dtype=torch.bfloat16) * 0.05,
+        "blocks.1.fc2.lora_A.weight": torch.randn(lora_rank, dim * 2, dtype=torch.bfloat16) * 0.05,
+        "blocks.1.fc2.lora_B.weight": torch.randn(dim, lora_rank, dtype=torch.bfloat16) * 0.05,
+    }
+    lora = Adapter.from_state_dict(lora_state)
+    strength = 0.5
+    ref, expected, expected_merged = _build_convrot_tp_reference(
+        dim,
+        use_static_act_scale=use_static_act_scale,
+        lora_state=lora_state,
+        lora_strength=strength,
+        x=x,
+    )
+
+    store = ModelStore.from_module(ref)
+    cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+    transport = "p2p" if _HAS_TWO_GPU_P2P else "host_staged"
+    fc1_ptrs = tuple(
+        t.untyped_storage().data_ptr()
+        for t in store._module_store.params["blocks.0.fc1.weight"].storage_tensors()
+    )
+    fc2_tensors = store._module_store.params["blocks.0.fc2.weight"].storage_tensors()
+    fc2_qdata_nbytes = fc2_tensors[0].untyped_storage().nbytes()
+    fc2_ptr = fc2_tensors[0].untyped_storage().data_ptr()
+    offloaders: list[ModelOffloader | None] = [None, None]
+
+    def run_rank(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+        mesh = init_device_mesh("cuda", (2,))
+        with torch.device("meta"):
+            shell = _QuantTPModel(dim=dim, num_blocks=2, bias=True, device="meta", dtype=torch.float32)
+        _parallelize_two_gpu_tp(shell, mesh)
+        off = store.bind(shell, cfg)
+        offloaders[rank] = off
+        return _assert_convrot_tp_rank_contract(
+            rank,
+            store=store,
+            shell=shell,
+            off=off,
+            fc1_ptrs=fc1_ptrs,
+            fc2_qdata_nbytes=fc2_qdata_nbytes,
+            lora=lora,
+            strength=strength,
+            x=x,
+        )
+
+    try:
+        with ParallelExecutor(["cuda:0", "cuda:1"], transport=transport, staging_bytes=64 * 1024) as ex:
+            outs = ex.run(run_rank)
+            # Dynamic activation quantizes half-width inputs independently per rank on RowwiseParallel.
+            tol = 4e-2 if use_static_act_scale else 8e-2
+            for rank in range(2):
+                torch.testing.assert_close(outs[rank][0], expected.chunk(2, dim=1)[rank], rtol=tol, atol=tol)
+                torch.testing.assert_close(outs[rank][1], expected_merged.chunk(2, dim=1)[rank], rtol=tol, atol=tol)
+
+            ex.run(lambda r: cast(ModelOffloader, offloaders[r]).activate(f"cuda:{r}"))
+            assert host_pin_manager._registrations[fc1_ptrs[0]].leases >= 2
+            assert host_pin_manager._registrations[fc2_ptr].leases >= 2
+            for off in offloaders:
+                assert off is not None
+                off.deactivate()
+            offloaders.clear()
+    finally:
+        for off in offloaders:
+            if off is not None and off.active_device is not None:
+                off.deactivate()
+        offloaders.clear()
+        host_pin_manager.clear()
+
+
+def _build_float8_tp_reference(
+    dim: int,
+    *,
+    granularity_name: str,
+    lora_state: dict[str, torch.Tensor],
+    x: torch.Tensor,
+) -> tuple[_QuantTPModel, torch.Tensor, torch.Tensor]:
+    from torchao.quantization.granularity import PerGroup, PerRow, PerTensor
+    from torchao.quantization.quantize_.workflows.float8.float8_tensor import Float8Tensor
+
+    gran_map = {
+        "per_row": PerRow(),
+        "per_tensor": PerTensor(),
+        "per_group": PerGroup(32),
+    }
+    granularity = gran_map[granularity_name]
+    # Float8Tensor lacks aten.addmm in TorchAO, so test bias=False linear layers.
+    ref = _QuantTPModel(dim=dim, num_blocks=2, bias=False, device="cpu", dtype=torch.bfloat16)
+    for block in ref.blocks:
+        block.fc1.weight = nn.Parameter(
+            Float8Tensor.from_hp(block.fc1.weight.data, granularity=granularity),
+            requires_grad=False,
+        )
+        block.fc2.weight = nn.Parameter(
+            Float8Tensor.from_hp(block.fc2.weight.data, granularity=granularity),
+            requires_grad=False,
+        )
+
+    merged_ref = copy.deepcopy(ref)
+    for prefix, weight_mod in (("blocks.0.fc1", merged_ref.blocks[0].fc1), ("blocks.1.fc2", merged_ref.blocks[1].fc2)):
+        delta = lora_state[f"{prefix}.lora_B.weight"] @ lora_state[f"{prefix}.lora_A.weight"]
+        weight_mod.weight = nn.Parameter(
+            Float8Tensor.from_hp(weight_mod.weight.dequantize() + 0.5 * delta, granularity=granularity),
+            requires_grad=False,
+        )
+    with torch.inference_mode():
+        expected = copy.deepcopy(ref).to("cuda:0")(x.to("cuda:0")).cpu()
+        expected_merged = merged_ref.to("cuda:0")(x.to("cuda:0")).cpu()
+    del merged_ref
+    return ref, expected, expected_merged
+
+
+@TWO_GPUS
+@pytest.mark.parametrize("granularity_name", ["per_row", "per_tensor", "per_group"])
+def test_two_gpu_model_store_bind_tp_float8(granularity_name: str) -> None:
+    pytest.importorskip("torchao.quantization")
+    host_pin_manager.clear()
+    torch.manual_seed(53)
+    dim = 128
+    lora_rank = 4
+    x = torch.randn(2, 4, dim, dtype=torch.bfloat16)
+    lora_state = {
+        "blocks.0.fc1.lora_A.weight": torch.randn(lora_rank, dim, dtype=torch.bfloat16) * 0.05,
+        "blocks.0.fc1.lora_B.weight": torch.randn(dim * 2, lora_rank, dtype=torch.bfloat16) * 0.05,
+        "blocks.1.fc2.lora_A.weight": torch.randn(lora_rank, dim * 2, dtype=torch.bfloat16) * 0.05,
+        "blocks.1.fc2.lora_B.weight": torch.randn(dim, lora_rank, dtype=torch.bfloat16) * 0.05,
+    }
+    lora = Adapter.from_state_dict(lora_state)
+    ref, expected, expected_merged = _build_float8_tp_reference(
+        dim, granularity_name=granularity_name, lora_state=lora_state, x=x,
+    )
+
+    store = ModelStore.from_module(ref)
+    cfg = OffloadConfig(block_paths=("blocks",), block_mode="streaming")
+    transport = "p2p" if _HAS_TWO_GPU_P2P else "host_staged"
+    fc2_qdata_ptr = store._module_store.params["blocks.0.fc2.weight"].storage_tensors()[0].untyped_storage().data_ptr()
+    offloaders: list[ModelOffloader | None] = [None, None]
+    try:
+        with ParallelExecutor(["cuda:0", "cuda:1"], transport=transport, staging_bytes=64 * 1024) as ex:
+            def run_rank(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+                dev = torch.device(f"cuda:{rank}")
+                mesh = init_device_mesh("cuda", (2,))
+                with torch.device("meta"):
+                    shell = _QuantTPModel(dim=dim, num_blocks=2, bias=False, device="meta", dtype=torch.float32)
+                _parallelize_two_gpu_tp(shell, mesh)
+                off = store.bind(shell, cfg)
+                offloaders[rank] = off
+                assert requires_activation(shell.blocks[0].fc2.weight)
+                x_local = x.chunk(2, dim=1)[rank].to(dev)
+                with activated_model(off, dev) as model:
+                    fc2_local = local_shard(model.blocks[0].fc2.weight)
+                    assert fc2_local.qdata.is_cuda and fc2_local.qdata.is_contiguous()
+                    with torch.inference_mode():
+                        y_base = model(x_local).cpu()
+                with activated_model(
+                    off,
+                    dev,
+                    adapters=[lora],
+                    adapter_strengths=[0.5],
+                    adapter_mode="merge",
+                    stochastic_rounding=False,
+                ) as model, torch.inference_mode():
+                    y_merged = model(x_local).cpu()
+                return y_base, y_merged
+
+            outs = ex.run(run_rank)
+            # PerGroup scales align to shard boundaries; per_row/per_tensor recompute local scales.
+            merge_tol = 4e-2 if granularity_name == "per_group" else 2e-1
+            for rank in range(2):
+                torch.testing.assert_close(outs[rank][0], expected.chunk(2, dim=1)[rank], rtol=3e-2, atol=3e-2)
+                torch.testing.assert_close(
+                    outs[rank][1], expected_merged.chunk(2, dim=1)[rank], rtol=merge_tol, atol=merge_tol,
+                )
+
+            ex.run(lambda r: cast(ModelOffloader, offloaders[r]).activate(f"cuda:{r}"))
+            assert host_pin_manager._registrations[fc2_qdata_ptr].leases >= 2
+            for off in offloaders:
+                assert off is not None
+                off.deactivate()
+            offloaders.clear()
+    finally:
+        for off in offloaders:
+            if off is not None and off.active_device is not None:
+                off.deactivate()
+        offloaders.clear()
+        host_pin_manager.clear()
+
+
+def _build_quant_tp_dense_and_resident_stores(
+    dim: int,
+    *,
+    x: torch.Tensor,
+    dense_fc1: torch.Tensor,
+    dense_fc2: torch.Tensor,
+    lora_state: dict[str, torch.Tensor],
+) -> tuple[ModelStore, ModelStore, ModelStore, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+    from torchao.quantization.granularity import PerGroup, PerRow
+    from torchao.quantization.quantize_.workflows.float8.float8_tensor import Float8Tensor
+
+    cr_ref = _QuantTPModel(dim=dim, num_blocks=2, bias=False, device="cpu", dtype=torch.bfloat16)
+    for block in cr_ref.blocks:
+        block.fc1.weight = nn.Parameter(
+            ConvRotInt8Tensor.from_hp(block.fc1.weight.data, group_size=64, act_per_tensor_scale=None),
+            requires_grad=False,
+        )
+        block.fc2.weight = nn.Parameter(
+            ConvRotInt8Tensor.from_hp(block.fc2.weight.data, group_size=64, act_per_tensor_scale=None),
+            requires_grad=False,
+        )
+    cr_merged = copy.deepcopy(cr_ref).to("cuda:0")
+    cr_merged.blocks[0].fc1.weight.add_(dense_fc1.to("cuda:0"), alpha=0.5)
+    cr_merged.blocks[0].fc2.weight.add_(dense_fc2.to("cuda:0"), alpha=0.5)
+    with torch.inference_mode():
+        expected_cr_dense = cr_merged(x.to("cuda:0")).cpu()
+    del cr_merged
+    cr_store = ModelStore.from_module(cr_ref)
+
+    f8_ref = _QuantTPModel(dim=dim, num_blocks=2, bias=False, device="cpu", dtype=torch.bfloat16)
+    f8_res_ref = _QuantTPModel(dim=dim, num_blocks=2, bias=False, device="cpu", dtype=torch.bfloat16)
+    for b_grp, b_row in zip(f8_ref.blocks, f8_res_ref.blocks, strict=True):
+        b_grp.fc1.weight = nn.Parameter(
+            Float8Tensor.from_hp(b_grp.fc1.weight.data, granularity=PerGroup(32)),
+            requires_grad=False,
+        )
+        b_grp.fc2.weight = nn.Parameter(
+            Float8Tensor.from_hp(b_grp.fc2.weight.data, granularity=PerGroup(32)),
+            requires_grad=False,
+        )
+        b_row.fc1.weight = nn.Parameter(
+            Float8Tensor.from_hp(b_row.fc1.weight.data, granularity=PerRow()),
+            requires_grad=False,
+        )
+        b_row.fc2.weight = nn.Parameter(
+            Float8Tensor.from_hp(b_row.fc2.weight.data, granularity=PerRow()),
+            requires_grad=False,
+        )
+    f8_dense_ref = copy.deepcopy(f8_ref)
+    f8_dense_ref.blocks[0].fc1.weight = nn.Parameter(
+        Float8Tensor.from_hp(
+            f8_dense_ref.blocks[0].fc1.weight.dequantize() + 0.5 * dense_fc1,
+            granularity=PerGroup(32),
+        ),
+        requires_grad=False,
+    )
+    f8_dense_ref.blocks[0].fc2.weight = nn.Parameter(
+        Float8Tensor.from_hp(
+            f8_dense_ref.blocks[0].fc2.weight.dequantize() + 0.5 * dense_fc2,
+            granularity=PerGroup(32),
+        ),
+        requires_grad=False,
+    )
+    f8_lora_ref = copy.deepcopy(f8_res_ref)
+    for prefix, weight_mod in (
+        ("blocks.0.fc1", f8_lora_ref.blocks[0].fc1),
+        ("blocks.1.fc2", f8_lora_ref.blocks[1].fc2),
+    ):
+        delta = lora_state[f"{prefix}.lora_B.weight"] @ lora_state[f"{prefix}.lora_A.weight"]
+        weight_mod.weight = nn.Parameter(
+            Float8Tensor.from_hp(weight_mod.weight.dequantize() + 0.5 * delta, granularity=PerRow()),
+            requires_grad=False,
+        )
+    with torch.inference_mode():
+        expected_f8_dense = f8_dense_ref.to("cuda:0")(x.to("cuda:0")).cpu()
+        expected_f8_base = copy.deepcopy(f8_res_ref).to("cuda:0")(x.to("cuda:0")).cpu()
+        expected_f8_lora = f8_lora_ref.to("cuda:0")(x.to("cuda:0")).cpu()
+    del f8_dense_ref, f8_lora_ref
+    return (
+        cr_store,
+        ModelStore.from_module(f8_ref),
+        ModelStore.from_module(f8_res_ref),
+        expected_cr_dense,
+        expected_f8_dense,
+        expected_f8_base,
+        expected_f8_lora,
+    )
+
+
+def _bind_quant_tp_shell(store_arg: ModelStore, mesh: DeviceMesh, dim: int) -> ModelOffloader:
+    with torch.device("meta"):
+        shell = _QuantTPModel(dim=dim, num_blocks=2, bias=False, device="meta", dtype=torch.float32)
+    _parallelize_two_gpu_tp(shell, mesh)
+    off = store_arg.bind(shell)
+    assert requires_activation(shell.blocks[0].fc2.weight)
+    return off
+
+
+@TWO_GPUS
+def test_two_gpu_model_store_bind_tp_quantized_dense_merge_and_inference_mode() -> None:
+    pytest.importorskip("torchao.quantization")
+    host_pin_manager.clear()
+    torch.manual_seed(67)
+    dim = 128
+    x = torch.randn(2, 4, dim, dtype=torch.bfloat16)
+    dense_fc1 = torch.randn(dim * 2, dim, dtype=torch.bfloat16) * 0.05
+    dense_fc2 = torch.randn(dim, dim * 2, dtype=torch.bfloat16) * 0.05
+    dense_adapter = Adapter(
+        {
+            "blocks.0.fc1.weight": ParameterDelta.from_tensors(dense=dense_fc1),
+            "blocks.0.fc2.weight": ParameterDelta.from_tensors(dense=dense_fc2),
+        }
+    )
+    lora_state = {
+        "blocks.0.fc1.lora_A.weight": torch.randn(4, dim, dtype=torch.bfloat16) * 0.05,
+        "blocks.0.fc1.lora_B.weight": torch.randn(dim * 2, 4, dtype=torch.bfloat16) * 0.05,
+        "blocks.1.fc2.lora_A.weight": torch.randn(4, dim * 2, dtype=torch.bfloat16) * 0.05,
+        "blocks.1.fc2.lora_B.weight": torch.randn(dim, 4, dtype=torch.bfloat16) * 0.05,
+    }
+    lora = Adapter.from_state_dict(lora_state)
+    (
+        cr_store,
+        f8_store,
+        f8_res_store,
+        expected_cr_dense,
+        expected_f8_dense,
+        expected_f8_base,
+        expected_f8_lora,
+    ) = _build_quant_tp_dense_and_resident_stores(
+        dim,
+        x=x,
+        dense_fc1=dense_fc1,
+        dense_fc2=dense_fc2,
+        lora_state=lora_state,
+    )
+
+    transport = "p2p" if _HAS_TWO_GPU_P2P else "host_staged"
+    offloaders: list[list[ModelOffloader]] = [[], []]
+    try:
+        with ParallelExecutor(["cuda:0", "cuda:1"], transport=transport, staging_bytes=64 * 1024) as ex:
+            def run_rank(rank: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                dev = torch.device(f"cuda:{rank}")
+                mesh = init_device_mesh("cuda", (2,))
+                x_local = x.chunk(2, dim=1)[rank].to(dev)
+
+                cr_off = _bind_quant_tp_shell(cr_store, mesh, dim)
+                f8_off = _bind_quant_tp_shell(f8_store, mesh, dim)
+                f8_res_off = _bind_quant_tp_shell(f8_res_store, mesh, dim)
+                offloaders[rank].extend((cr_off, f8_off, f8_res_off))
+
+                with activated_model(
+                    cr_off,
+                    dev,
+                    adapters=[dense_adapter],
+                    adapter_strengths=[0.5],
+                    adapter_mode="merge",
+                    stochastic_rounding=False,
+                ) as model, torch.inference_mode():
+                    y_cr_dense = model(x_local).cpu()
+
+                with activated_model(
+                    f8_off,
+                    dev,
+                    adapters=[dense_adapter],
+                    adapter_strengths=[0.5],
+                    adapter_mode="merge",
+                    stochastic_rounding=False,
+                ) as model, torch.inference_mode():
+                    y_f8_dense = model(x_local).cpu()
+
+                with torch.inference_mode():
+                    with activated_model(f8_res_off, dev) as model:
+                        assert not local_shard(model.blocks[0].fc1.weight).is_inference()
+                        assert not local_shard(model.blocks[0].fc2.weight).is_inference()
+                        y_f8_base = model(x_local).cpu()
+                    with activated_model(
+                        f8_res_off,
+                        dev,
+                        adapters=[lora],
+                        adapter_strengths=[0.5],
+                        adapter_mode="merge",
+                        stochastic_rounding=False,
+                    ) as model:
+                        assert not local_shard(model.blocks[0].fc1.weight).is_inference()
+                        assert not local_shard(model.blocks[0].fc2.weight).is_inference()
+                        y_f8_lora = model(x_local).cpu()
+
+                return y_cr_dense, y_f8_dense, y_f8_base, y_f8_lora
+
+            outs = ex.run(run_rank)
+            for rank in range(2):
+                torch.testing.assert_close(outs[rank][0], expected_cr_dense.chunk(2, dim=1)[rank], rtol=8e-2, atol=8e-2)
+                torch.testing.assert_close(outs[rank][1], expected_f8_dense.chunk(2, dim=1)[rank], rtol=4e-2, atol=4e-2)
+                torch.testing.assert_close(outs[rank][2], expected_f8_base.chunk(2, dim=1)[rank], rtol=3e-2, atol=3e-2)
+                torch.testing.assert_close(outs[rank][3], expected_f8_lora.chunk(2, dim=1)[rank], rtol=2e-1, atol=2e-1)
+    finally:
+        for rank_offs in offloaders:
+            for off in rank_offs:
+                if off.active_device is not None:
+                    off.deactivate()
+        host_pin_manager.clear()

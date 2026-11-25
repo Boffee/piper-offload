@@ -128,10 +128,10 @@ class HostParam:
         mapping retained during capture.
 
         Projection supports ``Replicate`` and contiguous ``Shard(dim)``
-        placements across CPU and CUDA/HIP meshes for plain tensors, and
-        ``Replicate`` placements for non-``nn.Parameter``-subclass quantized
-        tensors. The local CPU shard views or aliases the full source
-        allocation, so construction allocates no rank-local host tensor.
+        placements across CPU and CUDA/HIP meshes for plain tensors and
+        supported non-``nn.Parameter``-subclass quantized tensors. The host
+        backing stays a zero-copy view or alias of the full source allocation,
+        so construction allocates no rank-local host tensor.
         """
         if source.is_meta:
             raise ValueError("DTensor projection source must own physical host storage.")
@@ -147,11 +147,12 @@ class HostParam:
                 "DTensor projection target must use a standard torch DTensor "
                 f"representation; got {type(representation).__name__}."
             )
-        host_state = adapter.project_host(
-            source.adapter,
-            source.host_state,
-            representation,
-        )
+        with torch.inference_mode(False):
+            host_state = adapter.project_host(
+                source.adapter,
+                source.host_state,
+                representation,
+            )
         projected = cls.__new__(cls)
         projected._init_from_host_state(
             representation,
@@ -315,7 +316,8 @@ class HostParam:
                 cast(torch.Tensor, self.host_state),
                 requires_grad=False,
             )
-        return self.adapter.cpu_param(self.host_state)
+        with torch.inference_mode(False):
+            return self.adapter.cpu_param(self.host_state)
 
     def allocate_gpu_storage(self, device: torch.device) -> object:
         """Allocate empty GPU storage mirroring this host parameter's layout.
@@ -323,15 +325,16 @@ class HostParam:
         Returns an opaque adapter-specific handle; pass it back to
         :meth:`make_gpu_param` and :meth:`copy_to_gpu`.
         """
-        if self.is_meta:
-            source = cast(torch.Tensor, self.host_state)
-            return torch.empty_strided(
-                tuple(source.shape),
-                source.stride(),
-                dtype=source.dtype,
-                device=device,
-            )
-        return self.adapter.alloc_gpu(self.host_state, device)
+        with torch.inference_mode(False):
+            if self.is_meta:
+                source = cast(torch.Tensor, self.host_state)
+                return torch.empty_strided(
+                    tuple(source.shape),
+                    source.stride(),
+                    dtype=source.dtype,
+                    device=device,
+                )
+            return self.adapter.alloc_gpu(self.host_state, device)
 
     def make_gpu_param(self, gpu_state: object) -> nn.Parameter:
         """Build the frozen GPU-side :class:`nn.Parameter` for this host parameter.
@@ -339,9 +342,10 @@ class HostParam:
         The adapter receives the paired host state to reconstruct
         structured tensor wrappers.
         """
-        if self.is_meta:
-            return nn.Parameter(cast(torch.Tensor, gpu_state), requires_grad=False)
-        return self.adapter.gpu_param(self.host_state, gpu_state)
+        with torch.inference_mode(False):
+            if self.is_meta:
+                return nn.Parameter(cast(torch.Tensor, gpu_state), requires_grad=False)
+            return self.adapter.gpu_param(self.host_state, gpu_state)
 
     def copy_to_gpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk DMA host bytes into pre-allocated GPU storage."""
@@ -398,9 +402,10 @@ class HostParam:
                 "A meta parameter cannot be cloned without an active "
                 "parameter value."
             )
-        representation = param_representation(self.make_cpu_param())
-        cloned_state = clone_host_state(self.adapter, representation, self.host_state)
-        return self.adapter.cpu_param(cloned_state)
+        with torch.inference_mode(False):
+            representation = param_representation(self.make_cpu_param())
+            cloned_state = clone_host_state(self.adapter, representation, self.host_state)
+            return self.adapter.cpu_param(cloned_state)
 
     @property
     def compute_dtype(self) -> torch.dtype:

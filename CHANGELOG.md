@@ -13,7 +13,15 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   rank-local views sharing one host allocation and `MappedCheckpoint` file
   mapping, supporting 1D and N-D CPU/CUDA `DeviceMesh` topologies, `Replicate`
   and contiguous `Shard(dim)` placements for plain tensors, all-`Replicate`
-  projection for non-`nn.Parameter`-subclass quantized tensors, tied-weight
+  projection for `DTensor`-compatible non-`nn.Parameter`-subclass quantized
+  tensors, and zero-copy `Shard(dim)` projection for TorchAO `Float8Tensor`
+  (`PerTensor`, `PerRow` along any axis, and group-aligned `PerGroup`) and 2-D
+  Piper `ConvRotInt8Tensor` (`Shard(0)` on any non-empty split and
+  `group_size`-aligned `Shard(1)`, preserving optional scalar
+  `act_per_tensor_scale`), with contiguous 1/P CUDA target allocation,
+  `requires_activation()` guards on non-canonical resting shards, active LoRA
+  and dense adapter merges on CUDA, preflight rejection of unsupported, empty,
+  misaligned, or transposed quantized shards and 5-D Conv3D weights, tied-weight
   deduplication, and per-rank `ModelOffloader.cache_bytes`.
 - Added `ParallelExecutor` (`piper_offload.parallel`) and the `piper_parallel`
   PyTorch `ProcessGroup` backend for concurrent multi-GPU and CPU execution in
@@ -37,6 +45,15 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Fixed
 
+- `ModelStore.bind()` and `HostModuleStore.bind()` now reject quantized tensor
+  subclasses that cannot be wrapped in `DTensor` (such as
+  `PrototypeFloat8Tensor`) with a `layout mismatch` error during bind
+  preflight instead of raising an `IndexError`.
+- Host capture allocations, CUDA target allocations (resident, streaming, and
+  rolling), resting host wrapper restoration, and `DTensor` wrapper
+  reconstruction and local-shard extraction now exit `torch.inference_mode()`,
+  preventing `aten.view_as` dispatch failures on subclasses such as
+  `Float8Tensor` and keeping managed parameters and buffers non-inference.
 - Cached a backend-less resting CPU `DeviceMesh` (with distinct internal
   dimension names) inside DTensor host state during capture and projection (and
   returned already-CPU meshes directly), preventing crashes when deactivating

@@ -362,14 +362,18 @@ class HostModuleLoadPlan:
         _validate_cuda_device(device)
         params = self.sources
         buffers = _select_known_names(self.instance.buffers, buffer_names)
-        return HostModuleTarget(
-            param_targets=_allocate_param_targets(
-                params,
-                _items_for_names(self.instance.params, params),
-                device,
-            ),
-            buffer_targets=_allocate_buffer_targets(buffers, device),
-        )
+        # Active CUDA targets across resident, transient, streaming, and rolling
+        # runtimes must stay non-inference tensors so refills, merges, and wrapper
+        # reconstruction work regardless of the caller's inference_mode context.
+        with torch.inference_mode(False):
+            return HostModuleTarget(
+                param_targets=_allocate_param_targets(
+                    params,
+                    _items_for_names(self.instance.params, params),
+                    device,
+                ),
+                buffer_targets=_allocate_buffer_targets(buffers, device),
+            )
 
     def refill_param_target(
         self,

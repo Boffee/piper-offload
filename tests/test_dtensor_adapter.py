@@ -19,11 +19,14 @@ from piper_offload import (
     Adapter,
     LoRATransform,
     ModelOffloader,
+    ModelStore,
     OffloadConfig,
     ParameterDelta,
     ScaledLoRAFactor,
     merge_adapter,
+    requires_activation,
 )
+from piper_offload._dtensor import local_shard
 from piper_offload.dtensor_adapter import DTensorAdapter
 from piper_offload.host_module import HostModuleStore
 from piper_offload.int8_adapter import Int8Adapter
@@ -44,7 +47,7 @@ from piper_offload.tensor_adapter_registry import (
     select_adapter,
     tensor_id,
 )
-from tests.conftest import activated_model
+from tests.conftest import activated_model, host_component
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -1019,7 +1022,8 @@ class TestDTensorAdapter:
         with pytest.raises(ValueError, match="layout mismatch"):
             store.bind(plain_meta)
 
-        # Reject DTensor(meta) against a non-DTensor quantized store.
+        # Accept DTensor(meta) Shard(0) against an unsharded ConvRotInt8 store (zero-copy projection),
+        # while still rejecting unsupported quantized formats such as Int8Tensor.
         non_dtensor_proto = nn.Module()
         non_dtensor_proto.weight = nn.Parameter(q_local, requires_grad=False)
         non_dtensor_store = HostModuleStore.from_module(non_dtensor_proto)
@@ -1033,8 +1037,31 @@ class TestDTensorAdapter:
             ),
             requires_grad=False,
         )
+        non_dtensor_store.bind(dtensor_meta)
+        assert isinstance(dtensor_meta.weight.data, DTensor) and isinstance(
+            dtensor_meta.weight.data.to_local(), convrot_cls
+        )
+        assert (
+            dtensor_meta.weight.data.to_local().qdata.untyped_storage().data_ptr()
+            == non_dtensor_store.params["weight"].storage_tensors()[0].untyped_storage().data_ptr()
+        )
+        dtensor_meta_second = nn.Module()
+        dtensor_meta_second.weight = nn.Parameter(
+            DTensor.from_local(
+                torch.empty((rows, cols), dtype=torch.float32, device="meta"),
+                tp_mesh,
+                [_shard(0)],
+                run_check=False,
+            ),
+            requires_grad=False,
+        )
+        non_dtensor_store.bind(dtensor_meta_second)
+
+        torchao_quant = pytest.importorskip("torchao.quantization")
+        int8_layer = nn.Linear(cols, rows, bias=False, dtype=torch.bfloat16).eval().requires_grad_(False)
+        torchao_quant.quantize_(int8_layer, torchao_quant.Int8WeightOnlyConfig())
         with pytest.raises(ValueError, match="layout mismatch"):
-            non_dtensor_store.bind(dtensor_meta)
+            HostModuleStore.from_module(int8_layer).bind(dtensor_meta)
 
         # Accept matching DTensor over plain strided meta local shard (with mismatched placeholder dtype),
         # and allow re-binding after initial bind.
@@ -1095,3 +1122,457 @@ class TestDTensorAdapter:
         )
         with pytest.raises(ValueError, match="layout mismatch"):
             store.bind(bad_local)
+
+
+class TestQuantizedShardProjection:
+    """Zero-copy quantized DTensor Shard(dim) projection, activation, merge, and rejections."""
+
+    def test_float8_shard_projection_granularities_and_cuda_lifecycle(
+        self,
+        tp_mesh: Any,
+    ) -> None:
+        del tp_mesh
+        pytest.importorskip("torchao.quantization")
+        from torchao.quantization.granularity import PerGroup, PerRow, PerTensor
+        from torchao.quantization.quantize_.workflows.float8.float8_tensor import Float8Tensor
+
+        from piper_offload.float8_adapter import Float8Adapter
+
+        torch.manual_seed(0)
+        w2 = torch.randn(32, 64, dtype=torch.bfloat16)
+        w3 = torch.randn(4, 32, 64, dtype=torch.bfloat16)
+
+        cases = [
+            ("PerTensor", Float8Tensor.from_hp(w2, granularity=PerTensor()), (16, 32), (16, 32), (16, 32), True),
+            ("PerRow", Float8Tensor.from_hp(w2, granularity=PerRow()), (16, 32), (16, 32), (1, 32), True),
+            ("PerRow_dim0", Float8Tensor.from_hp(w2, granularity=PerRow(dim=0)), (16, 32), (16, 32), (16, 1), False),
+            ("PerGroup32", Float8Tensor.from_hp(w2, granularity=PerGroup(32)), (16, 32), (16, 32), (1, 32), True),
+            (
+                "3D_PerGroup32",
+                Float8Tensor.from_hp(w3, granularity=PerGroup(32)),
+                (2, 16, 32),
+                (2, 16, 32),
+                (1, 1, 32),
+                False,
+            ),
+            ("PerRow_1row_S1", Float8Tensor.from_hp(w2[:1], granularity=PerRow()), (0, 32), (1, 32), (1, 32), True),
+        ]
+
+        for label, src_tensor, offsets, local_shape, expected_block_size, supports_matmul in cases:
+            host_state = Float8Adapter.capture_host(src_tensor)
+            proj_state, layout_sig = Float8Adapter.project_shard(
+                host_state,
+                offsets=offsets,
+                local_shape=local_shape,
+            )
+            assert proj_state.meta.block_size == expected_block_size, label
+            q_host, s_host = host_state.storage
+            q_proj, s_proj = proj_state.storage
+            assert q_host is not None and s_host is not None
+            assert q_proj is not None and s_proj is not None
+            assert q_proj.untyped_storage().data_ptr() == q_host.untyped_storage().data_ptr(), label
+            assert s_proj.untyped_storage().data_ptr() == s_host.untyped_storage().data_ptr(), label
+
+            cpu_param = Float8Adapter.cpu_param(proj_state)
+            assert cpu_param.data.device.type == "cpu"
+            assert not cpu_param.is_meta
+            assert requires_activation(cpu_param)
+            assert Float8Adapter.accepts_bind_target(
+                proj_state,
+                cpu_param.data,
+                layout_signature=layout_sig,
+            )
+            assert "ProjectedTorchaoShard" in repr(cpu_param.data)
+            with pytest.raises(RuntimeError, match="requires CUDA activation"):
+                cpu_param.data.clone()
+            with (
+                torch.inference_mode(),
+                pytest.raises(RuntimeError, match="requires CUDA activation"),
+            ):
+                torch.zeros(local_shape, dtype=torch.bfloat16).view_as(cpu_param.data)
+
+            gpu_state = Float8Adapter.alloc_gpu(proj_state, torch.device("cuda"))
+            Float8Adapter.copy_to_gpu(proj_state, gpu_state, non_blocking=False)
+            gpu_param = Float8Adapter.gpu_param(proj_state, gpu_state)
+            assert gpu_param.data.qdata.is_contiguous(), label
+            assert gpu_param.data.scale.is_contiguous(), label
+            assert tuple(gpu_param.data.shape) == local_shape, label
+            assert Float8Adapter.layout_signature(gpu_param.data) == layout_sig, label
+
+            expected_dense = src_tensor.dequantize()
+            for dim, (off, sz) in enumerate(zip(offsets, local_shape, strict=True)):
+                expected_dense = expected_dense.narrow(dim, off, sz)
+            torch.testing.assert_close(gpu_param.data.dequantize().cpu(), expected_dense, rtol=0, atol=0)
+
+            if supports_matmul and len(local_shape) == 2:
+                x = torch.randn(3, local_shape[1], dtype=torch.bfloat16, device="cuda")
+                actual_y = torch.nn.functional.linear(x, gpu_param.data)
+                expected_y = torch.nn.functional.linear(x, expected_dense.to("cuda"))
+                torch.testing.assert_close(actual_y, expected_y, rtol=2e-2, atol=2e-2)
+
+    def test_float8_model_store_projection_shard0_shard1_merge_and_rejections(
+        self,
+        tp_mesh: Any,
+    ) -> None:
+        from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
+        from torchao.quantization.granularity import PerGroup, PerRow
+        from torchao.quantization.quantize_.workflows.float8.float8_tensor import Float8Tensor
+
+        torch.manual_seed(1)
+        rows, cols = 16, 64
+        w_s0 = Float8Tensor.from_hp(torch.randn(rows, cols, dtype=torch.bfloat16), granularity=PerRow())
+        w_s1 = Float8Tensor.from_hp(torch.randn(rows, cols, dtype=torch.bfloat16), granularity=PerGroup(32))
+
+        proto = nn.Module()
+        proto.fc1 = nn.Linear(cols, rows, bias=False, dtype=torch.bfloat16)
+        proto.fc2 = nn.Linear(cols, rows, bias=False, dtype=torch.bfloat16)
+        proto.fc1.weight = nn.Parameter(w_s0, requires_grad=False)
+        proto.fc2.weight = nn.Parameter(w_s1, requires_grad=False)
+        proto.tied = proto.fc2.weight
+        proto.requires_grad_(False)
+        store = ModelStore.from_module(proto)
+        fc1_qptr = store._module_store.params["fc1.weight"].storage_tensors()[0].untyped_storage().data_ptr()
+
+        shell = nn.Module()
+        shell.fc1 = nn.Linear(cols, rows, bias=False, device="meta")
+        shell.fc2 = nn.Linear(cols, rows, bias=False, device="meta")
+        parallelize_module(shell, tp_mesh, {"fc1": ColwiseParallel(), "fc2": RowwiseParallel()})
+        shell.tied = shell.fc2.weight
+        shell.requires_grad_(False)
+
+        offloader = store.bind(shell)
+        assert isinstance(shell.fc1.weight.data, DTensor)
+        assert not requires_activation(shell.fc1.weight)
+        assert not requires_activation(shell.fc2.weight)
+        assert shell.fc2.weight is shell.tied
+        assert shell.fc1.weight.to_local().qdata.untyped_storage().data_ptr() == fc1_qptr
+
+        lora_a_cpu = torch.randn(4, cols, dtype=torch.bfloat16) * 0.1
+        lora_b_cpu = torch.randn(rows, 4, dtype=torch.bfloat16) * 0.1
+        lora = Adapter.from_state_dict(
+            {
+                "fc1.lora_A.weight": torch.randn(4, cols, dtype=torch.bfloat16) * 0.1,
+                "fc1.lora_B.weight": torch.randn(rows, 4, dtype=torch.bfloat16) * 0.1,
+                "fc2.lora_A.weight": lora_a_cpu,
+                "fc2.lora_B.weight": lora_b_cpu,
+            }
+        )
+        x = torch.randn(2, cols, dtype=torch.bfloat16, device="cuda")
+        with activated_model(
+            offloader,
+            "cuda",
+            adapters=[lora],
+            adapter_strengths=[0.5],
+            adapter_mode="merge",
+        ) as model:
+            local_w2 = model.fc2.weight.to_local()
+            assert local_w2.qdata.is_contiguous()
+            torch.testing.assert_close(
+                local_w2.dequantize(),
+                w_s1.dequantize().to("cuda") + 0.5 * (lora_b_cpu.to("cuda") @ lora_a_cpu.to("cuda")),
+                rtol=0.1,
+                atol=0.1,
+            )
+            assert torch.isfinite(model.fc1(x)).all()
+            assert torch.isfinite(model.fc2(x)).all()
+        offloader.deactivate()
+
+        delta = Adapter(
+            {"fc2.weight": ParameterDelta.from_tensors(dense=torch.randn(rows, cols, dtype=torch.bfloat16) * 0.05)}
+        )
+        with activated_model(
+            offloader,
+            "cuda",
+            adapters=[delta],
+            adapter_strengths=[1.0],
+            adapter_mode="merge",
+        ) as model:
+            assert torch.isfinite(model.fc2(x)).all()
+        offloader.deactivate()
+
+    def test_convrot_int8_shard_projection_adapter_roundtrip(self) -> None:
+        convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
+        convrot_cls = convrot_mod.ConvRotInt8Tensor
+
+        from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
+
+        torch.manual_seed(2)
+        rows, cols = 16, 128
+        for use_static in (False, True):
+            act_scale = torch.tensor(0.35, dtype=torch.float32) if use_static else None
+            w = convrot_cls.from_hp(
+                torch.randn(rows, cols, dtype=torch.bfloat16),
+                group_size=64,
+                act_per_tensor_scale=act_scale,
+            )
+            host_state = PiperConvRotInt8Adapter.capture_host(w)
+            proj_state, layout_sig = PiperConvRotInt8Adapter.project_shard(
+                host_state,
+                offsets=(8, 64),
+                local_shape=(8, 64),
+            )
+            q_host, s_host, a_host = host_state.storage
+            q_proj, s_proj, a_proj = proj_state.storage
+            assert q_host is not None and s_host is not None
+            assert q_proj is not None and s_proj is not None
+            assert q_proj.untyped_storage().data_ptr() == q_host.untyped_storage().data_ptr()
+            assert s_proj.untyped_storage().data_ptr() == s_host.untyped_storage().data_ptr()
+            if use_static:
+                assert a_proj is a_host
+
+            cpu_param = PiperConvRotInt8Adapter.cpu_param(proj_state)
+            assert requires_activation(cpu_param)
+            gpu_state = PiperConvRotInt8Adapter.alloc_gpu(proj_state, torch.device("cuda"))
+            PiperConvRotInt8Adapter.copy_to_gpu(proj_state, gpu_state, non_blocking=False)
+            gpu_param = PiperConvRotInt8Adapter.gpu_param(proj_state, gpu_state)
+            assert gpu_param.data.qdata.is_contiguous()
+            assert gpu_param.data.scale.is_contiguous()
+            assert PiperConvRotInt8Adapter.layout_signature(gpu_param.data) == layout_sig
+            torch.testing.assert_close(
+                gpu_param.data.dequantize().cpu(),
+                w.dequantize().narrow(0, 8, 8).narrow(1, 64, 64),
+                rtol=0,
+                atol=0,
+            )
+
+    def test_convrot_int8_shard_projection_static_scale_and_cuda_lifecycle(
+        self,
+        tp_mesh: Any,
+    ) -> None:
+        from torch.distributed.tensor.parallel import RowwiseParallel, parallelize_module
+
+        convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
+        convrot_cls = convrot_mod.ConvRotInt8Tensor
+
+        torch.manual_seed(2)
+        rows, cols = 16, 128
+        w_full = convrot_cls.from_hp(
+            torch.randn(rows, cols, dtype=torch.bfloat16),
+            group_size=64,
+            act_per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
+        )
+        proto = nn.Module()
+        proto.fc = nn.Linear(cols, rows, bias=False, dtype=torch.bfloat16)
+        proto.fc.weight = nn.Parameter(w_full, requires_grad=False)
+        proto.requires_grad_(False)
+        store = ModelStore.from_module(proto)
+
+        shell = nn.Module()
+        shell.fc = nn.Linear(cols, rows, bias=False, device="meta")
+        parallelize_module(shell, tp_mesh, {"fc": RowwiseParallel()})
+        shell.requires_grad_(False)
+        offloader = store.bind(shell)
+        comp = host_component(offloader)
+        assert comp is not None
+        resting_sig = DTensorAdapter.layout_signature(shell.fc.weight.data)
+        cached_sig = comp._instance.params["fc.weight"].target_layout[1]
+
+        lora = Adapter.from_state_dict(
+            {
+                "fc.lora_A.weight": torch.randn(4, cols, dtype=torch.bfloat16) * 0.1,
+                "fc.lora_B.weight": torch.randn(rows, 4, dtype=torch.bfloat16) * 0.1,
+            }
+        )
+        x = torch.randn(3, cols, dtype=torch.bfloat16, device="cuda")
+        with activated_model(
+            offloader,
+            "cuda",
+            adapters=[lora],
+            adapter_strengths=[0.25],
+            adapter_mode="merge",
+        ) as model:
+            active_sig = DTensorAdapter.layout_signature(model.fc.weight.data)
+            assert active_sig[:4] == resting_sig[:4]
+            assert active_sig[5] == resting_sig[5]
+            assert active_sig == cached_sig
+            assert model.fc.weight.to_local().qdata.is_contiguous()
+            assert torch.isfinite(model.fc(x)).all()
+        offloader.deactivate()
+
+        delta = Adapter(
+            {"fc.weight": ParameterDelta.from_tensors(dense=torch.randn(rows, cols, dtype=torch.bfloat16) * 0.05)}
+        )
+        with activated_model(
+            offloader,
+            "cuda",
+            adapters=[delta],
+            adapter_strengths=[1.0],
+            adapter_mode="merge",
+        ) as model:
+            assert torch.isfinite(model.fc(x)).all()
+        offloader.deactivate()
+
+    def test_quantized_shard_projection_rejections_and_atomicity(
+        self,
+        tp_mesh: Any,
+    ) -> None:
+        from torch.distributed.tensor import DTensor, Replicate
+        from torchao.quantization.granularity import PerGroup, PerRow, PerTensor
+        from torchao.quantization.quantize_.workflows.float8.float8_tensor import (
+            Float8Tensor,
+            QuantizeTensorToFloat8Kwargs,
+        )
+
+        from piper_offload.float8_adapter import Float8Adapter
+        from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
+
+        convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
+        convrot_cls = convrot_mod.ConvRotInt8Tensor
+
+        f8_grp = Float8Adapter.capture_host(
+            Float8Tensor.from_hp(torch.randn(16, 64, dtype=torch.bfloat16), granularity=PerGroup(32))
+        )
+        with pytest.raises(ValueError, match="must align to quantization block_size"):
+            Float8Adapter.project_shard(f8_grp, offsets=(0, 16), local_shape=(16, 48))
+        with pytest.raises(ValueError, match="non-empty local shards"):
+            Float8Adapter.project_shard(f8_grp, offsets=(16, 0), local_shape=(0, 64))
+
+        f8_t = Float8Tensor.from_hp(torch.randn(32, 64, dtype=torch.bfloat16), granularity=PerRow()).t()
+        with pytest.raises(ValueError, match="contiguous, untransposed"):
+            Float8Adapter.project_shard(
+                Float8Adapter.capture_host(f8_t),
+                offsets=(0, 0),
+                local_shape=(32, 32),
+            )
+
+        cr8 = PiperConvRotInt8Adapter.capture_host(
+            convrot_cls.from_hp(torch.randn(16, 128, dtype=torch.bfloat16), group_size=64)
+        )
+        with pytest.raises(ValueError, match="must align to rotation group_size"):
+            PiperConvRotInt8Adapter.project_shard(cr8, offsets=(0, 32), local_shape=(16, 64))
+        with pytest.raises(ValueError, match="non-empty local shards"):
+            PiperConvRotInt8Adapter.project_shard(cr8, offsets=(16, 0), local_shape=(0, 128))
+
+        cr8_conv3d = convrot_cls.from_quantized(
+            torch.randint(-127, 128, (4, 3, 3, 3, 64), dtype=torch.int8),
+            torch.rand((4, 1), dtype=torch.float32) + 0.1,
+            group_size=64,
+            logical_dtype=torch.bfloat16,
+        )
+        with pytest.raises(ValueError, match="2-D matrices only"):
+            PiperConvRotInt8Adapter.project_shard(
+                PiperConvRotInt8Adapter.capture_host(cr8_conv3d),
+                offsets=(0, 0, 0, 0, 0),
+                local_shape=(2, 64, 3, 3, 3),
+            )
+
+        proto_f8_mod = pytest.importorskip("torchao.prototype.quantization.float8_static_quant.prototype_float8_tensor")
+        static_w = proto_f8_mod.PrototypeFloat8Tensor.from_hp(
+            torch.randn(16, 32, dtype=torch.bfloat16),
+            granularity=PerTensor(),
+            act_quant_kwargs=QuantizeTensorToFloat8Kwargs(granularity=PerTensor()),
+            act_quant_scale=torch.tensor(0.5, dtype=torch.float32),
+        )
+        static_proto = nn.Module()
+        static_proto.embed = nn.Parameter(torch.randn(8, 8, dtype=torch.bfloat16), requires_grad=False)
+        static_proto.w = nn.Parameter(static_w, requires_grad=False)
+        static_store = ModelStore.from_module(static_proto)
+
+        for placement in (Replicate(), _shard(0)):
+            shell = nn.Module()
+            orig_embed = nn.Parameter(torch.empty((8, 8), device="meta"), requires_grad=False)
+            orig_w = nn.Parameter(
+                DTensor.from_local(torch.empty((16, 32), device="meta"), tp_mesh, [placement], run_check=False),
+                requires_grad=False,
+            )
+            shell.embed = orig_embed
+            shell.w = orig_w
+            with pytest.raises(ValueError, match="layout mismatch"):
+                static_store.bind(shell)
+            assert shell.embed is orig_embed
+            assert shell.w is orig_w
+
+        f8_proto = nn.Module()
+        f8_proto.w = nn.Parameter(
+            Float8Tensor.from_hp(torch.randn(16, 64, dtype=torch.bfloat16), granularity=PerGroup(32)),
+            requires_grad=False,
+        )
+        f8_store = ModelStore.from_module(f8_proto)
+
+        cpu_plain_target = nn.Module()
+        cpu_plain_target.w = nn.Parameter(
+            DTensor.from_local(torch.zeros((16, 64), dtype=torch.bfloat16), tp_mesh, [_shard(0)], run_check=False),
+            requires_grad=False,
+        )
+        with pytest.raises(ValueError, match="layout mismatch"):
+            f8_store.bind(cpu_plain_target)
+
+        wrong_block_local = Float8Tensor.from_hp(torch.randn(16, 64, dtype=torch.bfloat16), granularity=PerRow())
+        wrong_phys_target = nn.Module()
+        wrong_phys_target.w = nn.Parameter(
+            DTensor.from_local(wrong_block_local, tp_mesh, [_shard(0)], run_check=False),
+            requires_grad=False,
+        )
+        with pytest.raises(ValueError, match="layout mismatch"):
+            f8_store.bind(wrong_phys_target)
+
+    def test_resident_float8_activation_and_materialize_inside_inference_mode(
+        self,
+        tp_mesh: Any,
+    ) -> None:
+        from torch.distributed.tensor.parallel import (
+            ColwiseParallel,
+            RowwiseParallel,
+            parallelize_module,
+        )
+        from torchao.quantization.granularity import PerRow
+        from torchao.quantization.quantize_.workflows.float8.float8_tensor import Float8Tensor
+
+        torch.manual_seed(3)
+        rows, cols = 32, 64
+        w1 = Float8Tensor.from_hp(torch.randn(rows, cols, dtype=torch.bfloat16), granularity=PerRow())
+        w2 = Float8Tensor.from_hp(torch.randn(cols, rows, dtype=torch.bfloat16), granularity=PerRow())
+        proto = nn.Module()
+        proto.fc1 = nn.Linear(cols, rows, bias=False, dtype=torch.bfloat16)
+        proto.fc2 = nn.Linear(rows, cols, bias=False, dtype=torch.bfloat16)
+        proto.fc1.weight = nn.Parameter(w1, requires_grad=False)
+        proto.fc2.weight = nn.Parameter(w2, requires_grad=False)
+        proto.requires_grad_(False)
+        store = ModelStore.from_module(proto)
+
+        shell = nn.Module()
+        shell.fc1 = nn.Linear(cols, rows, bias=False, device="meta")
+        shell.fc2 = nn.Linear(rows, cols, bias=False, device="meta")
+        parallelize_module(shell, tp_mesh, {"fc1": ColwiseParallel(), "fc2": RowwiseParallel()})
+        shell.requires_grad_(False)
+        offloader = store.bind(shell)
+        comp = host_component(offloader)
+        assert comp is not None
+        hp1 = comp._instance.params["fc1.weight"]
+        hp2 = comp._instance.params["fc2.weight"]
+
+        lora = Adapter.from_state_dict(
+            {
+                "fc1.lora_A.weight": torch.randn(4, cols, dtype=torch.bfloat16) * 0.1,
+                "fc1.lora_B.weight": torch.randn(rows, 4, dtype=torch.bfloat16) * 0.1,
+                "fc2.lora_A.weight": torch.randn(4, rows, dtype=torch.bfloat16) * 0.1,
+                "fc2.lora_B.weight": torch.randn(cols, 4, dtype=torch.bfloat16) * 0.1,
+            }
+        )
+        x = torch.randn(2, cols, dtype=torch.bfloat16, device="cuda")
+        with torch.inference_mode():
+            with activated_model(offloader, "cuda") as model:
+                assert not model.fc1.weight.is_inference()
+                assert not model.fc2.weight.is_inference()
+                assert not local_shard(model.fc1.weight).is_inference()
+                assert not local_shard(model.fc2.weight).is_inference()
+                assert torch.isfinite(model.fc2(model.fc1(x))).all()
+            with activated_model(
+                offloader,
+                "cuda",
+                adapters=[lora],
+                adapter_strengths=[0.5],
+                adapter_mode="merge",
+            ) as model:
+                assert not model.fc1.weight.is_inference()
+                assert not model.fc2.weight.is_inference()
+                assert not local_shard(model.fc1.weight).is_inference()
+                assert not local_shard(model.fc2.weight).is_inference()
+                assert torch.isfinite(model.fc2(model.fc1(x))).all()
+            mat1 = hp1.materialize(torch.device("cuda"))
+            mat2 = hp2.materialize(torch.device("cuda"))
+            assert not mat1.is_inference()
+            assert not mat2.is_inference()
+            assert not local_shard(mat1).is_inference()
+            assert not local_shard(mat2).is_inference()
