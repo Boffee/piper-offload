@@ -253,7 +253,6 @@ class StreamingBlockRuntime:
     def _return_target(self, block_target: _BlockTarget) -> None:
         """Return a target to the pool once its block is uninstalled and no prefetch writes it."""
         assert self._pool is not None, "runtime is not acquired"
-        block_target.lease.release()
         self._pool.release(self._signatures[block_target.block_idx], block_target.lease)
 
     def _stage_block(self, block_idx: int, stream: torch.cuda.Stream) -> _BlockTarget:
@@ -276,11 +275,12 @@ class StreamingBlockRuntime:
     def _release_block(self, block_target: _BlockTarget) -> None:
         """Restore a block to host storage, then return its target to the pool.
 
-        If the restore fails, some parameters may still point at the target,
-        so it is not returned; the caller keeps tracking it for a retry.
+        If the restore or lease release fails, the target stays tracked by the
+        caller for a retry rather than returning to the pool prematurely.
         """
         block_target.installed = False
         self._load_plans[block_target.block_idx].instance.install_host()
+        block_target.lease.release()
         self._return_target(block_target)
 
     def _submit_prefetch(self, block_idx: int) -> None:

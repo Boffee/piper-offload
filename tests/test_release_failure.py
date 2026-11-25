@@ -30,7 +30,7 @@ from piper_offload import (
     OffloadConfig,
 )
 from piper_offload.host_module import HostModuleInstance, HostModuleLoadPlan
-from tests.conftest import Interrupt, activated_model
+from tests.conftest import Interrupt, activated_model, block_components
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -277,4 +277,99 @@ def test_next_forward_finishes_a_transition_interrupted_mid_forward(
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(again, expected, rtol=0, atol=0)
     assert not offloader.failed
+    assert _on_device(model) == []
+
+
+def _inject_lookahead_record_failure(
+    patch: pytest.MonkeyPatch,
+    lookahead_stream_id: int,
+) -> tuple[list[object], list[object]]:
+    from piper_offload.target_lease import CudaTargetLease
+
+    caller = threading.get_ident()
+    worker_record_calls = 0
+    failed_leases: list[object] = []
+    closed_leases: list[object] = []
+    fail_lookahead_sync = True
+    original_stage = CudaTargetLease.stage
+    original_close = CudaTargetLease.close
+    original_record_event = torch.cuda.Stream.record_event
+    original_stream_sync = torch.cuda.Stream.synchronize
+
+    def tracking_stage(
+        lease: CudaTargetLease,
+        plan: HostModuleLoadPlan,
+        stream: torch.cuda.Stream,
+        *,
+        non_blocking: bool = True,
+    ) -> None:
+        try:
+            original_stage(lease, plan, stream, non_blocking=non_blocking)
+        except RuntimeError:
+            failed_leases.append(lease)
+            raise
+
+    def tracking_close(lease: CudaTargetLease) -> None:
+        original_close(lease)
+        closed_leases.append(lease)
+
+    def failing_record_event(stream: torch.cuda.Stream, *args: object, **kwargs: object) -> object:
+        nonlocal worker_record_calls
+        if threading.get_ident() != caller:
+            worker_record_calls += 1
+        if worker_record_calls >= 3 and stream.cuda_stream == lookahead_stream_id:
+            raise RuntimeError("injected lookahead record_event failure")
+        return original_record_event(stream, *args, **kwargs)  # type: ignore[arg-type]
+
+    def failing_stream_sync(stream: torch.cuda.Stream) -> None:
+        nonlocal fail_lookahead_sync
+        if stream.cuda_stream == lookahead_stream_id and fail_lookahead_sync:
+            fail_lookahead_sync = False
+            raise RuntimeError("injected lookahead synchronize failure")
+        original_stream_sync(stream)
+
+    patch.setattr(CudaTargetLease, "stage", tracking_stage)
+    patch.setattr(CudaTargetLease, "close", tracking_close)
+    patch.setattr(torch.cuda.Stream, "record_event", failing_record_event)
+    patch.setattr(torch.cuda.Stream, "synchronize", failing_stream_sync)
+    return failed_leases, closed_leases
+
+
+@CUDA
+def test_failed_lookahead_record_event_returns_lease_and_keeps_pin_lease_until_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(0)
+    model = _Model()
+    offloader = _Config("streaming").offloader(model)
+    component = block_components(offloader)[0]
+    runtime = component._runtime
+    x = torch.randn(2, _WIDTH, device="cuda")
+
+    offloader.activate("cuda")
+    with torch.inference_mode():
+        expected = model(x).cpu()
+    offloader.deactivate()
+
+    offloader.activate("cuda")
+    with monkeypatch.context() as patch:
+        failed_leases, closed_leases = _inject_lookahead_record_failure(patch, runtime._stream.cuda_stream)
+        with torch.inference_mode():
+            model(x)
+        with pytest.raises(RuntimeError, match="injected lookahead synchronize failure"):
+            offloader.deactivate()
+        assert len(failed_leases) == 1
+        assert failed_leases[0] not in closed_leases
+        assert runtime.acquired
+        assert component._pin_lease is not None
+        assert offloader.failed
+        # Even while record_event still fails on the worker stream, retry cleanup succeeds.
+        offloader.deactivate()
+
+    assert failed_leases[0] in closed_leases
+    assert not runtime.acquired
+    assert component._pin_lease is None
+    assert not offloader.failed
+    with activated_model(offloader, "cuda"), torch.inference_mode():
+        torch.testing.assert_close(model(x).cpu(), expected, rtol=0, atol=0)
     assert _on_device(model) == []

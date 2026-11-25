@@ -14,11 +14,13 @@ class CudaTargetLease:
     The caller chooses the allocation-owner stream: short-lived staged
     components use the default allocator pool, while block lookahead targets
     stay with their copy stream. A ready event orders consumption after copies;
-    recorded streams order later refills. These stream handoffs keep
-    storage in its original allocator pool and work for opaque adapter state
-    without inspecting its physical tensors. Closing the lease synchronizes all
-    recorded work before dropping the target so its storage cannot be
-    immediately reused while CUDA still accesses it.
+    release events recorded synchronously at :meth:`release` order later
+    refills after prior consumption without waiting for subsequent work on
+    those streams. These stream handoffs keep storage in its original allocator
+    pool and work for opaque adapter state without inspecting its physical
+    tensors. Closing the lease synchronizes all recorded work before dropping
+    the target so its storage cannot be immediately reused while CUDA still
+    accesses it.
     """
 
     def __init__(
@@ -32,6 +34,7 @@ class CudaTargetLease:
         self._staged = False
         self._acquired = False
         self._recorded_streams: set[torch.cuda.Stream] = set()
+        self._release_events: dict[torch.cuda.Stream, torch.cuda.Event] = {}
 
     @classmethod
     def allocate(
@@ -72,6 +75,7 @@ class CudaTargetLease:
         target = self.target
         prior = self._ready_event
         self._staged = False
+        copied = False
         with torch.cuda.stream(stream):
             if prior is not None:
                 stream.wait_event(prior)
@@ -79,24 +83,30 @@ class CudaTargetLease:
                 # A fresh target can reuse cached memory with pending work on
                 # its allocator stream. Order the first upload after that work.
                 stream.wait_stream(self._allocation_stream)
-            for recorded in self._recorded_streams:
+            for recorded, event in tuple(self._release_events.items()):
+                if recorded != stream:
+                    stream.wait_event(event)
+            for recorded in tuple(self._recorded_streams):
                 if recorded != stream:
                     stream.wait_stream(recorded)
-            self._recorded_streams.clear()
             try:
                 plan.copy_to_target(
                     target,
                     non_blocking=non_blocking,
                 )
-                self._staged = True
+                copied = True
             finally:
                 # An update or later tensor copy can fail after earlier async
-                # copies were enqueued. Preserve a completion marker so
-                # cleanup still hands the allocation back safely.
-                self._ready_event = cast(
-                    torch.cuda.Event,
-                    stream.record_event(),
-                )
+                # copies were enqueued. Record completion before retiring prior
+                # consumer dependencies so cleanup still synchronizes all work.
+                try:
+                    self._ready_event = cast(torch.cuda.Event, stream.record_event())
+                except BaseException:
+                    self._recorded_streams.add(stream)
+                    raise
+                self._staged = copied
+                self._release_events.clear()
+                self._recorded_streams.clear()
 
     def acquire(self, stream: torch.cuda.Stream) -> HostModuleTarget:
         """Order ``stream`` after staging and mark it as the consumer."""
@@ -118,7 +128,15 @@ class CudaTargetLease:
         self._recorded_streams.add(stream)
 
     def release(self) -> None:
-        """End the acquired state while retaining its stream dependencies."""
+        """End the acquired state and snapshot stream completion for later reuse."""
+        if not self._acquired:
+            return
+        for recorded in tuple(self._recorded_streams):
+            self._release_events[recorded] = cast(
+                torch.cuda.Event,
+                recorded.record_event(),
+            )
+            self._recorded_streams.discard(recorded)
         self._acquired = False
 
     def close(self) -> None:
@@ -130,9 +148,11 @@ class CudaTargetLease:
         """
         if self._target is None:
             return
-        self.release()
+        self._acquired = False
         if self._ready_event is not None:
             self._ready_event.synchronize()
+        for event in self._release_events.values():
+            event.synchronize()
         streams = set(self._recorded_streams)
         streams.add(self._allocation_stream)
         for stream in streams:
@@ -141,6 +161,7 @@ class CudaTargetLease:
         self._ready_event = None
         self._staged = False
         self._recorded_streams.clear()
+        self._release_events.clear()
 
 
 __all__ = ["CudaTargetLease"]

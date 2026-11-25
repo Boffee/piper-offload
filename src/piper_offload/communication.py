@@ -92,7 +92,7 @@ from torch._C._distributed_c10d import (
 
 from ._relay_shared import BUFFERS_PER_RANK, COPY_DTYPES, REDUCTION_DTYPES, SharedRelay, shared_slot_bytes
 from ._relay_staging import HostChunk, TransferPipeline, chunk_ranges, make_host_chunk
-from ._transfer_priority import foreground_transfer
+from ._transfer_priority import ForegroundProducer, foreground_transfer, register_foreground_producer
 from .pin_manager import host_pin_manager
 
 _BACKEND_NAME = "piper_relay"
@@ -249,6 +249,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
         self._p2p_inflight: set[threading.Thread] = set()
         self._p2p_pool: list[tuple[torch.Tensor, torch.cuda.Stream]] = []
         self._shutting_down = False
+        self._foreground_producer: ForegroundProducer | None = None
         options._validate_group_size(size)
         # Different chunk sizes would issue incompatible Gloo collectives.
         settings = dist.PrefixStore("piper_relay_options", store)
@@ -273,6 +274,7 @@ class _RelayProcessGroup(dist.ProcessGroup):
             self._shared = SharedRelay(
                 store, self._cpu_group, rank, size, self._staging_bytes, timeout, ipc=options.transport == "ipc",
             )
+        self._foreground_producer = register_foreground_producer()
 
     def getBackendName(self) -> str:  # noqa: N802 -- PyTorch trampoline name
         return _BACKEND_NAME
@@ -308,6 +310,9 @@ class _RelayProcessGroup(dist.ProcessGroup):
             self._staging_buffer = None
             self._pipeline = None
             self._shared = None
+            if self._foreground_producer is not None:
+                self._foreground_producer.close()
+                self._foreground_producer = None
             with self._p2p_lock:
                 self._p2p_pool.clear()
 

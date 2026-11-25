@@ -41,6 +41,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   rather than `meta` shell placeholder metadata, allocated contiguous device
   storage for projected non-contiguous plain views, and bypassed host
   registration lookups for empty (`0`-element) transfer views.
+- Fixed block streaming lookahead copies serializing behind subsequent compute
+  on the consumer stream or stalling single-GPU execution with unnecessary
+  stream synchronizations; background chunked yielding now activates while a
+  `piper_relay` process group is active in the process or a CUDA
+  `piper_parallel` collective backend targets that GPU, pipelining 2 MiB chunks
+  with at most 4 MiB in flight.
 
 ## [0.10.0rc16] - 2026-11-24
 

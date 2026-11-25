@@ -561,8 +561,9 @@ class PinManager:
         source, and raises otherwise: eviction is safe only because every
         such reader holds one. Pageable storage copies as is. Inside
         :func:`~piper_offload._transfer_priority.background_transfers`, an
-        asynchronous transfer first waits for foreground transfers and has
-        completed when this returns.
+        asynchronous transfer targeting a device with an active foreground
+        producer or foreground transfer waits for foreground transfers and has
+        completed when this returns; otherwise it enqueues asynchronously.
         """
         if source.device.type != "cpu":
             destination.copy_(source, non_blocking=non_blocking)
