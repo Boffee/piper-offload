@@ -311,6 +311,73 @@ class TestRollingCompile:
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     @CUDA
+    @pytest.mark.parametrize("quant_kind", ["mixed-trellis", "mixed-gguf"])
+    def test_mixed_rate_trellis_and_mixed_quant_gguf_rolling_match_compiled(
+        self, quant_kind: str
+    ) -> None:
+        width = 64
+
+        def _build_mixed_model() -> _BlockModel:
+            blocks: list[nn.Module] = []
+            if quant_kind == "mixed-trellis":
+                from piper_offload import TrellisParameter
+
+                for num_bytes in (35, 28, 42):
+                    block = _Block(width=width)
+                    codes = torch.randint(0x20, 0x40, (width, 1), dtype=torch.uint8)
+                    block.proj.weight = TrellisParameter(
+                        torch.randint(0, 256, (width, 1, num_bytes), dtype=torch.uint8),
+                        codes.view(torch.float8_e4m3fn),
+                        torch.rand(width, 1).mul_(1e-3).add_(1e-4),
+                        block_size=width,
+                        group_size=width,
+                    )
+                    blocks.append(block)
+            else:
+                from tests._gguf_helpers import GGUFParameter, packed_q4_0, packed_q8_0
+
+                for quant_type in (2, 8, 2):
+                    block = _Block(width=width)
+                    packed = (
+                        packed_q8_0(width, width)
+                        if quant_type == 8
+                        else packed_q4_0(width, width)
+                    )
+                    block.proj.weight = GGUFParameter(packed, quant_type=quant_type)
+                    blocks.append(block)
+            return _BlockModel(blocks=blocks)
+
+        torch.manual_seed(24)
+        baseline_model = _build_mixed_model()
+        torch.manual_seed(24)
+        rolling_model = _build_mixed_model()
+        torch.manual_seed(25)
+        with torch.inference_mode():
+            x = torch.randn(32, width, device="cuda", dtype=torch.bfloat16)
+        activation = {
+            "adapters": [_lora(3, width)],
+            "adapter_strengths": [0.125],
+            "adapter_mode": "merge",
+            "stochastic_rounding": False,
+        }
+
+        expected = _compiled_output(
+            baseline_model,
+            BlockCompileConfig(dynamic=False, fullgraph=True),
+            lambda: [baseline_model(x).clone() for _ in range(2)],
+            **activation,
+        )
+        actual = _compiled_output(
+            rolling_model,
+            BlockCompileConfig(dynamic=False, fullgraph=True),
+            lambda: [rolling_model(x).clone() for _ in range(2)],
+            block_mode="rolling",
+            **activation,
+        )
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @CUDA
     def test_piper_convrot_structured_slots_match_compiled(self) -> None:
         convrot = pytest.importorskip("piper_kernels.weights.convrot.int8")
         torch.manual_seed(10)

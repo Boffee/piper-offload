@@ -35,6 +35,8 @@ except ImportError:
     PIPER_CONVROT_AVAILABLE = False
     ConvRotInt8Tensor: Any = None
 
+_variable_row_support_cache: list[tuple[object, bool]] = []
+
 
 def is_convrot_int8_tensor(t: object) -> bool:
     """Return whether ``t`` is a Piper ``ConvRotInt8Tensor``."""
@@ -104,7 +106,18 @@ def supports_variable_row_trellis() -> bool:
     """Return whether the installed ``piper-kernels`` decodes variable-row trellis streams."""
     if not PIPER_CONVROT_AVAILABLE:
         return False
-    return "row_widths" in inspect.signature(ConvRotInt8Tensor.copy_from_trellis_).parameters
+    copy_fn = getattr(ConvRotInt8Tensor, "copy_from_trellis_", None)
+    if copy_fn is None:
+        return False
+    cached = _variable_row_support_cache[:]
+    if cached and cached[0][0] is copy_fn:
+        return cached[0][1]
+    try:
+        supported = "row_widths" in inspect.signature(copy_fn).parameters
+    except (TypeError, ValueError):
+        supported = False
+    _variable_row_support_cache[:] = [(copy_fn, supported)]
+    return supported
 
 
 def require_variable_row_trellis() -> None:

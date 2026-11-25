@@ -1,9 +1,10 @@
 """Direct GGUF-to-ConvRot INT8 offload.
 
 GGUF bytes remain compact in host backing. Each active target owns a reusable
-CUDA staging buffer and a BF16 ConvRot INT8 representation. Refills DMA the
-packed bytes and ask Piper Kernels to decode, rotate, and requantize directly
-into that target; no dense weight is materialized.
+BF16 ConvRot INT8 representation without retaining permanent GPU decode staging
+buffers. Refills stage the packed bytes into transient stream-ordered scratch
+memory and ask Piper Kernels to decode, rotate, and requantize directly into
+that target; no dense weight is materialized.
 
 Offload's ``GgufParameter`` and externally supplied Diffusers ``GGUFParameter``
 objects share the ``quant_type``, ``quant_shape``, and ``as_tensor()`` interface.
@@ -18,14 +19,17 @@ from typing import Any, cast
 import torch
 from torch import nn
 
-from ._convrot_int8_source import ConvRotInt8SourceAdapter
+from ._convrot_int8_source import (
+    ConvRotInt8GpuTarget,
+    ConvRotInt8SourceAdapter,
+    stage_packed_tensors,
+)
 from ._piper_convrot_int8 import create_convrot_int8_tensor
 from .gguf_parameter import GGUF_COMPUTE_DTYPE
 from .tensor_adapters import (
     capture_host_tensor,
     is_plain_meta_placeholder,
     matches_layout_signature,
-    transfer_,
 )
 
 __all__ = ["GgufAdapter"]
@@ -103,12 +107,6 @@ class _GgufHost:
     parameter_type: type[nn.Parameter]
 
 
-@dataclass(slots=True, frozen=True)
-class _GgufGpu:
-    staging: torch.Tensor
-    target: torch.Tensor
-
-
 class GgufAdapter(ConvRotInt8SourceAdapter):
     """Keep GGUF bytes on the host and refill fixed ConvRot INT8 targets."""
 
@@ -134,15 +132,12 @@ class GgufAdapter(ConvRotInt8SourceAdapter):
 
     @staticmethod
     def layout_signature(t: torch.Tensor) -> tuple[object, ...]:
-        data = _source_data(t)
-        quant_type = _quant_type(t)
+        _source_data(t)
+        _quant_type(t)
         logical_shape = _logical_shape(t)
         return (
             logical_shape,
             GGUF_COMPUTE_DTYPE,
-            tuple(data.shape),
-            data.stride(),
-            quant_type,
             _convrot_group_size(logical_shape[1]),
         )
 
@@ -190,10 +185,9 @@ class GgufAdapter(ConvRotInt8SourceAdapter):
         return parameter
 
     @staticmethod
-    def alloc_gpu(state: _GgufHost, device: torch.device) -> _GgufGpu:
+    def alloc_gpu(state: _GgufHost, device: torch.device) -> ConvRotInt8GpuTarget:
         rows, features = state.logical_shape
-        return _GgufGpu(
-            staging=torch.empty_like(state.data, device=device),
+        return ConvRotInt8GpuTarget(
             target=create_convrot_int8_tensor(
                 torch.empty((rows, features), dtype=torch.int8, device=device),
                 torch.empty((rows, 1), dtype=torch.float32, device=device),
@@ -205,13 +199,17 @@ class GgufAdapter(ConvRotInt8SourceAdapter):
     @staticmethod
     def copy_to_gpu(
         src: _GgufHost,
-        dst: _GgufGpu,
+        dst: ConvRotInt8GpuTarget,
         *,
         non_blocking: bool = False,
     ) -> None:
-        transfer_(dst.staging, src.data, non_blocking=non_blocking)
+        (staged_data,) = stage_packed_tensors(
+            (src.data,),
+            dst.target.device,
+            non_blocking=non_blocking,
+        )
         cast(Any, dst.target).copy_from_gguf_(
-            dst.staging,
+            staged_data,
             quant_type=src.quant_type,
         )
 
