@@ -1,21 +1,25 @@
-# Block streaming
+# Offloading and Streaming
 
-Block streaming runs models whose weights exceed GPU memory by loading blocks
-as they execute. It trades transfer time for a smaller GPU working set. Start
-with the [README](../README.md) for an overview and [models](models.md) for
+Unit offloading runs models whose weights exceed GPU memory (or models whose
+active weight working set should fit inside a bounded VRAM budget) by loading
+declared units as they execute and retaining hot units up to `vram_budget_bytes`.
+Start with the [README](../README.md) for an overview and [models](models.md) for
 capture, caching, and activation.
 
-## Select block groups
+## Select offloaded units
 
-Set `OffloadConfig.block_paths` to dotted paths resolving to nonempty
-`nn.ModuleList` objects whose block entries are registered submodules of the
-root model (unregistered modules in plain Python lists are rejected during
-preflight). Each list becomes an independent group. The model's
-forward calls its blocks normally, letting Piper's hooks load their weights.
-Everything outside those groups stays resident for the activation by default.
+Set `OffloadConfig.offload_paths` to dotted paths resolving to registered
+callable `nn.Module` submodules or nonempty `nn.ModuleList` objects of the root
+model. Alternatively, call `auto_offload_paths(model, min_unit_bytes=16 * 1024 * 1024)`
+to discover outermost `nn.ModuleList` containers and large callable standalone
+modules whose unique storage meets `min_unit_bytes` without splitting tied
+parameters or selecting non-callable containers (`nn.ModuleDict`,
+`nn.ParameterList`, `nn.ParameterDict`). Everything outside `offload_paths`
+remains resident for the activation.
 
-This small model shows the required structure; the same setup applies to a
-larger model with, for example, a block list at `model.transformer.blocks`:
+This small model shows the required structure; the same setup applies to larger
+models with `model.transformer.blocks` or standalone modules such as `embed`
+and `head`:
 
 ```python
 import torch
@@ -42,7 +46,7 @@ cache = ModelCache()
 spec = ModelSpec(
     key="streaming-example",
     factory=build_model,
-    config=OffloadConfig(block_paths=("blocks",)),
+    config=OffloadConfig(offload_paths=("blocks",)),
 )
 with cache.use(spec, device="cuda") as model, torch.inference_mode():
     output = model(torch.randn(1, 8, device="cuda"))
@@ -51,70 +55,77 @@ del model
 cache.clear()
 ```
 
-Enter `cache.use()` before `torch.inference_mode()` so background copies can
-refill the streamed targets. Keep inference mode around forward computation.
+Enter `cache.use()` before `torch.inference_mode()` so background lookahead
+copies can stage weights cleanly. Keep inference mode around forward computation.
 
-For multiple lists, use
-`OffloadConfig(block_paths=("transformer_blocks", "single_transformer_blocks"))`.
+For multiple modules and block lists, pass
+`OffloadConfig(offload_paths=("embed", "transformer_blocks", "head"))`.
 Pass the same `OffloadConfig` to `ModelSpec`, `ModelOffloader.from_module()`,
 or `ModelStore.bind()` when binding models directly.
 
-Blocks within a group must share parameter and buffer names. Ordinary streaming
-supports differing shapes, dtypes, quantization formats, alias topology, and
-buffer layouts within that structure. Shared storage is preserved within host
-state, including tied embeddings and output heads, or within one streamed block.
-Sharing between host and streamed state, between streamed blocks, or between
-block groups is unsupported. Use whole-model offloading when those ties must be
-preserved. See [`OffloadConfig`](../src/piper_offload/offload_config.py) and
-[`ModelStore`](../src/piper_offload/model_store.py).
+Units within an `nn.ModuleList` may be completely heterogeneous — differing in
+shapes, dtypes, quantization formats, alias topology, or parameter and buffer
+names — because the VRAM pool keys reusable target allocations by structural
+layout signature. Top-level repeated module aliases within one `ModuleList`
+(for example looped shared blocks) are deduplicated to one unit; shared
+stateless submodules (such as `nn.SiLU()`) and shared read-only buffers (such
+as rotary tables) across distinct units are supported. Sharing parameter storage
+or stateful/buffer submodule slots across offload boundaries is unsupported; use
+whole-model resident offloading (`offload_paths=()`) when cross-boundary ties must
+be preserved. Keep direct unit parameter/buffer accesses inside the unit's own
+forward, or remember that invoking another offloaded unit returns the previous
+unit to host storage. See
+[`OffloadConfig`](../src/piper_offload/offload_config.py) and
+[`ModelPartition`](../src/piper_offload/model_partition.py).
 
-The GPU must fit the resident state, block targets, activations, and temporary
-workspace together. Ordinary streaming keeps an active block and a lookahead
-target, overlapping computation with the next whole-block copy. Heterogeneous
-groups may also retain reusable targets for distinct layouts, so two targets
-are not a universal memory bound. Host pinning is configured separately; see
-[memory](memory.md).
+With `offload_paths=()`, activation uploads the whole model once without pinning.
+CPU activation uses the captured CPU state directly: no VRAM pool, offloading
+hooks, or weight copies.
 
-With no block paths, activation uploads the whole model. CPU activation uses
-the captured CPU state directly: no block target pool, streaming hooks, or
-weight copies. It can still use block compilation as described below.
+## Control the VRAM budget
 
-## Choose a block mode
+`vram_budget_bytes` caps the simultaneous **decoded GPU target bytes of
+offloaded units only** (excluding non-offloaded resident weights, activations,
+KV cache, and transient decode scratch; note packed formats such as GGUF and
+Trellis decode to larger ConvRot INT8 GPU targets):
 
-`block_mode` applies to every ordinary and transient block group.
-
-| Mode | CUDA behavior | When to use it |
+| `vram_budget_bytes` | CUDA behavior | When to use it |
 |---|---|---|
-| `"streaming"` (default) | Copies whole blocks through an active/lookahead pool. | General streaming, including heterogeneous groups. |
-| `"resident"` | Loads all block targets at activation. | All weights fit, but per-block compilation or transient group release is useful. |
-| `"rolling"` | Refills one shared target parameter by parameter during compiled computation. | Supported workloads needing a smaller weight working set. |
-| `"auto"` | Selects rolling per compatible group with full-graph compilation; otherwise uses streaming. | Try rolling while allowing unsupported groups to stream normally. |
+| `None` (default) | Strict 2-slot streaming (one active + one lookahead slot), reusing same-signature allocations. | Minimize weight VRAM regardless of model size. |
+| `0` | Releases the active unit's CUDA slot immediately on unit exit and disables async lookahead. | Tightest possible peak VRAM across non-overlapping stages. |
+| `0 < budget < total` | Retains hot units up to `budget`, evicting furthest-future-use idle slots (Belady MIN); async lookahead runs when `active_bytes + next_bytes <= budget` (if `budget` is smaller than one active unit, forward still runs and frees idle slots on exit). | Accelerate multi-step or looped workloads within a fixed weight budget. |
+| `budget >= total` | Preloads all offloaded units on activation using pageable (non-pinned) transfers and no lookahead thread. | Weights fit cleanly in budget, avoiding host pinning and async lookahead while keeping unit compilation. |
 
-Resident mode creates no prefetch thread, private copy stream, or block
-scheduling hooks. Streaming handles direction changes and traversal wraparound.
-Both streaming and rolling load skipped or out-of-order blocks in the
-foreground; streaming then resumes prefetching from the block that ran.
+Offload learns arbitrary execution orders (sequential, reverse, skipped, looped,
+or multi-branch) via an online suffix predictor (`k <= 4`) and overlaps
+computation with the predicted next unit's H2D copy when budget/ceiling permits.
+When merged adapters (LoRA or deltas) are active, parked cached slots retain
+their merged GPU weights across cache hits without re-merging or re-copying.
 
-### Yield to collectives
+To choose a different budget per inference run without rebuilding `ModelStore`
+or `ModelSpec`, pass `vram_budget_bytes=...` directly to
+`ModelOffloader.activate(..., vram_budget_bytes=...)` or
+`cache.use(..., vram_budget_bytes=...)`; omitted activations fall back to
+`OffloadConfig.vram_budget_bytes`.
 
-Weight copies and transfers of the experimental `piper_relay` process group and
-CUDA `ParallelExecutor` (`piper_parallel`) process groups share PCIe/host
-transfer resources, and running both at once on the same GPU slows both. While a
+## Yield to collectives
+
+Weight copies and transfers of the `piper_relay` process group and CUDA
+`ParallelExecutor` (`piper_parallel`) process groups share PCIe/host transfer
+resources, and running both at once on the same GPU slows both. While a
 `piper_relay` process group is active in the process or a CUDA `piper_parallel`
-collective backend targets that GPU, streaming copies the lookahead block one
-tensor at a time, pipelining large contiguous tensors in 2 MiB chunks with at
-most two chunks (4 MiB) in flight on the copy stream and yielding between chunks
-(and between smaller or non-contiguous tensors), so a collective issued inside a
-block waits for at most the queued chunks per active background copy stream
-rather than the whole tensor or block. When neither is active for that GPU,
-lookahead copies enqueue directly without per-chunk or per-tensor stream
-synchronizations. Rolling refills cannot wait; use streaming for blocks that
-issue collectives.
+collective backend targets that GPU, lookahead streaming copies one tensor at a
+time, pipelining large contiguous tensors in 2 MiB chunks with at most two chunks
+(4 MiB) in flight on the copy stream and yielding between chunks (and between
+smaller or non-contiguous tensors), so a collective issued inside a unit waits
+for at most the queued chunks per active background copy stream rather than the
+whole tensor or unit. When neither is active for that GPU, lookahead copies
+enqueue directly without per-chunk or per-tensor stream synchronizations.
 
-### Compile block forwards
+## Compile unit forwards
 
-Compilation is optional. Add one `BlockCompileConfig` to
-the spec for all declared groups. Using the factory above:
+Compilation is optional. Add `block_compile=BlockCompileConfig()` to
+`OffloadConfig` to compile each distinct offloaded unit's `forward`:
 
 ```python
 from piper_offload import BlockCompileConfig, ModelSpec, OffloadConfig
@@ -123,116 +134,23 @@ spec = ModelSpec(
     key="compiled-example",
     factory=build_model,
     config=OffloadConfig(
-        block_paths=("blocks",),
+        offload_paths=("blocks",),
         block_compile=BlockCompileConfig(),
     ),
 )
 ```
 
-Pass this spec to `cache.use()` as above. These examples use distinct keys
-because changing a spec does not replace an already registered cache entry.
-
-Only each distinct block's `forward` is compiled. Module calls and streaming
-pre-hooks remain eager, so weight loading finishes before compiled computation.
-Original forwards are restored on deactivation; later activations can reuse
-cached compiled callables. Without a compile configuration, execution is eager.
-External whole-model `torch.compile(model)` or `model.compile()`, and compilation
-outside declared block groups, are unsupported.
+Pass this spec to `cache.use()` as above. Original forwards are restored on
+deactivation; later activations can reuse cached compiled callables. Without
+a compile configuration, execution is eager. External whole-model
+`torch.compile(model)` or `model.compile()` is unsupported.
 
 The backend is Inductor. Defaults are `dynamic=True` and `fullgraph=False`;
 `options` accepts Inductor settings and compiler extensions, with a separate
-copy of the mapping for each block. There is no `mode` argument. See
-[`BlockCompileConfig`](../src/piper_offload/block_compile.py) for the controls.
-CPU compilation operates on existing host weights and requires a working C++
-toolchain; on Windows, use an x64 MSVC developer shell.
+copy of the mapping for each unit. See
+[`BlockCompileConfig`](../src/piper_offload/block_compile.py) for controls.
+Merge-mode adapters work with compilation; routed LoRA activations run units
+eagerly. CPU compilation operates on existing host weights and requires a working
+C++ toolchain.
 
-Merge-mode adapters work with compilation. An activation with any routed LoRA
-runs all declared blocks eagerly because its child-module hooks stage factors
-inside the block forward. Selecting routed mode without an adapter does not
-disable compilation. See [adapters](adapters.md).
-
-Compiler errors propagate. Piper does not retry a failed compiled invocation
-eagerly: earlier graph segments may already have executed, and retrying could
-repeat mutations. PyTorch's graph-break and recompilation behavior still
-applies.
-
-Compiler artifact caches and workspace are outside resource byte accounting;
-model eviction does not reset the process-wide compiler cache.
-
-### Rolling requirements
-
-Rolling requires full-graph compilation:
-
-```python
-spec = ModelSpec(
-    key="rolling-example",
-    factory=build_model,
-    config=OffloadConfig(
-        block_paths=("blocks",),
-        block_mode="auto",  # use "rolling" to require it
-        block_compile=BlockCompileConfig(fullgraph=True),
-    ),
-)
-```
-
-Rolling overlaps computation with transfers into reusable parameter storage.
-The shared block target, resident state, activations, and workspace must still
-fit together.
-
-Rolling graphs can reuse PyTorch's standard Inductor disk cache after a compiler
-reset or process restart. Custom compiler passes must also support caching.
-PyTorch controls cache storage and lookup, including `TORCHINDUCTOR_CACHE_DIR`.
-
-Rolling is experimental. Groups require distinct block modules, identical
-parameter names/order and layouts, frozen managed parameters, no tied managed
-parameters, no streamed buffers, and no zero-sized parameter slots. Supported
-representations include regular dense, TorchAO-family, GGUF, trellis-coded,
-and Piper ConvRot INT8/NVFP4. DTensor and unreviewed external tensor
-adapters use ordinary streaming in auto mode; explicit rolling rejects
-unsupported groups. Activation-specific parameter overrides must also be
-compatible. See [formats](formats.md) for format and merge restrictions.
-
-Auto falls back for unsupported groups or activation load plans; it does not
-recover from compiler failures. Routed-LoRA activations use eager streaming
-instead of rolling. On CPU, both modes use ordinary compilation without CUDA
-rolling.
-
-The [rolling benchmark](../benchmarks/benchmark_rolling_compile.py) compares
-latency, CUDA memory, and output equivalence against compiled whole-block
-streaming. Validate your model after changing PyTorch or compiler extensions.
-Implementation pointers are in [development](development.md).
-
-## Release working sets during a forward
-
-For inference, transient paths release state before the rest of the model
-finishes:
-
-```python
-spec = ModelSpec(
-    key="transient-example",
-    factory=build_model,
-    config=OffloadConfig(transient_block_paths=("blocks",)),
-)
-```
-
-For models with large non-streamed modules, use
-`transient_paths=("input_embedder", "output_head")` with paths matching those
-modules. A `transient_paths` module owns its non-streamed state recursively and
-releases it after its own successful forward. A `transient_block_paths` group releases
-its working set after its final block. The selected block mode still applies.
-Ordinary `block_paths` retain their working sets throughout the activation;
-the same path cannot appear in both block-path lists.
-
-A successful root-model forward reacquires released components for the next
-invocation. A skipped component stays acquired. If a forward raises after a
-component released, or a transient module is called outside the root model,
-the next root forward reacquires that component before running.
-
-Choose boundaries after which that state is no longer used in the current
-root forward. A transient block group cannot be traversed again later in that
-call, and its module objects must be distinct. Paths must own disjoint state,
-including shared-storage aliases. `ModuleList` and `ModuleDict` entries in `transient_paths` are not expanded
-into child boundaries: the selected module's own forward is the release point.
-Piper does not infer repeated calls, functional parameter access, or
-cross-component aliases. These are caller contracts. CPU activation installs
-no transient scheduling.
+[Back to the README](../README.md)

@@ -19,6 +19,7 @@ from torch import nn
 from ._convrot_int8_source import (
     ConvRotInt8GpuTarget,
     ConvRotInt8SourceAdapter,
+    convrot_int8_target_bytes,
     stage_packed_tensors,
 )
 from ._piper_convrot_int8 import create_convrot_int8_tensor, require_variable_row_trellis
@@ -208,3 +209,12 @@ class TrellisAdapter(ConvRotInt8SourceAdapter):
     @staticmethod
     def cache_bytes(state: _TrellisHost) -> int:
         return sum(tensor.nbytes for tensor in state.parameter.storage_tensors())
+
+    @staticmethod
+    def gpu_target_bytes(state: _TrellisHost) -> int:
+        rows, features = state.parameter.shape
+        return convrot_int8_target_bytes(
+            rows,
+            features,
+            state.parameter.act_per_tensor_scale,
+        )

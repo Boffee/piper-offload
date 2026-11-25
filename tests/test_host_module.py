@@ -1524,7 +1524,7 @@ class TestQuantizedMetaPlaceholderBind:
 
         model_store = ModelStore.from_module(proto)
         sk1 = make_meta_skeleton()
-        model_store.bind(sk1, OffloadConfig(block_paths=("blocks",)))
+        model_store.bind(sk1, OffloadConfig(offload_paths=("blocks",)))
         for idx, (exp_q, exp_s) in enumerate(((b0_q, b0_s), (b1_q, b1_s))):
             w = sk1.blocks[idx].weight.data
             assert isinstance(w, convrot_cls)
@@ -1532,7 +1532,7 @@ class TestQuantizedMetaPlaceholderBind:
             assert torch.equal(w.scale, exp_s)
 
         sk2 = make_meta_skeleton()
-        model_store.bind(sk2, OffloadConfig(block_paths=("blocks",), block_mode="streaming"))
+        model_store.bind(sk2, OffloadConfig(offload_paths=("blocks",)))
         assert isinstance(sk2.head.weight.data, convrot_cls)
         assert torch.equal(sk2.head.weight.data.qdata, head_q)
         for idx, (exp_q, exp_s) in enumerate(((b0_q, b0_s), (b1_q, b1_s))):
@@ -1551,7 +1551,7 @@ class TestQuantizedMetaPlaceholderBind:
         skeleton = make_meta_skeleton()
         offloader = model_store.bind(
             skeleton,
-            OffloadConfig(block_paths=("blocks",), block_mode="streaming"),
+            OffloadConfig(offload_paths=("blocks",)),
         )
 
         x = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
@@ -1559,7 +1559,10 @@ class TestQuantizedMetaPlaceholderBind:
             actual = skeleton.blocks[1](skeleton.blocks[0](skeleton.head(x)))
         proto_off = ModelOffloader.from_module(
             proto,
-            config=OffloadConfig(block_paths=("blocks",), block_mode="resident"),
+            config=OffloadConfig(
+                offload_paths=("blocks",),
+                vram_budget_bytes=1024 * 1024 * 1024,
+            ),
         )
         with activated_model(proto_off, "cuda"):
             expected = proto.blocks[1](proto.blocks[0](proto.head(x)))

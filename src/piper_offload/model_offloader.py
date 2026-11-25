@@ -1,11 +1,10 @@
 """Unified CUDA offload binding with optional adapter application.
 
-Supports whole-model host bulk offload or block streaming, with optional
-per-parameter adapter application.
+Supports resident bulk offload and dynamic unit residency / streaming with
+optional per-parameter adapter application.
 """
 
 import threading
-import weakref
 from collections.abc import Callable, Sequence
 from typing import Self
 
@@ -14,46 +13,27 @@ from torch import nn
 
 from ._devices import canonical_device
 from ._parameter_update import plan_merge_targets
-from .adapter import Adapter, AdapterMode, AdapterTargetUpdates, group_adapter_updates, resolve_adapter_strengths
-from .block_component import BlockComponent
-from .composite_component import CompositeComponent, _capture_and_bind, _ShellClaim, claim_shell
-from .host_component import HostComponent
+from .adapter import (
+    Adapter,
+    AdapterMode,
+    AdapterTargetUpdates,
+    group_adapter_updates,
+    resolve_adapter_strengths,
+)
 from .host_module import ParameterOverride
 from .lora import ScaledLoRAFactor, install_routed_residual_hook
+from .model_partition import ModelPartition, _capture_and_bind, _ShellClaim, claim_shell
 from .module_names import resolve_parent_leaf
-from .offload_config import OffloadConfig, resolve_offload_config
+from .offload_config import (
+    _USE_CONFIG_BUDGET,
+    OffloadConfig,
+    _UseConfigBudget,
+    resolve_offload_config,
+    validate_vram_budget,
+)
 from .pin_manager import PinLease, host_pin_manager
 
 type _ParameterUpdateMap = dict[str, AdapterTargetUpdates]
-type _TransientComponent = HostComponent | BlockComponent
-type _ForwardHook = Callable[
-    [nn.Module, tuple[object, ...], object],
-    object | None,
-]
-
-
-def _release_after_forward_hook(
-    component: _TransientComponent,
-    *,
-    record_device: torch.device | None = None,
-) -> _ForwardHook:
-    component_ref = weakref.ref(component)
-
-    def release(
-        _module: nn.Module,
-        _args: tuple[object, ...],
-        _output: object,
-    ) -> None:
-        component = component_ref()
-        if component is not None:
-            if record_device is not None:
-                assert isinstance(component, HostComponent)
-                component.record_stream(
-                    torch.cuda.current_stream(record_device),
-                )
-            component.release()
-
-    return release
 
 
 class ModelRuntimeInUseError(RuntimeError):
@@ -76,7 +56,7 @@ __all__ = [
 
 
 class ModelOffloader:
-    """Move a whole model or managed block groups between host RAM and
+    """Move a whole model or managed offload units between host RAM and
     CUDA, with optional adapter application.
 
     Construct directly from a module with :meth:`from_module` or bind a reusable
@@ -86,40 +66,40 @@ class ModelOffloader:
     replicas or serve overlapping activations. Concurrent use fails immediately
     with :class:`ModelRuntimeInUseError`.
 
-    :class:`~piper_offload.offload_config.OffloadConfig` selects block paths,
-    transient groups, CUDA execution mode, and optional Inductor compilation.
-    Adapter requests are supplied directly to :meth:`activate`; merge mode builds
-    activation-scoped parameter overrides so each update runs immediately after
-    its source is copied to CUDA. No separate merge binding is needed.
+    :class:`~piper_offload.offload_config.OffloadConfig` selects
+    ``offload_paths``, ``vram_budget_bytes``, and optional per-unit Inductor
+    compilation. Adapter requests are supplied directly to :meth:`activate`;
+    merge mode builds activation-scoped parameter overrides so each update runs
+    once when staged and stays cached across hits.
 
     Parameters
     ----------
     model:
-        The concrete model bound to the supplied composite.
-    composite:
-        Bound internal :class:`CompositeComponent` owning the model's host
-        and block offload components.
+        The concrete model bound to the supplied partition.
+    partition:
+        Bound internal :class:`ModelPartition` owning the model's host backing
+        and :class:`~piper_offload.residency_engine.ResidencyEngine`.
     cache_bytes:
-        Stable host-cache bytes owned by the bound components.
+        Stable host-cache bytes owned by the bound store.
     """
 
     def __init__(
         self,
         model: nn.Module,
         *,
-        composite: CompositeComponent,
+        partition: ModelPartition,
         cache_bytes: int,
         _shell_claim: _ShellClaim | None = None,
     ) -> None:
         self._shell_claim = claim_shell(model) if _shell_claim is None else _shell_claim
         self._model = model
         self._active_device: torch.device | None = None
-        self._composite = composite
+        self._partition = partition
+        self._engine = partition.engine
         self._cache_bytes = cache_bytes
         self._activation_lock = threading.Lock()
         self._routed_hook_removers: list[Callable[[], None]] = []
         self._routed_lease: PinLease | None = None
-        self._transient_hook_removers: list[Callable[[], None]] = []
 
     @classmethod
     def from_module(
@@ -130,9 +110,9 @@ class ModelOffloader:
         """Capture ``model`` and bind it under ``config`` as one cached runtime.
 
         Capture installs host backing on ``model``. The runtime retains those
-        bindings across activations. ``config`` configures ``block_paths``,
-        ``transient_block_paths``, ``transient_paths``, ``block_mode``, and
-        ``block_compile`` (defaulting to whole-model offload when omitted).
+        bindings across activations. ``config`` configures ``offload_paths``,
+        ``vram_budget_bytes``, and ``block_compile`` (defaulting to whole-model
+        resident offload when omitted).
         Requires frozen parameters (``requires_grad=False``) and takes
         ownership of compatible pageable CPU backing for every managed
         parameter and buffer, including non-resizable checkpoint views, while
@@ -140,11 +120,11 @@ class ModelOffloader:
         devices and incompatible views are normalized into CPU storage.
         """
         resolved = resolve_offload_config(config)
-        store, composite, claim = _capture_and_bind(model, resolved)
+        store, partition, claim = _capture_and_bind(model, resolved)
         try:
             return cls(
                 model,
-                composite=composite,
+                partition=partition,
                 cache_bytes=store.cache_bytes,
                 _shell_claim=claim,
             )
@@ -252,75 +232,15 @@ class ModelOffloader:
         )
         return handle.remove
 
-    def _install_transient_hooks(self) -> None:
-        active_device = self._active_device
-        assert active_device is not None
-        assert active_device.type == "cuda"
-        components: list[_TransientComponent] = []
-        for path, component in self._composite.transient:
-            self._transient_hook_removers.append(
-                self.register_forward_hook(
-                    path,
-                    _release_after_forward_hook(
-                        component,
-                        record_device=active_device,
-                    ),
-                )
-            )
-            components.append(component)
-
-        for block_component in self._composite.transient_blocks:
-            handle = block_component.blocks[-1].register_forward_hook(
-                _release_after_forward_hook(block_component),
-            )
-            self._transient_hook_removers.append(handle.remove)
-            components.append(block_component)
-
-        component_refs = tuple(weakref.ref(component) for component in components)
-
-        def reacquire() -> None:
-            for component_ref in component_refs:
-                component = component_ref()
-                if component is not None:
-                    component.acquire()
-
-        def reacquire_before_forward(
-            _module: nn.Module,
-            _args: tuple[object, ...],
-        ) -> None:
-            # A forward that raised after a component released, or a direct
-            # call of a transient submodule, skips the post-hook below.
-            # Acquisition is idempotent, so this is a no-op after a successful
-            # forward and otherwise restores the working set before it is used.
-            reacquire()
-
-        def reacquire_after_forward(
-            _module: nn.Module,
-            _args: tuple[object, ...],
-            _output: object,
-        ) -> None:
-            reacquire()
-
-        self._transient_hook_removers.append(
-            self._model.register_forward_pre_hook(reacquire_before_forward).remove,
-        )
-        self._transient_hook_removers.append(self.register_forward_hook("", reacquire_after_forward))
-
-    def _clear_transient_hooks(self) -> None:
-        remove_hooks = self._transient_hook_removers
-        self._transient_hook_removers = []
-        for remove_hook in reversed(remove_hooks):
-            remove_hook()
-
     def _clear_active_adapter_hooks(self) -> None:
         remove_hooks = self._routed_hook_removers
         self._routed_hook_removers = []
         for remove_hook in reversed(remove_hooks):
             remove_hook()
-        # Routed staging can still be in flight only if a component failed to
-        # finish releasing; the lease then stays, like theirs, until a retry
-        # releases them.
-        if self._routed_lease is not None and not self._composite.failed:
+        # Routed staging can still be in flight only if the residency engine
+        # failed to finish releasing; the lease then stays until a retry
+        # releases it.
+        if self._routed_lease is not None and not self._engine.failed:
             self._routed_lease.close()
             self._routed_lease = None
 
@@ -345,12 +265,17 @@ class ModelOffloader:
         return self._active_device
 
     @property
+    def vram_budget_bytes(self) -> int | None:
+        """VRAM budget for offloaded units in the active session, or configured default."""
+        return self._engine.vram_budget_bytes
+
+    @property
     def failed(self) -> bool:
-        """Whether a prior CUDA session still holds device work it could not release.
+        """Whether a prior session still holds CUDA, pin, or compile state it could not release.
 
         The next :meth:`deactivate` or :meth:`activate` retries the release.
         """
-        return self._composite.failed
+        return self._engine.failed
 
     @property
     def _retains_cache_lease(self) -> bool:
@@ -360,19 +285,19 @@ class ModelOffloader:
     def _retry_release(self) -> None:
         """Retry releasing what a prior session kept; the caller holds the activation lock."""
         try:
-            self._composite.deactivate()
+            self._engine.deactivate()
         finally:
             self._clear_active_adapter_hooks()
 
     @property
     def param_names(self) -> frozenset[str]:
         """Parameter names managed by this offloader."""
-        return self._composite.param_names
+        return self._partition.param_names
 
     @property
     def buffer_names(self) -> frozenset[str]:
         """Buffer names managed by this offloader."""
-        return self._composite.buffer_names
+        return self._partition.buffer_names
 
     def _resolve_device(self, device: torch.device | str | None) -> torch.device:
         if device is not None:
@@ -391,8 +316,14 @@ class ModelOffloader:
         adapter_strengths: Sequence[float] | None = None,
         adapter_mode: AdapterMode = "merge",
         stochastic_rounding: bool = True,
+        vram_budget_bytes: int | _UseConfigBudget | None = _USE_CONFIG_BUDGET,
     ) -> None:
         """Make the owned model usable on ``device``.
+
+        ``vram_budget_bytes`` optionally overrides :attr:`OffloadConfig.vram_budget_bytes`
+        for this session only (for example, to pass the free-VRAM budget
+        available for offloaded unit weights in this run); omitting it uses the
+        configured default on every activation.
 
         ``adapters`` and their optional ``adapter_strengths`` apply only to this
         activation. Exact-zero strengths are inactive and create no updates.
@@ -417,6 +348,8 @@ class ModelOffloader:
         retries that release; if it fails again, activation raises
         :class:`ModelRuntimeFailedError` before activating any component.
         """
+        if not isinstance(vram_budget_bytes, _UseConfigBudget):
+            validate_vram_budget(vram_budget_bytes)
         active_device = self._resolve_device(device)
         if not self._activation_lock.acquire(blocking=False):
             raise ModelRuntimeInUseError(
@@ -448,16 +381,16 @@ class ModelOffloader:
                     )
                 else:
                     self._register_routed_lora_hooks(updates)
-            schedule_transient = active_device.type == "cuda" and (
-                bool(self._composite.transient) or bool(self._composite.transient_blocks)
+            resident_overrides, unit_overrides = self._partition.route_overrides(
+                parameter_overrides
             )
-            self._composite.activate(
+            self._engine.activate(
                 active_device,
                 compile_blocks=not (updates and adapter_mode == "routed"),
-                parameter_overrides=parameter_overrides,
+                resident_overrides=resident_overrides,
+                unit_overrides=unit_overrides,
+                vram_budget_bytes=vram_budget_bytes,
             )
-            if schedule_transient:
-                self._install_transient_hooks()
         except BaseException:
             if self._active_device is None:
                 # Nothing was activated yet; only the claim is held.
@@ -482,18 +415,13 @@ class ModelOffloader:
                 finally:
                     self._activation_lock.release()
             return
-        # Scheduling hooks must stop before their components deactivate; the
-        # components synchronize before routed hooks and their lease go.
-        # Cleanup and the activation-lock release still run if component
-        # teardown raises.
+        # Engine synchronizes before routed hooks and their lease go. Cleanup
+        # and the activation-lock release still run if engine teardown raises.
         try:
-            self._clear_transient_hooks()
+            self._engine.deactivate()
         finally:
             try:
-                self._composite.deactivate()
+                self._clear_active_adapter_hooks()
             finally:
-                try:
-                    self._clear_active_adapter_hooks()
-                finally:
-                    self._active_device = None
-                    self._activation_lock.release()
+                self._active_device = None
+                self._activation_lock.release()

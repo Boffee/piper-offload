@@ -274,7 +274,10 @@ def test_mapped_blocks_execute_and_preserve_pinning_policy(checkpoint, pins, mod
     sources = [parameter.as_tensor() for parameter in model.parameters()]
     offloader = ModelOffloader.from_module(
         model,
-        OffloadConfig(block_paths=("blocks",), block_mode=mode),
+        OffloadConfig(
+            offload_paths=("blocks",),
+            vram_budget_bytes=1024 * 1024 * 1024 if mode == "resident" else None,
+        ),
     )
     value = torch.randn(2, 64, device="cuda", dtype=torch.bfloat16)
     expected = value

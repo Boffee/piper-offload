@@ -15,6 +15,7 @@ import torch
 from torch import nn
 
 from .adapter import AdapterMode, resolve_adapter_strengths
+from .offload_config import _USE_CONFIG_BUDGET, _UseConfigBudget
 from .resource_cache import ResourceCache
 from .resource_specs import AdapterSpec, ModelSpec
 
@@ -45,9 +46,13 @@ class ModelCache(ResourceCache):
         adapter_strengths: Sequence[float] | None = None,
         adapter_mode: AdapterMode = "merge",
         stochastic_rounding: bool = True,
+        vram_budget_bytes: int | _UseConfigBudget | None = _USE_CONFIG_BUDGET,
     ) -> Generator[M]:
         """Lease dependencies and activate a cached model runtime.
 
+        ``vram_budget_bytes`` optionally overrides the model spec's configured
+        ``OffloadConfig.vram_budget_bytes`` for this activation only; omitting
+        it uses the configured default on every run.
         ``adapter_strengths`` defaults to one for each adapter and, when
         supplied, must have the same length as ``adapter_specs``. Repeated resource keys
         contribute once per occurrence. Exact-zero strengths are inactive and
@@ -68,6 +73,7 @@ class ModelCache(ResourceCache):
                 adapter_strengths=None if adapter_strengths is None else tuple(strength for _, strength in active),
                 adapter_mode=adapter_mode,
                 stochastic_rounding=stochastic_rounding,
+                vram_budget_bytes=vram_budget_bytes,
             )
             try:
                 yield cast(M, offloader.value)

@@ -75,16 +75,16 @@ def activated_model(
         offloader.deactivate()
 
 
-def block_components(offloader: object) -> list:
-    """A ModelOffloader's block components (test-introspection helper)."""
-    return list(offloader._composite.blocks)  # type: ignore[attr-defined]
+def residency_engine(offloader: object):
+    """A ModelOffloader's ResidencyEngine (test-introspection helper)."""
+    return offloader._engine  # type: ignore[attr-defined]
 
 
-def host_component(offloader: object):
-    """A ModelOffloader's resident component, or None."""
-    return offloader._composite.resident  # type: ignore[attr-defined]
+def resident_instance(offloader: object):
+    """A ModelOffloader's resident HostModuleInstance, or None."""
+    return offloader._engine.resident  # type: ignore[attr-defined]
 
 
-def transient_components(offloader: object) -> list:
-    """A ModelOffloader's ``(path, component)`` transient pairs."""
-    return list(offloader._composite.transient)  # type: ignore[attr-defined]
+def offloaded_units(offloader: object) -> list:
+    """A ModelOffloader's offloaded unit HostModuleInstances."""
+    return list(offloader._engine.units)  # type: ignore[attr-defined]

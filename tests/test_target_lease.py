@@ -111,6 +111,9 @@ def test_close_synchronizes_target_work_before_drop() -> None:
         def __init__(self) -> None:
             self.synchronize_calls = 0
 
+        def wait_event(self, _event: object) -> None:
+            pass
+
         def synchronize(self) -> None:
             self.synchronize_calls += 1
 
@@ -555,3 +558,134 @@ def test_release_interruption_preserves_remaining_streams() -> None:
     assert retry_lease._recorded_streams == set()
     assert len(retry_lease._release_events) == 2
     retry_lease.close()
+
+
+def test_acquire_preserves_staged_and_skips_redundant_wait_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Event:
+        def synchronize(self) -> None:
+            pass
+
+    class Stream:
+        def __init__(self) -> None:
+            self.wait_calls: list[object] = []
+            self.events: list[Event] = []
+
+        def wait_event(self, event: object) -> None:
+            self.wait_calls.append(event)
+
+        def wait_stream(self, _stream: object) -> None:
+            pass
+
+        def record_event(self) -> Event:
+            event = Event()
+            self.events.append(event)
+            return event
+
+        def synchronize(self) -> None:
+            pass
+
+    class Plan:
+        def copy_to_target(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    allocation_stream = Stream()
+    copy_stream = Stream()
+    stream_a = Stream()
+    stream_b = Stream()
+    target = cast(HostModuleTarget, object())
+    lease = CudaTargetLease(target, cast(torch.cuda.Stream, allocation_stream))
+    ready_event = cast(torch.cuda.Event, Event())
+    lease._ready_event = ready_event
+    lease._staged = True
+
+    first = lease.acquire(cast(torch.cuda.Stream, stream_a))
+    assert first is target
+    assert stream_a.wait_calls == [ready_event]
+    lease.release()
+    assert lease._staged
+
+    # Re-acquiring on the same stream skips redundant wait_event.
+    second = lease.acquire(cast(torch.cuda.Stream, stream_a))
+    assert second is target
+    assert stream_a.wait_calls == [ready_event]
+    lease.release()
+
+    # Acquiring on a distinct stream still waits on the ready event once.
+    third = lease.acquire(cast(torch.cuda.Stream, stream_b))
+    assert third is target
+    assert stream_b.wait_calls == [ready_event]
+    lease.release()
+
+    # Re-staging via stage() clears waited streams so stream_a must wait again.
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: contextlib.nullcontext())
+    lease.stage(cast(HostModuleLoadPlan, Plan()), cast(torch.cuda.Stream, copy_stream))
+    new_event = copy_stream.events[-1]
+    fourth = lease.acquire(cast(torch.cuda.Stream, stream_a))
+    assert fourth is target
+    assert stream_a.wait_calls == [ready_event, new_event]
+    lease.release()
+    lease.close()
+
+
+def test_record_stream_orders_distinct_stream_after_ready_event_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Event:
+        def synchronize(self) -> None:
+            pass
+
+    class Stream:
+        def __init__(self) -> None:
+            self.wait_calls: list[object] = []
+            self.events: list[Event] = []
+
+        def wait_event(self, event: object) -> None:
+            self.wait_calls.append(event)
+
+        def wait_stream(self, _stream: object) -> None:
+            pass
+
+        def record_event(self) -> Event:
+            event = Event()
+            self.events.append(event)
+            return event
+
+        def synchronize(self) -> None:
+            pass
+
+    class Plan:
+        def copy_to_target(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    allocation_stream = Stream()
+    copy_stream = Stream()
+    stream_a = Stream()
+    stream_b = Stream()
+    target = cast(HostModuleTarget, object())
+    lease = CudaTargetLease(target, cast(torch.cuda.Stream, allocation_stream))
+    ready_event = cast(torch.cuda.Event, Event())
+    lease._ready_event = ready_event
+    lease._staged = True
+
+    lease.acquire(cast(torch.cuda.Stream, stream_a))
+    assert stream_a.wait_calls == [ready_event]
+
+    lease.record_stream(cast(torch.cuda.Stream, stream_b))
+    assert stream_b.wait_calls == [ready_event]
+
+    # Repeated recording on the same stream skips redundant wait_event.
+    lease.record_stream(cast(torch.cuda.Stream, stream_b))
+    assert stream_b.wait_calls == [ready_event]
+    lease.release()
+
+    # Re-staging via stage() clears waited streams so stream_b waits again on the new event.
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: contextlib.nullcontext())
+    lease.stage(cast(HostModuleLoadPlan, Plan()), cast(torch.cuda.Stream, copy_stream))
+    new_event = copy_stream.events[-1]
+    lease.acquire(cast(torch.cuda.Stream, stream_a))
+    lease.record_stream(cast(torch.cuda.Stream, stream_b))
+    assert stream_b.wait_calls == [ready_event, new_event]
+    lease.release()
+    lease.close()

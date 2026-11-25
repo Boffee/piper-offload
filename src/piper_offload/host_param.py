@@ -1,8 +1,8 @@
 """Per-parameter CPU storage primitive.
 
 Internal to the ``piper_offload`` subpackage. Shared by
-:class:`ModelStore`, :class:`ModelOffloader` (whole-model bulk capture), and
-:class:`BlockComponent` (per-block streaming). Both consumers reach this through
+:class:`ModelStore`, :class:`ModelOffloader`, and
+:class:`ResidencyEngine`. Both callers reach this through
 the same abstraction so the addition of new tensor types only requires writing
 a new :class:`TensorAdapter`, not editing the consumers.
 
@@ -24,6 +24,9 @@ from .tensor_adapters import (
     TensorAdapter,
     accepts_bind_target,
     clone_host_state,
+)
+from .tensor_adapters import (
+    gpu_target_bytes as _adapter_gpu_target_bytes,
 )
 
 
@@ -206,7 +209,7 @@ class HostParam:
             # Physical regular tensors are normalized to contiguous backing,
             # but meta parameters retain their declared layout while resting.
             # Keep differing unresolved meta layouts out of the same
-            # streaming/rolling target pool. A ParameterValue load replaces
+            # VRAM target pool. A ParameterValue load replaces
             # this signature with its physical source layout.
             signature = (
                 "meta",
@@ -217,24 +220,6 @@ class HostParam:
         return (type(adapter), signature)
 
     @classmethod
-    def rolling_slot_metadata_for(
-        cls,
-        param: nn.Parameter,
-    ) -> tuple[type, torch.Size, tuple[object, object]]:
-        """Adapter type, representation shape, and target layout before capture.
-
-        Keeps :class:`HostParam` as the single owner of adapter dispatch and
-        representation shape for pre-capture rolling validation.
-        """
-        representation = param_representation(param)
-        adapter = select_adapter(representation)
-        return (
-            type(adapter),
-            torch.Size(representation.shape),
-            cls._target_layout_from_adapter(adapter, representation),
-        )
-
-    @classmethod
     def target_layout_for(cls, param: nn.Parameter) -> tuple[object, object]:
         """Opaque target-compatibility layout for ``param``.
 
@@ -242,7 +227,9 @@ class HostParam:
         :class:`HostParam` mutates the source parameter. Callers should
         compare the returned value for equality only.
         """
-        return cls.rolling_slot_metadata_for(param)[2]
+        representation = param_representation(param)
+        adapter = select_adapter(representation)
+        return cls._target_layout_from_adapter(adapter, representation)
 
     def accepts_bind_target(self, param: nn.Parameter) -> bool:
         """Return whether ``param`` is a compatible bind target for this host store.
@@ -420,3 +407,11 @@ class HostParam:
         if self.is_meta:
             return 0
         return self.adapter.cache_bytes(self.host_state)
+
+    @property
+    def gpu_target_bytes(self) -> int:
+        """Unique GPU target storage bytes allocated by :meth:`allocate_gpu_storage`."""
+        if self.is_meta:
+            source = cast(torch.Tensor, self.host_state)
+            return source.numel() * source.element_size()
+        return _adapter_gpu_target_bytes(self.adapter, self.host_state)

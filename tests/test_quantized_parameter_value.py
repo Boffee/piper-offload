@@ -6,12 +6,9 @@ from torch import nn
 
 from piper_offload import (
     Adapter,
-    BlockCompileConfig,
     ModelOffloader,
-    OffloadConfig,
     ParameterValue,
     merge_adapter,
-    register_adapter,
 )
 from piper_offload.tensor_adapter_registry import (
     param_representation,
@@ -21,7 +18,7 @@ from piper_offload.tensor_adapters import (
     DenseMergeTensorAdapter,
     DequantizeTensorAdapter,
 )
-from tests.conftest import activated_model, block_components
+from tests.conftest import activated_model
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -185,59 +182,6 @@ def test_structured_parameter_value_dtype_is_representation_owned() -> None:
             source,
             dtype=torch.float16,
         )
-
-
-@CUDA
-@pytest.mark.parametrize("block_mode", ["auto", "rolling"])
-def test_only_auto_falls_back_for_incompatible_value_adapter(block_mode) -> None:
-    from tests._block_compile_helpers import _BlockModel
-    from tests.test_tensor_adapter_registry import (
-        _ExternalAdapter,
-        _ExternalTensor,
-    )
-
-    dim = 8
-    with torch.device("meta"):
-        model = _BlockModel(width=dim)
-    offloader = ModelOffloader.from_module(
-        model,
-        OffloadConfig(
-            block_paths=("blocks",),
-            block_mode=block_mode,
-            block_compile=BlockCompileConfig(fullgraph=True),
-        ),
-    )
-    component = block_components(offloader)[0]
-    assert component.block_mode == "rolling"
-    assert component._inductor_compile is None
-
-    remove_adapter = register_adapter(_ExternalAdapter)
-    try:
-        incompatible = Adapter.from_state_dict(
-            {
-                f"blocks.{idx}.proj.weight": torch.Tensor._make_subclass(
-                    _ExternalTensor,
-                    torch.eye(dim),
-                    False,
-                )
-                for idx in range(2)
-            },
-        )
-        if block_mode == "rolling":
-            with pytest.raises(NotImplementedError, match="does not support active parameter adapter"):
-                offloader.activate("cuda", adapters=[incompatible])
-            assert offloader.active_device is None
-            return
-        offloader.activate("cuda", adapters=[incompatible])
-        assert component._active_runtime is component._eager_runtime
-        assert component._inductor_compile is not None
-        assert component._inductor_compile.installed
-        assert not component._block_compile.installed
-    finally:
-        offloader.deactivate()
-        remove_adapter()
-    assert component._inductor_compile is not None
-    assert not component._inductor_compile.installed
 
 
 @pytest.mark.parametrize("kind", ["piper-convrot-int8", "piper-convrot-nvfp4"])

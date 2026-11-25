@@ -329,8 +329,17 @@ def _assert_mapped_delta_sources(adapter, sources):
 
 
 @CUDA
-@pytest.mark.parametrize("block_mode", ["resident", "streaming", "rolling"])
-def test_broadcast_activation_restores_mapped_model_and_sources(tmp_path, block_mode):
+@pytest.mark.parametrize(
+    ("vram_budget_bytes", "compiled"),
+    [
+        (1024 * 1024 * 1024, False),
+        (None, False),
+        (None, True),
+    ],
+)
+def test_broadcast_activation_restores_mapped_model_and_sources(
+    tmp_path, vram_budget_bytes, compiled
+):
     model = _StackedModel()
     base = {name: tensor.clone() for name, tensor in model.state_dict().items()}
     prefixes = ["head", "blocks.0", "blocks.1", "blocks.2"]
@@ -373,9 +382,9 @@ def test_broadcast_activation_restores_mapped_model_and_sources(tmp_path, block_
     offloader = ModelOffloader.from_module(
         model,
         OffloadConfig(
-            block_paths=("blocks",),
-            block_mode=block_mode,
-            block_compile=BlockCompileConfig(dynamic=False, fullgraph=True) if block_mode == "rolling" else None,
+            offload_paths=("blocks",),
+            vram_budget_bytes=vram_budget_bytes,
+            block_compile=BlockCompileConfig(dynamic=False, fullgraph=True) if compiled else None,
         ),
     )
     x = torch.tensor([[0.5, -0.75, 0.125], [1.0, 0.25, -0.5]])

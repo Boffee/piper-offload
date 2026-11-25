@@ -37,14 +37,14 @@ to register that storage. Piper's built-in runtimes choose as follows:
 
 | Transfer | Requests new registration |
 |---|---|
-| Streaming blocks, rolling blocks, experimental host relay | Yes: the transfer repeats |
-| Resident blocks, host components | No: pageable lease |
+| Streamed or partially cached offloaded units, experimental host relay | Yes: the transfer repeats |
+| Resident remainder and all-resident preloaded units | No: pageable lease |
 | Routed LoRA factors | No: pageable lease while hooks are installed |
 | CPU execution | No lease |
 
 A pageable lease can hold a registration that already exists; it requests no
-new registrations. See [streaming](streaming.md) for block modes and
-[adapters](adapters.md) for routed factors.
+new registrations. See [streaming](streaming.md) for offloading and VRAM budget
+modes, and [adapters](adapters.md) for routed factors.
 
 ## Inspect and release memory
 
@@ -206,9 +206,9 @@ while the manager owns it.
 
 A storage left pageable stays pageable until all its active leases close, even
 if capacity becomes available. Dropping its tensor owners retires a registration,
-which is released after its remaining leases close. Temporary working-set
-releases during a transient module or block forward also close their leases;
-the next reacquisition obtains a lease again.
+which is released after its remaining leases close. Using `vram_budget_bytes=0`
+frees each offloaded unit's GPU target slot on unit exit without closing the
+session's host pin lease; host pin leases close when the model deactivates.
 
 A runtime capacity failure evicts unrelated idle registrations and retries the
 current registration. If capacity remains unavailable, the rest of that

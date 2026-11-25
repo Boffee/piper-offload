@@ -11,7 +11,6 @@ retries what was kept and runs the model as before. A release that keeps failing
 paths join ``_CONFIGS``.
 """
 
-import contextlib
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -24,20 +23,21 @@ from torch import nn
 from piper_offload import (
     Adapter,
     BlockCompileConfig,
-    BlockMode,
     ModelOffloader,
     ModelRuntimeFailedError,
     OffloadConfig,
 )
+from piper_offload.block_compile import _BlockCompileState
 from piper_offload.host_module import HostModuleInstance, HostModuleLoadPlan
-from tests.conftest import Interrupt, activated_model, block_components
+from tests.conftest import Interrupt, activated_model, residency_engine
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 _WIDTH = 8
 _NUM_BLOCKS = 3
+_UNIT_BYTES = _WIDTH * _WIDTH * 4
 
-type _Step = Literal["synchronize", "restore", "refill"]
+type _Step = Literal["synchronize", "restore"]
 
 
 class _Block(nn.Module):
@@ -66,23 +66,20 @@ class _Model(nn.Module):
 
 @dataclass(frozen=True)
 class _Config:
-    block_mode: BlockMode | None
-    transient: bool = False
+    offload_paths: tuple[str, ...]
+    vram_budget_bytes: int | None = None
+    compiled: bool = False
     routed: bool = False
 
     def offloader(self, model: nn.Module) -> ModelOffloader:
-        if self.block_mode is None:
-            return ModelOffloader.from_module(model)
         return ModelOffloader.from_module(
             model,
             OffloadConfig(
-                block_paths=() if self.transient else ("blocks",),
-                transient_block_paths=("blocks",) if self.transient else (),
-                transient_paths=("embed",) if self.transient else (),
-                block_mode=self.block_mode,
+                offload_paths=self.offload_paths,
+                vram_budget_bytes=self.vram_budget_bytes,
                 block_compile=(
                     BlockCompileConfig(dynamic=False, fullgraph=True)
-                    if self.block_mode == "rolling"
+                    if self.compiled
                     else None
                 ),
             ),
@@ -99,12 +96,13 @@ class _Config:
 
 
 _CONFIGS = (
-    pytest.param(_Config(None), id="host-only"),
-    pytest.param(_Config("streaming"), id="streaming"),
-    pytest.param(_Config("resident"), id="resident"),
-    pytest.param(_Config("rolling"), id="rolling"),
-    pytest.param(_Config("streaming", transient=True), id="streaming-transient"),
-    pytest.param(_Config("streaming", routed=True), id="streaming-routed"),
+    pytest.param(_Config(()), id="host-only"),
+    pytest.param(_Config(("blocks",), None), id="streaming"),
+    pytest.param(_Config(("blocks",), 0), id="zero-budget"),
+    pytest.param(_Config(("blocks",), 2 * _UNIT_BYTES), id="partial-cache"),
+    pytest.param(_Config(("blocks",), 1024 * 1024 * 1024), id="all-resident"),
+    pytest.param(_Config(("embed", "blocks"), None, compiled=True), id="mixed-compiled"),
+    pytest.param(_Config(("blocks",), None, routed=True), id="streaming-routed"),
 )
 
 
@@ -148,10 +146,8 @@ def _fail(
         patch.setattr(torch.cuda, "synchronize", failing(torch.cuda.synchronize))
         patch.setattr(torch.cuda.Stream, "synchronize", failing(torch.cuda.Stream.synchronize))
         patch.setattr(torch.cuda.Event, "synchronize", failing(torch.cuda.Event.synchronize))
-    elif step == "restore":
-        patch.setattr(HostModuleInstance, "install_host", failing(HostModuleInstance.install_host))
     else:
-        patch.setattr(HostModuleLoadPlan, "refill_param_target", failing(HostModuleLoadPlan.refill_param_target))
+        patch.setattr(HostModuleInstance, "install_host", failing(HostModuleInstance.install_host))
 
 
 def _on_device(model: nn.Module) -> list[str]:
@@ -171,7 +167,7 @@ def test_failed_release_step_is_reported(
     occurrence: int,
     error: type[BaseException],
 ) -> None:
-    if config.block_mode == "rolling":
+    if config.compiled:
         # Keep compiled variants below Dynamo's frame limit.
         torch.compiler.reset()
         request.addfinalizer(torch.compiler.reset)
@@ -212,7 +208,7 @@ def test_failed_release_step_is_reported(
 @CUDA
 def test_activation_reports_a_release_that_keeps_failing() -> None:
     model = _Model()
-    offloader = _Config("streaming").offloader(model)
+    offloader = _Config(("blocks",), None).offloader(model)
     offloader.activate("cuda")
     with torch.inference_mode():
         model(torch.randn(2, _WIDTH, device="cuda"))
@@ -234,15 +230,14 @@ def test_activation_reports_a_release_that_keeps_failing() -> None:
     assert _on_device(model) == []
 
 
-# Transitions that run inside a forward: block switches, transient releases
-# and their reacquisition, and rolling refills.
+# Transitions that run inside a forward: unit switches and mid-forward
+# evictions on budget/ceiling pressure.
 _FORWARD_CASES = (
-    pytest.param(_Config("streaming"), "restore", id="streaming-switch"),
-    pytest.param(_Config("streaming", transient=True), "synchronize", id="streaming-transient-sync"),
-    pytest.param(_Config("streaming", transient=True), "restore", id="streaming-transient-restore"),
-    pytest.param(_Config("resident", transient=True), "synchronize", id="resident-transient-sync"),
-    pytest.param(_Config("resident", transient=True), "restore", id="resident-transient-restore"),
-    pytest.param(_Config("rolling"), "refill", id="rolling-refill"),
+    pytest.param(_Config(("blocks",), None), "restore", id="streaming-switch"),
+    pytest.param(_Config(("blocks",), 0), "restore", id="zero-budget-switch"),
+    pytest.param(_Config(("blocks",), 2 * _UNIT_BYTES), "restore", id="partial-switch"),
+    pytest.param(_Config(("embed", "blocks"), None), "synchronize", id="mixed-evict-sync"),
+    pytest.param(_Config(("blocks",), 1024 * 1024 * 1024), "restore", id="all-resident-switch"),
 )
 
 
@@ -257,7 +252,7 @@ def test_next_forward_finishes_a_transition_interrupted_mid_forward(
     occurrence: int,
     after: bool,
 ) -> None:
-    if config.block_mode == "rolling":
+    if config.compiled:
         torch.compiler.reset()
         request.addfinalizer(torch.compiler.reset)
     torch.manual_seed(0)
@@ -267,10 +262,15 @@ def test_next_forward_finishes_a_transition_interrupted_mid_forward(
 
     with activated_model(offloader, "cuda"), torch.inference_mode():
         expected = model(x).cpu()
+        interrupted = False
         with pytest.MonkeyPatch.context() as patch:
             _fail(patch, step, Interrupt, occurrence=occurrence, after=after)
-            with contextlib.suppress(Interrupt):
+            try:
                 model(x)
+            except Interrupt:
+                interrupted = True
+        if step == "restore":
+            assert interrupted
         actual = model(x).cpu()
         again = model(x).cpu()
 
@@ -315,10 +315,10 @@ def _inject_lookahead_record_failure(
 
     def failing_record_event(stream: torch.cuda.Stream, *args: object, **kwargs: object) -> object:
         nonlocal worker_record_calls
-        if threading.get_ident() != caller:
+        if threading.get_ident() != caller and stream.cuda_stream == lookahead_stream_id:
             worker_record_calls += 1
-        if worker_record_calls >= 3 and stream.cuda_stream == lookahead_stream_id:
-            raise RuntimeError("injected lookahead record_event failure")
+            if worker_record_calls >= 3:
+                raise RuntimeError("injected lookahead record_event failure")
         return original_record_event(stream, *args, **kwargs)  # type: ignore[arg-type]
 
     def failing_stream_sync(stream: torch.cuda.Stream) -> None:
@@ -341,9 +341,8 @@ def test_failed_lookahead_record_event_returns_lease_and_keeps_pin_lease_until_s
 ) -> None:
     torch.manual_seed(0)
     model = _Model()
-    offloader = _Config("streaming").offloader(model)
-    component = block_components(offloader)[0]
-    runtime = component._runtime
+    offloader = _Config(("blocks",), None).offloader(model)
+    engine = residency_engine(offloader)
     x = torch.randn(2, _WIDTH, device="cuda")
 
     offloader.activate("cuda")
@@ -352,24 +351,171 @@ def test_failed_lookahead_record_event_returns_lease_and_keeps_pin_lease_until_s
     offloader.deactivate()
 
     offloader.activate("cuda")
+    copy_stream = engine._copy_stream
+    assert copy_stream is not None
     with monkeypatch.context() as patch:
-        failed_leases, closed_leases = _inject_lookahead_record_failure(patch, runtime._stream.cuda_stream)
+        failed_leases, closed_leases = _inject_lookahead_record_failure(patch, copy_stream.cuda_stream)
         with torch.inference_mode():
             model(x)
         with pytest.raises(RuntimeError, match="injected lookahead synchronize failure"):
             offloader.deactivate()
         assert len(failed_leases) == 1
         assert failed_leases[0] not in closed_leases
-        assert runtime.acquired
-        assert component._pin_lease is not None
+        assert engine.retains_resources
+        assert engine._pin_lease is not None
         assert offloader.failed
         # Even while record_event still fails on the worker stream, retry cleanup succeeds.
         offloader.deactivate()
 
     assert failed_leases[0] in closed_leases
-    assert not runtime.acquired
-    assert component._pin_lease is None
+    assert not engine.retains_resources
+    assert engine._pin_lease is None
     assert not offloader.failed
     with activated_model(offloader, "cuda"), torch.inference_mode():
         torch.testing.assert_close(model(x).cpu(), expected, rtol=0, atol=0)
     assert _on_device(model) == []
+
+
+@pytest.mark.parametrize(
+    "device",
+    [pytest.param("cpu", id="cpu"), pytest.param("cuda", marks=CUDA, id="cuda")],
+)
+def test_interrupt_in_block_compile_restore_marks_failed_and_retries(
+    request: pytest.FixtureRequest,
+    device: str,
+) -> None:
+    torch.compiler.reset()
+    request.addfinalizer(torch.compiler.reset)
+    torch.manual_seed(0)
+    model = _Model()
+    offloader = _Config(("blocks",), None, compiled=True).offloader(model)
+    x = torch.randn(2, _WIDTH, device=device)
+
+    offloader.activate(device)
+    with torch.inference_mode():
+        expected = model(x).cpu()
+
+    original_restore = _BlockCompileState.restore
+    raised_once = False
+
+    def failing_restore(state: _BlockCompileState) -> None:
+        nonlocal raised_once
+        if not raised_once:
+            raised_once = True
+            raise Interrupt("injected restore failure")
+        original_restore(state)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(_BlockCompileState, "restore", failing_restore)
+        with pytest.raises(Interrupt, match="injected restore failure"):
+            offloader.deactivate()
+
+    assert offloader.active_device is None
+    assert offloader.failed
+    assert residency_engine(offloader).retains_resources
+
+    offloader.deactivate()
+    assert not offloader.failed
+    assert not residency_engine(offloader).retains_resources
+    assert _on_device(model) == []
+    for blk in model.blocks:
+        assert "forward" not in blk.__dict__
+
+    with activated_model(offloader, device), torch.inference_mode():
+        actual = model(x).cpu()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert _on_device(model) == []
+
+
+@CUDA
+def test_return_slot_eviction_failure_does_not_wedge_active_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from piper_offload.target_lease import CudaTargetLease
+    from piper_offload.vram_pool import ElasticVramPool
+
+    torch.manual_seed(0)
+    model = _Model()
+    offloader = _Config(("blocks",), _UNIT_BYTES).offloader(model)
+    engine = residency_engine(offloader)
+    x = torch.randn(2, _WIDTH, device="cuda")
+
+    with activated_model(offloader, "cuda"), torch.inference_mode():
+        expected = model(x).cpu()
+        assert engine.pool is not None
+        assert engine._active is not None
+        # Add two extra excess idle slots so _trim_to_budget inside _release_active_unit
+        # must evict 2 slots to reach _UNIT_BYTES: first succeeds (removing active.slot),
+        # second raises Interrupt.
+        for extra_idx in (0, 1):
+            plan = engine._unit_plans[extra_idx]
+            extra_lease = CudaTargetLease.allocate(plan, torch.device("cuda"))
+            extra_lease.stage(plan, torch.cuda.current_stream(), non_blocking=False)
+            engine.pool.admit_preloaded_slot(extra_idx, extra_lease, engine._active.slot.signature)
+
+        original_close = CudaTargetLease.close
+        close_calls = 0
+
+        def fail_second_close(lease: CudaTargetLease) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls == 2:
+                raise Interrupt("injected second eviction close failure")
+            original_close(lease)
+
+        monkeypatch.setattr(ElasticVramPool, "_pick_victim", staticmethod(lambda c, _d: c[0]))
+        with monkeypatch.context() as patch:
+            patch.setattr(CudaTargetLease, "close", fail_second_close)
+            with pytest.raises(Interrupt, match="injected second eviction close failure"):
+                engine._release_active_unit()
+
+        assert close_calls == 2
+        assert engine._active is None
+        actual = model(x).cpu()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not offloader.failed
+    assert _on_device(model) == []
+
+
+@CUDA
+def test_unit_release_failure_still_releases_resident_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from piper_offload.vram_pool import ElasticVramPool
+
+    torch.manual_seed(0)
+    model = _Model()
+    offloader = _Config(("blocks",), None).offloader(model)
+    engine = residency_engine(offloader)
+    x = torch.randn(2, _WIDTH, device="cuda")
+
+    offloader.activate("cuda")
+    with torch.inference_mode():
+        expected = model(x).cpu()
+
+    original_close_all = ElasticVramPool.close_all
+    failed_once = False
+
+    def fail_once(pool: ElasticVramPool) -> None:
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise RuntimeError("injected pool close failure")
+        original_close_all(pool)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ElasticVramPool, "close_all", fail_once)
+        with pytest.raises(RuntimeError, match="injected pool close failure"):
+            offloader.deactivate()
+
+    # Resident embed/head weights and lease were released despite unit pool error.
+    assert model.embed.weight.device.type == "cpu"
+    assert model.head.weight.device.type == "cpu"
+    assert engine._resident_lease is None
+    assert offloader.failed
+
+    offloader.deactivate()
+    assert not offloader.failed
+    assert _on_device(model) == []
+    with activated_model(offloader, "cuda"), torch.inference_mode():
+        torch.testing.assert_close(model(x).cpu(), expected, rtol=0, atol=0)

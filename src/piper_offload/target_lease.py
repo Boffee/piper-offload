@@ -35,6 +35,17 @@ class CudaTargetLease:
         self._acquired = False
         self._recorded_streams: set[torch.cuda.Stream] = set()
         self._release_events: dict[torch.cuda.Stream, torch.cuda.Event] = {}
+        self._waited_streams: set[torch.cuda.Stream] = set()
+
+    @property
+    def is_staged(self) -> bool:
+        """Whether this lease currently holds completed staged weights."""
+        return self._staged
+
+    @property
+    def is_acquired(self) -> bool:
+        """Whether this lease is currently acquired by a consumer."""
+        return self._acquired
 
     @classmethod
     def allocate(
@@ -75,6 +86,7 @@ class CudaTargetLease:
         target = self.target
         prior = self._ready_event
         self._staged = False
+        self._waited_streams.clear()
         copied = False
         with torch.cuda.stream(stream):
             if prior is not None:
@@ -115,16 +127,21 @@ class CudaTargetLease:
         event = self._ready_event
         if not self._staged or event is None:
             raise RuntimeError("CUDA target must be staged before use")
-        stream.wait_event(event)
-        self._staged = False
+        if stream not in self._waited_streams:
+            stream.wait_event(event)
+            self._waited_streams.add(stream)
         self._acquired = True
         self.record_stream(stream)
         return self.target
 
     def record_stream(self, stream: torch.cuda.Stream) -> None:
-        """Record a stream that may read or write the acquired target."""
+        """Order ``stream`` after staging and record it as a consumer."""
         if not self._acquired:
             raise RuntimeError("CUDA target must be acquired before use")
+        event = self._ready_event
+        if event is not None and stream not in self._waited_streams:
+            stream.wait_event(event)
+            self._waited_streams.add(stream)
         self._recorded_streams.add(stream)
 
     def release(self) -> None:
@@ -162,6 +179,7 @@ class CudaTargetLease:
         self._staged = False
         self._recorded_streams.clear()
         self._release_events.clear()
+        self._waited_streams.clear()
 
 
 __all__ = ["CudaTargetLease"]

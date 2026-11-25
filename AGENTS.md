@@ -49,7 +49,7 @@ the code that owns a behavior.
   different recovery paths.
 - [Streaming](docs/streaming.md). Preserve aliases within each ownership
   boundary (host state or one streamed block). Consult the guide for
-  compilation and transient lifetimes. [Scheduling hooks](docs/development.md#scheduling-hooks)
+  compilation and unit lifetimes. [Scheduling hooks](docs/development.md#scheduling-hooks)
   must recover from interrupted, skipped, and direct calls.
 - [Adapters](docs/adapters.md) and [formats](docs/formats.md). Model-update
   resources are immutable. Merge, routed execution, and tensor-format

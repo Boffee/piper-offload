@@ -7,6 +7,25 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Added `auto_offload_paths(model, min_unit_bytes=...)` to automatically
+  discover outermost `nn.ModuleList` containers and large callable standalone
+  submodules for offloading while skipping non-callable containers and tied
+  parameter boundaries and permitting shared stateless submodules and shared
+  read-only buffers across distinct units.
+- Added unified unit offloading with `OffloadConfig(offload_paths=..., vram_budget_bytes=..., block_compile=...)`,
+  per-run `vram_budget_bytes` overrides on `ModelOffloader.activate()` and
+  `ModelCache.use()`, and read-only `ModelOffloader.vram_budget_bytes`:
+  supports arbitrary standalone `nn.Module` and `nn.ModuleList` `offload_paths`,
+  heterogeneous units (differing shapes, dtypes, quantization formats, and
+  parameter/buffer names), online execution-order lookahead (`k <= 4`),
+  Belady MIN eviction under finite `vram_budget_bytes`, merge-once LoRA slot
+  caching, and non-pinned all-resident preloading when all units fit within
+  `vram_budget_bytes`.
+- Added `GpuTargetBytesTensorAdapter` (and `gpu_target_bytes`) in
+  `piper_offload.tensor_adapters` (implemented by `GgufAdapter`,
+  `TrellisAdapter`, and `DTensorAdapter`, and surfaced via `HostParam`) so
+  packed adapters report decoded GPU target byte sizes accurately to budgeted
+  residency.
 - `ModelStore.bind()` and `HostModuleStore.bind()` now project an unsharded host
   store directly onto `DTensor`-sharded shells (such as `meta` shells produced
   by `torch.distributed.tensor.parallel.parallelize_module`) with zero-copy
@@ -46,13 +65,26 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
+- Breaking: Replaced `OffloadConfig(block_paths, block_mode, transient_paths, transient_block_paths)`
+  and `BlockMode` with keyword-only `OffloadConfig(offload_paths=(), vram_budget_bytes=None, block_compile=None)`,
+  removing rolling compilation (`block_mode="rolling" | "auto"`) and separate
+  transient schedules. Migrate callers passing `block_paths` to
+  `offload_paths` (any `Sequence[str]`, normalized to `tuple[str, ...]`,
+  accepting callable standalone modules as well as `nn.ModuleList`), replace
+  `block_mode="resident"` by omitting paths from `offload_paths` (always-resident
+  without compilation) or passing `vram_budget_bytes >= total_unit_gpu_bytes`
+  (retains `block_compile`), replace `transient_*` schedules with
+  `vram_budget_bytes=0` (immediate post-forward release without async lookahead)
+  or a per-run `vram_budget_bytes` override on `ModelOffloader.activate()` /
+  `ModelCache.use()`, and note that `block_compile` now compiles standalone
+  `offload_paths` units as well as `nn.ModuleList` blocks.
 - `merge_adapter()` now requires an unbound model and rejects models or
   submodules owned by a live `ModelOffloader` before mutating any shared backing.
 - Removed permanent per-parameter GPU decode staging buffers from
   `TrellisAdapter` and `GgufAdapter` in favor of transient stream-ordered
   scratch staging, and narrowed their `layout_signature` keys to the active
-  ConvRot INT8 target layout so mixed-rate Trellis and mixed-quant GGUF blocks
-  share GPU target pools and work with `block_mode="rolling"` and `"auto"`.
+  ConvRot INT8 target layout so mixed-rate Trellis and mixed-quant GGUF units
+  share GPU target pools.
 - Reduced lock contention and per-transfer Python overhead for offloaded host
   transfers and block switches by pre-resolving leased transfer views, caching
   bound module parameter/buffer slots and resting CPU parameter wrappers per
@@ -64,8 +96,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   subclasses that cannot be wrapped in `DTensor` (such as
   `PrototypeFloat8Tensor`) with a `layout mismatch` error during bind
   preflight instead of raising an `IndexError`.
-- Host capture allocations, CUDA target allocations (resident, streaming, and
-  rolling), resting host wrapper restoration, and `DTensor` wrapper
+- Host capture allocations, CUDA target allocations (resident and offloaded),
+  resting host wrapper restoration, and `DTensor` wrapper
   reconstruction and local-shard extraction now exit `torch.inference_mode()`,
   preventing `aten.view_as` dispatch failures on subclasses such as
   `Float8Tensor` and keeping managed parameters and buffers non-inference.

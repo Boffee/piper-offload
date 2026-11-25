@@ -15,11 +15,12 @@ from piper_offload import (
     ScaledLoRAFactor,
     merge_adapter,
 )
-from piper_offload.int8_adapter import Int8Adapter
 from piper_offload.host_param import HostParam
-from piper_offload.block_component import _param_target_layout
+from piper_offload.int8_adapter import Int8Adapter
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from tests.conftest import activated_model
+
+_param_target_layout = HostParam.target_layout_for
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -1246,7 +1247,7 @@ class TestInt8Adapter:
             )
         offloader = ModelOffloader.from_module(
             model,
-            OffloadConfig(block_paths=("blocks",)),
+            OffloadConfig(offload_paths=("blocks",)),
         )
         lora = Adapter.from_state_dict(
             state_dict={
@@ -1319,7 +1320,7 @@ class TestInt8Adapter:
 
         offloader = ModelOffloader.from_module(
             model,
-            OffloadConfig(block_paths=("blocks",)),
+            OffloadConfig(offload_paths=("blocks",)),
         )
         try:
             x = torch.randn(8, 32, dtype=torch.bfloat16, device="cuda")
@@ -1330,11 +1331,22 @@ class TestInt8Adapter:
                 adapter_strengths=[0.5],
                 adapter_mode="merge",
             ) as active:
-                merged = active.blocks[0].weight.data
-                assert isinstance(merged, int8_cls)
-                _assert_triton_int8_close(merged, expected)
-                y = active(x)
-                torch.cuda.synchronize()
+                ran = False
+
+                def _check_merged(mod: nn.Module, _inputs: object) -> None:
+                    nonlocal ran
+                    merged = mod.weight.data
+                    assert isinstance(merged, int8_cls)
+                    _assert_triton_int8_close(merged, expected)
+                    ran = True
+
+                handle = active.blocks[0].register_forward_pre_hook(_check_merged)
+                try:
+                    y = active(x)
+                    torch.cuda.synchronize()
+                finally:
+                    handle.remove()
+                assert ran
             assert y.shape == (8, 32)
         finally:
             offloader.deactivate()

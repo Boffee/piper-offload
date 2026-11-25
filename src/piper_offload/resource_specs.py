@@ -25,8 +25,8 @@ class ModelSpec[M: nn.Module]:
 
     ``factory`` runs once to construct the cached :class:`ModelOffloader`.
     Every lease reuses that same model runtime sequentially; overlapping uses
-    are rejected by the offloader. ``config`` configures block streaming,
-    compilation, and transient working sets for the bound runtime. The factory
+    are rejected by the offloader. ``config`` selects dynamic offload paths,
+    ``vram_budget_bytes``, and optional compilation for the bound runtime. The factory
     transfers compatible pageable CPU storage to the cached runtime,
     preserving checkpoint-backed mappings.
     """

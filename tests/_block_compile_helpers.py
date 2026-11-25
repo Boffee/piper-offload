@@ -7,7 +7,6 @@ from torch import nn
 
 from piper_offload import (
     BlockCompileConfig,
-    BlockMode,
     ModelOffloader,
     OffloadConfig,
 )
@@ -45,20 +44,16 @@ class _BlockModel(nn.Module):
 def _make_offloader(
     model: nn.Module,
     *,
-    block_paths: Sequence[str] | None = None,
-    transient_block_paths: tuple[str, ...] = (),
+    offload_paths: Sequence[str] = ("blocks",),
+    vram_budget_bytes: int | None = None,
     block_compile: BlockCompileConfig | None = None,
-    block_mode: BlockMode = "streaming",
 ) -> ModelOffloader:
-    if block_paths is None:
-        block_paths = () if transient_block_paths else ("blocks",)
     return ModelOffloader.from_module(
         model,
         config=OffloadConfig(
-            block_paths=tuple(block_paths),
-            transient_block_paths=transient_block_paths,
+            offload_paths=tuple(offload_paths),
+            vram_budget_bytes=vram_budget_bytes,
             block_compile=block_compile,
-            block_mode=block_mode,
         ),
     )
 

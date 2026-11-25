@@ -504,7 +504,7 @@ class TestDirectConversion:
 
         offloader = ModelOffloader.from_module(
             model,
-            OffloadConfig(block_paths=("blocks",), block_mode="streaming"),
+            OffloadConfig(offload_paths=("blocks",)),
         )
         offloader.activate("cuda")
         try:

@@ -11,8 +11,8 @@ instances can use an injected backend for testing.
 
 Every host transfer runs under a lease, so nothing is read or written while
 it could be evicted, and only transfers that repeat ask the lease to pin:
-streaming, rolling, and the relay register their storage; a resident or host
-upload leases it pageable.
+streaming/budgeted unit offloading and the relay register their storage; a
+one-shot resident upload leases it pageable.
 
 Registration uses whole storage byte ranges. Storage that records a
 checkpoint file slice (:func:`file_slice`) is never pinned in place: the

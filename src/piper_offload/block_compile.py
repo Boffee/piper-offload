@@ -1,4 +1,4 @@
-"""Opt-in ``torch.compile`` policy for model block groups."""
+"""Opt-in ``torch.compile`` policy for offloaded model units."""
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -17,7 +17,7 @@ _NO_INSTANCE_FORWARD = object()
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class BlockCompileConfig:
-    """Compilation options applied to every declared block group.
+    """Compilation options applied to every declared offloaded unit.
 
     Compilation is disabled unless an instance of this configuration is
     supplied inside :class:`piper_offload.OffloadConfig` to
@@ -27,8 +27,8 @@ class BlockCompileConfig:
     graph-capture controls needed by supported inference workloads, plus an
     optional mapping for target-specific compiler extensions.
 
-    CPU activations compile against the existing host weights with ordinary
-    Inductor. CUDA activations use the selected block runtime's compiler backend.
+    CPU and CUDA activations both compile each declared offloaded unit with
+    Inductor.
 
     Attributes
     ----------

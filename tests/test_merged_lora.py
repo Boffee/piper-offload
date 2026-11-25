@@ -66,9 +66,9 @@ from piper_offload.tensor_adapters import (
 from tests.conftest import (
     Interrupt,
     activated_model,
-    block_components,
-    host_component,
-    transient_components,
+    offloaded_units,
+    residency_engine,
+    resident_instance,
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -266,7 +266,7 @@ def _expected_routed_output(
 
 def _make_strategy(model: nn.Module) -> ModelOffloader:
     """Shorthand for constructing the strategy."""
-    return ModelOffloader.from_module(model, OffloadConfig(block_paths=("transformer_blocks",)))
+    return ModelOffloader.from_module(model, OffloadConfig(offload_paths=("transformer_blocks",)))
 
 
 def _plan_lora_merge(offloader: ModelOffloader, adapter: Adapter) -> dict[str, ParameterOverride]:
@@ -1171,11 +1171,12 @@ class TestActivationLoraValidation:
         delta = ParameterDelta.from_tensors(a=torch.ones(1, 16), b=torch.ones(16, 1))
 
         resident_overrides = _plan_lora_merge(offloader, Adapter({"head.weight": delta}))
-        resident = host_component(offloader)
-        resident_plan = resident._instance.resolve_load_plan(resident_overrides)
+        resident = resident_instance(offloader)
+        assert resident is not None
+        resident_plan = resident.resolve_load_plan(resident_overrides)
         block_overrides = _plan_lora_merge(offloader, Adapter({"transformer_blocks.0.alias.weight": delta}))
-        blocks, = block_components(offloader)
-        block_plan, = blocks._resolve_load_plans(block_overrides)
+        _, unit_overrides = offloader._partition.route_overrides(block_overrides)
+        block_plan = offloaded_units(offloader)[0].resolve_load_plan(unit_overrides[0])
         for plan, target, alias in (
             (resident_plan, "head.weight", "embed.weight"),
             (block_plan, "alias.weight", "attn.weight"),
@@ -1226,8 +1227,19 @@ class TestActivationLoraValidation:
         })
         with activated_model(_make_strategy(m), "cuda", adapters=[lora]):
             block = m.transformer_blocks[0]
-            assert block.attn.weight is block.ff.weight
-            torch.testing.assert_close(block.attn.weight.cpu(), base + 1)
+            captured: list[torch.Tensor] = []
+
+            def _capture_weight(mod: nn.Module, _inputs: object) -> None:
+                assert mod.attn.weight is mod.ff.weight
+                assert mod.attn.weight.is_cuda
+                captured.append(mod.attn.weight.detach().cpu())
+
+            handle = block.register_forward_pre_hook(_capture_weight)
+            try:
+                _ = block(torch.randn(1, 16, dtype=torch.bfloat16, device="cuda"))
+            finally:
+                handle.remove()
+            torch.testing.assert_close(captured[0], base + 1)
 
     def test_prefixed_keys_rejected(self) -> None:
         # Keys are verbatim, so a ``diffusion_model.``-prefixed adapter does not
@@ -1294,7 +1306,19 @@ class TestActivationLoraValidation:
         with activated_model(_make_strategy(m), "cuda", adapters=[lora]):
             assert not attn._forward_pre_hooks
             assert not attn._forward_hooks
-            torch.testing.assert_close(attn.weight.cpu(), expected)
+            captured: list[torch.Tensor] = []
+
+            def _capture(_mod: nn.Module, _inputs: object) -> None:
+                assert not attn._forward_pre_hooks
+                assert not attn._forward_hooks
+                captured.append(attn.weight.detach().cpu())
+
+            handle = m.transformer_blocks[0].register_forward_pre_hook(_capture)
+            try:
+                _ = m.transformer_blocks[0](torch.randn(1, 16, dtype=torch.float32, device="cuda"))
+            finally:
+                handle.remove()
+            torch.testing.assert_close(captured[0], expected)
 
     def test_accepts_int8_target_in_merge_and_routed_modes(self) -> None:
         from tests.test_int8_adapter import _make_affine_int8
@@ -1380,7 +1404,26 @@ class TestLifecycle:
                 assert model.embed.weight.is_cuda
                 assert model.head.weight.is_cuda
                 embed = model.embed.weight.detach().cpu()
-                block = model.transformer_blocks[0].attn.weight.detach().cpu()
+                captured_blocks: list[torch.Tensor] = []
+
+                def _capture_block(
+                    mod: nn.Module,
+                    _inputs: object,
+                    out: list[torch.Tensor] = captured_blocks,
+                ) -> None:
+                    assert mod.attn.weight.is_cuda
+                    out.append(mod.attn.weight.detach().cpu())
+
+                handle = model.transformer_blocks[0].register_forward_pre_hook(_capture_block)
+                try:
+                    # Traverse every block, including the initial base-only use.
+                    output = x
+                    for component in model.transformer_blocks:
+                        output = component(output)
+                finally:
+                    handle.remove()
+                torch.cuda.synchronize()
+                block = captured_blocks[0]
                 if loras:
                     assert not torch.equal(embed, base_embed)
                     assert not torch.equal(block, base_block)
@@ -1390,16 +1433,6 @@ class TestLifecycle:
                 else:
                     torch.testing.assert_close(embed, base_embed, rtol=0, atol=0)
                     torch.testing.assert_close(block, base_block, rtol=0, atol=0)
-                # Traverse every block, including the initial base-only use.
-                output = x
-                for component in model.transformer_blocks:
-                    output = component(output)
-                torch.cuda.synchronize()
-                if not loras:
-                    torch.testing.assert_close(
-                        model.transformer_blocks[0].attn.weight.detach().cpu(),
-                        base_block, rtol=0, atol=0,
-                    )
             assert strategy.active_device is None
             for parameter in model.parameters():
                 assert parameter.device == torch.device("cpu")
@@ -1416,10 +1449,13 @@ class TestLifecycle:
 class TestMergeCorrectness:
     @CUDA
     @pytest.mark.parametrize("mode", ["merge", "routed"])
-    def test_transient_path_preserves_lora_on_reacquire(
+    def test_standalone_path_preserves_lora_on_reacquire(
         self,
         mode: AdapterMode,
     ) -> None:
+        import copy
+
+        torch.manual_seed(9)
         model = _make_bf16_model(num_blocks=2, dim=16)
         lora = Adapter.from_state_dict(
             {
@@ -1427,51 +1463,90 @@ class TestMergeCorrectness:
                 "embed.lora_B.weight": torch.randn(16, 4),
             }
         )
+        baseline_model = copy.deepcopy(model)
+        value = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+        with torch.inference_mode():
+            base_out = baseline_model.cuda()(value).cpu()
+
         offloader = ModelOffloader.from_module(
             model,
-            OffloadConfig(transient_paths=("embed",)),
+            OffloadConfig(offload_paths=("embed",), vram_budget_bytes=0),
         )
-        component = dict(transient_components(offloader))["embed"]
-        with activated_model(offloader, "cuda", adapters=[lora], adapter_strengths=[0.5], adapter_mode=mode):
-            value = torch.randn(
-                2,
-                16,
-                dtype=torch.bfloat16,
-                device="cuda",
-            )
+        engine = residency_engine(offloader)
+        assert model.embed.weight.dtype is torch.bfloat16
+        with activated_model(
+            offloader,
+            "cuda",
+            adapters=[lora],
+            adapter_strengths=[0.5],
+            adapter_mode=mode,
+        ):
             with torch.inference_mode():
                 first = model(value).clone()
+                assert engine.pool is not None and engine.pool.live_slot_count == 0
+                assert engine._active is None
                 second = model(value).clone()
             torch.cuda.synchronize()
-            assert component._lease is not None
 
         torch.testing.assert_close(second, first, rtol=0, atol=0)
+        assert not torch.allclose(first.cpu(), base_out, rtol=1e-3, atol=1e-3)
 
     @CUDA
     @pytest.mark.parametrize("mode", ["merge", "routed"])
-    def test_transient_block_path_preserves_lora_on_reacquire(
+    def test_module_list_path_preserves_lora_on_reacquire(
         self,
         mode: AdapterMode,
     ) -> None:
+        import copy
+
+        torch.manual_seed(9)
         model = _make_bf16_model(num_blocks=2, dim=16)
+        reference = copy.deepcopy(model)
         lora = _make_lora(num_blocks=2, dim=16, seed=9)
+        value = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+        with torch.inference_mode():
+            ref_cuda = reference.to("cuda")
+            base_out = ref_cuda(value).cpu()
+            if mode == "routed":
+                expected = _expected_routed_output(
+                    ref_cuda,
+                    value,
+                    [(lora, 0.5)],
+                ).cpu()
+            else:
+                for i, blk in enumerate(ref_cuda.transformer_blocks):
+                    blk.attn.weight.data.copy_(
+                        _expected_merged_weight(
+                            blk.attn.weight,
+                            [(lora, 0.5)],
+                            i,
+                            "attn.weight",
+                        )
+                    )
+                expected = ref_cuda(value).cpu()
+
         offloader = ModelOffloader.from_module(
             model,
-            OffloadConfig(transient_block_paths=("transformer_blocks",)),
+            OffloadConfig(offload_paths=("transformer_blocks",), vram_budget_bytes=0),
         )
-        with activated_model(offloader, "cuda", adapters=[lora], adapter_strengths=[0.5], adapter_mode=mode):
-            value = torch.randn(
-                2,
-                16,
-                dtype=torch.bfloat16,
-                device="cuda",
-            )
+        engine = residency_engine(offloader)
+        with activated_model(
+            offloader,
+            "cuda",
+            adapters=[lora],
+            adapter_strengths=[0.5],
+            adapter_mode=mode,
+        ):
             with torch.inference_mode():
                 first = model(value).clone()
+                assert engine.pool is not None and engine.pool.live_slot_count == 0
+                assert engine._active is None
                 second = model(value).clone()
             torch.cuda.synchronize()
 
         torch.testing.assert_close(second, first, rtol=0, atol=0)
+        torch.testing.assert_close(first.cpu(), expected, rtol=1e-2, atol=1e-2)
+        assert not torch.allclose(first.cpu(), base_out, rtol=1e-3, atol=1e-3)
 
     @CUDA
     @pytest.mark.parametrize("streamed", [False, True])
@@ -1507,30 +1582,34 @@ class TestMergeCorrectness:
         strategy = ModelOffloader.from_module(
             m,
             OffloadConfig(
-                block_paths=("transformer_blocks",) if streamed else (),
+                offload_paths=("transformer_blocks",) if streamed else (),
             ),
         )
         adapters, strengths = zip(*loras, strict=True)
         with activated_model(strategy, "cuda", adapters=adapters, adapter_strengths=strengths):
-            streamer = block_components(strategy)[0] if streamed else None
+            engine = residency_engine(strategy) if streamed else None
             for block_idx, block in enumerate(m.transformer_blocks):
-                if streamer is not None:
-                    streamer._runtime._before_block_forward(block_idx)
-                actual = block.attn.bias
-                assert actual is not None
-                expected = base_biases[block_idx].to(actual.device)
-                delta = torch.zeros_like(expected)
-                target_name = f"transformer_blocks.{block_idx}.attn.bias"
-                for lora, strength in loras:
-                    target = lora.targets[target_name]
-                    assert isinstance(target, ParameterDelta)
-                    assert target.dense is not None
-                    bias = target.dense.make_cpu_param().data
-                    delta.add_(
-                        bias.to(device=actual.device, dtype=actual.dtype),
-                        alpha=strength,
-                    )
-                torch.testing.assert_close(actual, expected + delta)
+                if engine is not None:
+                    engine._before_unit_forward(block_idx)
+                try:
+                    actual = block.attn.bias
+                    assert actual is not None
+                    expected = base_biases[block_idx].to(actual.device)
+                    delta = torch.zeros_like(expected)
+                    target_name = f"transformer_blocks.{block_idx}.attn.bias"
+                    for lora, strength in loras:
+                        target = lora.targets[target_name]
+                        assert isinstance(target, ParameterDelta)
+                        assert target.dense is not None
+                        bias = target.dense.make_cpu_param().data
+                        delta.add_(
+                            bias.to(device=actual.device, dtype=actual.dtype),
+                            alpha=strength,
+                        )
+                    torch.testing.assert_close(actual, expected + delta)
+                finally:
+                    if engine is not None:
+                        engine._after_unit_forward(block_idx)
 
     @CUDA
     def test_merged_weights_match_manual_baseline(self) -> None:
@@ -1549,7 +1628,21 @@ class TestMergeCorrectness:
                 x = blk(x)
             torch.cuda.synchronize()
             for i in range(4):
-                _ = m.transformer_blocks[i](torch.randn(2, 16, dtype=torch.bfloat16, device="cuda"))
+                captured: list[torch.Tensor] = []
+
+                def _capture(
+                    mod: nn.Module,
+                    _inputs: object,
+                    out: list[torch.Tensor] = captured,
+                ) -> None:
+                    assert mod.attn.weight.is_cuda
+                    out.append(mod.attn.weight.detach().clone())
+
+                handle = m.transformer_blocks[i].register_forward_pre_hook(_capture)
+                try:
+                    _ = m.transformer_blocks[i](torch.randn(2, 16, dtype=torch.bfloat16, device="cuda"))
+                finally:
+                    handle.remove()
                 torch.cuda.synchronize()
                 expected = _expected_merged_weight(
                     captured_base[i].to("cuda"),
@@ -1557,7 +1650,7 @@ class TestMergeCorrectness:
                     i,
                     "attn.weight",
                 )
-                actual = m.transformer_blocks[i].attn.weight.detach()
+                actual = captured[0]
                 assert torch.allclose(actual, expected, rtol=0.01, atol=0.01), (
                     f"block {i} merged weight mismatch:\n"
                     f"  expected: {expected.flatten()[:4]}\n"
@@ -1632,7 +1725,21 @@ class TestMergeCorrectness:
             m(x)
             torch.cuda.synchronize()
             for i in range(4):
-                _ = m.transformer_blocks[i](torch.randn(2, 16, dtype=torch.bfloat16, device="cuda"))
+                captured: list[torch.Tensor] = []
+
+                def _capture(
+                    mod: nn.Module,
+                    _inputs: object,
+                    out: list[torch.Tensor] = captured,
+                ) -> None:
+                    assert mod.attn.base_layer.weight.is_cuda
+                    out.append(mod.attn.base_layer.weight.detach().clone())
+
+                handle = m.transformer_blocks[i].register_forward_pre_hook(_capture)
+                try:
+                    _ = m.transformer_blocks[i](torch.randn(2, 16, dtype=torch.bfloat16, device="cuda"))
+                finally:
+                    handle.remove()
                 torch.cuda.synchronize()
                 expected = _expected_merged_weight(
                     captured_base[i].to("cuda"),
@@ -1640,7 +1747,7 @@ class TestMergeCorrectness:
                     i,
                     "attn.base_layer.weight",
                 )
-                actual = m.transformer_blocks[i].attn.base_layer.weight.detach()
+                actual = captured[0]
                 assert torch.allclose(actual, expected, rtol=0.01, atol=0.01), f"block {i} base_layer merge mismatch"
 
 
@@ -1964,10 +2071,10 @@ class TestParameterValueActivation:
         offloader.activate("cuda")
         try:
             assert model.weight.is_meta
-            resident = offloader._composite.resident
-            assert resident is not None
-            assert resident._lease is not None
-            assert resident._lease.target.param_targets == {}
+            engine = residency_engine(offloader)
+            assert engine.resident is not None
+            assert engine.resident.resolve_load_plan().loads == {}
+            assert engine._resident_lease is None
         finally:
             offloader.deactivate()
 
@@ -2008,10 +2115,19 @@ class TestParameterValueActivation:
         assert model.weight.is_meta
 
     @CUDA
-    @pytest.mark.parametrize("block_mode", ["resident", "streaming", "rolling", "auto"])
-    def test_parameter_values_work_in_every_block_mode(
+    @pytest.mark.parametrize(
+        ("vram_budget_bytes", "compiled"),
+        [
+            (1024 * 1024 * 1024, False),
+            (None, False),
+            (None, True),
+            (1024 * 1024 * 1024, True),
+        ],
+    )
+    def test_parameter_values_work_in_every_offload_mode(
         self,
-        block_mode: str,
+        vram_budget_bytes: int | None,
+        compiled: bool,
     ) -> None:
         dim = 4
 
@@ -2039,13 +2155,13 @@ class TestParameterValueActivation:
         with torch.device("meta"):
             model = M()
         compile_config = (
-            BlockCompileConfig(dynamic=False, fullgraph=True) if block_mode in {"rolling", "auto"} else None
+            BlockCompileConfig(dynamic=False, fullgraph=True) if compiled else None
         )
         offloader = ModelOffloader.from_module(
             model,
             OffloadConfig(
-                block_paths=("blocks",),
-                block_mode=block_mode,  # type: ignore[arg-type]
+                offload_paths=("blocks",),
+                vram_budget_bytes=vram_budget_bytes,
                 block_compile=compile_config,
             ),
         )
@@ -2057,22 +2173,25 @@ class TestParameterValueActivation:
         offloader.activate("cuda", adapters=[lora])
         try:
             torch.testing.assert_close(model(x).cpu(), x.cpu() * 6)
-            component = block_components(offloader)[0]
-            if component.block_mode == "rolling":
-                runtime = component._active_runtime
-                assert runtime is not None
-                assert runtime._lease is not None
-                assert len(runtime._lease.target.param_targets) == 1
         finally:
             offloader.deactivate()
 
         assert all(param.is_meta for param in model.parameters())
 
     @CUDA
-    @pytest.mark.parametrize("block_mode", ["resident", "streaming", "rolling", "auto"])
+    @pytest.mark.parametrize(
+        ("vram_budget_bytes", "compiled"),
+        [
+            (1024 * 1024 * 1024, False),
+            (None, False),
+            (None, True),
+            (1024 * 1024 * 1024, True),
+        ],
+    )
     def test_inactive_meta_blocks_allocate_no_extra_slots(
         self,
-        block_mode: str,
+        vram_budget_bytes: int | None,
+        compiled: bool,
     ) -> None:
         dim = 4
 
@@ -2095,13 +2214,13 @@ class TestParameterValueActivation:
         with torch.device("meta"):
             model = M()
         compile_config = (
-            BlockCompileConfig(dynamic=False, fullgraph=True) if block_mode in {"rolling", "auto"} else None
+            BlockCompileConfig(dynamic=False, fullgraph=True) if compiled else None
         )
         offloader = ModelOffloader.from_module(
             model,
             OffloadConfig(
-                block_paths=("blocks",),
-                block_mode=block_mode,  # type: ignore[arg-type]
+                offload_paths=("blocks",),
+                vram_budget_bytes=vram_budget_bytes,
                 block_compile=compile_config,
             ),
         )
@@ -2110,22 +2229,16 @@ class TestParameterValueActivation:
         x = torch.randn(2, dim, device="cuda")
 
         offloader.activate("cuda", adapters=[lora])
+        engine = residency_engine(offloader)
         try:
             torch.testing.assert_close(model.blocks[1](x).cpu(), x.cpu())
-            component = block_components(offloader)[0]
-            if component.block_mode == "rolling":
-                # Rolling installs its one already-required shared slot on the
-                # homogeneous block group. Inactive contents are unspecified,
-                # but they consume no additional parameter storage.
-                assert all(param.device.type == "cuda" for param in model.parameters())
-                runtime = component._active_runtime
-                assert runtime is not None
-                assert runtime._lease is not None
-                assert len(runtime._lease.target.param_targets) == 1
-            else:
-                assert model.blocks[0].weight.is_meta
-                assert model.blocks[1].weight.device.type == "cuda"
-                assert model.blocks[2].weight.is_meta
+            assert model.blocks[1].weight.device.type == "cuda"
+            assert model.blocks[0].weight.is_meta
+            assert model.blocks[2].weight.is_meta
+            assert engine.pool is not None
+            assert engine.pool.used_bytes == value.nbytes
+            for idx in (0, 2):
+                assert engine._unit_plans[idx].loads == {}
         finally:
             offloader.deactivate()
 
@@ -2971,7 +3084,7 @@ class TestRoutedMode:
         strength = 0.5
         s = ModelOffloader.from_module(
             m,
-            OffloadConfig(block_paths=("transformer_blocks",)),
+            OffloadConfig(offload_paths=("transformer_blocks",)),
         )
         with activated_model(s, "cuda", adapters=[lora], adapter_strengths=[strength], adapter_mode="routed"):
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
@@ -3008,7 +3121,7 @@ class TestRoutedStaging:
         x = torch.randn(3, 16)
         lora1 = _make_lora(num_blocks=1, dim=16, seed=1)
         lora2 = _make_lora(num_blocks=1, dim=16, seed=2)
-        s = ModelOffloader.from_module(m, OffloadConfig(block_paths=("transformer_blocks",)))
+        s = ModelOffloader.from_module(m, OffloadConfig(offload_paths=("transformer_blocks",)))
 
         def routed_forward(adapters: list[Adapter], strengths: list[float]) -> torch.Tensor:
             with activated_model(s, "cpu", adapters=adapters, adapter_strengths=strengths, adapter_mode="routed"):
@@ -3143,7 +3256,7 @@ class TestRoutedStaging:
             "transformer_blocks.1.attn.base_layer.weight",
         }
 
-        s = ModelOffloader.from_module(m, OffloadConfig(block_paths=("transformer_blocks",)))
+        s = ModelOffloader.from_module(m, OffloadConfig(offload_paths=("transformer_blocks",)))
         x = torch.randn(2, 16)
         with activated_model(s, "cpu", adapters=[lora], adapter_strengths=[0.5], adapter_mode="routed"):
             actual = m(x).clone()
@@ -3161,7 +3274,7 @@ class TestRoutedStaging:
     def test_deactivate_removes_staging_hooks(self) -> None:
         m = _make_bf16_model(num_blocks=2, dim=16).float()
         lora = _make_lora(num_blocks=2, dim=16, seed=4)
-        s = ModelOffloader.from_module(m, OffloadConfig(block_paths=("transformer_blocks",)))
+        s = ModelOffloader.from_module(m, OffloadConfig(offload_paths=("transformer_blocks",)))
 
         x = torch.randn(2, 16)
         base = m(x)
@@ -3183,7 +3296,7 @@ class TestRoutedStaging:
             state_dict=_make_lora_sd(num_blocks=2, dim=16, seed=7),
         )
         x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
-        s = ModelOffloader.from_module(m, OffloadConfig(block_paths=("transformer_blocks",)))
+        s = ModelOffloader.from_module(m, OffloadConfig(offload_paths=("transformer_blocks",)))
         with activated_model(s, "cuda", adapters=[lora], adapter_strengths=[0.5]):
             merged = m(x).clone()
             torch.cuda.synchronize()
@@ -3203,7 +3316,7 @@ class TestRoutedStaging:
             "transformer_blocks.0.absent.lora_B.weight": torch.randn(16, 4),
         }
         bad = Adapter.from_state_dict(state_dict=sd)
-        s = ModelOffloader.from_module(m, OffloadConfig(block_paths=("transformer_blocks",)))
+        s = ModelOffloader.from_module(m, OffloadConfig(offload_paths=("transformer_blocks",)))
         x = torch.randn(2, 16, dtype=torch.bfloat16)
         base = m(x)
         with pytest.raises(ValueError, match="not parameters in the model"):
@@ -3216,23 +3329,24 @@ class TestRoutedStaging:
 class TestDeactivateCleanupInvariants:
     @CUDA
     @pytest.mark.parametrize("mode", ["merge", "routed"])
-    def test_cleanup_runs_even_when_streamer_deactivate_raises(
+    def test_cleanup_runs_even_when_engine_release_raises(
         self, mode: AdapterMode, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
-        component, = block_components(s)
+        engine = residency_engine(s)
         x = torch.ones(1, 16, dtype=torch.bfloat16)
         base = m(x)
 
         def fail_release() -> None:
-            raise RuntimeError("streamer cleanup failed")
+            engine._working_set_state = engine._working_set_state.CHANGING
+            raise RuntimeError("engine cleanup failed")
 
         s.activate("cuda", adapters=[_make_lora(4, 16)], adapter_mode=mode)
         try:
             with monkeypatch.context() as patch:
-                patch.setattr(component, "release", fail_release)
-                with pytest.raises(RuntimeError, match="streamer cleanup failed"):
+                patch.setattr(engine, "release", fail_release)
+                with pytest.raises(RuntimeError, match="engine cleanup failed"):
                     s.deactivate()
             assert s.active_device is None
             assert s.failed
