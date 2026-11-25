@@ -28,6 +28,13 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   and `DeviceMesh` subgroups, `torch.compile`, and `ModelStore`/`ModelOffloader`
   streaming coordination.
 
+### Changed
+
+- Reduced lock contention and per-transfer Python overhead for offloaded host
+  transfers and block switches by pre-resolving leased transfer views, caching
+  bound module parameter/buffer slots and resting CPU parameter wrappers per
+  module instance, and speeding up large-model pin range tracking.
+
 ### Fixed
 
 - Cached a backend-less resting CPU `DeviceMesh` (with distinct internal

@@ -11,7 +11,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import NoReturn, Self, cast
 
@@ -174,29 +174,87 @@ class HostModuleInstance:
     module: nn.Module
     params: Mapping[str, HostParam]
     buffers: Mapping[str, HostBuffer]
+    _param_slots: dict[str, tuple[nn.Module, str]] | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+    _buffer_slots: dict[str, tuple[nn.Module, str]] | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+    _host_param_install: tuple[tuple[nn.Module, str, nn.Parameter], ...] | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+    _host_buffer_install: tuple[tuple[nn.Module, str, torch.Tensor], ...] | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+
+    def _resolved_param_slots(self) -> dict[str, tuple[nn.Module, str]]:
+        slots = self._param_slots
+        if slots is None:
+            slots = {name: resolve_parent_leaf(self.module, name) for name in self.params}
+            self._param_slots = slots
+        return slots
+
+    def _resolved_buffer_slots(self) -> dict[str, tuple[nn.Module, str]]:
+        slots = self._buffer_slots
+        if slots is None:
+            slots = {name: resolve_parent_leaf(self.module, name) for name in self.buffers}
+            self._buffer_slots = slots
+        return slots
+
+    def _resolved_host_param_install(self) -> tuple[tuple[nn.Module, str, nn.Parameter], ...]:
+        install = self._host_param_install
+        if install is None:
+            param_slots = self._resolved_param_slots()
+            by_host: dict[int, nn.Parameter] = {}
+            entries: list[tuple[nn.Module, str, nn.Parameter]] = []
+            for name, host in self.params.items():
+                cpu_param = by_host.get(id(host))
+                if cpu_param is None:
+                    cpu_param = host.make_cpu_param()
+                    by_host[id(host)] = cpu_param
+                parent, leaf = param_slots[name]
+                entries.append((parent, leaf, cpu_param))
+            install = tuple(entries)
+            self._host_param_install = install
+        return install
+
+    def _resolved_host_buffer_install(self) -> tuple[tuple[nn.Module, str, torch.Tensor], ...]:
+        install = self._host_buffer_install
+        if install is None:
+            buffer_slots = self._resolved_buffer_slots()
+            install = tuple(
+                (*buffer_slots[name], host.tensor)
+                for name, host in self.buffers.items()
+            )
+            self._host_buffer_install = install
+        return install
 
     def install_host(self) -> None:
         """Install the host bytes onto :attr:`module`'s attributes.
 
-        Pure CPU repoint: materializes the CPU wrappers on
-        demand (deduped by ``id(host)`` so tied names share one wrapper)
-        and installs them onto :attr:`module`, leaving its managed state on
-        the host bytes. Mutates :attr:`module` in place.
+        Pure CPU repoint: reuses per-instance CPU wrappers (deduped by
+        ``id(host)`` so tied names share one wrapper) and pre-resolved
+        module slots, leaving managed state on host bytes. Mutates
+        :attr:`module` in place.
         """
-        _install_host_params(self.module, self.params)
-        _install_host_buffers(self.module, self.buffers)
+        for parent, leaf, param in self._resolved_host_param_install():
+            _set_param(parent, leaf, param)
+        for parent, leaf, tensor in self._resolved_host_buffer_install():
+            _set_buffer(parent, leaf, tensor)
 
     def install_target(self, target: HostModuleTarget) -> None:
         """Install already-filled active storage without copying into it."""
         _validate_target_names_known(self.params, self.buffers, target)
-        install_parameters(
-            self.module,
-            {name: param_target.param for name, param_target in target.param_targets.items()},
-        )
-        _set_buffers(
-            self.module,
-            {name: buffer_target.tensor for name, buffer_target in target.buffer_targets.items()},
-        )
+        if target.param_targets:
+            param_slots = self._resolved_param_slots()
+            for name, param_target in target.param_targets.items():
+                parent, leaf = param_slots[name]
+                _set_param(parent, leaf, param_target.param)
+        if target.buffer_targets:
+            buffer_slots = self._resolved_buffer_slots()
+            for name, buffer_target in target.buffer_targets.items():
+                parent, leaf = buffer_slots[name]
+                _set_buffer(parent, leaf, buffer_target.tensor)
 
     def resolve_load_plan(
         self,
@@ -349,15 +407,13 @@ class HostModuleLoadPlan:
         """Copy sources, apply updates, and leave module registries untouched."""
         instance = self.instance
         _validate_target_names_known(instance.params, instance.buffers, target)
-        loads = _items_for_names(self.loads, target.param_targets)
-        buffers = _items_for_names(instance.buffers, target.buffer_targets)
         _load_params_to_target(
-            loads,
+            self.loads,
             target.param_targets,
             non_blocking=non_blocking,
         )
         _copy_buffers_to_target(
-            buffers,
+            instance.buffers,
             target.buffer_targets,
             non_blocking=non_blocking,
         )
@@ -626,10 +682,12 @@ def _validate_target_names_known(
     buffers: Mapping[str, HostBuffer],
     target: HostModuleTarget,
 ) -> None:
+    if all(name in params for name in target.param_targets) and all(
+        name in buffers for name in target.buffer_targets
+    ):
+        return
     extra_params = sorted(set(target.param_targets) - set(params))
     extra_buffers = sorted(set(target.buffer_targets) - set(buffers))
-    if not extra_params and not extra_buffers:
-        return
 
     details = []
     if extra_params:
@@ -767,9 +825,13 @@ def _load_params_to_target(
     *,
     non_blocking: bool,
 ) -> None:
+    if not targets:
+        return
     copied: set[int] = set()
     for name, load in loads.items():
-        target = targets[name]
+        target = targets.get(name)
+        if target is None:
+            continue
         key = id(target)
         if key in copied:
             continue
@@ -805,33 +867,18 @@ def _copy_buffers_to_target(
     *,
     non_blocking: bool,
 ) -> None:
+    if not targets:
+        return
     copied: set[int] = set()
     for name, host in buffers.items():
+        target = targets.get(name)
+        if target is None:
+            continue
         key = id(host)
         if key in copied:
             continue
-        transfer_(targets[name].tensor, host.tensor, non_blocking=non_blocking)
+        transfer_(target.tensor, host.tensor, non_blocking=non_blocking)
         copied.add(key)
-
-
-def _install_host_params(
-    module: nn.Module,
-    params: Mapping[str, HostParam],
-) -> None:
-    # Build the materialized CPU params on demand, deduped by ``id(host)``
-    # so tied names share one wrapper (preserving tied-weight behavior).
-    # ``make_cpu_param`` is cheap/zero-copy for every adapter (a plain
-    # wrapper / metadata reconstruction aliasing the host tensors), so
-    # per-install construction is fine.
-    materialized: dict[str, nn.Parameter] = {}
-    by_host: dict[int, nn.Parameter] = {}
-    for name, host in params.items():
-        cpu_param = by_host.get(id(host))
-        if cpu_param is None:
-            cpu_param = host.make_cpu_param()
-            by_host[id(host)] = cpu_param
-        materialized[name] = cpu_param
-    install_parameters(module, materialized)
 
 
 def install_parameters(
@@ -842,26 +889,6 @@ def install_parameters(
     for name, materialized in materialized_params.items():
         parent, leaf = resolve_parent_leaf(module, name)
         _set_param(parent, leaf, materialized)
-
-
-def _install_host_buffers(
-    module: nn.Module,
-    buffers: Mapping[str, HostBuffer],
-) -> None:
-    _set_buffers(
-        module,
-        {name: host.tensor for name, host in buffers.items()},
-    )
-
-
-def _set_buffers(
-    module: nn.Module,
-    buffers: Mapping[str, torch.Tensor],
-) -> None:
-    for name, tensor in buffers.items():
-        parent, leaf = resolve_parent_leaf(module, name)
-        persistent = leaf not in parent._non_persistent_buffers_set
-        parent.register_buffer(leaf, tensor, persistent=persistent)
 
 
 def _named_parameters(module: nn.Module) -> dict[str, nn.Parameter]:
@@ -887,6 +914,12 @@ def _set_param(parent: nn.Module, leaf: str, param: nn.Parameter) -> None:
     if leaf not in parent._parameters:
         raise RuntimeError(f"Parameter {leaf!r} is unexpectedly missing.")
     parent._parameters[leaf] = param
+
+
+def _set_buffer(parent: nn.Module, leaf: str, tensor: torch.Tensor) -> None:
+    if leaf not in parent._buffers:
+        raise RuntimeError(f"Buffer {leaf!r} is unexpectedly missing.")
+    parent._buffers[leaf] = tensor
 
 
 def _unique_cache_bytes(

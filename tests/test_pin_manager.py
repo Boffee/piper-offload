@@ -1,10 +1,13 @@
 """Registration ownership, page accounting, and explicit pin leases."""
 
+from bisect import bisect_left
+from collections import deque
 import ctypes
 import gc
 import logging
 import mmap
 import os
+import random
 import sys
 import threading
 import time
@@ -3036,5 +3039,279 @@ def test_empty_view_into_idle_registered_storage_transfers_without_lease(
             assert (lease.registered_bytes, lease.pageable_bytes) == (0, 0)
             manager.transfer(fake_cuda_dst, empty, non_blocking=True)  # type: ignore[arg-type]
         assert copies == [(0, True)]
+    finally:
+        manager.clear()
+
+
+def test_sorted_pointers_matches_reference_oracle() -> None:
+    rng = random.Random(42)
+    index = pin_module._SortedPointers()
+    oracle: list[int] = []
+
+    assert index.neighbors(0) == ()
+    with pytest.raises(KeyError):
+        index.remove(123)
+
+    next_ptr = 1024
+    for step in range(2500):
+        # Bias toward growth early so multiple bucket splits occur (> 512 items), then mix churn.
+        if not oracle or step < 1400 or rng.random() < 0.55:
+            ptr = next_ptr + rng.randrange(1, 2048)
+            next_ptr = ptr if rng.random() < 0.7 else next_ptr
+            if ptr not in oracle:
+                index.add(ptr)
+                index.add(ptr)  # duplicate add must stay idempotent
+                oracle.insert(bisect_left(oracle, ptr), ptr)
+        else:
+            ptr = oracle[rng.randrange(len(oracle))]
+            index.remove(ptr)
+            oracle.remove(ptr)
+
+        if step % 25 == 0:
+            for probe in (0, next_ptr + 10_000, *(rng.sample(oracle, min(3, len(oracle))))):
+                for query in (probe - 1, probe, probe + 1):
+                    pos = bisect_left(oracle, query)
+                    assert index.neighbors(query) == tuple(oracle[max(0, pos - 1):pos + 1])
+
+    with pytest.raises(KeyError):
+        index.remove(oracle[0] + 1 if oracle[0] + 1 not in oracle else -1)
+    with pytest.raises(KeyError):
+        index.remove(oracle[-1] + 9999)
+
+    rng.shuffle(oracle)
+    for idx, ptr in enumerate(oracle):
+        index.remove(ptr)
+        if idx % 20 == 0 and oracle[idx + 1 :]:
+            sample_q = oracle[idx + 1]
+            rem = sorted(oracle[idx + 1 :])
+            for query in (sample_q - 1, sample_q, sample_q + 1):
+                pos = bisect_left(rem, query)
+                assert index.neighbors(query) == tuple(rem[max(0, pos - 1):pos + 1])
+    assert index.neighbors(0) == ()
+    with pytest.raises(KeyError):
+        index.remove(oracle[0])
+
+
+def test_leased_async_transfer_reuses_preresolved_view_without_manager_lock(
+    backend: FakeBackend,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ckpt = _checkpoint(tmp_path, 2 * PAGE, "preresolved")
+    sub = ckpt[16:128]
+    manager = PinManager(4 * PAGE, backend=backend)
+    view_calls = 0
+    original_view = copy_memory.Copy.view
+
+    def counting_view(self: copy_memory.Copy, tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal view_calls
+        view_calls += 1
+        return original_view(self, tensor)
+
+    monkeypatch.setattr(copy_memory.Copy, "view", counting_view)
+
+    transferred: list[tuple[int, torch.Tensor]] = []
+    errors: list[BaseException] = []
+    fake_cuda_dst = SimpleNamespace(
+        device=torch.device("cuda", 0),
+        copy_=lambda src, *, non_blocking=False: transferred.append(
+            (src.untyped_storage().data_ptr(), src.clone())
+        ),
+    )
+
+    def run_transfer() -> None:
+        try:
+            manager.transfer(fake_cuda_dst, ckpt, non_blocking=True)  # type: ignore[arg-type]
+        except BaseException as exc:  # pragma: no cover - re-raised below
+            errors.append(exc)
+
+    try:
+        with manager.acquire([ckpt]) as lease:
+            assert lease.registered_bytes == 2 * PAGE
+            assert view_calls == 1
+            reg_ptr = manager._registrations[ckpt.untyped_storage().data_ptr()].registered
+            # Hold _lock on main thread while worker runs repeated async transfers.
+            with manager._lock:
+                for _ in range(5):
+                    t = threading.Thread(target=run_transfer)
+                    t.start()
+                    t.join(timeout=2.0)
+                    assert not t.is_alive()
+            assert not errors
+            assert view_calls == 1
+            assert len(transferred) == 5
+            assert all(ptr == reg_ptr and torch.equal(out, ckpt) for ptr, out in transferred)
+
+            # Synchronous leased copy also reuses the pre-resolved view without re-calling Copy.view.
+            cpu_dst = torch.empty_like(ckpt)
+            manager.transfer(cpu_dst, ckpt, non_blocking=False)
+            assert view_calls == 1
+            assert torch.equal(cpu_dst, ckpt)
+
+            # Derived sub-view falls back cleanly under the lock via Copy.view.
+            manager.transfer(fake_cuda_dst, sub, non_blocking=True)  # type: ignore[arg-type]
+            assert view_calls == 2
+            assert transferred[-1][0] == reg_ptr
+            assert torch.equal(transferred[-1][1], sub)
+            assert reg_ptr in backend.registered
+
+        with pytest.raises(RuntimeError, match="outside a lease"):
+            manager.transfer(fake_cuda_dst, ckpt, non_blocking=True)  # type: ignore[arg-type]
+    finally:
+        manager.clear()
+
+
+def test_concurrent_leases_share_and_release_preresolved_views_for_windows_offering(
+    backend: FakeBackend,
+    offering: FakeKernel,
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    del offering
+    first = _checkpoint(tmp_path, 2 * PAGE, "first")
+    second = _checkpoint(tmp_path, 2 * PAGE, "second")
+    manager = _offered_manager(backend)
+    try:
+        lease1 = manager.acquire([first])
+        lease2 = manager.acquire([first])
+        assert manager._leased_views[id(first)][1] == 2
+        lease1.close()
+        assert manager._leased_views[id(first)][1] == 1
+        lease2.close()
+        assert manager._leased_views == {}
+
+        offered_pointer = _copy_pointer(backend)
+        with caplog.at_level(logging.WARNING, logger="piper_offload"), manager.acquire([second]):
+            assert ("offer", offered_pointer) in backend.events
+            assert (manager.stats.offered_bytes, manager.stats.pinned_bytes) == (2 * PAGE, 2 * PAGE)
+        assert "still referenced" not in caplog.text
+    finally:
+        manager.clear()
+
+
+def test_open_lease_view_failure_rolls_back_cleanly(
+    backend: FakeBackend,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    first = _checkpoint(tmp_path, 2 * PAGE, "first")
+    second = _checkpoint(tmp_path, 2 * PAGE, "second")
+    manager = PinManager(8 * PAGE, backend=backend)
+    calls = 0
+    original_view = copy_memory.Copy.view
+
+    def fail_second_view(self: copy_memory.Copy, tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected view failure")
+        return original_view(self, tensor)
+
+    monkeypatch.setattr(copy_memory.Copy, "view", fail_second_view)
+    try:
+        with caplog.at_level(logging.WARNING, logger="piper_offload"), pytest.raises(
+            RuntimeError, match="injected view failure",
+        ):
+            manager.acquire([first, second])
+        assert manager._leased_views == {}
+        assert manager.stats.active_leases == 0
+        assert manager.stats.registrations == 0
+        assert manager.stats.pinned_bytes == 0
+        assert backend.registered == {}
+        assert "still referenced" not in caplog.text
+    finally:
+        manager.clear()
+
+
+def test_open_lease_pin_lease_init_failure_preserves_shared_lease(
+    backend: FakeBackend,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ckpt = _checkpoint(tmp_path, 2 * PAGE, "shared")
+    ptr = ckpt.untyped_storage().data_ptr()
+    manager = PinManager(4 * PAGE, backend=backend)
+    lease1 = manager.acquire([ckpt])
+    try:
+        reg_ptr = manager._registrations[ptr].registered
+        real_finalize = weakref.finalize
+
+        class FailingAtExitFinalizer:
+            def __init__(self, obj: object, func: object, *args: object) -> None:
+                self._real = real_finalize(obj, func, *args)  # type: ignore[arg-type]
+
+            @property
+            def alive(self) -> bool:
+                return self._real.alive
+
+            @property
+            def atexit(self) -> bool:
+                return self._real.atexit
+
+            @atexit.setter
+            def atexit(self, _value: bool) -> None:
+                raise RuntimeError("injected PinLease init failure")
+
+            def detach(self) -> object:
+                return self._real.detach()
+
+            def __call__(self) -> object:
+                return self._real()
+
+        with monkeypatch.context() as patch:
+            patch.setattr(weakref, "finalize", FailingAtExitFinalizer)
+            with pytest.raises(RuntimeError, match="injected PinLease init failure"):
+                manager.acquire([ckpt])
+        gc.collect()
+        assert manager.stats.active_leases == 1
+        assert manager._leased_views[id(ckpt)][1] == 1
+        assert manager._registrations[ptr].leases == 1
+        assert reg_ptr in backend.registered
+        lease1.close()
+        assert manager._leased_views == {}
+        assert manager.stats.active_leases == 0
+    finally:
+        manager.clear()
+        assert backend.registered == {}
+
+
+def test_interrupted_release_views_retry_preserves_other_lease(
+    backend: FakeBackend,
+    tmp_path,
+) -> None:
+    first = _checkpoint(tmp_path, 2 * PAGE, "first")
+    second = _checkpoint(tmp_path, 2 * PAGE, "second")
+    manager = PinManager(8 * PAGE, backend=backend)
+    lease1 = manager.acquire([first, second])
+    lease2 = manager.acquire([first, second])
+    try:
+        class OnceInterruptingDeque(deque[int]):
+            def __init__(self, iterable: deque[int]) -> None:
+                super().__init__(iterable)
+                self._calls = 0
+
+            def popleft(self) -> int:
+                self._calls += 1
+                if self._calls == 2:
+                    raise KeyboardInterrupt("injected release_views interrupt")
+                return super().popleft()
+
+        state = manager._leases[lease1._key]
+        state.view_ids = OnceInterruptingDeque(state.view_ids)
+
+        with pytest.raises(KeyboardInterrupt, match="injected release_views interrupt"):
+            lease1.close()
+        assert not lease1.closed
+        assert len(state.view_ids) == 1
+
+        lease1.close()
+        assert lease1.closed
+        assert manager._leased_views[id(first)][1] == 1
+        assert manager._leased_views[id(second)][1] == 1
+
+        lease2.close()
+        assert manager._leased_views == {}
+        assert manager.stats.active_leases == 0
     finally:
         manager.clear()
