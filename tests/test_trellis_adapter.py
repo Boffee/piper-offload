@@ -13,6 +13,7 @@ from piper_offload import (
     TrellisParameter,
     merge_adapter,
 )
+from piper_offload._convrot_int8_source import ConvRotInt8GpuTarget
 from piper_offload._piper_convrot_int8 import supports_variable_row_trellis
 from piper_offload.host_param import HostParam
 from piper_offload.lora import LoRATransform, ScaledLoRAFactor
@@ -35,22 +36,29 @@ VARIABLE_ROW_CUDA = pytest.mark.skipif(
 
 
 def _weight(
-    seed: int, *, blocks: int = 1, num_bytes: int = 143, act_scale: float | None = None
+    seed: int,
+    *,
+    blocks: int = 1,
+    num_bytes: int = 143,
+    act_scale: float | None = None,
+    block_size: int = BLOCK_SIZE,
+    group_size: int = GROUP_SIZE,
+    rows: int = ROWS,
 ) -> TrellisParameter:
     """Arbitrary trellis storage: every bit pattern is a valid walk."""
     generator = torch.Generator().manual_seed(seed)
     bitstreams = torch.randint(
-        0, 256, (ROWS, blocks, num_bytes), dtype=torch.uint8, generator=generator
+        0, 256, (rows, blocks, num_bytes), dtype=torch.uint8, generator=generator
     )
     # E4M3 codes 0x20-0x3F are finite scales from 0.125 to 1.875.
-    codes = torch.randint(0x20, 0x40, (ROWS, blocks), dtype=torch.uint8, generator=generator)
-    scale = torch.rand(ROWS, 1, generator=generator) * 1e-3 + 1e-4
+    codes = torch.randint(0x20, 0x40, (rows, blocks), dtype=torch.uint8, generator=generator)
+    scale = torch.rand(rows, 1, generator=generator) * 1e-3 + 1e-4
     return TrellisParameter(
         bitstreams,
         codes.view(torch.float8_e4m3fn),
         scale,
-        block_size=BLOCK_SIZE,
-        group_size=GROUP_SIZE,
+        block_size=block_size,
+        group_size=group_size,
         act_per_tensor_scale=None if act_scale is None else torch.tensor(act_scale),
     )
 
@@ -376,6 +384,26 @@ class TestTrellisSource:
         with pytest.raises(RuntimeError, match="missing row_widths support"):
             TrellisAdapter.alloc_gpu(state, torch.device("cpu"))
 
+    def test_copy_to_gpu_fails_fast_when_variable_row_refills_uniform_target(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import piper_offload.trellis_adapter as ta
+
+        weight = _variable_row_weight(4)
+        state = TrellisAdapter.capture_host(weight)
+
+        def _raise() -> None:
+            raise RuntimeError("missing row_widths support")
+
+        def _unexpected_stage(*args: object, **kwargs: object) -> object:
+            raise AssertionError("unexpected stage_packed_tensors call")
+
+        monkeypatch.setattr(ta, "require_variable_row_trellis", _raise)
+        monkeypatch.setattr(ta, "stage_packed_tensors", _unexpected_stage)
+        target = ConvRotInt8GpuTarget(target=torch.empty((ROWS, BLOCK_SIZE), dtype=torch.int8))
+        with pytest.raises(RuntimeError, match="missing row_widths support"):
+            TrellisAdapter.copy_to_gpu(state, target)
+
     def test_model_store_distinguishes_negated_row_widths_sharing_storage(self) -> None:
         class _Pair(nn.Module):
             def __init__(self, first: TrellisParameter, second: TrellisParameter) -> None:
@@ -466,17 +494,30 @@ class TestTrellisSource:
         assert TrellisAdapter.logical_shape(weight) == (ROWS, 2 * BLOCK_SIZE)
         assert TrellisAdapter.compute_dtype(weight) is torch.bfloat16
 
-    def test_tensor_id_and_layout_follow_storage_and_rate(self) -> None:
+    def test_tensor_id_and_layout_follow_storage_and_target(self) -> None:
         weight = _weight(5)
         other_rate = _weight(5, num_bytes=111)
+        other_block_size = _weight(5, blocks=2, block_size=128, num_bytes=72)
+        other_group_size = _weight(5, group_size=128)
+        with_act_scale = _weight(5, act_scale=0.1)
 
         assert TrellisAdapter.tensor_id(weight) == TrellisAdapter.tensor_id(weight.detach())
         assert TrellisAdapter.tensor_id(weight) != TrellisAdapter.tensor_id(weight.clone())
+        assert TrellisAdapter.tensor_id(weight) != TrellisAdapter.tensor_id(other_rate)
         assert TrellisAdapter.layout_signature(weight) == TrellisAdapter.layout_signature(
             weight.clone()
         )
-        assert TrellisAdapter.layout_signature(weight) != TrellisAdapter.layout_signature(
+        assert TrellisAdapter.layout_signature(weight) == TrellisAdapter.layout_signature(
             other_rate
+        )
+        assert TrellisAdapter.layout_signature(weight) == TrellisAdapter.layout_signature(
+            other_block_size
+        )
+        assert TrellisAdapter.layout_signature(weight) != TrellisAdapter.layout_signature(
+            other_group_size
+        )
+        assert TrellisAdapter.layout_signature(weight) != TrellisAdapter.layout_signature(
+            with_act_scale
         )
 
     def test_variable_row_tensor_id_and_layout_signature(self) -> None:
@@ -489,9 +530,10 @@ class TestTrellisSource:
         assert TrellisAdapter.tensor_id(first) == TrellisAdapter.tensor_id(first.detach())
         assert TrellisAdapter.tensor_id(first) != TrellisAdapter.tensor_id(first.clone())
         assert TrellisAdapter.tensor_id(first) != TrellisAdapter.tensor_id(permuted)
+        assert TrellisAdapter.tensor_id(first) != TrellisAdapter.tensor_id(uniform_equal)
         assert TrellisAdapter.layout_signature(first) == TrellisAdapter.layout_signature(permuted)
-        assert TrellisAdapter.layout_signature(first) != TrellisAdapter.layout_signature(other_total)
-        assert TrellisAdapter.layout_signature(first) != TrellisAdapter.layout_signature(
+        assert TrellisAdapter.layout_signature(first) == TrellisAdapter.layout_signature(other_total)
+        assert TrellisAdapter.layout_signature(first) == TrellisAdapter.layout_signature(
             uniform_equal
         )
 
@@ -507,6 +549,33 @@ class TestTrellisSource:
 
         with pytest.raises(ValueError, match="Permanent updates to trellis-coded"):
             merge_adapter(model, [(adapter, 1.0)])
+
+    def test_model_store_bind_accepts_differing_rates_and_rejects_target_mismatches(
+        self,
+    ) -> None:
+        def _shell_with_weight(w: TrellisParameter) -> nn.Linear:
+            mod = nn.Linear(BLOCK_SIZE, ROWS, bias=False, device="meta")
+            mod.weight = w
+            return mod.requires_grad_(False)
+
+        base = _weight(18, num_bytes=143)
+        store = ModelStore.from_module(_shell_with_weight(base))
+
+        # Differing uniform bitrate and variable-row shells share the same target layout.
+        diff_rate = _shell_with_weight(_weight(19, num_bytes=111))
+        store.bind(diff_rate)
+        assert torch.equal(diff_rate.weight.bitstreams, base.bitstreams)
+
+        diff_var = _shell_with_weight(_variable_row_weight(20))
+        store.bind(diff_var)
+        assert diff_var.weight.row_widths is None
+        assert torch.equal(diff_var.weight.bitstreams, base.bitstreams)
+
+        # Differing target layout metadata still rejects bind.
+        with pytest.raises(ValueError, match="layout mismatch"):
+            store.bind(_shell_with_weight(_weight(21, group_size=128)))
+        with pytest.raises(ValueError, match="layout mismatch"):
+            store.bind(_shell_with_weight(_weight(22, act_scale=0.1)))
 
 
 class TestTrellisActivation:
@@ -534,7 +603,28 @@ class TestTrellisActivation:
 
     @CUDA
     def test_refill_reuses_the_target_and_carries_the_activation_scale(self) -> None:
-        first, second = _weight(8, act_scale=0.05), _weight(9, act_scale=0.25)
+        first = _weight(8, num_bytes=143, act_scale=0.05)
+        second = _weight(9, num_bytes=111, act_scale=0.25)
+        backing = HostParam(first)
+        state = backing.allocate_gpu_storage(torch.device("cuda"))
+        assert not hasattr(state, "staging")
+        actual = param_representation(backing.make_gpu_param(state))
+        backing.copy_to_gpu(state)
+        qdata_pointer = actual.qdata.data_ptr()
+
+        HostParam(second).copy_to_gpu(state)
+        torch.cuda.synchronize()
+
+        expected = _decode(second)
+        assert actual.qdata.data_ptr() == qdata_pointer
+        assert torch.equal(actual.qdata, expected.qdata)
+        assert torch.equal(actual.scale, expected.scale)
+        assert float(actual.act_per_tensor_scale) == pytest.approx(0.25)
+
+    @CUDA
+    def test_refill_reuses_target_across_different_block_sizes(self) -> None:
+        first = _weight(30, blocks=1, block_size=256, num_bytes=143)
+        second = _weight(31, blocks=2, block_size=128, num_bytes=72)
         backing = HostParam(first)
         state = backing.allocate_gpu_storage(torch.device("cuda"))
         actual = param_representation(backing.make_gpu_param(state))
@@ -548,8 +638,6 @@ class TestTrellisActivation:
         assert actual.qdata.data_ptr() == qdata_pointer
         assert torch.equal(actual.qdata, expected.qdata)
         assert torch.equal(actual.scale, expected.scale)
-        assert float(actual.act_per_tensor_scale) == pytest.approx(0.25)
-        assert sum(t.nbytes for t in state.staging) < actual.qdata.nbytes
 
     @CUDA
     def test_lora_merges_into_the_decoded_target(self) -> None:
@@ -645,10 +733,11 @@ class TestTrellisActivation:
             12, blocks=2, widths=[128] * 32 + [160] * 32, act_scale=0.05
         )
         second = _variable_row_weight(
-            13, blocks=2, widths=[160] * 32 + [128] * 32, act_scale=0.25
+            13, blocks=2, widths=[112] * 32 + [144] * 32, act_scale=0.25
         )
         backing = HostParam(first)
         state = backing.allocate_gpu_storage(torch.device("cuda"))
+        assert not hasattr(state, "staging")
         actual = param_representation(backing.make_gpu_param(state))
         backing.copy_to_gpu(state, non_blocking=True)
         qdata_pointer = actual.qdata.data_ptr()
@@ -661,8 +750,6 @@ class TestTrellisActivation:
         assert torch.equal(actual.qdata, expected.qdata)
         assert torch.equal(actual.scale, expected.scale)
         assert float(actual.act_per_tensor_scale) == pytest.approx(0.25)
-        assert len(state.staging) == 4
-        assert sum(t.nbytes for t in state.staging) < actual.qdata.nbytes
 
     @VARIABLE_ROW_CUDA
     def test_variable_row_streaming_blocks_share_target_and_merge_lora(self) -> None:
@@ -684,8 +771,8 @@ class TestTrellisActivation:
 
         weights = (
             _variable_row_weight(14, widths=[128] * 32 + [160] * 32),
-            _variable_row_weight(15, widths=[160] * 32 + [128] * 32),
-            _variable_row_weight(16, widths=[144] * ROWS),
+            _variable_row_weight(15, widths=[112] * 32 + [144] * 32),
+            _weight(16, num_bytes=143),
         )
         model = _BlockModel(weights)
 
@@ -746,4 +833,117 @@ class TestTrellisActivation:
         finally:
             for handle in handles:
                 handle.remove()
+            offloader.deactivate()
+
+    @CUDA
+    def test_mixed_rate_streaming_blocks_share_two_target_pool_and_merge_lora(self) -> None:
+        class _BlockModel(nn.Module):
+            def __init__(self, weights: tuple[TrellisParameter, ...]) -> None:
+                super().__init__()
+                blocks = []
+                for w in weights:
+                    layer = nn.Linear(BLOCK_SIZE, ROWS, bias=False)
+                    layer.weight = w
+                    blocks.append(layer)
+                self.blocks = nn.ModuleList(blocks)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                out = self.blocks[0](x)
+                for block in self.blocks[1:]:
+                    out = out + block(x)
+                return out
+
+        weights = (
+            _weight(24, num_bytes=111),
+            _weight(25, num_bytes=143),
+            _weight(26, num_bytes=175),
+        )
+        model = _BlockModel(weights)
+
+        torch.manual_seed(27)
+        factors = [(torch.randn(4, BLOCK_SIZE), torch.randn(ROWS, 4)) for _ in weights]
+        adapter = Adapter.from_state_dict(
+            {
+                key: tensor
+                for idx, (a, b) in enumerate(factors)
+                for key, tensor in (
+                    (f"blocks.{idx}.lora_A.weight", a),
+                    (f"blocks.{idx}.lora_B.weight", b),
+                )
+            }
+        )
+
+        x = torch.randn(8, BLOCK_SIZE, device="cuda", dtype=torch.bfloat16)
+        expected = torch.zeros((8, ROWS), device="cuda", dtype=torch.bfloat16)
+        for weight, (a, b) in zip(weights, factors, strict=True):
+            decoded = _decode(weight)
+            decoded.addmm_(
+                b.to(device="cuda", dtype=torch.bfloat16),
+                a.to(device="cuda", dtype=torch.bfloat16),
+                alpha=0.25,
+            )
+            expected = expected + F.linear(x, decoded)
+
+        seen_ptrs: list[int] = []
+        handles = [
+            block.register_forward_hook(
+                lambda mod, _inp, _out: seen_ptrs.append(
+                    param_representation(mod.weight).qdata.data_ptr()
+                )
+            )
+            for block in model.blocks
+        ]
+
+        offloader = ModelOffloader.from_module(
+            model,
+            OffloadConfig(block_paths=("blocks",), block_mode="streaming"),
+        )
+        offloader.activate(
+            "cuda",
+            adapters=[adapter],
+            adapter_strengths=[0.25],
+            adapter_mode="merge",
+            stochastic_rounding=False,
+        )
+        try:
+            with torch.inference_mode():
+                actual = model(x)
+                torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected)
+            # Active + lookahead share a 2-target pool across mixed bitrates.
+            assert len(seen_ptrs) == 3
+            assert len(set(seen_ptrs)) == 2
+            assert seen_ptrs[2] == seen_ptrs[0]
+        finally:
+            for handle in handles:
+                handle.remove()
+            offloader.deactivate()
+
+    @CUDA
+    def test_resident_activation_retains_no_permanent_staging_vram(self) -> None:
+        weights = [_weight(100 + idx, rows=512, blocks=2, num_bytes=143) for idx in range(8)]
+        layers = []
+        for weight in weights:
+            layer = nn.Linear(512, 512, bias=False)
+            layer.weight = weight
+            layers.append(layer)
+        model = nn.Sequential(*layers)
+        offloader = ModelOffloader.from_module(model)
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        baseline = torch.cuda.memory_allocated()
+        offloader.activate("cuda")
+        try:
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_allocated() - baseline
+            target_bytes = sum(
+                param_representation(layer.weight).qdata.nbytes
+                + param_representation(layer.weight).scale.nbytes
+                for layer in layers
+            )
+            packed_bytes = sum(t.nbytes for w in weights for t in w.storage_tensors())
+            assert allocated <= target_bytes + 16 * 1024
+            assert allocated < target_bytes + packed_bytes // 2
+        finally:
             offloader.deactivate()

@@ -38,6 +38,11 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
+- Removed permanent per-parameter GPU decode staging buffers from
+  `TrellisAdapter` and `GgufAdapter` in favor of transient stream-ordered
+  scratch staging, and narrowed their `layout_signature` keys to the active
+  ConvRot INT8 target layout so mixed-rate Trellis and mixed-quant GGUF blocks
+  share GPU target pools and work with `block_mode="rolling"` and `"auto"`.
 - Reduced lock contention and per-transfer Python overhead for offloaded host
   transfers and block switches by pre-resolving leased transfer views, caching
   bound module parameter/buffer slots and resting CPU parameter wrappers per

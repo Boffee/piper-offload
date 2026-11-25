@@ -64,7 +64,7 @@ def _param_target_layout(p: nn.Parameter) -> tuple[object, object]:
     targets, so a refill is a plain ``Tensor.copy_``; unequal values must
     never share a target, because ``copy_`` silently casts dtype and
     silently broadcasts compatible shapes, and wrapper metadata (qtype,
-    axis, activation_qtype, quant_type) is similarly invisible to it.
+    axis, activation_qtype, group_size) is similarly invisible to it.
 
     This is the standalone form of the same value
     :attr:`HostParam.target_layout` supplies the same value to the block

@@ -1,9 +1,10 @@
 """Trellis-coded ConvRot INT8 offload.
 
 Trellis streams stay packed in host backing, at 3 to 6 bits per weight. Each
-active target owns reusable CUDA staging for the packed tensors and a ConvRot
-INT8 representation. Refills DMA the packed tensors and ask Piper Kernels to
-decode them into that target, so no dense weight is materialized. Decoding needs
+active target owns a reusable ConvRot INT8 representation without retaining
+permanent decode staging buffers. Refills stage the packed tensors into
+transient stream-ordered scratch memory and ask Piper Kernels to decode them
+directly into that target, so no dense weight is materialized. Decoding needs
 a Triton accelerator supported by Piper Kernels.
 """
 
@@ -15,7 +16,11 @@ from typing import Any, cast
 import torch
 from torch import nn
 
-from ._convrot_int8_source import ConvRotInt8SourceAdapter
+from ._convrot_int8_source import (
+    ConvRotInt8GpuTarget,
+    ConvRotInt8SourceAdapter,
+    stage_packed_tensors,
+)
 from ._piper_convrot_int8 import create_convrot_int8_tensor, require_variable_row_trellis
 from .tensor_adapters import (
     capture_host_tensor,
@@ -41,13 +46,6 @@ def _require_trellis_parameter(tensor: torch.Tensor) -> TrellisParameter:
 class _TrellisHost:
     parameter: TrellisParameter
     """The captured parameter, whose tensors are the host backing."""
-
-
-@dataclass(slots=True, frozen=True)
-class _TrellisGpu:
-    staging: tuple[torch.Tensor, ...]
-    """Bitstreams, block scales, row scale, and row widths when variable-row."""
-    target: torch.Tensor
 
 
 class TrellisAdapter(ConvRotInt8SourceAdapter):
@@ -78,10 +76,7 @@ class TrellisAdapter(ConvRotInt8SourceAdapter):
         return (
             tuple(parameter.shape),
             parameter.dtype,
-            tuple(parameter.bitstreams.shape),
-            parameter.block_size,
             parameter.group_size,
-            parameter.row_widths is not None,
             parameter.act_per_tensor_scale is not None,
         )
 
@@ -151,21 +146,13 @@ class TrellisAdapter(ConvRotInt8SourceAdapter):
         return parameter._rewrap_validated(parameter.storage_tensors())
 
     @staticmethod
-    def alloc_gpu(state: _TrellisHost, device: torch.device) -> _TrellisGpu:
+    def alloc_gpu(state: _TrellisHost, device: torch.device) -> ConvRotInt8GpuTarget:
         parameter = state.parameter
         if parameter.row_widths is not None:
             require_variable_row_trellis()
         rows, features = parameter.shape
         act_scale = parameter.act_per_tensor_scale
-        staging: tuple[torch.Tensor, ...] = (
-            torch.empty_like(parameter.bitstreams, device=device),
-            torch.empty_like(parameter.block_scales, device=device),
-            torch.empty_like(parameter.scale, device=device),
-        )
-        if parameter.row_widths is not None:
-            staging = (*staging, torch.empty_like(parameter.row_widths, device=device))
-        return _TrellisGpu(
-            staging=staging,
+        return ConvRotInt8GpuTarget(
             target=create_convrot_int8_tensor(
                 torch.empty((rows, features), dtype=torch.int8, device=device),
                 torch.empty((rows, 1), dtype=torch.float32, device=device),
@@ -176,8 +163,15 @@ class TrellisAdapter(ConvRotInt8SourceAdapter):
         )
 
     @staticmethod
-    def copy_to_gpu(src: _TrellisHost, dst: _TrellisGpu, *, non_blocking: bool = False) -> None:
+    def copy_to_gpu(
+        src: _TrellisHost,
+        dst: ConvRotInt8GpuTarget,
+        *,
+        non_blocking: bool = False,
+    ) -> None:
         parameter = src.parameter
+        if parameter.row_widths is not None:
+            require_variable_row_trellis()
         host_tensors: tuple[torch.Tensor, ...] = (
             parameter.bitstreams,
             parameter.block_scales,
@@ -185,10 +179,13 @@ class TrellisAdapter(ConvRotInt8SourceAdapter):
         )
         if parameter.row_widths is not None:
             host_tensors = (*host_tensors, parameter.row_widths)
-        for staging, host in zip(dst.staging, host_tensors, strict=True):
-            transfer_(staging, host, non_blocking=non_blocking)
         # ConvRotInt8Tensor is an optional import, typed Any at its boundary module.
         target = cast(Any, dst.target)
+        staged = stage_packed_tensors(
+            host_tensors,
+            dst.target.device,
+            non_blocking=non_blocking,
+        )
         if parameter.act_per_tensor_scale is not None:
             transfer_(
                 target.act_per_tensor_scale,
@@ -196,9 +193,9 @@ class TrellisAdapter(ConvRotInt8SourceAdapter):
                 non_blocking=non_blocking,
             )
         if parameter.row_widths is None:
-            target.copy_from_trellis_(*dst.staging)
+            target.copy_from_trellis_(*staged)
         else:
-            target.copy_from_trellis_(*dst.staging[:3], row_widths=dst.staging[3])
+            target.copy_from_trellis_(*staged[:3], row_widths=staged[3])
 
     @staticmethod
     def compute_dtype(t: torch.Tensor) -> torch.dtype:
