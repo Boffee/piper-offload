@@ -109,6 +109,9 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   transfers and block switches by pre-resolving leased transfer views, caching
   bound module parameter/buffer slots and resting CPU parameter wrappers per
   module instance, and speeding up large-model pin range tracking.
+- Lowered the `TrellisParameter` / `TrellisAdapter` minimum `row_widths`
+  validation floor from `3` to `2` code bits per weight (`2` to `6` code bits per
+  weight; 2-bit GPU decoding requires `piper-kernels>=0.8.0rc8`).
 
 ### Fixed
 

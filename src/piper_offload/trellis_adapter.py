@@ -1,6 +1,6 @@
 """Trellis-coded ConvRot INT8 offload.
 
-Trellis streams stay packed in host backing, at 3 to 6 bits per weight. Each
+Trellis streams stay packed in host backing, at 2 to 6 bits per weight. Each
 active target owns a reusable ConvRot INT8 representation without retaining
 permanent decode staging buffers. Refills stage the packed tensors into
 transient stream-ordered scratch memory and ask Piper Kernels to decode them

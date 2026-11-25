@@ -1,6 +1,6 @@
 """Trellis-coded ConvRot INT8 source parameters with logical shape and compute dtype.
 
-A trellis-coded weight stores a ConvRot INT8 matrix in 3 to 6 bits per weight
+A trellis-coded weight stores a ConvRot INT8 matrix in 2 to 6 bits per weight
 (Piper Kernels' ``piper_kernels.trellis`` format), either at a uniform block
 width or with per-row byte widths. ``TrellisParameter`` keeps those packed
 tensors on the host and presents the logical ``[out, in]`` weight; Offload
@@ -20,7 +20,7 @@ from torch import nn
 
 _MIN_BLOCK_SIZE = 16
 _MAX_BLOCK_SIZE = 256
-_MIN_BITS_PER_WEIGHT = 3
+_MIN_BITS_PER_WEIGHT = 2
 _MAX_BITS_PER_WEIGHT = 6
 
 
@@ -153,7 +153,7 @@ class TrellisParameter(nn.Parameter):
     rotated for ConvRot ``group_size``. ``dtype`` is the logical dtype of the
     decoded ConvRot INT8 weight, and ``act_per_tensor_scale`` its optional static
     strided float32 scalar activation scale. CPU construction validates
-    ``row_widths`` bounds (3 to 6 code bits per weight) and minimum
+    ``row_widths`` bounds (2 to 6 code bits per weight) and minimum
     ``bitstreams`` capacity. Use ``ModelOffloader`` to activate the parameter before
     executing its module.
     """
