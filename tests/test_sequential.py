@@ -537,11 +537,11 @@ def test_rejects_nested_executor_and_run(executor):
 @pytest.mark.parametrize("format_name", ["nvfp4", "convrot_nvfp4"])
 @pytest.mark.parametrize("placement", [Replicate(), Shard(0), Shard(1)])
 def test_high_first_dtensor_offload_roundtrip(executor, format_name, placement):
-    from tests.test_nvfp4_adapter import _make_nvfp4_amax, _piper_nvfp4
     from tests.test_piper_convrot_nvfp4_adapter import _make_convrot_nvfp4
+    from tests.test_piper_nvfp4_adapter import _make_piper_nvfp4
 
     if format_name == "nvfp4":
-        source = _piper_nvfp4(_make_nvfp4_amax(), high_first=True)
+        source, _ = _make_piper_nvfp4(rows=128, cols=128, high_first=True)
     else:
         source, _ = _make_convrot_nvfp4(high_first=True)
     source = source.cuda()

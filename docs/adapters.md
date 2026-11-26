@@ -89,7 +89,7 @@ conflicting values before capturing tensors.
 
 Unknown targets raise by default. Set `AdapterSpec(allow_partial_targets=True)`
 when one checkpoint intentionally spans separately loaded or optional model
-components. Missing names are ignored. In activation merge and permanent
+components. Missing names are ignored. For activation-scoped adapters and permanent
 `merge_adapter()`, additive updates also skip existing meta parameters with no
 active complete value provider, leaving those parameters meta. If every target
 is skipped, application is a valid no-op.
@@ -100,9 +100,9 @@ provider does not. With a base, every additive contribution merges normally,
 regardless of adapter order. Shapes, representations, value conflicts, and
 strengths retain their normal validation. A strict additive adapter targeting
 the same unpopulated parameter still raises; partial adapters cannot suppress
-its requirement for a base. Routed LoRA retains its existing target requirements.
+its requirement for a base.
 
-For activation merge and permanent `merge_adapter()`, use one target name per
+For activation-scoped adapters and permanent `merge_adapter()`, use one target name per
 tied parameter across all active adapters. The update reaches every alias;
 targeting multiple names for that shared parameter raises.
 
@@ -115,7 +115,7 @@ objects. Their contracts live in [adapter.py](../src/piper_offload/adapter.py),
 
 ## Broadcast additive updates
 
-Activation merge and permanent `merge_adapter()` use standard PyTorch
+Activation-scoped adapters and permanent `merge_adapter()` use standard PyTorch
 broadcasting for additive updates to plain floating-point parameters, excluding
 plain float8. Each dense delta and each LoRA product `B @ A` must broadcast to
 the existing target shape: `torch.broadcast_shapes(update_shape, target_shape)`
@@ -141,12 +141,16 @@ dense updates. Factors and dense sources remain immutable; callers need not
 repeat or pre-scale checkpoint tensors. Broadcasting does not require a separate
 update copy for every target head.
 
-Complete parameter values require **exact full-shape matching**. Routed LoRA
-retains its exact linear-weight shape contract. Built-in quantized and DTensor
-merge paths currently require exact full-shape updates; custom tensor adapters
-can explicitly opt into broadcast merges. See [formats](formats.md).
+Complete parameter values require **exact full-shape matching**. Built-in
+quantized and DTensor merge paths currently require exact full-shape updates;
+custom tensor adapters can explicitly opt into broadcast merges. See
+[formats](formats.md).
 
-### Accumulation and rounding
+## Accumulation and rounding
+
+Activation-scoped adapters require CUDA and apply updates after each
+host-to-device load (LoRA factors, dense deltas, and complete meta parameter
+values, subject to format capabilities).
 
 Sources are staged in the target's compute dtype. Plain merge arithmetic keeps
 that dtype even inside an autocast context; low-precision sources are not
@@ -157,32 +161,10 @@ Broadcast LoRA products round before addition, so broadcast merges need not be
 bit-identical to separate per-head fused `addmm_` calls. Combining several
 updates can also round differently from applying each separately. Merging
 low-precision heads before averaging need not match adding a shared delta after
-averaging, and adapter ordering does not promise bit-identical sums. Quantized
-rounding is described below. The arithmetic and staging details belong to
+averaging, and adapter ordering does not promise bit-identical sums. The
+arithmetic and staging details belong to
 [the tensor adapters](../src/piper_offload/tensor_adapters.py) and
 [parameter updates](../src/piper_offload/_parameter_update.py).
-
-## Choose merge or routed LoRA
-
-| Mode | Behavior | Supported updates |
-|---|---|---|
-| `"merge"` (default) | Applies updates after each host-to-device load | LoRA, dense deltas, and meta parameter values, subject to format capabilities |
-| `"routed"` | Adds a LoRA residual to each targeted linear's output | LoRA factors only |
-
-Activation-scoped merge requires CUDA. Routed LoRA works on CPU and CUDA
-and leaves the base weight untouched. Before leasing factor storage or
-installing hooks, activation checks that every target belongs to an `nn.Linear`.
-The factors must match the linear's logical weight shape and have a compatible
-compute dtype. Each forward stages its factors and releases them afterwards.
-Several LoRAs on one target contribute independently. For tied weights, only
-the named parent receives the routed residual.
-
-Use `adapter_mode="routed"` in the example above when avoiding quantized
-re-encoding matters more than the extra forward work, or the format cannot
-merge. Routed adapters are inference-only: factors are frozen and do not receive
-gradients. They cannot apply dense deltas, create a missing bias, or populate
-meta parameters. Active routed adapters also bypass block compilation; see
-[streaming](streaming.md).
 
 Quantized merges are lossy. Piper combines contributions to a target before one
 re-encoding, including LoRA terms when a dense delta is present. Stochastic
@@ -191,7 +173,6 @@ pass `stochastic_rounding=False` to `cache.use()` for round-to-nearest instead.
 Sampling does not consume PyTorch's global RNG. Repeated streamed merges use
 fresh deterministic samples derived from the target and merge count; matching
 seeds do not promise identical bytes across different backend implementations.
-Routed mode does not requantize and ignores this option.
 
 ## Populate optional meta parameters
 
@@ -199,7 +180,7 @@ Complete values let a model declare an optional weight without allocating a
 base tensor. For example, a factory can create
 `nn.Linear(4, 3, bias=False, device="meta").requires_grad_(False)` and an
 `AdapterSpec` can supply `{"weight": torch.randn(3, 4)}`. Select that adapter
-in a CUDA merge activation to materialize the weight.
+in a CUDA activation to materialize the weight.
 
 The target must be a frozen, plain floating-point meta parameter of the same
 logical shape. It supplies the name, shape, and alias group; the value supplies
@@ -252,8 +233,9 @@ scaling with `AdapterSpec(scale_parameter_values=True)`, or per target with
 adapters remain inactive under either policy.
 
 A value can use any supported physical representation with a floating compute
-dtype and compatible logical shape, including tile-packed INT4. Exact copying
-does not require additive merge support or a dequantize/requantize pass.
+dtype and compatible logical shape, including representations without additive
+merge support. Exact copying
+does not require additive merge support.
 LoRA-only contributions require factorized merge support, including when the
 supplied value is scaled. Value-only scaling and compositions containing dense
 deltas require dense merge support. Scaling and additive contributions combine
@@ -296,4 +278,4 @@ Permanent merge accepts the same cross-adapter composition, strength,
 partial-target, and rounding policies. Quantized support follows the [format matrix](formats.md), except
 that packed GGUF and trellis-coded sources can only be merged during activation. See
 [merge.py](../src/piper_offload/merge.py) for the function contract and
-[lora.py](../src/piper_offload/lora.py) for factor and routing details.
+[lora.py](../src/piper_offload/lora.py) for factor data types.

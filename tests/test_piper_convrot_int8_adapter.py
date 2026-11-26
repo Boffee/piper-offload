@@ -12,7 +12,6 @@ from torch import nn
 from piper_offload import (
     Adapter,
     BlockCompileConfig,
-    LoRATransform,
     ModelOffloader,
     ModelStore,
     OffloadConfig,
@@ -21,19 +20,17 @@ from piper_offload import (
     derive_seed,
     merge_adapter,
 )
-from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from piper_offload.dtensor_adapter import DTensorAdapter
 from piper_offload.host_module import HostModuleStore
 from piper_offload.host_param import HostParam
+from piper_offload.lora import LoRATransform
+from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
-    DequantRequantTensorAdapter,
-    DequantizeTensorAdapter,
-    DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
+    DenseMergeValidationTensorAdapter,
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
-    TensorCopyIntoAdapter,
 )
 from tests.conftest import activated_model
 
@@ -95,8 +92,8 @@ def _scaled_value_reference(source, strength):
 
 
 def test_package_import_does_not_require_torchao() -> None:
-    # piper-kernels is required, but its ConvRot tensors subclass
-    # TorchAOBaseTensor. Without the `torchao` extra both ConvRot adapters
+    # piper-kernels is required, but its ConvRot/NVFP4 tensors rely on
+    # torchao. Without the `torchao` extra all three Piper quantized adapters
     # report their format unavailable rather than failing the package import.
     script = (
         "import builtins\n"
@@ -114,8 +111,11 @@ def test_package_import_does_not_require_torchao() -> None:
         "PiperConvRotInt8Adapter\n"
         "from piper_offload.piper_convrot_nvfp4_adapter import "
         "PiperConvRotNVFP4Adapter\n"
+        "from piper_offload.piper_nvfp4_adapter import "
+        "PiperNvfp4Adapter\n"
         "assert not PiperConvRotInt8Adapter.matches(torch.zeros(1))\n"
         "assert not PiperConvRotNVFP4Adapter.matches(torch.zeros(1))\n"
+        "assert not PiperNvfp4Adapter.matches(torch.zeros(1))\n"
     )
     completed = subprocess.run(
         [sys.executable, "-c", script],
@@ -320,8 +320,8 @@ class TestPiperConvRotInt8Adapter:
             alpha=0.5,
         )
 
-        transform.validate_target(param)
-        transform.apply(param)
+        transform.validate_parameter(param)
+        transform.apply_parameter(param)
 
         assert param is original_param
         assert param.data.qdata.data_ptr() == qdata_ptr
@@ -432,7 +432,6 @@ class TestPiperConvRotInt8Adapter:
         scale_with_strength: bool,
     ) -> None:
         source = _make_convrot()
-        source_dense = source.dequantize()
         strength = -0.25
         adapter = Adapter.from_state_dict(
             {"weight": source},
@@ -622,13 +621,10 @@ class TestPiperConvRotInt8Adapter:
     def test_advertises_merge_capabilities(self) -> None:
         adapter = PiperConvRotInt8Adapter()
 
-        assert isinstance(adapter, DequantizeTensorAdapter)
-        assert not isinstance(adapter, DequantRequantTensorAdapter)
-        assert not isinstance(adapter, TensorCopyIntoAdapter)
         assert isinstance(adapter, LoRAMergeTensorAdapter)
         assert isinstance(adapter, LoRAMergeValidationTensorAdapter)
         assert isinstance(adapter, DenseMergeTensorAdapter)
-        assert isinstance(adapter, DenseMergeTargetValidationTensorAdapter)
+        assert isinstance(adapter, DenseMergeValidationTensorAdapter)
 
     @CUDA
     def test_allocate_copy_and_reconstruct_gpu_wrapper(self) -> None:
@@ -873,7 +869,7 @@ class TestPiperConvRotInt8Adapter:
         assert all(param.is_meta for param in model.parameters())
 
     @CUDA
-    def test_streamed_merge_requantizes_on_activate(self) -> None:
+    def test_streamed_merge_updates_on_activate(self) -> None:
         convrot_cls = _convrot_cls()
 
         class M(nn.Module):
@@ -950,7 +946,6 @@ class TestPiperConvRotInt8Adapter:
                 "cuda",
                 adapters=[lora],
                 adapter_strengths=[0.5],
-                adapter_mode="merge",
                 stochastic_rounding=False,
             ) as active:
                 ran = False
@@ -1028,4 +1023,3 @@ class TestPiperConvRotInt8Adapter:
 
         assert torch.equal(samples[0], samples[1])
         assert offloader.active_device is None
-        assert offloader._routed_hook_removers == []

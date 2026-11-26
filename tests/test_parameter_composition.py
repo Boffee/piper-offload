@@ -21,8 +21,11 @@ from piper_offload import (
     file_slice,
     merge_adapter,
 )
-from piper_offload._parameter_update import _DenseMergeTransform
-from piper_offload.adapter import group_adapter_updates
+from piper_offload._parameter_update import (
+    _DenseMergeTransform,
+    group_adapter_updates,
+    plan_parameter_update,
+)
 from piper_offload.tensor_adapter_registry import param_representation, select_adapter
 from piper_offload.tensor_adapters import RegularAdapter
 from tests._block_compile_helpers import _BlockModel
@@ -186,7 +189,7 @@ def test_unpopulated_partial_targets_create_no_merge_work():
     assert model.weight is original
     offloader = ModelOffloader.from_module(model)
     updates = group_adapter_updates([(adapter, 1.0)], offloader.param_names)
-    assert offloader._build_merge_parameter_overrides(torch.device("cuda"), updates) == {}
+    assert offloader._build_parameter_overrides(torch.device("cuda"), updates) == {}
     assert offloader.cache_bytes == 0
     assert model.weight.is_meta
 
@@ -284,16 +287,16 @@ def test_composition_preflight_leaves_all_parameters_unchanged(application, fail
 
 
 @pytest.mark.parametrize("application", ["permanent", "activation"])
-@pytest.mark.parametrize("kind", ["torchao-int8", "torchao-float8"])
+@pytest.mark.parametrize("kind", ["piper-nvfp4", "piper-convrot-int8", "piper-convrot-nvfp4"])
 @pytest.mark.parametrize("value_scale", [1.0, -0.5])
 def test_quantized_composition_encodes_once(application, kind, value_scale, monkeypatch):
     source = _make_quantized(kind)
     adapter_type = type(select_adapter(source))
-    base = adapter_type.dequantize(source).cpu().clone()
+    base = source.dequantize().cpu().clone()
     rows, cols = base.shape
-    a = torch.full((1, cols), 0.5)
-    b = torch.full((rows, 1), 0.25)
-    dense = torch.full((rows, cols), 0.125)
+    a = torch.full((1, cols), 0.5, dtype=base.dtype)
+    b = torch.full((rows, 1), 0.25, dtype=base.dtype)
+    dense = torch.full((rows, cols), 0.125, dtype=base.dtype)
     value = Adapter.from_state_dict({"weight": source}, scale_parameter_values=True)
     delta = Adapter({"weight": ParameterDelta.from_tensors(a=a, b=b, dense=dense)})
     original_merge = adapter_type.merge_dense_
@@ -307,14 +310,16 @@ def test_quantized_composition_encodes_once(application, kind, value_scale, monk
     model = nn.Module()
     model.weight = nn.Parameter(torch.empty(rows, cols, device="meta"), requires_grad=False)
     with _application(model, [(delta, 0.5), (value, value_scale)], application):
-        actual = adapter_type.dequantize(param_representation(model.weight)).cpu()
-        expected = base.float() * value_scale + 0.5 * (b @ a + dense)
+        actual = param_representation(model.weight).dequantize().cpu()
+        expected = base.float() * value_scale + 0.5 * (b.float() @ a.float() + dense.float())
         # Allow terminal quantization error while comparing independent dense arithmetic.
-        torch.testing.assert_close(
-            actual.float(), expected, rtol=0.05, atol=max(base.abs().max().item() * 0.02, 0.02),
-        )
+        if kind == "piper-convrot-int8":
+            rtol, atol = 0.05, max(base.abs().max().item() * 0.02, 0.02)
+        else:
+            rtol, atol = 0.15, max(base.abs().max().item() * 0.2, 0.2)
+        torch.testing.assert_close(actual.float(), expected, rtol=rtol, atol=atol)
     assert calls == [None]
-    torch.testing.assert_close(adapter_type.dequantize(source).cpu(), base)
+    torch.testing.assert_close(source.dequantize().cpu(), base)
 
 
 @pytest.mark.parametrize("application", ["permanent", "activation"])
@@ -343,12 +348,12 @@ def test_value_with_loras_retains_one_factorized_merge(application, scale_value,
 
 
 @pytest.mark.parametrize("application", ["permanent", "activation"])
-@pytest.mark.parametrize("kind", ["piper-convrot-int8", "piper-convrot-nvfp4"])
+@pytest.mark.parametrize("kind", ["piper-nvfp4", "piper-convrot-int8", "piper-convrot-nvfp4"])
 @pytest.mark.usefixtures("forbid_dense_merge")
-def test_scaled_convrot_value_with_loras_uses_one_native_merge(application, kind, monkeypatch):
+def test_scaled_quantized_value_with_loras_uses_one_native_merge(application, kind, monkeypatch):
     source = _make_quantized(kind)
     adapter_type = type(select_adapter(source))
-    base = adapter_type.dequantize(source).float().clone()
+    base = source.dequantize().float().clone()
     rows, cols = base.shape
     value = Adapter.from_state_dict({"weight": source}, scale_parameter_values=True)
     delta = Adapter({"weight": ParameterDelta.from_tensors(
@@ -367,12 +372,12 @@ def test_scaled_convrot_value_with_loras_uses_one_native_merge(application, kind
     monkeypatch.setattr(adapter_type, "merge_lora_", staticmethod(record_merge))
     model = nn.Linear(cols, rows, bias=False, device="meta").requires_grad_(False)
     with _application(model, [(value, -0.5), (delta, 0.25), (delta, -0.125)], application):
-        actual = adapter_type.dequantize(param_representation(model.weight)).cpu().float()
+        actual = param_representation(model.weight).dequantize().cpu().float()
         expected = base * -0.5 + (0.25 - 0.125) * 0.25 * 0.5
         tolerance = 0.03 if kind == "piper-convrot-int8" else 0.2
         assert (actual - expected).abs().mean() < expected.abs().mean() * tolerance
     assert calls == [((rows, 2), (2, cols), 1.0, -0.5)]
-    torch.testing.assert_close(adapter_type.dequantize(source).float(), base)
+    torch.testing.assert_close(source.dequantize().float(), base)
 
 
 @CUDA
@@ -497,31 +502,112 @@ def test_cache_composition_preserves_mappings_through_switching_and_exception(tm
         torch.testing.assert_close(actual, expected)
 
 
-@CUDA
 @pytest.mark.parametrize("application", ["permanent", "activation"])
 def test_copy_only_value_rejects_composed_arithmetic_before_mutation(application):
-    from tests.test_int4_tile_adapter import _make_int4_tile
+    from dataclasses import dataclass
 
-    source = _make_int4_tile()
-    value = Adapter.from_state_dict({"weight": source})
-    rows, cols = source.shape
-    delta = Adapter({
-        "physical": ParameterDelta.from_tensors(dense=torch.ones(1)),
-        "weight": ParameterDelta.from_tensors(a=torch.ones(1, cols), b=torch.ones(rows, 1)),
-    }, allow_partial_targets=True)
-    model = nn.Module()
-    model.physical = nn.Parameter(torch.zeros(1), requires_grad=False)
-    model.weight = nn.Parameter(torch.empty(rows, cols, device="meta"), requires_grad=False)
-    with pytest.raises(ValueError, match="Int4TilePackedAdapter"), _application(
-        model, [(delta, 1.0), (value, 1.0)], application,
-    ):
-        pytest.fail("copy-only representation accepted arithmetic")
-    assert model.weight.is_meta
-    torch.testing.assert_close(model.physical.cpu(), torch.zeros(1))
-    # The rejected update must not disable exact copying of the same resource.
-    with _application(model, [(value, 1.0)], application):
-        assert torch.equal(model.weight.data.qdata.cpu(), source.qdata.cpu())
-        assert torch.equal(model.weight.data.scale_and_zero.cpu(), source.scale_and_zero.cpu())
+    from piper_offload import register_adapter
+    from piper_offload.structured_adapter import StructuredTensorAdapter
+
+    class _CopyOnlyTensor(torch.Tensor):
+        qdata: torch.Tensor
+        scale: torch.Tensor
+
+        @staticmethod
+        def __new__(cls, qdata: torch.Tensor, scale: torch.Tensor) -> _CopyOnlyTensor:
+            out = torch.Tensor._make_wrapper_subclass(
+                cls,
+                qdata.shape,
+                dtype=torch.bfloat16,
+                device=qdata.device,
+                requires_grad=False,
+            )
+            out.qdata = qdata
+            out.scale = scale
+            return out
+
+        @classmethod
+        def __torch_dispatch__(cls, func, _types, args=(), _kwargs=None):
+            if func in (torch.ops.aten.detach.default, torch.ops.aten.alias.default):
+                src = args[0]
+                return cls(src.qdata, src.scale)
+            return NotImplemented
+
+    @dataclass(slots=True, frozen=True)
+    class _Meta:
+        pass
+
+    class _CopyOnlyAdapter(StructuredTensorAdapter[_Meta]):
+        _TAG = "test-copy-only"
+        _STORAGE_NAMES = ("qdata", "scale")
+
+        @staticmethod
+        def _is_tensor(t: torch.Tensor) -> bool:
+            return isinstance(t, _CopyOnlyTensor)
+
+        @staticmethod
+        def _validate_layout(t: torch.Tensor) -> None:
+            del t
+
+        @staticmethod
+        def _require(t: torch.Tensor) -> _CopyOnlyTensor:
+            assert isinstance(t, _CopyOnlyTensor)
+            return t
+
+        @staticmethod
+        def _storage_of(t: _CopyOnlyTensor) -> tuple[torch.Tensor | None, ...]:
+            return (t.qdata, t.scale)
+
+        @staticmethod
+        def _meta_of(t: _CopyOnlyTensor) -> _Meta:
+            del t
+            return _Meta()
+
+        @staticmethod
+        def _reconstruct(
+            storage: tuple[torch.Tensor | None, ...], meta: _Meta
+        ) -> torch.Tensor:
+            del meta
+            assert storage[0] is not None and storage[1] is not None
+            return _CopyOnlyTensor(storage[0], storage[1])
+
+        @staticmethod
+        def _id_metadata(t: _CopyOnlyTensor) -> tuple[object, ...]:
+            del t
+            return ()
+
+        @staticmethod
+        def _compute_dtype(t: _CopyOnlyTensor) -> torch.dtype:
+            del t
+            return torch.bfloat16
+
+    remove_adapter = register_adapter(_CopyOnlyAdapter)
+    try:
+        rows, cols = 8, 16
+        source = _CopyOnlyTensor(
+            torch.randint(0, 127, (rows, cols), dtype=torch.uint8),
+            torch.ones((rows, 1), dtype=torch.bfloat16),
+        )
+        value = Adapter.from_state_dict({"weight": source})
+        delta = Adapter({
+            "physical": ParameterDelta.from_tensors(dense=torch.ones(1)),
+            "weight": ParameterDelta.from_tensors(a=torch.ones(1, cols), b=torch.ones(rows, 1)),
+        }, allow_partial_targets=True)
+        model = nn.Module()
+        model.physical = nn.Parameter(torch.zeros(1), requires_grad=False)
+        model.weight = nn.Parameter(torch.empty(rows, cols, device="meta"), requires_grad=False)
+        with pytest.raises(ValueError, match="_CopyOnlyAdapter"), _application(
+            model, [(delta, 1.0), (value, 1.0)], application,
+        ):
+            pytest.fail("copy-only representation accepted arithmetic")
+        assert model.weight.is_meta
+        torch.testing.assert_close(model.physical.cpu(), torch.zeros(1))
+        # The rejected update must not disable exact copying of the same resource.
+        with _application(model, [(value, 1.0)], application):
+            assert torch.equal(model.weight.data.qdata.cpu(), source.qdata.cpu())
+            assert torch.equal(model.weight.data.scale.cpu(), source.scale.cpu())
+    finally:
+        remove_adapter()
 
 
 @CUDA
@@ -620,39 +706,42 @@ def test_scaled_composition_avoids_base_cancellation(application, dtype, base, s
 
 @pytest.mark.parametrize("application", ["permanent", "activation"])
 def test_scaled_quantized_lora_composition_avoids_intermediate_overflow(application):
-    from piper_offload.int8_adapter import Int8Adapter
-    from tests.test_int8_adapter import _make_affine_int8
+    from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
-    source = _make_affine_int8(torch.full((17, 128), 40000.0, dtype=torch.float16))
-    base = Int8Adapter.dequantize(source)
+    source = ConvRotInt8Tensor.from_hp(torch.full((17, 128), 40000.0, dtype=torch.float16), group_size=64)
+    base = source.dequantize()
     a = torch.full((1, 128), -40000.0, dtype=torch.float16)
     b = torch.ones((17, 1), dtype=torch.float16)
     # The scaled base exceeds FP16's range, but the combined result fits.
     assert torch.isinf(base * 2.0).all()
     expected = (base.double() * 2.0 + b.double() @ a.double()).to(base.dtype)
     assert torch.isfinite(expected).all()
-    reference = Int8Adapter.dequantize(Int8Adapter.requantize(expected, like=source))
+    reference = ConvRotInt8Tensor.from_hp(expected, group_size=64).dequantize()
     value = Adapter.from_state_dict({"weight": source}, scale_parameter_values=True)
     lora = Adapter({"weight": ParameterDelta.from_tensors(a=a, b=b)})
     model = nn.Linear(128, 17, bias=False, device="meta").requires_grad_(False)
 
     with _application(model, [(value, 2.0), (lora, 1.0)], application):
-        actual = Int8Adapter.dequantize(param_representation(model.weight)).cpu()
+        actual = param_representation(model.weight).dequantize().cpu()
         assert torch.isfinite(actual).all()
-        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-    torch.testing.assert_close(Int8Adapter.dequantize(source), base, rtol=0, atol=0)
+        torch.testing.assert_close(actual, reference, rtol=1e-2, atol=2.0)
+    torch.testing.assert_close(source.dequantize(), base, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("scale", [1.0, -1.0])
-def test_value_transform_shares_plan_and_invalidates_failed_validation(scale, monkeypatch):
-    from piper_offload import ParameterValue, ParameterValueTransform, derive_seed
+def test_value_plan_validates_target_tracks_seeds_and_resets_failed_plan(scale, monkeypatch):
+    from piper_offload import ParameterValue, derive_seed
 
     source = torch.full((2, 3), 40000.0, dtype=torch.float16)
     value = ParameterValue.from_tensor(source, scale_with_strength=True)
-    transform = ParameterValueTransform(value.scaled(scale), stochastic_rounding=True, target_key="weight")
+    plan = plan_parameter_update(
+        [],
+        value=value.scaled(scale),
+        stochastic_rounding=True,
+        target_key="weight",
+    )
     slot = nn.Parameter(torch.empty(2, 3, device="meta"), requires_grad=False)
-    with pytest.raises(RuntimeError, match="validated before application"):
-        transform.materialize()
+    assert plan.source is value.backing
     seeds = []
     original_merge = RegularAdapter.merge_dense_
 
@@ -661,16 +750,34 @@ def test_value_transform_shares_plan_and_invalidates_failed_validation(scale, mo
         original_merge(target, update, alpha, beta=beta, rounding_seed=rounding_seed)
 
     monkeypatch.setattr(RegularAdapter, "merge_dense_", staticmethod(record_merge))
-    for _ in range(2):
-        transform.validate_parameter(slot)
-        torch.testing.assert_close(transform.materialize(), source * scale, rtol=0, atol=0)
-    # Revalidation keeps the repeated-merge rounding sequence.
-    assert seeds == ([] if scale == 1.0 else [derive_seed("weight", i) for i in range(2)])
-    with pytest.raises(ValueError, match="shape mismatch"):
-        transform.validate_parameter(nn.Parameter(torch.empty(3, 2, device="meta"), requires_grad=False))
+    if scale == 1.0:
+        plan.validate_parameter(slot)
+        assert plan.update is None
+        loaded = plan.source.make_cpu_param()
+        torch.testing.assert_close(loaded, source, rtol=0, atol=0)
+        assert seeds == []
+        with pytest.raises(ValueError, match="shape mismatch"):
+            plan.validate_parameter(nn.Parameter(torch.empty(3, 2, device="meta"), requires_grad=False))
+        return
+
+    assert isinstance(plan.update, _DenseMergeTransform)
     with pytest.raises(RuntimeError, match="validated before application"):
-        transform.apply_parameter(nn.Parameter(source.clone(), requires_grad=False))
-    transform.validate_parameter(slot)
+        plan.update.apply_parameter(nn.Parameter(source.clone(), requires_grad=False))
+    plan.validate_parameter(slot)
+    for i in range(2):
+        loaded = nn.Parameter(source.clone(), requires_grad=False)
+        plan.update.apply_parameter(loaded)
+        torch.testing.assert_close(loaded, source * scale, rtol=0, atol=0)
+    assert seeds == [derive_seed("weight", i) for i in range(2)]
+    with pytest.raises(ValueError, match="shape mismatch"):
+        plan.validate_parameter(nn.Parameter(torch.empty(3, 2, device="meta"), requires_grad=False))
+    with pytest.raises(ValueError, match="existing plain floating-point target"):
+        plan.update.validate_parameter(slot)
+    assert plan.update._dense_plan is None
+    with pytest.raises(RuntimeError, match="validated before application"):
+        plan.update.apply_parameter(nn.Parameter(source.clone(), requires_grad=False))
+    plan.validate_parameter(slot)
     loaded = nn.Parameter(source.clone(), requires_grad=False)
-    transform.apply_parameter(loaded)
+    plan.update.apply_parameter(loaded)
     torch.testing.assert_close(loaded, source * scale, rtol=0, atol=0)
+    assert seeds == [derive_seed("weight", i) for i in range(3)]

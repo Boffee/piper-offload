@@ -1,30 +1,27 @@
-"""Shared base for TorchAO structured-tensor adapters.
+"""Shared base for Piper structured-tensor adapters.
 
-TorchAO represents each quantized weight as a tensor subclass wrapping a
-handful of inner storage tensors (packed elements + scales) plus opaque
-dispatch metadata. Moving such a weight across the CPU<->GPU boundary is
-the same mechanical dance for every format: clone each inner tensor into
-host memory, allocate stride-matching GPU storage, bulk-copy, and
-rebuild the wrapper from storage + a metadata snapshot. Only a few things
-vary per format: which inner tensors exist (and whether some are
-optional), how the wrapper is reconstructed, the identity/layout metadata
-that distinguishes incompatible variants, and the logical compute dtype.
+Piper Kernels represents each quantized weight as a tensor subclass wrapping a
+handful of inner storage tensors (packed elements + scales) plus reconstruction
+metadata. Moving such a weight across the CPU<->GPU boundary is the same
+mechanical dance for every format: capture each inner tensor into host memory,
+allocate stride-matching GPU storage, bulk-copy, and rebuild the wrapper from
+storage + a metadata snapshot. Only a few things vary per format: which inner
+tensors exist (and whether some are optional), how the wrapper is
+reconstructed, the identity/layout metadata that distinguishes incompatible
+variants, and the logical compute dtype.
 
-:class:`TorchaoStructuredAdapter` captures the shared mechanics once and
-exposes the per-format parts as small hooks. Concrete adapters
-(:class:`~piper_offload.float8_adapter.Float8Adapter`,
-:class:`~piper_offload.mx_adapter.MxAdapter`,
-:class:`~piper_offload.nvfp4_adapter.Nvfp4Adapter`, ...) subclass it and
-implement those hooks.
+:class:`StructuredTensorAdapter` captures the shared mechanics once and exposes
+the per-format parts as small hooks. Concrete adapters
+(:class:`~piper_offload.piper_nvfp4_adapter.PiperNvfp4Adapter`,
+:class:`~piper_offload.piper_convrot_nvfp4_adapter.PiperConvRotNVFP4Adapter`,
+:class:`~piper_offload.piper_convrot_int8_adapter.PiperConvRotInt8Adapter`)
+subclass it and implement those hooks.
 
-Capabilities beyond inference movement and metadata queries (dequantize/requantize
-conversion, representation-preserving copy, and staged factorized or dense
-merge) are added by the concrete subclass that supports them — and only that
-subclass — so the ``@runtime_checkable`` capability protocols, which test for
-method presence on the class, report each format's true capability. The base
-deliberately implements no mutation capabilities: subclasses that add nothing
-stay inference-only movement, while a subclass that defines the extra methods
-advertises exactly those capabilities.
+Capabilities beyond inference movement and metadata queries (DTensor
+shard projection and in-place LoRA or dense merge) are added by the concrete
+subclass that supports them — and only that subclass — so the
+``@runtime_checkable`` capability protocols, which test for method presence on
+the class, report each format's true capability.
 """
 
 import math
@@ -36,10 +33,8 @@ import torch
 from torch import nn
 
 from .tensor_adapters import (
-    DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
     DenseMergeValidationTensorAdapter,
-    DequantizeTensorAdapter,
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
     adapter_name,
@@ -53,12 +48,12 @@ from .tensor_adapters import (
 )
 
 __all__ = [
-    "TorchaoGpu",
-    "TorchaoHost",
-    "TorchaoStructuredAdapter",
-    "_ProjectedTorchaoShard",
-    "_ProjectedTorchaoShardAdapter",
-    "copy_storage",
+    "StructuredGpu",
+    "StructuredHost",
+    "StructuredTensorAdapter",
+    "_KernelMergeStructuredAdapter",
+    "_ProjectedStructuredShard",
+    "_ProjectedStructuredShardAdapter",
 ]
 
 
@@ -72,8 +67,8 @@ def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
 
 
 @dataclass(slots=True, frozen=True)
-class TorchaoHost[MetaT]:
-    """CPU state for a TorchAO structured tensor.
+class StructuredHost[MetaT]:
+    """CPU state for a structured tensor subclass.
 
     ``storage`` holds the inner storage tensors positionally, parallel to
     the adapter's ``_STORAGE_NAMES``; an entry is ``None`` for an absent
@@ -82,8 +77,8 @@ class TorchaoHost[MetaT]:
     ``logical_shape`` is the dense wrapper shape preserved across offload.
     When ``target_shapes`` is not ``None`` (e.g., non-canonical projected host
     views such as ``Shard(1)`` or swizzled tile-grid slices), CPU stays behind
-    :class:`_ProjectedTorchaoShard` and device activation allocates contiguous
-    buffers matching each slot's target shape.
+    :class:`_ProjectedStructuredShard` and device activation allocates
+    contiguous buffers matching each slot's target shape.
     """
 
     storage: tuple[torch.Tensor | None, ...]
@@ -128,29 +123,29 @@ def _resolve_target_shapes(
     return tuple(resolved)
 
 
-class _ProjectedTorchaoShard(torch.Tensor):
+class _ProjectedStructuredShard(torch.Tensor):
     """Resting CPU placeholder for a non-canonical projected quantized shard.
 
-    Keeps zero-copy host views inside :class:`TorchaoHost` while presenting a
+    Keeps zero-copy host views inside :class:`StructuredHost` while presenting a
     non-meta CPU local tensor of the exact shard shape and compute dtype to
     :class:`~piper_offload.dtensor_adapter.DTensorAdapter` and update preflight.
     """
 
-    _adapter_cls: type[TorchaoStructuredAdapter[Any]]
-    _state: TorchaoHost[Any]
+    _adapter_cls: type[StructuredTensorAdapter[Any]]
+    _state: StructuredHost[Any]
     _meta_tensor: torch.Tensor
     _layout_signature: tuple[object, ...]
 
     @staticmethod
     def __new__(
-        cls: type[_ProjectedTorchaoShard],
-        adapter_cls: type[TorchaoStructuredAdapter[Any]],
-        state: TorchaoHost[Any],
+        cls: type[_ProjectedStructuredShard],
+        adapter_cls: type[StructuredTensorAdapter[Any]],
+        state: StructuredHost[Any],
         meta_tensor: torch.Tensor,
         layout_signature: tuple[object, ...],
-    ) -> _ProjectedTorchaoShard:
+    ) -> _ProjectedStructuredShard:
         tensor = cast(
-            _ProjectedTorchaoShard,
+            _ProjectedStructuredShard,
             torch.Tensor._make_wrapper_subclass(  # type: ignore[attr-defined]
                 cls,
                 tuple(meta_tensor.shape),
@@ -172,7 +167,7 @@ class _ProjectedTorchaoShard(torch.Tensor):
     def __repr__(self, *, tensor_contents: object = None) -> str:
         del tensor_contents
         return (
-            f"_ProjectedTorchaoShard(adapter={self._adapter_cls.__name__}, "
+            f"_ProjectedStructuredShard(adapter={self._adapter_cls.__name__}, "
             f"shape={tuple(self.shape)}, dtype={self.dtype})"
         )
 
@@ -183,7 +178,7 @@ class _ProjectedTorchaoShard(torch.Tensor):
         _types: tuple[type, ...],
         args: tuple[object, ...] = (),
         _kwargs: dict[str, object] | None = None,
-    ) -> _ProjectedTorchaoShard:
+    ) -> _ProjectedStructuredShard:
         if args and isinstance(args[0], cls):
             target = args[0]
             identity_view = (
@@ -210,26 +205,26 @@ class _ProjectedTorchaoShard(torch.Tensor):
         )
 
 
-def _require_projected_shard(t: torch.Tensor) -> _ProjectedTorchaoShard:
-    if not isinstance(t, _ProjectedTorchaoShard):
+def _require_projected_shard(t: torch.Tensor) -> _ProjectedStructuredShard:
+    if not isinstance(t, _ProjectedStructuredShard):
         raise TypeError(
-            f"expected _ProjectedTorchaoShard, got {type(t).__name__}"
+            f"expected _ProjectedStructuredShard, got {type(t).__name__}"
         )
     return t
 
 
-class _ProjectedTorchaoShardAdapter:
+class _ProjectedStructuredShardAdapter:
     """Internal adapter matched when inspecting a resting projected shard."""
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
-        return isinstance(t, _ProjectedTorchaoShard)
+        return isinstance(t, _ProjectedStructuredShard)
 
     @staticmethod
     def tensor_id(t: torch.Tensor) -> tuple[object, ...]:
         shard = _require_projected_shard(t)
         return (
-            "projected-torchao",
+            "projected-structured",
             shard._adapter_cls._TAG,
             *(optional_tensor_id(s) for s in shard._state.storage),
             shard._layout_signature,
@@ -310,42 +305,20 @@ class _ProjectedTorchaoShardAdapter:
         )
 
     @staticmethod
-    def dequantize(t: torch.Tensor) -> NoReturn:
-        shard = _require_projected_shard(t)
-        adapter = shard._adapter_cls()
-        if not isinstance(adapter, DequantizeTensorAdapter):
-            raise ValueError(
-                f"{adapter_name(adapter)} does not support dequantize."
-            )
-        raise RuntimeError(
-            "Projected quantized shard must be activated on CUDA before "
-            "dequantizing."
-        )
-
-    @staticmethod
     def validate_lora_merge(
         target: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
-        alpha: float,
         *,
-        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         shard = _require_projected_shard(target)
         adapter = shard._adapter_cls()
         if not isinstance(adapter, LoRAMergeTensorAdapter):
             raise ValueError(
-                f"{adapter_name(adapter)} does not support LoRA merge. "
-                "Use routed LoRA for this tensor type."
+                f"{adapter_name(adapter)} does not support LoRA merge."
             )
         if isinstance(adapter, LoRAMergeValidationTensorAdapter):
             adapter.validate_lora_merge(
                 shard._meta_tensor,
-                b,
-                a,
-                alpha,
-                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -366,31 +339,9 @@ class _ProjectedTorchaoShardAdapter:
         )
 
     @staticmethod
-    def validate_dense_merge_target(
-        target: torch.Tensor,
-        *,
-        rounding_seed: int | None = None,
-    ) -> bool:
-        shard = _require_projected_shard(target)
-        adapter = shard._adapter_cls()
-        if not isinstance(adapter, DenseMergeTensorAdapter):
-            raise ValueError(
-                f"{adapter_name(adapter)} does not support dense parameter merge."
-            )
-        if isinstance(adapter, DenseMergeTargetValidationTensorAdapter):
-            return adapter.validate_dense_merge_target(
-                shard._meta_tensor,
-                rounding_seed=rounding_seed,
-            )
-        return isinstance(adapter, DenseMergeValidationTensorAdapter)
-
-    @staticmethod
     def validate_dense_merge(
         target: torch.Tensor,
-        update: torch.Tensor,
-        alpha: float,
         *,
-        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         shard = _require_projected_shard(target)
@@ -402,9 +353,6 @@ class _ProjectedTorchaoShardAdapter:
         if isinstance(adapter, DenseMergeValidationTensorAdapter):
             adapter.validate_dense_merge(
                 shard._meta_tensor,
-                update,
-                alpha,
-                beta=beta,
                 rounding_seed=rounding_seed,
             )
 
@@ -425,70 +373,28 @@ class _ProjectedTorchaoShardAdapter:
 
 
 @dataclass(slots=True, frozen=True)
-class TorchaoGpu:
-    """GPU state for a TorchAO structured tensor: device storage only;
-    metadata lives in the originating :class:`TorchaoHost`."""
+class StructuredGpu:
+    """GPU state for a structured tensor: device storage only;
+    metadata lives in the originating :class:`StructuredHost`.
+    """
 
     storage: tuple[torch.Tensor | None, ...]
 
 
-def copy_storage(
-    src: tuple[torch.Tensor | None, ...],
-    dst: tuple[torch.Tensor | None, ...],
-    *,
-    non_blocking: bool,
-) -> None:
-    """Per-tensor bulk copy of a parallel storage tuple, skipping absent
-    (``None``) entries for H2D movement.
-
-    Movement keeps the same representation on both sides, so a ``None`` on
-    one side is ``None`` on the other; skipping on ``src`` therefore also
-    leaves the matching ``dst`` slot untouched."""
-    for s, d in zip(src, dst, strict=True):
-        if s is None:
-            continue
-        assert d is not None
-        transfer_(d, s, non_blocking=non_blocking)
-
-
-def copy_storage_into(
-    src: tuple[torch.Tensor | None, ...],
-    dst: tuple[torch.Tensor | None, ...],
-    *,
-    non_blocking: bool,
-) -> None:
-    """Fill every present ``dst`` slot from its ``src`` counterpart,
-    preserving ``dst``'s slot presence.
-
-    Mirror of :func:`copy_storage` but driven by ``dst``: used by
-    ``copy_into`` after a requantize, where the re-encoded ``src`` may
-    populate an optional slot that ``dst``'s representation omits — e.g. a
-    symmetric int8 weight stored with ``zero_point=None``, while
-    ``Int8Tensor.from_hp`` always emits a zeros ``zero_point``. Such a slot
-    carries no information ``dst`` lacks, so it is skipped rather than
-    forced. A ``dst`` slot that *is* present must have a ``src`` to fill
-    it (the requantized tensor mirrors ``dst``'s required slots)."""
-    for s, d in zip(src, dst, strict=True):
-        if d is None:
-            continue
-        assert s is not None
-        transfer_(d, s, non_blocking=non_blocking)
-
-
-class TorchaoStructuredAdapter[MetaT](ABC):
-    """Base adapter for TorchAO structured (subclass-wrapped) weights.
+class StructuredTensorAdapter[MetaT](ABC):
+    """Base adapter for structured (subclass-wrapped) weights.
 
     Implements the full
     :class:`~piper_offload.tensor_adapters.TensorAdapter` movement and
     identity contract in terms of per-format hooks. A concrete adapter
     sets :attr:`_TAG` / :attr:`_STORAGE_NAMES` and implements the ``_*``
     hooks; it opts into capabilities beyond inference movement by defining
-    the relevant methods (``dequantize`` / ``requantize`` / ``copy_into``,
-    ``merge_lora_``, or ``merge_dense_``) itself.
+    the relevant methods (``project_shard``, ``merge_lora_``, or
+    ``merge_dense_``) itself or subclassing
+    :class:`_KernelMergeStructuredAdapter`.
 
-    The hooks operate on the validated wrapper, typed :data:`Any` because
-    TorchAO tensor subclasses are untyped — the same boundary the
-    per-format ``require_*_tensor`` helpers expose.
+    The hooks operate on the validated wrapper, typed :data:`Any` at the
+    boundary exposed by per-format ``require_*_tensor`` helpers.
     """
 
     _TAG: ClassVar[str]
@@ -499,8 +405,9 @@ class TorchaoStructuredAdapter[MetaT](ABC):
     @staticmethod
     @abstractmethod
     def _is_tensor(t: torch.Tensor) -> bool:
-        """True if ``t`` is this format's TorchAO subclass (and a supported
-        variant). Mirrors the per-format ``is_*_tensor`` predicate."""
+        """True if ``t`` is this format's tensor subclass (and a supported
+        variant). Mirrors the per-format ``is_*_tensor`` predicate.
+        """
 
     @staticmethod
     @abstractmethod
@@ -516,7 +423,8 @@ class TorchaoStructuredAdapter[MetaT](ABC):
     @abstractmethod
     def _storage_of(t: Any) -> tuple[torch.Tensor | None, ...]:  # noqa: ANN401
         """Live inner storage tensors, positional and parallel to
-        :attr:`_STORAGE_NAMES`; ``None`` for an absent optional tensor."""
+        :attr:`_STORAGE_NAMES`; ``None`` for an absent optional tensor.
+        """
 
     @staticmethod
     @abstractmethod
@@ -528,23 +436,12 @@ class TorchaoStructuredAdapter[MetaT](ABC):
     def _reconstruct(
         storage: tuple[torch.Tensor | None, ...], meta: MetaT
     ) -> torch.Tensor:
-        """Rebuild the TorchAO wrapper from storage + metadata snapshot."""
+        """Rebuild the wrapper from storage + metadata snapshot."""
 
     @staticmethod
     @abstractmethod
     def _id_metadata(t: Any) -> tuple[object, ...]:  # noqa: ANN401
-        """Format-specific identity metadata fragments for :meth:`tensor_id`."""
-
-    @classmethod
-    def _layout_metadata(cls, t: Any) -> tuple[object, ...]:  # noqa: ANN401
-        """Layout metadata fragments for :meth:`layout_signature`.
-
-        Defaults to the identity metadata — correct when block-pool
-        compatibility needs exactly the fields that distinguish identity.
-        Override only when layout needs fewer/different fields (e.g. Float8
-        drops the logical dtype, which the standard dtype slot already
-        carries)."""
-        return cls._id_metadata(t)
+        """Format-specific identity and layout metadata fragments."""
 
     @staticmethod
     @abstractmethod
@@ -579,7 +476,7 @@ class TorchaoStructuredAdapter[MetaT](ABC):
             tuple(w.shape),
             w.dtype,
             w.stride(),
-            *cls._layout_metadata(w),
+            *cls._id_metadata(w),
             *(
                 (name, tensor_layout(s))
                 for name, s in zip(
@@ -592,7 +489,7 @@ class TorchaoStructuredAdapter[MetaT](ABC):
     def capture_host(
         cls,
         t: torch.Tensor,
-    ) -> TorchaoHost[MetaT]:
+    ) -> StructuredHost[MetaT]:
         w = cls._require(t)
         # preserve_format (capture_host_tensor default): inner-tensor stride
         # ordering can encode a transposed quantized tensor.
@@ -600,14 +497,14 @@ class TorchaoStructuredAdapter[MetaT](ABC):
             capture_host_tensor(s) if s is not None else None
             for s in cls._storage_of(w)
         )
-        return TorchaoHost(
+        return StructuredHost(
             storage=storage,
             meta=cls._meta_of(w),
             logical_shape=tuple(w.shape),
         )
 
     @classmethod
-    def _meta_representation(cls, state: TorchaoHost[MetaT]) -> torch.Tensor:
+    def _meta_representation(cls, state: StructuredHost[MetaT]) -> torch.Tensor:
         """Build a 0-byte ``meta`` wrapper with canonical target buffer shapes."""
         slot_shapes = _resolve_target_shapes(state.storage, state.target_shapes)
         meta_storage = tuple(
@@ -626,7 +523,7 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         logical_shape: tuple[int, ...],
         *,
         target_shapes: tuple[tuple[int, ...] | None, ...] | None = None,
-    ) -> tuple[TorchaoHost[MetaT], tuple[object, ...]]:
+    ) -> tuple[StructuredHost[MetaT], tuple[object, ...]]:
         """Build zero-copy projected host state and its canonical layout signature.
 
         Contiguous views matching their target buffer shapes stay native host
@@ -645,7 +542,7 @@ class TorchaoStructuredAdapter[MetaT](ABC):
             )
             for s, shape in zip(storage, resolved_shapes, strict=True)
         )
-        host = TorchaoHost(
+        host = StructuredHost(
             storage=storage,
             meta=meta,
             logical_shape=logical_shape,
@@ -667,7 +564,7 @@ class TorchaoStructuredAdapter[MetaT](ABC):
     @classmethod
     def accepts_bind_target(
         cls,
-        state: TorchaoHost[MetaT],
+        state: StructuredHost[MetaT],
         target: torch.Tensor,
         *,
         layout_signature: object,
@@ -675,7 +572,7 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         return (
             is_plain_meta_placeholder(target, state.logical_shape)
             or (
-                isinstance(target, _ProjectedTorchaoShard)
+                isinstance(target, _ProjectedStructuredShard)
                 and target._adapter_cls is cls
                 and target._layout_signature == layout_signature
             )
@@ -683,15 +580,15 @@ class TorchaoStructuredAdapter[MetaT](ABC):
         )
 
     @staticmethod
-    def storage_tensors(state: TorchaoHost[MetaT]) -> tuple[torch.Tensor, ...]:
+    def storage_tensors(state: StructuredHost[MetaT]) -> tuple[torch.Tensor, ...]:
         return tuple(tensor for tensor in state.storage if tensor is not None)
 
     @classmethod
-    def cpu_param(cls, state: TorchaoHost[MetaT]) -> nn.Parameter:
+    def cpu_param(cls, state: StructuredHost[MetaT]) -> nn.Parameter:
         if state.target_shapes is not None:
             meta_tensor = cls._meta_representation(state)
             return nn.Parameter(
-                _ProjectedTorchaoShard(
+                _ProjectedStructuredShard(
                     cls,
                     state,
                     meta_tensor,
@@ -706,11 +603,11 @@ class TorchaoStructuredAdapter[MetaT](ABC):
 
     @classmethod
     def alloc_gpu(
-        cls, state: TorchaoHost[MetaT], device: torch.device
-    ) -> TorchaoGpu:
+        cls, state: StructuredHost[MetaT], device: torch.device
+    ) -> StructuredGpu:
         if state.target_shapes is not None:
             slot_shapes = _resolve_target_shapes(state.storage, state.target_shapes)
-            return TorchaoGpu(
+            return StructuredGpu(
                 storage=tuple(
                     torch.empty(shape, dtype=s.dtype, device=device)
                     if s is not None and shape is not None
@@ -718,7 +615,7 @@ class TorchaoStructuredAdapter[MetaT](ABC):
                     for s, shape in zip(state.storage, slot_shapes, strict=True)
                 )
             )
-        return TorchaoGpu(
+        return StructuredGpu(
             storage=tuple(
                 empty_like_strided(s, device) if s is not None else None
                 for s in state.storage
@@ -728,8 +625,8 @@ class TorchaoStructuredAdapter[MetaT](ABC):
     @classmethod
     def gpu_param(
         cls,
-        host: TorchaoHost[MetaT],
-        gpu_state: TorchaoGpu,
+        host: StructuredHost[MetaT],
+        gpu_state: StructuredGpu,
     ) -> nn.Parameter:
         return nn.Parameter(
             cls._reconstruct(gpu_state.storage, host.meta),
@@ -739,8 +636,8 @@ class TorchaoStructuredAdapter[MetaT](ABC):
     @classmethod
     def copy_to_gpu(
         cls,
-        src: TorchaoHost[MetaT],
-        dst: TorchaoGpu,
+        src: StructuredHost[MetaT],
+        dst: StructuredGpu,
         *,
         non_blocking: bool = False,
     ) -> None:
@@ -754,10 +651,14 @@ class TorchaoStructuredAdapter[MetaT](ABC):
                 else d.view(s.shape)
                 for s, d in zip(src.storage, dst.storage, strict=True)
             )
-        copy_storage(src.storage, dst_storage, non_blocking=non_blocking)
+        for s, d in zip(src.storage, dst_storage, strict=True):
+            if s is None:
+                continue
+            assert d is not None
+            transfer_(d, s, non_blocking=non_blocking)
 
     @classmethod
-    def cache_bytes(cls, state: TorchaoHost[MetaT]) -> int:
+    def cache_bytes(cls, state: StructuredHost[MetaT]) -> int:
         return sum(s.nbytes for s in state.storage if s is not None)
 
     @classmethod
@@ -769,5 +670,74 @@ class TorchaoStructuredAdapter[MetaT](ABC):
 
     @classmethod
     def logical_shape(cls, t: torch.Tensor) -> tuple[int, ...]:
-        """Dense shape carried directly by every supported TorchAO wrapper."""
+        """Dense shape carried directly by every supported structured wrapper."""
         return tuple(cls._require(t).shape)
+
+
+class _KernelMergeStructuredAdapter[MetaT](StructuredTensorAdapter[MetaT]):
+    """Structured adapter delegating in-place LoRA and dense merges to the wrapper."""
+
+    @staticmethod
+    @abstractmethod
+    def _require_matrix(t: torch.Tensor) -> Any:  # noqa: ANN401
+        """Validate that ``t`` is an updatable 2-D matrix wrapper."""
+
+    @classmethod
+    def merge_lora_(
+        cls,
+        target: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        alpha: float,
+        *,
+        beta: float = 1.0,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Delegate a validated staged LoRA update to the target wrapper."""
+        cls._require_matrix(target).addmm_(
+            b,
+            a,
+            beta=beta,
+            alpha=alpha,
+            rounding_seed=rounding_seed,
+        )
+
+    @classmethod
+    def validate_lora_merge(
+        cls,
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Validate target layout before staging or merging a LoRA update."""
+        del rounding_seed
+        cls._require_matrix(target)
+
+    @classmethod
+    def validate_dense_merge(
+        cls,
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Validate target layout before staging or merging a dense update."""
+        del rounding_seed
+        cls._require_matrix(target)
+
+    @classmethod
+    def merge_dense_(
+        cls,
+        target: torch.Tensor,
+        update: torch.Tensor,
+        alpha: float,
+        *,
+        beta: float = 1.0,
+        rounding_seed: int | None = None,
+    ) -> None:
+        """Delegate a validated dense update to the target wrapper."""
+        cls._require_matrix(target).add_(
+            update,
+            alpha=alpha,
+            beta=beta,
+            rounding_seed=rounding_seed,
+        )

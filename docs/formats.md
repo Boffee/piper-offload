@@ -14,10 +14,10 @@ Install `piper-offload[all]` for every integration. The supported dependency
 ranges are maintained in [pyproject.toml](../pyproject.toml). Native execution still requires the
 format's compatible hardware and PyTorch stack.
 
-The `torchao` extra also covers Piper ConvRot. On Linux, PyTorch supplies its matching
+The `torchao` extra covers Piper Kernels weights (`PiperNVFP4Tensor` and Piper ConvRot) in this release. On Linux, PyTorch supplies its matching
 CUDA or ROCm Triton; the composable `triton` extra adds `triton-windows` on 64-bit Windows.
-Most integrations have portable fallbacks without Triton; GGUF conversion and
-trellis decoding require it. Windows GPU execution
+Piper Kernels owns execution and merge kernels for its weight classes; GGUF
+conversion and trellis decoding require Triton. Windows GPU execution
 requires Windows 10 or 11, a supported NVIDIA GPU and current driver, and the
 Visual C++ Redistributable for Visual Studio 2015–2022. A separate CUDA toolkit
 or Visual Studio installation is not required for eager GPU execution.
@@ -25,22 +25,14 @@ or Visual Studio installation is not required for eager GPU execution.
 | Weight representation | Extra | LoRA merge | Dense / mixed merge |
 |---|---|---|---|
 | Plain floating point, excluding plain float8 | None | Native | Native |
-| TorchAO scaled FP8 | `torchao` | Yes | Yes |
-| TorchAO static-activation scaled FP8 | `torchao` | Yes | Yes |
-| TorchAO INT8 | `torchao` | Yes | Yes |
-| TorchAO MXFP8 / MXFP4 | `torchao` | Yes, layout restrictions | Yes, layout restrictions |
-| TorchAO NVFP4 | `torchao` | Yes, layout restrictions | Yes, layout restrictions |
-| TorchAO INT4 tile-packed | `torchao` | No | No |
+| Piper NVFP4 | `torchao` | Yes, 2-D contiguous matrices | Yes, 2-D contiguous matrices |
 | Piper ConvRot INT8 | `torchao` | Yes, matrices only | Yes, matrices only |
 | Piper ConvRot NVFP4 | `torchao` | Yes, layout restrictions | Yes, layout restrictions |
 | Packed GGUF → ConvRot INT8 | `gguf` | Activation only | Activation only |
 | Trellis-coded → ConvRot INT8 | `torchao`, `triton` | Activation only | Activation only |
 | DTensor | Depends on local shard | Delegates to local adapter | Delegates to local adapter |
 
-Plain float8 storage can move but is not an additive merge target. Scaled FP8
-wrappers have their own merge implementations. Routed LoRA requires no merge
-capability, so it also works with tile-packed INT4 when the owning module is a
-compatible logical `nn.Linear`.
+Plain float8 storage can move but is not an additive merge target.
 
 [Broadcast additive updates](adapters.md#broadcast-additive-updates) are
 supported by plain floating-point targets, excluding plain float8. Built-in
@@ -51,17 +43,18 @@ Quantized additive merges recompute data-dependent weight scales and preserve
 activation calibration metadata. Optimized merges keep source scaling and
 addition in FP32 until the terms are combined, avoiding intermediate overflow
 or loss of small residuals. All merge-capable built-in quantized formats support
-stochastic rounding. See [adapter rounding](adapters.md#choose-merge-or-routed-lora)
-for configuration and reproducibility. Backend selection is documented with
-each format's adapter.
+stochastic rounding. See [adapter rounding](adapters.md#accumulation-and-rounding)
+for configuration and reproducibility.
 
 ## Layout limits
 
-Transposed MX and NVFP4 packed targets cannot be re-encoded into their existing
-storage; use routed LoRA. Scaled FP8 supports transposed per-row and per-tensor
-scales, but not transposed per-group scales. TorchAO INT8 does not support
-transposed weights; Piper ConvRot INT8 also rejects transposed matrices at
-capture. Other layouts support merging only when the format can re-encode them.
+Transposed packed targets cannot be re-encoded into their existing storage.
+`PiperNVFP4Tensor` requires contiguous, untransposed 2-D matrices for additive
+LoRA and dense merges (3-D `(E, M, K)` MoE weights move for inference and accept
+complete parameter values via `ParameterValue`, not additive merges). Piper
+ConvRot INT8 and ConvRot NVFP4 also reject transposed and non-2-D weights during
+additive merge preflight; 5-D Conv3D ConvRot INT8 weights (`[out, in, 3, 3, 3]`)
+and transposed ConvRot NVFP4 weights move for inference without additive merges.
 
 Complete [parameter values](adapters.md#populate-optional-meta-parameters)
 can copy supported physical representations even when additive merge is
@@ -70,23 +63,13 @@ unavailable. Scaling and mixed-update requirements belong to the
 
 ## Format details
 
-**TorchAO FP8.** The weight-only and dynamic-activation path preserves
-`Float8Tensor` metadata with per-group, per-row, or per-tensor scales. FP8
-matmul requires compatible SM89+ CUDA hardware. The static-activation adapter
-supports `PrototypeFloat8Tensor` with per-tensor weight and activation scales.
-Its linear dispatch accommodates scalar or one-element checkpoint activation
-scales for ordinary 2-D and 3-D inputs. Output activation quantization and other
-Prototype layouts are unsupported. See
-[float8_adapter.py](../src/piper_offload/float8_adapter.py) and
-[static_float8_adapter.py](../src/piper_offload/static_float8_adapter.py).
-
-**TorchAO MX and NVFP4.** MX supports E4M3/E5M2 MXFP8 and packed MXFP4; MXFP6
-is unsupported. These formats' matmul paths depend on suitable Blackwell-class
-hardware and CUDA software. Preserved metadata includes block layout, scale
-swizzling, and dispatch settings. MX re-encoding uses the recorded scale mode
-when available, otherwise TorchAO's default. See
-[mx_adapter.py](../src/piper_offload/mx_adapter.py) and
-[nvfp4_adapter.py](../src/piper_offload/nvfp4_adapter.py).
+**Piper NVFP4.** Preserves `PiperNVFP4Tensor` packed elements, block scales,
+block layout, 128x4 swizzle configuration, `high_first` packing order, optional
+global `per_tensor_scale` (scalar or per-expert `(E, 1, 1)`), and optional
+`act_per_tensor_scale` metadata across 2-D linear and 3-D `(E, M, K)` MoE
+weights. Piper Kernels owns dequantization, linear dispatch, and 2-D `addmm_` /
+`add_` updates. See [piper_nvfp4_adapter.py](../src/piper_offload/piper_nvfp4_adapter.py)
+and [structured_adapter.py](../src/piper_offload/structured_adapter.py).
 
 **Piper ConvRot.** INT8 and NVFP4 wrappers retain their rotation groups and
 quantization metadata; Piper Kernels owns their arithmetic. Static-scale INT8
@@ -172,36 +155,26 @@ shard. It targets frozen inference with ordinary `Replicate` and contiguous
 When binding an unsharded `ModelStore` onto a `DTensor`-sharded shell, plain
 strided weights project zero-copy local views for any `Replicate` or contiguous
 `Shard(dim)` placement. Non-`nn.Parameter`-subclass quantized weights whose
-tensor subclass supports `DTensor` wrapping (such as TorchAO FP8, MX, NVFP4, or
-Piper ConvRot) project zero-copy for all-`Replicate` targets. For `Shard(dim)`
+tensor subclass supports `DTensor` wrapping (Piper `PiperNVFP4Tensor` and Piper
+ConvRot) project zero-copy for all-`Replicate` targets. For `Shard(dim)`
 placements across 1D and N-D `DeviceMesh` shells, zero-copy projection supports
-TorchAO `Float8Tensor` (`PerTensor`, `PerRow` along any axis, and `PerGroup`
-when shard boundaries align with the group size), TorchAO `MXTensor` (MXFP8 and
-packed MXFP4 across 2-D and N-D tensors when column shards align to
-`block_size=32`, and for 128x4 swizzled scales when row shards align to 128
-rows and column shards align to 128 columns with final tail-block allowance —
-requiring `rows % 128 == 0` for N-D tensors when `prod(leading) > 1`), TorchAO
-`NVFP4Tensor` and Piper `PiperNVFP4Tensor` (2-D and N-D tensors when column
+Piper `PiperNVFP4Tensor` (2-D linear and 3-D `(E, M, K)` MoE tensors when column
 shards align to `block_size=16`, and for 128x4 swizzled scales when row shards
 align to 128 rows and column shards align to 64 columns with final tail-block
-allowance; flattened N-D swizzled TorchAO `NVFP4Tensor` and 4-D+ weights
-require `rows % 128 == 0` when `prod(leading) > 1`, whereas 3-D `(E, M, K)`
-`PiperNVFP4Tensor` pads each expert's 128-row tiles independently, narrows
-per-expert `(E, 1, 1)` `per_tensor_scale` zero-copy, and replicates scalar
-global scales while plain TorchAO `NVFP4Tensor` accepts `None` or scalar
-`per_tensor_scale`), 2-D Piper `ConvRotInt8Tensor` (`Shard(0)` on any non-empty
-split; `Shard(1)` when shard offset and local width are aligned to
-`group_size`, preserving optional scalar `act_per_tensor_scale`), and 2-D Piper
-`ConvRotNVFP4Tensor` (`Shard(0)` on any non-empty split when unswizzled or
+allowance; 3-D `(E, M, K)` pads each expert's 128-row tiles independently,
+narrows per-expert `(E, 1, 1)` `per_tensor_scale` zero-copy, and replicates
+scalar global and activation scales), 2-D Piper `ConvRotInt8Tensor` (`Shard(0)`
+on any non-empty split; `Shard(1)` when shard offset and local width are aligned
+to `group_size`, preserving optional scalar `act_per_tensor_scale`), and 2-D
+Piper `ConvRotNVFP4Tensor` (`Shard(0)` on any non-empty split when unswizzled or
 aligned to 128 rows with tail-block allowance when 128x4 swizzled, and
 `Shard(1)` aligned to `block_size=16` and rotation `group_size` plus 64-col
 swizzle alignment with tail-block allowance when 128x4 swizzled, preserving
-optional scalar global scales). Formats without shard projection (5-D Conv3D
-`ConvRotInt8Tensor` and non-2-D `ConvRotNVFP4Tensor`), empty, misaligned, or
-transposed quantized shards, and `DTensor`-incompatible tensor subclasses (such
-as TorchAO `Int8Tensor`, tile-packed INT4, `PrototypeFloat8Tensor`, or TorchAO
-`NVFP4Tensor` with non-scalar `per_tensor_scale`) are rejected cleanly with
-`layout mismatch` during bind preflight. Non-canonical projected quantized
+optional scalar global and activation scales). Formats without shard projection
+(5-D Conv3D `ConvRotInt8Tensor` and non-2-D `ConvRotNVFP4Tensor`), empty,
+misaligned, or transposed quantized shards, and `DTensor`-incompatible tensor
+subclasses are rejected cleanly with `layout mismatch` during bind preflight.
+Non-canonical projected quantized
 shards (such as `Shard(1)` or non-contiguous swizzled 512-byte tile-grid slices)
 keep zero-copy host views under the single store allocation, report
 `requires_activation(param) == True` while resting on CPU (disallowing direct

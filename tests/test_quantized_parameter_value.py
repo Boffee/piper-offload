@@ -14,55 +14,29 @@ from piper_offload.tensor_adapter_registry import (
     param_representation,
     select_adapter,
 )
-from piper_offload.tensor_adapters import (
-    DenseMergeTensorAdapter,
-    DequantizeTensorAdapter,
-)
+from piper_offload.tensor_adapters import DenseMergeTensorAdapter
 from tests.conftest import activated_model
+
+
+def _to_dense(tensor: torch.Tensor) -> torch.Tensor:
+    dequantize = getattr(tensor, "dequantize", None)
+    return dequantize() if callable(dequantize) else tensor.clone()
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 _QUANT_KINDS = (
-    "torchao-float8",
-    "torchao-static-float8",
-    "torchao-int8",
-    "torchao-mxfp8",
-    "torchao-mxfp4",
-    "torchao-nvfp4",
+    "piper-nvfp4",
     "piper-convrot-int8",
     "piper-convrot-nvfp4",
 )
 
 
-def _make_quantized(kind: str) -> torch.Tensor:  # noqa: PLR0911
+def _make_quantized(kind: str) -> torch.Tensor:
     """Build one physical representation supported by dense merge."""
-    if kind == "torchao-float8":
-        from tests.test_float8_adapter import _make_float8
+    if kind == "piper-nvfp4":
+        from tests.test_piper_nvfp4_adapter import _make_piper_nvfp4
 
-        return _make_float8()
-    elif kind == "torchao-static-float8":
-        from tests.test_static_float8_adapter import _make_static_float8
-
-        return _make_static_float8()
-    elif kind == "torchao-int8":
-        from tests.test_int8_adapter import _make_int8
-
-        return _make_int8()
-    elif kind == "torchao-mxfp8":
-        from tests.test_mx_adapter import _make_mx
-
-        return _make_mx(elem_dtype=torch.float8_e4m3fn)
-    elif kind == "torchao-mxfp4":
-        from tests.test_mx_adapter import _make_mx
-
-        elem_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-        if elem_dtype is None:
-            pytest.skip("torch lacks float4_e2m1fn_x2")
-        return _make_mx(elem_dtype=elem_dtype)
-    elif kind == "torchao-nvfp4":
-        from tests.test_nvfp4_adapter import _make_nvfp4
-
-        return _make_nvfp4()
+        return _make_piper_nvfp4()[0]
     elif kind == "piper-convrot-int8":
         from tests.test_piper_convrot_int8_adapter import _make_convrot
 
@@ -87,8 +61,7 @@ def test_quantized_parameter_value_uses_dense_merge_support(
     source = _make_quantized(kind)
     source_adapter = select_adapter(source)
     assert isinstance(source_adapter, DenseMergeTensorAdapter)
-    assert isinstance(source_adapter, DequantizeTensorAdapter)
-    dense_source = source_adapter.dequantize(source).cpu()
+    dense_source = _to_dense(source).cpu()
 
     adapter = Adapter.from_state_dict(
         {"weight": source},
@@ -113,7 +86,7 @@ def test_quantized_parameter_value_uses_dense_merge_support(
         target = param_representation(model.weight)
         target_adapter = select_adapter(target)
         assert type(target_adapter) is type(source_adapter)
-        dense_target = target_adapter.dequantize(target).cpu()
+        dense_target = _to_dense(target).cpu()
 
     assert model.weight.is_meta
     assert tuple(dense_target.shape) == value.backing.logical_shape
@@ -130,8 +103,7 @@ def test_quantized_parameter_value_uses_dense_merge_support(
 def test_quantized_parameter_value_permanent_scaling(kind: str) -> None:
     source = _make_quantized(kind)
     source_adapter = select_adapter(source)
-    assert isinstance(source_adapter, DequantizeTensorAdapter)
-    dense_source = source_adapter.dequantize(source).cpu()
+    dense_source = _to_dense(source).cpu()
     adapter = Adapter.from_state_dict(
         {"weight": source},
         scale_parameter_values=True,
@@ -156,7 +128,7 @@ def test_quantized_parameter_value_permanent_scaling(kind: str) -> None:
     target = param_representation(model.weight)
     target_adapter = select_adapter(target)
     assert type(target_adapter) is type(source_adapter)
-    dense_target = target_adapter.dequantize(target).cpu()
+    dense_target = _to_dense(target).cpu()
     scaled_error = (dense_target - dense_source * 0.5).abs().mean()
     unchanged_error = (dense_target - dense_source).abs().mean()
     assert scaled_error < unchanged_error
@@ -184,13 +156,13 @@ def test_structured_parameter_value_dtype_is_representation_owned() -> None:
         )
 
 
-@pytest.mark.parametrize("kind", ["piper-convrot-int8", "piper-convrot-nvfp4"])
+@pytest.mark.parametrize("kind", ["piper-nvfp4", "piper-convrot-int8", "piper-convrot-nvfp4"])
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
 def test_scaled_native_dense_merge_preserves_storage_calibration_and_seed(kind, device):
     source = _make_quantized(kind).to(device)
     source.act_per_tensor_scale = torch.tensor(0.75, device=device)
     adapter = select_adapter(source)
-    before = adapter.dequantize(source).float()
+    before = _to_dense(source).float()
     update = torch.linspace(-2, 2, before.numel(), device=device).reshape(before.shape)
     update = update.to(adapter.compute_dtype(source))
     expected = before * -0.5 + update.float() * 0.25
@@ -209,11 +181,11 @@ def test_scaled_native_dense_merge_preserves_storage_calibration_and_seed(kind, 
             assert torch.equal(torch.cuda.get_rng_state(), cuda_rng)
         assert pointers == [getattr(target, name).data_ptr() for name in names]
         torch.testing.assert_close(target.act_per_tensor_scale, source.act_per_tensor_scale)
-        actual = adapter.dequantize(target).float()
+        actual = _to_dense(target).float()
         # NVFP4's coarse code grid allows larger error than INT8.
         tolerance = 0.03 if kind == "piper-convrot-int8" else 0.2
         assert (actual - expected).abs().mean() < expected.abs().mean() * tolerance
         encodings.append([getattr(target, name).clone() for name in names])
     for first, replay in zip(*encodings, strict=True):
         assert torch.equal(first.reshape(-1).view(torch.uint8), replay.reshape(-1).view(torch.uint8))
-    torch.testing.assert_close(adapter.dequantize(source).float(), before)
+    torch.testing.assert_close(_to_dense(source).float(), before)

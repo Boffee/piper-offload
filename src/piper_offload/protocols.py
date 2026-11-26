@@ -21,8 +21,8 @@ CPU->MPS materialization without a second CPU cache).
 :class:`~piper_offload.ModelStore` captures reusable frozen host backing
 that binds onto target shells as :class:`~piper_offload.ModelOffloader`
 instances. An :class:`~piper_offload.Adapter` is itself the cached adapter
-resource. Merge and routed consumers read its immutable host backing directly;
-routed device copies belong to activation-scoped model hooks.
+resource. Active merge sessions and permanent merges read its immutable host
+backing directly.
 
 Lifecycle
 ---------

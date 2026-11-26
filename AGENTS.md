@@ -52,8 +52,8 @@ the code that owns a behavior.
   compilation and unit lifetimes. [Scheduling hooks](docs/development.md#scheduling-hooks)
   must recover from interrupted, skipped, and direct calls.
 - [Adapters](docs/adapters.md) and [formats](docs/formats.md). Model-update
-  resources are immutable. Merge, routed execution, and tensor-format
-  capabilities have separate contracts.
+  resources are immutable. Merge and tensor-format capabilities have separate
+  contracts.
 - [Memory](docs/memory.md). Keep mappings read-only and write to owned storage.
   Asynchronous transfers hold pin leases. Tensor adapters copy through
   `transfer_()`. Only repeated transfers request pinning. Memory component

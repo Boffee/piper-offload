@@ -3,8 +3,8 @@
 Merges additive parameter deltas directly into existing model parameters and
 materializes dense or prequantized parameter values for meta targets. Plain
 floating-point targets support combined low-rank and full-rank deltas.
-Quantized adapters own their factorized and dense encoding paths and may select
-a format-specific kernel or a dequantize/requantize fallback. Mixed deltas and
+Quantized adapters own their factorized and dense encoding paths and apply
+updates without allocating dense weights on the host. Mixed deltas and
 scaled quantized values encode the target once.
 
 Permanent and activation merge share source selection and arithmetic planning.
@@ -22,8 +22,14 @@ import torch
 from torch import nn
 
 from ._dtensor import local_shard
-from ._parameter_update import ParameterUpdatePlan, merge_target_id, plan_merge_targets
-from .adapter import Adapter, AdapterTargetUpdates, active_adapter_pairs, group_adapter_updates
+from ._parameter_update import (
+    AdapterTargetUpdates,
+    ParameterUpdatePlan,
+    group_adapter_updates,
+    merge_target_id,
+    plan_merge_targets,
+)
+from .adapter import Adapter, active_adapter_pairs
 from .host_module import install_parameters
 from .model_partition import reserve_shell
 from .pin_manager import host_pin_manager
@@ -109,7 +115,7 @@ def merge_adapter(
     strengths are inactive. If no adapters are active, return zero before
     visiting model parameters. Merge requires frozen target parameters
     (``requires_grad=False``) across every tied alias and reads immutable host
-    backing, so the same adapter may also serve other merge or routed uses.
+    backing, so the same adapter may also serve other merge uses.
     Target names and capabilities of planned merges are validated before any
     parameter is modified. An adapter constructed with
     ``allow_partial_targets=True`` ignores targets absent from this model
@@ -142,15 +148,12 @@ def merge_adapter(
             params_by_target, updates, stochastic_rounding=stochastic_rounding
         )
 
-        # Preflight every operation before applying any of them. This catches all
-        # expected name, shape, and adapter-capability errors without leaving a
-        # permanently half-merged model.
-        # Validation and application both stage adapter sources onto a CUDA
-        # target asynchronously, so the sources are leased, pageable, until the
-        # device has synchronized; a failed step may already have enqueued copies.
-        # If the synchronization itself fails the context is unusable and no
-        # later call could retry it, so the lease closes with this function.
-        devices = {op.param.device for op in merge_ops if op.param.device.type == "cuda"}
+        # Preflight every operation before applying any of them so name,
+        # shape, and adapter-capability errors fail before mutating the model.
+        targets = [op.prepare(params_by_target) for op in merge_ops]
+        # Application stages adapter sources onto CUDA asynchronously, so
+        # sources are leased until the target device has synchronized.
+        devices = {target.device for target in targets if target.device.type == "cuda"}
         sources = (
             tensor
             for op in merge_ops
@@ -159,7 +162,6 @@ def merge_adapter(
         )
         with host_pin_manager.acquire(sources, pin=False) if devices else contextlib.nullcontext():
             try:
-                targets = [op.prepare(params_by_target) for op in merge_ops]
                 for op, target in zip(merge_ops, targets, strict=True):
                     op.apply(model, target)
             finally:

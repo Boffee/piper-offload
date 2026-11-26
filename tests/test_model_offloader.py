@@ -1458,7 +1458,7 @@ class TestFailedSession:
             pass
 
     @CUDA
-    def test_recoverable_deactivation_error_keeps_routed_activation_available(self) -> None:
+    def test_recoverable_deactivation_error_keeps_adapter_activation_available(self) -> None:
         model = _make_block_model(num_blocks=3)
         lora = Adapter.from_state_dict(
             {
@@ -1474,7 +1474,7 @@ class TestFailedSession:
         engine = residency_engine(offloader)
         x = torch.randn(2, 8, device="cuda")
 
-        offloader.activate("cuda", adapters=[lora], adapter_mode="routed")
+        offloader.activate("cuda", adapters=[lora])
         with torch.no_grad():
             expected = model(x).clone()
         lookahead = engine._lookahead
@@ -1487,8 +1487,7 @@ class TestFailedSession:
             offloader.deactivate()
 
         assert not offloader.failed
-        assert offloader._routed_lease is None
-        with activated_model(offloader, "cuda", adapters=[lora], adapter_mode="routed"), torch.no_grad():
+        with activated_model(offloader, "cuda", adapters=[lora]), torch.no_grad():
             actual = model(x).clone()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
@@ -2526,3 +2525,25 @@ class TestFrozenContract:
         assert bad_target.head.weight.untyped_storage().data_ptr() == bad_head_ptr
         assert bad_target.transformer_blocks[0].weight is bad_b0
         assert bad_target.transformer_blocks[0].weight.untyped_storage().data_ptr() == bad_b0_ptr
+
+
+def test_adapter_mode_public_api_removed() -> None:
+    import piper_offload
+    from piper_offload import ModelCache, ModelSpec
+
+    assert "AdapterMode" not in piper_offload.__all__
+    assert not hasattr(piper_offload, "AdapterMode")
+
+    model = _make_block_model(num_blocks=1)
+    offloader = ModelOffloader.from_module(model)
+    for bad_mode in ("merge", "routed"):
+        with pytest.raises(TypeError, match="adapter_mode"):
+            cast(Any, offloader.activate)("cpu", adapter_mode=bad_mode)
+    assert offloader.active_device is None
+
+    cache = ModelCache()
+    spec = ModelSpec(key="model", estimated_cache_bytes=1024, factory=lambda: _make_block_model(num_blocks=1))
+    for bad_mode in ("merge", "routed"):
+        with pytest.raises(TypeError, match="adapter_mode"):
+            with cast(Any, cache.use)(spec, device="cpu", adapter_mode=bad_mode):
+                pass

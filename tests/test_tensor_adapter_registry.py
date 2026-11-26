@@ -214,3 +214,36 @@ def test_dtensor_outer_wrapper_precedes_external_adapters(
 
 def test_tensor_adapter_contract_is_public() -> None:
     assert isinstance(_ExternalAdapter(), TensorAdapter)
+
+
+def test_removed_torchao_formats_are_not_matched() -> None:
+    pytest.importorskip("torchao.quantization")
+    proto_f8_mod = pytest.importorskip(
+        "torchao.prototype.quantization.float8_static_quant.prototype_float8_tensor"
+    )
+    from torchao.prototype.mx_formats.mx_tensor import MXTensor
+    from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+    from torchao.quantization import Int8WeightOnlyConfig, quantize_
+    from torchao.quantization.granularity import PerTensor
+    from torchao.quantization.quantize_.workflows.float8.float8_tensor import (
+        Float8Tensor,
+        QuantizeTensorToFloat8Kwargs,
+    )
+
+    layer = torch.nn.Linear(64, 16, bias=False, dtype=torch.bfloat16)
+    quantize_(layer, Int8WeightOnlyConfig(version=2))
+    samples: list[torch.Tensor] = [
+        Float8Tensor.from_hp(torch.randn(16, 64, dtype=torch.bfloat16)),
+        proto_f8_mod.PrototypeFloat8Tensor.from_hp(
+            torch.randn(16, 64, dtype=torch.bfloat16),
+            granularity=PerTensor(),
+            act_quant_kwargs=QuantizeTensorToFloat8Kwargs(granularity=PerTensor()),
+            act_quant_scale=torch.tensor(0.5, dtype=torch.float32),
+        ),
+        layer.weight.data,
+        MXTensor.to_mx(torch.randn(16, 64, dtype=torch.bfloat16), torch.float8_e4m3fn, block_size=32),
+        NVFP4Tensor.to_nvfp4(torch.randn(16, 64, dtype=torch.bfloat16), is_swizzled_scales=False),
+    ]
+    for sample in samples:
+        with pytest.raises(NotImplementedError, match="register_adapter"):
+            select_adapter(sample)

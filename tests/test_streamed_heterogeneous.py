@@ -148,49 +148,27 @@ def test_cuda_morphing_pool_handles_repeated_iterations() -> None:
     torch.testing.assert_close(second, first)
 
 
-def _int8_quantizer():
-    """Return a callable that int8-quantizes a Linear in place, or skip.
-
-    Mirrors ``test_int8_adapter.py``: the int8 adapter targets the
-    torchao>=0.18 version-2 ``Int8Tensor`` workflow, so probe whether the
-    installed torchao produces a weight this package's registry supports
-    and skip (don't fail) when it predates it.
-    """
-    pytest.importorskip("torchao")
-    try:
-        from torchao.quantization import Int8WeightOnlyConfig, quantize_
-    except ImportError as exc:  # pragma: no cover - torchao API drift
-        pytest.skip(f"torchao int8 API unavailable: {exc}")
-
-    from piper_offload.tensor_adapter_registry import select_adapter
-
-    try:
-        cfg = Int8WeightOnlyConfig(version=2)
-    except TypeError:  # pragma: no cover - older torchao signature
-        pytest.skip("installed torchao predates the version-2 Int8Tensor")
+def _convrot_int8_quantizer():
+    """Return a callable that replaces a Linear's weight with ``ConvRotInt8Tensor``."""
+    convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
 
     def quantize(linear: nn.Linear) -> None:
-        quantize_(linear, cfg)
-
-    probe = nn.Linear(32, 32, bias=False).to(torch.bfloat16)
-    quantize(probe)
-    try:
-        select_adapter(probe.weight.data)
-    except NotImplementedError:  # pragma: no cover - torchao format drift
-        pytest.skip(
-            "installed torchao int8 weight type has no piper-offload adapter"
+        linear.weight = nn.Parameter(
+            convrot_mod.ConvRotInt8Tensor.from_hp(linear.weight.data, group_size=16),
+            requires_grad=False,
         )
+
     return quantize
 
 
 @CUDA
 def test_cuda_streams_mixed_quant_and_plain_blocks() -> None:
-    """Realistic case: some blocks torchao-int8 quantized, others plain."""
-    quantize = _int8_quantizer()
+    """Realistic case: some blocks ConvRot-INT8 quantized, others plain."""
+    quantize = _convrot_int8_quantizer()
 
     dim = 32
     model = _frozen_model(dim, [torch.bfloat16] * 4)
-    # Quantize alternate blocks → int8 layout interleaved with plain bf16.
+    # Quantize alternate blocks → ConvRot INT8 layout interleaved with plain bf16.
     for block in list(model.blocks)[::2]:
         quantize(block.lin)
     for param in model.parameters():

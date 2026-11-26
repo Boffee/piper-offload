@@ -5,13 +5,14 @@ is validated against the effective physical source. The caller owns allocation,
 leases, and installation. Tensor adapters own representation-specific arithmetic.
 """
 
-from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping, Sequence, Set
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
 
+from .host_module import ParameterTransform
 from .host_param import HostParam
 from .lora import (
     LoRATransform,
@@ -21,13 +22,11 @@ from .lora import (
     _MaterializedWeightFactor,
     _pack_materialized_weight_factors,
     _validate_factor_shapes,
-    _validate_materialized_weight_factors,
 )
-from .parameter_transform import ParameterTransform
+from .parameter_delta import ParameterDelta, ScaledParameterDelta
 from .seeding import derive_seed
 from .tensor_adapter_registry import param_representation, param_tensor_id, select_adapter
 from .tensor_adapters import (
-    DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
     DenseMergeValidationTensorAdapter,
     LogicalShapeTensorAdapter,
@@ -39,9 +38,58 @@ from .tensor_adapters import (
 )
 
 if TYPE_CHECKING:
-    from .adapter import AdapterTargetUpdates
-    from .parameter_delta import ScaledParameterDelta
+    from .adapter import Adapter, AdapterTarget
     from .parameter_value import ScaledParameterValue
+
+
+@dataclass(slots=True)
+class AdapterTargetUpdates:
+    """Package-internal active contributions for one parameter name."""
+
+    deltas: list[ScaledParameterDelta] = field(default_factory=list)
+    value: ScaledParameterValue | None = None
+    requires_base: bool = False
+
+    def add(
+        self,
+        target: AdapterTarget,
+        strength: float,
+        *,
+        target_key: str,
+        allow_partial_targets: bool,
+    ) -> None:
+        """Bind one contribution, allowing only one authoritative value."""
+        if isinstance(target, ParameterDelta):
+            self.deltas.append(target.scaled(strength))
+            self.requires_base |= not allow_partial_targets
+            return
+
+        if self.value is not None:
+            raise ValueError(f"Adapter target {target_key!r} has multiple active parameter values.")
+        self.value = target.scaled(strength)
+
+
+def group_adapter_updates(
+    adapters: Sequence[tuple[Adapter, float]],
+    param_names: Set[str],
+) -> dict[str, AdapterTargetUpdates]:
+    """Collect contributions by exact name, omitting absent partial targets."""
+    updates: dict[str, AdapterTargetUpdates] = {}
+    missing: set[str] = set()
+    for adapter, strength in adapters:
+        for name, target in adapter.targets.items():
+            if name not in param_names:
+                if not adapter.allow_partial_targets:
+                    missing.add(name)
+                continue
+            contributions = updates.setdefault(name, AdapterTargetUpdates())
+            contributions.add(target, strength, target_key=name, allow_partial_targets=adapter.allow_partial_targets)
+    if missing:
+        raise ValueError(
+            f"Adapter targets are not parameters in the model: {sorted(missing)}. "
+            f"Target keys must match exactly. Sample model parameter keys: {sorted(param_names)[:3]}."
+        )
+    return updates
 
 
 def merge_target_id(param: nn.Parameter) -> tuple[Any, ...]:
@@ -177,26 +225,10 @@ class _DenseMergeTransform:
             validate_broadcast_merge(adapter, target)
 
         rounding_seed = self._rounding_seed()
-        requires_update_validation = isinstance(
-            adapter,
-            DenseMergeValidationTensorAdapter,
-        )
-        if isinstance(adapter, DenseMergeTargetValidationTensorAdapter):
-            requires_update_validation = adapter.validate_dense_merge_target(
-                target,
-                rounding_seed=rounding_seed,
-            )
-        if requires_update_validation and not isinstance(
-            adapter,
-            DenseMergeValidationTensorAdapter,
-        ):
-            raise ValueError(
-                f"{adapter_name(adapter)} requested staged dense-update validation "
-                "without implementing validate_dense_merge()."
-            )
+        if isinstance(adapter, DenseMergeValidationTensorAdapter):
+            adapter.validate_dense_merge(target, rounding_seed=rounding_seed)
 
         factors = _materialize_weight_factors(self._lora_factors)
-        _validate_materialized_weight_factors(factors)
         local_shape = shape
         if isinstance(adapter, MergeLocalityTensorAdapter):
             local_shape, offsets = adapter.merge_local_shape_and_offsets(target)
@@ -223,7 +255,7 @@ class _DenseMergeTransform:
             else local_shape
         )
 
-        plan = _DenseMergePlan(
+        self._dense_plan = _DenseMergePlan(
             adapter=adapter,
             dense_sources=tuple(dense_sources),
             factors=tuple(factors),
@@ -231,17 +263,6 @@ class _DenseMergeTransform:
             update_shape=update_shape,
             compute_dtype=dtype,
         )
-        if requires_update_validation:
-            assert isinstance(adapter, DenseMergeValidationTensorAdapter)
-            staged = self._stage_update_for_plan(param, plan)
-            adapter.validate_dense_merge(
-                target,
-                staged,
-                1.0,
-                beta=self._source_scale,
-                rounding_seed=rounding_seed,
-            )
-        self._dense_plan = plan
 
     def apply_parameter(self, param: nn.Parameter) -> None:
         """Stage all deltas, then scale and update the loaded parameter."""
@@ -399,26 +420,6 @@ class ParameterUpdatePlan:
             param = self.source.make_cpu_param()
         if self.update is not None:
             self.update.validate_parameter(param)
-
-    def apply_parameter(self, param: nn.Parameter) -> None:
-        """Apply arithmetic, or check an exact replacement's loaded representation."""
-        if self.update is not None:
-            self.update.apply_parameter(param)
-            return
-        source = self.source
-        assert source is not None
-        target = param_representation(param)
-        adapter = select_adapter(target)
-        if (
-            target.is_meta
-            or adapter.compute_dtype(target) is not source.compute_dtype
-            or not isinstance(adapter, LogicalShapeTensorAdapter)
-            or adapter.logical_shape(target) != source.logical_shape
-        ):
-            raise RuntimeError(
-                "Parameter value update requires physical storage matching "
-                "the validated replacement source."
-            )
 
 
 def build_parameter_transform(

@@ -93,8 +93,8 @@ class TestConv3dWeight:
 
         def validate():
             if operation == "dense":
-                return PiperConvRotInt8Adapter.validate_dense_merge_target(weight)
-            return PiperConvRotInt8Adapter.validate_lora_merge(weight, torch.ones(8, 1), torch.ones(1, 64), 1.0)
+                return PiperConvRotInt8Adapter.validate_dense_merge(weight)
+            return PiperConvRotInt8Adapter.validate_lora_merge(weight)
 
         with pytest.raises(NotImplementedError, match="updates require a 2-D weight"):
             validate()

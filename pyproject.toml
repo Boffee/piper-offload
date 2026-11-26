@@ -26,9 +26,9 @@ Issues = "https://github.com/Boffee/piper-offload/issues"
 Changelog = "https://github.com/Boffee/piper-offload/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-# TorchAO's own formats and Piper ConvRot INT8/NVFP4 share one requirement:
-# ConvRot tensors subclass `TorchAOBaseTensor`, and the NVFP4 encoder reaches
-# TorchAO's `mx_formats` kernels, which import NumPy at module scope.
+# TorchAO weight formats are unsupported in piper-offload; this optional extra
+# remains temporarily because Piper Kernels' ConvRot and NVFP4 tensors still
+# subclass `TorchAOBaseTensor` / call `torchao.prototype.mx_formats`.
 torchao = ["numpy>=2.3.2,<3", "torchao>=0.18,<0.19"]
 # Reading GGUF files needs no extra. Activating their quantized weights decodes
 # through ConvRot INT8's Triton converter, which has no fallback.
@@ -97,10 +97,6 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"src/piper_offload/_triton_*_lora.py" = [
-    # Triton JIT kernels expose positional pointer and constexpr parameters.
-    "PLR0917",
-]
 "tests/**/*.py" = [
     # Tests intentionally use local helpers, optional imports guarded by
     # importorskip(), and assertion-oriented context-manager structure.

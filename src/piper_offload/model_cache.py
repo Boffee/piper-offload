@@ -14,7 +14,7 @@ from typing import cast
 import torch
 from torch import nn
 
-from .adapter import AdapterMode, resolve_adapter_strengths
+from .adapter import resolve_adapter_strengths
 from .device_transfer import DeviceTransferContext
 from .offload_config import _USE_CONFIG_BUDGET, _UseConfigBudget
 from .resource_cache import ResourceCache
@@ -46,7 +46,6 @@ class ModelCache(ResourceCache):
         device: torch.device | str,
         adapter_specs: Sequence[AdapterSpec] = (),
         adapter_strengths: Sequence[float] | None = None,
-        adapter_mode: AdapterMode = "merge",
         stochastic_rounding: bool = True,
         vram_budget_bytes: int | _UseConfigBudget | None = _USE_CONFIG_BUDGET,
         vram_budget: VramBudget | None = None,
@@ -69,7 +68,7 @@ class ModelCache(ResourceCache):
         their adapter resources are not leased. ``stochastic_rounding`` is
         forwarded to the model activation's merge path and defaults to
         stochastic requantization for quantized delta targets and scaled
-        quantized parameter values; routed targets are unaffected.
+        quantized parameter values.
         """
         active = resolve_adapter_strengths(adapter_specs, adapter_strengths)
         # Hold active adapters before model admission can evict them.
@@ -81,7 +80,6 @@ class ModelCache(ResourceCache):
                 device,
                 adapters=adapters,
                 adapter_strengths=None if adapter_strengths is None else tuple(strength for _, strength in active),
-                adapter_mode=adapter_mode,
                 stochastic_rounding=stochastic_rounding,
                 vram_budget_bytes=vram_budget_bytes,
                 vram_budget=vram_budget,

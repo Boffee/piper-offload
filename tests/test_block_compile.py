@@ -281,28 +281,6 @@ class TestCompiledForwardLifecycle:
         finally:
             offloader.deactivate()
 
-    @pytest.mark.parametrize("vram_budget_bytes", [None, 1024 * 1024 * 1024])
-    def test_cpu_compile_bypass_is_temporary(self, monkeypatch, vram_budget_bytes):
-        spy = _CompileSpy()
-        monkeypatch.setattr(torch, "compile", spy)
-        model = _BlockModel()
-        offloader = _make_offloader(
-            model,
-            vram_budget_bytes=vram_budget_bytes,
-            block_compile=BlockCompileConfig(fullgraph=True),
-        )
-        engine = residency_engine(offloader)
-        for compile_blocks in (False, True, False):
-            engine.activate("cpu", compile_blocks=compile_blocks)
-            try:
-                with torch.inference_mode():
-                    model(torch.randn(2, 8))
-                    assert all(("forward" in block.__dict__) == compile_blocks for block in model.blocks)
-            finally:
-                engine.deactivate()
-            assert all("forward" not in block.__dict__ for block in model.blocks)
-        assert spy.executions == 2
-
     def test_cpu_without_compile_config_remains_eager(self, monkeypatch):
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
@@ -520,11 +498,8 @@ class TestCompiledForwardLifecycle:
         state_type = type(compile_state)
         original_install = state_type.install
 
-        def broken_install(
-            state: object,
-            active_config: BlockCompileConfig | None,
-        ) -> None:
-            original_install(state, active_config)
+        def broken_install(state: object) -> None:
+            original_install(state)
             raise RuntimeError("simulated compiled-forward install failure")
 
         with monkeypatch.context() as install_patch:
@@ -647,7 +622,7 @@ class TestCompileFailureSemantics:
 
 class TestCompiledLoRA:
     @CUDA
-    def test_real_inductor_matches_eager_merge_mode(self) -> None:
+    def test_real_inductor_matches_eager_with_lora(self) -> None:
         torch.manual_seed(0)
         eager_model = _BlockModel()
         compiled_model = _BlockModel()
@@ -667,7 +642,6 @@ class TestCompiledLoRA:
                 "cuda",
                 adapters=[lora],
                 adapter_strengths=[0.25],
-                adapter_mode="merge",
             ):
                 with torch.inference_mode():
                     expected = eager_model(x).cpu()
@@ -684,7 +658,6 @@ class TestCompiledLoRA:
                 "cuda",
                 adapters=[lora],
                 adapter_strengths=[0.25],
-                adapter_mode="merge",
             ):
                 with torch.inference_mode():
                     actual = compiled_model(x).cpu()
@@ -692,61 +665,3 @@ class TestCompiledLoRA:
             compiled_offloader.deactivate()
 
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
-
-    @pytest.mark.parametrize("device", DEVICES)
-    @pytest.mark.parametrize("vram_budget_bytes", [None, 1024 * 1024 * 1024])
-    def test_routed_bypass_is_model_wide_and_temporary(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        vram_budget_bytes: int | None,
-        device: str,
-    ) -> None:
-        spy = _CompileSpy()
-        monkeypatch.setattr(torch, "compile", spy)
-        model = _TwoGroupModel()
-        lora = Adapter.from_state_dict(
-            {
-                "first_blocks.0.proj.lora_A.weight": torch.randn(2, 8),
-                "first_blocks.0.proj.lora_B.weight": torch.randn(8, 2),
-            }
-        )
-        offloader = _make_offloader(
-            model,
-            offload_paths=["first_blocks", "second_blocks"],
-            vram_budget_bytes=vram_budget_bytes,
-            block_compile=BlockCompileConfig(),
-        )
-        x = torch.randn(2, 8, device=device)
-        try:
-            with activated_model(
-                offloader,
-                device,
-                adapters=[lora],
-                adapter_mode="routed",
-            ):
-                assert all("forward" not in block.__dict__ for block in (*model.first_blocks, *model.second_blocks))
-                with torch.inference_mode():
-                    model(x)
-            assert spy.executions == 0
-
-            with activated_model(
-                offloader,
-                device,
-                adapter_mode="routed",
-            ):
-                with torch.inference_mode():
-                    model(x)
-            assert spy.executions == 4
-
-            if device == "cuda":
-                with activated_model(
-                    offloader,
-                    device,
-                    adapters=[lora],
-                    adapter_mode="merge",
-                ):
-                    with torch.inference_mode():
-                        model(x)
-                assert spy.executions == 8
-        finally:
-            offloader.deactivate()

@@ -4,7 +4,7 @@ GGUF and trellis-coded sources keep their packed bytes in host backing, and each
 refill stages them into a transient stream-ordered scratch buffer and decodes
 directly into a reusable ConvRot INT8 target without retaining permanent GPU
 staging allocations. Once active, the parameter is an ordinary
-``ConvRotInt8Tensor``, so dequantization and LoRA and dense updates delegate to
+``ConvRotInt8Tensor``, so LoRA and dense updates delegate to
 :class:`PiperConvRotInt8Adapter`. The packed source is inference-only and cannot
 be updated permanently. Each subclass owns its capture, identity, and refill.
 """
@@ -99,11 +99,6 @@ class ConvRotInt8SourceAdapter:
             f"Permanent updates to {cls._SOURCE_NAME} parameters are unsupported; "
             "use activation-time adapter merge instead."
         )
-
-    @staticmethod
-    def dequantize(t: torch.Tensor) -> torch.Tensor:
-        """Delegate active-value dequantization to ConvRot INT8."""
-        return PiperConvRotInt8Adapter.dequantize(t)
 
     @staticmethod
     def merge_lora_(

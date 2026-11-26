@@ -79,12 +79,12 @@ Keep latency and throughput measurements in [benchmarks](../benchmarks).
 | Checkpoint reader | Validate file headers, map tensor storage read-only, and record its file slice | [checkpoint.py](../src/piper_offload/checkpoint.py) |
 | Model cache | Lease adapters and a model, then activate the model for a use | [model_cache.py](../src/piper_offload/model_cache.py) |
 | Model store and offload config | Capture flat frozen host backing once and configure/bind offload topologies | [model_store.py](../src/piper_offload/model_store.py), [offload_config.py](../src/piper_offload/offload_config.py) |
-| Model offloader | Coordinate shell ownership, adapter hooks, activation, and dynamic VRAM controls | [model_offloader.py](../src/piper_offload/model_offloader.py) |
+| Model offloader | Coordinate shell ownership, activation, and dynamic VRAM controls | [model_offloader.py](../src/piper_offload/model_offloader.py) |
 | Model partition | Partition resident state and offloaded units with cross-boundary alias validation | [model_partition.py](../src/piper_offload/model_partition.py) |
 | Elastic VRAM pool & residency engine | Capacity-bounded GPU slot reuse (Belady MIN), trace lookahead, and hook lifecycle | [vram_pool.py](../src/piper_offload/vram_pool.py), [residency_engine.py](../src/piper_offload/residency_engine.py) |
 | Shared Layer 1 substrate | Multi-reader/GPU-born `StreamLease`, shared `DeviceTransferContext`, `VramBudget` coordinator, and single-`uint8` `Uint8DualArena` + `TypedSidePool`/`StructuredSidePool` | [stream_lease.py](../src/piper_offload/stream_lease.py), [device_transfer.py](../src/piper_offload/device_transfer.py), [vram_budget.py](../src/piper_offload/vram_budget.py), [dual_arena.py](../src/piper_offload/dual_arena.py) |
 | Host parameters and tensor adapters | Capture, account for, transfer, and reconstruct each tensor representation | [host_param.py](../src/piper_offload/host_param.py), [tensor_adapters.py](../src/piper_offload/tensor_adapters.py) |
-| Model adapters | Immutable LoRA, delta, and value resources applied through load plans or hooks | [adapter.py](../src/piper_offload/adapter.py), [merge.py](../src/piper_offload/merge.py) |
+| Model adapters | Immutable LoRA, delta, and value resources merged during weight loading and permanent merge | [adapter.py](../src/piper_offload/adapter.py), [merge.py](../src/piper_offload/merge.py) |
 | Parameter updates | Select merge targets and sources, validate them, and plan arithmetic for activation and permanent merge | [_parameter_update.py](../src/piper_offload/_parameter_update.py), [lora.py](../src/piper_offload/lora.py) |
 | Pin manager | Transfer leases, page accounting, registration order, and the shared lock | [pin_manager.py](../src/piper_offload/pin_manager.py) |
 | Transfer priority | Background host-to-device copies wait while foreground transfers move data | [_transfer_priority.py](../src/piper_offload/_transfer_priority.py) |
@@ -120,7 +120,7 @@ frames and any tensors they reference.
 
 ### Scheduling hooks
 
-Unit offloading and routed LoRA staging run from module forward hooks. A hook
+Unit offloading runs from module forward hooks. A hook
 must work even if an earlier hook was skipped or interrupted.
 
 - A forward that raises skips ordinary post-hooks. `always_call` handles
@@ -197,8 +197,7 @@ implementation in [resource_cache.py](../src/piper_offload/resource_cache.py).
    bytes differ from resting host `cache_bytes` so `vram_budget_bytes` stays
    accurate), caller-managed arena binding (`ArenaBindableTensorAdapter` via
    `BufferSpec` and `GpuAllocator`), zero-copy stacked-axis slicing
-   (`SliceableTensorAdapter`), representation-preserving copy, conversion, and
-   merge are separate protocols.
+   (`SliceableTensorAdapter`), and merge are separate protocols.
    For factorized or dense merge, the merge and preflight
    docstrings specify rounding, coefficients, broadcasting, locality, and
    storage preservation. See the [caller contract](adapters.md#broadcast-additive-updates)

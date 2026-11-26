@@ -75,7 +75,7 @@ class AdapterSpec:
     """Adapter resource built from a state-dict factory.
 
     ``dtype`` is forwarded to :meth:`Adapter.from_state_dict`; matching the
-    model's compute dtype reduces routed per-forward transfer volume.
+    model's compute dtype avoids conversion work during merge staging.
     Compatible complete pageable CPU allocations and non-empty views into
     non-resizable storage transfer to the resource, so the caller must not
     mutate factory values after construction. The factory's reserved

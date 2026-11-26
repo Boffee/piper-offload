@@ -53,16 +53,12 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   mapping, supporting 1D and N-D CPU/CUDA `DeviceMesh` topologies, `Replicate`
   and contiguous `Shard(dim)` placements for plain tensors, all-`Replicate`
   projection for `DTensor`-compatible non-`nn.Parameter`-subclass quantized
-  tensors, and zero-copy `Shard(dim)` projection for TorchAO `Float8Tensor`
-  (`PerTensor`, `PerRow` along any axis, and group-aligned `PerGroup`), TorchAO
-  `MXTensor` (MXFP8 and packed MXFP4 across 2-D and N-D leading dims, including
-  zero-copy 128x4 swizzled tile-grid slicing with `rows % 128 == 0` when
-  `prod(leading) > 1`), TorchAO `NVFP4Tensor` (scalar or `None`
-  `per_tensor_scale`) and Piper `PiperNVFP4Tensor` (2-D and 3-D `(E, M, K)`
-  per-expert swizzling with `(E, 1, 1)` or scalar `per_tensor_scale`,
-  unswizzled and 128x4 swizzled), 2-D Piper `ConvRotInt8Tensor` (`Shard(0)` on
-  any non-empty split and `group_size`-aligned `Shard(1)`, preserving optional
-  scalar `act_per_tensor_scale`), and 2-D Piper `ConvRotNVFP4Tensor`
+  tensors, and zero-copy `Shard(dim)` projection for Piper `PiperNVFP4Tensor`
+  (2-D and 3-D `(E, M, K)` per-expert swizzling with `(E, 1, 1)` or scalar
+  `per_tensor_scale`, unswizzled and 128x4 swizzled), 2-D Piper
+  `ConvRotInt8Tensor` (`Shard(0)` on any non-empty split and
+  `group_size`-aligned `Shard(1)`, preserving optional scalar
+  `act_per_tensor_scale`), and 2-D Piper `ConvRotNVFP4Tensor`
   (`Shard(0)` aligned to 128 rows with tail allowance when 128x4 swizzled, and
   `block_size`/`group_size`/swizzle-aligned `Shard(1)`), with contiguous 1/P
   CUDA target allocation (expanding tile-grid host views cleanly),
@@ -82,6 +78,10 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   (`reduce_scatter_tensor_coalesced`) over `ReduceOp.SUM`, `dist.new_group()`
   and `DeviceMesh` subgroups, `torch.compile`, and `ModelStore`/`ModelOffloader`
   streaming coordination.
+- Added `PiperNvfp4Adapter` (`piper_nvfp4_adapter.py` / `_piper_nvfp4.py`) for
+  Piper Kernels' `PiperNVFP4Tensor` (2-D linear and 3-D `(E, M, K)` MoE weights),
+  and renamed the shared structured base adapter module to `structured_adapter.py`
+  (`StructuredTensorAdapter`).
 
 ### Changed
 
@@ -112,18 +112,47 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 - Lowered the `TrellisParameter` / `TrellisAdapter` minimum `row_widths`
   validation floor from `3` to `2` code bits per weight (`2` to `6` code bits per
   weight; 2-bit GPU decoding requires `piper-kernels>=0.8.0rc8`).
+- Breaking: Removed `adapter_mode="routed"` and `AdapterMode` across
+  `ModelOffloader.activate()`, `ModelCache.use()`, internal LoRA merge helpers,
+  and top-level exports; activation-scoped adapters now always merge on CUDA.
+- Breaking: Removed all standalone TorchAO weight format adapters
+  (`Float8Adapter`, `StaticFloat8Adapter`, `Int8Adapter`,
+  `Int4TilePackedAdapter`, `MxAdapter`, and TorchAO `Nvfp4Adapter`), along with
+  their `_torchao_*` shims, custom Triton LoRA/dense merge kernels
+  (`_triton_*_lora`, `_dense_merge`), and standalone stochastic quantization helpers
+  (`_stochastic_quantization`, `_triton_stochastic_quantization`). Piper Kernels
+  weights remain supported via `PiperNvfp4Adapter`, `PiperConvRotInt8Adapter`,
+  `PiperConvRotNVFP4Adapter`, `GgufAdapter`, and `TrellisAdapter` (the `torchao`
+  optional extra remains in place until `piper-kernels` drops its `torchao`
+  dependency).
+- Breaking: Removed `ParameterDeltaTransform` (`parameter_delta.py`),
+  `ParameterValueTransform` (`parameter_value.py`), and the
+  `piper_offload.parameter_transform` module; internalized `ParameterTransform` in
+  `piper_offload.host_module`; and removed `LoRATransform` from both
+  `piper_offload` and `piper_offload.lora.__all__` (along with duplicate
+  `LoRATransform` alias methods `validate_target`, `validate_weight_target`,
+  `apply`, and `apply_weight`). Compose updates through `Adapter`,
+  `ParameterDelta`, `ParameterValue`, `LoRAFactor`, `merge_adapter()`,
+  `ModelOffloader`, and `ModelCache`.
+- Breaking: Removed unused optional adapter protocols
+  `DequantRequantTensorAdapter`, `TensorCopyIntoAdapter`,
+  `DequantizeTensorAdapter` (and adapter `.dequantize()` methods), and
+  `DenseMergeTargetValidationTensorAdapter` from `piper_offload.tensor_adapters`,
+  and narrowed `LoRAMergeValidationTensorAdapter.validate_lora_merge` and
+  `DenseMergeValidationTensorAdapter.validate_dense_merge` to target-only
+  `(target, *, rounding_seed=None) -> None` preflight signatures (removing
+  redundant factor staging during validation).
 
 ### Fixed
 
-- `ModelStore.bind()` and `HostModuleStore.bind()` now reject quantized tensor
-  subclasses that cannot be wrapped in `DTensor` (such as
-  `PrototypeFloat8Tensor`) with a `layout mismatch` error during bind
-  preflight instead of raising an `IndexError`.
+- `ModelStore.bind()` and `HostModuleStore.bind()` now reject incompatible
+  quantized targets or non-projectable quantized layouts with a `layout mismatch`
+  error during bind preflight instead of raising an `IndexError`.
 - Host capture allocations, CUDA target allocations (resident and offloaded),
   resting host wrapper restoration, and `DTensor` wrapper
   reconstruction and local-shard extraction now exit `torch.inference_mode()`,
-  preventing `aten.view_as` dispatch failures on subclasses such as
-  `Float8Tensor` and keeping managed parameters and buffers non-inference.
+  preventing `aten.view_as` dispatch failures on tensor subclasses and keeping
+  managed parameters and buffers non-inference.
 - Cached a backend-less resting CPU `DeviceMesh` (with distinct internal
   dimension names) inside DTensor host state during capture and projection (and
   returned already-CPU meshes directly), preventing crashes when deactivating

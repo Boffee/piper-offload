@@ -13,7 +13,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import NoReturn, Self, cast
+from typing import NoReturn, Protocol, Self, cast
 
 import torch
 from torch import nn
@@ -23,13 +23,28 @@ from .dtensor_adapter import DTensorAdapter, require_initialized_mesh
 from .host_buffer import HostBuffer
 from .host_param import HostParam
 from .module_names import group_names, resolve_parent_leaf
-from .parameter_transform import ParameterTransform
 from .tensor_adapter_registry import (
     buffer_tensor_id,
     param_representation,
     param_tensor_id,
 )
 from .tensor_adapters import transfer_
+
+
+class ParameterTransform(Protocol):
+    """Internal contract for activation-scoped parameter updates."""
+
+    def validate_parameter(self, param: nn.Parameter) -> None:
+        """Validate ``param`` and prepare any reusable execution state."""
+        ...
+
+    def apply_parameter(self, param: nn.Parameter) -> None:
+        """Apply the prepared update to ``param`` in place."""
+        ...
+
+    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return physical CPU tensors read while applying the update."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,23 +389,6 @@ class HostModuleLoadPlan:
                 ),
                 buffer_targets=_allocate_buffer_targets(buffers, device),
             )
-
-    def refill_param_target(
-        self,
-        name: str,
-        target: HostParamTarget,
-        *,
-        non_blocking: bool = True,
-    ) -> None:
-        """Refill one target and immediately apply its planned update."""
-        if name not in self.instance.params:
-            raise ValueError(
-                f"param name {name!r} is not owned by this HostModuleInstance"
-            )
-        load = self.loads.get(name)
-        if load is None:
-            return
-        _load_param_target(load, target, non_blocking=non_blocking)
 
     def load_to_target(
         self,
