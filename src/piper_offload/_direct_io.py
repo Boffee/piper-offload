@@ -687,6 +687,8 @@ def _default_win32_io() -> _Win32IO:
 
 
 def _resolve_open_path(file: io.BufferedReader) -> str:
+    if getattr(file, "closed", False):
+        return ""
     if sys.platform == "win32":
         windll = _configure_kernel32()
         try:
@@ -1013,6 +1015,8 @@ class DirectFileReader:
         return _ManagedFileHandle(backend)
 
     def _handle_for(self, file: io.BufferedReader) -> _ManagedFileHandle:
+        if getattr(file, "closed", False):
+            raise ValueError("I/O operation on closed file.")
         key = id(file)
         stale: list[_ManagedFileHandle] = []
         with self._lock:

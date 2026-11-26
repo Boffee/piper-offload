@@ -13,7 +13,7 @@ import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -173,6 +173,8 @@ class TestDirectFileReaderPosix:
                     )
             assert torch.equal(torch.frombuffer(out_a, dtype=torch.bfloat16).reshape(t0.shape), t0)
             assert torch.equal(torch.frombuffer(out_b, dtype=torch.uint8).reshape(t1.shape), t1)
+            del a_mapped, b_mapped, fs_a, fs_b
+            gc.collect()
 
     def test_coalesces_nearby_small_requests_and_splits_large_reads(self, tmp_path: Path, monkeypatch) -> None:
         path = tmp_path / "coalesce.bin"
@@ -498,18 +500,17 @@ class TestDirectFileReaderPosix:
             gc.collect()
             assert entry.weak_file() is None
             assert entry.handle._backend._closed
-            with tempfile.TemporaryDirectory() as prune_dir:
-                prune_path = Path(prune_dir) / "prune.bin"
-                prune_data = b"prune-test" * 8
-                prune_path.write_bytes(prune_data)
-                with prune_path.open("rb") as f_prune:
-                    out_prune = bytearray(32)
-                    with memoryview(out_prune) as mv_prune:
-                        req_prune = DirectReadRequest(FileSlice(f_prune, 0, 32), mv_prune, aligned_target=False)
-                        reader.read_into([req_prune])
-                    assert bytes(out_prune) == prune_data[:32]
-                    assert len(reader._handles) == 1
-                    assert reader._handles[id(f_prune)] is not entry
+            prune_path = tmp_path / "prune.bin"
+            prune_data = b"prune-test" * 8
+            prune_path.write_bytes(prune_data)
+            with prune_path.open("rb") as f_prune:
+                out_prune = bytearray(32)
+                with memoryview(out_prune) as mv_prune:
+                    req_prune = DirectReadRequest(FileSlice(f_prune, 0, 32), mv_prune, aligned_target=False)
+                    reader.read_into([req_prune])
+                assert bytes(out_prune) == prune_data[:32]
+                assert len(reader._handles) == 1
+                assert reader._handles[id(f_prune)] is not entry
 
     def test_concurrent_close_drains_inflight_and_keyboard_interrupt_cleans_up(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -929,7 +930,10 @@ class TestDirectFileReaderRegressions:
         orig_open, orig_close = os.open, os.close
 
         def spy_open(p: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
-            fd = orig_open(p, flags, mode)
+            try:
+                fd = orig_open(p, flags, mode)
+            except OSError:
+                fd = orig_open(p, flags & ~getattr(os, "O_DIRECT", 0), mode)
             opened_fds.add(fd)
             return fd
 
@@ -944,10 +948,24 @@ class TestDirectFileReaderRegressions:
             with monkeypatch.context() as ctx:
                 ctx.setattr(direct_io_mod.os, "open", spy_open)
                 ctx.setattr(direct_io_mod.os, "close", spy_close)
-                with suppress(ValueError, OSError):
-                    assert not reader.is_direct(f_closed)
-            assert opened_fds.issubset(closed_fds)
+                with pytest.raises(ValueError, match="closed file"):
+                    reader.is_direct(f_closed)
+            assert not opened_fds
             assert len(reader._handles) == 0
+
+        if hasattr(os, "O_DIRECT") and hasattr(os, "preadv"):
+            with path.open("rb") as f_probe, monkeypatch.context() as ctx:
+                ctx.setattr(direct_io_mod.os, "open", spy_open)
+                ctx.setattr(direct_io_mod.os, "close", spy_close)
+                ctx.setattr(
+                    direct_io_mod,
+                    "_same_open_file",
+                    lambda *_args: (_ for _ in ()).throw(ValueError("probe boom")),
+                )
+                with pytest.raises(ValueError, match="probe boom"):
+                    direct_io_mod._PosixBackend(f_probe, direct_io=True)
+            assert len(opened_fds) == 1
+            assert opened_fds == closed_fds
 
         monkeypatch.delattr(os, "preadv", raising=False)
         slices = [(0, 1500), (1500, 2300), (3800, 3100), (7000, 4000)]

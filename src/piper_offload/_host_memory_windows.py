@@ -161,7 +161,8 @@ class VirtualRegion:
         return view
 
     def __release_buffer__(self, view: memoryview, /) -> None:
-        self._exports -= 1
+        if hasattr(self, "_exports"):
+            self._exports -= 1
 
     @property
     def closed(self) -> bool:

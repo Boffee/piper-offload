@@ -460,6 +460,10 @@ class _SpanLease:
             target[0]._return_slab_span(target[1], self.offset, self.size)
 
 
+_ACTIVE_SPAN_EXPORTS: dict[int, _SpanLease] = {}
+_SPAN_EXPORTS_LOCK = threading.Lock()
+
+
 class _SpanView:
     """PEP 688 Buffer object ensuring exported views/tensors keep ``_SpanLease`` alive."""
 
@@ -471,18 +475,25 @@ class _SpanView:
         self._end = end
 
     def __buffer__(self, flags: int, /) -> memoryview:
-        region = self._lease.acquire_region_for_export()
+        lease = self._lease
+        region = lease.acquire_region_for_export()
         try:
-            return memoryview(region)[self._start : self._end]
+            inner = memoryview(region)[self._start : self._end]
         except BaseException:
-            self._lease.release_export()
+            lease.release_export()
             raise
+        with _SPAN_EXPORTS_LOCK:
+            _ACTIVE_SPAN_EXPORTS[id(inner)] = lease
+        return inner
 
     def __release_buffer__(self, view: memoryview, /) -> None:
         try:
             view.release()
         finally:
-            self._lease.release_export()
+            with _SPAN_EXPORTS_LOCK:
+                lease = _ACTIVE_SPAN_EXPORTS.pop(id(view), None)
+            if lease is not None:
+                lease.release_export()
 
 
 def _finalize_lease(lease: _SpanLease) -> None:

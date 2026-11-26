@@ -829,9 +829,18 @@ class TestHostArenaAndRingRegressions:
                     cycle: list[object] = [alloc, mv]
                     cycle.append(cycle)
                     del alloc, mv, cycle
+                for _ in range(10):
+                    alloc = arena.allocate(PAGE)
+                    assert alloc is not None
+                    sv = host_arena_mod._SpanView(alloc._lease, alloc.offset, alloc.offset + alloc.size)
+                    mv = memoryview(sv)
+                    cycle = [alloc, sv, mv]
+                    cycle.append(cycle)
+                    del alloc, sv, mv, cycle
                 gc.collect()
                 assert arena.stats.used_bytes == 0
                 assert arena.stats.live_allocations == 0
+                assert not host_arena_mod._ACTIVE_SPAN_EXPORTS
             finally:
                 gc.set_threshold(*old_threshold)
 
