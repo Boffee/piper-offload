@@ -7,6 +7,11 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Added host-memory staging primitives in `piper_offload.host_arena` (`HostSlabArena`,
+  `ArenaAllocation`, `HostArenaStats`, and `PinnedBounceRing`), backed by direct
+  file-slice I/O (`_direct_io`), platform-aligned host allocation and memory budget
+  helpers (`_host_memory`), and transfer-priority background yield chunk scheduling
+  (`_transfer_priority`).
 - Added the shared Layer 1 residency substrate (available from submodules, with user
   coordination types `VramBudget`, `VramReservation`, `VramBudgetExhaustedError`, and
   `DeviceTransferContext` exported from top-level `piper_offload`): multi-reader and atomic

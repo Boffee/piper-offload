@@ -25,6 +25,7 @@ import ctypes
 import functools
 import io
 import logging
+import mmap
 import sys
 import threading
 import time
@@ -34,6 +35,9 @@ from dataclasses import dataclass
 from typing import cast
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_PIN_FRACTION = 0.45
+DEFAULT_HOST_FRACTION = 0.75
 
 _MEM_COMMIT = 0x1000
 _MEM_RESERVE = 0x2000
@@ -152,8 +156,9 @@ class VirtualRegion:
     def __buffer__(self, flags: int, /) -> memoryview:
         if self._offered or self.closed:
             raise ValueError("region is offered or closed")
+        view = _from_memory()(self.address, self.size, _PYBUF_WRITE)
         self._exports += 1
-        return _from_memory()(self.address, self.size, _PYBUF_WRITE)
+        return view
 
     def __release_buffer__(self, view: memoryview, /) -> None:
         self._exports -= 1
@@ -398,4 +403,22 @@ class Readers(contextlib.AbstractContextManager["Readers"]):
         return handle.readinto(buffer)
 
 
-__all__ = ["Readers", "VirtualRegion", "available_memory", "commit_exhausted", "reading_below_offers"]
+def allocate_aligned_region(size: int) -> VirtualRegion:
+    """Allocate ``size`` bytes of page-aligned private memory via ``VirtualAlloc``."""
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0 or size % mmap.PAGESIZE != 0:
+        raise ValueError(
+            f"Aligned host region size must be a positive multiple of {mmap.PAGESIZE}, got {size!r}."
+        )
+    return VirtualRegion(size)
+
+
+__all__ = [
+    "DEFAULT_HOST_FRACTION",
+    "DEFAULT_PIN_FRACTION",
+    "Readers",
+    "VirtualRegion",
+    "allocate_aligned_region",
+    "available_memory",
+    "commit_exhausted",
+    "reading_below_offers",
+]
