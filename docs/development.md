@@ -86,18 +86,18 @@ Keep latency and throughput measurements in [benchmarks](../benchmarks).
 | Host parameters and tensor adapters | Capture, account for, transfer, and reconstruct each tensor representation | [host_param.py](../src/piper_offload/host_param.py), [tensor_adapters.py](../src/piper_offload/tensor_adapters.py) |
 | Model adapters | Immutable LoRA, delta, and value resources merged during weight loading and permanent merge | [adapter.py](../src/piper_offload/adapter.py), [merge.py](../src/piper_offload/merge.py) |
 | Parameter updates | Select merge targets and sources, validate them, and plan arithmetic for activation and permanent merge | [_parameter_update.py](../src/piper_offload/_parameter_update.py), [lora.py](../src/piper_offload/lora.py) |
-| Pin manager | Transfer leases, page accounting, registration order, and the shared lock | [pin_manager.py](../src/piper_offload/pin_manager.py) |
+| Pin manager | Transfer leases, Tier 2a/2b slab management, Direct I/O checkpoint fill, lazy bounce streaming, and budget accounting | [pin_manager.py](../src/piper_offload/pin_manager.py) |
 | Transfer priority | Background host-to-device copies wait while foreground transfers move data | [_transfer_priority.py](../src/piper_offload/_transfer_priority.py) |
 | Host arena & direct I/O | Page-aligned direct file reader, Tier 2a/2b slab arena, and pinned bounce ring staging | [_direct_io.py](../src/piper_offload/_direct_io.py), [host_arena.py](../src/piper_offload/host_arena.py) |
 | Relay process group | Coordinate collectives, point-to-point operations, and host staging across ranks | [communication.py](../src/piper_offload/communication.py) |
 | In-process multi-rank executors | Coordinate concurrent or serialized multi-rank threads, runtime isolation, and local transports | [sequential.py](../src/piper_offload/sequential.py), [parallel.py](../src/piper_offload/parallel.py), [_sequential_runtime.py](../src/piper_offload/_sequential_runtime.py), [_parallel_collectives.py](../src/piper_offload/_parallel_collectives.py) |
-| Memory components | Owned checkpoint copies, platform allocation, and Windows retention | [_copy_memory.py](../src/piper_offload/_copy_memory.py), [_copy_memory_windows.py](../src/piper_offload/_copy_memory_windows.py), [_host_memory.py](../src/piper_offload/_host_memory.py) |
+| Platform host memory | Physical and cgroup memory budgets and aligned OS region allocation | [_host_memory.py](../src/piper_offload/_host_memory.py), [_host_memory_linux.py](../src/piper_offload/_host_memory_linux.py), [_host_memory_windows.py](../src/piper_offload/_host_memory_windows.py) |
 | Block compilation | Compile declared offloaded unit forwards | [block_compile.py](../src/piper_offload/block_compile.py) |
 
 A resource *spec* builds a *store*. Capture establishes its `cache_bytes`.
 A resource lease protects that store from eviction. A pin lease protects
 storage used by a transfer. The runtime decides whether to request registration
-under the [transfer pinning policy](memory.md#set-the-pin-budget).
+under the [transfer pinning policy](memory.md#set-host-memory-budgets).
 
 A *binding* adds a device lifecycle to a store. `ModelOffloader` implements
 both. `ModelPartition` splits non-offloaded resident weights from offloaded units,

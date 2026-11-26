@@ -216,6 +216,8 @@ def test_row_concatenation_preserves_encoding_and_has_owned_storage(checkpoint):
 
 
 def test_pins_owned_copy_and_eviction_releases_it(checkpoint):
+    from piper_offload.host_arena import ArenaAllocation
+
     path, expected = checkpoint
     weight = MappedCheckpoint(path).get_tensor("weight")
     raw = GgufAdapter.capture_host(weight).data
@@ -224,11 +226,14 @@ def test_pins_owned_copy_and_eviction_releases_it(checkpoint):
     with manager.acquire([raw]) as lease:
         assert lease.registered_bytes == raw.nbytes
         assert backend.register_calls[0][0] != raw.data_ptr()
-        region = manager._registrations[raw.data_ptr()].copy.region
+        alloc = manager._registrations[raw.data_ptr()].copy
+        assert isinstance(alloc, ArenaAllocation)
+        assert not alloc.released
         assert manager.stats.copy_bytes > 0
         torch.testing.assert_close(_transferred(manager, raw), expected)
     manager.clear()
-    assert region.closed
+    assert alloc.released
+    assert backend.registered == {}
     assert manager.stats.copy_bytes == manager.stats.pinned_bytes == 0
     torch.testing.assert_close(raw, expected)
 
@@ -293,7 +298,7 @@ def test_mapped_blocks_execute_and_preserve_pinning_policy(checkpoint, pins, mod
             assert (manager.stats.copy_bytes > 0) == (mode == "streaming")
         finally:
             offloader.deactivate()
-    assert len(backend.registrations) == (2 if mode == "streaming" else 0)
+    assert len(backend.registrations) == (1 if mode == "streaming" else 0)
     assert all(pointer not in {source.data_ptr() for source in sources} for pointer, _ in backend.registrations)
     manager.clear()
     assert manager.stats.pinned_bytes == manager.stats.copy_bytes == 0

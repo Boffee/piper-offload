@@ -85,7 +85,7 @@ its store. If leased stores alone exceed the requested limit, resizing raises
 `ResourceTooLargeError` and preserves the old budget and all entries.
 
 `used_cache_bytes` counts logical backing bytes. Use `info(key)` to see whether
-a store is cached or leased. The [pin budget](memory.md#set-the-pin-budget)
+a store is cached or leased. The [pin budget](memory.md#set-host-memory-budgets)
 controls registered host memory separately.
 
 If model cleanup fails with device work outstanding, the cache retains the

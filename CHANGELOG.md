@@ -90,6 +90,24 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Changed
 
+- Breaking: Replaced `PinManager`'s offered-memory overflow tier (removing the
+  `PinManager(..., max_offered_bytes=...)` keyword argument,
+  `PinManager.max_offered_bytes`, `PinStats.offered_bytes`, and
+  `PinStats.max_offered_bytes`) with chunked pre-pinned checkpoint caching,
+  direct unbuffered reads with page-cache fallback, a two-tier host overflow
+  pool bounded by `PinManager(..., max_host_bytes=...)` (`PinManager.max_host_bytes`
+  and `PinStats.max_host_bytes` / `PinStats.private_copy_bytes`), and lazy
+  bounce-ring staging inside `PinManager.transfer()` / `transfer_()` for
+  overflow, uncached checkpoint, and pageable CUDA transfers (`PinStats.bounce_bytes`),
+  configurable via `PinManager(..., slab_bytes=..., bounce_bytes=...,
+  bounce_slot_bytes=..., min_bounce_bytes=...)`. Default budgets changed from
+  50% physical RAM to 70% pinned / 80% total host RAM on Linux (bounded by
+  cgroups) and 45% pinned / 75% total host RAM on Windows. Migrate callers from
+  `max_offered_bytes` to `max_host_bytes` (pass `0` to disable overflow
+  retention or `None` for an unbounded overflow pool), read
+  `stats.private_copy_bytes` and `stats.bounce_bytes` instead of
+  `stats.offered_bytes`, and pass `bounce_bytes=0` to disable bounce staging
+  without disabling `max_pinned_bytes`.
 - Breaking: Replaced `OffloadConfig(block_paths, block_mode, transient_paths, transient_block_paths)`
   and `BlockMode` with keyword-only `OffloadConfig(offload_paths=(), vram_budget_bytes=None, block_compile=None)`,
   removing rolling compilation (`block_mode="rolling" | "auto"`) and separate

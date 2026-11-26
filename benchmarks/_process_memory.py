@@ -1,14 +1,11 @@
 """Process memory, read traffic, and page-cache control on Linux and Windows.
 
-The checkpoint benchmarks report what pinned copies cost and where their bytes
-come from. Linux answers from ``/proc``: the resident set, the shared part
-anonymous mappings land in, and the bytes the process read from disk. Windows
-splits the same question in two, which the offered tier needs kept apart: the
-*working set* is what the process has resident, which offering gives up, and
-*commitment* is what the memory manager has promised it, which offering keeps.
-Its per-process I/O counter also counts reads served from the cache, so it
-bounds disk traffic rather than measuring it. :class:`Reclaims` counts what
-the offered tier's reclaims got back.
+The checkpoint benchmarks report what Tier 2a pinned slabs and Tier 2b
+overflow copies cost and where their bytes come from. Linux answers from
+``/proc``: the resident set, the shared part anonymous mappings land in, and the
+bytes the process read from disk. Windows reports the process's *working set*
+and *commitment* (``PrivateUsage``). Its per-process I/O counter also counts
+reads served from the cache, so it bounds disk traffic rather than measuring it.
 """
 
 import ctypes
@@ -16,8 +13,6 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-
-from piper_offload._host_memory_windows import VirtualRegion
 
 _READ_CHUNK = 64 * 2**20
 
@@ -64,7 +59,7 @@ class _IoCounters(ctypes.Structure):
 
 
 class _MemoryStatus(ctypes.Structure):
-    # Windows MEMORYSTATUSEX; the commit pair is what the offered tier spends.
+    # Windows MEMORYSTATUSEX.
     _fields_ = [
         ("length", ctypes.c_uint32),
         ("load", ctypes.c_uint32),
@@ -166,31 +161,4 @@ def drop_from_cache(path: Path) -> None:
         os.close(fd)
 
 
-class Reclaims:
-    """Counts what the offered tier's reclaims kept and what Windows discarded, until ``restore()``."""
-
-    def __init__(self) -> None:
-        self.intact_bytes = self.discarded_bytes = 0
-        reclaim = VirtualRegion.reclaim
-        self._reclaim = reclaim
-
-        def counted(region: VirtualRegion) -> list[tuple[int, int]]:
-            discarded = reclaim(region)
-            lost = sum(length for _start, length in discarded)
-            self.discarded_bytes += lost
-            self.intact_bytes += region.size - lost
-            return discarded
-
-        VirtualRegion.reclaim = counted
-
-    def restore(self) -> None:
-        VirtualRegion.reclaim = self._reclaim
-
-    def take(self) -> tuple[int, int]:
-        """The intact and discarded bytes counted since the last take, resetting both."""
-        counts = (self.intact_bytes, self.discarded_bytes)
-        self.intact_bytes = self.discarded_bytes = 0
-        return counts
-
-
-__all__ = ["Memory", "Reclaims", "drop_from_cache", "fill_cache", "memory", "read_bytes", "system_commit"]
+__all__ = ["Memory", "drop_from_cache", "fill_cache", "memory", "read_bytes", "system_commit"]
