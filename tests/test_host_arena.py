@@ -1386,4 +1386,27 @@ class TestHostArenaFinalReviewRegressions:
                     if retained is not None:
                         retained.close()
 
+    def test_bounce_ring_initializes_under_non_cpu_default_device(self) -> None:
+        backend = _FakeBackend()
+        with (
+            torch.device("meta"),
+            PinnedBounceRing(slot_bytes=4 * PAGE, num_slots=2, backend=backend) as ring,
+        ):
+            assert ring._ensure_initialized()
+            assert ring._res.slots is not None
+            assert all(slot.uint8_view.device.type == "cpu" for slot in ring._res.slots)
+        assert not backend.registered
+
+        if torch.cuda.is_available():
+            src = torch.arange(PAGE, dtype=torch.float32, device="cpu")
+            dst = torch.empty_like(src, device="cuda")
+            with (
+                torch.device("cuda"),
+                PinnedBounceRing(slot_bytes=4 * PAGE, num_slots=2, min_bounce_bytes=0) as cuda_ring,
+            ):
+                assert cuda_ring.copy_pageable_to_device(dst, src)
+                torch.cuda.synchronize()
+            torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
+
+
 

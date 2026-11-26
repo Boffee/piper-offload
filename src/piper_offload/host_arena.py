@@ -1462,7 +1462,7 @@ class PinnedBounceRing:
                         index=idx,
                         offset=idx * eff_slot_bytes,
                         size=eff_slot_bytes,
-                        uint8_view=torch.empty(0, dtype=torch.uint8).set_(
+                        uint8_view=torch.empty(0, dtype=torch.uint8, device="cpu").set_(
                             storage, idx * eff_slot_bytes, (eff_slot_bytes,), (1,)
                         ),
                     )
