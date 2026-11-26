@@ -156,6 +156,24 @@ def _wait_for_foreground(device: torch.device) -> None:
         _foreground.condition.wait_for(lambda: not _foreground.counts.get(device, 0))
 
 
+def wait_for_foreground_if_background(device: torch.device | str) -> None:
+    """Block a background thread until active foreground transfers on ``device`` finish.
+
+    Callers must not hold bounded pool resources (such as bounce slots) needed by
+    foreground transfers while waiting here.
+    """
+    if not _local.background:
+        return
+    _wait_for_foreground(canonical_device(device))
+
+
+def background_yield_chunk_bytes(device: torch.device | str) -> int | None:
+    """Return the background staging chunk size when ``device`` should yield, else ``None``."""
+    if not _local.background:
+        return None
+    return _BACKGROUND_CHUNK_BYTES if should_yield(device) else None
+
+
 def _can_chunk(destination: torch.Tensor, source: torch.Tensor) -> bool:
     return (
         type(destination) is torch.Tensor

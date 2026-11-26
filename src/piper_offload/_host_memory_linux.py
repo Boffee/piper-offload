@@ -14,6 +14,8 @@ from ._copy_memory import Memory as CopyMemory
 
 _PROC_CGROUP = "/proc/self/cgroup"
 _CGROUP_MOUNT = "/sys/fs/cgroup"
+DEFAULT_PIN_FRACTION = 0.70
+DEFAULT_HOST_FRACTION = 0.80
 
 
 def _cgroup_memory_limit() -> int | None:
@@ -90,4 +92,20 @@ class Memory(CopyMemory):
         return Copy(size, mmap.mmap(-1, size))
 
 
-__all__ = ["Memory", "Readers", "available_memory"]
+def allocate_aligned_region(size: int) -> mmap.mmap:
+    """Allocate ``size`` bytes of page-aligned anonymous memory."""
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0 or size % mmap.PAGESIZE != 0:
+        raise ValueError(
+            f"Aligned host region size must be a positive multiple of {mmap.PAGESIZE}, got {size!r}."
+        )
+    return mmap.mmap(-1, size)
+
+
+__all__ = [
+    "DEFAULT_HOST_FRACTION",
+    "DEFAULT_PIN_FRACTION",
+    "Memory",
+    "Readers",
+    "allocate_aligned_region",
+    "available_memory",
+]

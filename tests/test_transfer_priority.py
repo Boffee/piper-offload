@@ -675,3 +675,60 @@ def test_mid_block_foreground_transfer_yields_lookahead_with_producer(
     assert out.shape == (2, 256)
     assert saw_yield
     assert after_yield.is_set()
+
+
+def test_wait_for_foreground_if_background_and_yield_chunk_bytes() -> None:
+    dev0 = torch.device("cpu")
+    with transfer_priority.foreground_transfer(dev0):
+        # Non-background thread never blocks and gets None yield chunk.
+        transfer_priority.wait_for_foreground_if_background(dev0)
+        assert transfer_priority.background_yield_chunk_bytes(dev0) is None
+
+    with transfer_priority.register_foreground_producer([dev0]):
+        with transfer_priority.background_transfers():
+            assert (
+                transfer_priority.background_yield_chunk_bytes(dev0)
+                == transfer_priority._BACKGROUND_CHUNK_BYTES
+            )
+            # No active foreground_transfer -> returns immediately despite registered producer.
+            transfer_priority.wait_for_foreground_if_background(dev0)
+
+    cuda0 = torch.device("cuda", 0)
+    with transfer_priority.background_transfers():
+        assert transfer_priority.background_yield_chunk_bytes(dev0) is None
+    with transfer_priority.register_foreground_producer([cuda0]):
+        with transfer_priority.background_transfers():
+            assert transfer_priority.background_yield_chunk_bytes(dev0) is None
+    with transfer_priority.foreground_transfer(cuda0):
+        bg_other_done = threading.Event()
+
+        def bg_other() -> None:
+            with transfer_priority.background_transfers():
+                assert transfer_priority.background_yield_chunk_bytes(dev0) is None
+                transfer_priority.wait_for_foreground_if_background(dev0)
+                bg_other_done.set()
+
+        t_other = threading.Thread(target=bg_other)
+        t_other.start()
+        assert bg_other_done.wait(timeout=2.0)
+        t_other.join(timeout=2.0)
+
+    fg_released = threading.Event()
+    bg_started = threading.Event()
+    bg_finished = threading.Event()
+
+    def bg_waiter() -> None:
+        with transfer_priority.background_transfers():
+            bg_started.set()
+            transfer_priority.wait_for_foreground_if_background("cpu")
+            bg_finished.set()
+
+    with transfer_priority.foreground_transfer("cpu"):
+        t = threading.Thread(target=bg_waiter)
+        t.start()
+        assert bg_started.wait(timeout=2.0)
+        assert not bg_finished.wait(timeout=0.05)
+        fg_released.set()
+    t.join(timeout=2.0)
+    assert fg_released.is_set()
+    assert bg_finished.is_set()
