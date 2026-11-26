@@ -3050,3 +3050,225 @@ def test_bounce_ring_retained_headroom_and_oversubscribed_release(backend: FakeB
     hold.close()
     mgr2.clear()
     assert backend.registered == {}
+
+
+def test_tier2a_respects_active_tier2b_lease_under_max_host_bytes(
+    backend: FakeBackend, tmp_path,
+) -> None:
+    a = _checkpoint(tmp_path, PAGE, "host_a")
+    b = _checkpoint(tmp_path, 3 * PAGE, "host_b")
+    c = _checkpoint(tmp_path, 2 * PAGE, "host_c")
+    manager = PinManager(3 * PAGE, max_host_bytes=3 * PAGE, slab_bytes=PAGE, backend=backend)
+    with manager.acquire([a]):
+        pass
+    manager.max_pinned_bytes = 0
+    assert manager.stats.private_copy_bytes == PAGE
+    lease_a = manager.acquire([a], pin=False)
+    manager.max_pinned_bytes = 3 * PAGE
+
+    with manager.acquire([b]) as lease_b:
+        assert lease_b.registered_bytes == 0
+        assert lease_b.pageable_bytes == 3 * PAGE
+        assert manager.stats.pinned_bytes + manager.stats.private_copy_bytes <= 3 * PAGE
+
+    with manager.acquire([c]) as lease_c:
+        assert lease_c.registered_bytes == 2 * PAGE
+        assert manager.stats.copy_bytes == 2 * PAGE
+        assert manager.stats.private_copy_bytes == PAGE
+        assert manager.stats.pinned_bytes + manager.stats.private_copy_bytes == 3 * PAGE
+
+    lease_a.close()
+    manager.clear()
+    assert backend.registered == {}
+
+
+def test_tier2a_evicts_idle_tier2b_before_allocating_and_coalesces_slab(
+    backend: FakeBackend, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warm = _checkpoint(tmp_path, 2 * PAGE, "warm_2b")
+    ckpts = [_checkpoint(tmp_path, PAGE, f"cold_{i}") for i in range(4)]
+    manager = PinManager(4 * PAGE, max_host_bytes=4 * PAGE, slab_bytes=4 * PAGE, backend=backend)
+    with manager.acquire([warm]):
+        pass
+    manager.max_pinned_bytes = 0
+    assert manager.stats.private_copy_bytes == 2 * PAGE
+    manager.max_pinned_bytes = 4 * PAGE
+
+    peak = 0
+    orig_allocate = HostSlabArena.allocate
+    orig_read_into = DirectFileReader.read_into
+
+    def track_alloc(self: HostSlabArena, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal peak
+        alloc = orig_allocate(self, *args, **kwargs)
+        peak = max(peak, manager.stats.pinned_bytes + manager.stats.private_copy_bytes)
+        return alloc
+
+    def track_read(self: DirectFileReader, requests) -> None:
+        nonlocal peak
+        peak = max(peak, manager.stats.pinned_bytes + manager.stats.private_copy_bytes)
+        orig_read_into(self, requests)
+
+    monkeypatch.setattr(HostSlabArena, "allocate", track_alloc)
+    monkeypatch.setattr(DirectFileReader, "read_into", track_read)
+    regs_before = len(backend.register_calls)
+    with manager.acquire(ckpts) as lease:
+        assert lease.registered_bytes == 4 * PAGE
+
+    monkeypatch.undo()
+    assert peak <= 4 * PAGE
+    assert manager.stats.private_copy_bytes == 0
+    assert len(backend.register_calls) - regs_before == 1
+    manager.clear()
+    assert backend.registered == {}
+
+
+def test_in_place_respects_combined_host_budget(
+    backend: FakeBackend, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = PinManager(3 * PAGE, max_host_bytes=3 * PAGE, slab_bytes=PAGE, backend=backend)
+    ckpt = _checkpoint(tmp_path, PAGE, "inplace_2b")
+    big, fit = _tensors((0, 3 * PAGE), (4 * PAGE, 2 * PAGE))
+    with manager.acquire([ckpt]):
+        pass
+    manager.max_pinned_bytes = 0
+    lease_p = manager.acquire([ckpt], pin=False)
+    manager.max_pinned_bytes = 3 * PAGE
+
+    with manager.acquire([big]) as lease_big:
+        assert lease_big.registered_bytes == 0
+        assert manager.stats.pinned_bytes + manager.stats.private_copy_bytes <= 3 * PAGE
+    with manager.acquire([fit]) as lease_fit:
+        assert lease_fit.registered_bytes == 2 * PAGE
+        assert manager.stats.pinned_bytes + manager.stats.private_copy_bytes == 3 * PAGE
+    lease_p.close()
+    manager.clear()
+
+    with manager.acquire([ckpt]):
+        pass
+    manager.max_pinned_bytes = 0
+    assert manager.stats.private_copy_bytes == PAGE
+    manager.max_pinned_bytes = 3 * PAGE
+    orig_register = backend.register
+    private_at_register: list[int] = []
+
+    def check_private_evicted_before_register(pointer: int, size: int) -> bool:
+        private_at_register.append(manager.stats.private_copy_bytes)
+        return orig_register(pointer, size)
+
+    monkeypatch.setattr(backend, "register", check_private_evicted_before_register)
+    with manager.acquire([big]) as lease_big2:
+        assert lease_big2.registered_bytes == 3 * PAGE
+    monkeypatch.undo()
+    assert private_at_register == [0]
+    manager.clear()
+    assert backend.registered == {}
+
+
+def test_bounce_ring_respects_combined_host_budget(backend: FakeBackend, tmp_path) -> None:
+    parts = [_checkpoint(tmp_path, 64 * 1024, f"bpart_{i}") for i in range(4)]
+    mgr2 = PinManager(
+        256 * 1024,
+        max_host_bytes=256 * 1024,
+        slab_bytes=64 * 1024,
+        bounce_bytes=128 * 1024,
+        bounce_slot_bytes=64 * 1024,
+        min_bounce_bytes=64 * 1024,
+        backend=backend,
+    )
+    with mgr2.acquire(parts[:3]):
+        pass
+    mgr2.max_pinned_bytes = 0
+    lease_3 = mgr2.acquire(parts[:3], pin=False)
+    mgr2.max_pinned_bytes = 256 * 1024
+    with mgr2._use_bounce_ring() as ring:
+        assert ring is not None
+        assert mgr2.stats.bounce_bytes == 64 * 1024
+        assert mgr2.stats.pinned_bytes + mgr2.stats.private_copy_bytes == 256 * 1024
+    lease_3.close()
+    mgr2.clear()
+
+    mgr3 = PinManager(
+        256 * 1024,
+        max_host_bytes=512 * 1024,
+        slab_bytes=64 * 1024,
+        bounce_bytes=128 * 1024,
+        bounce_slot_bytes=64 * 1024,
+        min_bounce_bytes=64 * 1024,
+        backend=backend,
+    )
+    with mgr3.acquire(parts):
+        pass
+    mgr3.max_pinned_bytes = 0
+    lease_4 = mgr3.acquire(parts, pin=False)
+    assert mgr3.stats.private_copy_bytes == 256 * 1024
+    mgr3.max_host_bytes = 256 * 1024
+    mgr3.max_pinned_bytes = 256 * 1024
+    regs_before = len(backend.register_calls)
+    with mgr3._use_bounce_ring() as ring2:
+        assert ring2 is None
+    assert len(backend.register_calls) == regs_before
+    lease_4.close()
+    mgr3.clear()
+    assert backend.registered == {}
+
+
+def test_eager_tier2b_promotion_streams_multi_tensor_batch_under_tight_host_budget(
+    backend: FakeBackend, direct_reads, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a = _checkpoint(tmp_path, 2 * PAGE, "eager_a")
+    b = _checkpoint(tmp_path, 2 * PAGE, "eager_b")
+    manager = PinManager(4 * PAGE, max_host_bytes=6 * PAGE, slab_bytes=2 * PAGE, backend=backend)
+    with manager.acquire([a, b]):
+        pass
+    manager.max_pinned_bytes = 0
+    assert (manager.stats.copy_bytes, manager.stats.private_copy_bytes) == (0, 4 * PAGE)
+    manager.max_pinned_bytes = 4 * PAGE
+
+    peak = 0
+    orig_allocate = HostSlabArena.allocate
+
+    def track_peak(self: HostSlabArena, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal peak
+        alloc = orig_allocate(self, *args, **kwargs)
+        peak = max(peak, manager.stats.pinned_bytes + manager.stats.private_copy_bytes)
+        return alloc
+
+    monkeypatch.setattr(HostSlabArena, "allocate", track_peak)
+    direct_reads.clear()
+    with manager.acquire([a, b]) as lease:
+        assert lease.registered_bytes == 4 * PAGE
+        assert direct_reads == []
+        assert manager.stats.private_copy_bytes == 0
+        torch.testing.assert_close(_transferred(manager, a), a)
+        torch.testing.assert_close(_transferred(manager, b), b)
+    monkeypatch.undo()
+    assert peak <= 6 * PAGE
+    manager.clear()
+
+    # Self-unblocking fallback when max_host_bytes was lowered after demotion.
+    mgr2 = PinManager(2 * PAGE, max_host_bytes=4 * PAGE, slab_bytes=2 * PAGE, backend=backend)
+    with mgr2.acquire([a]):
+        pass
+    mgr2.max_pinned_bytes = 0
+    assert mgr2.stats.private_copy_bytes == 2 * PAGE
+    mgr2.max_host_bytes = 2 * PAGE
+    mgr2.max_pinned_bytes = 2 * PAGE
+    peak2 = 0
+
+    def track_peak2(self: HostSlabArena, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal peak2
+        alloc = orig_allocate(self, *args, **kwargs)
+        peak2 = max(peak2, mgr2.stats.pinned_bytes + mgr2.stats.private_copy_bytes)
+        return alloc
+
+    monkeypatch.setattr(HostSlabArena, "allocate", track_peak2)
+    with mgr2.acquire([a]) as lease2:
+        assert lease2.registered_bytes == 2 * PAGE
+        assert mgr2.stats.copy_bytes == 2 * PAGE
+        assert mgr2.stats.private_copy_bytes == 0
+        torch.testing.assert_close(_transferred(mgr2, a), a)
+    monkeypatch.undo()
+    assert peak2 <= 2 * PAGE
+    mgr2.clear()
+    assert backend.registered == {}

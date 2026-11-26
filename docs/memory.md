@@ -45,10 +45,11 @@ leases remain pinned until those leases close.
 Set `max_host_bytes` to `0` to disable Tier 2b private overflow retention
 without affecting Tier 2a, or `None` to allow unbounded Tier 2b growth. Lowering
 `max_host_bytes` immediately evicts least recently used idle Tier 2b copies.
-`max_host_bytes` is enforced as a peak ceiling: simultaneously promoting a
-batch from Tier 2b while demoting idle Tier 2a copies requires transient headroom
-for both within `max_host_bytes`, otherwise evicted copies are dropped cleanly
-rather than exceeding the cap.
+`max_host_bytes` is enforced as a peak ceiling across all pinned and private
+slab reservations: idle Tier 2b copies are evicted before allocating new pinned
+memory when combined usage would exceed the cap, actively leased Tier 2b copies
+reduce available pinned headroom within `max_host_bytes`, and simultaneous
+demotion skips or drops copies rather than exceeding `max_host_bytes`.
 
 A pin lease holds storage until a transfer finishes; it does not decide whether
 to request registration. Piper's built-in runtimes choose as follows:
