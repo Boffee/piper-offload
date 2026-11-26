@@ -14,12 +14,12 @@ from piper_offload import (
     ModelOffloader,
     OffloadConfig,
     ParameterDelta,
-    ParameterDeltaTransform,
     ParameterValue,
     file_slice,
     host_pin_manager,
     merge_adapter,
 )
+from piper_offload._parameter_update import _DenseMergeTransform, build_parameter_transform
 from piper_offload.tensor_adapters import RegularAdapter
 from tests.conftest import activated_model
 
@@ -216,21 +216,28 @@ def test_complete_values_remain_exact_shape(source_shape):
 
 @pytest.mark.parametrize("kind", ["lora", "dense", "mixed"])
 def test_quantized_broadcast_requires_explicit_capability(kind):
-    from tests.test_int8_adapter import _make_int8
+    convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
 
-    weight = _make_int8(rows=3, cols=4)
+    weight = convrot_mod.ConvRotInt8Tensor.from_hp(
+        torch.randn(4, 16, dtype=torch.bfloat16),
+        group_size=16,
+    )
     before = weight.dequantize()
     model = nn.Module()
-    model.first = nn.Parameter(torch.zeros(3, 4), requires_grad=False)
+    model.first = nn.Parameter(torch.zeros(4, 16), requires_grad=False)
     model.weight = nn.Parameter(weight, requires_grad=False)
     delta = ParameterDelta.from_tensors(
-        a=torch.ones(1, 4) if kind != "dense" else None,
-        b=torch.ones(1, 1) if kind != "dense" else None,
-        dense=torch.ones(3, 4) if kind == "mixed" else (torch.ones(()) if kind == "dense" else None),
+        a=torch.ones(1, 16, dtype=torch.bfloat16) if kind != "dense" else None,
+        b=torch.ones(1, 1, dtype=torch.bfloat16) if kind != "dense" else None,
+        dense=(
+            torch.ones(4, 16, dtype=torch.bfloat16)
+            if kind == "mixed"
+            else (torch.ones((), dtype=torch.bfloat16) if kind == "dense" else None)
+        ),
     )
     adapter = Adapter({"first": ParameterDelta.from_tensors(dense=torch.ones(())), "weight": delta})
 
-    with pytest.raises(ValueError, match="Int8Adapter does not support broadcast"):
+    with pytest.raises(ValueError, match="PiperConvRotInt8Adapter does not support broadcast"):
         merge_adapter(model, [(adapter, 1.0)])
     assert torch.count_nonzero(model.first) == 0
     torch.testing.assert_close(weight.dequantize(), before)
@@ -260,10 +267,16 @@ def test_prepared_local_sources_reuse_mapped_views(tmp_path, monkeypatch):
     with MappedCheckpoint(path) as checkpoint:
         mapped = {name: checkpoint.get_tensor(name) for name in sources}
     delta = ParameterDelta.from_tensors(**mapped)
-    transform = ParameterDeltaTransform([delta.scaled(0.25)])
+    transform = build_parameter_transform(
+        [delta.scaled(0.25)],
+        source_scale=1.0,
+        stochastic_rounding=False,
+        target_key="",
+    )
     target = nn.Parameter(torch.zeros(4, 3, device="cuda"), requires_grad=False)
     transform.validate_parameter(target)
-    plan = transform._update._dense_plan
+    assert isinstance(transform, _DenseMergeTransform)
+    plan = transform._dense_plan
     assert plan is not None
     assert plan.update_shape == (4, 3)
     assert not plan.dense_sources[0][0].is_contiguous()

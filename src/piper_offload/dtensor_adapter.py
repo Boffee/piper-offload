@@ -7,10 +7,11 @@ an ordinary tensor — plain, or a quantized subclass — so this adapter
 **delegates all local-shard movement to whatever adapter the registry
 already selects** for it, and adds only the distributed wrapper.
 
-One adapter therefore composes with the plain and TorchAO-subclass
-adapters: a ``DTensor`` wrapping a ``Float8Tensor`` reuses ``Float8Adapter``
-for the local shard, a ``DTensor`` wrapping a plain tensor reuses
-``RegularAdapter``, and so on — no per-quant ``DTensor`` variants.
+One adapter therefore composes with plain and Piper-subclass
+adapters: a ``DTensor`` wrapping a ``ConvRotInt8Tensor`` reuses
+``PiperConvRotInt8Adapter`` for the local shard, a ``DTensor`` wrapping a plain
+tensor reuses ``RegularAdapter``, and so on — no per-quant ``DTensor``
+variants.
 
 Local shards must retain their tensor representation through ``.data``
 because reconstruction reads it from the inner wrapper. ``capture_host``
@@ -18,7 +19,7 @@ rejects local ``nn.Parameter`` subclasses, which may carry state on the
 object itself.
 
 Scope: **movement plus shard-local additive merge, for frozen-inference tensor
-parallelism.** Merge mode supports ordinary ``Replicate`` and contiguous
+parallelism.** Additive merge supports ordinary ``Replicate`` and contiguous
 ``Shard`` placements. It selects the host dense regions and, for rank-two
 weights, LoRA factor regions needed by each rank before device staging, then
 delegates the actual update to the local shard's adapter. This keeps
@@ -26,9 +27,9 @@ tensor-parallel concerns out of format-specific quant adapters.
 
 Dense ``Replicate`` and contiguous ``Shard(dim)`` tensors across 1D and N-D
 meshes can also be projected from a full plain host parameter or a supported
-non-``nn.Parameter``-subclass quantized host parameter (such as TorchAO
-``Float8Tensor``, ``MXTensor``, ``NVFP4Tensor``, Piper ``PiperNVFP4Tensor``,
-or 2-D Piper ``ConvRotInt8Tensor`` / ``ConvRotNVFP4Tensor`` via
+non-``nn.Parameter``-subclass quantized host parameter (such as Piper
+``PiperNVFP4Tensor``, or 2-D Piper ``ConvRotInt8Tensor`` /
+``ConvRotNVFP4Tensor`` via
 :class:`~piper_offload.tensor_adapters.ShardProjectionTensorAdapter`). The
 target DTensor supplies only its distributed layout and may use a meta local
 tensor; host storage remains a zero-copy view or alias of the original host
@@ -37,12 +38,9 @@ shards (such as column-sharded quantized matrices) rest on CPU in a minimal
 zero-allocation placeholder until CUDA activation materializes contiguous
 ``1/P`` device shards.
 
-The adapter advertises no full dequantize/requantize or ``copy_into``
-capability. It can expose a dense local shard when the inner adapter can, which
-lets exact-name parameter values reuse the same dense merge path for value-only
-scaling. A DTensor merge is available only when its local shard's adapter
-supports the corresponding factorized or dense merge operation; otherwise
-routed LoRA remains the inference path.
+A DTensor merge is available only when its local shard's adapter
+supports the corresponding factorized or dense merge operation; inference
+without updates remains supported otherwise.
 
 Identity and layout keys are taken from the **local shard** (delegated to
 the inner adapter) plus a structural ``(mesh, placements)`` signature. This
@@ -62,7 +60,6 @@ so the CPU-resting and CUDA-resident forms match. The resident GPU parameter is
 rebuilt on the original CUDA mesh in :meth:`gpu_param`.
 """
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -81,11 +78,10 @@ from ._dtensor import (
     require_dtensor,
 )
 from .seeding import derive_seed
+from .structured_adapter import _ProjectedStructuredShard
 from .tensor_adapters import (
-    DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
     DenseMergeValidationTensorAdapter,
-    DequantizeTensorAdapter,
     LogicalShapeTensorAdapter,
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
@@ -97,7 +93,6 @@ from .tensor_adapters import (
 from .tensor_adapters import (
     gpu_target_bytes as _gpu_target_bytes,
 )
-from .torchao_structured_adapter import _ProjectedTorchaoShard
 
 
 def _mesh_target_key(mesh: Any) -> tuple[object, ...]:  # noqa: ANN401
@@ -301,7 +296,7 @@ def _merge_context(target: torch.Tensor) -> _DTensorLoRAMergeContext:
     if not isinstance(context.inner, LoRAMergeTensorAdapter):
         raise ValueError(
             f"DTensor local shard adapter {adapter_name(context.inner)} does not support "
-            "LoRA merge. Use routed LoRA for this tensor type."
+            "LoRA merge."
         )
 
     return cast(_DTensorLoRAMergeContext, context)
@@ -340,25 +335,6 @@ def _local_dense_update(
     ):
         local = local.narrow(dim, offset, size)
     return local.contiguous()
-
-
-def _validate_local_prepared_factors(
-    context: _DTensorLoRAMergeContext,
-    b: torch.Tensor,
-    a: torch.Tensor,
-) -> None:
-    """Require factors prepared for exactly this rank's local shard."""
-    if b.ndim != 2 or a.ndim != 2 or b.shape[1] != a.shape[0]:
-        raise ValueError(
-            "DTensor prepared LoRA factors must be rank two with matching "
-            f"inner dimensions, got B={tuple(b.shape)}, A={tuple(a.shape)}."
-        )
-    if (b.shape[0], a.shape[1]) != context.local_shape:
-        raise ValueError(
-            "DTensor prepared LoRA factors must match the local weight "
-            f"shape {context.local_shape}, got B={tuple(b.shape)}, "
-            f"A={tuple(a.shape)}."
-        )
 
 
 def _local_lora_factors(
@@ -439,7 +415,7 @@ def _validate_dtensor_wrapping(
     if type(local) is not torch.Tensor:
         try:
             # Validate during preflight that DTensor wrapping and Parameter
-            # wrapping succeed for this tensor subclass (e.g. Int8Tensor lacks
+            # wrapping succeed for this tensor subclass (some subclasses lack
             # aten.view and would otherwise fail late during install_host after
             # earlier components mutated the shell).
             nn.Parameter(
@@ -451,7 +427,7 @@ def _validate_dtensor_wrapping(
                 f"DTensor {mode} projection requires a local tensor representation "
                 f"compatible with DTensor wrapping ({type(local).__name__}): {exc}"
             ) from exc
-    if isinstance(local, _ProjectedTorchaoShard):
+    if isinstance(local, _ProjectedStructuredShard):
         meta_tensor = local._meta_tensor
         try:
             nn.Parameter(
@@ -607,7 +583,7 @@ class DTensorAdapter:
         inner = _select(local)
         inner_type = (
             local._adapter_cls
-            if isinstance(local, _ProjectedTorchaoShard)
+            if isinstance(local, _ProjectedStructuredShard)
             else type(inner)
         )
         return (
@@ -642,7 +618,7 @@ class DTensorAdapter:
             raise NotImplementedError(
                 f"DTensorAdapter cannot move a local shard that is itself an "
                 f"nn.Parameter subclass ({type(local).__name__}); its quant "
-                f"state would be stripped. Plain and TorchAO-subclass local "
+                f"state would be stripped. Plain and structured-tensor local "
                 f"shards are supported."
             )
         inner = _select(local)
@@ -775,17 +751,6 @@ class DTensorAdapter:
         return tuple(require_dtensor(t).shape)
 
     @staticmethod
-    def dequantize(t: torch.Tensor) -> torch.Tensor:
-        """Return the dense local shard accepted by this adapter's merge."""
-        context = _dense_merge_context(t)
-        if not isinstance(context.inner, DequantizeTensorAdapter):
-            raise ValueError(
-                f"DTensor local shard adapter {adapter_name(context.inner)} "
-                "does not expose a dense logical value."
-            )
-        return context.inner.dequantize(context.local)
-
-    @staticmethod
     def merge_local_shape_and_offsets(
         target: torch.Tensor,
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -796,23 +761,14 @@ class DTensorAdapter:
     @staticmethod
     def validate_lora_merge(
         target: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
-        alpha: float,
         *,
-        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Validate both DTensor placement and inner shard merge operation."""
         context = _merge_context(target)
-        local_b, local_a = _local_lora_factors(context, b, a)
         if isinstance(context.inner, LoRAMergeValidationTensorAdapter):
             context.inner.validate_lora_merge(
                 context.local,
-                local_b,
-                local_a,
-                alpha,
-                beta=beta,
                 rounding_seed=_localize_rounding_seed(
                     rounding_seed,
                     context.offsets,
@@ -822,152 +778,19 @@ class DTensorAdapter:
     @staticmethod
     def validate_dense_merge(
         target: torch.Tensor,
-        update: torch.Tensor,
-        alpha: float,
         *,
-        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
         """Validate placement and the local shard's dense merge operation."""
         context = _dense_merge_context(target)
-        local_update = _local_dense_update(context, update)
         if isinstance(context.inner, DenseMergeValidationTensorAdapter):
             context.inner.validate_dense_merge(
                 context.local,
-                local_update,
-                alpha,
-                beta=beta,
                 rounding_seed=_localize_rounding_seed(
                     rounding_seed,
                     context.offsets,
                 ),
             )
-
-    @staticmethod
-    def validate_dense_merge_target(
-        target: torch.Tensor,
-        *,
-        rounding_seed: int | None = None,
-    ) -> bool:
-        """Validate the local target and propagate staged-validation needs."""
-        context = _dense_merge_context(target)
-        local_seed = _localize_rounding_seed(rounding_seed, context.offsets)
-        requires_update_validation = isinstance(
-            context.inner,
-            DenseMergeValidationTensorAdapter,
-        )
-        if isinstance(context.inner, DenseMergeTargetValidationTensorAdapter):
-            requires_update_validation = context.inner.validate_dense_merge_target(
-                context.local,
-                rounding_seed=local_seed,
-            )
-        if requires_update_validation and not isinstance(
-            context.inner,
-            DenseMergeValidationTensorAdapter,
-        ):
-            raise ValueError(
-                f"DTensor local shard adapter {adapter_name(context.inner)} "
-                "requested staged dense-update validation without implementing "
-                "validate_dense_merge()."
-            )
-        return requires_update_validation
-
-    @staticmethod
-    def stage_lora_factors(
-        target: torch.Tensor,
-        factors: Sequence[tuple[float, torch.Tensor, torch.Tensor]],
-        *,
-        logical_shape: tuple[int, ...],
-        compute_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
-        """Delegate factor-aware staging to the local-shard adapter.
-
-        LoRATransform has already sliced each host factor to this rank before
-        entering this method. Keeping the original factor boundaries here lets
-        an inner quant adapter combine per-factor strengths with any
-        stored-coordinate transform before the packed buffer is cast to its
-        lower compute precision.
-        """
-        context = _merge_context(target)
-        stage = getattr(context.inner, "stage_lora_factors", None)
-        validate = getattr(context.inner, "validate_prepared_lora_merge", None)
-        merge = getattr(context.inner, "merge_prepared_lora_", None)
-        if not (callable(stage) and callable(validate) and callable(merge)):
-            return None
-        if tuple(logical_shape) != context.local_shape:
-            raise ValueError(
-                "DTensor factor-aware LoRA staging requires the localized "
-                f"factor shape {context.local_shape}, got {logical_shape}."
-            )
-        return cast(
-            tuple[torch.Tensor, torch.Tensor, float] | None,
-            stage(
-                context.local,
-                factors,
-                logical_shape=context.local_shape,
-                compute_dtype=compute_dtype,
-            ),
-        )
-
-    @staticmethod
-    def validate_prepared_lora_merge(
-        target: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
-        alpha: float,
-        *,
-        beta: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> None:
-        """Validate a prepared update with the local-shard adapter."""
-        context = _merge_context(target)
-        _validate_local_prepared_factors(context, b, a)
-        validate = getattr(context.inner, "validate_prepared_lora_merge", None)
-        if not callable(validate):
-            raise ValueError(
-                f"DTensor local shard adapter {adapter_name(context.inner)} does not support prepared LoRA validation."
-            )
-        validate(
-            context.local,
-            b,
-            a,
-            alpha,
-            beta=beta,
-            rounding_seed=_localize_rounding_seed(
-                rounding_seed,
-                context.offsets,
-            ),
-        )
-
-    @staticmethod
-    def merge_prepared_lora_(
-        target: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
-        alpha: float,
-        *,
-        beta: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> None:
-        """Apply a prepared update with the local-shard adapter."""
-        context = _merge_context(target)
-        _validate_local_prepared_factors(context, b, a)
-        merge = getattr(context.inner, "merge_prepared_lora_", None)
-        if not callable(merge):
-            raise ValueError(
-                f"DTensor local shard adapter {adapter_name(context.inner)} does not support prepared LoRA merge."
-            )
-        merge(
-            context.local,
-            b.contiguous(),
-            a.contiguous(),
-            alpha,
-            beta=beta,
-            rounding_seed=_localize_rounding_seed(
-                rounding_seed,
-                context.offsets,
-            ),
-        )
 
     @staticmethod
     def merge_lora_(
@@ -1025,10 +848,8 @@ class DTensorAdapter:
 
     @staticmethod
     def compute_dtype(t: torch.Tensor) -> torch.dtype:
-        # Accept either the live DTensor or the bare local shard: the
-        # HostParam.compute_dtype property feeds the local shard that
-        # cpu_param produced (a DTensor weight's resting representation is not
-        # a DTensor), and the routed-LoRA path feeds the live DTensor.
+        # HostParam.compute_dtype and callers inspecting active parameters may
+        # pass a DTensor (on CPU or CUDA) or an already unwrapped local shard.
         local = local_shard(t)
         return _select(local).compute_dtype(local)
 

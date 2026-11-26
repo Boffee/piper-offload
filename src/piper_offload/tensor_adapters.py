@@ -41,11 +41,8 @@ __all__ = [
     "BindTargetTensorAdapter",
     "BroadcastMergeTensorAdapter",
     "BufferSpec",
-    "DenseMergeTargetValidationTensorAdapter",
     "DenseMergeTensorAdapter",
     "DenseMergeValidationTensorAdapter",
-    "DequantRequantTensorAdapter",
-    "DequantizeTensorAdapter",
     "GpuAllocator",
     "GpuTargetBytesTensorAdapter",
     "LoRAMergeTensorAdapter",
@@ -56,7 +53,6 @@ __all__ = [
     "ShardProjectionTensorAdapter",
     "SliceableTensorAdapter",
     "TensorAdapter",
-    "TensorCopyIntoAdapter",
     "accepts_bind_target",
     "adapter_name",
     "capture_host_tensor",
@@ -339,9 +335,11 @@ class LoRAMergeTensorAdapter[HostStateT, GpuStateT](
     tensor's object and storage identities. Implementations may select a
     format-specific kernel or a regular framework-operator fallback.
 
-    Merge and staged validation must accept keyword-only ``beta=1.0`` and
+    ``merge_lora_`` must accept keyword-only ``beta=1.0`` and
     ``rounding_seed: int | None = None``, including implementations that only
-    support deterministic rounding. ``None`` selects deterministic behavior;
+    support deterministic rounding, while optional target-only preflight via
+    :class:`LoRAMergeValidationTensorAdapter` takes only
+    ``rounding_seed: int | None = None``. ``None`` selects deterministic behavior;
     :func:`piper_offload.seeding.derive_seed` provides reproducible substreams.
     Apply source scaling before addition, preserving activation calibration and
     encoding only the final result. A cancelling base delta can overflow or
@@ -364,25 +362,21 @@ class LoRAMergeTensorAdapter[HostStateT, GpuStateT](
 
 @runtime_checkable
 class LoRAMergeValidationTensorAdapter(Protocol):
-    """Optional non-mutating validation for an advertised LoRA merge.
+    """Optional target-only preflight for an advertised LoRA merge.
 
     Some representations support merge only for a subset of otherwise valid
-    tensor layouts or staged factor values. Implementations expose those
-    constraints here so permanent merge can reject every unsupported operation
-    before mutating any model parameter.
+    tensor layouts or dtypes. Implementations expose those constraints here so
+    permanent merge and activation preflight can reject unsupported targets
+    without staging factors or mutating any model parameter.
     """
 
     @staticmethod
     def validate_lora_merge(
         target: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
-        alpha: float,
         *,
-        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        """Validate the staged update and optional rounding mode."""
+        """Validate ``target`` and optional rounding mode."""
         ...
 
 
@@ -398,9 +392,11 @@ class DenseMergeTensorAdapter[HostStateT, GpuStateT](
     ``alpha`` scales the update and ``beta`` scales the current target before
     addition, without encoding an intermediate scaled base. Implementations
     preserve the target tensor's object and storage identities; structured
-    formats may use a native kernel or dequantize/add/requantize internally.
-    Merge and staged validation follow :class:`LoRAMergeTensorAdapter`'s
-    coefficient, rounding, and calibration-preservation contract.
+    formats use a native kernel or re-encode once internally.
+    ``merge_dense_`` follows :class:`LoRAMergeTensorAdapter`'s coefficient,
+    rounding, and calibration-preservation contract, while optional target-only
+    preflight via :class:`DenseMergeValidationTensorAdapter` takes only
+    ``rounding_seed: int | None = None``.
     """
 
     @staticmethod
@@ -417,39 +413,16 @@ class DenseMergeTensorAdapter[HostStateT, GpuStateT](
 
 
 @runtime_checkable
-class DenseMergeTargetValidationTensorAdapter(Protocol):
-    """Optional target-only preflight for an advertised dense merge."""
-
-    @staticmethod
-    def validate_dense_merge_target(
-        target: torch.Tensor,
-        *,
-        rounding_seed: int | None = None,
-    ) -> bool:
-        """Validate ``target`` and report whether update validation is needed.
-
-        Returning ``True`` requires the adapter to also implement
-        :class:`DenseMergeValidationTensorAdapter`. This supports composing
-        wrappers whose inner adapter may or may not need to inspect the staged
-        update without forcing target-only formats to stage it during preflight.
-        """
-        ...
-
-
-@runtime_checkable
 class DenseMergeValidationTensorAdapter(Protocol):
-    """Optional staged-update validation for an advertised dense merge."""
+    """Optional target-only preflight for an advertised dense merge."""
 
     @staticmethod
     def validate_dense_merge(
         target: torch.Tensor,
-        update: torch.Tensor,
-        alpha: float,
         *,
-        beta: float = 1.0,
         rounding_seed: int | None = None,
     ) -> None:
-        """Validate the affine full-rank update and rounding mode."""
+        """Validate ``target`` and optional rounding mode."""
         ...
 
 
@@ -466,76 +439,6 @@ class MergeLocalityTensorAdapter(Protocol):
         target: torch.Tensor,
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """Return this target's local shape and global offsets."""
-        ...
-
-
-@runtime_checkable
-class DequantizeTensorAdapter[HostStateT, GpuStateT](
-    TensorAdapter[HostStateT, GpuStateT],
-    Protocol,
-):
-    """Optional capability for exposing a dense logical representation.
-
-    The returned tensor must be accepted as a local or global update by the
-    same adapter's :class:`DenseMergeTensorAdapter` implementation. Composing
-    distributed adapters may therefore return the dense local shard.
-    """
-
-    @staticmethod
-    def dequantize(t: torch.Tensor) -> torch.Tensor:
-        """Return the dense logical value represented by ``t``."""
-        ...
-
-
-@runtime_checkable
-class DequantRequantTensorAdapter[HostStateT, GpuStateT](
-    DequantizeTensorAdapter[HostStateT, GpuStateT],
-    Protocol,
-):
-    """Optional capability for shape-preserving dequantize/requantize conversion.
-
-    ``dequantize(t)`` returns a dense logical tensor for ``t`` in
-    ``compute_dtype(t)``. ``requantize(t, like=...)`` converts a
-    shape-compatible dense tensor back into the same representation/layout
-    as ``like``. Device follows the dense input tensor; callers can move
-    tensors explicitly before calling.
-
-    Data-dependent weight quantization parameters are recomputed from the new
-    dense values. Callers must not assume scale bytes survive a
-    dequantize/requantize round trip. Built-in quantized adapters internally
-    compose stochastic terminal-code recoding with this same conversion, but
-    the public structural protocol remains deterministic.
-    This conversion capability does not by itself advertise in-place copy or
-    LoRA merge support.
-    """
-
-    @staticmethod
-    def requantize(
-        t: torch.Tensor,
-        *,
-        like: torch.Tensor,
-        rounding_seed: int | None = None,
-    ) -> torch.Tensor:
-        """Return ``t`` encoded in the same representation as ``like``."""
-        ...
-
-
-@runtime_checkable
-class TensorCopyIntoAdapter[HostStateT, GpuStateT](
-    TensorAdapter[HostStateT, GpuStateT],
-    Protocol,
-):
-    """Optional capability for representation-preserving copy into ``target``.
-
-    ``copy_into(src, target=...)`` copies ``src``'s representation into
-    ``target`` while preserving ``target``'s object identity and storage.
-    Structured tensor wrappers use this when generic ``target.copy_(src)``
-    does not update their internal storage correctly.
-    """
-
-    @staticmethod
-    def copy_into(src: torch.Tensor, *, target: torch.Tensor) -> None:
-        """Copy ``src`` into ``target``'s existing representation."""
         ...
 
 
@@ -816,7 +719,7 @@ def capture_host_tensor(
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers for structured-tensor adapters (nvfp4, float8, ...)
+# Shared helpers for structured-tensor adapters (nvfp4, convrot, ...)
 # ---------------------------------------------------------------------------
 
 
@@ -1043,11 +946,6 @@ class RegularAdapter:
         return tuple(t.shape)
 
     @staticmethod
-    def dequantize(t: torch.Tensor) -> torch.Tensor:
-        """Return an independent dense logical value."""
-        return t.clone()
-
-    @staticmethod
     def merge_lora_(
         target: torch.Tensor,
         b: torch.Tensor,
@@ -1073,23 +971,34 @@ class RegularAdapter:
                 RegularAdapter.merge_dense_(target, b @ a, alpha, beta=beta)
 
     @staticmethod
-    def validate_broadcast_merge(target: torch.Tensor) -> None:
+    def _reject_plain_float8(target: torch.Tensor, operation: str) -> None:
         if target.dtype.is_floating_point and torch.finfo(target.dtype).bits == 8:
-            raise ValueError("Broadcast merges do not support float8 targets with plain storage.")
+            raise ValueError(
+                f"{operation} do not support float8 targets with plain storage; "
+                f"got {target.dtype}."
+            )
 
     @staticmethod
-    def validate_dense_merge_target(
+    def validate_broadcast_merge(target: torch.Tensor) -> None:
+        RegularAdapter._reject_plain_float8(target, "Broadcast merges")
+
+    @staticmethod
+    def validate_lora_merge(
         target: torch.Tensor,
         *,
         rounding_seed: int | None = None,
-    ) -> bool:
+    ) -> None:
         del rounding_seed
-        if target.dtype.is_floating_point and torch.finfo(target.dtype).bits == 8:
-            raise ValueError(
-                "Dense merges do not support float8 targets with plain storage; "
-                f"got {target.dtype}."
-            )
-        return False
+        RegularAdapter._reject_plain_float8(target, "LoRA merges")
+
+    @staticmethod
+    def validate_dense_merge(
+        target: torch.Tensor,
+        *,
+        rounding_seed: int | None = None,
+    ) -> None:
+        del rounding_seed
+        RegularAdapter._reject_plain_float8(target, "Dense merges")
 
     @staticmethod
     def merge_dense_(

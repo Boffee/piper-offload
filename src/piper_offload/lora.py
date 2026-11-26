@@ -1,13 +1,13 @@
-"""Host-backed LoRA data, parameter merging, and routed execution.
+"""Host-backed LoRA data and parameter merging.
 
 The general mixed adapter resource lives in :mod:`piper_offload.adapter`;
 this module owns the complete low-rank update family beneath it.
 """
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, Self, runtime_checkable
+from typing import Any, Self
 
 import torch
 from torch import nn
@@ -26,9 +26,7 @@ from .tensor_adapters import (
 
 __all__ = [
     "LoRAFactor",
-    "LoRATransform",
     "ScaledLoRAFactor",
-    "install_routed_residual_hook",
 ]
 
 
@@ -39,6 +37,10 @@ def _validate_factor_tensors(
     for name, tensor in (("LoRA A", a), ("LoRA B", b)):
         if not isinstance(tensor, torch.Tensor):
             raise ValueError(f"{name} must be a torch.Tensor; got {type(tensor).__name__}.")
+        if type(tensor) is not torch.Tensor:
+            raise ValueError(
+                f"{name} must be a plain torch.Tensor; got {type(tensor).__name__}."
+            )
         if tensor.requires_grad:
             raise ValueError(f"{name} must be frozen (requires_grad=False).")
         if tensor.is_meta:
@@ -80,8 +82,7 @@ class LoRAFactor:
     target shape is checked separately, where the target is known.
 
     Merge targets accept a product that broadcasts to their logical shape
-    when their tensor adapter supports it. Routed targets require an exact
-    matrix shape.
+    when their tensor adapter supports it.
 
     Two scalars meet here and they are not the same thing. ``scale`` is
     *intrinsic*: the checkpoint's own ``alpha / rank`` magnitude, a property of
@@ -92,8 +93,7 @@ class LoRAFactor:
     an anonymous tensor.
 
     :meth:`scaled` binds the extrinsic strength without discarding the host
-    representation, so each application path can materialize the factors
-    through their tensor adapters.
+    representation, so the merge path can stage factors onto the target device.
     """
 
     a: HostParam
@@ -144,17 +144,16 @@ class LoRAFactor:
 class ScaledLoRAFactor:
     """Host-backed LoRA tensors bound to an application ``strength``.
 
-    The application-side carrier used by :class:`LoRATransform` and routed
-    hooks. Keeping :class:`HostParam` rather than CPU tensor views preserves
-    adapter-specific reconstruction metadata such as a ``DTensor``'s original
-    device mesh. The contribution to the base weight is
+    The application-side carrier used by parameter updates. Keeping
+    :class:`HostParam` retains the host storage backing and cache accounting
+    across repeated loads. The contribution to the base weight is
     ``coefficient * (b @ a)``.
 
     One scalar, not two: :attr:`coefficient` is the caller's strength already
     composed with the factor's intrinsic scaling, so no application path has to
     remember to combine them. Build it through :meth:`LoRAFactor.scaled`,
-    which does that composition, or :meth:`from_tensors` for a standalone
-    transform from source tensors.
+    which does that composition, or :meth:`from_tensors` to construct one
+    directly from source tensors.
     """
 
     factor: LoRAFactor
@@ -204,63 +203,6 @@ class ScaledLoRAFactor:
         return (self.b.shape[0], self.a.shape[1])
 
 
-# The float is the coefficient on ``B @ A``: a factor's intrinsic scaling already
-# composed with the strength it was bound to, never the strength alone.
-type _RawLoRAFactor = tuple[float, torch.Tensor, torch.Tensor]
-
-
-@runtime_checkable
-class _FactorAwareLoRAMergeAdapter(Protocol):
-    """Optional staging path for formats that transform individual factors.
-
-    The ordinary packer folds each factor's coefficient into an
-    already-low-precision ``A`` slice. Formats whose stored-weight coordinates
-    require another transform can instead stage every factor atomically, before
-    packing loses the original factor boundaries.
-
-    Prepared validation and merge must honor the same ``alpha``, ``beta``, and
-    ``rounding_seed`` contract as ``LoRAMergeTensorAdapter``; forwarding a
-    prepared update must preserve source scaling as well as its coefficient.
-    """
-
-    @staticmethod
-    def stage_lora_factors(
-        target: torch.Tensor,
-        factors: Sequence[_RawLoRAFactor],
-        *,
-        logical_shape: tuple[int, ...],
-        compute_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
-        """Return a prepared ``(B, A, coefficient)`` or defer to normal staging."""
-        ...
-
-    @staticmethod
-    def validate_prepared_lora_merge(
-        target: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
-        alpha: float,
-        *,
-        beta: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> None:
-        """Validate a prepared update without transforming it again."""
-        ...
-
-    @staticmethod
-    def merge_prepared_lora_(
-        target: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
-        alpha: float,
-        *,
-        beta: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> None:
-        """Apply a prepared update without transforming it again."""
-        ...
-
-
 @dataclass(slots=True, frozen=True)
 class _MaterializedWeightFactor:
     """One scaled weight factor exposed as plain host tensors."""
@@ -289,23 +231,6 @@ def _materialize_weight_factors(
         )
         for factor in factors
     ]
-
-
-def _validate_materialized_weight_factors(
-    factors: Sequence[_MaterializedWeightFactor],
-) -> None:
-    if all(
-        type(factor.a) is torch.Tensor
-        and type(factor.b) is torch.Tensor
-        and factor.a.device.type == "cpu"
-        and factor.b.device.type == "cpu"
-        for factor in factors
-    ):
-        return
-    raise ValueError(
-        "LoRA merge requires plain CPU torch.Tensor factors; "
-        "wrapped factor representations are unsupported."
-    )
 
 
 def _localize_materialized_weight_factors(
@@ -384,7 +309,6 @@ class _LoRAWeightPlan:
 
     adapter: LoRAMergeTensorAdapter[Any, Any]
     factors: tuple[_MaterializedWeightFactor, ...]
-    staging_shape: tuple[int, ...]
     compute_dtype: torch.dtype
 
 
@@ -434,21 +358,10 @@ class LoRATransform:
             return None
         return derive_seed(self._target_key, self._merge_index)
 
-    def validate_target(
-        self,
-        weight: nn.Parameter,
-    ) -> None:
-        """Validate the weight and prepare subsequent applications."""
-        self.validate_weight_target(weight)
-
-    def validate_weight_target(self, param: nn.Parameter) -> None:
-        """Validate ``param`` and prepare subsequent weight applications."""
+    def validate_parameter(self, param: nn.Parameter) -> None:
+        """Validate ``param`` and prepare subsequent applications."""
         self._weight_plan = None
         self._weight_plan = self._build_weight_plan(param)
-
-    def validate_parameter(self, param: nn.Parameter) -> None:
-        """Implement the shared parameter-transform validation protocol."""
-        self.validate_weight_target(param)
 
     def _build_weight_plan(self, param: nn.Parameter) -> _LoRAWeightPlan:
         """Validate a weight target and return its reusable merge plan."""
@@ -467,67 +380,42 @@ class LoRATransform:
         )
         if any(factor.produced_shape != logical_shape for factor in self._factors):
             validate_broadcast_merge(adapter, representation)
-        factors, staging_shape = self._localize_weight_factors(
+        factors = self._localize_weight_factors(
             representation,
             adapter,
-            self._materialize_weight_factors(),
-            logical_shape=logical_shape,
+            _materialize_weight_factors(self._factors),
         )
-        self._validate_materialized_factors(factors)
         if isinstance(adapter, LoRAMergeValidationTensorAdapter):
-            staged, prepared = self._stage_update_for_adapter(
+            adapter.validate_lora_merge(
                 representation,
-                adapter,
-                factors,
-                logical_shape=staging_shape,
-                compute_dtype=compute_dtype,
-            )
-            b, a, alpha = staged
-            _validate_lora_merge(
-                adapter,
-                representation,
-                b,
-                a,
-                alpha,
-                beta=self._beta,
-                prepared=prepared,
                 rounding_seed=rounding_seed,
             )
         return _LoRAWeightPlan(
             adapter,
             tuple(factors),
-            staging_shape,
             compute_dtype,
         )
 
-    def apply(
-        self,
-        weight: nn.Parameter,
-    ) -> None:
-        """Apply the weight update after :meth:`validate_target`."""
-        self.apply_weight(weight)
-
-    def apply_weight(self, param: nn.Parameter) -> None:
+    def apply_parameter(self, param: nn.Parameter) -> None:
         """Apply this transform to a previously validated weight target."""
         plan = self._weight_plan
         if plan is None:
             raise RuntimeError("LoRA weight target must be validated before application.")
-        representation = param_representation(param)
-        self._apply_plan(representation, plan)
-
-    def _apply_plan(self, representation: torch.Tensor, plan: _LoRAWeightPlan) -> None:
-        """Apply one validated plan and advance its merge sequence."""
-        rounding_seed = self._rounding_seed()
-        self._apply_merge(
-            representation,
-            plan,
-            rounding_seed=rounding_seed,
+        data = param_representation(param)
+        b, a, alpha = self._stage_single_or_packed_update(
+            data,
+            plan.factors,
+            compute_dtype=plan.compute_dtype,
+        )
+        plan.adapter.merge_lora_(
+            data,
+            b,
+            a,
+            alpha,
+            beta=self._beta,
+            rounding_seed=self._rounding_seed(),
         )
         self._merge_index += 1
-
-    def apply_parameter(self, param: nn.Parameter) -> None:
-        """Implement the shared parameter-transform application protocol."""
-        self.apply_weight(param)
 
     def storage_tensors(self) -> tuple[torch.Tensor, ...]:
         """Return the physical host tensors used to stage all factors."""
@@ -538,71 +426,24 @@ class LoRATransform:
             for tensor in backing.storage_tensors()
         )
 
-    def _materialize_weight_factors(
-        self,
-    ) -> list[_MaterializedWeightFactor]:
-        return _materialize_weight_factors(self._factors)
-
-    def _apply_merge(
-        self,
-        data: torch.Tensor,
-        plan: _LoRAWeightPlan,
-        *,
-        rounding_seed: int | None,
-    ) -> None:
-        """Stage one combined update and delegate it to the target adapter."""
-        staged, prepared = self._stage_update_for_adapter(
-            data,
-            plan.adapter,
-            plan.factors,
-            logical_shape=plan.staging_shape,
-            compute_dtype=plan.compute_dtype,
-        )
-        b, a, alpha = staged
-        if prepared:
-            assert isinstance(plan.adapter, _FactorAwareLoRAMergeAdapter)
-            plan.adapter.merge_prepared_lora_(
-                data,
-                b,
-                a,
-                alpha,
-                beta=self._beta,
-                rounding_seed=rounding_seed,
-            )
-        else:
-            plan.adapter.merge_lora_(
-                data,
-                b,
-                a,
-                alpha,
-                beta=self._beta,
-                rounding_seed=rounding_seed,
-            )
-
     @staticmethod
     def _localize_weight_factors(
         data: torch.Tensor,
         adapter: LoRAMergeTensorAdapter[Any, Any],
         factors: Sequence[_MaterializedWeightFactor],
-        *,
-        logical_shape: tuple[int, ...],
-    ) -> tuple[
-        list[_MaterializedWeightFactor],
-        tuple[int, ...],
-    ]:
+    ) -> list[_MaterializedWeightFactor]:
         """Slice host-backed factors to an adapter-local merge region."""
         if not isinstance(adapter, MergeLocalityTensorAdapter):
-            return list(factors), logical_shape
+            return list(factors)
 
         local_shape, offsets = adapter.merge_local_shape_and_offsets(data)
         out_size, in_size = local_shape[-2:]
         out_offset, in_offset = offsets[-2:]
-        localized = _localize_materialized_weight_factors(
+        return _localize_materialized_weight_factors(
             factors,
             out_range=(out_offset, out_size),
             in_range=(in_offset, in_size),
         )
-        return localized, (out_size, in_size)
 
     @staticmethod
     def _stage_single_or_packed_update(
@@ -625,41 +466,6 @@ class LoRATransform:
             compute_dtype=compute_dtype,
         )
         return b, a, 1.0
-
-    @classmethod
-    def _stage_update_for_adapter(
-        cls,
-        data: torch.Tensor,
-        adapter: LoRAMergeTensorAdapter[Any, Any],
-        factors: Sequence[_MaterializedWeightFactor],
-        *,
-        logical_shape: tuple[int, ...],
-        compute_dtype: torch.dtype,
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor, float], bool]:
-        """Let an adapter preserve factor boundaries before normal packing."""
-        if isinstance(adapter, _FactorAwareLoRAMergeAdapter):
-            prepared = adapter.stage_lora_factors(
-                data,
-                tuple((factor.coefficient, factor.a, factor.b) for factor in factors),
-                logical_shape=logical_shape,
-                compute_dtype=compute_dtype,
-            )
-            if prepared is not None:
-                return prepared, True
-        return (
-            cls._stage_single_or_packed_update(
-                data,
-                factors,
-                compute_dtype=compute_dtype,
-            ),
-            False,
-        )
-
-    @staticmethod
-    def _validate_materialized_factors(
-        factors: Sequence[_MaterializedWeightFactor],
-    ) -> None:
-        _validate_materialized_weight_factors(factors)
 
 
 def _validate_factor_shapes(
@@ -689,187 +495,9 @@ def _select_lora_merge_adapter(
         ) from exc
 
     if not isinstance(adapter, LoRAMergeTensorAdapter):
-        raise ValueError(f"{adapter_name(adapter)} does not support LoRA merge. Use routed LoRA for this tensor type.")
+        raise ValueError(f"{adapter_name(adapter)} does not support LoRA merge.")
 
     compute_dtype = adapter.compute_dtype(data)
     if not compute_dtype.is_floating_point:
         raise ValueError(f"LoRA merge requires a floating-point compute dtype, got {compute_dtype}.")
     return adapter
-
-
-def _validate_lora_merge(
-    adapter: LoRAMergeTensorAdapter[Any, Any],
-    target: torch.Tensor,
-    b: torch.Tensor,
-    a: torch.Tensor,
-    alpha: float,
-    *,
-    beta: float = 1.0,
-    prepared: bool = False,
-    rounding_seed: int | None = None,
-) -> None:
-    """Run adapter-specific staged-merge checks without mutation."""
-    if prepared:
-        assert isinstance(adapter, _FactorAwareLoRAMergeAdapter)
-        adapter.validate_prepared_lora_merge(
-            target,
-            b,
-            a,
-            alpha,
-            beta=beta,
-            rounding_seed=rounding_seed,
-        )
-    elif isinstance(adapter, LoRAMergeValidationTensorAdapter):
-        adapter.validate_lora_merge(
-            target,
-            b,
-            a,
-            alpha,
-            beta=beta,
-            rounding_seed=rounding_seed,
-        )
-
-
-@dataclass(slots=True, frozen=True)
-class _StagedLoRAFactor:
-    """Adapter tensors materialized for one forward invocation."""
-
-    a: nn.Parameter
-    b: nn.Parameter
-    coefficient: float
-
-
-def _routed_residual(
-    x: torch.Tensor,
-    factors: Sequence[_StagedLoRAFactor],
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    """Routed contribution ``Σ strength_i · ((x @ A_i.T) @ B_i.T)``.
-
-    Strength scales the intermediate ``M·r`` projection (cheaper than scaling
-    the ``M·out`` result, and keeps it extrinsic to the stored factors rather
-    than baked into a buffer).
-    """
-    x_compute = x.to(dtype=output_dtype)
-    total: torch.Tensor | None = None
-    for factor in factors:
-        # The PRE hook has already reconstructed the factors on their proper
-        # device representation. A dtype-only cast preserves wrappers such as
-        # DTensor and their device meshes.
-        a = param_representation(factor.a).to(dtype=output_dtype)
-        b = param_representation(factor.b).to(dtype=output_dtype)
-        part = ((x_compute @ a.T) * factor.coefficient) @ b.T
-        total = part if total is None else total + part
-    if total is None:
-        raise ValueError("Routed LoRA residual requires at least one factor")
-    return total
-
-
-def _linear_input(
-    inputs: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> torch.Tensor:
-    if inputs:
-        x = inputs[0]
-    else:
-        try:
-            x = kwargs["input"]
-        except KeyError as exc:
-            raise TypeError(
-                "Routed LoRA expected the Linear input as either the first positional argument or the 'input' keyword"
-            ) from exc
-    if not isinstance(x, torch.Tensor):
-        raise TypeError(f"Routed LoRA requires the Linear input to be a torch.Tensor; got {type(x).__name__}")
-    return x
-
-
-def _stage_routed_factors(
-    factors: Sequence[ScaledLoRAFactor],
-    x: torch.Tensor,
-) -> tuple[_StagedLoRAFactor, ...]:
-    """Materialize host factors on the invocation's input device."""
-    return tuple(
-        _StagedLoRAFactor(
-            factor.a.materialize(x.device, non_blocking=True),
-            factor.b.materialize(x.device, non_blocking=True),
-            factor.coefficient,
-        )
-        for factor in factors
-    )
-
-
-def install_routed_residual_hook(
-    parent: nn.Module,
-    factors: Sequence[ScaledLoRAFactor],
-) -> Callable[[], None]:
-    """Stage host factors in a PRE hook and add their residual in POST.
-
-    Returns an idempotent callable that removes both hooks. One hook pair
-    covers every LoRA targeting this parent. Device copies are scoped to a
-    single invocation and released after the residual is enqueued, or by the
-    next invocation if an interrupt skipped that, so routed mode needs no
-    adapter activation lifecycle or block scheduler.
-    """
-    if not factors:
-        raise ValueError("Routed LoRA hook requires at least one factor")
-
-    # A Linear forward does not re-enter itself, and a model serves one caller
-    # at a time, so one invocation is staged at a time.
-    staged_factors: tuple[_StagedLoRAFactor, ...] | None = None
-
-    def pre_hook(
-        _module: nn.Module,
-        inputs: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> None:
-        nonlocal staged_factors
-        x = _linear_input(inputs, kwargs)
-        # Drop staging left by an interrupted forward before allocating more:
-        # PyTorch skips ``always_call`` hooks for errors that are not an
-        # ``Exception``, such as KeyboardInterrupt.
-        staged_factors = None
-        staged_factors = _stage_routed_factors(factors, x)
-
-    def post_hook(
-        _module: nn.Module,
-        inputs: tuple[Any, ...],
-        kwargs: dict[str, Any],
-        output: object,
-    ) -> object:
-        nonlocal staged_factors
-        # ``always_call=True`` also reaches this hook when the Linear or an
-        # earlier hook raises. In that case there may be no staged entry or
-        # Tensor output; only discard any completed staging work.
-        staged, staged_factors = staged_factors, None
-        if staged is None or not isinstance(output, torch.Tensor):
-            return output
-        output_tensor: Any = output
-        x = _linear_input(inputs, kwargs)
-        return output_tensor + _routed_residual(x, staged, output_tensor.dtype)
-
-    pre_handle = parent.register_forward_pre_hook(
-        pre_hook,
-        with_kwargs=True,
-    )
-    try:
-        post_handle = parent.register_forward_hook(
-            post_hook,
-            with_kwargs=True,
-            always_call=True,
-        )
-    except BaseException:
-        pre_handle.remove()
-        raise
-
-    removed = False
-
-    def remove_hooks() -> None:
-        nonlocal removed, staged_factors
-        if removed:
-            return
-        post_handle.remove()
-        pre_handle.remove()
-        staged_factors = None
-        removed = True
-
-    return remove_hooks

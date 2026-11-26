@@ -42,11 +42,10 @@ def require_dtensor(t: torch.Tensor) -> Any:  # noqa: ANN401
 def local_shard(t: Any) -> torch.Tensor:  # noqa: ANN401
     """The local shard of ``t`` if it is a ``DTensor``, else ``t`` unchanged.
 
-    Tolerates the bare local shard that ``DTensorAdapter.cpu_param`` yields
-    (a DTensor weight's resting representation is not a DTensor). Runs outside
-    ``torch.inference_mode()`` so PyTorch's ``Parameter(DTensor).to_local()``
-    never dispatches ``aten.view_as`` directly into tensor subclasses such as
-    ``Float8Tensor`` (mirrors :func:`rebuild_dtensor`)."""
+    Runs outside ``torch.inference_mode()`` so PyTorch's
+    ``Parameter(DTensor).to_local()`` never dispatches ``aten.view_as`` directly
+    into tensor subclasses such as wrapped quantized weights (mirrors
+    :func:`rebuild_dtensor`)."""
     if not is_dtensor(t):
         return t
     with torch.inference_mode(False):
@@ -123,8 +122,8 @@ def rebuild_dtensor(
     shape/stride — passed explicitly so ``from_local`` does not re-infer the
     global shape as ``local_size * world_size`` (wrong for uneven shards).
     Runs outside ``torch.inference_mode()`` so ``DTensor.from_local`` never
-    dispatches ``aten.view_as`` directly into tensor subclasses such as
-    ``Float8Tensor`` or marks rebuilt resting parameters as inference tensors.
+    dispatches ``aten.view_as`` directly into wrapped tensor subclasses or
+    marks rebuilt resting parameters as inference tensors.
     ``mesh``/``placements`` are typed loosely here at the optional-import
     boundary."""
     with torch.inference_mode(False):

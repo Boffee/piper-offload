@@ -2,9 +2,9 @@
 
 Scheduling hooks must act on installed state rather than assume the previous
 hook ran; see the scheduling-hooks section of ``docs/development.md``. Each
-configuration exercises one scheduler. A new offloaded residency configuration or
-hook-driven adapter path joins ``_CONFIGS``; a new way for hooks to miss each
-other joins ``_INTERRUPTIONS``.
+configuration exercises one scheduler. A new offloaded residency configuration
+joins ``_CONFIGS``; a new way for hooks to miss each other joins
+``_INTERRUPTIONS``.
 """
 
 import gc
@@ -16,7 +16,6 @@ import torch
 from torch import nn
 
 from piper_offload import (
-    Adapter,
     BlockCompileConfig,
     DeviceTransferContext,
     ModelOffloader,
@@ -44,8 +43,8 @@ type _Interruption = Literal[
 _INTERRUPTIONS: tuple[_Interruption, ...] = (
     # Leaves the residency engine mid-traversal.
     "error_after_block",
-    # Raise inside the resident head after its routed pre-hook staged.
-    # ``always_call`` post-hooks run for an ``Exception`` but not for an interrupt.
+    # Raise inside the resident head before its forward runs to exercise
+    # resident failure before the next pass.
     "error_in_layer",
     "interrupt_in_layer",
     # Raise inside an offloaded unit's forward so unit hooks unwind via
@@ -92,11 +91,9 @@ class _Model(nn.Module):
 
 @dataclass(frozen=True)
 class _Config:
-    device: str
     offload_paths: tuple[str, ...] = ("blocks",)
     vram_budget_bytes: int | None = None
     compiled: bool = False
-    routed: bool = False
     use_vram_budget: bool = False
     use_transfer_context: bool = False
 
@@ -118,30 +115,19 @@ class _Config:
 _UNIT_BYTES = _WIDTH * _WIDTH * 4
 
 _CONFIGS = (
-    pytest.param(_Config("cuda", ("blocks",), None), marks=CUDA, id="streaming"),
-    pytest.param(_Config("cuda", ("blocks",), 0), marks=CUDA, id="zero-budget"),
-    pytest.param(_Config("cuda", ("embed", "blocks"), None), marks=CUDA, id="mixed-paths"),
-    pytest.param(_Config("cuda", ("blocks",), 2 * _UNIT_BYTES), marks=CUDA, id="partial-cache"),
-    pytest.param(_Config("cuda", ("embed", "blocks"), 1024 * 1024 * 1024), marks=CUDA, id="all-resident"),
-    pytest.param(_Config("cuda", ("blocks",), None, use_vram_budget=True), marks=CUDA, id="shared-budget"),
+    pytest.param(_Config(("blocks",), None), marks=CUDA, id="streaming"),
+    pytest.param(_Config(("blocks",), 0), marks=CUDA, id="zero-budget"),
+    pytest.param(_Config(("embed", "blocks"), None), marks=CUDA, id="mixed-paths"),
+    pytest.param(_Config(("blocks",), 2 * _UNIT_BYTES), marks=CUDA, id="partial-cache"),
+    pytest.param(_Config(("embed", "blocks"), 1024 * 1024 * 1024), marks=CUDA, id="all-resident"),
+    pytest.param(_Config(("blocks",), None, use_vram_budget=True), marks=CUDA, id="shared-budget"),
     pytest.param(
-        _Config("cuda", ("blocks",), None, use_transfer_context=True),
+        _Config(("blocks",), None, use_transfer_context=True),
         marks=CUDA,
         id="shared-transfer-context",
     ),
-    pytest.param(_Config("cuda", ("blocks",), None, compiled=True), marks=CUDA, id="compiled"),
-    pytest.param(_Config("cuda", ("blocks",), None, routed=True), marks=CUDA, id="streaming-routed"),
-    # CPU activation schedules no CUDA units, but routed hooks still stage factors.
-    pytest.param(_Config("cpu", ("blocks",), None, routed=True), id="cpu-routed"),
+    pytest.param(_Config(("blocks",), None, compiled=True), marks=CUDA, id="compiled"),
 )
-
-
-def _lora() -> Adapter:
-    state: dict[str, torch.Tensor] = {}
-    for name in (*(f"blocks.{idx}.proj" for idx in range(_NUM_BLOCKS)), "head"):
-        state[f"{name}.lora_A.weight"] = torch.randn(2, _WIDTH)
-        state[f"{name}.lora_B.weight"] = torch.randn(_WIDTH, 2)
-    return Adapter.from_state_dict(state)
 
 
 def _interrupt(model: _Model, x: torch.Tensor, interruption: _Interruption) -> None:
@@ -176,7 +162,7 @@ def _interrupt(model: _Model, x: torch.Tensor, interruption: _Interruption) -> N
         def fail(_module: nn.Module, _args: tuple[object, ...]) -> None:
             raise error("simulated interruption")
 
-        # Registered after activation, so it runs after any routed pre-hook.
+        # Registered after activation so it runs in the layer's pre-hook chain.
         handle = target.register_forward_pre_hook(fail)
         try:
             with pytest.raises(error, match="simulated interruption"):
@@ -185,10 +171,8 @@ def _interrupt(model: _Model, x: torch.Tensor, interruption: _Interruption) -> N
             handle.remove()
 
 
-def _device_bytes(device: str) -> int:
+def _device_bytes() -> int:
     gc.collect()
-    if device != "cuda":
-        return 0
     torch.cuda.synchronize()
     return torch.cuda.memory_allocated()
 
@@ -206,36 +190,33 @@ def test_next_forward_recovers_from_interruption(
         request.addfinalizer(torch.compiler.reset)
     torch.manual_seed(0)
     model = _Model()
-    adapters = [_lora()] if config.routed else []
     offloader = config.offloader(model)
     leases = host_pin_manager.stats.active_leases
-    x = torch.randn(2, _WIDTH, device=config.device)
+    x = torch.randn(2, _WIDTH, device="cuda")
     budget = VramBudget(4 * _UNIT_BYTES) if config.use_vram_budget else None
     transfer_ctx = (
-        DeviceTransferContext(config.device) if config.use_transfer_context else None
+        DeviceTransferContext("cuda") if config.use_transfer_context else None
     )
 
     try:
         with (
             activated_model(
                 offloader,
-                config.device,
-                adapters=adapters,
-                adapter_mode="routed",
+                "cuda",
                 vram_budget=budget,
                 transfer_context=transfer_ctx,
             ),
             torch.inference_mode(),
         ):
             expected = model(x).cpu()
-            settled = _device_bytes(config.device)
+            settled = _device_bytes()
 
             _interrupt(model, x, interruption)
             actual = model(x).cpu()
 
             # The forward after an interruption leaves the same working sets,
             # and nothing an interrupted call staged, on the device.
-            assert _device_bytes(config.device) == settled
+            assert _device_bytes() == settled
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert host_pin_manager.stats.active_leases == leases
@@ -253,7 +234,7 @@ def test_next_forward_recovers_from_interruption(
 def test_no_record_trace_recovers_from_interruption(error: type[BaseException]) -> None:
     torch.manual_seed(0)
     model = _Model()
-    offloader = _Config("cuda", ("blocks",), 0).offloader(model)
+    offloader = _Config(("blocks",), 0).offloader(model)
     x = torch.randn(2, _WIDTH, device="cuda")
 
     with activated_model(offloader, "cuda"), torch.inference_mode():

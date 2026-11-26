@@ -543,7 +543,6 @@ class ResidencyEngine:
         *,
         vram_budget_bytes: int | None,
         vram_budget: VramBudget | None,
-        compile_blocks: bool,
     ) -> None:
         if not self._units:
             return
@@ -601,15 +600,13 @@ class ResidencyEngine:
             self._ensure_streaming_resources()
 
         self._register_unit_hooks()
-        self._block_compile.install(compile_blocks)
+        self._block_compile.install()
 
     def _activate_cpu(
         self,
         active_device: torch.device,
         resident_overrides: Mapping[str, ParameterOverride] | None,
         per_unit_overrides: tuple[Mapping[str, ParameterOverride] | None, ...],
-        *,
-        compile_blocks: bool,
     ) -> None:
         if resident_overrides or any(bool(ovr) for ovr in per_unit_overrides):
             raise ValueError("Parameter overrides require CUDA activation.")
@@ -618,7 +615,7 @@ class ResidencyEngine:
         for unit in self._units:
             unit.install_host()
         try:
-            self._block_compile.install(compile_blocks)
+            self._block_compile.install()
         except BaseException:
             self._block_compile.restore()
             raise
@@ -628,7 +625,6 @@ class ResidencyEngine:
         self,
         device: torch.device | str,
         *,
-        compile_blocks: bool = True,
         resident_overrides: Mapping[str, ParameterOverride] | None = None,
         unit_overrides: Sequence[Mapping[str, ParameterOverride] | None] | None = None,
         vram_budget_bytes: int | _UseConfigBudget | None = _USE_CONFIG_BUDGET,
@@ -685,7 +681,6 @@ class ResidencyEngine:
                 active_device,
                 resident_overrides,
                 per_unit_overrides,
-                compile_blocks=compile_blocks,
             )
             return
 
@@ -724,7 +719,6 @@ class ResidencyEngine:
                 stream,
                 vram_budget_bytes=session_budget,
                 vram_budget=vram_budget,
-                compile_blocks=compile_blocks,
             )
         except BaseException:
             self.deactivate()

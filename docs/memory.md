@@ -39,12 +39,11 @@ to register that storage. Piper's built-in runtimes choose as follows:
 |---|---|
 | Streamed or partially cached offloaded units, experimental host relay | Yes: the transfer repeats |
 | Resident remainder and all-resident preloaded units (without a shared `VramBudget`) | No: pageable lease |
-| Routed LoRA factors | No: pageable lease while hooks are installed |
 | CPU execution | No lease |
 
 A pageable lease can hold a registration that already exists; it requests no
 new registrations. See [streaming](streaming.md) for offloading and VRAM budget
-modes, and [adapters](adapters.md) for routed factors.
+modes, and [adapters](adapters.md) for adapter usage.
 
 ## Inspect and release memory
 

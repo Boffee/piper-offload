@@ -8,25 +8,22 @@ from torch import nn
 
 from piper_offload import (
     Adapter,
-    LoRATransform,
     ModelOffloader,
     ScaledLoRAFactor,
     merge_adapter,
 )
 from piper_offload.host_param import HostParam
-from piper_offload.nvfp4_adapter import Nvfp4Adapter
+from piper_offload.lora import LoRATransform
 from piper_offload.piper_convrot_nvfp4_adapter import (
     PiperConvRotNVFP4Adapter,
 )
+from piper_offload.piper_nvfp4_adapter import PiperNvfp4Adapter
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
-    DequantRequantTensorAdapter,
-    DequantizeTensorAdapter,
-    DenseMergeTargetValidationTensorAdapter,
     DenseMergeTensorAdapter,
+    DenseMergeValidationTensorAdapter,
     LoRAMergeTensorAdapter,
     LoRAMergeValidationTensorAdapter,
-    TensorCopyIntoAdapter,
 )
 from tests.conftest import activated_model
 
@@ -43,16 +40,13 @@ SM120 = pytest.mark.skipif(
 )
 
 
-def _modules() -> tuple[Any, Any, Any, Any, Any]:
+def _modules() -> tuple[Any, Any, Any]:
     nvfp4 = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
     convrot = pytest.importorskip("piper_kernels.weights.convrot.nvfp4")
-    rotation = pytest.importorskip("piper_kernels.weights.convrot._rotation")
     return (
         nvfp4.NVFP4Tensor,
         nvfp4.QuantizeTensorToNVFP4Kwargs,
-        nvfp4.per_tensor_amax_to_scale,
         convrot.ConvRotNVFP4Tensor,
-        rotation.rotate_groups,
     )
 
 
@@ -66,16 +60,15 @@ def _make_convrot_nvfp4(
     dense: torch.Tensor | None = None,
     high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    nvfp4_cls, kwargs_cls, amax_to_scale, convrot_cls, rotate_groups = _modules()
+    _nvfp4_cls, kwargs_cls, convrot_cls = _modules()
     if dense is None:
         dense = torch.randn(rows, cols, device=device, dtype=dtype)
     else:
         dense = dense.to(device=device, dtype=dtype)
-    rotated = rotate_groups(dense, group_size)
-    global_scale = amax_to_scale(rotated.abs().amax().to(torch.float32)).clamp_min(torch.finfo(torch.float32).eps)
-    packed = nvfp4_cls.to_nvfp4(
-        rotated,
-        per_tensor_scale=global_scale,
+    convrot = convrot_cls.from_hp(
+        dense,
+        group_size=group_size,
+        compute_per_tensor_scale=True,
         is_swizzled_scales=True,
         use_triton_kernel=False,
         act_quant_kwargs=kwargs_cls(
@@ -85,7 +78,6 @@ def _make_convrot_nvfp4(
             use_dynamic_per_tensor_scale=True,
         ),
     )
-    convrot = convrot_cls.from_torchao(packed, group_size=group_size)
     if high_first:
         qdata = (((convrot.qdata & 0x0F) << 4) | (convrot.qdata >> 4)).to(torch.uint8)
         convrot = convrot_cls(
@@ -105,12 +97,16 @@ def _make_convrot_nvfp4(
 
 
 class TestPiperConvRotNVFP4Adapter:
-    def test_dedicated_adapter_precedes_generic_nvfp4(self) -> None:
-        convrot, _dense = _make_convrot_nvfp4()
+    def test_dedicated_adapter_selects_convrot_and_not_plain_nvfp4(self) -> None:
+        nvfp4_cls = _modules()[0]
+        convrot, dense = _make_convrot_nvfp4()
+        torchao_w = nvfp4_cls.to_nvfp4(dense, is_swizzled_scales=True, use_triton_kernel=False)
 
         assert PiperConvRotNVFP4Adapter.matches(convrot)
-        assert Nvfp4Adapter.matches(convrot)
+        assert not PiperNvfp4Adapter.matches(convrot)
         assert isinstance(select_adapter(convrot), PiperConvRotNVFP4Adapter)
+        with pytest.raises(NotImplementedError, match="register_adapter"):
+            select_adapter(torchao_w)
 
     def test_capture_preserves_storage_and_all_metadata(self) -> None:
         convrot, _dense = _make_convrot_nvfp4(group_size=64)
@@ -169,7 +165,7 @@ class TestPiperConvRotNVFP4Adapter:
         torch.testing.assert_close(reconstructed.dequantize(), convrot.dequantize())
 
     def test_identity_and_pool_layout_track_rotation_group(self) -> None:
-        convrot_cls = _modules()[3]
+        convrot_cls = _modules()[2]
         group_64, _dense = _make_convrot_nvfp4(group_size=64)
         group_16 = convrot_cls(
             group_64.qdata,
@@ -205,8 +201,8 @@ class TestPiperConvRotNVFP4Adapter:
         qdata_ptr = convrot.qdata.data_ptr()
         scale_ptr = convrot.scale.data_ptr()
 
-        transform.validate_target(param)
-        transform.apply(param)
+        transform.validate_parameter(param)
+        transform.apply_parameter(param)
 
         assert param.data.qdata.data_ptr() == qdata_ptr
         assert param.data.scale.data_ptr() == scale_ptr
@@ -276,7 +272,7 @@ class TestPiperConvRotNVFP4Adapter:
         monkeypatch: pytest.MonkeyPatch,
         beta: float,
     ) -> None:
-        convrot_cls = _modules()[3]
+        convrot_cls = _modules()[2]
         convrot, _dense = _make_convrot_nvfp4()
         update = torch.randn(16, 64, dtype=convrot.orig_dtype)
         calls: list[tuple[float, float, int | None]] = []
@@ -315,7 +311,7 @@ class TestPiperConvRotNVFP4Adapter:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        convrot_cls = _modules()[3]
+        convrot_cls = _modules()[2]
         convrot, _dense = _make_convrot_nvfp4()
         mat1 = torch.randn(16, 4, dtype=torch.bfloat16)
         mat2 = torch.randn(4, 64, dtype=torch.bfloat16)
@@ -381,10 +377,7 @@ class TestPiperConvRotNVFP4Adapter:
         assert isinstance(adapter, LoRAMergeTensorAdapter)
         assert isinstance(adapter, LoRAMergeValidationTensorAdapter)
         assert isinstance(adapter, DenseMergeTensorAdapter)
-        assert isinstance(adapter, DenseMergeTargetValidationTensorAdapter)
-        assert isinstance(adapter, DequantizeTensorAdapter)
-        assert not isinstance(adapter, DequantRequantTensorAdapter)
-        assert not isinstance(adapter, TensorCopyIntoAdapter)
+        assert isinstance(adapter, DenseMergeValidationTensorAdapter)
 
     def test_validates_mutated_rotation_metadata(self) -> None:
         convrot, _dense = _make_convrot_nvfp4()
@@ -394,9 +387,50 @@ class TestPiperConvRotNVFP4Adapter:
         with pytest.raises(ValueError, match="group size"):
             PiperConvRotNVFP4Adapter.matches(mutated)
 
+    def test_preflight_rejects_transposed_and_non_contiguous_atomically(self) -> None:
+        convrot_cls = _modules()[2]
+        base, _ = _make_convrot_nvfp4(rows=16, cols=64, group_size=64)
+        non_contig = convrot_cls(
+            base.qdata[::2],
+            base.scale.clone(),
+            base.block_size,
+            base.orig_dtype,
+            group_size=base.group_size,
+            per_tensor_scale=base.per_tensor_scale,
+            act_per_tensor_scale=base.act_per_tensor_scale,
+            is_swizzled_scales=base.is_swizzled_scales,
+            use_triton_kernel=base.use_triton_kernel,
+            act_quant_kwargs=base.act_quant_kwargs,
+            high_first=base.high_first,
+        )
+        for bad_weight, rows, cols in ((base.t(), 64, 16), (non_contig, 8, 64)):
+            model = nn.Module()
+            model.good = nn.Linear(16, 4, bias=False, dtype=torch.bfloat16).requires_grad_(False)
+            model.good.weight.fill_(1.0)
+            model.bad = nn.Linear(cols, rows, bias=False, dtype=torch.bfloat16).requires_grad_(False)
+            model.bad.weight = nn.Parameter(bad_weight, requires_grad=False)
+            lora = Adapter.from_state_dict(
+                {
+                    "good.lora_A.weight": torch.ones(2, 16, dtype=torch.bfloat16),
+                    "good.lora_B.weight": torch.ones(4, 2, dtype=torch.bfloat16),
+                    "bad.lora_A.weight": torch.ones(2, cols, dtype=torch.bfloat16),
+                    "bad.lora_B.weight": torch.ones(rows, 2, dtype=torch.bfloat16),
+                }
+            )
+            dense = Adapter.from_state_dict(
+                {
+                    "good.delta.weight": torch.ones(4, 16, dtype=torch.bfloat16),
+                    "bad.delta.weight": torch.ones(rows, cols, dtype=torch.bfloat16),
+                }
+            )
+            for adapter in (lora, dense):
+                with pytest.raises(ValueError, match="contiguous untransposed packed storage"):
+                    merge_adapter(model, [(adapter, 1.0)])
+                torch.testing.assert_close(model.good.weight, torch.ones_like(model.good.weight), rtol=0, atol=0)
+
     @SM120
     def test_model_offloader_cuda_forward_preserves_convrot_nvfp4(self) -> None:
-        convrot_cls = _modules()[3]
+        convrot_cls = _modules()[2]
         weight, _dense = _make_convrot_nvfp4(rows=128, cols=256)
         layer = nn.Linear(256, 128, bias=False, dtype=torch.bfloat16)
         layer.weight = nn.Parameter(weight, requires_grad=False)

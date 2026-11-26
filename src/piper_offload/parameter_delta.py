@@ -1,21 +1,18 @@
 """Host-backed additive updates for existing model parameters."""
 
 import math
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Self
 
 import torch
 from torch import nn
 
-from ._parameter_update import build_parameter_transform
 from .host_param import HostParam
 from .lora import LoRAFactor
 from .tensor_adapter_registry import param_representation
 
 __all__ = [
     "ParameterDelta",
-    "ParameterDeltaTransform",
     "ScaledParameterDelta",
 ]
 
@@ -136,42 +133,3 @@ class ScaledParameterDelta:
     def __post_init__(self) -> None:
         if not math.isfinite(self.strength):
             raise ValueError(f"Parameter delta strength must be finite; got {self.strength}.")
-
-
-class ParameterDeltaTransform:
-    """Apply additive low-rank and dense updates to an existing parameter.
-
-    Each delta retains its own strength. Factor-only updates use factorized
-    merge; dense and mixed updates combine before one terminal encoding.
-    Source selection and optional value scaling belong to adapter composition.
-    """
-
-    __slots__ = ("_update",)
-
-    def __init__(
-        self,
-        deltas: Sequence[ScaledParameterDelta],
-        *,
-        stochastic_rounding: bool = False,
-        target_key: str = "",
-    ) -> None:
-        if not deltas:
-            raise ValueError("ParameterDeltaTransform requires a delta.")
-        self._update = build_parameter_transform(
-            deltas,
-            source_scale=1.0,
-            stochastic_rounding=stochastic_rounding,
-            target_key=target_key,
-        )
-
-    def validate_parameter(self, param: nn.Parameter) -> None:
-        """Validate every delta before preparing repeated application."""
-        self._update.validate_parameter(param)
-
-    def apply_parameter(self, param: nn.Parameter) -> None:
-        """Add the prepared deltas to an already-loaded parameter."""
-        self._update.apply_parameter(param)
-
-    def storage_tensors(self) -> tuple[torch.Tensor, ...]:
-        """Return physical host tensors read while staging the deltas."""
-        return self._update.storage_tensors()

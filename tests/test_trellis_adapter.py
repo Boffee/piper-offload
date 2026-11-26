@@ -880,7 +880,6 @@ class TestTrellisActivation:
             "cuda",
             adapters=[adapter],
             adapter_strengths=[0.25],
-            adapter_mode="merge",
             stochastic_rounding=False,
         )
         try:
@@ -964,7 +963,6 @@ class TestTrellisActivation:
             "cuda",
             adapters=[adapter],
             adapter_strengths=[0.25],
-            adapter_mode="merge",
             stochastic_rounding=False,
         )
         try:

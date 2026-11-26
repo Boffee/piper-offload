@@ -6,46 +6,25 @@ in-place updates through ``ConvRotNVFP4Tensor.addmm_`` and
 ``ConvRotNVFP4Tensor.add_``, including both update and base scaling.
 """
 
-from dataclasses import dataclass
 from typing import Any
 
 import torch
 
-from ._block_scale_projection import project_nvfp4_storage
-from ._piper_convrot_nvfp4 import (
-    create_convrot_nvfp4_tensor,
+from ._nvfp4_projection import project_nvfp4_storage
+from ._piper_nvfp4 import (
     is_convrot_nvfp4_tensor,
+    require_convrot_nvfp4_matrix,
     require_convrot_nvfp4_tensor,
-    validate_layout,
+    validate_convrot_nvfp4_layout,
 )
-from .tensor_adapters import metadata_key
-from .torchao_structured_adapter import TorchaoHost, TorchaoStructuredAdapter
+from .piper_nvfp4_adapter import _PiperNvfp4BaseAdapter, _PiperNvfp4Meta
+from .structured_adapter import StructuredHost
 
 
-@dataclass(slots=True, frozen=True)
-class _PiperConvRotNVFP4Meta:
-    """NVFP4 and rotation metadata needed to reconstruct a wrapper."""
-
-    wrapper_type: type[torch.Tensor]
-    block_size: int
-    orig_dtype: torch.dtype
-    group_size: int
-    is_swizzled_scales: bool
-    use_triton_kernel: bool
-    act_quant_kwargs: object | None
-    high_first: bool
-
-
-class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta]):
+class PiperConvRotNVFP4Adapter(_PiperNvfp4BaseAdapter):
     """Adapter for Piper Kernels ``ConvRotNVFP4Tensor`` weights."""
 
     _TAG = "piper-kernels-convrot-nvfp4"
-    _STORAGE_NAMES = (
-        "qdata",
-        "scale",
-        "per_tensor_scale",
-        "act_per_tensor_scale",
-    )
 
     @staticmethod
     def _is_tensor(t: torch.Tensor) -> bool:
@@ -53,77 +32,32 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
 
     @staticmethod
     def _validate_layout(t: torch.Tensor) -> None:
-        validate_layout(t)
+        validate_convrot_nvfp4_layout(t)
 
     @staticmethod
     def _require(t: torch.Tensor) -> Any:  # noqa: ANN401
         return require_convrot_nvfp4_tensor(t)
 
     @staticmethod
-    def _storage_of(t: Any) -> tuple[torch.Tensor | None, ...]:  # noqa: ANN401
-        return (t.qdata, t.scale, t.per_tensor_scale, t.act_per_tensor_scale)
+    def _require_matrix(t: torch.Tensor) -> Any:  # noqa: ANN401
+        return require_convrot_nvfp4_matrix(t)
 
     @staticmethod
-    def _meta_of(t: Any) -> _PiperConvRotNVFP4Meta:  # noqa: ANN401
-        return _PiperConvRotNVFP4Meta(
-            wrapper_type=type(t),
-            block_size=t.block_size,
-            orig_dtype=t.orig_dtype,
-            group_size=t.group_size,
-            is_swizzled_scales=t.is_swizzled_scales,
-            use_triton_kernel=t.use_triton_kernel,
-            act_quant_kwargs=t.act_quant_kwargs,
-            high_first=t.high_first,
-        )
-
-    @staticmethod
-    def _reconstruct(
-        storage: tuple[torch.Tensor | None, ...],
-        meta: _PiperConvRotNVFP4Meta,
-    ) -> torch.Tensor:
-        qdata, scale, per_tensor_scale, act_per_tensor_scale = storage
-        assert qdata is not None
-        assert scale is not None
-        return create_convrot_nvfp4_tensor(
-            qdata,
-            scale,
-            meta.block_size,
-            meta.orig_dtype,
-            meta.group_size,
-            per_tensor_scale,
-            act_per_tensor_scale,
-            meta.is_swizzled_scales,
-            meta.use_triton_kernel,
-            meta.act_quant_kwargs,
-            meta.high_first,
-            wrapper_type=meta.wrapper_type,
-        )
+    def _meta_of(t: Any) -> _PiperNvfp4Meta:  # noqa: ANN401
+        return _PiperNvfp4BaseAdapter._meta_from_nvfp4(t, group_size=t.group_size)
 
     @staticmethod
     def _id_metadata(t: Any) -> tuple[object, ...]:  # noqa: ANN401
-        return (
-            type(t),
-            t.block_size,
-            t.orig_dtype,
-            t.group_size,
-            t.is_swizzled_scales,
-            t.use_triton_kernel,
-            metadata_key(t.act_quant_kwargs),
-            t.high_first,
-        )
-
-    @staticmethod
-    def _compute_dtype(t: Any) -> torch.dtype:  # noqa: ANN401
-        return t.orig_dtype
+        return _PiperNvfp4BaseAdapter._id_metadata_nvfp4(t, t.group_size)
 
     @classmethod
     def project_shard(
         cls,
-        state: TorchaoHost[_PiperConvRotNVFP4Meta],
+        state: StructuredHost[_PiperNvfp4Meta],
         *,
         offsets: tuple[int, ...],
         local_shape: tuple[int, ...],
-    ) -> tuple[TorchaoHost[_PiperConvRotNVFP4Meta], tuple[object, ...]]:
+    ) -> tuple[StructuredHost[_PiperNvfp4Meta], tuple[object, ...]]:
         """Project a zero-copy 2-D ``ConvRotNVFP4Tensor`` shard from ``state``."""
         if len(state.logical_shape) != 2:
             raise ValueError(
@@ -131,7 +65,7 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
                 f"got shape {state.logical_shape}."
             )
         group_size = state.meta.group_size
-        if group_size <= 0:
+        if group_size is None or group_size <= 0:
             raise ValueError(
                 f"{cls.__name__} rotation group_size must be positive, got {group_size}."
             )
@@ -143,7 +77,6 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
             local_shape=local_shape,
             block_size=state.meta.block_size,
             is_swizzled_scales=state.meta.is_swizzled_scales,
-            per_leading_swizzle_tiles=False,
         )
         col_off, local_cols = offsets[1], local_shape[1]
         if col_off % group_size != 0 or local_cols % group_size != 0:
@@ -156,69 +89,4 @@ class PiperConvRotNVFP4Adapter(TorchaoStructuredAdapter[_PiperConvRotNVFP4Meta])
             state.meta,
             local_shape,
             target_shapes=target_shapes,
-        )
-
-    @staticmethod
-    def dequantize(t: torch.Tensor) -> torch.Tensor:
-        """Return ConvRot's dense logical weight."""
-        return require_convrot_nvfp4_tensor(t).dequantize()
-
-    @staticmethod
-    def merge_lora_(
-        target: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
-        alpha: float,
-        *,
-        beta: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> None:
-        """Delegate a validated staged update to Piper Kernels."""
-        require_convrot_nvfp4_tensor(target).addmm_(
-            b,
-            a,
-            beta=beta,
-            alpha=alpha,
-            rounding_seed=rounding_seed,
-        )
-
-    @staticmethod
-    def validate_lora_merge(
-        target: torch.Tensor,
-        _b: torch.Tensor,
-        _a: torch.Tensor,
-        _alpha: float,
-        *,
-        beta: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> None:
-        del beta, rounding_seed
-        require_convrot_nvfp4_tensor(target)
-
-    @staticmethod
-    def validate_dense_merge_target(
-        target: torch.Tensor,
-        *,
-        rounding_seed: int | None = None,
-    ) -> bool:
-        """Validate kernel support without staging the dense update."""
-        del rounding_seed
-        require_convrot_nvfp4_tensor(target)
-        return False
-
-    @staticmethod
-    def merge_dense_(
-        target: torch.Tensor,
-        update: torch.Tensor,
-        alpha: float,
-        *,
-        beta: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> None:
-        """Delegate a validated dense update to Piper Kernels."""
-        require_convrot_nvfp4_tensor(target).add_(
-            update,
-            alpha=alpha,
-            beta=beta,
-            rounding_seed=rounding_seed,
         )

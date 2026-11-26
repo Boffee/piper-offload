@@ -101,7 +101,7 @@ or multi-branch) via an online suffix predictor (`k <= 4`) and overlaps
 computation with the predicted next unit's H2D copy when budget/ceiling permits.
 To run speculative or draft passes (such as MTP) without overwriting the
 predictor's main-pass history, wrap the draft forward in
-`with offloader.no_record_trace():`. When merged adapters (LoRA or deltas) are
+`with offloader.no_record_trace():`. When adapters (LoRA or deltas) are
 active, parked cached slots retain their merged GPU weights across cache hits
 without re-merging or re-copying.
 
@@ -172,8 +172,7 @@ The backend is Inductor. Defaults are `dynamic=True` and `fullgraph=False`;
 `options` accepts Inductor settings and compiler extensions, with a separate
 copy of the mapping for each unit. See
 [`BlockCompileConfig`](../src/piper_offload/block_compile.py) for controls.
-Merge-mode adapters work with compilation; routed LoRA activations run units
-eagerly. CPU compilation operates on existing host weights and requires a working
-C++ toolchain.
+Adapters merge before execution and work with compilation. CPU compilation
+operates on existing host weights and requires a working C++ toolchain.
 
 [Back to the README](../README.md)

@@ -23,6 +23,7 @@ from piper_offload import (
     OffloadConfig,
     TrellisParameter,
     auto_offload_paths,
+    merge_adapter,
 )
 from piper_offload.host_module import HostModuleLoadPlan, HostModuleStore, HostModuleTarget
 from piper_offload.host_param import HostParam
@@ -624,13 +625,16 @@ class TestAutoOffloadPaths:
         assert auto_offload_paths(m, min_unit_bytes=16 * 1024) == ("big",)
 
         try:
-            torchao_quant = pytest.importorskip("torchao.quantization")
+            convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
         except pytest.skip.Exception:
             return
         qm = nn.Module()
         qm.proj = nn.Linear(64, 64, bias=False, dtype=torch.bfloat16)
+        qm.proj.weight = nn.Parameter(
+            convrot_mod.ConvRotInt8Tensor.from_hp(qm.proj.weight.data, group_size=64),
+            requires_grad=False,
+        )
         qm.eval().requires_grad_(False)
-        torchao_quant.quantize_(qm.proj, torchao_quant.Float8WeightOnlyConfig())
         assert auto_offload_paths(qm, min_unit_bytes=1024) == ("proj",)
 
 
@@ -876,11 +880,7 @@ class TestResidencyEngineCuda:
             model,
             OffloadConfig(offload_paths=("blocks",), vram_budget_bytes=total_bytes),
         )
-        # Also run a streaming unmerged reference on CPU/CUDA via routed mode to check exact parity.
-        ref_offloader = ModelOffloader.from_module(
-            reference,
-            OffloadConfig(offload_paths=("blocks",), vram_budget_bytes=None),
-        )
+        # Compute exact parity reference on a merged CUDA copy of the model.
         stage_calls = 0
         original_stage = CudaTargetLease.stage
 
@@ -897,11 +897,13 @@ class TestResidencyEngineCuda:
 
         try:
             x = torch.randn(2, 16, device="cuda")
-            with activated_model(ref_offloader, "cuda", adapters=[lora], adapter_mode="routed"), torch.inference_mode():
+            reference = reference.cuda()
+            merge_adapter(reference, [(lora, 1.0)])
+            with torch.inference_mode():
                 expected = reference(x).clone()
 
             monkeypatch.setattr(CudaTargetLease, "stage", count_stage)
-            with activated_model(offloader, "cuda", adapters=[lora], adapter_mode="merge"), torch.inference_mode():
+            with activated_model(offloader, "cuda", adapters=[lora]), torch.inference_mode():
                 assert stage_calls == 3  # preloaded once at activation with merged LoRA
                 stage_calls = 0
                 actual_1 = model(x)
@@ -910,7 +912,6 @@ class TestResidencyEngineCuda:
             torch.testing.assert_close(actual_1, expected, rtol=1e-4, atol=1e-4)
             torch.testing.assert_close(actual_2, expected, rtol=1e-4, atol=1e-4)
         finally:
-            ref_offloader.deactivate()
             offloader.deactivate()
 
     @CUDA
@@ -969,7 +970,6 @@ class TestResidencyEngineCuda:
         torch.manual_seed(6)
         model = _make_uniform_model(num_blocks=4, dim=32)
         reference = copy.deepcopy(model).cuda()
-        block_bytes = cast(nn.Linear, model.blocks[0]).weight.nbytes
         total_bytes = sum(t.nbytes for t in model.state_dict().values())
         offloader = ModelOffloader.from_module(
             model,
@@ -1036,7 +1036,6 @@ class TestResidencyEngineCuda:
             }
         )
         ref = copy.deepcopy(model)
-        ref_off = ModelOffloader.from_module(ref, OffloadConfig(offload_paths=("blocks",)))
         block_bytes = cast(nn.Linear, model.blocks[0]).weight.nbytes
         offloader = ModelOffloader.from_module(
             model,
@@ -1059,9 +1058,10 @@ class TestResidencyEngineCuda:
 
         try:
             x = torch.randn(2, 16, device="cuda")
-            with activated_model(ref_off, "cuda", adapters=[lora], adapter_mode="routed"), torch.inference_mode():
+            ref = ref.cuda()
+            merge_adapter(ref, [(lora, 1.0)])
+            with torch.inference_mode():
                 expected = ref(x).clone()
-            ref_off.deactivate()
 
             monkeypatch.setattr(CudaTargetLease, "stage", spy_stage)
             monkeypatch.setattr(CudaTargetLease, "allocate", spy_alloc)
@@ -1071,7 +1071,7 @@ class TestResidencyEngineCuda:
                 stage_calls = 0
                 alloc_calls = 0
                 with activated_model(
-                    offloader, "cuda", adapters=[lora], adapter_mode="merge", vram_budget_bytes=budget
+                    offloader, "cuda", adapters=[lora], vram_budget_bytes=budget
                 ), torch.inference_mode():
                     actual1 = model(x)
                     actual2 = model(x)
@@ -1081,7 +1081,6 @@ class TestResidencyEngineCuda:
                 if budget == block_bytes:
                     assert alloc_calls == 1 and stage_calls == 8
         finally:
-            ref_off.deactivate()
             offloader.deactivate()
 
     @CUDA
@@ -1128,7 +1127,6 @@ class TestResidencyEngineCuda:
             release.wait(timeout=5)
             worker_finished = True
 
-        original_result = Future.result
         original_wait = concurrent.futures.wait
         wait_calls = 0
 
@@ -1499,8 +1497,8 @@ class TestResidencyEngineCuda:
     def test_auto_offload_paths_estimates_packed_bytes_for_gguf_trellis_and_projected_shard(
         self,
     ) -> None:
-        from piper_offload.float8_adapter import Float8Adapter, _Float8Meta
-        from piper_offload.torchao_structured_adapter import TorchaoHost, _ProjectedTorchaoShard
+        from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter, _PiperConvRotInt8Meta
+        from piper_offload.structured_adapter import StructuredHost, _ProjectedStructuredShard
 
         # 1. GGUF Q4_0 (64, 64): packed = 2304 B (vs dense BF16 = 8192 B)
         gguf_param = GGUFParameter(
@@ -1523,24 +1521,22 @@ class TestResidencyEngineCuda:
         )
         assert _estimate_tensor_bytes(trellis_param) == 64 * 96 + 64 + 64 * 4
 
-        # 3. _ProjectedTorchaoShard: float8 qdata (4096 B) + float32 scale (256 B) = 4352 B
+        # 3. _ProjectedStructuredShard: int8 qdata (4096 B) + float32 scale (256 B) = 4352 B
         #    (vs logical meta BF16 = 8192 B).
-        proj_shard = _ProjectedTorchaoShard(
-            Float8Adapter,
-            TorchaoHost(
+        proj_shard = _ProjectedStructuredShard(
+            PiperConvRotInt8Adapter,
+            StructuredHost(
                 storage=(
-                    torch.empty((64, 64), dtype=torch.float8_e4m3fn),
+                    torch.empty((64, 64), dtype=torch.int8),
                     torch.empty((64, 1), dtype=torch.float32),
+                    None,
                 ),
-                meta=_Float8Meta(
-                    block_size=(1, 64),
-                    mm_config=None,
-                    act_quant_kwargs=None,
-                    kernel_preference=None,
+                meta=_PiperConvRotInt8Meta(
+                    group_size=64,
                     dtype=torch.bfloat16,
                 ),
                 logical_shape=(64, 64),
-                target_shapes=((64, 64), (64, 1)),
+                target_shapes=((64, 64), (64, 1), None),
             ),
             torch.empty((64, 64), dtype=torch.bfloat16, device="meta"),
             ("proj",),

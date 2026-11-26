@@ -12,11 +12,11 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 import piper_offload.dtensor_adapter as dtensor_adapter_module
 import piper_offload.lora as lora_module
 from piper_offload import (
-    LoRATransform,
     ParameterDelta,
-    ParameterDeltaTransform,
     ScaledLoRAFactor,
 )
+from piper_offload._parameter_update import _DenseMergeTransform, build_parameter_transform
+from piper_offload.lora import LoRATransform
 from piper_offload.dtensor_adapter import DTensorAdapter, _local_shape_and_offsets
 from piper_offload import derive_seed
 from piper_offload.tensor_adapters import RegularAdapter
@@ -50,12 +50,17 @@ def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
                 ParameterDelta.from_tensors(a=a, b=b[:1].clone()),
                 ParameterDelta.from_tensors(dense=torch.ones(())),
             ):
-                broadcast_transform = ParameterDeltaTransform([broadcast_delta.scaled(strength)])
+                broadcast_transform = build_parameter_transform(
+                    [broadcast_delta.scaled(strength)],
+                    source_scale=1.0,
+                    stochastic_rounding=False,
+                    target_key="",
+                )
                 with pytest.raises(ValueError, match="DTensorAdapter does not support broadcast"):
                     broadcast_transform.validate_parameter(param)
                 torch.testing.assert_close(target.full_tensor(), weight)
-            transform.validate_target(param)
-            transform.apply(param)
+            transform.validate_parameter(param)
+            transform.apply_parameter(param)
             torch.testing.assert_close(target.full_tensor(), expected)
 
             direct_target = distribute_tensor(
@@ -75,18 +80,22 @@ def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
                 mesh,
                 [Shard(shard_dim)],
             )
-            dense_transform = ParameterDeltaTransform(
+            dense_transform = build_parameter_transform(
                 [
                     ParameterDelta.from_tensors(
                         a=a,
                         b=b,
                         dense=dense,
                     ).scaled(strength)
-                ]
+                ],
+                source_scale=1.0,
+                stochastic_rounding=False,
+                target_key="",
             )
             dense_param = nn.Parameter(dense_target, requires_grad=False)
             dense_transform.validate_parameter(dense_param)
-            plan = dense_transform._update._dense_plan
+            assert isinstance(dense_transform, _DenseMergeTransform)
+            plan = dense_transform._dense_plan
             assert plan is not None
             local_source, _ = plan.dense_sources[0]
             assert local_source.shape == dense_target.to_local().shape
@@ -119,8 +128,8 @@ def _run_two_rank_merge(rank: int, world_size: int, init_file: str) -> None:
             )
 
             empty_param = nn.Parameter(empty_target, requires_grad=False)
-            empty_transform.validate_target(empty_param)
-            empty_transform.apply(empty_param)
+            empty_transform.validate_parameter(empty_param)
+            empty_transform.apply_parameter(empty_param)
 
             torch.testing.assert_close(
                 empty_target.full_tensor(),
@@ -265,14 +274,11 @@ def test_transform_localizes_factors_before_staging(
     ]
     transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, strength) for a, b, strength in factor_inputs])
 
-    transform.validate_target(target)
-    transform.apply(target)
+    transform.validate_parameter(target)
+    transform.apply_parameter(target)
 
     expected_staging = [((rank, 3), (4, rank)) for rank in range(2, 2 + factor_count)]
-    assert staged_inputs == [
-        expected_staging,  # validation
-        expected_staging,  # application
-    ]
+    assert staged_inputs == [expected_staging]
     expected = torch.zeros_like(target)
     for a, b, strength in factor_inputs:
         expected.addmm_(b[2:6], a[:, 5:8], alpha=strength)
@@ -351,8 +357,8 @@ def test_stochastic_merge_forwards_seed_to_local_adapter(
         target_key="sharded.weight",
     )
 
-    transform.validate_target(target)
-    transform.apply(target)
+    transform.validate_parameter(target)
+    transform.apply_parameter(target)
 
     expected_seed = dtensor_adapter_module._localize_rounding_seed(
         derive_seed("sharded.weight", 0),

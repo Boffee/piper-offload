@@ -62,8 +62,8 @@ class HostParam:
     this optimization because ``.data =`` can drop wrapper state.
 
     A frozen plain floating-point meta parameter retains its shape, dtype, and
-    stride without host backing or a cache reservation. It remains meta unless a
-    merge-mode parameter value allocates and fills active device storage.
+    stride without host backing or a cache reservation. It remains meta unless an
+    active parameter value allocates and fills active device storage.
     Low-rank factors cannot materialize it.
     """
 
@@ -312,15 +312,11 @@ class HostParam:
         Returns an opaque adapter-specific handle; pass it back to
         :meth:`make_gpu_param` and :meth:`copy_to_gpu`.
         """
+        if self.is_meta:
+            raise RuntimeError(
+                "A meta parameter cannot be materialized without an active parameter value."
+            )
         with torch.inference_mode(False):
-            if self.is_meta:
-                source = cast(torch.Tensor, self.host_state)
-                return torch.empty_strided(
-                    tuple(source.shape),
-                    source.stride(),
-                    dtype=source.dtype,
-                    device=device,
-                )
             return self.adapter.alloc_gpu(self.host_state, device)
 
     def make_gpu_param(self, gpu_state: object) -> nn.Parameter:
@@ -329,17 +325,19 @@ class HostParam:
         The adapter receives the paired host state to reconstruct
         structured tensor wrappers.
         """
+        if self.is_meta:
+            raise RuntimeError(
+                "A meta parameter cannot be materialized without an active parameter value."
+            )
         with torch.inference_mode(False):
-            if self.is_meta:
-                return nn.Parameter(cast(torch.Tensor, gpu_state), requires_grad=False)
             return self.adapter.gpu_param(self.host_state, gpu_state)
 
     def copy_to_gpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk DMA host bytes into pre-allocated GPU storage."""
         if self.is_meta:
-            # The activation-scoped parameter-value hook populates this storage
-            # directly. There are deliberately no zero bytes to transfer.
-            return
+            raise RuntimeError(
+                "A meta parameter cannot be materialized without an active parameter value."
+            )
         self.adapter.copy_to_gpu(self.host_state, gpu_state, non_blocking=non_blocking)
 
     def materialize(
@@ -412,6 +410,5 @@ class HostParam:
     def gpu_target_bytes(self) -> int:
         """Unique GPU target storage bytes allocated by :meth:`allocate_gpu_storage`."""
         if self.is_meta:
-            source = cast(torch.Tensor, self.host_state)
-            return source.numel() * source.element_size()
+            return 0
         return _adapter_gpu_target_bytes(self.adapter, self.host_state)

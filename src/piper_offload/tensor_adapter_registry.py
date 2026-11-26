@@ -15,20 +15,15 @@ from torch import nn
 
 from ._dtensor import local_shard
 from .dtensor_adapter import DTensorAdapter
-from .float8_adapter import Float8Adapter
 from .gguf_adapter import GgufAdapter
-from .int4_tile_adapter import Int4TilePackedAdapter
-from .int8_adapter import Int8Adapter
-from .mx_adapter import MxAdapter
-from .nvfp4_adapter import Nvfp4Adapter
 from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
 from .piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
-from .static_float8_adapter import StaticFloat8Adapter
-from .tensor_adapters import RegularAdapter, TensorAdapter
-from .torchao_structured_adapter import (
-    _ProjectedTorchaoShard,
-    _ProjectedTorchaoShardAdapter,
+from .piper_nvfp4_adapter import PiperNvfp4Adapter
+from .structured_adapter import (
+    _ProjectedStructuredShard,
+    _ProjectedStructuredShardAdapter,
 )
+from .tensor_adapters import RegularAdapter, TensorAdapter
 from .trellis_adapter import TrellisAdapter
 
 # DTensorAdapter is always checked before registered and built-in adapters: a
@@ -41,16 +36,11 @@ from .trellis_adapter import TrellisAdapter
 # structured subclasses reach their dedicated adapter first.
 _BUILTIN_ADAPTERS: tuple[type[TensorAdapter[Any, Any]], ...] = (
     PiperConvRotNVFP4Adapter,
-    Nvfp4Adapter,
-    MxAdapter,
-    StaticFloat8Adapter,
-    Float8Adapter,
-    Int8Adapter,
-    Int4TilePackedAdapter,
+    PiperNvfp4Adapter,
+    PiperConvRotInt8Adapter,
     GgufAdapter,
     TrellisAdapter,
-    PiperConvRotInt8Adapter,
-    _ProjectedTorchaoShardAdapter,
+    _ProjectedStructuredShardAdapter,
     RegularAdapter,
 )
 
@@ -163,7 +153,7 @@ def requires_activation(tensor: torch.Tensor) -> bool:
     return (
         GgufAdapter.matches(representation)
         or TrellisAdapter.matches(representation)
-        or isinstance(local_shard(representation), _ProjectedTorchaoShard)
+        or isinstance(local_shard(representation), _ProjectedStructuredShard)
     )
 
 

@@ -27,23 +27,21 @@ maps implementation ownership and extension points.
 """
 
 from ._host_registration import HostRegistrationError
-from .adapter import Adapter, AdapterMode, AdapterTarget
+from .adapter import Adapter, AdapterTarget
 from .block_compile import BlockCompileConfig
 from .checkpoint import CheckpointError, FileSlice, MappedCheckpoint, file_slice
 from .device_transfer import DeviceTransferContext
 from .gguf_parameter import GgufParameter
-from .lora import LoRAFactor, LoRATransform, ScaledLoRAFactor
+from .lora import LoRAFactor, ScaledLoRAFactor
 from .merge import merge_adapter
 from .model_cache import ModelCache
 from .model_offloader import ModelOffloader, ModelRuntimeFailedError, ModelRuntimeInUseError
 from .model_store import ModelStore
 from .mps_weights import MpsWeights
 from .offload_config import OffloadConfig, auto_offload_paths
-from .parameter_delta import ParameterDelta, ParameterDeltaTransform, ScaledParameterDelta
-from .parameter_transform import ParameterTransform
+from .parameter_delta import ParameterDelta, ScaledParameterDelta
 from .parameter_value import (
     ParameterValue,
-    ParameterValueTransform,
     ScaledParameterValue,
 )
 from .pin_manager import PinLease, PinManager, PinStats, host_pin_manager
@@ -83,7 +81,6 @@ from .vram_budget import (
 
 __all__ = [
     "Adapter",
-    "AdapterMode",
     "AdapterSpec",
     "AdapterTarget",
     "BlockCompileConfig",
@@ -100,7 +97,6 @@ __all__ = [
     "HostRegistrationError",
     "LRUEvictionPolicy",
     "LoRAFactor",
-    "LoRATransform",
     "MappedCheckpoint",
     "ModelCache",
     "ModelOffloader",
@@ -113,10 +109,7 @@ __all__ = [
     "ObjectSpec",
     "OffloadConfig",
     "ParameterDelta",
-    "ParameterDeltaTransform",
-    "ParameterTransform",
     "ParameterValue",
-    "ParameterValueTransform",
     "PinLease",
     "PinManager",
     "PinStats",

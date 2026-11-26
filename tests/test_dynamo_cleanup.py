@@ -77,7 +77,7 @@ def test_discarded_trace_does_not_retain_real_inputs(monkeypatch, discard, devic
     )
     gc.collect()
     try:
-        state.install(True)
+        state.install()
         with torch.inference_mode():
             value = torch.randn(2, 8, device=device)
             value_ref = ref(value)

@@ -2,29 +2,24 @@
 
 An :class:`Adapter` captures a canonical state dict containing low-rank LoRA
 factors, full-rank parameter deltas, exact-name values for meta parameters,
-or a combination. It owns
-storage and target metadata only; merge and routed execution live in their
-respective transform modules.
+or a combination. It owns storage and target metadata only; in-place merge
+execution lives in the parameter-update modules.
 """
 
-from collections.abc import Iterable, Mapping, Sequence, Set
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Mapping, Sequence
 from types import MappingProxyType
 from typing import Literal, Self
 
 import torch
 
-from .lora import ScaledLoRAFactor
-from .parameter_delta import ParameterDelta, ScaledParameterDelta
-from .parameter_value import ParameterValue, ScaledParameterValue
+from .parameter_delta import ParameterDelta
+from .parameter_value import ParameterValue
 
 __all__ = [
     "Adapter",
-    "AdapterMode",
     "AdapterTarget",
 ]
 
-type AdapterMode = Literal["merge", "routed"]
 type AdapterTarget = ParameterDelta | ParameterValue
 
 type _InputPart = Literal["a", "b", "alpha", "dense", "value"]
@@ -38,45 +33,6 @@ _INPUT_SUFFIXES: tuple[tuple[str, str, _InputPart], ...] = (
     (".delta.weight", ".weight", "dense"),
     (".delta.bias", ".bias", "dense"),
 )
-
-
-@dataclass(slots=True)
-class AdapterTargetUpdates:
-    """Package-internal active contributions for one parameter name."""
-
-    deltas: list[ScaledParameterDelta] = field(default_factory=list)
-    value: ScaledParameterValue | None = None
-    requires_base: bool = False
-
-    def add(
-        self,
-        target: AdapterTarget,
-        strength: float,
-        *,
-        target_key: str,
-        allow_partial_targets: bool,
-    ) -> None:
-        """Bind one contribution, allowing only one authoritative value."""
-        if isinstance(target, ParameterDelta):
-            self.deltas.append(target.scaled(strength))
-            self.requires_base |= not allow_partial_targets
-            return
-
-        if self.value is not None:
-            raise ValueError(f"Adapter target {target_key!r} has multiple active parameter values.")
-        self.value = target.scaled(strength)
-
-    @property
-    def factors(self) -> list[ScaledLoRAFactor]:
-        """Low-rank contributions extracted for routed execution."""
-        return [
-            bound.delta.lora.scaled(bound.strength) for bound in self.deltas if bound.delta.lora is not None
-        ]
-
-    @property
-    def has_dense(self) -> bool:
-        """Whether any active delta contains a full-rank contribution."""
-        return any(bound.delta.dense is not None for bound in self.deltas)
 
 
 class Adapter:
@@ -95,9 +51,9 @@ class Adapter:
 
     Satisfies :class:`~piper_offload.protocols.ResourceStore`, so it can be
     registered in :class:`~piper_offload.ResourceCache` for budget tracking and
-    policy-driven eviction. Merge and routed consumers read the same immutable
-    backing and may overlap. Parameter values are merge-only and populate
-    only frozen floating-point meta parameters.
+    policy-driven eviction. Active merge sessions and permanent merges read the
+    same immutable backing and may overlap. Parameter values populate only
+    frozen floating-point meta parameters.
 
     Strength is extrinsic and supplied when the adapter is activated or
     permanently merged. It always scales parameter deltas. Complete parameter
@@ -116,7 +72,6 @@ class Adapter:
     skips deltas to meta parameters without an active complete value, leaving
     them meta. Any strict delta on the same target still requires a source.
     Physical targets and active supplied values retain normal validation.
-    Routed execution retains its existing target requirements.
     """
 
     def __init__(
@@ -215,29 +170,6 @@ def resolve_adapter_strengths[T](adapters: Sequence[T], strengths: Sequence[floa
     if strengths is None:
         return [(adapter, 1.0) for adapter in adapters]
     return active_adapter_pairs(zip(adapters, strengths, strict=True))
-
-
-def group_adapter_updates(
-    adapters: Sequence[tuple[Adapter, float]],
-    param_names: Set[str],
-) -> dict[str, AdapterTargetUpdates]:
-    """Collect contributions by exact name, omitting absent partial targets."""
-    updates: dict[str, AdapterTargetUpdates] = {}
-    missing: set[str] = set()
-    for adapter, strength in adapters:
-        for name, target in adapter.targets.items():
-            if name not in param_names:
-                if not adapter.allow_partial_targets:
-                    missing.add(name)
-                continue
-            contributions = updates.setdefault(name, AdapterTargetUpdates())
-            contributions.add(target, strength, target_key=name, allow_partial_targets=adapter.allow_partial_targets)
-    if missing:
-        raise ValueError(
-            f"Adapter targets are not parameters in the model: {sorted(missing)}. "
-            f"Target keys must match exactly. Sample model parameter keys: {sorted(param_names)[:3]}."
-        )
-    return updates
 
 
 def _target_and_part(key: str) -> tuple[str, _InputPart]:

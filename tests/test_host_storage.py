@@ -23,7 +23,7 @@ def test_quantized_storage_is_complete_and_reuses_backing(
     backing = ParameterValue.from_tensor(_make_quantized(kind)).backing
     expected_bytes = backing.cache_bytes
     adapter_type = type(backing.adapter)
-    for method in ("capture_host", "cpu_param", "alloc_gpu", "dequantize"):
+    for method in ("capture_host", "cpu_param", "alloc_gpu"):
         if hasattr(adapter_type, method):
             monkeypatch.setattr(adapter_type, method, staticmethod(_unexpected_materialization))
 

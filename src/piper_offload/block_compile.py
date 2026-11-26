@@ -128,8 +128,8 @@ class _BlockCompileState:
     def installed(self) -> bool:
         return self._installed
 
-    def install(self, enabled: bool) -> None:
-        if not enabled or not self._forwards:
+    def install(self) -> None:
+        if not self._forwards:
             return
         if self._installed:
             raise RuntimeError("compiled block forwards are already installed")

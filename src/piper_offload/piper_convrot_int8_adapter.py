@@ -12,8 +12,7 @@ per-target seed to the kernel-owned terminal INT8 code selection.
 Permanent and activation-time LoRA merge
 preserve the existing target wrapper and storage identities. Piper selects its
 optimized Triton backend on supported CUDA devices and its portable reference
-backend elsewhere. Routed LoRA remains available when the base must remain
-untouched.
+backend elsewhere.
 """
 
 from dataclasses import dataclass
@@ -28,7 +27,7 @@ from ._piper_convrot_int8 import (
     require_convrot_int8_tensor,
     validate_layout,
 )
-from .torchao_structured_adapter import TorchaoHost, TorchaoStructuredAdapter
+from .structured_adapter import StructuredHost, _KernelMergeStructuredAdapter
 
 
 @dataclass(slots=True, frozen=True)
@@ -39,7 +38,7 @@ class _PiperConvRotInt8Meta:
     dtype: torch.dtype
 
 
-class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
+class PiperConvRotInt8Adapter(_KernelMergeStructuredAdapter[_PiperConvRotInt8Meta]):
     """Adapter for ``piper_kernels.weights.convrot.int8.ConvRotInt8Tensor`` weights."""
 
     _TAG = "piper-kernels-convrot-int8"
@@ -56,6 +55,10 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
     @staticmethod
     def _require(t: torch.Tensor) -> Any:  # noqa: ANN401
         return require_convrot_int8_tensor(t)
+
+    @staticmethod
+    def _require_matrix(t: torch.Tensor) -> Any:  # noqa: ANN401
+        return require_convrot_int8_matrix(t)
 
     @staticmethod
     def _storage_of(t: Any) -> tuple[torch.Tensor | None, ...]:  # noqa: ANN401
@@ -95,11 +98,11 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
     @classmethod
     def project_shard(
         cls,
-        state: TorchaoHost[_PiperConvRotInt8Meta],
+        state: StructuredHost[_PiperConvRotInt8Meta],
         *,
         offsets: tuple[int, ...],
         local_shape: tuple[int, ...],
-    ) -> tuple[TorchaoHost[_PiperConvRotInt8Meta], tuple[object, ...]]:
+    ) -> tuple[StructuredHost[_PiperConvRotInt8Meta], tuple[object, ...]]:
         """Project a zero-copy host shard for 2-D ``ConvRotInt8Tensor`` weights."""
         qdata, scale, act_per_tensor_scale = state.storage
         assert qdata is not None
@@ -166,69 +169,4 @@ class PiperConvRotInt8Adapter(TorchaoStructuredAdapter[_PiperConvRotInt8Meta]):
             (qdata_local, scale_local, act_per_tensor_scale),
             state.meta,
             local_shape,
-        )
-
-    @staticmethod
-    def dequantize(t: torch.Tensor) -> torch.Tensor:
-        """Return ConvRot's dense logical weight."""
-        return require_convrot_int8_tensor(t).dequantize()
-
-    @staticmethod
-    def merge_lora_(
-        target: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
-        alpha: float,
-        *,
-        beta: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> None:
-        """Merge a validated staged update into ConvRot INT8 storage."""
-        require_convrot_int8_matrix(target).addmm_(
-            b,
-            a,
-            beta=beta,
-            alpha=alpha,
-            rounding_seed=rounding_seed,
-        )
-
-    @staticmethod
-    def validate_lora_merge(
-        target: torch.Tensor,
-        _b: torch.Tensor,
-        _a: torch.Tensor,
-        _alpha: float,
-        *,
-        beta: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> None:
-        del beta, rounding_seed
-        require_convrot_int8_matrix(target)
-
-    @staticmethod
-    def validate_dense_merge_target(
-        target: torch.Tensor,
-        *,
-        rounding_seed: int | None = None,
-    ) -> bool:
-        """Validate kernel support without staging the dense update."""
-        del rounding_seed
-        require_convrot_int8_matrix(target)
-        return False
-
-    @staticmethod
-    def merge_dense_(
-        target: torch.Tensor,
-        update: torch.Tensor,
-        alpha: float,
-        *,
-        beta: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> None:
-        """Delegate a validated dense update to Piper Kernels."""
-        require_convrot_int8_matrix(target).add_(
-            update,
-            alpha=alpha,
-            beta=beta,
-            rounding_seed=rounding_seed,
         )

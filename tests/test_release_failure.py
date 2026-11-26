@@ -7,8 +7,7 @@ release step, so ``ModelOffloader.failed`` is true exactly when one failed,
 and otherwise every managed tensor is back on the host. The next activation
 retries what was kept and runs the model as before. A release that keeps failing makes activation raise
 :class:`ModelRuntimeFailedError`. See the scheduling-hooks rules in
-``docs/development.md``. New block modes, components, and hook-driven adapter
-paths join ``_CONFIGS``.
+``docs/development.md``. New block modes and components join ``_CONFIGS``.
 """
 
 import threading
@@ -21,7 +20,6 @@ import torch
 from torch import nn
 
 from piper_offload import (
-    Adapter,
     BlockCompileConfig,
     DeviceTransferContext,
     ModelOffloader,
@@ -71,7 +69,6 @@ class _Config:
     offload_paths: tuple[str, ...]
     vram_budget_bytes: int | None = None
     compiled: bool = False
-    routed: bool = False
     use_vram_budget: bool = False
     use_transfer_context: bool = False
 
@@ -89,15 +86,6 @@ class _Config:
             ),
         )
 
-    def adapters(self) -> list[Adapter]:
-        if not self.routed:
-            return []
-        state: dict[str, torch.Tensor] = {}
-        for idx in range(_NUM_BLOCKS):
-            state[f"blocks.{idx}.proj.lora_A.weight"] = torch.randn(1, _WIDTH)
-            state[f"blocks.{idx}.proj.lora_B.weight"] = torch.randn(_WIDTH, 1)
-        return [Adapter.from_state_dict(state)]
-
 
 _CONFIGS = (
     pytest.param(_Config(()), id="host-only"),
@@ -108,7 +96,6 @@ _CONFIGS = (
     pytest.param(_Config(("blocks",), None, use_vram_budget=True), id="shared-budget"),
     pytest.param(_Config(("blocks",), None, use_transfer_context=True), id="shared-transfer-context"),
     pytest.param(_Config(("embed", "blocks"), None, compiled=True), id="mixed-compiled"),
-    pytest.param(_Config(("blocks",), None, routed=True), id="streaming-routed"),
 )
 
 
@@ -179,7 +166,6 @@ def test_failed_release_step_is_reported(
         request.addfinalizer(torch.compiler.reset)
     torch.manual_seed(0)
     model = _Model()
-    adapters = config.adapters()
     offloader = config.offloader(model)
     x = torch.randn(2, _WIDTH, device="cuda")
     budget = VramBudget(4 * _UNIT_BYTES) if config.use_vram_budget else None
@@ -190,8 +176,6 @@ def test_failed_release_step_is_reported(
     try:
         offloader.activate(
             "cuda",
-            adapters=adapters,
-            adapter_mode="routed",
             vram_budget=budget,
             transfer_context=transfer_ctx,
         )
@@ -212,15 +196,12 @@ def test_failed_release_step_is_reported(
         if raised is None:
             # The occurrence did not exist: nothing failed, so nothing was kept.
             assert _on_device(model) == []
-            assert offloader._routed_lease is None
 
         # The next activation retries whatever was kept, then runs as before.
         with (
             activated_model(
                 offloader,
                 "cuda",
-                adapters=adapters,
-                adapter_mode="routed",
                 vram_budget=budget,
                 transfer_context=transfer_ctx,
             ),

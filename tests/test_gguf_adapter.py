@@ -8,9 +8,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from piper_offload import Adapter, ModelOffloader, ModelStore, OffloadConfig, merge_adapter
+from piper_offload._parameter_update import build_parameter_transform
 from piper_offload.gguf_adapter import GgufAdapter
 from piper_offload.lora import LoRATransform, ScaledLoRAFactor
-from piper_offload.parameter_delta import ParameterDelta, ParameterDeltaTransform
+from piper_offload.parameter_delta import ParameterDelta
 from piper_offload.host_param import HostParam
 from piper_offload.tensor_adapter_registry import param_representation
 from tests._gguf_helpers import GGUFParameter, packed_q4_0, packed_q8_0
@@ -337,7 +338,6 @@ class TestDirectConversion:
                 quant_type=quant_type,
                 group_size=64,
             )
-            dense = expected.dequantize()
             expected.addmm_(
                 torch.zeros(expected.shape[0], 1, dtype=expected.dtype, device=expected.device),
                 torch.zeros(1, expected.shape[1], dtype=expected.dtype, device=expected.device),
@@ -428,12 +428,15 @@ class TestDirectConversion:
         backing = HostParam(source_param)
         dense = torch.randn(64, 64)
         strength = 0.125
-        transform = ParameterDeltaTransform(
+        transform = build_parameter_transform(
             [
                 ParameterDelta.from_tensors(
                     dense=dense,
                 ).scaled(strength)
-            ]
+            ],
+            source_scale=1.0,
+            stochastic_rounding=False,
+            target_key="",
         )
         transform.validate_parameter(source_param)
         state = backing.allocate_gpu_storage(torch.device("cuda"))
