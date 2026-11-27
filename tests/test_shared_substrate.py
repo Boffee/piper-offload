@@ -11,21 +11,28 @@ from torch import nn
 
 import piper_offload
 from piper_offload import (
+    ArenaCapacityError,
     DeviceTransferContext,
+    ExpertPoolStats,
+    ExpertSlabPool,
+    ExpertWave,
     ModelCache,
     ModelOffloader,
     ModelSpec,
     OffloadConfig,
+    SlotSchema,
+    Uint8DualArena,
     VramBudget,
     VramBudgetExhaustedError,
     VramReservation,
 )
 from piper_offload.dual_arena import (
-    ArenaCapacityError,
+    ArenaFieldSpec,
     KvMetadataPool,
+    LowSlotLayout,
+    SideFieldSpec,
     StructuredSidePool,
     TypedSidePool,
-    Uint8DualArena,
 )
 from piper_offload.stream_lease import StreamLease
 from piper_offload.tensor_adapters import (
@@ -122,29 +129,37 @@ def _make_fake_stream_types():
 
 
 def test_top_level_exports_expose_user_coordination_types_only() -> None:
+    _ = (ExpertPoolStats, ExpertSlabPool, ExpertWave)
     top_all = set(piper_offload.__all__)
     assert {
+        "ArenaCapacityError",
         "DeviceTransferContext",
+        "ExpertPoolStats",
+        "ExpertSlabPool",
+        "ExpertWave",
+        "SlotSchema",
+        "Uint8DualArena",
         "VramBudget",
         "VramBudgetExhaustedError",
         "VramReservation",
     } <= top_all
-    internal_names = {
+    submodule_only_names = {
         "ArenaBindableTensorAdapter",
-        "ArenaCapacityError",
+        "ArenaFieldSpec",
         "ArenaSlice",
         "BudgetTenantHandle",
         "BufferSpec",
         "GpuAllocator",
         "HighSlotLayout",
         "KvMetadataPool",
+        "LowSlotLayout",
+        "SideFieldSpec",
         "SliceableTensorAdapter",
         "StreamLease",
         "StructuredSidePool",
         "TypedSidePool",
-        "Uint8DualArena",
     }
-    assert top_all.isdisjoint(internal_names)
+    assert top_all.isdisjoint(submodule_only_names)
 
 
 # ---------------------------------------------------------------------------
@@ -1396,6 +1411,198 @@ def test_dual_arena_blocking_ranges_and_slice_validation() -> None:
     s_low_b.release()
     assert small_arena.blocking_low_slices(0) == ()
     small_arena.close()
+
+
+def test_slot_schema_validation_and_alignment() -> None:
+    schema = SlotSchema(
+        {"up": 300, "down": (4, 64)},
+        {"scale": (torch.float32, (3,))},
+        field_alignment=256,
+        side_alignment=16,
+    )
+    assert schema.arena_field_names == ("up", "down")
+    assert schema.side_field_names == ("scale",)
+    assert isinstance(schema.arena_field("up"), ArenaFieldSpec)
+    assert isinstance(schema.side_field("scale"), SideFieldSpec)
+    assert schema.side_field("scale").nbytes == 12
+    assert schema.arena_field("up").offset == 0
+    assert schema.arena_field("up").aligned_bytes == 512
+    assert schema.arena_field("down").offset == 512
+    assert schema.arena_field("down").aligned_bytes == 256
+    assert schema.drawer_bytes == 768
+    assert schema.side_bytes_per_slot == 16  # 3 * fp32 (12B) aligned up to 16B
+
+    no_side = SlotSchema({"up": 64}, side_fields=None)
+    assert no_side.side_fields == ()
+    assert no_side.side_bytes_per_slot == 0
+    with pytest.raises(KeyError):
+        schema.arena_field("missing")
+    with pytest.raises(KeyError):
+        schema.side_field("missing")
+    with pytest.raises(TypeError, match="mapping or None"):
+        SlotSchema({"up": 64}, side_fields=[("scale", (torch.float32, (1,)))])  # type: ignore[arg-type]
+
+    for bad_fn, match in (
+        (lambda: SlotSchema({}), "at least one"),
+        (lambda: SlotSchema({"bad": True}), "bool"),
+        (lambda: SlotSchema({"bad": ()}), "non-empty"),
+        (lambda: SlotSchema({"a": 64}, {"a": (torch.float32, (2,))}), "Duplicate"),
+        (lambda: SlotSchema({"a": 64}, {"s": ("f32", (2,))}), "torch.dtype"),  # type: ignore[arg-type]
+        (lambda: SlotSchema({"a": 64}, field_alignment=8), "power of two >= 16"),
+        (lambda: SlotSchema({"a": 64}, field_alignment=48), "power of two >= 16"),
+        (lambda: SlotSchema({"a": 64}, side_alignment=True), "power of two >= 16"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            bad_fn()
+
+
+def test_symmetric_low_slots_and_views() -> None:
+    with pytest.raises(ValueError, match="requires low_slot_bytes"):
+        Uint8DualArena(2048, device="cpu", low_max_slots=2)
+    with pytest.raises(ArenaCapacityError):
+        Uint8DualArena(2048, device="cpu", low_slot_bytes=768, low_max_slots=3, alignment=256)
+
+    # Reject fixed low slot configuration while variable alloc_low slices are active; allow once freed.
+    with Uint8DualArena(2048, device="cpu", alignment=256) as mixed_arena:
+        for fn in (
+            mixed_arena.alloc_low_slot,
+            lambda: mixed_arena.free_low_slot(0),
+            lambda: mixed_arena.low_slot_tensor(0),
+            lambda: mixed_arena.low_pool_view((64,)),
+        ):
+            with pytest.raises(RuntimeError, match="not configured"):
+                fn()
+        var_slc = mixed_arena.alloc_low(128)
+        with pytest.raises(RuntimeError, match="while low allocations are active"):
+            mixed_arena.configure_low_slots(256)
+        var_slc.release()
+        mixed_arena.configure_low_slots(256, max_slots=4)
+        assert mixed_arena.low_slot_layout is not None
+        assert mixed_arena.low_slot_layout.max_slots == 4
+
+    with Uint8DualArena(
+        2048,
+        device="cpu",
+        slot_bytes=512,
+        low_slot_bytes=768,
+        alignment=256,
+    ) as arena:
+        assert isinstance(arena.low_slot_layout, LowSlotLayout)
+        assert arena.low_slot_layout.max_slots == 2
+        assert arena.available_low_slots == 2
+        with pytest.raises(RuntimeError, match="fixed low slots"):
+            arena.alloc_low(64)
+
+        low0 = arena.alloc_low_slot()
+        low1 = arena.alloc_low_slot(max_slot_id=1)
+        assert (low0, low1) == (0, 1)
+        assert arena.active_low_slots == (0, 1)
+        assert arena.low_frontier == 1536
+        assert arena.active_low_bytes == 1536
+        assert arena.raw_uint8_view().numel() == 2048
+
+        # Freeing top slot shrinks frontier, double free is idempotent, invalid IDs raise.
+        arena.free_low_slot(low1)
+        arena.free_low_slot(low1)
+        assert arena.low_frontier == 768
+        assert arena.alloc_low_slot() == 1
+        arena.free_low_slot(low0)
+        assert arena.alloc_low_slot(max_slot_id=0, allow_reclaim=False) == 0
+        with pytest.raises(ArenaCapacityError):
+            arena.alloc_low_slot(max_slot_id=0, allow_reclaim=False)
+        with pytest.raises(TypeError, match="int"):
+            arena.free_low_slot(True)
+        with pytest.raises(IndexError):
+            arena.free_low_slot(99)
+
+        down_view = arena.low_pool_view((4, 64), field_offset=512)
+        assert tuple(down_view.shape) == (2, 4, 64)
+        assert down_view.stride(0) == 768
+        down_view[low1].fill_(42)
+        assert int(arena.low_slot_tensor(low1)[512:].min().item()) == 42
+        with pytest.raises(ValueError, match="multiple of 16"):
+            arena.low_pool_view((4,), field_offset=8)
+
+
+def test_peer_frontier_reclaimer_callbacks() -> None:
+    with Uint8DualArena(
+        2048,
+        device="cpu",
+        slot_bytes=512,
+        low_slot_bytes=768,
+        alignment=256,
+    ) as arena:
+        assert arena.alloc_low_slot() == 0
+        low1 = arena.alloc_low_slot()
+        assert low1 == 1
+        assert arena.alloc_high_slot() == 3
+        with pytest.raises(ArenaCapacityError):
+            arena.alloc_high_slot()
+
+        low_calls: list[int] = []
+
+        def low_reclaim(target_low: int) -> None:
+            low_calls.append(target_low)
+            assert arena.high_frontier == 1536  # arena._lock is NOT held during callback
+            arena.free_low_slot(low1)
+
+        with pytest.raises(TypeError, match="callable"):
+            arena.set_low_reclaimer(123)  # type: ignore[arg-type]
+        arena.set_low_reclaimer(low_reclaim)
+        with pytest.raises(RuntimeError, match="already registered"):
+            arena.set_low_reclaimer(lambda _t: None)
+
+        # Wrong callback identity does not clear the active reclaimer.
+        arena.clear_low_reclaimer(lambda _t: None)
+        hi2 = arena.alloc_high_slot()
+        assert hi2 == 2
+        assert low_calls == [1024]
+        assert arena.low_frontier == 768
+
+        high_calls: list[int] = []
+
+        def high_reclaim(needed_high: int) -> None:
+            high_calls.append(needed_high)
+            arena.free_high_slot(hi2)
+
+        arena.set_high_reclaimer(high_reclaim)
+        assert arena.alloc_low_slot() == 1
+        assert high_calls == [1536]
+        assert arena.high_frontier == 1536
+
+        stalled_calls: list[int] = []
+        arena.clear_high_reclaimer(high_reclaim)
+        arena.free_low_slot(1)
+        assert arena.alloc_high_slot() == 2
+        arena.set_high_reclaimer(stalled_calls.append)
+        with pytest.raises(ArenaCapacityError):
+            arena.alloc_low_slot()
+        assert stalled_calls == [1536]
+
+        # Stalled low_reclaimer stops cleanly; set_low_reclaimer(None) clears unconditionally.
+        arena.set_low_reclaimer(None)
+        stalled_low: list[int] = []
+        arena.set_low_reclaimer(stalled_low.append)
+        with pytest.raises(ArenaCapacityError):
+            arena.alloc_high_slot()
+        assert stalled_low == [512]
+        arena.set_low_reclaimer(None)
+
+
+def test_peer_frontier_reclaimer_closed_and_variable_slice_reclaim() -> None:
+    arena = Uint8DualArena(1024, device="cpu", slot_bytes=512, low_slot_bytes=512, alignment=256)
+    arena.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        arena.set_low_reclaimer(lambda _t: None)
+    with pytest.raises(RuntimeError, match="closed"):
+        arena.set_high_reclaimer(lambda _t: None)
+
+    # Variable alloc_low slices also work with low_reclaimer when alloc_high_slot collides.
+    with Uint8DualArena(1024, device="cpu", slot_bytes=512, alignment=256) as var_arena:
+        s0 = var_arena.alloc_low(512)
+        var_arena.set_low_reclaimer(lambda _target: s0.release())
+        assert var_arena.alloc_high_slot() == 1
+        assert var_arena.alloc_high_slot() == 0
 
 
 def test_interleaved_kv_views_and_structured_side_pools() -> None:

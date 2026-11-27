@@ -57,6 +57,8 @@ to request registration. Piper's built-in runtimes choose as follows:
 | Transfer | Requests new registration |
 |---|---|
 | Streamed or partially cached offloaded units, experimental host relay | Yes: the transfer repeats |
+| `ExpertSlabPool` misses and `prefetch()` with `bypass=False` ([streaming](streaming.md#stream-keyed-slabs-expertslabpool)) | Yes: slots may evict and reload under shared pressure |
+| `ExpertSlabPool` misses and `prefetch()` with `bypass=True` | No: pageable lease |
 | Resident remainder and all-resident preloaded units (without a shared `VramBudget`) | No: pageable lease |
 | CPU execution | No lease |
 

@@ -8,8 +8,10 @@
   lifecycle, including whole-model uploads, block streaming, and
   :meth:`~ModelOffloader.no_record_trace` for speculative passes.
 - :class:`VramBudget`, :class:`VramReservation`, :class:`VramBudgetExhaustedError`,
-  and :class:`DeviceTransferContext` coordinate shared per-device CUDA VRAM
-  budgets and reusable async transfer streams/workers across models and pools.
+  :class:`Uint8DualArena`, :class:`SlotSchema`, :class:`ExpertSlabPool`, and
+  :class:`DeviceTransferContext` coordinate shared per-device CUDA VRAM budgets,
+  reusable async transfer streams, and global expert slab residency across
+  models and pools.
 - :class:`ResourceCache` and :class:`ObjectSpec` support other cached resources.
 - :class:`Adapter` holds reusable model updates; :func:`merge_adapter` applies
   them permanently.
@@ -31,6 +33,12 @@ from .adapter import Adapter, AdapterTarget
 from .block_compile import BlockCompileConfig
 from .checkpoint import CheckpointError, FileSlice, MappedCheckpoint, file_slice
 from .device_transfer import DeviceTransferContext
+from .dual_arena import (
+    ArenaCapacityError,
+    SlotSchema,
+    Uint8DualArena,
+)
+from .expert_slab_pool import ExpertPoolStats, ExpertSlabPool, ExpertWave
 from .gguf_parameter import GgufParameter
 from .lora import LoRAFactor, ScaledLoRAFactor
 from .merge import merge_adapter
@@ -83,6 +91,7 @@ __all__ = [
     "Adapter",
     "AdapterSpec",
     "AdapterTarget",
+    "ArenaCapacityError",
     "BlockCompileConfig",
     "CacheError",
     "CheckpointError",
@@ -92,6 +101,9 @@ __all__ = [
     "EvictionContext",
     "EvictionPolicy",
     "EvictionPolicyError",
+    "ExpertPoolStats",
+    "ExpertSlabPool",
+    "ExpertWave",
     "FileSlice",
     "GgufParameter",
     "HostRegistrationError",
@@ -125,8 +137,10 @@ __all__ = [
     "ScaledLoRAFactor",
     "ScaledParameterDelta",
     "ScaledParameterValue",
+    "SlotSchema",
     "TensorAdapter",
     "TrellisParameter",
+    "Uint8DualArena",
     "VramBudget",
     "VramBudgetExhaustedError",
     "VramReservation",

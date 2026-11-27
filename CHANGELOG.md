@@ -7,6 +7,19 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Added `ExpertSlabPool`, `ExpertWave`, `ExpertPoolStats`, and `SlotSchema`
+  (exported from top-level `piper_offload` alongside `Uint8DualArena` and
+  `ArenaCapacityError`; descriptor/layout types `ArenaFieldSpec`, `SideFieldSpec`,
+  `LowSlotLayout`, `HighSlotLayout`, and `ArenaSlice` live in
+  `piper_offload.dual_arena`), plus ascending fixed low-end slots and peer
+  frontier reclaimer callbacks (`set_low_reclaimer`, `clear_low_reclaimer`,
+  `set_high_reclaimer`, `clear_high_reclaimer`) on `Uint8DualArena`.
+  `ExpertSlabPool` manages keyed slabs across multiple groups in a shared
+  `Uint8DualArena` and aligned side pools with variable per-group/expert byte
+  sizes, hit-first waves with lookahead overlap staging, W-TinyLFU admission and
+  `bypass` transient streaming, `no_record_stats()` / `commit_accepted()`,
+  `prefetch()`, zero-sync all-resident waves, and automatic frontier relocation
+  or eviction on high-end space pressure.
 - Added unified `PiperQuantizedAdapter` (`piper_offload.piper_quantized_adapter`)
   over `piper_kernels.weights.QuantizedWeight` (`as_storage()` /
   `from_storage()`), supporting `PiperNVFP4Tensor`, `ConvRotInt8Tensor`,
@@ -23,7 +36,8 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   helpers (`_host_memory`), and transfer-priority background yield chunk scheduling
   (`_transfer_priority`).
 - Added the shared Layer 1 residency substrate (available from submodules, with user
-  coordination types `VramBudget`, `VramReservation`, `VramBudgetExhaustedError`, and
+  coordination types `Uint8DualArena`, `ArenaCapacityError`, `SlotSchema`,
+  `VramBudget`, `VramReservation`, `VramBudgetExhaustedError`, and
   `DeviceTransferContext` exported from top-level `piper_offload`): multi-reader and atomic
   write-once GPU-born `StreamLease` (`produce_with`, `stream_lease.py`, composed inside
   `CudaTargetLease`), reusable per-device `DeviceTransferContext` with `ensure_stream()`
