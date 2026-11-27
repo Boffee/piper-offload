@@ -2,7 +2,7 @@
 
 import math
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Self
 
@@ -61,6 +61,21 @@ def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(strides)
 
 
+def _element_size(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _aligned_side_stride0(
+    inner_numel: int,
+    dtype: torch.dtype,
+    alignment_bytes: int,
+) -> int:
+    """Return element-count ``stride(0) >= inner_numel`` aligned to ``alignment_bytes``."""
+    elem_bytes = _element_size(dtype)
+    align_elems = max(1, math.lcm(alignment_bytes, elem_bytes) // elem_bytes)
+    return _align_up(inner_numel, align_elems)
+
+
 def _allocate_aligned_storage(
     numel: int,
     *,
@@ -71,7 +86,7 @@ def _allocate_aligned_storage(
     reservation_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, int, int, VramReservation | None]:
     """Allocate normal-mode storage with guaranteed ``alignment_bytes`` base alignment."""
-    elem_bytes = torch.empty((), dtype=dtype).element_size()
+    elem_bytes = _element_size(dtype)
     if alignment_bytes % elem_bytes != 0:
         raise ValueError(
             f"alignment_bytes ({alignment_bytes}) must be divisible by "
@@ -119,6 +134,280 @@ def _allocate_aligned_storage(
     return raw, view, base_offset, allocated_bytes, reservation
 
 
+def _validate_slot_id(slot_id: object, *, max_slots: int) -> int:
+    if isinstance(slot_id, bool) or not isinstance(slot_id, int):
+        raise TypeError(f"slot_id must be an int; got {slot_id!r}.")
+    if slot_id < 0 or slot_id >= max_slots:
+        raise IndexError(f"slot_id {slot_id} out of range [0, {max_slots}).")
+    return slot_id
+
+
+@dataclass(frozen=True, slots=True)
+class ArenaFieldSpec:
+    """Layout descriptor for one raw ``uint8`` field inside a :class:`SlotSchema` drawer."""
+
+    name: str
+    nbytes: int
+    offset: int
+    aligned_bytes: int
+    shape: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SideFieldSpec:
+    """Layout descriptor for one typed non-``uint8`` field stored in a :class:`TypedSidePool`."""
+
+    name: str
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+    alignment_bytes: int
+
+    @property
+    def nbytes(self) -> int:
+        """Logical unpadded payload size in bytes for one slot of this field."""
+        return math.prod(self.shape) * _element_size(self.dtype)
+
+
+def _parse_arena_fields(
+    arena_fields: Mapping[str, int | tuple[int, ...]],
+    alignment: int,
+) -> tuple[tuple[ArenaFieldSpec, ...], dict[str, ArenaFieldSpec], int]:
+    if not isinstance(arena_fields, Mapping) or not arena_fields:
+        raise ValueError("SlotSchema requires at least one named arena field.")
+    parsed: list[ArenaFieldSpec] = []
+    by_name: dict[str, ArenaFieldSpec] = {}
+    offset = 0
+    for name, raw_spec in arena_fields.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("SlotSchema arena field names must be non-empty strings.")
+        if isinstance(raw_spec, bool):
+            raise ValueError(f"Arena field {name!r} byte count cannot be a bool.")
+        if isinstance(raw_spec, int):
+            nbytes = _validate_positive_int(raw_spec, name=f"arena_fields[{name!r}]")
+            shape: tuple[int, ...] = (nbytes,)
+        elif isinstance(raw_spec, tuple):
+            if not raw_spec:
+                raise ValueError(f"Arena field {name!r} shape tuple must be non-empty.")
+            _contiguous_strides(raw_spec)
+            shape = raw_spec
+            nbytes = math.prod(shape)
+        else:
+            raise ValueError(
+                f"Arena field {name!r} must be a positive int or shape tuple; got {raw_spec!r}."
+            )
+        aligned = _align_up(nbytes, alignment)
+        spec = ArenaFieldSpec(
+            name=name,
+            nbytes=nbytes,
+            offset=offset,
+            aligned_bytes=aligned,
+            shape=shape,
+        )
+        parsed.append(spec)
+        by_name[name] = spec
+        offset += aligned
+    return tuple(parsed), by_name, offset
+
+
+def _parse_side_fields(
+    side_fields: Mapping[str, tuple[torch.dtype, tuple[int, ...]]] | None,
+    arena_names: Mapping[str, ArenaFieldSpec],
+    alignment: int,
+) -> tuple[tuple[SideFieldSpec, ...], dict[str, SideFieldSpec], int]:
+    if side_fields is not None and not isinstance(side_fields, Mapping):
+        raise TypeError("side_fields must be a mapping or None.")
+    if not side_fields:
+        return (), {}, 0
+    parsed: list[SideFieldSpec] = []
+    by_name: dict[str, SideFieldSpec] = {}
+    bytes_per_slot = 0
+    for name, raw_side in side_fields.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("SlotSchema side field names must be non-empty strings.")
+        if name in arena_names:
+            raise ValueError(
+                f"Duplicate field name {name!r} across arena and side fields."
+            )
+        if not isinstance(raw_side, tuple) or len(raw_side) != 2:
+            raise ValueError(
+                f"Side field {name!r} must be a (dtype, shape) tuple; got {raw_side!r}."
+            )
+        dtype, raw_shape = raw_side
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(
+                f"Side field {name!r} dtype must be a torch.dtype; got {dtype!r}."
+            )
+        if not isinstance(raw_shape, tuple) or not raw_shape:
+            raise ValueError(
+                f"Side field {name!r} shape must be a non-empty tuple; got {raw_shape!r}."
+            )
+        _contiguous_strides(raw_shape)
+        spec = SideFieldSpec(
+            name=name,
+            dtype=dtype,
+            shape=raw_shape,
+            alignment_bytes=alignment,
+        )
+        stride0_elems = _aligned_side_stride0(math.prod(raw_shape), dtype, alignment)
+        bytes_per_slot += stride0_elems * _element_size(dtype)
+        parsed.append(spec)
+        by_name[name] = spec
+    return tuple(parsed), by_name, bytes_per_slot
+
+
+class SlotSchema:
+    """Generic drawer schema pairing raw ``uint8`` arena fields with typed side fields.
+
+    Both low-end (for example ``ExpertSlabPool``) and high-end (for example
+    fixed-slot KV caches) arena consumers describe per-slot layouts through
+    ``SlotSchema`` without hardcoding format-specific field names or coupling
+    ``piper-offload`` to kernel math.
+    """
+
+    def __init__(
+        self,
+        arena_fields: Mapping[str, int | tuple[int, ...]],
+        side_fields: Mapping[str, tuple[torch.dtype, tuple[int, ...]]] | None = None,
+        *,
+        field_alignment: int = 256,
+        side_alignment: int = 16,
+    ) -> None:
+        """Validate field specs and compute aligned drawer and side-pool sizes.
+
+        Args:
+            arena_fields: Non-empty mapping of field name -> byte count or ``uint8``
+                inner shape tuple packed inside each aligned arena drawer.
+            side_fields: Optional mapping of field name -> ``(dtype, shape)`` backed
+                by dedicated :class:`TypedSidePool` allocations outside the arena.
+            field_alignment: Power-of-two byte alignment >= 16 applied to each
+                arena field offset inside a drawer.
+            side_alignment: Power-of-two byte alignment >= 16 applied to each side
+                pool's base pointer and ``stride(0)``.
+        """
+        f_align = _validate_alignment(
+            field_alignment, name="field_alignment", min_alignment=16
+        )
+        s_align = _validate_alignment(
+            side_alignment, name="side_alignment", min_alignment=16
+        )
+        parsed_arena, arena_by_name, drawer_bytes = _parse_arena_fields(
+            arena_fields, f_align
+        )
+        parsed_side, side_by_name, side_bytes_per_slot = _parse_side_fields(
+            side_fields, arena_by_name, s_align
+        )
+
+        self._arena_fields = parsed_arena
+        self._side_fields = parsed_side
+        self._arena_by_name = arena_by_name
+        self._side_by_name = side_by_name
+        self._field_alignment = f_align
+        self._side_alignment = s_align
+        self._drawer_bytes = drawer_bytes
+        self._side_bytes_per_slot = side_bytes_per_slot
+
+    @property
+    def arena_fields(self) -> tuple[ArenaFieldSpec, ...]:
+        """Ordered :class:`ArenaFieldSpec` descriptors packed into one drawer."""
+        return self._arena_fields
+
+    @property
+    def side_fields(self) -> tuple[SideFieldSpec, ...]:
+        """Ordered :class:`SideFieldSpec` descriptors backed by :class:`TypedSidePool`."""
+        return self._side_fields
+
+    @property
+    def arena_field_names(self) -> tuple[str, ...]:
+        """Names of all raw ``uint8`` arena fields."""
+        return tuple(spec.name for spec in self._arena_fields)
+
+    @property
+    def side_field_names(self) -> tuple[str, ...]:
+        """Names of all typed side fields."""
+        return tuple(spec.name for spec in self._side_fields)
+
+    @property
+    def field_alignment(self) -> int:
+        """Byte alignment applied to every arena field inside each drawer."""
+        return self._field_alignment
+
+    @property
+    def side_alignment(self) -> int:
+        """Byte alignment requested for every typed side pool."""
+        return self._side_alignment
+
+    @property
+    def drawer_bytes(self) -> int:
+        """Total aligned byte footprint of one ``uint8`` arena drawer."""
+        return self._drawer_bytes
+
+    @property
+    def side_bytes_per_slot(self) -> int:
+        """Total aligned side-pool bytes required per slot across all side fields."""
+        return self._side_bytes_per_slot
+
+    def arena_field(self, name: str) -> ArenaFieldSpec:
+        """Look up the :class:`ArenaFieldSpec` for ``name``."""
+        return self._arena_by_name[name]
+
+    def side_field(self, name: str) -> SideFieldSpec:
+        """Look up the :class:`SideFieldSpec` for ``name``."""
+        return self._side_by_name[name]
+
+
+@dataclass(frozen=True, slots=True)
+class LowSlotLayout:
+    """Layout descriptor for ascending fixed-size slots inside a byte arena."""
+
+    slot_bytes: int
+    slot_stride: int
+    max_slots: int
+    alignment: int
+
+    def slot_offset(self, slot_id: int) -> int:
+        """Return the aligned starting byte offset for ``slot_id``."""
+        idx = _validate_slot_id(slot_id, max_slots=self.max_slots)
+        return idx * self.slot_stride
+
+    def slot_byte_range(self, slot_id: int) -> tuple[int, int]:
+        """Return ``[start, end)`` byte bounds owned by ``slot_id``."""
+        start = self.slot_offset(slot_id)
+        return start, start + self.slot_stride
+
+
+def _compute_low_slot_layout(
+    capacity_bytes: int,
+    alignment: int,
+    slot_bytes: int,
+    *,
+    max_slots: int | None = None,
+) -> LowSlotLayout:
+    sb = _validate_positive_int(slot_bytes, name="slot_bytes")
+    slot_stride = _align_up(sb, alignment)
+    aligned_cap = (capacity_bytes // alignment) * alignment
+    fit_slots = aligned_cap // slot_stride
+    if fit_slots <= 0:
+        raise ArenaCapacityError(
+            f"Arena capacity {capacity_bytes} cannot hold one aligned "
+            f"{slot_stride}-byte low slot."
+        )
+    if max_slots is not None:
+        resolved_max = _validate_positive_int(max_slots, name="max_slots")
+        if resolved_max > fit_slots:
+            raise ArenaCapacityError(
+                f"Requested low max_slots={resolved_max} ({resolved_max * slot_stride} bytes) "
+                f"exceeds arena capacity {aligned_cap}."
+            )
+    else:
+        resolved_max = fit_slots
+    return LowSlotLayout(
+        slot_bytes=sb,
+        slot_stride=slot_stride,
+        max_slots=resolved_max,
+        alignment=alignment,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class HighSlotLayout:
     """Layout descriptor for descending fixed-size slots inside a byte arena."""
@@ -131,13 +420,8 @@ class HighSlotLayout:
 
     def slot_offset(self, slot_id: int) -> int:
         """Return the aligned starting byte offset for ``slot_id``."""
-        if isinstance(slot_id, bool) or not isinstance(slot_id, int):
-            raise TypeError(f"slot_id must be an int; got {slot_id!r}.")
-        if slot_id < 0 or slot_id >= self.max_slots:
-            raise IndexError(
-                f"slot_id {slot_id} out of range [0, {self.max_slots})."
-            )
-        return self.base_offset + slot_id * self.slot_stride
+        idx = _validate_slot_id(slot_id, max_slots=self.max_slots)
+        return self.base_offset + idx * self.slot_stride
 
     def slot_byte_range(self, slot_id: int) -> tuple[int, int]:
         """Return ``[start, end)`` byte bounds owned by ``slot_id``."""
@@ -241,11 +525,17 @@ class Uint8DualArena:
     slices and mutate high-end KV slots inside the same underlying storage
     without triggering PyTorch AOTAutograd's mixed-dtype mutation assertion.
 
-    High-end slots are addressed by non-overlapping indices
-    ``[0 .. max_slots - 1]`` with strictly positive, ``alignment``-aligned
-    ``stride(0)`` and allocated **descending** from ``max_slots - 1`` down so
-    the two ends pack toward each other cleanly. Callers own CUDA stream
-    synchronization and live view lifetimes before invoking :meth:`close`.
+    The low end supports either variable-size slices (:meth:`alloc_low`) or
+    symmetric ascending fixed-size slots (:meth:`configure_low_slots` /
+    :meth:`alloc_low_slot`). The high end supports descending fixed-size slots
+    allocated from ``max_slots - 1`` down so both ends pack toward each other
+    across one frontier. Optional peer reclaim callbacks
+    (:meth:`set_low_reclaimer`, :meth:`set_high_reclaimer`) let fixed-slot
+    allocations (:meth:`alloc_low_slot` and :meth:`alloc_high_slot`; variable
+    :meth:`alloc_low` does not invoke peer reclaim) ask the opposite end to
+    release frontier space outside ``Uint8DualArena``'s internal lock. Callers
+    own CUDA stream synchronization and live view lifetimes before invoking
+    :meth:`close`.
     """
 
     def __init__(
@@ -254,10 +544,25 @@ class Uint8DualArena:
         *,
         device: torch.device | str = "cpu",
         slot_bytes: int | None = None,
+        low_slot_bytes: int | None = None,
+        low_max_slots: int | None = None,
         alignment: int = 256,
         budget: VramBudget | None = None,
         reservation_name: str = "uint8_dual_arena",
     ) -> None:
+        """Allocate aligned single-``uint8`` arena storage and optional slot geometries.
+
+        Args:
+            capacity_bytes: Logical arena byte size (must be >= ``alignment``).
+            device: Target ``cpu`` or ``cuda`` device.
+            slot_bytes: Optional descending high-end slot payload size in bytes.
+            low_slot_bytes: Optional ascending low-end fixed drawer size in bytes.
+            low_max_slots: Optional cap on ascending low-end fixed slots (requires
+                ``low_slot_bytes``).
+            alignment: Power-of-two byte alignment >= 16 for base storage and slot strides.
+            budget: Optional :class:`VramBudget` reserving the arena's allocated bytes.
+            reservation_name: Diagnostic label attached to ``budget`` reservations.
+        """
         cap = _validate_positive_int(capacity_bytes, name="capacity_bytes")
         align = _validate_alignment(alignment, name="alignment", min_alignment=16)
         if cap < align:
@@ -271,9 +576,16 @@ class Uint8DualArena:
             )
         if not isinstance(reservation_name, str) or not reservation_name:
             raise ValueError("reservation_name must be a non-empty string.")
-        initial_layout = (
+        if low_max_slots is not None and low_slot_bytes is None:
+            raise ValueError("low_max_slots requires low_slot_bytes.")
+        initial_high_layout = (
             _compute_high_slot_layout(cap, align, slot_bytes)
             if slot_bytes is not None
+            else None
+        )
+        initial_low_layout = (
+            _compute_low_slot_layout(cap, align, low_slot_bytes, max_slots=low_max_slots)
+            if low_slot_bytes is not None
             else None
         )
 
@@ -293,12 +605,17 @@ class Uint8DualArena:
         self._allocated_bytes = allocated_bytes
         self._device = resolved_device
         self._alignment = align
+        self._budget: VramBudget | None = budget
         self._reservation: VramReservation | None = reservation
         self._low_cursor = 0
         self._low_free: list[tuple[int, int]] = []
         self._active_low: dict[int, ArenaSlice] = {}
-        self._high_layout: HighSlotLayout | None = initial_layout
+        self._low_layout: LowSlotLayout | None = initial_low_layout
+        self._allocated_low_slots: set[int] = set()
+        self._high_layout: HighSlotLayout | None = initial_high_layout
         self._allocated_high_slots: set[int] = set()
+        self._low_reclaimer: Callable[[int], None] | None = None
+        self._high_reclaimer: Callable[[int], None] | None = None
         self._raw_storage: torch.Tensor | None = raw
         self._storage: torch.Tensor | None = storage
         self._base_offset = base_offset
@@ -326,9 +643,27 @@ class Uint8DualArena:
         return self._alignment
 
     @property
+    def budget(self) -> VramBudget | None:
+        """Optional :class:`VramBudget` coordinating this arena's reservation."""
+        return self._budget
+
+    @property
     def slot_layout(self) -> HighSlotLayout | None:
         with self._lock:
             return self._high_layout
+
+    @property
+    def low_slot_layout(self) -> LowSlotLayout | None:
+        """Return configured ascending low-slot geometry, or ``None`` if using variable slices."""
+        with self._lock:
+            return self._low_layout
+
+    def _low_frontier_unlocked(self) -> int:
+        if self._low_layout is not None:
+            if not self._allocated_low_slots:
+                return 0
+            return (max(self._allocated_low_slots) + 1) * self._low_layout.slot_stride
+        return self._low_cursor
 
     def _high_frontier_unlocked(self) -> int:
         if not self._allocated_high_slots:
@@ -341,7 +676,7 @@ class Uint8DualArena:
     def low_frontier(self) -> int:
         """Lowest byte above which all low-end allocations currently sit below."""
         with self._lock:
-            return self._low_cursor
+            return self._low_frontier_unlocked()
 
     @property
     def high_frontier(self) -> int:
@@ -355,12 +690,35 @@ class Uint8DualArena:
         with self._lock:
             if self._storage is None:
                 return 0
-            return max(0, self._high_frontier_unlocked() - self._low_cursor)
+            return max(0, self._high_frontier_unlocked() - self._low_frontier_unlocked())
 
     @property
     def active_low_bytes(self) -> int:
         with self._lock:
+            if self._low_layout is not None:
+                return len(self._allocated_low_slots) * self._low_layout.slot_stride
             return sum(slc.aligned_size for slc in self._active_low.values())
+
+    @property
+    def active_low_slots(self) -> tuple[int, ...]:
+        """Return currently allocated low slot IDs sorted ascending."""
+        with self._lock:
+            return tuple(sorted(self._allocated_low_slots))
+
+    @property
+    def available_low_slots(self) -> int:
+        """Return count of unallocated low slots still clear of ``high_frontier``."""
+        with self._lock:
+            if self._storage is None or self._low_layout is None:
+                return 0
+            layout = self._low_layout
+            high_frontier = self._high_frontier_unlocked()
+            return sum(
+                1
+                for slot_id in range(layout.max_slots)
+                if slot_id not in self._allocated_low_slots
+                and (slot_id + 1) * layout.slot_stride <= high_frontier
+            )
 
     @property
     def active_high_slots(self) -> tuple[int, ...]:
@@ -374,11 +732,12 @@ class Uint8DualArena:
         with self._lock:
             if self._storage is None or self._high_layout is None:
                 return 0
+            low_frontier = self._low_frontier_unlocked()
             return sum(
                 1
                 for slot_id in range(self._high_layout.max_slots)
                 if slot_id not in self._allocated_high_slots
-                and self._high_layout.slot_offset(slot_id) >= self._low_cursor
+                and self._high_layout.slot_offset(slot_id) >= low_frontier
             )
 
     def _require_storage_unlocked(self) -> torch.Tensor:
@@ -401,6 +760,47 @@ class Uint8DualArena:
             storage = self._require_storage_unlocked()
             return storage[arena_slice._offset : arena_slice._offset + arena_slice._size]
 
+    def configure_low_slots(
+        self,
+        slot_bytes: int,
+        *,
+        max_slots: int | None = None,
+    ) -> LowSlotLayout:
+        """Configure or replace ascending fixed-size low slots when the low end is empty."""
+        layout = _compute_low_slot_layout(
+            self._capacity_bytes,
+            self._alignment,
+            slot_bytes,
+            max_slots=max_slots,
+        )
+        with self._lock:
+            self._require_storage_unlocked()
+            if self._active_low or self._allocated_low_slots:
+                raise RuntimeError(
+                    "Cannot reconfigure low slot layout while low allocations are active."
+                )
+            self._low_layout = layout
+            return layout
+
+    def _release_low_owner(
+        self,
+        callback: Callable[[int], None],
+        *,
+        reset_expected: LowSlotLayout | None = None,
+    ) -> None:
+        with self._lock:
+            if self._low_reclaimer == callback:
+                self._low_reclaimer = None
+            if (
+                self._storage is not None
+                and reset_expected is not None
+                and self._low_layout is reset_expected
+                and not self._active_low
+                and not self._allocated_low_slots
+                and self._low_reclaimer is None
+            ):
+                self._low_layout = None
+
     def configure_high_slots(self, slot_bytes: int) -> HighSlotLayout:
         """Configure or replace the descending high-end slot geometry when empty."""
         layout = _compute_high_slot_layout(
@@ -417,12 +817,79 @@ class Uint8DualArena:
             self._high_layout = layout
             return layout
 
+    def set_low_reclaimer(self, callback: Callable[[int], None] | None) -> None:
+        """Register or replace the low-frontier reclaimer invoked outside ``_lock``.
+
+        :meth:`alloc_high_slot` calls ``callback(target_low)`` when high slots
+        need ``low_frontier <= target_low``. Callbacks must pass
+        ``allow_reclaim=False`` when allocating relocation slots on their own end
+        to avoid mutual recursion; non-progress stops reclaim with
+        :class:`ArenaCapacityError`. Passing ``None`` clears unconditionally; use
+        :meth:`clear_low_reclaimer` for identity-checked teardown.
+        """
+        if callback is not None and not callable(callback):
+            raise TypeError("low_reclaimer must be callable or None.")
+        with self._lock:
+            if callback is not None:
+                self._require_storage_unlocked()
+            if (
+                callback is not None
+                and self._low_reclaimer is not None
+                and self._low_reclaimer != callback
+            ):
+                raise RuntimeError("A low frontier reclaimer is already registered.")
+            self._low_reclaimer = callback
+
+    def clear_low_reclaimer(self, callback: Callable[[int], None]) -> None:
+        """Clear ``callback`` if it is currently registered as the low frontier reclaimer."""
+        with self._lock:
+            if self._low_reclaimer == callback:
+                self._low_reclaimer = None
+
+    def set_high_reclaimer(self, callback: Callable[[int], None] | None) -> None:
+        """Register or replace the high-frontier reclaimer invoked outside ``_lock``.
+
+        :meth:`alloc_low_slot` calls ``callback(needed_high)`` when low slots
+        need ``high_frontier >= needed_high``. Callbacks must pass
+        ``allow_reclaim=False`` when allocating relocation slots on their own end
+        to avoid mutual recursion; non-progress stops reclaim with
+        :class:`ArenaCapacityError`. Passing ``None`` clears unconditionally; use
+        :meth:`clear_high_reclaimer` for identity-checked teardown.
+        """
+        if callback is not None and not callable(callback):
+            raise TypeError("high_reclaimer must be callable or None.")
+        with self._lock:
+            if callback is not None:
+                self._require_storage_unlocked()
+            if (
+                callback is not None
+                and self._high_reclaimer is not None
+                and self._high_reclaimer != callback
+            ):
+                raise RuntimeError("A high frontier reclaimer is already registered.")
+            self._high_reclaimer = callback
+
+    def clear_high_reclaimer(self, callback: Callable[[int], None]) -> None:
+        """Clear ``callback`` if it is currently registered as the high frontier reclaimer."""
+        with self._lock:
+            if self._high_reclaimer == callback:
+                self._high_reclaimer = None
+
+    def raw_uint8_view(self) -> torch.Tensor:
+        """Return the underlying 1-D aligned ``torch.uint8`` arena view."""
+        with self._lock:
+            return self._require_storage_unlocked()
+
     def alloc_low(self, nbytes: int, *, tag: str = "") -> ArenaSlice:
         """Allocate ``nbytes`` (aligned up) from the low end with free-list reuse."""
         req = _validate_positive_int(nbytes, name="nbytes")
         aligned = _align_up(req, self._alignment)
         with self._lock:
             self._require_storage_unlocked()
+            if self._low_layout is not None:
+                raise RuntimeError(
+                    "Cannot use variable alloc_low() when fixed low slots are configured."
+                )
             for idx, (hole_off, hole_size) in enumerate(self._low_free):
                 if hole_size >= aligned:
                     if hole_size == aligned:
@@ -473,25 +940,154 @@ class Uint8DualArena:
                 merged.pop()
             self._low_free = merged
 
-    def alloc_high_slot(self) -> int:
-        """Allocate the highest free slot index whose range stays above ``low_frontier``."""
-        with self._lock:
-            self._require_storage_unlocked()
-            if self._high_layout is None:
-                raise RuntimeError("High slots are not configured on this Uint8DualArena.")
-            layout = self._high_layout
-            for slot_id in range(layout.max_slots - 1, -1, -1):
-                if slot_id in self._allocated_high_slots:
-                    continue
-                start, _end = layout.slot_byte_range(slot_id)
-                if start < self._low_cursor:
+    def alloc_low_slot(
+        self,
+        *,
+        allow_reclaim: bool = True,
+        max_slot_id: int | None = None,
+    ) -> int:
+        """Allocate the lowest free low slot index whose range stays below ``high_frontier``."""
+        if max_slot_id is not None and (
+            isinstance(max_slot_id, bool) or not isinstance(max_slot_id, int)
+        ):
+            raise ValueError(f"max_slot_id must be an int or None; got {max_slot_id!r}.")
+        prev_high: int | None = None
+        while True:
+            reclaimer: Callable[[int], None] | None = None
+            needed_high = 0
+            with self._lock:
+                self._require_storage_unlocked()
+                if self._low_layout is None:
+                    raise RuntimeError("Low slots are not configured on this Uint8DualArena.")
+                layout = self._low_layout
+                high_frontier = self._high_frontier_unlocked()
+                upper = (
+                    layout.max_slots
+                    if max_slot_id is None
+                    else max(0, min(layout.max_slots, max_slot_id + 1))
+                )
+                first_free: int | None = None
+                for slot_id in range(upper):
+                    if slot_id in self._allocated_low_slots:
+                        continue
+                    if first_free is None:
+                        first_free = slot_id
+                    if (slot_id + 1) * layout.slot_stride <= high_frontier:
+                        self._allocated_low_slots.add(slot_id)
+                        return slot_id
                     break
-                self._allocated_high_slots.add(slot_id)
-                return slot_id
-            raise ArenaCapacityError(
-                f"No high slot fits above low_frontier={self._low_cursor} "
-                f"(slot_stride={layout.slot_stride}, max_slots={layout.max_slots})."
+                if (
+                    not allow_reclaim
+                    or first_free is None
+                    or self._high_reclaimer is None
+                ):
+                    raise ArenaCapacityError(
+                        f"No low slot fits below high_frontier={high_frontier} "
+                        f"(slot_stride={layout.slot_stride}, max_slots={layout.max_slots})."
+                    )
+                needed_high = (first_free + 1) * layout.slot_stride
+                if needed_high > self._capacity_bytes or (
+                    prev_high is not None and high_frontier <= prev_high
+                ):
+                    raise ArenaCapacityError(
+                        f"No low slot fits below high_frontier={high_frontier} "
+                        f"(slot_stride={layout.slot_stride}, max_slots={layout.max_slots})."
+                    )
+                prev_high = high_frontier
+                reclaimer = self._high_reclaimer
+            reclaimer(needed_high)
+
+    def free_low_slot(self, slot_id: int) -> None:
+        """Return fixed low ``slot_id`` to the arena (idempotent if already free)."""
+        with self._lock:
+            if self._low_layout is None:
+                raise RuntimeError("Low slots are not configured on this Uint8DualArena.")
+            self._low_layout.slot_offset(slot_id)
+            self._allocated_low_slots.discard(slot_id)
+
+    def low_slot_tensor(self, slot_id: int) -> torch.Tensor:
+        """Return a 1D ``torch.uint8`` view of length ``slot_bytes`` for low ``slot_id``."""
+        with self._lock:
+            if self._low_layout is None:
+                raise RuntimeError("Low slots are not configured on this Uint8DualArena.")
+            storage = self._require_storage_unlocked()
+            start = self._low_layout.slot_offset(slot_id)
+            return storage[start : start + self._low_layout.slot_bytes]
+
+    def low_pool_view(
+        self,
+        inner_shape: tuple[int, ...],
+        *,
+        field_offset: int = 0,
+    ) -> torch.Tensor:
+        """Return a positive-stride ``uint8`` tensor ``[max_slots, *inner_shape]`` on low slots."""
+        shape = tuple(inner_shape)
+        inner_strides = _contiguous_strides(shape)
+        inner_numel = math.prod(shape)
+        off = _validate_nonneg_int(field_offset, name="field_offset")
+        if off % 16 != 0:
+            raise ValueError(
+                f"field_offset ({off}) must be a multiple of 16 bytes for alignment."
             )
+        with self._lock:
+            if self._low_layout is None:
+                raise RuntimeError("Low slots are not configured on this Uint8DualArena.")
+            self._require_storage_unlocked()
+            raw = self._raw_storage
+            assert raw is not None
+            layout = self._low_layout
+            if off + inner_numel > layout.slot_bytes:
+                raise ValueError(
+                    f"field_offset ({off}) + inner_shape {shape} ({inner_numel} bytes) "
+                    f"exceeds low slot_bytes={layout.slot_bytes}."
+                )
+            return raw.as_strided(
+                size=(layout.max_slots, *shape),
+                stride=(layout.slot_stride, *inner_strides),
+                storage_offset=self._base_offset + off,
+            )
+
+    def alloc_high_slot(self, *, allow_reclaim: bool = True) -> int:
+        """Allocate the highest free slot index whose range stays above ``low_frontier``."""
+        prev_low: int | None = None
+        while True:
+            reclaimer: Callable[[int], None] | None = None
+            target_low = 0
+            with self._lock:
+                self._require_storage_unlocked()
+                if self._high_layout is None:
+                    raise RuntimeError("High slots are not configured on this Uint8DualArena.")
+                layout = self._high_layout
+                low_frontier = self._low_frontier_unlocked()
+                first_free: int | None = None
+                for slot_id in range(layout.max_slots - 1, -1, -1):
+                    if slot_id in self._allocated_high_slots:
+                        continue
+                    if first_free is None:
+                        first_free = slot_id
+                    start, _end = layout.slot_byte_range(slot_id)
+                    if start < low_frontier:
+                        break
+                    self._allocated_high_slots.add(slot_id)
+                    return slot_id
+                if (
+                    not allow_reclaim
+                    or first_free is None
+                    or self._low_reclaimer is None
+                ):
+                    raise ArenaCapacityError(
+                        f"No high slot fits above low_frontier={low_frontier} "
+                        f"(slot_stride={layout.slot_stride}, max_slots={layout.max_slots})."
+                    )
+                target_low = layout.slot_offset(first_free)
+                if target_low < 0 or (prev_low is not None and low_frontier >= prev_low):
+                    raise ArenaCapacityError(
+                        f"No high slot fits above low_frontier={low_frontier} "
+                        f"(slot_stride={layout.slot_stride}, max_slots={layout.max_slots})."
+                    )
+                prev_low = low_frontier
+                reclaimer = self._low_reclaimer
+            reclaimer(target_low)
 
     def free_high_slot(self, slot_id: int) -> None:
         """Return ``slot_id`` to the high-end pool (idempotent if already free)."""
@@ -607,7 +1203,7 @@ class Uint8DualArena:
         return tuple(hits)
 
     def overlapping_low_slices(self, slot_id: int) -> tuple[ArenaSlice, ...]:
-        """Return active low-end slices overlapping high slot ``slot_id``'s bytes."""
+        """Return active variable :meth:`alloc_low` slices overlapping high ``slot_id``."""
         with self._lock:
             if self._high_layout is None:
                 raise RuntimeError("High slots are not configured on this Uint8DualArena.")
@@ -615,11 +1211,11 @@ class Uint8DualArena:
             return self._overlapping_low_unlocked(slot_start, slot_end)
 
     def blocking_low_slices(self, slot_id: int) -> tuple[ArenaSlice, ...]:
-        """Return active low slices pinning ``low_frontier`` above high slot ``slot_id``.
+        """Return active variable :meth:`alloc_low` slices pinning ``low_frontier`` above ``slot_id``.
 
-        Unlike :meth:`overlapping_low_slices`, this includes slices at higher
-        offsets up to ``low_frontier`` whose eviction is required for
-        ``low_frontier`` to shrink below ``slot_id``'s start byte.
+        Unlike :meth:`overlapping_low_slices`, this inspects variable slices up
+        to the variable low cursor whose eviction is required to shrink
+        ``low_frontier`` below high ``slot_id``'s start byte.
         """
         with self._lock:
             if self._high_layout is None:
@@ -634,7 +1230,7 @@ class Uint8DualArena:
         start_byte: int,
         end_byte: int,
     ) -> tuple[ArenaSlice, ...]:
-        """Return active low-end slices intersecting ``[start_byte, end_byte)``."""
+        """Return active variable :meth:`alloc_low` slices intersecting ``[start_byte, end_byte)``."""
         start = _validate_nonneg_int(start_byte, name="start_byte")
         end = _validate_nonneg_int(end_byte, name="end_byte")
         if end < start:
@@ -652,7 +1248,10 @@ class Uint8DualArena:
             self._active_low.clear()
             self._low_free.clear()
             self._low_cursor = 0
+            self._allocated_low_slots.clear()
             self._allocated_high_slots.clear()
+            self._low_reclaimer = None
+            self._high_reclaimer = None
             self._raw_storage = None
             self._storage = None
             self._base_offset = 0
@@ -707,11 +1306,10 @@ class TypedSidePool:
         shape = tuple(inner_shape)
         inner_strides = _contiguous_strides(shape)
         inner_numel = math.prod(shape)
-        elem_bytes = torch.empty((), dtype=dtype).element_size()
-        align_elems = max(1, math.lcm(align_b, elem_bytes) // elem_bytes)
+        elem_bytes = _element_size(dtype)
 
         if stride0 is None:
-            resolved_stride0 = _align_up(inner_numel, align_elems)
+            resolved_stride0 = _aligned_side_stride0(inner_numel, dtype, align_b)
         else:
             resolved_stride0 = _validate_positive_int(stride0, name="stride0")
             if resolved_stride0 < inner_numel:
@@ -880,8 +1478,6 @@ class StructuredSidePool:
         )
         if not isinstance(dtype, torch.dtype):
             raise ValueError(f"dtype must be a torch.dtype; got {dtype!r}.")
-        elem_bytes = torch.empty((), dtype=dtype).element_size()
-        align_elems = max(1, math.lcm(align_b, elem_bytes) // elem_bytes)
 
         offset = 0
         field_specs: list[tuple[str, tuple[int, ...], tuple[int, ...], int]] = []
@@ -891,7 +1487,7 @@ class StructuredSidePool:
             shape = tuple(raw_shape)
             strides = _contiguous_strides(shape)
             numel = math.prod(shape)
-            field_stride = _align_up(numel, align_elems)
+            field_stride = _aligned_side_stride0(numel, dtype, align_b)
             field_specs.append((name, shape, strides, offset))
             offset += field_stride
         slot_stride = offset
@@ -1100,9 +1696,13 @@ class KvMetadataPool:
 
 __all__ = [
     "ArenaCapacityError",
+    "ArenaFieldSpec",
     "ArenaSlice",
     "HighSlotLayout",
     "KvMetadataPool",
+    "LowSlotLayout",
+    "SideFieldSpec",
+    "SlotSchema",
     "StructuredSidePool",
     "TypedSidePool",
     "Uint8DualArena",

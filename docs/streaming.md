@@ -131,6 +131,90 @@ arenas) share one CUDA GPU:
   worker across concurrent models on the same GPU. Active sessions borrow the
   context (refusing `ctx.close()` until all borrowers deactivate).
 
+## Stream keyed slabs (`ExpertSlabPool`)
+
+When an MoE runtime (or another keyed collection of fixed-schema experts or
+blocks) needs slot-level streaming without embedding `piper-offload` inside model
+definitions, define a format-agnostic `SlotSchema`, pair a `Uint8DualArena` with
+an `ExpertSlabPool`, and iterate yielded waves around the kernel call:
+
+```python
+import torch
+from piper_offload import ExpertSlabPool, SlotSchema, Uint8DualArena
+
+schema = SlotSchema(
+    {"up_gate": max_up_bytes, "down": max_down_bytes},
+    {"up_gate_scale": (torch.float32, (up_out,))},
+)
+with (
+    Uint8DualArena(arena_bytes, device="cuda", budget=budget) as arena,
+    ExpertSlabPool(arena, schema, transfer_context=transfer_context) as pool,
+):
+    pool.register_group("layer0", experts)  # frozen CPU plain-tensor mappings per group
+
+    with pool.waves("layer0", active_expert_ids) as waves:
+        for wave in waves:
+            run_expert_kernel(
+                wave.arena_views,     # field -> strided [max_slots, *shape] uint8 view
+                wave.side_views,      # field -> strided [max_slots, *shape] typed pool
+                                      #   (aligned stride(0), contiguous per-slot slice)
+                wave.arena_bytes,     # 1-D uint8 arena for slot_offsets indexing
+                wave.slot_offsets,    # field -> int64[max_slots] byte offsets in wave.arena_bytes
+                wave.expert_to_slot,  # int32[num_experts] wave slots (-1 otherwise;
+                                      #   all group experts on the zero-sync fast path)
+                accumulate=wave.index > 0,
+            )
+```
+
+Key behaviors and contracts of [`ExpertSlabPool`](../src/piper_offload/expert_slab_pool.py)
+and [`Uint8DualArena`](../src/piper_offload/dual_arena.py):
+
+- **Fixed aligned drawers:** Every low slot holds `schema.drawer_bytes` aligned
+  bytes (requiring `arena.alignment >= schema.field_alignment` and
+  `slot_stride % schema.field_alignment == 0`), while transfers copy only each
+  expert's actual `src.nbytes`. Trailing bytes beyond `src.nbytes` are left
+  uninitialized across slot reuse.
+- **Wave staging & CUDA stream lifetime:** Cache hits execute first when
+  available (`is_hit_wave=True`), while misses stage on the CUDA copy stream via
+  `PinManager` and execute in subsequent accumulating waves. When free or
+  transient slot headroom exists, the next miss wave stages ahead behind active
+  execution; when all `max_slots` hold resident experts, subsequent miss waves
+  stage once active wave slots finish and release. Pass `transfer_context` to
+  share one CUDA copy stream across components on the same device, and pass
+  `budget` (which `ExpertSlabPool` inherits from `arena.budget` by default; note
+  the parameter name `budget` rather than `ModelOffloader`'s `vram_budget`) to
+  coordinate `TypedSidePool` allocations inside `VramBudget`. Kernels reading a
+  wave must launch on the CUDA stream active when fetching that wave, before
+  requesting the next wave or exiting `with pool.waves(...)`.
+- **Decode caching vs. prefill / speculative isolation:** Decode (`bypass=False`)
+  uses W-TinyLFU frequency admission (`pin=True`), borrowing at most one resident
+  slot per rejected cold miss wave so hot experts survive cold spikes. Prefill
+  passes can set `bypass=True` to use a bounded transient window (default
+  `max(1, max_slots // 4)`, configurable via `default_bypass_wave_slots` or
+  `max_wave_slots`) with pageable leases (`pin=False`) instead of forcing new host
+  registrations. Speculative passes can run drafts under
+  `with pool.no_record_stats():` and promote accepted keys with
+  `pool.commit_accepted(...)`. Call `pool.prefetch(...)` to warm misses ahead
+  of execution without reclaiming high-end peers. When every expert in a group
+  occupies a `READY` slot and either stats recording is off or total registered
+  experts fit within `max_slots`, `waves()` returns one fast-path wave covering
+  `0..num_experts-1` and skips CPU readbacks of non-empty integer `expert_ids`
+  tensors (even all-`-1` tensors; all-sentinel Python iterables still yield 0
+  waves). Out-of-range integer IDs (`< 0` or `>= num_experts`) are ignored as
+  sentinels.
+- **Host immutability, read-only waves & teardown:** `register_group()` requires
+  frozen (`requires_grad=False`) CPU plain tensors (`torch.Tensor` or frozen
+  `nn.Parameter`) and retains compatible storage immutably via
+  `capture_host_tensor`. Treat all yielded `ExpertWave` tensors as strictly
+  read-only. Close `pool` outside active `waves()` sessions and before closing
+  `arena`.
+- **Shared frontier negotiation:** `Uint8DualArena` coordinates low-end and
+  high-end fixed slots across one frontier via `set_low_reclaimer` and
+  `set_high_reclaimer` callbacks invoked outside the arena lock. On high-end
+  pressure, `ExpertSlabPool` relocates resident frontier experts into lower
+  idle or colder slots when possible, or otherwise evicts unleased frontier
+  slots without disturbing active wave readers.
+
 ## Yield to collectives
 
 Weight copies and transfers of the `piper_relay` process group and CUDA
