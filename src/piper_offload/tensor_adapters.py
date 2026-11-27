@@ -79,9 +79,9 @@ def host_state_is_owned[HostStateT](
     """Whether every physical tensor of ``state`` lives in storage this process allocated.
 
     A view into a file mapping, or into a buffer the process did not
-    allocate, is not owned. Piper never writes into a file mapping: the pin
-    manager may return its pages to the file, so merge targets modified in place
-    must be owned first.
+    allocate, is not owned. Piper never writes into a file mapping: file-backed
+    checkpoint storage stays read-only while owned copies or direct I/O serve
+    transfers, so merge targets modified in place must be owned first.
     """
     return all(tensor.untyped_storage().resizable() for tensor in adapter.storage_tensors(state))
 

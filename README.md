@@ -89,7 +89,7 @@ a pinned release.
 | Cache models, manage activation, inspect or release resources | [Models](https://github.com/Boffee/piper-offload/blob/main/docs/models.md) |
 | Run models larger than VRAM or compile inference blocks | [Streaming](https://github.com/Boffee/piper-offload/blob/main/docs/streaming.md) |
 | Apply LoRA, parameter deltas, or parameter values | [Adapters](https://github.com/Boffee/piper-offload/blob/main/docs/adapters.md) |
-| Configure checkpoint backing, pinning, and Windows copy retention | [Memory](https://github.com/Boffee/piper-offload/blob/main/docs/memory.md) |
+| Configure checkpoint backing, host pinning, and two-tier memory | [Memory](https://github.com/Boffee/piper-offload/blob/main/docs/memory.md) |
 | Check tensor formats, optional dependencies, or DTensor support | [Formats](https://github.com/Boffee/piper-offload/blob/main/docs/formats.md) |
 | Understand the implementation or contribute changes | [Development](https://github.com/Boffee/piper-offload/blob/main/docs/development.md) |
 

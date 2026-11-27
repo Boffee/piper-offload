@@ -1,22 +1,19 @@
-"""Select the host memory component once at import; native calls remain lazy.
+"""Select the platform host memory helpers once at import; native calls remain lazy.
 
-Pinning mechanisms are not probed at runtime. Linux copies use anonymous
-mappings and Windows copies use ``VirtualAlloc`` regions. File fills use
-positional reads where available, otherwise one handle per worker. Allocation
-and reader contracts live in the selected platform module; copy ownership and
-preparation are defined by :mod:`piper_offload._copy_memory`.
+Linux allocations use anonymous mappings and Windows allocations use
+``VirtualAlloc`` regions. Budget fractions reflect safe defaults (70% pinned /
+80% total host on Linux bounded by cgroups; 45% pinned / 75% total host on
+Windows WDDM).
 """
 
 import logging
 import mmap
-import os
 import sys
 from collections.abc import Buffer
 from fractions import Fraction
 from typing import Protocol
 
 if sys.platform == "win32":
-    from ._copy_memory_windows import Memory
     from ._host_memory_windows import (
         DEFAULT_HOST_FRACTION,
         DEFAULT_PIN_FRACTION,
@@ -29,18 +26,11 @@ else:
     from ._host_memory_linux import (
         DEFAULT_HOST_FRACTION,
         DEFAULT_PIN_FRACTION,
-        Memory,
         available_memory,
     )
     from ._host_memory_linux import (
         allocate_aligned_region as _platform_allocate_aligned_region,
     )
-
-    # Preserve per-worker handles on systems without positional reads.
-    if not hasattr(os, "preadv"):
-        from ._host_memory_windows import Readers
-
-        Memory.readers = Readers
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +75,6 @@ __all__ = [
     "DEFAULT_HOST_FRACTION",
     "DEFAULT_PIN_FRACTION",
     "AlignedRegion",
-    "Memory",
     "allocate_aligned_region",
     "available_memory",
     "default_host_budget",

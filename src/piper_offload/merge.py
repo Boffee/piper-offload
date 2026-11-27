@@ -135,8 +135,8 @@ def merge_adapter(
     parameter, preserving any tied aliases of the original parameter.
     A target that is a view into a file mapping is likewise
     merged into an independent copy installed under every tied name: Piper
-    never writes into a file mapping, because the pin manager
-    may return a mapping's pages to the file.
+    never writes into a file mapping; file-backed checkpoint storage stays
+    read-only while owned copies or direct I/O serve device transfers.
     """
     active = active_adapter_pairs(adapters)
     if not active:

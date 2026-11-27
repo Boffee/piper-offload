@@ -57,7 +57,7 @@ the code that owns a behavior.
 - [Memory](docs/memory.md). Keep mappings read-only and write to owned storage.
   Asynchronous transfers hold pin leases. Tensor adapters copy through
   `transfer_()`. Only repeated transfers request pinning. Memory component
-  docstrings specify Windows reclaim and lock ordering.
+  docstrings specify Tier 2a/2b lifetimes, bounce staging, and lock ordering.
 - [Relay communication](src/piper_offload/communication.py). Preserve collective
   issue order, point-to-point progress, and buffer lifetimes through completion.
   A failed shared exchange can leave partial outputs and requires a new process group.

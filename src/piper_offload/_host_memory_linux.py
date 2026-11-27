@@ -1,16 +1,10 @@
-"""Linux host memory: physical and cgroup limits, anonymous mappings, and positional reads."""
+"""Linux host memory: physical and cgroup limits and aligned anonymous mappings."""
 
-import contextlib
-import functools
-import io
 import mmap
 import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
-
-from ._copy_memory import Copy
-from ._copy_memory import Memory as CopyMemory
 
 _PROC_CGROUP = "/proc/self/cgroup"
 _CGROUP_MOUNT = "/sys/fs/cgroup"
@@ -67,31 +61,6 @@ def available_memory() -> int:
     return total if limit is None else min(total, limit)
 
 
-def _preadv(fd: int, buffer: memoryview, offset: int) -> int:
-    # preadv is absent on Windows, where the selector uses per-worker handles.
-    preadv = cast(Callable[[int, list[memoryview], int], int], getattr(os, "preadv"))  # noqa: B009
-    return preadv(fd, [buffer], offset)
-
-
-class Readers(contextlib.AbstractContextManager["Readers"]):
-    """Positional reads share the checkpoint's descriptor without moving its file position."""
-
-    def read_at(self, file: io.BufferedReader) -> Callable[[memoryview, int], int]:
-        return functools.partial(_preadv, file.fileno())
-
-    def __exit__(self, *_exc: object) -> None:
-        pass
-
-
-class Memory(CopyMemory):
-    """Linux copies use anonymous mappings and return to the OS on eviction."""
-
-    readers = Readers
-
-    def new_copy(self, size: int) -> Copy:
-        return Copy(size, mmap.mmap(-1, size))
-
-
 def allocate_aligned_region(size: int) -> mmap.mmap:
     """Allocate ``size`` bytes of page-aligned anonymous memory."""
     if isinstance(size, bool) or not isinstance(size, int) or size <= 0 or size % mmap.PAGESIZE != 0:
@@ -104,8 +73,6 @@ def allocate_aligned_region(size: int) -> mmap.mmap:
 __all__ = [
     "DEFAULT_HOST_FRACTION",
     "DEFAULT_PIN_FRACTION",
-    "Memory",
-    "Readers",
     "allocate_aligned_region",
     "available_memory",
 ]
