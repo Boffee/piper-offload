@@ -1,10 +1,13 @@
 """Additive broadcasting: shape policy, arithmetic, and load lifetimes."""
 
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
-from safetensors.torch import save_file
 from torch import nn
+
+from tests.test_checkpoint import _write as _write_safetensors
 
 import piper_offload._parameter_update as parameter_update_impl
 from piper_offload import (
@@ -237,7 +240,7 @@ def test_quantized_broadcast_requires_explicit_capability(kind):
     )
     adapter = Adapter({"first": ParameterDelta.from_tensors(dense=torch.ones(())), "weight": delta})
 
-    with pytest.raises(ValueError, match="PiperConvRotInt8Adapter does not support broadcast"):
+    with pytest.raises(ValueError, match="PiperQuantizedAdapter does not support broadcast"):
         merge_adapter(model, [(adapter, 1.0)])
     assert torch.count_nonzero(model.first) == 0
     torch.testing.assert_close(weight.dequantize(), before)
@@ -263,7 +266,7 @@ def test_prepared_local_sources_reuse_mapped_views(tmp_path, monkeypatch):
         "b": torch.arange(12, dtype=torch.float32).reshape(6, 2) / 8,
     }
     path = tmp_path / "delta.safetensors"
-    save_file(sources, path)
+    _write_safetensors(Path(path), sources)
     with MappedCheckpoint(path) as checkpoint:
         mapped = {name: checkpoint.get_tensor(name) for name in sources}
     delta = ParameterDelta.from_tensors(**mapped)
@@ -367,7 +370,7 @@ def test_broadcast_activation_restores_mapped_model_and_sources(
         "bias_delta": torch.tensor(0.25),
     }
     path = tmp_path / "model-and-adapter.safetensors"
-    save_file(base | sources, path)
+    _write_safetensors(Path(path), base | sources)
     with MappedCheckpoint(path) as checkpoint:
         mapped = {name: checkpoint.get_tensor(name) for name in base | sources}
     model.load_state_dict({name: mapped[name] for name in base}, assign=True)

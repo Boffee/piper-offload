@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import gc
 import logging
 import math
@@ -13,7 +14,8 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from safetensors.torch import save_file
+
+from tests.test_checkpoint import _write as _write_safetensors
 
 import piper_offload._host_memory as host_memory
 import piper_offload._host_memory_linux as linux_memory
@@ -210,7 +212,7 @@ class TestHostSlabArena:
         base = torch.arange(24, dtype=torch.float32).reshape(4, 6)
         cplx = torch.complex(torch.randn(3, 4), torch.randn(3, 4))
         bf16 = torch.randn(7, 5, dtype=torch.bfloat16)
-        save_file({"base": base, "bf16": bf16}, st_path)
+        _write_safetensors(st_path, {"base": base, "bf16": bf16})
 
         with MappedCheckpoint(st_path) as ckpt:
             fs_base = file_slice(ckpt.get_tensor("base"))
@@ -693,7 +695,7 @@ class TestPinnedBounceRing:
         t_small = torch.randn(31, 47, dtype=torch.bfloat16)
         # > 100 KiB tensor so multi-chunk streaming spans multiple 32 KiB bounce slots.
         t_large = torch.randn(192, 192, dtype=torch.float32)
-        save_file({"small": t_small, "large": t_large}, st_path)
+        _write_safetensors(st_path, {"small": t_small, "large": t_large})
 
         with MappedCheckpoint(st_path) as ckpt:
             fs_small = file_slice(ckpt.get_tensor("small"))
@@ -843,7 +845,7 @@ class TestPinnedBounceRing:
     ) -> None:
         st_path = tmp_path / "concurrent_stream.safetensors"
         tensor = torch.randn(192, 192, dtype=torch.float32)
-        save_file({"w": tensor}, st_path)
+        _write_safetensors(st_path, {"w": tensor})
         with MappedCheckpoint(st_path) as ckpt:
             fs = file_slice(ckpt.get_tensor("w"))
         assert fs is not None
@@ -1180,7 +1182,7 @@ class TestPinnedBounceRingCudaRegressions:
     def test_cuda_run_pipelined_chunks_drains_worker_before_checkin_on_interrupt(self, tmp_path: Path) -> None:
         st_path = tmp_path / "pipe_ki.safetensors"
         tensor = torch.arange(16 * PAGE, dtype=torch.uint8)
-        save_file({"w": tensor}, st_path)
+        _write_safetensors(st_path, {"w": tensor})
         backend = _FakeBackend()
         ring = PinnedBounceRing(slot_bytes=4 * PAGE, num_slots=3, backend=backend)
         orig_copy = ring._copy_slot_to_cuda
@@ -1415,7 +1417,9 @@ class TestHostArenaFinalReviewRegressions:
                 self.closed = False
 
             def __buffer__(self, flags: int, /) -> memoryview:
-                return memoryview(self._tensor.numpy())
+                return memoryview(
+                    (ctypes.c_float * self._tensor.numel()).from_address(self._tensor.data_ptr())
+                )
 
             def close(self) -> None:
                 self.closed = True

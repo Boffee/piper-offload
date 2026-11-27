@@ -4,9 +4,8 @@ import pytest
 import torch
 from torch import nn
 
-from piper_offload._piper_convrot_int8 import create_convrot_int8_tensor
 from piper_offload.host_param import HostParam
-from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
+from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter
 from piper_offload.tensor_adapter_registry import tensor_id
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -43,12 +42,12 @@ class TestConv3dWeight:
     def test_activation_scale_participates_in_identity_and_layout(self):
         weight = self._weight()
         original_id = tensor_id(weight)
-        original_layout = PiperConvRotInt8Adapter.layout_signature(weight)
+        original_layout = PiperQuantizedAdapter.layout_signature(weight)
         weight.act_per_tensor_scale = torch.tensor(0.03)
         assert tensor_id(weight) != original_id
-        assert PiperConvRotInt8Adapter.layout_signature(weight) == original_layout
+        assert PiperQuantizedAdapter.layout_signature(weight) == original_layout
         weight.act_per_tensor_scale = None
-        assert PiperConvRotInt8Adapter.layout_signature(weight) != original_layout
+        assert PiperQuantizedAdapter.layout_signature(weight) != original_layout
 
     @CUDA
     def test_offloaded_weight_preserves_scale_and_convolution_execution(self):
@@ -77,9 +76,9 @@ class TestConv3dWeight:
         assert not getattr(weight, storage).is_contiguous()
         with pytest.raises(ValueError, match="must be contiguous"):
             if operation == "validate":
-                PiperConvRotInt8Adapter.matches(weight)
+                PiperQuantizedAdapter.matches(weight)
             else:
-                create_convrot_int8_tensor(
+                _convrot_cls()(
                     weight.qdata,
                     weight.scale,
                     weight.group_size,
@@ -93,13 +92,13 @@ class TestConv3dWeight:
 
         def validate():
             if operation == "dense":
-                return PiperConvRotInt8Adapter.validate_dense_merge(weight)
-            return PiperConvRotInt8Adapter.validate_lora_merge(weight)
+                return PiperQuantizedAdapter.validate_dense_merge(weight)
+            return PiperQuantizedAdapter.validate_lora_merge(weight)
 
         with pytest.raises(NotImplementedError, match="updates require a 2-D weight"):
             validate()
 
     def test_offload_rejects_unrepresented_matrix_transpose(self):
         weight = _convrot_cls().from_hp(torch.ones(8, 64), group_size=64).t()
-        with pytest.raises(NotImplementedError, match="untransposed weight"):
+        with pytest.raises(NotImplementedError, match="transposed weight"):
             HostParam(nn.Parameter(weight, requires_grad=False))

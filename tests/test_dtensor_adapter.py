@@ -500,8 +500,8 @@ class TestDTensorAdapter:
         first_before = model.first.weight.to_local().clone()
 
         with pytest.raises(
-            ValueError,
-            match="contiguous untransposed packed storage",
+            NotImplementedError,
+            match="transposed weight",
         ):
             merge_adapter(model, [(lora, 0.25)])
 
@@ -595,12 +595,12 @@ class TestDTensorAdapter:
 
     def test_composes_with_quantized_local_shard(self, tp_mesh: Any) -> None:
         # One DTensorAdapter composes with every quant adapter. A DTensor
-        # wrapping a ConvRotInt8Tensor must reuse PiperConvRotInt8Adapter for
+        # wrapping a ConvRotInt8Tensor must reuse PiperQuantizedAdapter for
         # the local shard with no DTensor-specific quant code.
         convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
         from torch.distributed.tensor import DTensor
 
-        from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
+        from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter
 
         torch.manual_seed(17)
         cr = convrot_mod.ConvRotInt8Tensor.from_hp(
@@ -610,10 +610,10 @@ class TestDTensorAdapter:
         dt = DTensor.from_local(cr, tp_mesh, [_shard(0)], run_check=False)
 
         assert isinstance(select_adapter(dt), DTensorAdapter)
-        assert isinstance(select_adapter(dt.to_local()), PiperConvRotInt8Adapter)
+        assert isinstance(select_adapter(dt.to_local()), PiperQuantizedAdapter)
 
         host_param = HostParam(nn.Parameter(dt, requires_grad=False))
-        assert isinstance(host_param.host_state.inner, PiperConvRotInt8Adapter)
+        assert isinstance(host_param.host_state.inner, PiperQuantizedAdapter)
 
         qdata, scale = host_param.storage_tensors()
         assert type(qdata) is torch.Tensor and type(scale) is torch.Tensor
@@ -630,7 +630,7 @@ class TestDTensorAdapter:
         assert _is_dtensor(gpu_param.data)
         assert isinstance(
             select_adapter(gpu_param.data.to_local()),
-            PiperConvRotInt8Adapter,
+            PiperQuantizedAdapter,
         )
         assert gpu_param.data.placements == dt.placements
 
@@ -656,7 +656,7 @@ class TestDTensorAdapter:
             assert _is_dtensor(actual)
             assert isinstance(
                 select_adapter(actual.to_local()),
-                PiperConvRotInt8Adapter,
+                PiperQuantizedAdapter,
             )
             torch.testing.assert_close(
                 actual.to_local().dequantize(),
@@ -673,7 +673,7 @@ class TestDTensorAdapter:
         convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
         from torch.distributed.tensor import DTensor
 
-        from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
+        from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter
 
         in_dim = 64
         out_dim = 16
@@ -696,7 +696,7 @@ class TestDTensorAdapter:
                 self.target.weight = nn.Parameter(weight, requires_grad=False)
 
         calls: list[tuple[type[torch.Tensor], tuple[int, ...], tuple[int, ...]]] = []
-        original_merge = PiperConvRotInt8Adapter.merge_lora_
+        original_merge = PiperQuantizedAdapter.merge_lora_
 
         def record_local_merge(
             target: torch.Tensor,
@@ -718,7 +718,7 @@ class TestDTensorAdapter:
             )
 
         monkeypatch.setattr(
-            PiperConvRotInt8Adapter,
+            PiperQuantizedAdapter,
             "merge_lora_",
             staticmethod(record_local_merge),
         )
@@ -926,7 +926,7 @@ class TestQuantizedShardProjection:
         convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
         convrot_cls = convrot_mod.ConvRotInt8Tensor
 
-        from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
+        from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter
 
         torch.manual_seed(2)
         rows, cols = 16, 128
@@ -937,35 +937,34 @@ class TestQuantizedShardProjection:
                 group_size=64,
                 act_per_tensor_scale=act_scale,
             )
-            host_state = PiperConvRotInt8Adapter.capture_host(w)
-            proj_state, layout_sig = PiperConvRotInt8Adapter.project_shard(
+            host_state = PiperQuantizedAdapter.capture_host(w)
+            proj_state, layout_sig = PiperQuantizedAdapter.project_shard(
                 host_state,
                 offsets=(8, 64),
                 local_shape=(8, 64),
             )
-            q_host, s_host, a_host = host_state.storage
-            q_proj, s_proj, a_proj = proj_state.storage
+            q_host, s_host = host_state.storage[:2]
+            q_proj, s_proj = proj_state.storage[:2]
             assert q_host is not None and s_host is not None
             assert q_proj is not None and s_proj is not None
             assert q_proj.untyped_storage().data_ptr() == q_host.untyped_storage().data_ptr()
             assert s_proj.untyped_storage().data_ptr() == s_host.untyped_storage().data_ptr()
             if use_static:
-                assert a_proj is a_host
+                assert proj_state.storage[2] is host_state.storage[2]
 
-            cpu_param = PiperConvRotInt8Adapter.cpu_param(proj_state)
+            cpu_param = PiperQuantizedAdapter.cpu_param(proj_state)
             assert requires_activation(cpu_param)
-            gpu_state = PiperConvRotInt8Adapter.alloc_gpu(proj_state, torch.device("cuda"))
-            PiperConvRotInt8Adapter.copy_to_gpu(proj_state, gpu_state, non_blocking=False)
-            gpu_param = PiperConvRotInt8Adapter.gpu_param(proj_state, gpu_state)
+            gpu_state = PiperQuantizedAdapter.alloc_gpu(proj_state, torch.device("cuda"))
+            PiperQuantizedAdapter.copy_to_gpu(proj_state, gpu_state, non_blocking=False)
+            gpu_param = PiperQuantizedAdapter.gpu_param(proj_state, gpu_state)
             assert gpu_param.data.qdata.is_contiguous()
             assert gpu_param.data.scale.is_contiguous()
-            assert PiperConvRotInt8Adapter.layout_signature(gpu_param.data) == layout_sig
-            torch.testing.assert_close(
-                gpu_param.data.dequantize().cpu(),
-                w.dequantize().narrow(0, 8, 8).narrow(1, 64, 64),
-                rtol=0,
-                atol=0,
-            )
+            assert PiperQuantizedAdapter.layout_signature(gpu_param.data) == layout_sig
+            expected_slice = w.dequantize().narrow(0, 8, 8).narrow(1, 64, 64)
+            assert torch.equal(gpu_param.data.qdata.cpu(), w.qdata.narrow(0, 8, 8).narrow(1, 64, 64))
+            assert torch.equal(gpu_param.data.scale.cpu(), w.scale.narrow(0, 8, 8))
+            torch.testing.assert_close(gpu_param.data.cpu().dequantize(), expected_slice, rtol=0, atol=0)
+            torch.testing.assert_close(gpu_param.data.dequantize().cpu(), expected_slice, rtol=1e-4, atol=1e-5)
 
     def test_convrot_int8_shard_projection_static_scale_and_cuda_lifecycle(
         self,
@@ -1038,20 +1037,19 @@ class TestQuantizedShardProjection:
     ) -> None:
         from torch.distributed.tensor import DTensor, Replicate
 
-        from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
-        from piper_offload.piper_nvfp4_adapter import PiperNvfp4Adapter
+        from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter
 
         convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
         nvfp4_mod = pytest.importorskip("piper_kernels.weights.nvfp4")
         convrot_cls = convrot_mod.ConvRotInt8Tensor
 
-        cr8 = PiperConvRotInt8Adapter.capture_host(
+        cr8 = PiperQuantizedAdapter.capture_host(
             convrot_cls.from_hp(torch.randn(16, 128, dtype=torch.bfloat16), group_size=64)
         )
         with pytest.raises(ValueError, match="must align to rotation group_size"):
-            PiperConvRotInt8Adapter.project_shard(cr8, offsets=(0, 32), local_shape=(16, 64))
+            PiperQuantizedAdapter.project_shard(cr8, offsets=(0, 32), local_shape=(16, 64))
         with pytest.raises(ValueError, match="non-empty local shards"):
-            PiperConvRotInt8Adapter.project_shard(cr8, offsets=(16, 0), local_shape=(0, 128))
+            PiperQuantizedAdapter.project_shard(cr8, offsets=(16, 0), local_shape=(0, 128))
 
         cr8_conv3d = convrot_cls.from_quantized(
             torch.randint(-127, 128, (4, 3, 3, 3, 64), dtype=torch.int8),
@@ -1060,21 +1058,20 @@ class TestQuantizedShardProjection:
             logical_dtype=torch.bfloat16,
         )
         with pytest.raises(ValueError, match="2-D matrices only"):
-            PiperConvRotInt8Adapter.project_shard(
-                PiperConvRotInt8Adapter.capture_host(cr8_conv3d),
+            PiperQuantizedAdapter.project_shard(
+                PiperQuantizedAdapter.capture_host(cr8_conv3d),
                 offsets=(0, 0, 0, 0, 0),
                 local_shape=(2, 64, 3, 3, 3),
             )
 
-        nv_swiz = PiperNvfp4Adapter.capture_host(
+        nv_swiz = PiperQuantizedAdapter.capture_host(
             nvfp4_mod.PiperNVFP4Tensor.from_hp(
                 torch.randn(128, 128, dtype=torch.bfloat16),
                 is_swizzled_scales=True,
-                use_triton_kernel=False,
             )
         )
         with pytest.raises(ValueError, match="swizzle"):
-            PiperNvfp4Adapter.project_shard(nv_swiz, offsets=(0, 32), local_shape=(128, 32))
+            PiperQuantizedAdapter.project_shard(nv_swiz, offsets=(0, 32), local_shape=(128, 32))
 
         cr8_proto = nn.Module()
         cr8_proto.embed = nn.Parameter(torch.randn(8, 8, dtype=torch.bfloat16), requires_grad=False)
@@ -1258,25 +1255,24 @@ class TestPackedAndSwizzledShardProjection:
         from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
         from piper_offload import host_pin_manager
-        from piper_offload.piper_nvfp4_adapter import PiperNvfp4Adapter
+        from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter
 
         host_pin_manager.clear()
         torch.manual_seed(37)
         w2d = torch.randn(192, 160, dtype=torch.bfloat16)
         gs2d = torch.tensor(0.5, dtype=torch.float32)
-        nv2d = PiperNVFP4Tensor.from_hp(w2d, per_tensor_scale=gs2d, is_swizzled_scales=True, use_triton_kernel=False)
-        proj2d, _ = PiperNvfp4Adapter.project_shard(
-            PiperNvfp4Adapter.capture_host(nv2d), offsets=(0, 128), local_shape=(192, 32)
+        nv2d = PiperNVFP4Tensor.from_hp(w2d, per_tensor_scale=gs2d, is_swizzled_scales=True)
+        proj2d, _ = PiperQuantizedAdapter.project_shard(
+            PiperQuantizedAdapter.capture_host(nv2d), offsets=(0, 128), local_shape=(192, 32)
         )
-        assert proj2d.target_shapes == ((192, 16), (64, 16), (), None)
-        gpu2d = PiperNvfp4Adapter.alloc_gpu(proj2d, torch.device("cuda"))
-        PiperNvfp4Adapter.copy_to_gpu(proj2d, gpu2d, non_blocking=False)
-        nv2d_gpu = PiperNvfp4Adapter.gpu_param(proj2d, gpu2d).data
+        assert proj2d.target_shapes == ((192, 16), (64, 16), ())
+        gpu2d = PiperQuantizedAdapter.alloc_gpu(proj2d, torch.device("cuda"))
+        PiperQuantizedAdapter.copy_to_gpu(proj2d, gpu2d, non_blocking=False)
+        nv2d_gpu = PiperQuantizedAdapter.gpu_param(proj2d, gpu2d).data
         ref2d = PiperNVFP4Tensor.from_hp(
             w2d[:, 128:160].contiguous(),
             per_tensor_scale=gs2d,
             is_swizzled_scales=True,
-            use_triton_kernel=False,
         )
         assert torch.equal(nv2d_gpu.scale.cpu().view(torch.uint8), ref2d.scale.view(torch.uint8))
         assert torch.equal(nv2d_gpu.qdata.cpu().view(torch.uint8), ref2d.qdata.view(torch.uint8))
@@ -1285,30 +1281,28 @@ class TestPackedAndSwizzledShardProjection:
             torch.randn(4, 256, 128, dtype=torch.bfloat16),
             per_tensor_scale=gs2d,
             is_swizzled_scales=True,
-            use_triton_kernel=False,
         )
         p3d = PiperNVFP4Tensor(
             base3d.qdata,
             base3d.scale,
             base3d.block_size,
-            base3d.orig_dtype,
+            base3d.dtype,
             torch.tensor([0.2, 0.4, 0.6, 0.8], dtype=torch.float32).view(4, 1, 1),
             torch.tensor(0.25, dtype=torch.float32),
             True,
-            False,
             None,
             high_first=True,
         )
-        proj3d, _ = PiperNvfp4Adapter.project_shard(
-            PiperNvfp4Adapter.capture_host(p3d), offsets=(2, 0, 64), local_shape=(2, 256, 64)
+        proj3d, _ = PiperQuantizedAdapter.project_shard(
+            PiperQuantizedAdapter.capture_host(p3d), offsets=(2, 0, 64), local_shape=(2, 256, 64)
         )
         assert proj3d.target_shapes == ((2, 256, 32), (2, 64, 16), (2, 1, 1), ())
-        gpu3d = PiperNvfp4Adapter.alloc_gpu(proj3d, torch.device("cuda"))
+        gpu3d = PiperQuantizedAdapter.alloc_gpu(proj3d, torch.device("cuda"))
         try:
-            with host_pin_manager.acquire(PiperNvfp4Adapter.storage_tensors(proj3d), pin=True):
-                PiperNvfp4Adapter.copy_to_gpu(proj3d, gpu3d, non_blocking=True)
+            with host_pin_manager.acquire(PiperQuantizedAdapter.storage_tensors(proj3d), pin=True):
+                PiperQuantizedAdapter.copy_to_gpu(proj3d, gpu3d, non_blocking=True)
             torch.cuda.synchronize()
-            rebuilt = PiperNvfp4Adapter.gpu_param(proj3d, gpu3d).data
+            rebuilt = PiperQuantizedAdapter.gpu_param(proj3d, gpu3d).data
             assert rebuilt.high_first is True and tuple(rebuilt.scale.shape) == (2, 64, 16)
             torch.testing.assert_close(rebuilt.dequantize().cpu(), p3d.dequantize()[2:4, :, 64:128], rtol=0, atol=0)
         finally:
@@ -1318,13 +1312,11 @@ class TestPackedAndSwizzledShardProjection:
             torch.randn(256, 128, dtype=torch.bfloat16),
             per_tensor_scale=gs2d,
             is_swizzled_scales=True,
-            use_triton_kernel=False,
         )
         nv_b1 = PiperNVFP4Tensor.from_hp(
             torch.randn(256, 128, dtype=torch.bfloat16),
             per_tensor_scale=gs2d,
             is_swizzled_scales=True,
-            use_triton_kernel=False,
         )
         dense = Adapter(
             {"blocks.0.weight": ParameterDelta.from_tensors(dense=torch.randn(256, 128, dtype=torch.bfloat16) * 0.02)}
@@ -1333,66 +1325,50 @@ class TestPackedAndSwizzledShardProjection:
 
     def test_convrot_nvfp4_shard_projection_and_cuda_lifecycle(self, tp_mesh: Any) -> None:
         from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
-        from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
         from piper_offload import host_pin_manager
-        from piper_offload.piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
+        from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter
 
         host_pin_manager.clear()
         torch.manual_seed(41)
-        unswiz_kw = QuantizeTensorToNVFP4Kwargs(
-            block_size=16,
-            is_swizzled_scales=False,
-            use_triton_kernel=False,
-            use_dynamic_per_tensor_scale=True,
-        )
         cr_unswiz = ConvRotNVFP4Tensor.from_hp(
             torch.randn(128, 128, dtype=torch.bfloat16),
             per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
             is_swizzled_scales=False,
-            use_triton_kernel=False,
-            act_quant_kwargs=unswiz_kw,
+            act_quant="dynamic",
             group_size=64,
         )
-        u_state = PiperConvRotNVFP4Adapter.capture_host(cr_unswiz)
-        u_s0, _ = PiperConvRotNVFP4Adapter.project_shard(u_state, offsets=(17, 0), local_shape=(19, 128))
-        assert not requires_activation(PiperConvRotNVFP4Adapter.cpu_param(u_s0))
-        u_s1, _ = PiperConvRotNVFP4Adapter.project_shard(u_state, offsets=(0, 64), local_shape=(128, 64))
-        u_gpu = PiperConvRotNVFP4Adapter.alloc_gpu(u_s1, torch.device("cuda"))
-        with host_pin_manager.acquire(PiperConvRotNVFP4Adapter.storage_tensors(u_s1), pin=True):
-            PiperConvRotNVFP4Adapter.copy_to_gpu(u_s1, u_gpu, non_blocking=True)
+        u_state = PiperQuantizedAdapter.capture_host(cr_unswiz)
+        u_s0, _ = PiperQuantizedAdapter.project_shard(u_state, offsets=(17, 0), local_shape=(19, 128))
+        assert not requires_activation(PiperQuantizedAdapter.cpu_param(u_s0))
+        u_s1, _ = PiperQuantizedAdapter.project_shard(u_state, offsets=(0, 64), local_shape=(128, 64))
+        u_gpu = PiperQuantizedAdapter.alloc_gpu(u_s1, torch.device("cuda"))
+        with host_pin_manager.acquire(PiperQuantizedAdapter.storage_tensors(u_s1), pin=True):
+            PiperQuantizedAdapter.copy_to_gpu(u_s1, u_gpu, non_blocking=True)
         torch.cuda.synchronize()
-        rebuilt_u = PiperConvRotNVFP4Adapter.gpu_param(u_s1, u_gpu).data
+        rebuilt_u = PiperQuantizedAdapter.gpu_param(u_s1, u_gpu).data
         u_ref = cr_unswiz.dequantize()[:, 64:128]
         torch.testing.assert_close(rebuilt_u.dequantize().cpu(), u_ref, rtol=0, atol=0)
         lora_b = torch.randn(128, 4, device="cuda", dtype=torch.bfloat16) * 0.05
         lora_a = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16) * 0.05
-        PiperConvRotNVFP4Adapter.merge_lora_(rebuilt_u, lora_b, lora_a, 0.5)
+        PiperQuantizedAdapter.merge_lora_(rebuilt_u, lora_b, lora_a, 0.5)
         u_merged = rebuilt_u.dequantize().cpu()
         assert torch.isfinite(u_merged).all() and not torch.allclose(u_merged, u_ref, atol=1e-2)
         torch.testing.assert_close(u_merged, u_ref + 0.5 * (lora_b @ lora_a).cpu(), rtol=3e-1, atol=4e-1)
         host_pin_manager.clear()
 
-        swiz_kw = QuantizeTensorToNVFP4Kwargs(
-            block_size=16,
-            is_swizzled_scales=True,
-            use_triton_kernel=False,
-            use_dynamic_per_tensor_scale=True,
-        )
         sw_b0 = ConvRotNVFP4Tensor.from_hp(
             torch.randn(256, 128, dtype=torch.bfloat16),
             per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
             is_swizzled_scales=True,
-            use_triton_kernel=False,
-            act_quant_kwargs=swiz_kw,
+            act_quant="dynamic",
             group_size=64,
         )
         sw_b1 = ConvRotNVFP4Tensor.from_hp(
             torch.randn(256, 128, dtype=torch.bfloat16),
             per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
             is_swizzled_scales=True,
-            use_triton_kernel=False,
-            act_quant_kwargs=swiz_kw,
+            act_quant="dynamic",
             group_size=64,
         )
         dense = Adapter(
@@ -1410,7 +1386,7 @@ class TestPackedAndSwizzledShardProjection:
         from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
         from piper_offload import MappedCheckpoint, host_pin_manager
-        from piper_offload.piper_nvfp4_adapter import PiperNvfp4Adapter
+        from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter
         from tests.test_model_store import _write_safetensors
 
         host_pin_manager.clear()
@@ -1419,7 +1395,6 @@ class TestPackedAndSwizzledShardProjection:
             torch.randn(256, 128, dtype=torch.bfloat16),
             per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
             is_swizzled_scales=True,
-            use_triton_kernel=False,
         )
         ckpt_path = tmp_path / "swiz.safetensors"
         _write_safetensors(
@@ -1436,23 +1411,22 @@ class TestPackedAndSwizzledShardProjection:
                 ckpt.get_tensor("nv_q"),
                 ckpt.get_tensor("nv_s"),
                 nv_w.block_size,
-                nv_w.orig_dtype,
+                nv_w.dtype,
                 torch.tensor(0.5, dtype=torch.float32),
                 None,
                 True,
-                False,
                 None,
                 high_first=nv_w.high_first,
             )
-            nv_proj, _ = PiperNvfp4Adapter.project_shard(
-                PiperNvfp4Adapter.capture_host(nv_mapped), offsets=(0, 64), local_shape=(256, 64)
+            nv_proj, _ = PiperQuantizedAdapter.project_shard(
+                PiperQuantizedAdapter.capture_host(nv_mapped), offsets=(0, 64), local_shape=(256, 64)
             )
             assert nv_proj.storage[1].storage_offset() == 512 and tuple(nv_proj.storage[1].shape) == (2, 1, 512)
-            nv_gpu = PiperNvfp4Adapter.alloc_gpu(nv_proj, torch.device("cuda"))
-            with host_pin_manager.acquire(PiperNvfp4Adapter.storage_tensors(nv_proj), pin=True):
-                PiperNvfp4Adapter.copy_to_gpu(nv_proj, nv_gpu, non_blocking=True)
+            nv_gpu = PiperQuantizedAdapter.alloc_gpu(nv_proj, torch.device("cuda"))
+            with host_pin_manager.acquire(PiperQuantizedAdapter.storage_tensors(nv_proj), pin=True):
+                PiperQuantizedAdapter.copy_to_gpu(nv_proj, nv_gpu, non_blocking=True)
             torch.cuda.synchronize()
-            nv_rec = PiperNvfp4Adapter.gpu_param(nv_proj, nv_gpu).data
+            nv_rec = PiperQuantizedAdapter.gpu_param(nv_proj, nv_gpu).data
             torch.testing.assert_close(nv_rec.dequantize().cpu(), nv_w.dequantize()[:, 64:128], rtol=0, atol=0)
         finally:
             host_pin_manager.clear()

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from torch import nn
 
 from ._convrot_int8_source import (
@@ -25,7 +26,6 @@ from ._convrot_int8_source import (
     convrot_int8_target_bytes,
     stage_packed_tensors,
 )
-from ._piper_convrot_int8 import create_convrot_int8_tensor
 from .gguf_parameter import GGUF_COMPUTE_DTYPE
 from .tensor_adapters import (
     capture_host_tensor,
@@ -189,7 +189,7 @@ class GgufAdapter(ConvRotInt8SourceAdapter):
     def alloc_gpu(state: _GgufHost, device: torch.device) -> ConvRotInt8GpuTarget:
         rows, features = state.logical_shape
         return ConvRotInt8GpuTarget(
-            target=create_convrot_int8_tensor(
+            target=ConvRotInt8Tensor(
                 torch.empty((rows, features), dtype=torch.int8, device=device),
                 torch.empty((rows, 1), dtype=torch.float32, device=device),
                 state.group_size,

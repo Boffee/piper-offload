@@ -2,11 +2,14 @@
 
 from contextlib import contextmanager
 
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
-from safetensors.torch import save_file
 from torch import nn
+
+from tests.test_checkpoint import _write as _write_safetensors
 
 from piper_offload import (
     Adapter,
@@ -435,10 +438,10 @@ def test_cache_composition_preserves_mappings_through_switching_and_exception(tm
     path = tmp_path / "value.safetensors"
     source = torch.arange(6, dtype=torch.float32).reshape(2, 3).expand(4, 2, 3).clone()
     physical = torch.ones(2, 3)
-    save_file({
+    _write_safetensors(Path(path), {
         "weight": source, "physical": physical,
         "a": torch.ones(1, 3), "b": torch.ones(2, 1),
-    }, path)
+    })
     original_file = path.read_bytes()
     with MappedCheckpoint(path) as checkpoint:
         mapped, mapped_physical, a, b = (
@@ -507,7 +510,7 @@ def test_copy_only_value_rejects_composed_arithmetic_before_mutation(application
     from dataclasses import dataclass
 
     from piper_offload import register_adapter
-    from piper_offload.structured_adapter import StructuredTensorAdapter
+    from piper_offload.structured_adapter import StructuredSnapshot, StructuredTensorAdapter
 
     class _CopyOnlyTensor(torch.Tensor):
         qdata: torch.Tensor
@@ -539,15 +542,10 @@ def test_copy_only_value_rejects_composed_arithmetic_before_mutation(application
 
     class _CopyOnlyAdapter(StructuredTensorAdapter[_Meta]):
         _TAG = "test-copy-only"
-        _STORAGE_NAMES = ("qdata", "scale")
 
         @staticmethod
         def _is_tensor(t: torch.Tensor) -> bool:
             return isinstance(t, _CopyOnlyTensor)
-
-        @staticmethod
-        def _validate_layout(t: torch.Tensor) -> None:
-            del t
 
         @staticmethod
         def _require(t: torch.Tensor) -> _CopyOnlyTensor:
@@ -555,13 +553,14 @@ def test_copy_only_value_rejects_composed_arithmetic_before_mutation(application
             return t
 
         @staticmethod
-        def _storage_of(t: _CopyOnlyTensor) -> tuple[torch.Tensor | None, ...]:
-            return (t.qdata, t.scale)
-
-        @staticmethod
-        def _meta_of(t: _CopyOnlyTensor) -> _Meta:
-            del t
-            return _Meta()
+        def _extract(t: torch.Tensor) -> StructuredSnapshot[_Meta]:
+            w = _CopyOnlyAdapter._require(t)
+            return StructuredSnapshot(
+                tensor=w,
+                named_storage=(("qdata", w.qdata), ("scale", w.scale)),
+                meta=_Meta(),
+                id_metadata=(),
+            )
 
         @staticmethod
         def _reconstruct(
@@ -570,11 +569,6 @@ def test_copy_only_value_rejects_composed_arithmetic_before_mutation(application
             del meta
             assert storage[0] is not None and storage[1] is not None
             return _CopyOnlyTensor(storage[0], storage[1])
-
-        @staticmethod
-        def _id_metadata(t: _CopyOnlyTensor) -> tuple[object, ...]:
-            del t
-            return ()
 
         @staticmethod
         def _compute_dtype(t: _CopyOnlyTensor) -> torch.dtype:
@@ -657,7 +651,7 @@ def test_permanent_composition_preserves_mapped_value_and_delta(tmp_path):
     path = tmp_path / "sources.safetensors"
     source = torch.arange(6, dtype=torch.float32).reshape(2, 3).clone()
     dense = torch.full((2, 3), 0.25)
-    save_file({"value": source, "delta": dense}, path)
+    _write_safetensors(Path(path), {"value": source, "delta": dense})
     before = path.read_bytes()
     with MappedCheckpoint(path) as checkpoint:
         mapped_value = checkpoint.get_tensor("value")

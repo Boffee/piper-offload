@@ -19,7 +19,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from safetensors.torch import save_file
+
+from tests.test_checkpoint import _write as _write_safetensors
 
 import piper_offload._direct_io as direct_io_mod
 from piper_offload import MappedCheckpoint
@@ -153,7 +154,7 @@ class TestDirectFileReaderPosix:
             st_path = work_dir / "weights.safetensors"
             t0 = torch.randn(31, 47, dtype=torch.bfloat16)
             t1 = torch.randint(0, 255, (19, 13), dtype=torch.uint8)
-            save_file({"a": t0, "b": t1}, st_path)
+            _write_safetensors(st_path, {"a": t0, "b": t1})
             with MappedCheckpoint(st_path) as ckpt:
                 a_mapped = ckpt.get_tensor("a")
                 b_mapped = ckpt.get_tensor("b")
@@ -1029,7 +1030,7 @@ class TestDirectFileReaderRegressions:
 
         backing_path = tmp_path / "views.bin"
         backing_path.write_bytes(b"\x00" * _page_align(8192))
-        strided = memoryview(torch.zeros(8192, dtype=torch.float32).numpy())[::2]
+        strided = memoryview(bytearray(8192))[::2]
         ro = memoryview(b"\x00" * 4096)
         with backing_path.open("rb") as f, DirectFileReader(direct_io=False) as reader:
             with pytest.raises(ValueError, match="C-contiguous"):

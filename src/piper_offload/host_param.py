@@ -132,9 +132,11 @@ class HostParam:
 
         Projection supports ``Replicate`` and contiguous ``Shard(dim)``
         placements across CPU and CUDA/HIP meshes for plain tensors and
-        supported non-``nn.Parameter``-subclass quantized tensors. The host
-        backing stays a zero-copy view or alias of the full source allocation,
-        so construction allocates no rank-local host tensor.
+        supported non-``nn.Parameter``-subclass quantized tensors. Where the
+        format's layout permits, host backing stays a zero-copy view or alias
+        of the full source allocation without allocating a rank-local copy;
+        variable-width layouts (such as variable-row ``ConvRotTrellisTensor``
+        under ``Shard(1)``) re-pack rank-local storage.
         """
         if source.is_meta:
             raise ValueError("DTensor projection source must own physical host storage.")

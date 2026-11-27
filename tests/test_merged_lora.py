@@ -8,13 +8,17 @@ Merge preflight runs on CPU. Tests that load merged weights or exercise
 CUDA streaming require a GPU.
 """
 
+import ctypes
 from typing import get_protocol_members
+
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
-from safetensors.torch import save_file
 from torch import nn
+
+from tests.test_checkpoint import _write as _write_safetensors
 
 import piper_offload.lora as lora_impl
 
@@ -47,7 +51,7 @@ from piper_offload._parameter_update import (
 )
 from piper_offload.adapter import resolve_adapter_strengths
 from piper_offload.lora import LoRATransform
-from piper_offload.structured_adapter import StructuredTensorAdapter
+from piper_offload.structured_adapter import StructuredSnapshot, StructuredTensorAdapter
 from piper_offload.host_module import ParameterOverride, HostModuleInstance
 from piper_offload.host_param import HostParam
 from piper_offload.protocols import (
@@ -846,7 +850,7 @@ class TestParameterDelta:
         with_lora: bool,
     ) -> None:
         convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
-        from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
+        from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter
 
         torch.manual_seed(11)
         weight = torch.randn(4, 16, dtype=torch.bfloat16)
@@ -875,11 +879,11 @@ class TestParameterDelta:
             )
             low_rank = b @ a
         adapter = Adapter.from_state_dict(state_dict)
-        assert isinstance(PiperConvRotInt8Adapter(), DenseMergeTensorAdapter)
+        assert isinstance(PiperQuantizedAdapter(), DenseMergeTensorAdapter)
         original_data_ptr = model.target.weight.data.qdata.data_ptr()
         original_scale_ptr = model.target.weight.data.scale.data_ptr()
         calls = 0
-        original_dense_merge = PiperConvRotInt8Adapter.merge_dense_
+        original_dense_merge = PiperQuantizedAdapter.merge_dense_
 
         def tracked_dense_merge(
             target: torch.Tensor,
@@ -903,12 +907,12 @@ class TestParameterDelta:
             raise AssertionError("mixed update used the factorized merge path")
 
         monkeypatch.setattr(
-            PiperConvRotInt8Adapter,
+            PiperQuantizedAdapter,
             "merge_dense_",
             staticmethod(tracked_dense_merge),
         )
         monkeypatch.setattr(
-            PiperConvRotInt8Adapter,
+            PiperQuantizedAdapter,
             "merge_lora_",
             staticmethod(unexpected_lora_merge),
         )
@@ -1898,7 +1902,6 @@ class TestLoRATransform:
     ) -> None:
         class MovementOnlyAdapter(StructuredTensorAdapter[None]):
             _TAG = "movement-only"
-            _STORAGE_NAMES = ("data",)
 
             @staticmethod
             def _is_tensor(t: torch.Tensor) -> bool:
@@ -1906,31 +1909,23 @@ class TestLoRATransform:
                 return True
 
             @staticmethod
-            def _validate_layout(t: torch.Tensor) -> None:
-                del t
-
-            @staticmethod
             def _require(t: torch.Tensor) -> torch.Tensor:
                 return t
 
             @staticmethod
-            def _storage_of(t: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
-                return (t,)
-
-            @staticmethod
-            def _meta_of(t: torch.Tensor) -> None:
-                del t
+            def _extract(t: torch.Tensor) -> StructuredSnapshot[None]:
+                return StructuredSnapshot(
+                    tensor=t,
+                    named_storage=(("data", t),),
+                    meta=None,
+                    id_metadata=(),
+                )
 
             @staticmethod
             def _reconstruct(storage: tuple[torch.Tensor | None, ...], meta: None) -> torch.Tensor:
                 del meta
                 assert storage[0] is not None
                 return storage[0]
-
-            @staticmethod
-            def _id_metadata(t: torch.Tensor) -> tuple[object, ...]:
-                del t
-                return ()
 
             @staticmethod
             def _compute_dtype(t: torch.Tensor) -> torch.dtype:
@@ -2686,7 +2681,7 @@ class TestPermanentMerge:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
-        from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
+        from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter
 
         rows, cols = 4, 16
         weight = convrot_mod.ConvRotInt8Tensor.from_hp(
@@ -2706,7 +2701,7 @@ class TestPermanentMerge:
         lora = Adapter({"weight": ParameterDelta.from_tensors(a=a, b=b)})
 
         calls = 0
-        original_merge = PiperConvRotInt8Adapter.merge_lora_
+        original_merge = PiperQuantizedAdapter.merge_lora_
 
         def counted_merge(
             target: torch.Tensor,
@@ -2728,7 +2723,7 @@ class TestPermanentMerge:
                 rounding_seed=rounding_seed,
             )
 
-        monkeypatch.setattr(PiperConvRotInt8Adapter, "merge_lora_", staticmethod(counted_merge))
+        monkeypatch.setattr(PiperQuantizedAdapter, "merge_lora_", staticmethod(counted_merge))
 
         assert merge_adapter(model, [(lora, 0.5), (lora, 0.5)], stochastic_rounding=False) == 1
         assert calls == 1
@@ -3256,7 +3251,8 @@ class TestMergeIntoMappedModel:
     def test_mapped_target_is_copied_out_before_the_merge(self, tmp_path, shape) -> None:
         base = torch.randn(shape)
         path = tmp_path / "weights.bin"
-        path.write_bytes(base.numpy().tobytes())
+        flat = base.contiguous().view(torch.uint8)
+        path.write_bytes(ctypes.string_at(flat.data_ptr(), flat.nbytes))
         mapped = torch.from_file(str(path), shared=False, size=base.numel(), dtype=torch.float32).reshape(shape)
         model = nn.Module()
         model.target = nn.Linear(4, 3, bias=False)
@@ -3281,7 +3277,8 @@ class TestMergeIntoMappedModel:
     def test_distinct_parameter_objects_over_one_mapped_view_stay_tied(self, tmp_path, transpose) -> None:
         base = torch.randn(3, 4)
         path = tmp_path / "weights.bin"
-        path.write_bytes(base.numpy().tobytes())
+        flat = base.contiguous().view(torch.uint8)
+        path.write_bytes(ctypes.string_at(flat.data_ptr(), flat.nbytes))
         mapped = torch.from_file(str(path), shared=False, size=12, dtype=torch.float32).reshape(3, 4)
         if transpose:
             mapped, base = mapped.T, base.T
@@ -3514,12 +3511,12 @@ class TestIntrinsicLoRAScale:
     def test_a_mapped_factor_stays_mapped(self, tmp_path) -> None:
         """Why the scale is intrinsic: folding alpha here would replace the mapping."""
         path = tmp_path / "lora.safetensors"
-        save_file(
+        _write_safetensors(
+            Path(path),
             {
                 "target.lora_A.weight": torch.randn(4, 32),
                 "target.lora_B.weight": torch.randn(32, 4),
             },
-            str(path),
             metadata={"alpha": "8"},
         )
         reader = MappedCheckpoint(path)

@@ -5,7 +5,7 @@ refill stages them into a transient stream-ordered scratch buffer and decodes
 directly into a reusable ConvRot INT8 target without retaining permanent GPU
 staging allocations. Once active, the parameter is an ordinary
 ``ConvRotInt8Tensor``, so LoRA and dense updates delegate to
-:class:`PiperConvRotInt8Adapter`. The packed source is inference-only and cannot
+:class:`PiperQuantizedAdapter`. The packed source is inference-only and cannot
 be updated permanently. Each subclass owns its capture, identity, and refill.
 """
 
@@ -17,7 +17,7 @@ from typing import ClassVar
 import torch
 from torch import nn
 
-from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
+from .piper_quantized_adapter import PiperQuantizedAdapter
 from .tensor_adapters import transfer_
 
 _SCRATCH_ALIGNMENT = 256
@@ -111,7 +111,7 @@ class ConvRotInt8SourceAdapter:
         rounding_seed: int | None = None,
     ) -> None:
         """Delegate an activation-time LoRA update to ConvRot INT8."""
-        PiperConvRotInt8Adapter.merge_lora_(
+        PiperQuantizedAdapter.merge_lora_(
             target, b, a, alpha, beta=beta, rounding_seed=rounding_seed
         )
 
@@ -125,7 +125,7 @@ class ConvRotInt8SourceAdapter:
         rounding_seed: int | None = None,
     ) -> None:
         """Delegate an activation-time dense update to ConvRot INT8."""
-        PiperConvRotInt8Adapter.merge_dense_(
+        PiperQuantizedAdapter.merge_dense_(
             target, update, alpha, beta=beta, rounding_seed=rounding_seed
         )
 

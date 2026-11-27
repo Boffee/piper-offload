@@ -16,7 +16,7 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.15,<2.16",
-    "piper-kernels>=0.8.0rc1,<0.9",
+    "piper-kernels>=0.9.0rc1,<0.10",
 ]
 
 [project.urls]
@@ -26,13 +26,9 @@ Issues = "https://github.com/Boffee/piper-offload/issues"
 Changelog = "https://github.com/Boffee/piper-offload/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-# TorchAO weight formats are unsupported in piper-offload; this optional extra
-# remains temporarily because Piper Kernels' ConvRot and NVFP4 tensors still
-# subclass `TorchAOBaseTensor` / call `torchao.prototype.mx_formats`.
-torchao = ["numpy>=2.3.2,<3", "torchao>=0.18,<0.19"]
 # Reading GGUF files needs no extra. Activating their quantized weights decodes
 # through ConvRot INT8's Triton converter, which has no fallback.
-gguf = ["piper-offload[torchao,triton]"]
+gguf = ["piper-offload[triton]"]
 triton = [
     # Linux PyTorch builds declare their own matching Triton: `triton` for CUDA,
     # `triton-rocm` for PyTorch's ROCm wheels. Naming one here would clash with the other.
@@ -53,7 +49,7 @@ dev = [
     "pytest~=9.1",
     "ruff>=0.16.1",
     "safetensors",
-    "piper-offload[torchao,triton]",
+    "piper-offload[triton]",
 ]
 
 [tool.ruff]
@@ -71,9 +67,6 @@ reportPrivateImportUsage = "none"
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-torchao = [
-    { index = "pytorch-cu132", marker = "sys_platform == 'linux'" },
 ]
 [[tool.uv.index]]
 name = "pytorch-cu132"

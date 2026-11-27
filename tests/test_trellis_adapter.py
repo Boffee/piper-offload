@@ -13,8 +13,6 @@ from piper_offload import (
     TrellisParameter,
     merge_adapter,
 )
-from piper_offload._convrot_int8_source import ConvRotInt8GpuTarget
-from piper_offload._piper_convrot_int8 import supports_variable_row_trellis
 from piper_offload.host_param import HostParam
 from piper_offload.lora import LoRATransform, ScaledLoRAFactor
 from piper_offload.tensor_adapter_registry import (
@@ -29,14 +27,11 @@ ROWS = 64
 BLOCK_SIZE = 256
 GROUP_SIZE = 256
 
-VARIABLE_ROW_CUDA = pytest.mark.skipif(
-    not torch.cuda.is_available() or not supports_variable_row_trellis(),
-    reason="CUDA/ROCm and piper-kernels variable-row trellis support required",
-)
+VARIABLE_ROW_CUDA = CUDA
 
 
 def _supports_2bit_trellis() -> bool:
-    if not torch.cuda.is_available() or not supports_variable_row_trellis():
+    if not torch.cuda.is_available():
         return False
     try:
         from piper_kernels.trellis import TrellisLayout
@@ -410,41 +405,6 @@ class TestTrellisSource:
 
         with pytest.raises(AssertionError, match="unexpected row_widths"):
             weight.rebuild(weight.storage_tensors())
-
-    def test_alloc_gpu_fails_fast_when_variable_row_kernel_missing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import piper_offload.trellis_adapter as ta
-
-        weight = _variable_row_weight(4)
-        state = TrellisAdapter.capture_host(weight)
-
-        def _raise() -> None:
-            raise RuntimeError("missing row_widths support")
-
-        monkeypatch.setattr(ta, "require_variable_row_trellis", _raise)
-        with pytest.raises(RuntimeError, match="missing row_widths support"):
-            TrellisAdapter.alloc_gpu(state, torch.device("cpu"))
-
-    def test_copy_to_gpu_fails_fast_when_variable_row_refills_uniform_target(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import piper_offload.trellis_adapter as ta
-
-        weight = _variable_row_weight(4)
-        state = TrellisAdapter.capture_host(weight)
-
-        def _raise() -> None:
-            raise RuntimeError("missing row_widths support")
-
-        def _unexpected_stage(*args: object, **kwargs: object) -> object:
-            raise AssertionError("unexpected stage_packed_tensors call")
-
-        monkeypatch.setattr(ta, "require_variable_row_trellis", _raise)
-        monkeypatch.setattr(ta, "stage_packed_tensors", _unexpected_stage)
-        target = ConvRotInt8GpuTarget(target=torch.empty((ROWS, BLOCK_SIZE), dtype=torch.int8))
-        with pytest.raises(RuntimeError, match="missing row_widths support"):
-            TrellisAdapter.copy_to_gpu(state, target)
 
     def test_model_store_distinguishes_negated_row_widths_sharing_storage(self) -> None:
         class _Pair(nn.Module):

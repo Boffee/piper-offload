@@ -481,10 +481,11 @@ class ShardProjectionTensorAdapter[HostStateT, GpuStateT](
     """Optional capability: project an unsharded host state onto a contiguous shard.
 
     Adapters implementing this protocol slice or alias the full host backing
-    into a rank-local host state without copying payload bytes, returning
-    ``(projected_state, canonical_inner_layout_signature)``. Formats with
-    quantization block/group structure validate sharding alignment here and
-    derive shard-local metadata and layout signatures.
+    into a rank-local host state without copying payload bytes where the format
+    permits (or re-pack rank-local streams where variable-width layouts require
+    it), returning ``(projected_state, canonical_inner_layout_signature)``.
+    Formats with quantization block/group structure validate sharding alignment
+    here and derive shard-local metadata and layout signatures.
     """
 
     @staticmethod
@@ -494,7 +495,7 @@ class ShardProjectionTensorAdapter[HostStateT, GpuStateT](
         offsets: tuple[int, ...],
         local_shape: tuple[int, ...],
     ) -> tuple[HostStateT, tuple[object, ...]]:
-        """Project a zero-copy rank-local shard from captured host ``state``."""
+        """Project a rank-local shard from captured host ``state``."""
         ...
 
 

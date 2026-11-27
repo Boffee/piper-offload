@@ -183,8 +183,8 @@ class TestBlockCompileConfig:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        convrot = pytest.importorskip("piper_kernels.linear.convrot")
-        compiler_options = convrot.convrot_int8_compile_options({"max_autotune": True})
+        piper_kernels_mod = pytest.importorskip("piper_kernels")
+        compiler_options = piper_kernels_mod.compile_options({"max_autotune": True})
         spy = _CompileSpy()
         monkeypatch.setattr(torch, "compile", spy)
 

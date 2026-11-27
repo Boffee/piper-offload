@@ -7,6 +7,16 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Added unified `PiperQuantizedAdapter` (`piper_offload.piper_quantized_adapter`)
+  over `piper_kernels.weights.QuantizedWeight` (`as_storage()` /
+  `from_storage()`), supporting `PiperNVFP4Tensor`, `ConvRotInt8Tensor`,
+  `ConvRotNVFP4Tensor`, packed `ConvRotTrellisTensor` (`2–6` bpw uniform and
+  variable-row `row_widths`, including 2-D DTensor `Shard(0)` zero-copy
+  projection via `trellis_row_shard_byte_range` and aligned `Shard(1)`
+  projection (zero-copy for uniform bitstreams, per-rank re-packed via
+  `shard_quantized_weight` for variable-row `row_widths`), and custom `QuantizedWeight`
+  subclasses for offload, CPU/CUDA inference, `Replicate` DTensor binding, and
+  unscaled `ParameterValue` updates.
 - Added host-memory staging primitives in `piper_offload.host_arena` (`HostSlabArena`,
   `ArenaAllocation`, `HostArenaStats`, and `PinnedBounceRing`), backed by direct
   file-slice I/O (`_direct_io`), platform-aligned host allocation and memory budget
@@ -83,9 +93,7 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   (`reduce_scatter_tensor_coalesced`) over `ReduceOp.SUM`, `dist.new_group()`
   and `DeviceMesh` subgroups, `torch.compile`, and `ModelStore`/`ModelOffloader`
   streaming coordination.
-- Added `PiperNvfp4Adapter` (`piper_nvfp4_adapter.py` / `_piper_nvfp4.py`) for
-  Piper Kernels' `PiperNVFP4Tensor` (2-D linear and 3-D `(E, M, K)` MoE weights),
-  and renamed the shared structured base adapter module to `structured_adapter.py`
+- Renamed the shared structured base adapter module to `structured_adapter.py`
   (`StructuredTensorAdapter`).
 
 ### Changed
@@ -133,21 +141,32 @@ All notable changes to Piper Offload are documented here. Versions follow the po
   bound module parameter/buffer slots and resting CPU parameter wrappers per
   module instance, and speeding up large-model pin range tracking.
 - Lowered the `TrellisParameter` / `TrellisAdapter` minimum `row_widths`
-  validation floor from `3` to `2` code bits per weight (`2` to `6` code bits per
-  weight; 2-bit GPU decoding requires `piper-kernels>=0.8.0rc8`).
+  validation floor from `3` to `2` code bits per weight.
 - Breaking: Removed `adapter_mode="routed"` and `AdapterMode` across
   `ModelOffloader.activate()`, `ModelCache.use()`, internal LoRA merge helpers,
   and top-level exports; activation-scoped adapters now always merge on CUDA.
+- Breaking: Bumped `piper-kernels` dependency constraint to
+  `>=0.9.0rc1,<0.10`, removed the `torchao` optional extra (and
+  `[tool.uv.sources]` entry), removed `numpy` from optional/dev test paths, and
+  changed the `gguf` extra and `dev` dependency group to require
+  `piper-offload[triton]`.
+- Breaking: Consolidated `PiperConvRotInt8Adapter`
+  (`piper_convrot_int8_adapter.py`, `_piper_convrot_int8.py`) and
+  `PiperConvRotNVFP4Adapter` (`piper_convrot_nvfp4_adapter.py`) into the
+  single `PiperQuantizedAdapter` (`piper_quantized_adapter.py`), and unified
+  `StructuredTensorAdapter` (`structured_adapter.py`) around single-pass
+  `StructuredSnapshot` / `_extract` hooks.
+  Transposed `QuantizedWeight` tensors now raise `NotImplementedError` from
+  `as_storage()` during both offload capture and additive merge preflight.
 - Breaking: Removed all standalone TorchAO weight format adapters
   (`Float8Adapter`, `StaticFloat8Adapter`, `Int8Adapter`,
   `Int4TilePackedAdapter`, `MxAdapter`, and TorchAO `Nvfp4Adapter`), along with
   their `_torchao_*` shims, custom Triton LoRA/dense merge kernels
   (`_triton_*_lora`, `_dense_merge`), and standalone stochastic quantization helpers
   (`_stochastic_quantization`, `_triton_stochastic_quantization`). Piper Kernels
-  weights remain supported via `PiperNvfp4Adapter`, `PiperConvRotInt8Adapter`,
-  `PiperConvRotNVFP4Adapter`, `GgufAdapter`, and `TrellisAdapter` (the `torchao`
-  optional extra remains in place until `piper-kernels` drops its `torchao`
-  dependency).
+  `QuantizedWeight` subclasses, GGUF (`GgufAdapter`), and `TrellisParameter`
+  (`TrellisAdapter`) remain supported without any `torchao` or `numpy`
+  dependency.
 - Breaking: Removed `ParameterDeltaTransform` (`parameter_delta.py`),
   `ParameterValueTransform` (`parameter_value.py`), and the
   `piper_offload.parameter_transform` module; internalized `ParameterTransform` in
