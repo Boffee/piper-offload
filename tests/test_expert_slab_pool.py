@@ -33,6 +33,7 @@ from piper_offload import (
     VramBudgetExhaustedError,
 )
 from piper_offload.dual_arena import HighSlotLayout
+from piper_offload.stream_lease import StreamLease
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 _TAGS = {dtype: tag for tag, dtype in checkpoint_module._DTYPES.items()}
@@ -1203,5 +1204,201 @@ def test_cuda_expert_slab_pool_shares_arena_under_torch_compile_fullgraph(
                 torch.testing.assert_close(out1, expected)
                 torch.testing.assert_close(out2, expected)
                 assert int(kv_pool[kv_slot, :16].min().item()) == 7
+    finally:
+        pin_mgr.clear()
+
+
+@CUDA
+def test_cuda_wave_release_failure_retries_and_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+    device = torch.device("cuda")
+    pin_mgr = PinManager(max_pinned_bytes=64 * 1024 * 1024, max_host_bytes=64 * 1024 * 1024)
+    budget = VramBudget(16 * 1024 * 1024)
+    schema = SlotSchema({"up": 256, "down": 128}, {"scale": (torch.float32, (8,))})
+    experts = [_make_synthetic_expert(i, up_bytes=256, down_bytes=128) for i in range(2)]
+    orig_release = StreamLease.release
+    fail_mode = "once"
+    calls = 0
+
+    def _flaky_release(self_lease: StreamLease, stream: torch.cuda.Stream | None = None) -> None:
+        nonlocal calls
+        calls += 1
+        if fail_mode == "always" or (fail_mode == "once" and calls == 1):
+            raise RuntimeError("transient release failure")
+        orig_release(self_lease, stream)
+
+    try:
+        with (
+            Uint8DualArena(1024, device=device, slot_bytes=512, alignment=256, budget=budget) as arena,
+            ExpertSlabPool(arena, schema, max_slots=1, pin_manager=pin_mgr) as pool,
+        ):
+            pool.register_group("moe", experts)
+            monkeypatch.setattr(StreamLease, "release", _flaky_release)
+
+            # Transient error during loop-end release must recover on the generator finally retry.
+            with pytest.raises(RuntimeError, match="transient release failure"):
+                with pool.waves("moe", [0]) as waves:
+                    _ = list(waves)
+            assert pool._slots[0].active_readers == 0
+            with pool.waves("moe", [1]) as waves:
+                _ = list(waves)
+
+            # Escaping error hands ownership to the pool, protects slot 0, and self-heals when cleared.
+            fail_mode = "always"
+            with pytest.raises(RuntimeError, match="transient release failure"):
+                with pool.waves("moe", [1]) as waves:
+                    _ = next(waves)
+            assert pool._slots[0].active_readers > 0
+            with pytest.raises(ArenaCapacityError):
+                with pool.waves("moe", [0]) as waves:
+                    _ = list(waves)
+
+            fail_mode = "none"
+            _ = pool.stats()
+            assert pool._slots[0].active_readers == 0
+            with pool.waves("moe", [0]) as waves:
+                _ = list(waves)
+        assert budget.reserved_bytes == 0
+        assert pin_mgr.stats.active_leases == 0
+    finally:
+        pin_mgr.clear()
+
+
+@CUDA
+def test_cuda_persistent_release_failure_closes_via_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    device = torch.device("cuda")
+    pin_mgr = PinManager(max_pinned_bytes=64 * 1024 * 1024, max_host_bytes=64 * 1024 * 1024)
+    budget = VramBudget(16 * 1024 * 1024)
+    schema = SlotSchema({"up": 256, "down": 128}, {"scale": (torch.float32, (8,))})
+    experts = [_make_synthetic_expert(i, up_bytes=256, down_bytes=128) for i in range(2)]
+    alt_stream = torch.cuda.Stream(device=device)
+    orig_sync_reset = StreamLease.synchronize_and_reset
+    sync_calls = 0
+
+    def _always_fail_release(_self_lease: StreamLease, _stream: torch.cuda.Stream | None = None) -> None:
+        raise RuntimeError("permanent release failure")
+
+    def _fail_first_sync(self_lease: StreamLease) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            raise RuntimeError("sync failed")
+        orig_sync_reset(self_lease)
+
+    try:
+        with Uint8DualArena(1024, device=device, slot_bytes=512, alignment=256, budget=budget) as arena:
+            pool = ExpertSlabPool(arena, schema, max_slots=2, pin_manager=pin_mgr)
+            pool.register_group("moe", experts)
+            monkeypatch.setattr(StreamLease, "release", _always_fail_release)
+            orig_stream = torch.cuda.current_stream(device)
+            try:
+                with pytest.raises(RuntimeError, match="permanent release failure"):
+                    with pool.waves("moe", [0]) as waves:
+                        _ = next(waves)
+                        torch.cuda.set_stream(alt_stream)
+            finally:
+                torch.cuda.set_stream(orig_stream)
+
+            assert pool._slots[0].active_readers > 0
+            with monkeypatch.context() as patch:
+                patch.setattr(StreamLease, "synchronize_and_reset", _fail_first_sync)
+                with pytest.raises(RuntimeError, match="sync failed"):
+                    pool.close()
+            assert pool._closing
+            assert not pool._closed
+            assert not pool.is_open
+            pool.close()
+            assert pool._closed
+            assert not pool.is_open
+            assert arena.low_frontier == 0
+        assert budget.reserved_bytes == 0
+        assert pin_mgr.stats.active_leases == 0
+    finally:
+        pin_mgr.clear()
+
+
+@CUDA
+def test_cuda_record_stream_failure_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    device = torch.device("cuda")
+    pin_mgr = PinManager(max_pinned_bytes=64 * 1024 * 1024, max_host_bytes=64 * 1024 * 1024)
+    budget = VramBudget(16 * 1024 * 1024)
+    schema = SlotSchema({"up": 256, "down": 128}, {"scale": (torch.float32, (8,))})
+    experts = [_make_synthetic_expert(i, up_bytes=256, down_bytes=128) for i in range(2)]
+    alt_stream = torch.cuda.Stream(device=device)
+    orig_record_stream = StreamLease.record_stream
+    fail_record = False
+
+    def _maybe_fail_record(self_lease: StreamLease, stream: torch.cuda.Stream) -> None:
+        if fail_record and stream == alt_stream:
+            raise RuntimeError("record_stream failure")
+        orig_record_stream(self_lease, stream)
+
+    try:
+        with (
+            Uint8DualArena(1024, device=device, slot_bytes=512, alignment=256, budget=budget) as arena,
+            ExpertSlabPool(arena, schema, max_slots=2, pin_manager=pin_mgr) as pool,
+        ):
+            pool.register_group("moe", experts)
+            with pool.waves("moe", [0, 1]) as waves:
+                _ = list(waves)
+            monkeypatch.setattr(StreamLease, "record_stream", _maybe_fail_record)
+
+            # record_stream failure on stream switch must retain slot protection rather than releasing unsafely.
+            orig_stream = torch.cuda.current_stream(device)
+            fail_record = True
+            try:
+                with pytest.raises(RuntimeError, match="record_stream failure"):
+                    with pool.waves("moe", [0]) as waves:
+                        _ = next(waves)
+                        torch.cuda.set_stream(alt_stream)
+            finally:
+                torch.cuda.set_stream(orig_stream)
+                fail_record = False
+            assert pool._slots[0].active_readers > 0
+            assert pool._slots[0].lease is not None and pool._slots[0].lease.is_acquired
+            _ = pool.stats()
+            assert pool._slots[0].active_readers == 0
+        assert budget.reserved_bytes == 0
+    finally:
+        pin_mgr.clear()
+
+
+@CUDA
+def test_cuda_d2d_release_failure_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    device = torch.device("cuda")
+    pin_mgr = PinManager(max_pinned_bytes=64 * 1024 * 1024, max_host_bytes=64 * 1024 * 1024)
+    budget = VramBudget(16 * 1024 * 1024)
+    schema = SlotSchema({"up": 256, "down": 128}, {"scale": (torch.float32, (8,))})
+    experts = [_make_synthetic_expert(i, up_bytes=256, down_bytes=128) for i in range(4)]
+    orig_release = StreamLease.release
+    fail_d2d = False
+
+    def _maybe_fail_release(self_lease: StreamLease, stream: torch.cuda.Stream | None = None) -> None:
+        if fail_d2d:
+            raise RuntimeError("d2d release failure")
+        orig_release(self_lease, stream)
+
+    try:
+        with (
+            Uint8DualArena(2048, device=device, slot_bytes=512, alignment=256, budget=budget) as arena,
+            ExpertSlabPool(arena, schema, max_slots=4, pin_manager=pin_mgr) as pool,
+        ):
+            pool.register_group("moe", experts)
+            with pool.waves("moe", [0, 1, 2, 3]) as waves:
+                _ = list(waves)
+            monkeypatch.setattr(StreamLease, "release", _maybe_fail_release)
+
+            # Sibling _queue_slot_d2d release failure keeps src slot protected and recovers cleanly on reap.
+            pool.commit_accepted([("moe", 3), ("moe", 3)])
+            fail_d2d = True
+            with pytest.raises(RuntimeError, match="d2d release failure"):
+                arena.alloc_high_slot()
+            src_slot = pool._slots[3]
+            assert src_slot.active_readers > 0
+            assert src_slot.lease is not None and src_slot.lease.is_acquired
+            fail_d2d = False
+            _ = pool.stats()
+            assert src_slot.active_readers == 0
+            assert not src_slot.lease.is_acquired
+        assert budget.reserved_bytes == 0
     finally:
         pin_mgr.clear()
