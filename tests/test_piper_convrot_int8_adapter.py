@@ -24,7 +24,7 @@ from piper_offload.dtensor_adapter import DTensorAdapter
 from piper_offload.host_module import HostModuleStore
 from piper_offload.host_param import HostParam
 from piper_offload.lora import LoRATransform
-from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter
+from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
     DenseMergeTensorAdapter,
@@ -91,31 +91,27 @@ def _scaled_value_reference(source, strength):
     return expected
 
 
-def test_package_import_does_not_require_torchao() -> None:
-    # piper-kernels is required, but its ConvRot/NVFP4 tensors rely on
-    # torchao. Without the `torchao` extra all three Piper quantized adapters
-    # report their format unavailable rather than failing the package import.
+def test_package_import_does_not_require_torchao_or_numpy() -> None:
     script = (
         "import builtins\n"
         "real_import = builtins.__import__\n"
-        "def import_without_torchao("
+        "def import_without_optional("
         "name, globals=None, locals=None, fromlist=(), level=0):\n"
-        "    if name == 'torchao' or name.startswith('torchao.'):\n"
+        "    top = name.split('.', 1)[0]\n"
+        "    if top in ('torchao', 'numpy'):\n"
         "        raise ModuleNotFoundError("
-        "'No module named torchao', name='torchao')\n"
+        "f'No module named {top}', name=top)\n"
         "    return real_import(name, globals, locals, fromlist, level)\n"
-        "builtins.__import__ = import_without_torchao\n"
+        "builtins.__import__ = import_without_optional\n"
         "import torch\n"
         "import piper_offload\n"
-        "from piper_offload.piper_convrot_int8_adapter import "
-        "PiperConvRotInt8Adapter\n"
-        "from piper_offload.piper_convrot_nvfp4_adapter import "
-        "PiperConvRotNVFP4Adapter\n"
-        "from piper_offload.piper_nvfp4_adapter import "
-        "PiperNvfp4Adapter\n"
-        "assert not PiperConvRotInt8Adapter.matches(torch.zeros(1))\n"
-        "assert not PiperConvRotNVFP4Adapter.matches(torch.zeros(1))\n"
-        "assert not PiperNvfp4Adapter.matches(torch.zeros(1))\n"
+        "from piper_offload.piper_quantized_adapter import "
+        "PiperQuantizedAdapter\n"
+        "from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor\n"
+        "from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor\n"
+        "from piper_kernels.weights.convrot.trellis import ConvRotTrellisTensor\n"
+        "from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor\n"
+        "assert not PiperQuantizedAdapter.matches(torch.zeros(1))\n"
     )
     completed = subprocess.run(
         [sys.executable, "-c", script],
@@ -131,33 +127,32 @@ class TestPiperConvRotInt8Adapter:
     def test_matches_and_dispatches_convrot_only(self) -> None:
         convrot = _make_convrot()
 
-        assert PiperConvRotInt8Adapter.matches(convrot)
-        assert not PiperConvRotInt8Adapter.matches(torch.zeros(8, 64))
-        assert isinstance(select_adapter(convrot), PiperConvRotInt8Adapter)
+        assert PiperQuantizedAdapter.matches(convrot)
+        assert not PiperQuantizedAdapter.matches(torch.zeros(8, 64))
+        assert isinstance(select_adapter(convrot), PiperQuantizedAdapter)
 
     def test_validates_mutated_public_storage(self) -> None:
         convrot: Any = _make_convrot()
         convrot.scale = convrot.scale.to(torch.float16)
 
         with pytest.raises(ValueError, match="scale must be float32"):
-            PiperConvRotInt8Adapter.matches(convrot)
+            PiperQuantizedAdapter.matches(convrot)
 
     def test_meta_layout_preserves_representation(self) -> None:
         convrot = _make_convrot(device="meta")
-        signature = PiperConvRotInt8Adapter.layout_signature(convrot)
+        signature = PiperQuantizedAdapter.layout_signature(convrot)
 
         assert convrot.device.type == "meta"
         assert signature[0] == (8, 64)
         assert signature[1] is torch.bfloat16
-        assert signature[-3] == (
+        assert signature[-2] == (
             "qdata",
             ((8, 64), torch.int8, (64, 1)),
         )
-        assert signature[-2] == (
+        assert signature[-1] == (
             "scale",
             ((8, 1), torch.float32, (1, 1)),
         )
-        assert signature[-1] == ("act_per_tensor_scale", None)
 
     def test_capture_preserves_storage_metadata_shape_and_cache_bytes(self) -> None:
         convrot_cls = _convrot_cls()
@@ -240,7 +235,7 @@ class TestPiperConvRotInt8Adapter:
         )
 
         key = tensor_id(group_64)
-        assert key[0] == "piper-kernels-convrot-int8"
+        assert key[0] == "piper-kernels-quantized"
         assert key == tensor_id(same_storage)
         assert key != tensor_id(group_16)
         assert key != tensor_id(float16)
@@ -416,7 +411,7 @@ class TestPiperConvRotInt8Adapter:
 
         monkeypatch.setattr(convrot_cls, "add_", recording_add)
 
-        PiperConvRotInt8Adapter.merge_dense_(
+        PiperQuantizedAdapter.merge_dense_(
             convrot,
             update,
             0.125,
@@ -619,7 +614,7 @@ class TestPiperConvRotInt8Adapter:
         assert torch.equal(first[1], replay[1])
 
     def test_advertises_merge_capabilities(self) -> None:
-        adapter = PiperConvRotInt8Adapter()
+        adapter = PiperQuantizedAdapter()
 
         assert isinstance(adapter, LoRAMergeTensorAdapter)
         assert isinstance(adapter, LoRAMergeValidationTensorAdapter)

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from torch import nn
 
 from ._convrot_int8_source import (
@@ -22,7 +23,6 @@ from ._convrot_int8_source import (
     convrot_int8_target_bytes,
     stage_packed_tensors,
 )
-from ._piper_convrot_int8 import create_convrot_int8_tensor, require_variable_row_trellis
 from .tensor_adapters import (
     capture_host_tensor,
     is_plain_meta_placeholder,
@@ -149,12 +149,10 @@ class TrellisAdapter(ConvRotInt8SourceAdapter):
     @staticmethod
     def alloc_gpu(state: _TrellisHost, device: torch.device) -> ConvRotInt8GpuTarget:
         parameter = state.parameter
-        if parameter.row_widths is not None:
-            require_variable_row_trellis()
         rows, features = parameter.shape
         act_scale = parameter.act_per_tensor_scale
         return ConvRotInt8GpuTarget(
-            target=create_convrot_int8_tensor(
+            target=ConvRotInt8Tensor(
                 torch.empty((rows, features), dtype=torch.int8, device=device),
                 torch.empty((rows, 1), dtype=torch.float32, device=device),
                 parameter.group_size,
@@ -171,8 +169,6 @@ class TrellisAdapter(ConvRotInt8SourceAdapter):
         non_blocking: bool = False,
     ) -> None:
         parameter = src.parameter
-        if parameter.row_widths is not None:
-            require_variable_row_trellis()
         host_tensors: tuple[torch.Tensor, ...] = (
             parameter.bitstreams,
             parameter.block_scales,
@@ -180,7 +176,6 @@ class TrellisAdapter(ConvRotInt8SourceAdapter):
         )
         if parameter.row_widths is not None:
             host_tensors = (*host_tensors, parameter.row_widths)
-        # ConvRotInt8Tensor is an optional import, typed Any at its boundary module.
         target = cast(Any, dst.target)
         staged = stage_packed_tensors(
             host_tensors,

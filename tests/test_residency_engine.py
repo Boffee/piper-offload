@@ -1497,7 +1497,9 @@ class TestResidencyEngineCuda:
     def test_auto_offload_paths_estimates_packed_bytes_for_gguf_trellis_and_projected_shard(
         self,
     ) -> None:
-        from piper_offload.piper_convrot_int8_adapter import PiperConvRotInt8Adapter, _PiperConvRotInt8Meta
+        from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+
+        from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter, _PiperQuantizedMeta
         from piper_offload.structured_adapter import StructuredHost, _ProjectedStructuredShard
 
         # 1. GGUF Q4_0 (64, 64): packed = 2304 B (vs dense BF16 = 8192 B)
@@ -1524,19 +1526,19 @@ class TestResidencyEngineCuda:
         # 3. _ProjectedStructuredShard: int8 qdata (4096 B) + float32 scale (256 B) = 4352 B
         #    (vs logical meta BF16 = 8192 B).
         proj_shard = _ProjectedStructuredShard(
-            PiperConvRotInt8Adapter,
+            PiperQuantizedAdapter,
             StructuredHost(
                 storage=(
                     torch.empty((64, 64), dtype=torch.int8),
                     torch.empty((64, 1), dtype=torch.float32),
-                    None,
                 ),
-                meta=_PiperConvRotInt8Meta(
-                    group_size=64,
-                    dtype=torch.bfloat16,
+                meta=_PiperQuantizedMeta(
+                    wrapper_type=ConvRotInt8Tensor,
+                    storage_names=("qdata", "scale"),
+                    metadata=(("dtype", torch.bfloat16), ("group_size", 64)),
                 ),
                 logical_shape=(64, 64),
-                target_shapes=((64, 64), (64, 1), None),
+                target_shapes=((64, 64), (64, 1)),
             ),
             torch.empty((64, 64), dtype=torch.bfloat16, device="meta"),
             ("proj",),

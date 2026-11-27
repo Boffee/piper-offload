@@ -14,8 +14,7 @@ from piper_offload import (
 )
 from piper_offload.host_param import HostParam
 from piper_offload.lora import LoRATransform
-from piper_offload.piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
-from piper_offload.piper_nvfp4_adapter import PiperNvfp4Adapter
+from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter
 from piper_offload.tensor_adapter_registry import select_adapter, tensor_id
 from piper_offload.tensor_adapters import (
     DenseMergeTensorAdapter,
@@ -39,10 +38,8 @@ SM120 = pytest.mark.skipif(
 )
 
 
-def _modules() -> tuple[Any, Any, Any]:
-    nv_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
-    piper_nv = pytest.importorskip("piper_kernels.weights.nvfp4")
-    return nv_mod.NVFP4Tensor, nv_mod.QuantizeTensorToNVFP4Kwargs, piper_nv.PiperNVFP4Tensor
+def _piper_cls() -> Any:
+    return pytest.importorskip("piper_kernels.weights.nvfp4").PiperNVFP4Tensor
 
 
 def _make_piper_nvfp4(
@@ -57,7 +54,7 @@ def _make_piper_nvfp4(
     per_tensor_scale: torch.Tensor | None = None,
     act_per_tensor_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _torchao_nv, kwargs_cls, piper_cls = _modules()
+    piper_cls = _piper_cls()
     if dense is None:
         dense = torch.randn(rows, cols, device=device, dtype=dtype)
     else:
@@ -68,13 +65,7 @@ def _make_piper_nvfp4(
         compute_per_tensor_scale=per_tensor_scale is None,
         act_per_tensor_scale=act_per_tensor_scale,
         is_swizzled_scales=is_swizzled_scales,
-        use_triton_kernel=False,
-        act_quant_kwargs=kwargs_cls(
-            block_size=16,
-            is_swizzled_scales=is_swizzled_scales,
-            use_triton_kernel=False,
-            use_dynamic_per_tensor_scale=True,
-        ),
+        act_quant="dynamic",
     )
     if high_first:
         qdata = (((packed.qdata & 0x0F) << 4) | (packed.qdata >> 4)).to(torch.uint8)
@@ -82,33 +73,41 @@ def _make_piper_nvfp4(
             qdata,
             packed.scale,
             packed.block_size,
-            packed.orig_dtype,
+            packed.dtype,
             packed.per_tensor_scale,
             packed.act_per_tensor_scale,
             packed.is_swizzled_scales,
-            packed.use_triton_kernel,
-            packed.act_quant_kwargs,
+            packed.act_quant,
             high_first=True,
         )
     return packed, dense
 
 
 class TestPiperNvfp4Adapter:
-    def test_matches_piper_nvfp4_and_rejects_torchao_and_convrot(self) -> None:
-        torchao_nv_cls, _kwargs_cls, _piper_cls = _modules()
+    def test_matches_piper_nvfp4_and_convrot_nvfp4_under_unified_adapter(self) -> None:
         convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.nvfp4")
 
-        piper_w, dense = _make_piper_nvfp4()
-        torchao_w = torchao_nv_cls.to_nvfp4(dense, is_swizzled_scales=True, use_triton_kernel=False)
-        convrot_w = convrot_mod.ConvRotNVFP4Tensor.from_torchao(torchao_w, group_size=64)
+        piper_w, _dense = _make_piper_nvfp4()
+        convrot_w = convrot_mod.ConvRotNVFP4Tensor.from_quantized(
+            piper_w.qdata,
+            piper_w.scale,
+            group_size=64,
+            logical_dtype=piper_w.dtype,
+            per_tensor_scale=piper_w.per_tensor_scale,
+            act_per_tensor_scale=piper_w.act_per_tensor_scale,
+            is_swizzled_scales=piper_w.is_swizzled_scales,
+            act_quant=piper_w.act_quant,
+            high_first=piper_w.high_first,
+        )
 
-        assert PiperNvfp4Adapter.matches(piper_w)
-        assert isinstance(select_adapter(piper_w), PiperNvfp4Adapter)
-        assert not PiperNvfp4Adapter.matches(torchao_w)
-        assert not PiperNvfp4Adapter.matches(convrot_w)
-        assert isinstance(select_adapter(convrot_w), PiperConvRotNVFP4Adapter)
-        with pytest.raises(NotImplementedError, match="register_adapter"):
-            select_adapter(torchao_w)
+        assert PiperQuantizedAdapter.matches(piper_w)
+        assert PiperQuantizedAdapter.matches(convrot_w)
+        assert isinstance(select_adapter(piper_w), PiperQuantizedAdapter)
+        assert isinstance(select_adapter(convrot_w), PiperQuantizedAdapter)
+        assert tensor_id(piper_w) != tensor_id(convrot_w)
+        assert PiperQuantizedAdapter.layout_signature(piper_w) != PiperQuantizedAdapter.layout_signature(
+            convrot_w
+        )
 
     def test_capture_and_reconstruct_preserve_storage_and_metadata(self) -> None:
         piper_w, _dense = _make_piper_nvfp4(high_first=True, act_per_tensor_scale=torch.tensor(0.25))
@@ -121,7 +120,7 @@ class TestPiperNvfp4Adapter:
         assert host.high_first is True
         assert host.per_tensor_scale is not None
         assert host.act_per_tensor_scale is not None
-        assert host_param.compute_dtype is piper_w.orig_dtype
+        assert host_param.compute_dtype is piper_w.dtype
         assert host_param.cache_bytes == sum(
             s.nbytes
             for s in (piper_w.qdata, piper_w.scale, piper_w.per_tensor_scale, piper_w.act_per_tensor_scale)
@@ -141,7 +140,7 @@ class TestPiperNvfp4Adapter:
         low_first, dense = _make_piper_nvfp4(high_first=False)
         high_first, _ = _make_piper_nvfp4(dense=dense, high_first=True)
 
-        assert tensor_id(low_first)[0] == "piper-kernels-nvfp4"
+        assert tensor_id(low_first)[0] == "piper-kernels-quantized"
         assert tensor_id(low_first) != tensor_id(high_first)
         assert _param_target_layout(nn.Parameter(low_first, requires_grad=False)) != _param_target_layout(
             nn.Parameter(high_first, requires_grad=False)
@@ -154,8 +153,8 @@ class TestPiperNvfp4Adapter:
         piper_w, _dense = _make_piper_nvfp4(rows=rows, cols=cols)
         piper_w = piper_w.to(device)
         param = nn.Parameter(piper_w, requires_grad=False)
-        a = torch.randn(rank, cols, dtype=piper_w.orig_dtype)
-        b = torch.randn(rows, rank, dtype=piper_w.orig_dtype)
+        a = torch.randn(rank, cols, dtype=piper_w.dtype)
+        b = torch.randn(rows, rank, dtype=piper_w.dtype)
         transform = LoRATransform([ScaledLoRAFactor.from_tensors(a, b, 0.25)], beta=beta)
         expected = piper_w.clone()
         expected.addmm_(b.to(device), a.to(device), alpha=0.25, beta=beta)
@@ -176,20 +175,20 @@ class TestPiperNvfp4Adapter:
         rows, cols, rank = 16, 64, 4
         piper_w, _dense = _make_piper_nvfp4(rows=rows, cols=cols)
         model = nn.Module()
-        model.lin = nn.Linear(cols, rows, bias=False, dtype=piper_w.orig_dtype)
+        model.lin = nn.Linear(cols, rows, bias=False, dtype=piper_w.dtype)
         model.lin.weight = nn.Parameter(piper_w, requires_grad=False)
         dense = torch.randn(rows, cols)
         strength = -0.25
         state_dict = {"lin.delta.weight": dense}
-        expected_update = torch.zeros(rows, cols, dtype=piper_w.orig_dtype)
-        expected_update.add_(dense.to(piper_w.orig_dtype), alpha=strength)
+        expected_update = torch.zeros(rows, cols, dtype=piper_w.dtype)
+        expected_update.add_(dense.to(piper_w.dtype), alpha=strength)
         if with_lora:
             a = torch.randn(rank, cols)
             b = torch.randn(rows, rank)
             state_dict.update({"lin.lora_A.weight": a, "lin.lora_B.weight": b})
-            scaled_a = a.to(piper_w.orig_dtype)
+            scaled_a = a.to(piper_w.dtype)
             scaled_a.mul_(strength)
-            expected_update.addmm_(b.to(piper_w.orig_dtype), scaled_a)
+            expected_update.addmm_(b.to(piper_w.dtype), scaled_a)
         expected = piper_w.clone()
         expected.add_(expected_update)
         qdata_ptr = piper_w.qdata.data_ptr()
@@ -207,7 +206,7 @@ class TestPiperNvfp4Adapter:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        piper_cls = _modules()[2]
+        piper_cls = _piper_cls()
         piper_w, _ = _make_piper_nvfp4()
         b = torch.randn(16, 4, dtype=torch.bfloat16)
         a = torch.randn(4, 64, dtype=torch.bfloat16)
@@ -243,53 +242,40 @@ class TestPiperNvfp4Adapter:
         monkeypatch.setattr(piper_cls, "addmm_", rec_addmm)
         monkeypatch.setattr(piper_cls, "add_", rec_add)
 
-        PiperNvfp4Adapter.merge_lora_(piper_w, b, a, 0.125, beta=-0.5, rounding_seed=456)
-        PiperNvfp4Adapter.merge_dense_(piper_w, update, 0.25, beta=-0.75, rounding_seed=789)
+        PiperQuantizedAdapter.merge_lora_(piper_w, b, a, 0.125, beta=-0.5, rounding_seed=456)
+        PiperQuantizedAdapter.merge_dense_(piper_w, update, 0.25, beta=-0.75, rounding_seed=789)
 
         assert addmm_calls == [(0.125, -0.5, 456)]
         assert add_calls == [(0.25, -0.75, 789)]
 
     def test_preflight_rejects_3d_and_transposed_updates(self) -> None:
-        piper_cls = _modules()[2]
+        piper_cls = _piper_cls()
         w3 = piper_cls.from_hp(
             torch.randn(2, 16, 64, dtype=torch.bfloat16),
             per_tensor_scale=torch.tensor([0.2, 0.4], dtype=torch.float32).view(2, 1, 1),
             is_swizzled_scales=True,
-            use_triton_kernel=False,
         )
         with pytest.raises(ValueError, match="2-D weight"):
-            PiperNvfp4Adapter.validate_lora_merge(w3)
+            PiperQuantizedAdapter.validate_lora_merge(w3)
         with pytest.raises(ValueError, match="2-D weight"):
-            PiperNvfp4Adapter.validate_dense_merge(w3)
+            PiperQuantizedAdapter.validate_dense_merge(w3)
 
         w2, _ = _make_piper_nvfp4(rows=16, cols=64, is_swizzled_scales=False)
         wt = w2.t()
         assert wt.transposed
-        with pytest.raises(ValueError, match="contiguous untransposed"):
-            PiperNvfp4Adapter.validate_lora_merge(wt)
-        with pytest.raises(ValueError, match="contiguous untransposed"):
-            PiperNvfp4Adapter.validate_dense_merge(wt)
+        with pytest.raises(NotImplementedError, match="transposed weight"):
+            PiperQuantizedAdapter.validate_lora_merge(wt)
+        with pytest.raises(NotImplementedError, match="transposed weight"):
+            PiperQuantizedAdapter.validate_dense_merge(wt)
 
     def test_preflight_rejects_non_scalar_per_tensor_scale_atomically(self) -> None:
-        piper_cls = _modules()[2]
-        base, _ = _make_piper_nvfp4(rows=16, cols=64, is_swizzled_scales=False)
-        bad_weight = piper_cls(
-            base.qdata,
-            base.scale,
-            base.block_size,
-            base.orig_dtype,
-            torch.tensor([0.2, 0.4], dtype=torch.float32).view(2, 1, 1),
-            base.act_per_tensor_scale,
-            base.is_swizzled_scales,
-            base.use_triton_kernel,
-            base.act_quant_kwargs,
-            high_first=base.high_first,
-        )
+        base: Any = _make_piper_nvfp4(rows=16, cols=64, is_swizzled_scales=False)[0]
+        base.per_tensor_scale = torch.tensor([0.2, 0.4], dtype=torch.float32).view(2, 1, 1)
         model = nn.Module()
         model.good = nn.Linear(16, 4, bias=False, dtype=torch.bfloat16).requires_grad_(False)
         model.good.weight.fill_(1.0)
         model.bad = nn.Linear(64, 16, bias=False, dtype=torch.bfloat16).requires_grad_(False)
-        model.bad.weight = nn.Parameter(bad_weight, requires_grad=False)
+        model.bad.weight = nn.Parameter(base, requires_grad=False)
         lora = Adapter.from_state_dict(
             {
                 "good.lora_A.weight": torch.ones(2, 16, dtype=torch.bfloat16),
@@ -305,39 +291,30 @@ class TestPiperNvfp4Adapter:
             }
         )
         for adapter in (lora, dense):
-            with pytest.raises(ValueError, match="scalar per_tensor_scale"):
+            with pytest.raises(ValueError, match="per_tensor_scale"):
                 merge_adapter(model, [(adapter, 1.0)])
             torch.testing.assert_close(model.good.weight, torch.ones_like(model.good.weight), rtol=0, atol=0)
 
-    @pytest.mark.parametrize("orig_dtype", [torch.float64, torch.float8_e4m3fn])
-    def test_preflight_rejects_unsupported_orig_dtype_atomically(
-        self,
-        orig_dtype: torch.dtype,
-    ) -> None:
-        piper_cls = _modules()[2]
+    def test_preflight_rejects_non_canonical_flat_scale_atomically(self) -> None:
+        piper_cls = _piper_cls()
         base, _ = _make_piper_nvfp4(rows=16, cols=64, is_swizzled_scales=False)
-        bad_weight = piper_cls(
+        flat_weight = piper_cls.from_quantized(
             base.qdata,
-            base.scale,
-            base.block_size,
-            orig_dtype,
-            base.per_tensor_scale,
-            base.act_per_tensor_scale,
-            base.is_swizzled_scales,
-            base.use_triton_kernel,
-            base.act_quant_kwargs,
-            high_first=base.high_first,
+            base.scale.reshape(-1),
+            logical_dtype=base.dtype,
+            is_swizzled_scales=False,
         )
-        with pytest.raises(ValueError, match="orig_dtype"):
-            PiperNvfp4Adapter.validate_lora_merge(bad_weight)
-        with pytest.raises(ValueError, match="orig_dtype"):
-            PiperNvfp4Adapter.validate_dense_merge(bad_weight)
+        assert PiperQuantizedAdapter.matches(flat_weight)
+        with pytest.raises(ValueError, match="canonical 2-D scales"):
+            PiperQuantizedAdapter.validate_lora_merge(flat_weight)
+        with pytest.raises(ValueError, match="canonical 2-D scales"):
+            PiperQuantizedAdapter.validate_dense_merge(flat_weight)
 
         model = nn.Module()
         model.good = nn.Linear(16, 4, bias=False, dtype=torch.bfloat16).requires_grad_(False)
         model.good.weight.fill_(1.0)
         model.bad = nn.Linear(64, 16, bias=False, dtype=torch.bfloat16).requires_grad_(False)
-        model.bad.weight = nn.Parameter(bad_weight, requires_grad=False)
+        model.bad.weight = nn.Parameter(flat_weight, requires_grad=False)
         lora = Adapter.from_state_dict(
             {
                 "good.lora_A.weight": torch.ones(2, 16, dtype=torch.bfloat16),
@@ -353,29 +330,16 @@ class TestPiperNvfp4Adapter:
             }
         )
         for adapter in (lora, dense):
-            with pytest.raises(ValueError, match="orig_dtype"):
+            with pytest.raises(ValueError, match="canonical 2-D scales"):
                 merge_adapter(model, [(adapter, 1.0)])
             torch.testing.assert_close(model.good.weight, torch.ones_like(model.good.weight), rtol=0, atol=0)
 
-    def test_create_piper_nvfp4_tensor_rejects_convrot_subclass(self) -> None:
-        from piper_offload._piper_nvfp4 import create_piper_nvfp4_tensor
-
+    def test_from_storage_validates_subclass_identity(self) -> None:
         cr_mod = pytest.importorskip("piper_kernels.weights.convrot.nvfp4")
         base, _ = _make_piper_nvfp4(rows=16, cols=64, is_swizzled_scales=False)
-        with pytest.raises(TypeError, match="not ConvRotNVFP4Tensor"):
-            create_piper_nvfp4_tensor(
-                base.qdata,
-                base.scale,
-                base.block_size,
-                base.orig_dtype,
-                base.per_tensor_scale,
-                base.act_per_tensor_scale,
-                base.is_swizzled_scales,
-                base.use_triton_kernel,
-                base.act_quant_kwargs,
-                base.high_first,
-                wrapper_type=cr_mod.ConvRotNVFP4Tensor,
-            )
+        tensors, metadata = base.as_storage()
+        with pytest.raises(ValueError, match="group_size"):
+            cr_mod.ConvRotNVFP4Tensor.from_storage(tensors, metadata)
 
     def test_stochastic_merge_replays(self) -> None:
         generator = torch.Generator().manual_seed(123)
@@ -385,7 +349,7 @@ class TestPiperNvfp4Adapter:
 
         def run() -> tuple[torch.Tensor, torch.Tensor]:
             piper_w, _ = _make_piper_nvfp4(dense=dense)
-            PiperNvfp4Adapter.merge_lora_(piper_w, b, a, 0.125, rounding_seed=456)
+            PiperQuantizedAdapter.merge_lora_(piper_w, b, a, 0.125, rounding_seed=456)
             return piper_w.qdata.clone(), piper_w.scale.clone()
 
         first = run()
@@ -394,16 +358,15 @@ class TestPiperNvfp4Adapter:
         assert torch.equal(first[1].view(torch.uint8), replay[1].view(torch.uint8))
 
     def test_3d_per_expert_swizzled_projection_roundtrip(self) -> None:
-        piper_cls = _modules()[2]
+        piper_cls = _piper_cls()
         torch.manual_seed(11)
         w3 = piper_cls.from_hp(
             torch.randn(4, 192, 80, dtype=torch.bfloat16),
             per_tensor_scale=torch.tensor([0.2, 0.4, 0.6, 0.8], dtype=torch.float32).view(4, 1, 1),
             is_swizzled_scales=True,
-            use_triton_kernel=False,
         )
-        host = PiperNvfp4Adapter.capture_host(w3)
-        proj, _ = PiperNvfp4Adapter.project_shard(
+        host = PiperQuantizedAdapter.capture_host(w3)
+        proj, _ = PiperQuantizedAdapter.project_shard(
             host, offsets=(2, 128, 64), local_shape=(2, 64, 16)
         )
         assert proj.target_shapes is not None
@@ -418,12 +381,12 @@ class TestPiperNvfp4Adapter:
             )
             for tensor, shape in zip(proj.storage, proj.target_shapes, strict=True)
         )
-        rebuilt = PiperNvfp4Adapter._reconstruct(slots, proj.meta)
+        rebuilt = PiperQuantizedAdapter._reconstruct(slots, proj.meta)
         ref = w3.dequantize()[2:4, 128:192, 64:80]
         torch.testing.assert_close(rebuilt.dequantize(), ref, rtol=0, atol=0)
 
     def test_advertises_expected_capabilities(self) -> None:
-        adapter = PiperNvfp4Adapter()
+        adapter = PiperQuantizedAdapter()
 
         assert isinstance(adapter, LoRAMergeTensorAdapter)
         assert isinstance(adapter, LoRAMergeValidationTensorAdapter)
@@ -433,7 +396,7 @@ class TestPiperNvfp4Adapter:
 
     @SM120
     def test_model_offloader_cuda_forward_preserves_piper_nvfp4(self) -> None:
-        piper_cls = _modules()[2]
+        piper_cls = _piper_cls()
         weight, _dense = _make_piper_nvfp4(rows=128, cols=256)
         layer = nn.Linear(256, 128, bias=False, dtype=torch.bfloat16)
         layer.weight = nn.Parameter(weight, requires_grad=False)

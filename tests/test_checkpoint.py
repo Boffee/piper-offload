@@ -1,5 +1,6 @@
 """Read-only checkpoint mapping: safe_open surface, validation, lifetime, and provenance."""
 
+import ctypes
 import errno
 import gc
 import json
@@ -39,7 +40,10 @@ def _write(path: Path, tensors: dict[str, torch.Tensor], metadata: dict[str, str
 
 
 def _raw_bytes(tensor: torch.Tensor) -> bytes:
-    return tensor.reshape(-1).contiguous().view(torch.uint8).numpy().tobytes() if tensor.numel() else b""
+    if not tensor.numel():
+        return b""
+    flat = tensor.detach().cpu().reshape(-1).contiguous().view(torch.uint8)
+    return ctypes.string_at(flat.data_ptr(), flat.nbytes)
 
 
 def _write_raw(path: Path, header: object, data: bytes = b"") -> None:

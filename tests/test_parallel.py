@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import ctypes
 import gc
 import json
 import mmap
@@ -808,7 +809,8 @@ def _exercise_mapped_ro_subrange(ro: torch.Tensor, ro_sub: torch.Tensor) -> None
 
 def _run_mapped_ro_subrange_checks(tmp_path: Path) -> None:
     ckpt_path = tmp_path / "readonly.bin"
-    raw = torch.arange(16, dtype=torch.float32).numpy().tobytes()
+    src_raw = torch.arange(16, dtype=torch.float32)
+    raw = ctypes.string_at(src_raw.data_ptr(), src_raw.nbytes)
     ckpt_path.write_bytes(raw)
     f = ckpt_path.open("rb")
     mm = mmap.mmap(f.fileno(), len(raw), access=mmap.ACCESS_READ)
@@ -1782,7 +1784,8 @@ def test_mapped_file_snapshot_and_session_lease_interrupt_retry(
     from piper_offload import _mapped_file
 
     ckpt_path = tmp_path / "snap.bin"
-    ckpt_path.write_bytes(torch.arange(8, dtype=torch.float32).numpy().tobytes())
+    raw_src = torch.arange(8, dtype=torch.float32)
+    ckpt_path.write_bytes(ctypes.string_at(raw_src.data_ptr(), raw_src.nbytes))
     with ckpt_path.open("rb") as f:
         mm = mmap.mmap(f.fileno(), 32, access=mmap.ACCESS_READ)
         try:
@@ -2331,7 +2334,11 @@ def _write_tp_safetensors(path: Path, tensors: dict[str, torch.Tensor]) -> None:
     header: dict[str, object] = {}
     payload = bytearray()
     for name, tensor in tensors.items():
-        raw = tensor.reshape(-1).contiguous().view(torch.uint8).numpy().tobytes() if tensor.numel() else b""
+        if tensor.numel():
+            flat = tensor.detach().cpu().reshape(-1).contiguous().view(torch.uint8)
+            raw = ctypes.string_at(flat.data_ptr(), flat.nbytes)
+        else:
+            raw = b""
         header[name] = {
             "dtype": tags[tensor.dtype],
             "shape": list(tensor.shape),
@@ -2947,16 +2954,8 @@ def _build_nvfp4_and_convrot_tp_references(
 ) -> tuple[ModelStore, ModelStore, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     piper_nv = pytest.importorskip("piper_kernels.weights.nvfp4")
     cr_mod = pytest.importorskip("piper_kernels.weights.convrot.nvfp4")
-    nv_kw_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
-    from piper_offload.piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
-    from piper_offload.piper_nvfp4_adapter import PiperNvfp4Adapter
+    from piper_offload.piper_quantized_adapter import PiperQuantizedAdapter
 
-    act_kw = nv_kw_mod.QuantizeTensorToNVFP4Kwargs(
-        block_size=16,
-        is_swizzled_scales=True,
-        use_triton_kernel=False,
-        use_dynamic_per_tensor_scale=True,
-    )
     nv_ref = _QuantTPModel(dim=dim, num_blocks=2, bias=False, device="cpu", dtype=torch.bfloat16)
     cr_ref = _QuantTPModel(dim=dim, num_blocks=2, bias=False, device="cpu", dtype=torch.bfloat16)
     for b_nv, b_cr in zip(nv_ref.blocks, cr_ref.blocks, strict=True):
@@ -2966,27 +2965,26 @@ def _build_nvfp4_and_convrot_tp_references(
                     l_nv.weight.data,
                     per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
                     is_swizzled_scales=True,
-                    use_triton_kernel=False,
-                    act_quant_kwargs=act_kw,
+                    act_quant="dynamic",
                 ),
                 requires_grad=False,
             )
-            base_cr = piper_nv.PiperNVFP4Tensor.from_hp(
-                l_cr.weight.data,
-                per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
-                is_swizzled_scales=True,
-                use_triton_kernel=False,
-                act_quant_kwargs=act_kw,
-            )
             l_cr.weight = nn.Parameter(
-                cr_mod.ConvRotNVFP4Tensor.from_torchao(base_cr, group_size=64), requires_grad=False
+                cr_mod.ConvRotNVFP4Tensor.from_hp(
+                    l_cr.weight.data,
+                    per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
+                    is_swizzled_scales=True,
+                    act_quant="dynamic",
+                    group_size=64,
+                ),
+                requires_grad=False,
             )
 
     with torch.inference_mode():
         nv_expected = copy.deepcopy(nv_ref).to("cuda:0")(x.to("cuda:0")).cpu()
         cr_expected = copy.deepcopy(cr_ref).to("cuda:0")(x.to("cuda:0")).cpu()
-    nv_expected_merged = _merge_sharded_ref_model(nv_ref, dense_fc1, dense_fc2, PiperNvfp4Adapter, x)
-    cr_expected_merged = _merge_sharded_ref_model(cr_ref, dense_fc1, dense_fc2, PiperConvRotNVFP4Adapter, x)
+    nv_expected_merged = _merge_sharded_ref_model(nv_ref, dense_fc1, dense_fc2, PiperQuantizedAdapter, x)
+    cr_expected_merged = _merge_sharded_ref_model(cr_ref, dense_fc1, dense_fc2, PiperQuantizedAdapter, x)
     return (
         ModelStore.from_module(nv_ref),
         ModelStore.from_module(cr_ref),
@@ -2999,7 +2997,6 @@ def _build_nvfp4_and_convrot_tp_references(
 
 @TWO_GPUS
 def test_two_gpu_model_store_bind_tp_nvfp4_and_convrot_nvfp4() -> None:
-    pytest.importorskip("numpy")
     host_pin_manager.clear()
     torch.manual_seed(79)
     dim = 256
@@ -3064,16 +3061,8 @@ def test_two_gpu_model_store_bind_tp_nvfp4_and_convrot_nvfp4() -> None:
 
 @TWO_GPUS
 def test_two_gpu_model_store_bind_tp_piper_nvfp4_and_lora_merge() -> None:
-    pytest.importorskip("numpy")
     piper_nv = pytest.importorskip("piper_kernels.weights.nvfp4")
     cr_mod = pytest.importorskip("piper_kernels.weights.convrot.nvfp4")
-    nv_kw_mod = pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
-    act_kw = nv_kw_mod.QuantizeTensorToNVFP4Kwargs(
-        block_size=16,
-        is_swizzled_scales=True,
-        use_triton_kernel=False,
-        use_dynamic_per_tensor_scale=True,
-    )
 
     host_pin_manager.clear()
     torch.manual_seed(83)
@@ -3089,18 +3078,25 @@ def test_two_gpu_model_store_bind_tp_piper_nvfp4_and_lora_merge() -> None:
     cr_ref = _QuantTPModel(dim=dim, num_blocks=2, bias=False, device="cpu", dtype=torch.bfloat16)
     for b_p, b_cr in zip(p_ref.blocks, cr_ref.blocks, strict=True):
         for l_p, l_cr in ((b_p.fc1, b_cr.fc1), (b_p.fc2, b_cr.fc2)):
-            for lin, wrap in (
-                (l_p, lambda t: t),
-                (l_cr, lambda t: cr_mod.ConvRotNVFP4Tensor.from_torchao(t, group_size=64)),
-            ):
-                base = piper_nv.PiperNVFP4Tensor.from_hp(
-                    lin.weight.data,
+            l_p.weight = nn.Parameter(
+                piper_nv.PiperNVFP4Tensor.from_hp(
+                    l_p.weight.data,
                     per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
                     is_swizzled_scales=True,
-                    use_triton_kernel=False,
-                    act_quant_kwargs=act_kw,
-                )
-                lin.weight = nn.Parameter(wrap(base), requires_grad=False)
+                    act_quant="dynamic",
+                ),
+                requires_grad=False,
+            )
+            l_cr.weight = nn.Parameter(
+                cr_mod.ConvRotNVFP4Tensor.from_hp(
+                    l_cr.weight.data,
+                    per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
+                    is_swizzled_scales=True,
+                    act_quant="dynamic",
+                    group_size=64,
+                ),
+                requires_grad=False,
+            )
 
     p_store, cr_store = (ModelStore.from_module(p_ref), ModelStore.from_module(cr_ref))
     with activated_model(ModelOffloader.from_module(p_ref), "cuda:0") as ref_m, torch.inference_mode():

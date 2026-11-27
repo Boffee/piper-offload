@@ -1,10 +1,13 @@
 """Host registration across CUDA sessions and asynchronous copies."""
 
 import mmap
+from pathlib import Path
 
 import pytest
 import torch
 from torch import nn
+
+from tests.test_checkpoint import _write as _write_safetensors
 
 import piper_offload.merge as merge_module
 import piper_offload.pin_manager as pin_module
@@ -541,13 +544,12 @@ def test_failed_deactivation_refuses_resident_reactivation(pins, monkeypatch) ->
 @CUDA
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 def test_mapped_checkpoint_streams_from_owned_copies(compiled, pins, tmp_path, monkeypatch) -> None:
-    safetensors = pytest.importorskip("safetensors.torch")
     manager, backend = pins
     model = _BlockModel(width=64)
     inputs = torch.randn(2, 64)
     expected = model(inputs)
     path = tmp_path / "model.safetensors"
-    safetensors.save_file(model.state_dict(), str(path))
+    _write_safetensors(Path(path), model.state_dict())
     reader = MappedCheckpoint(path)
     names = reader.keys()
     sources = {name: reader.get_tensor(name) for name in names}
@@ -666,7 +668,6 @@ def test_permanent_merge_leases_sources_during_apply(pins, monkeypatch) -> None:
 @CUDA
 def test_rotating_mapped_models_promotes_between_tier2a_and_tier2b(pins, tmp_path, monkeypatch) -> None:
     """Two streamed checkpoints over a budget that holds one rotate via Tier 2b without re-reading disk."""
-    safetensors = pytest.importorskip("safetensors.torch")
     manager, backend = pins
     disk_reads: list[int] = []
     orig_read_into = DirectFileReader.read_into
@@ -682,7 +683,7 @@ def test_rotating_mapped_models_promotes_between_tier2a_and_tier2b(pins, tmp_pat
         inputs = torch.randn(2, 64)
         expected = model(inputs)
         path = tmp_path / f"{name}.safetensors"
-        safetensors.save_file(model.state_dict(), str(path))
+        _write_safetensors(Path(path), model.state_dict())
         reader = MappedCheckpoint(path)
         names = reader.keys()
         model.load_state_dict({name: reader.get_tensor(name) for name in names}, assign=True)

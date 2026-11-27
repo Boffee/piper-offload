@@ -8,10 +8,10 @@ an ordinary tensor — plain, or a quantized subclass — so this adapter
 already selects** for it, and adds only the distributed wrapper.
 
 One adapter therefore composes with plain and Piper-subclass
-adapters: a ``DTensor`` wrapping a ``ConvRotInt8Tensor`` reuses
-``PiperConvRotInt8Adapter`` for the local shard, a ``DTensor`` wrapping a plain
-tensor reuses ``RegularAdapter``, and so on — no per-quant ``DTensor``
-variants.
+adapters: a ``DTensor`` wrapping a ``ConvRotInt8Tensor`` (or another
+``QuantizedWeight``) reuses ``PiperQuantizedAdapter`` for the local shard, a
+``DTensor`` wrapping a plain tensor reuses ``RegularAdapter``, and so on — no
+per-quant ``DTensor`` variants.
 
 Local shards must retain their tensor representation through ``.data``
 because reconstruction reads it from the inner wrapper. ``capture_host``
@@ -29,13 +29,15 @@ Dense ``Replicate`` and contiguous ``Shard(dim)`` tensors across 1D and N-D
 meshes can also be projected from a full plain host parameter or a supported
 non-``nn.Parameter``-subclass quantized host parameter (such as Piper
 ``PiperNVFP4Tensor``, or 2-D Piper ``ConvRotInt8Tensor`` /
-``ConvRotNVFP4Tensor`` via
+``ConvRotNVFP4Tensor`` / ``ConvRotTrellisTensor`` via
 :class:`~piper_offload.tensor_adapters.ShardProjectionTensorAdapter`). The
 target DTensor supplies only its distributed layout and may use a meta local
 tensor; host storage remains a zero-copy view or alias of the original host
-allocation, including mmap-backed checkpoint storage. Non-canonical projected
-shards (such as column-sharded quantized matrices) rest on CPU in a minimal
-zero-allocation placeholder until CUDA activation materializes contiguous
+allocation (including mmap-backed checkpoint storage) where the format's layout
+permits, or re-packs rank-local streams when required by variable-width layouts
+such as variable-row ``ConvRotTrellisTensor`` ``Shard(1)``. Non-canonical
+projected shards (such as column-sharded quantized matrices) rest on CPU in a
+minimal zero-allocation placeholder until CUDA activation materializes contiguous
 ``1/P`` device shards.
 
 A DTensor merge is available only when its local shard's adapter

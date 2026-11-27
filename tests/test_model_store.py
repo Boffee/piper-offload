@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import ctypes
 import gc
 import json
 from pathlib import Path
@@ -1596,11 +1597,11 @@ def _write_safetensors(path: Path, tensors: dict[str, torch.Tensor]) -> None:
     header: dict[str, object] = {}
     payload = bytearray()
     for name, tensor in tensors.items():
-        raw = (
-            tensor.reshape(-1).contiguous().view(torch.uint8).numpy().tobytes()
-            if tensor.numel()
-            else b""
-        )
+        if tensor.numel():
+            flat = tensor.detach().cpu().reshape(-1).contiguous().view(torch.uint8)
+            raw = ctypes.string_at(flat.data_ptr(), flat.nbytes)
+        else:
+            raw = b""
         header[name] = {
             "dtype": tags[tensor.dtype],
             "shape": list(tensor.shape),
@@ -2255,7 +2256,6 @@ class TestModelStoreDTensorProjection:
     def test_bind_dtensor_quantized_2d_mesh_zero_copy_and_per_rank_bytes(self) -> None:
         if not DTENSOR_AVAILABLE:
             pytest.skip("DTensor required")
-        pytest.importorskip("numpy")
         piper_nv = pytest.importorskip("piper_kernels.weights.nvfp4")
         convrot_mod = pytest.importorskip("piper_kernels.weights.convrot.int8")
 
@@ -2359,28 +2359,21 @@ def _build_2d_packed_swizzled_fixtures(
         torch.randn(512, 256, dtype=torch.bfloat16),
         per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
         is_swizzled_scales=True,
-        use_triton_kernel=False,
     )
-    cr_raw = cr_mod.ConvRotNVFP4Tensor.from_torchao(
-        piper_nv.PiperNVFP4Tensor.from_hp(
-            torch.randn(512, 256, dtype=torch.bfloat16),
-            per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
-            is_swizzled_scales=True,
-            use_triton_kernel=False,
-        ),
+    cr_raw = cr_mod.ConvRotNVFP4Tensor.from_hp(
+        torch.randn(512, 256, dtype=torch.bfloat16),
+        per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
+        is_swizzled_scales=True,
         group_size=64,
     )
-    cr_global = cr_mod.ConvRotNVFP4Tensor(
+    cr_global = cr_mod.ConvRotNVFP4Tensor.from_quantized(
         (((cr_raw.qdata & 0x0F) << 4) | (cr_raw.qdata >> 4)).to(torch.uint8),
         cr_raw.scale,
-        cr_raw.block_size,
-        cr_raw.orig_dtype,
-        cr_raw.group_size,
-        cr_raw.per_tensor_scale,
-        None,
-        True,
-        False,
-        None,
+        group_size=cr_raw.group_size,
+        logical_dtype=cr_raw.dtype,
+        block_size=cr_raw.block_size,
+        per_tensor_scale=cr_raw.per_tensor_scale,
+        is_swizzled_scales=True,
         high_first=True,
     )
     proto = nn.Module()
@@ -2501,7 +2494,7 @@ def _assert_tied_and_canonical_guard_on_rank(
     tied_store: ModelStore,
     canon_store: ModelStore,
     canon_before: tuple[torch.Tensor, torch.Tensor],
-    nv_4d_store: ModelStore,
+    nv_3d_store: ModelStore,
 ) -> None:
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed.tensor import DTensor, Shard
@@ -2549,7 +2542,7 @@ def _assert_tied_and_canonical_guard_on_rank(
     )
     snap = _snapshot_tensors(sh)
     with pytest.raises(ValueError, match="layout mismatch"):
-        nv_4d_store.bind(sh)
+        nv_3d_store.bind(sh)
     _assert_unmutated(sh, snap)
 
 
@@ -2557,7 +2550,6 @@ class TestModelStorePackedSwizzledDTensorProjection:
     def test_bind_dtensor_packed_swizzled_2d_mesh_zero_copy_and_rejections(self) -> None:
         if not DTENSOR_AVAILABLE:
             pytest.skip("DTensor required")
-        pytest.importorskip("numpy")
         piper_nv = pytest.importorskip("piper_kernels.weights.nvfp4")
         cr_mod = pytest.importorskip("piper_kernels.weights.convrot.nvfp4")
         from piper_offload.parallel import ParallelExecutor
@@ -2578,10 +2570,9 @@ class TestModelStorePackedSwizzledDTensorProjection:
             )
         assert {offsets for _, offsets in results} == {(0, 0), (0, 128), (256, 0), (256, 128)}
 
-    def test_bind_dtensor_tied_canonical_guard_and_4d_swizzle_rejection(self) -> None:
+    def test_bind_dtensor_tied_canonical_guard_and_shape_rank_rejection(self) -> None:
         if not DTENSOR_AVAILABLE:
             pytest.skip("DTensor required")
-        pytest.importorskip("numpy")
         piper_nv = pytest.importorskip("piper_kernels.weights.nvfp4")
         from piper_offload.parallel import ParallelExecutor
 
@@ -2602,7 +2593,6 @@ class TestModelStorePackedSwizzledDTensorProjection:
                 torch.randn(256, 128, dtype=torch.bfloat16),
                 per_tensor_scale=torch.tensor(0.5, dtype=torch.float32),
                 is_swizzled_scales=True,
-                use_triton_kernel=False,
             ),
             requires_grad=False,
         )
@@ -2611,26 +2601,26 @@ class TestModelStorePackedSwizzledDTensorProjection:
         canon_before = (c_slots[0].clone(), c_slots[2].clone())
 
         base3d = piper_nv.PiperNVFP4Tensor.from_hp(
-            torch.randn(4, 100, 128, dtype=torch.bfloat16), is_swizzled_scales=True, use_triton_kernel=False
+            torch.randn(4, 100, 128, dtype=torch.bfloat16), is_swizzled_scales=True
         )
-        bad_4d = piper_nv.PiperNVFP4Tensor(
-            base3d.qdata.view(2, 2, 100, 64),
-            base3d.scale.view(2, 2, *base3d.scale.shape[1:]),
-            base3d.block_size,
-            base3d.orig_dtype,
-            None,
-            None,
-            True,
-            False,
-            None,
-        )
-        nv_4d_proto = nn.Module()
-        nv_4d_proto.w = nn.Parameter(bad_4d, requires_grad=False)
-        nv_4d_store = ModelStore.from_module(nv_4d_proto)
+        with pytest.raises(ValueError, match="2-D or 3-D"):
+            piper_nv.PiperNVFP4Tensor(
+                base3d.qdata.view(2, 2, 100, 64),
+                base3d.scale.view(2, 2, *base3d.scale.shape[1:]),
+                base3d.block_size,
+                base3d.dtype,
+                None,
+                None,
+                True,
+                None,
+            )
+        nv_3d_proto = nn.Module()
+        nv_3d_proto.w = nn.Parameter(base3d, requires_grad=False)
+        nv_3d_store = ModelStore.from_module(nv_3d_proto)
 
         with ParallelExecutor(["cpu"] * 4) as ex:
             ex.run(
                 lambda _r: _assert_tied_and_canonical_guard_on_rank(
-                    tied_store, canon_store, canon_before, nv_4d_store
+                    tied_store, canon_store, canon_before, nv_3d_store
                 )
             )

@@ -16,9 +16,7 @@ from torch import nn
 from ._dtensor import local_shard
 from .dtensor_adapter import DTensorAdapter
 from .gguf_adapter import GgufAdapter
-from .piper_convrot_int8_adapter import PiperConvRotInt8Adapter
-from .piper_convrot_nvfp4_adapter import PiperConvRotNVFP4Adapter
-from .piper_nvfp4_adapter import PiperNvfp4Adapter
+from .piper_quantized_adapter import PiperQuantizedAdapter
 from .structured_adapter import (
     _ProjectedStructuredShard,
     _ProjectedStructuredShardAdapter,
@@ -35,9 +33,7 @@ from .trellis_adapter import TrellisAdapter
 # RegularAdapter is last — it matches only exact torch.Tensor/nn.Parameter, so
 # structured subclasses reach their dedicated adapter first.
 _BUILTIN_ADAPTERS: tuple[type[TensorAdapter[Any, Any]], ...] = (
-    PiperConvRotNVFP4Adapter,
-    PiperNvfp4Adapter,
-    PiperConvRotInt8Adapter,
+    PiperQuantizedAdapter,
     GgufAdapter,
     TrellisAdapter,
     _ProjectedStructuredShardAdapter,

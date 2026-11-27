@@ -11,17 +11,14 @@ reconstructed, the identity/layout metadata that distinguishes incompatible
 variants, and the logical compute dtype.
 
 :class:`StructuredTensorAdapter` captures the shared mechanics once and exposes
-the per-format parts as small hooks. Concrete adapters
-(:class:`~piper_offload.piper_nvfp4_adapter.PiperNvfp4Adapter`,
-:class:`~piper_offload.piper_convrot_nvfp4_adapter.PiperConvRotNVFP4Adapter`,
-:class:`~piper_offload.piper_convrot_int8_adapter.PiperConvRotInt8Adapter`)
-subclass it and implement those hooks.
+the per-format parts as small hooks. :class:`~piper_offload.piper_quantized_adapter.PiperQuantizedAdapter`
+subclasses it for all :class:`piper_kernels.weights.QuantizedWeight` formats,
+and external tensor subclasses may subclass it directly.
 
 Capabilities beyond inference movement and metadata queries (DTensor
-shard projection and in-place LoRA or dense merge) are added by the concrete
-subclass that supports them — and only that subclass — so the
-``@runtime_checkable`` capability protocols, which test for method presence on
-the class, report each format's true capability.
+shard projection and in-place LoRA or dense merge) can be implemented on a
+concrete subclass and validated per target through
+``validate_lora_merge`` / ``validate_dense_merge`` / ``project_shard``.
 """
 
 import math
@@ -50,6 +47,7 @@ from .tensor_adapters import (
 __all__ = [
     "StructuredGpu",
     "StructuredHost",
+    "StructuredSnapshot",
     "StructuredTensorAdapter",
     "_KernelMergeStructuredAdapter",
     "_ProjectedStructuredShard",
@@ -67,12 +65,22 @@ def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
 
 
 @dataclass(slots=True, frozen=True)
+class StructuredSnapshot[MetaT]:
+    """Validated single-pass snapshot of a structured tensor's storage and metadata."""
+
+    tensor: torch.Tensor
+    named_storage: tuple[tuple[str, torch.Tensor | None], ...]
+    meta: MetaT
+    id_metadata: tuple[object, ...]
+
+
+@dataclass(slots=True, frozen=True)
 class StructuredHost[MetaT]:
     """CPU state for a structured tensor subclass.
 
     ``storage`` holds the inner storage tensors positionally, parallel to
-    the adapter's ``_STORAGE_NAMES``; an entry is ``None`` for an absent
-    optional tensor (e.g. NVFP4 global scales). ``meta`` is the immutable
+    the slots returned by :meth:`StructuredTensorAdapter._extract`; an entry
+    may be ``None`` for an absent optional tensor. ``meta`` is the immutable
     metadata snapshot used to rebuild the wrapper on each move, and
     ``logical_shape`` is the dense wrapper shape preserved across offload.
     When ``target_shapes`` is not ``None`` (e.g., non-canonical projected host
@@ -387,18 +395,20 @@ class StructuredTensorAdapter[MetaT](ABC):
     Implements the full
     :class:`~piper_offload.tensor_adapters.TensorAdapter` movement and
     identity contract in terms of per-format hooks. A concrete adapter
-    sets :attr:`_TAG` / :attr:`_STORAGE_NAMES` and implements the ``_*``
-    hooks; it opts into capabilities beyond inference movement by defining
-    the relevant methods (``project_shard``, ``merge_lora_``, or
+    sets :attr:`_TAG` and implements ``_is_tensor``, ``_require``,
+    ``_extract``, ``_reconstruct``, and ``_compute_dtype`` (plus
+    ``_validate_layout`` when extra checks differ from ``_require``); it
+    opts into capabilities beyond inference movement by defining the
+    relevant methods (``project_shard``, ``merge_lora_``, or
     ``merge_dense_``) itself or subclassing
     :class:`_KernelMergeStructuredAdapter`.
 
-    The hooks operate on the validated wrapper, typed :data:`Any` at the
-    boundary exposed by per-format ``require_*_tensor`` helpers.
+    ``_extract`` validates the wrapper once per call and returns a
+    :class:`StructuredSnapshot` pairing each slot name with its physical
+    tensor, reconstruction metadata, and identity metadata.
     """
 
     _TAG: ClassVar[str]
-    _STORAGE_NAMES: ClassVar[tuple[str, ...]]
 
     # --- per-format hooks -------------------------------------------------
 
@@ -409,10 +419,10 @@ class StructuredTensorAdapter[MetaT](ABC):
         variant). Mirrors the per-format ``is_*_tensor`` predicate.
         """
 
-    @staticmethod
-    @abstractmethod
-    def _validate_layout(t: torch.Tensor) -> None:
-        """Raise if ``t`` is missing the attributes this adapter preserves."""
+    @classmethod
+    def _validate_layout(cls, t: torch.Tensor) -> None:
+        """Raise if ``t`` is missing the attributes or layout this adapter preserves."""
+        cls._require(t)
 
     @staticmethod
     @abstractmethod
@@ -421,15 +431,8 @@ class StructuredTensorAdapter[MetaT](ABC):
 
     @staticmethod
     @abstractmethod
-    def _storage_of(t: Any) -> tuple[torch.Tensor | None, ...]:  # noqa: ANN401
-        """Live inner storage tensors, positional and parallel to
-        :attr:`_STORAGE_NAMES`; ``None`` for an absent optional tensor.
-        """
-
-    @staticmethod
-    @abstractmethod
-    def _meta_of(t: Any) -> MetaT:  # noqa: ANN401
-        """Snapshot the wrapper's reconstruction metadata."""
+    def _extract(t: torch.Tensor) -> StructuredSnapshot[MetaT]:
+        """Validate ``t`` and capture named storage, metadata, and identity in one pass."""
 
     @staticmethod
     @abstractmethod
@@ -437,11 +440,6 @@ class StructuredTensorAdapter[MetaT](ABC):
         storage: tuple[torch.Tensor | None, ...], meta: MetaT
     ) -> torch.Tensor:
         """Rebuild the wrapper from storage + metadata snapshot."""
-
-    @staticmethod
-    @abstractmethod
-    def _id_metadata(t: Any) -> tuple[object, ...]:  # noqa: ANN401
-        """Format-specific identity and layout metadata fragments."""
 
     @staticmethod
     @abstractmethod
@@ -459,30 +457,27 @@ class StructuredTensorAdapter[MetaT](ABC):
 
     @classmethod
     def tensor_id(cls, t: torch.Tensor) -> tuple[object, ...]:
-        w = cls._require(t)
+        snap = cls._extract(t)
+        w = snap.tensor
         return (
             cls._TAG,
-            *(optional_tensor_id(s) for s in cls._storage_of(w)),
+            *((name, optional_tensor_id(s)) for name, s in snap.named_storage),
             tuple(w.shape),
             w.stride(),
-            *cls._id_metadata(w),
+            *snap.id_metadata,
         )
 
     @classmethod
     def layout_signature(cls, t: torch.Tensor) -> tuple[object, ...]:
         """Hashable layout metadata used by block-pool compatibility checks."""
-        w = cls._require(t)
+        snap = cls._extract(t)
+        w = snap.tensor
         return (
             tuple(w.shape),
             w.dtype,
             w.stride(),
-            *cls._id_metadata(w),
-            *(
-                (name, tensor_layout(s))
-                for name, s in zip(
-                    cls._STORAGE_NAMES, cls._storage_of(w), strict=True
-                )
-            ),
+            *snap.id_metadata,
+            *((name, tensor_layout(s)) for name, s in snap.named_storage),
         )
 
     @classmethod
@@ -490,17 +485,17 @@ class StructuredTensorAdapter[MetaT](ABC):
         cls,
         t: torch.Tensor,
     ) -> StructuredHost[MetaT]:
-        w = cls._require(t)
+        snap = cls._extract(t)
         # preserve_format (capture_host_tensor default): inner-tensor stride
         # ordering can encode a transposed quantized tensor.
         storage = tuple(
             capture_host_tensor(s) if s is not None else None
-            for s in cls._storage_of(w)
+            for _, s in snap.named_storage
         )
         return StructuredHost(
             storage=storage,
-            meta=cls._meta_of(w),
-            logical_shape=tuple(w.shape),
+            meta=snap.meta,
+            logical_shape=tuple(snap.tensor.shape),
         )
 
     @classmethod

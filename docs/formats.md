@@ -10,14 +10,21 @@ and the [README](../README.md) for the starting point.
 
 The table lists the extras required to execute each representation. Reading a
 GGUF checkpoint with `MappedCheckpoint` requires only the base install.
-Install `piper-offload[all]` for every integration. The supported dependency
+`piper-kernels>=0.9.0rc1,<0.10` is a core dependency, so all
+`piper_kernels.weights.QuantizedWeight` weight classes (`PiperNVFP4Tensor`,
+`ConvRotInt8Tensor`, `ConvRotNVFP4Tensor`, `ConvRotTrellisTensor`, and future
+subclasses) are supported out of the box without optional extras. Install
+`piper-offload[all]` for every optional integration. The supported dependency
 ranges are maintained in [pyproject.toml](../pyproject.toml). Native execution still requires the
 format's compatible hardware and PyTorch stack.
 
-The `torchao` extra covers Piper Kernels weights (`PiperNVFP4Tensor` and Piper ConvRot) in this release. On Linux, PyTorch supplies its matching
-CUDA or ROCm Triton; the composable `triton` extra adds `triton-windows` on 64-bit Windows.
-Piper Kernels owns execution and merge kernels for its weight classes; GGUF
-conversion and trellis decoding require Triton. Windows GPU execution
+On Linux, PyTorch supplies its matching CUDA or ROCm Triton; the composable
+`triton` extra adds `triton-windows` on 64-bit Windows. Piper Kernels owns
+execution and merge kernels for its `QuantizedWeight` classes; GGUF conversion
+and `TrellisParameter` decoding require Triton (with no fallback), whereas
+`ConvRotTrellisTensor` works without Triton via Piper Kernels' portable
+reference and uses Triton for fast GPU execution (install `piper-offload[triton]`
+on Windows). Windows GPU execution
 requires Windows 10 or 11, a supported NVIDIA GPU and current driver, and the
 Visual C++ Redistributable for Visual Studio 2015–2022. A separate CUDA toolkit
 or Visual Studio installation is not required for eager GPU execution.
@@ -25,11 +32,13 @@ or Visual Studio installation is not required for eager GPU execution.
 | Weight representation | Extra | LoRA merge | Dense / mixed merge |
 |---|---|---|---|
 | Plain floating point, excluding plain float8 | None | Native | Native |
-| Piper NVFP4 | `torchao` | Yes, 2-D contiguous matrices | Yes, 2-D contiguous matrices |
-| Piper ConvRot INT8 | `torchao` | Yes, matrices only | Yes, matrices only |
-| Piper ConvRot NVFP4 | `torchao` | Yes, layout restrictions | Yes, layout restrictions |
+| Piper NVFP4 | None | Yes, 2-D contiguous matrices | Yes, 2-D contiguous matrices |
+| Piper ConvRot INT8 | None | Yes, 2-D matrices only | Yes, 2-D matrices only |
+| Piper ConvRot NVFP4 | None | Yes, 2-D layout restrictions | Yes, 2-D layout restrictions |
+| Piper ConvRot Trellis (`ConvRotTrellisTensor`) | None (`triton` for fast GPU) | No | No |
+| Other Piper `QuantizedWeight` subclasses | None | No | No |
 | Packed GGUF → ConvRot INT8 | `gguf` | Activation only | Activation only |
-| Trellis-coded → ConvRot INT8 | `torchao`, `triton` | Activation only | Activation only |
+| `TrellisParameter` → ConvRot INT8 | `triton` | Activation only | Activation only |
 | DTensor | Depends on local shard | Delegates to local adapter | Delegates to local adapter |
 
 Plain float8 storage can move but is not an additive merge target.
@@ -48,13 +57,17 @@ for configuration and reproducibility.
 
 ## Layout limits
 
-Transposed packed targets cannot be re-encoded into their existing storage.
-`PiperNVFP4Tensor` requires contiguous, untransposed 2-D matrices for additive
-LoRA and dense merges (3-D `(E, M, K)` MoE weights move for inference and accept
-complete parameter values via `ParameterValue`, not additive merges). Piper
-ConvRot INT8 and ConvRot NVFP4 also reject transposed and non-2-D weights during
-additive merge preflight; 5-D Conv3D ConvRot INT8 weights (`[out, in, 3, 3, 3]`)
-and transposed ConvRot NVFP4 weights move for inference without additive merges.
+All `piper_kernels.weights.QuantizedWeight` subclasses require contiguous,
+untransposed storage; transposed `QuantizedWeight` tensors reject both offload
+capture and additive merges with `NotImplementedError` (from `as_storage()`).
+`PiperNVFP4Tensor`, `ConvRotInt8Tensor`, and `ConvRotNVFP4Tensor` support
+in-place LoRA (`addmm_`) and dense (`add_`) merges on contiguous 2-D matrices;
+3-D `(E, M, K)` MoE `PiperNVFP4Tensor` weights and 5-D Conv3D
+`ConvRotInt8Tensor` weights (`[out, in, 3, 3, 3]`) move for inference without
+additive merges. `ConvRotTrellisTensor` weights and arbitrary custom
+`QuantizedWeight` subclasses also move for inference (and accept unscaled
+complete parameter values via `ParameterValue`) while rejecting additive merges
+cleanly during preflight without mutating weights.
 
 Complete [parameter values](adapters.md#populate-optional-meta-parameters)
 can copy supported physical representations even when additive merge is
@@ -63,21 +76,30 @@ unavailable. Scaling and mixed-update requirements belong to the
 
 ## Format details
 
-**Piper NVFP4.** Preserves `PiperNVFP4Tensor` packed elements, block scales,
-block layout, 128x4 swizzle configuration, `high_first` packing order, optional
-global `per_tensor_scale` (scalar or per-expert `(E, 1, 1)`), and optional
-`act_per_tensor_scale` metadata across 2-D linear and 3-D `(E, M, K)` MoE
-weights. Piper Kernels owns dequantization, linear dispatch, and 2-D `addmm_` /
-`add_` updates. See [piper_nvfp4_adapter.py](../src/piper_offload/piper_nvfp4_adapter.py)
-and [structured_adapter.py](../src/piper_offload/structured_adapter.py).
+**Piper Quantized Weights (`QuantizedWeight`).** One stateless adapter
+([piper_quantized_adapter.py](../src/piper_offload/piper_quantized_adapter.py),
+built on [structured_adapter.py](../src/piper_offload/structured_adapter.py))
+handles every `piper_kernels.weights.QuantizedWeight` subclass uniformly via the
+`as_storage()` / `from_storage(tensors, metadata)` storage contract:
 
-**Piper ConvRot.** INT8 and NVFP4 wrappers retain their rotation groups and
-quantization metadata; Piper Kernels owns their arithmetic. Static-scale INT8
-Conv3D weights also move, including activation scales, but require contiguous,
-untransposed storage and accept neither LoRA nor dense updates. Their logical
-shape is `[out, in, 3, 3, 3]`. See
-[piper_convrot_int8_adapter.py](../src/piper_offload/piper_convrot_int8_adapter.py)
-and [piper_convrot_nvfp4_adapter.py](../src/piper_offload/piper_convrot_nvfp4_adapter.py).
+- **Piper NVFP4 (`PiperNVFP4Tensor`).** Preserves packed elements, block scales,
+  block layout, 128x4 swizzle configuration, `high_first` packing order, optional
+  global `per_tensor_scale` (scalar or per-expert `(E, 1, 1)`), and optional
+  `act_per_tensor_scale` metadata across 2-D linear and 3-D `(E, M, K)` MoE
+  weights, with 2-D `addmm_` / `add_` updates.
+- **Piper ConvRot INT8 (`ConvRotInt8Tensor`).** Retains rotation groups and
+  optional static `act_per_tensor_scale` across 2-D matrices (merge-capable) and
+  5-D Conv3D `[out, in, 3, 3, 3]` weights (inference-only).
+- **Piper ConvRot NVFP4 (`ConvRotNVFP4Tensor`).** Preserves ConvRot rotation
+  groups and NVFP4 packing/swizzle/scale metadata on 2-D matrices, with 2-D
+  `addmm_` / `add_` updates.
+- **Piper ConvRot Trellis (`ConvRotTrellisTensor`).** Moves packed 2–6 bpw
+  matrices—both uniform `[out, blocks, bytes_per_block]` and variable-row
+  1-D `bitstreams` with `row_widths`—directly across CPU and GPU for inference.
+- **Custom `QuantizedWeight` subclasses.** Any subclass implementing
+  `as_storage()` / `from_storage()` and `QuantizedWeight` device/copy ops
+  automatically offloads for inference and accepts unscaled `ParameterValue`
+  updates without registering a separate offload adapter.
 
 ## Load a GGUF checkpoint
 
@@ -113,8 +135,9 @@ packed; active weights use BF16 ConvRot INT8 without allocating a full dense
 weight during conversion. The logical input width must be divisible by 16.
 
 Direct conversion supports F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
-Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS. The `gguf` extra installs
-TorchAO and Triton for this conversion. LoRA and dense updates apply to the
+Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS. The `gguf` extra adds Triton
+(on Windows; Linux PyTorch supplies Triton) alongside the core `piper-kernels`
+dependency for this conversion. LoRA and dense updates apply to the
 active ConvRot target; permanent merge cannot modify the packed GGUF source.
 
 Externally supplied Diffusers `GGUFParameter` objects are recognized without a
@@ -125,27 +148,32 @@ and [gguf_adapter.py](../src/piper_offload/gguf_adapter.py).
 ## Load trellis-coded weights
 
 Trellis coding stores a ConvRot INT8 matrix at 2 to 6 bits per weight; Piper
-Kernels owns the format and its encoder, `TrellisStorage.from_hp`. Wrap each
-weight's stored tensors and block size, as `TrellisStorage` holds them, in a
-`TrellisParameter` with the ConvRot group size, the logical dtype, and any
-static activation scale. For per-row bitrates within a matrix, pass
-`row_widths` (`uint8 [out]`, giving bytes per block for each row) with
-row-concatenated 1-D `bitstreams` (`uint8` of at least
-`(in / block_size) * sum(row_widths)` bytes); CPU construction and host capture
-validate width bounds (`2` to `6` code bits per weight) and minimum bitstream
-capacity, and variable-row decoding requires a Piper Kernels release that
-accepts `row_widths` (added in Piper Kernels PR #320, after `0.8.0rc6`; `2`-bit
-decoding requires `piper-kernels>=0.8.0rc8`). Split or
-regroup checkpoint storage first: the parameter supports only detach and clone.
-Assign the parameters to the model and freeze it before capture.
+Kernels owns the format and its encoder, `TrellisStorage.from_hp`. There are
+two ways to supply trellis weights depending on whether decoding happens during
+activation or stays packed:
 
-Host backing stays packed, and `requires_activation(parameter)` is true. Each
-refill transfers the packed tensors and decodes them into a reusable ConvRot
-INT8 target, without allocating a dense weight; decoding requires a Triton
-accelerator that Piper Kernels supports. LoRA and dense updates apply to the
-active target; permanent merge cannot modify the packed source. See
-[trellis_parameter.py](../src/piper_offload/trellis_parameter.py) and
-[trellis_adapter.py](../src/piper_offload/trellis_adapter.py).
+- **Direct `ConvRotTrellisTensor` weights (recommended).** Assign
+  `ConvRotTrellisTensor` parameters directly (uniform 2–6 bpw or variable-row
+  `row_widths`). `PiperQuantizedAdapter` keeps host and device storage packed,
+  supports CPU and CUDA execution without activation-time decoding to
+  ConvRot INT8 (running via Piper Kernels' Triton kernels on GPU when Triton
+  is installed, or its portable reference otherwise), and supports 2-D DTensor
+  `Shard(0)` / `Shard(1)` projection.
+- **Decoded `TrellisParameter` weights.** Wrap each weight's stored tensors
+  and block size, as `TrellisStorage` holds them, in a `TrellisParameter` with
+  the ConvRot group size, the logical dtype, and any static activation scale.
+  For per-row bitrates within a matrix, pass `row_widths` (`uint8 [out]`,
+  giving bytes per block for each row) with row-concatenated 1-D `bitstreams`
+  (`uint8` of at least `(in / block_size) * sum(row_widths)` bytes); CPU
+  construction and host capture validate width bounds (`2` to `6` code bits per
+  weight) and minimum bitstream capacity. Each CUDA refill transfers the packed
+  tensors and decodes them via Triton into a reusable ConvRot INT8 target
+  (`requires_activation(parameter)` is true). Split or regroup checkpoint
+  storage first (`TrellisParameter` supports only detach and clone). LoRA and
+  dense updates apply only to the decoded ConvRot INT8 active target; permanent
+  merge cannot modify the packed source. See
+  [trellis_parameter.py](../src/piper_offload/trellis_parameter.py) and
+  [trellis_adapter.py](../src/piper_offload/trellis_adapter.py).
 
 ## DTensor and custom formats
 
@@ -155,9 +183,11 @@ shard. It targets frozen inference with ordinary `Replicate` and contiguous
 When binding an unsharded `ModelStore` onto a `DTensor`-sharded shell, plain
 strided weights project zero-copy local views for any `Replicate` or contiguous
 `Shard(dim)` placement. Non-`nn.Parameter`-subclass quantized weights whose
-tensor subclass supports `DTensor` wrapping (Piper `PiperNVFP4Tensor` and Piper
-ConvRot) project zero-copy for all-`Replicate` targets. For `Shard(dim)`
-placements across 1D and N-D `DeviceMesh` shells, zero-copy projection supports
+tensor subclass supports `DTensor` wrapping (`QuantizedWeight` subclasses:
+`PiperNVFP4Tensor`, `ConvRotInt8Tensor`, `ConvRotNVFP4Tensor`,
+`ConvRotTrellisTensor`, and custom `QuantizedWeight` subclasses) project
+zero-copy for all-`Replicate` targets. For `Shard(dim)`
+placements across 1D and N-D `DeviceMesh` shells, zero-copy or sharded host projection supports
 Piper `PiperNVFP4Tensor` (2-D linear and 3-D `(E, M, K)` MoE tensors when column
 shards align to `block_size=16`, and for 128x4 swizzled scales when row shards
 align to 128 rows and column shards align to 64 columns with final tail-block
@@ -165,13 +195,19 @@ allowance; 3-D `(E, M, K)` pads each expert's 128-row tiles independently,
 narrows per-expert `(E, 1, 1)` `per_tensor_scale` zero-copy, and replicates
 scalar global and activation scales), 2-D Piper `ConvRotInt8Tensor` (`Shard(0)`
 on any non-empty split; `Shard(1)` when shard offset and local width are aligned
-to `group_size`, preserving optional scalar `act_per_tensor_scale`), and 2-D
+to `group_size`, preserving optional scalar `act_per_tensor_scale`), 2-D
 Piper `ConvRotNVFP4Tensor` (`Shard(0)` on any non-empty split when unswizzled or
 aligned to 128 rows with tail-block allowance when 128x4 swizzled, and
 `Shard(1)` aligned to `block_size=16` and rotation `group_size` plus 64-col
 swizzle alignment with tail-block allowance when 128x4 swizzled, preserving
-optional scalar global and activation scales). Formats without shard projection
-(5-D Conv3D `ConvRotInt8Tensor` and non-2-D `ConvRotNVFP4Tensor`), empty,
+optional scalar global and activation scales), and 2-D Piper `ConvRotTrellisTensor`
+(`Shard(0)` zero-copy on any non-empty split for both uniform bitstreams and
+variable-row `row_widths` via `trellis_row_shard_byte_range`, and `Shard(1)`
+aligned to both `block_size` and rotation `group_size`—zero-copy on uniform
+bitstreams and per-rank re-packed via `shard_quantized_weight` on variable-row
+`row_widths`). Formats without shard projection
+(5-D Conv3D `ConvRotInt8Tensor`, non-2-D `ConvRotNVFP4Tensor` / `ConvRotTrellisTensor`,
+and arbitrary custom `QuantizedWeight` subclasses), empty,
 misaligned, or transposed quantized shards, and `DTensor`-incompatible tensor
 subclasses are rejected cleanly with `layout mismatch` during bind preflight.
 Non-canonical projected quantized
@@ -182,8 +218,10 @@ CPU execution and permanent `merge_adapter` updates; bound `ModelOffloader`
 shells also reject `merge_adapter` regardless of placement), allocate contiguous
 per-rank device buffers (expanding tile-grid scale views back to contiguous
 swizzled shapes) preserving block-pool compatibility across streaming refills
-on CUDA activation, and support active LoRA and dense adapter merges on CUDA
-(in `RowwiseParallel` layers, bias-free `nn.Linear` avoids PyTorch DTensor's
+on CUDA activation, and support active LoRA and dense adapter merges on CUDA for
+merge-capable formats (`PiperNVFP4Tensor`, `ConvRotInt8Tensor`,
+`ConvRotNVFP4Tensor`); uniform `ConvRotTrellisTensor` `Shard(1)` remains
+non-mergeable (in `RowwiseParallel` layers, bias-free `nn.Linear` avoids PyTorch DTensor's
 linear decomposition falling back to all-gathering `Shard(1)` quantized weights). Each
 rank selects its portion of plain host-backed LoRA factors or dense deltas
 before staging; merging requires no collective. Full adapter tensors remain in

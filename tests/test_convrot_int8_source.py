@@ -1,12 +1,9 @@
 """Tests for the shared behavior of sources that activate as ConvRot INT8."""
 
-import inspect
-
 import pytest
 import torch
 
 import piper_offload._convrot_int8_source as source_mod
-import piper_offload._piper_convrot_int8 as piper_convrot_mod
 from piper_offload._convrot_int8_source import (
     ConvRotInt8GpuTarget,
     ConvRotInt8SourceAdapter,
@@ -103,52 +100,6 @@ def test_gpu_param_wraps_target_state() -> None:
     param = ConvRotInt8SourceAdapter.gpu_param(object(), ConvRotInt8GpuTarget(target=target))
     assert param.data.data_ptr() == target.data_ptr()
     assert not param.requires_grad
-
-
-def test_supports_variable_row_trellis_caches_per_method_and_handles_monkeypatch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sig_calls = 0
-    real_signature = inspect.signature
-
-    def _spy_signature(obj: object) -> inspect.Signature:
-        nonlocal sig_calls
-        sig_calls += 1
-        return real_signature(obj)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(piper_convrot_mod.inspect, "signature", _spy_signature)
-    monkeypatch.setattr(piper_convrot_mod, "PIPER_CONVROT_AVAILABLE", False)
-    assert not piper_convrot_mod.supports_variable_row_trellis()
-    assert sig_calls == 0
-
-    class _NoMethod:
-        pass
-
-    monkeypatch.setattr(piper_convrot_mod, "PIPER_CONVROT_AVAILABLE", True)
-    monkeypatch.setattr(piper_convrot_mod, "ConvRotInt8Tensor", _NoMethod)
-    assert not piper_convrot_mod.supports_variable_row_trellis()
-    assert sig_calls == 0
-
-    class _WithVariableRow:
-        def copy_from_trellis_(
-            self, bitstreams: object, block_scales: object, scale: object, row_widths: object = None
-        ) -> None:
-            pass
-
-    monkeypatch.setattr(piper_convrot_mod, "ConvRotInt8Tensor", _WithVariableRow)
-    assert piper_convrot_mod.supports_variable_row_trellis()
-    assert piper_convrot_mod.supports_variable_row_trellis()
-    assert sig_calls == 1
-
-    class _UniformOnly:
-        def copy_from_trellis_(
-            self, bitstreams: object, block_scales: object, scale: object
-        ) -> None:
-            pass
-
-    monkeypatch.setattr(piper_convrot_mod, "ConvRotInt8Tensor", _UniformOnly)
-    assert not piper_convrot_mod.supports_variable_row_trellis()
-    assert sig_calls == 2
 
 
 @CUDA

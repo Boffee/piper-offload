@@ -42,8 +42,9 @@ def test_package_import_does_not_require_triton() -> None:
 def test_package_import_does_not_require_dtensor() -> None:
     script = """
 import sys
-# Model a minimal installation. TorchAO can itself require DTensor.
+# Model a minimal installation without optional distributed modules.
 sys.modules['torchao'] = None
+sys.modules['numpy'] = None
 sys.modules['torch.distributed.tensor'] = None
 import torch
 import piper_offload

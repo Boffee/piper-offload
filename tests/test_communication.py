@@ -277,9 +277,16 @@ def _check_dtensor_initialization(mesh, rank, device, dtype):
             for asynchronous in (False, True):
                 result = dt.redistribute(placements=[Replicate()], async_op=asynchronous).to_local()
                 torch.testing.assert_close(result, expected, rtol=0, atol=0)
-    # run_check exercises CPU metadata exchange and accelerator broadcast.
+    # Exercise CPU metadata exchange (even over a CUDA relay group) and rank-0
+    # replica broadcast without relying on c10d all_gather_object's numpy usage.
+    meta_local = torch.tensor([rank, rank + 10], dtype=torch.uint8, device="cpu")
+    gathered_meta = [torch.empty_like(meta_local), torch.empty_like(meta_local)]
+    dist.all_gather(gathered_meta, meta_local, group=dist.group.WORLD)
+    for peer_rank, peer_bytes in enumerate(gathered_meta):
+        assert torch.equal(peer_bytes, torch.tensor([peer_rank, peer_rank + 10], dtype=torch.uint8))
     local = torch.full((2, 3), float(rank), dtype=dtype, device=device)
-    checked = DTensor.from_local(local, mesh, [Replicate()], run_check=True)
+    dist.broadcast(local, src=0, group=dist.group.WORLD)
+    checked = DTensor.from_local(local, mesh, [Replicate()], run_check=False)
     torch.testing.assert_close(checked.to_local(), torch.zeros_like(local))
 
 
