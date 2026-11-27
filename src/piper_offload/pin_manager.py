@@ -198,6 +198,13 @@ class _Candidate:
     private_source: _PrivateCopy | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _CandidateRun:
+    candidates: Sequence[_Candidate]
+    start: int
+    end: int
+
+
 @dataclass(slots=True)
 class _PreparedCopy:
     pointer: int
@@ -1034,25 +1041,29 @@ class PinManager:
         prepared_copies: list[_PreparedCopy],
         pending_keys: list[int],
     ) -> None:
-        remaining_ckpt = sum(c.aligned_size for c in candidates if c.source is not None)
         batched_hint = True
         held_set = set(held)
+        run_end = 0
         for idx, candidate in enumerate(candidates):
             if candidate.source is None:
                 exhausted = self._acquire_in_place_candidate(
                     candidate, effective_ceiling, held, created, held_set
                 )
             else:
+                if idx >= run_end:
+                    run_end = idx + 1
+                    while run_end < len(candidates) and candidates[run_end].source is not None:
+                        run_end += 1
+                run_tail = _CandidateRun(candidates, idx + 1, run_end if batched_hint else idx + 1)
                 exhausted, used_fallback = self._acquire_tier2a_candidate(
                     candidate,
                     effective_ceiling,
-                    remaining_ckpt if batched_hint else candidate.aligned_size,
+                    run_tail,
                     prepared_copies,
                     held_set,
                 )
                 if used_fallback:
                     batched_hint = False
-                remaining_ckpt -= candidate.aligned_size
 
             # Pop already-settled / skipped non-copy candidates so waiters proceed promptly.
             if candidate.source is None or (
@@ -1244,17 +1255,24 @@ class PinManager:
             if not self._evict_idle_for_runtime_retry(target, protected=protected):
                 return False
 
-    def _desired_tier2a_slab_growth(
+    def _plan_tier2a_slab_hint(
         self,
         candidate: _Candidate,
-        slab_hint_bytes: int,
-        pin_avail_2a: int | None,
-        tier2a_reserved: int,
+        run_tail: _CandidateRun,
+        max_2a_bytes: int | None,
     ) -> int:
-        growth = max(candidate.aligned_size, min(self._slab_bytes, slab_hint_bytes))
-        if pin_avail_2a is not None:
-            growth = min(growth, max(candidate.aligned_size, pin_avail_2a - tier2a_reserved))
-        return growth
+        # Must not be called while holding self._lock (Lock order: PinManager._lock before arena locks).
+        sub_align = max(candidate.sector, mmap.PAGESIZE)
+        following = (
+            (run_tail.candidates[j].aligned_size, max(run_tail.candidates[j].sector, mmap.PAGESIZE))
+            for j in range(run_tail.start, run_tail.end)
+        )
+        return self._tier2a.plan_slab_bytes(
+            candidate.aligned_size,
+            sub_align,
+            following,
+            max_bytes=max_2a_bytes,
+        )
 
     def _finish_prepared_tier2a_copy(
         self,
@@ -1462,11 +1480,12 @@ class PinManager:
     def _prepare_tier2a_headroom(
         self,
         candidate: _Candidate,
+        run_tail: _CandidateRun,
         *,
         budget_open: bool,
         active_ceiling: int | None,
         host_budget: int | None,
-        slab_hint_bytes: int,
+        pinned_2b_floor: int,
         in_place: int,
         protected: set[int],
     ) -> tuple[str, int | None, int | None, int, bool]:
@@ -1477,7 +1496,14 @@ class PinManager:
         combined_ceiling, host_capped = self._apply_host_ceiling(
             active_ceiling, host_budget, private_bytes
         )
-        pin_avail_2a = None if active_ceiling is None else max(0, active_ceiling - in_place - bounce_bytes)
+        post_evict_ceiling, _ = self._apply_host_ceiling(
+            active_ceiling, host_budget, pinned_2b_floor
+        )
+        post_evict_avail_2a = (
+            None
+            if post_evict_ceiling is None
+            else max(0, post_evict_ceiling - in_place - bounce_bytes)
+        )
         avail_2a = (
             None if combined_ceiling is None else max(0, combined_ceiling - in_place - bounce_bytes)
         )
@@ -1490,13 +1516,13 @@ class PinManager:
                 evict_target_pinned=None,
                 protected=protected,
             ) else "stop"
-            return action, avail_2a, pin_avail_2a, bounce_bytes, host_capped
+            return action, avail_2a, post_evict_avail_2a, bounce_bytes, host_capped
         if host_capped and avail_2a is not None and self._tier2a.stats.reserved_bytes == 0:
-            growth = self._desired_tier2a_slab_growth(candidate, slab_hint_bytes, pin_avail_2a, 0)
+            growth = self._plan_tier2a_slab_hint(candidate, run_tail, post_evict_avail_2a)
             if avail_2a < growth and self._reserve_host_headroom_for_pinned(
                 host_budget, in_place + bounce_bytes + growth
             ):
-                return "retry", avail_2a, pin_avail_2a, bounce_bytes, host_capped
+                return "retry", avail_2a, post_evict_avail_2a, bounce_bytes, host_capped
         if avail_2a is not None and avail_2a < candidate.aligned_size:
             assert combined_ceiling is not None
             action = "retry" if self._evict_for_tier2a_headroom(
@@ -1507,41 +1533,45 @@ class PinManager:
                 evict_target_pinned=max(0, combined_ceiling - candidate.aligned_size),
                 protected=protected,
             ) else "stop"
-            return action, avail_2a, pin_avail_2a, bounce_bytes, host_capped
-        return "ready", avail_2a, pin_avail_2a, bounce_bytes, host_capped
+            return action, avail_2a, post_evict_avail_2a, bounce_bytes, host_capped
+        return "ready", avail_2a, post_evict_avail_2a, bounce_bytes, host_capped
 
     def _evict_for_tier2a_miss(
         self,
         candidate: _Candidate,
+        run_tail: _CandidateRun,
         *,
         avail_2a: int | None,
-        pin_avail_2a: int | None,
-        slab_hint_bytes: int,
+        post_evict_avail_2a: int | None,
         host_budget: int | None,
         host_capped: bool,
         in_place: int,
         bounce_bytes: int,
         protected: set[int],
     ) -> bool:
-        tier2a_reserved = self._tier2a.stats.reserved_bytes
-        growth = self._desired_tier2a_slab_growth(
-            candidate, slab_hint_bytes, pin_avail_2a, tier2a_reserved
-        )
-        required = in_place + bounce_bytes + tier2a_reserved + growth
-        if host_capped and self._reserve_host_headroom_for_pinned(host_budget, required):
-            return True
+        tier2a_reserved = 0
+        if host_capped:
+            tier2a_reserved = self._tier2a.stats.reserved_bytes
+            growth = self._plan_tier2a_slab_hint(candidate, run_tail, post_evict_avail_2a)
+            planned_2a = tier2a_reserved + growth
+            if post_evict_avail_2a is not None:
+                planned_2a = min(planned_2a, post_evict_avail_2a)
+            if self._reserve_host_headroom_for_pinned(host_budget, in_place + bounce_bytes + planned_2a):
+                return True
         if self._evict_one_for_tier2a(avail_2a, protected=protected):
             return True
         if host_capped and candidate.private_source is not None:
             self._release_private_candidate_holds([candidate])
-            return self._reserve_host_headroom_for_pinned(host_budget, required)
+            return self._reserve_host_headroom_for_pinned(
+                host_budget, in_place + bounce_bytes + tier2a_reserved + candidate.aligned_size
+            )
         return False
 
     def _acquire_tier2a_candidate(
         self,
         candidate: _Candidate,
         effective_ceiling: int | None,
-        slab_hint_bytes: int,
+        run_tail: _CandidateRun,
         prepared_copies: list[_PreparedCopy],
         protected: set[int],
     ) -> tuple[bool, bool]:
@@ -1563,20 +1593,29 @@ class PinManager:
                     host_budget,
                     in_place,
                 ) = self._effective_candidate_ceiling_locked(effective_ceiling)
-            state, avail_2a, pin_avail_2a, bounce_bytes, host_capped = self._prepare_tier2a_headroom(
-                candidate,
-                budget_open=budget_open,
-                active_ceiling=active_ceiling,
-                host_budget=host_budget,
-                slab_hint_bytes=slab_hint_bytes,
-                in_place=in_place,
-                protected=protected,
+                pinned_2b_floor = (
+                    sum(_page_rounded(priv.size) for priv in self._private_copies.values() if priv.leases > 0)
+                    if host_budget is not None and host_budget > 0 and self._private_copies
+                    else 0
+                )
+            state, avail_2a, post_evict_avail_2a, bounce_bytes, host_capped = (
+                self._prepare_tier2a_headroom(
+                    candidate,
+                    run_tail,
+                    budget_open=budget_open,
+                    active_ceiling=active_ceiling,
+                    host_budget=host_budget,
+                    pinned_2b_floor=pinned_2b_floor,
+                    in_place=in_place,
+                    protected=protected,
+                )
             )
             if state == "retry":
                 continue
             if state == "stop":
                 break
 
+            slab_hint_bytes = self._plan_tier2a_slab_hint(candidate, run_tail, avail_2a)
             alloc, reg_failed, refused, status = self._try_alloc_tier2a_span(
                 candidate, avail_2a, slab_hint_bytes, cur_epoch, cur_host_epoch
             )
@@ -1597,9 +1636,9 @@ class PinManager:
                 return True, used_fallback
             if not self._evict_for_tier2a_miss(
                 candidate,
+                run_tail,
                 avail_2a=avail_2a,
-                pin_avail_2a=pin_avail_2a,
-                slab_hint_bytes=slab_hint_bytes,
+                post_evict_avail_2a=post_evict_avail_2a,
                 host_budget=host_budget,
                 host_capped=host_capped,
                 in_place=in_place,

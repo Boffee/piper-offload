@@ -507,6 +507,73 @@ class TestHostSlabArena:
         gc.collect()
         assert not backend.registered
 
+    def test_plan_slab_bytes_accounts_for_existing_slab_holes(self) -> None:
+        backend = _FakeBackend()
+        with HostSlabArena(pinned=True, slab_bytes=4 * PAGE, backend=backend) as arena:
+            live = arena.allocate(2 * PAGE, alignment=PAGE, slab_hint_bytes=3 * PAGE)
+            hole = arena.allocate(PAGE, alignment=PAGE)
+            assert live is not None and hole is not None
+            hole.release()
+            assert arena.stats.slab_count == 1
+            assert arena.stats.reserved_bytes == 3 * PAGE
+
+            assert (
+                arena.plan_slab_bytes(2 * PAGE, PAGE, [(PAGE, PAGE)])
+                == 2 * PAGE
+            )
+            assert (
+                arena.plan_slab_bytes(2 * PAGE, PAGE, [(PAGE, PAGE), (PAGE, PAGE)])
+                == 3 * PAGE
+            )
+            live.release()
+
+    def test_plan_slab_bytes_stops_at_unfitting_and_slab_overflowing_followups(self) -> None:
+        backend = _FakeBackend()
+        with HostSlabArena(pinned=True, slab_bytes=4 * PAGE, backend=backend) as arena:
+            assert (
+                arena.plan_slab_bytes(
+                    PAGE,
+                    PAGE,
+                    [(2 * PAGE, PAGE), (PAGE, PAGE)],
+                    max_bytes=2 * PAGE,
+                )
+                == PAGE
+            )
+            assert (
+                arena.plan_slab_bytes(
+                    3 * PAGE,
+                    PAGE,
+                    [(3 * PAGE, PAGE), (PAGE, PAGE)],
+                )
+                == 3 * PAGE
+            )
+
+    def test_plan_slab_bytes_short_circuits_when_first_fits_existing_slab(self) -> None:
+        backend = _FakeBackend()
+        with HostSlabArena(pinned=True, slab_bytes=4 * PAGE, backend=backend) as arena:
+            alloc = arena.allocate(PAGE, alignment=PAGE, slab_hint_bytes=3 * PAGE)
+            assert alloc is not None
+
+            def unexpected_following():
+                raise AssertionError("following iterable should not be consumed on fast-path hit")
+                yield (PAGE, PAGE)  # pragma: no cover
+
+            assert arena.plan_slab_bytes(PAGE, PAGE, unexpected_following()) == PAGE
+            alloc.release()
+
+    def test_plan_slab_bytes_matches_empty_slab_trim_under_max_bytes(self) -> None:
+        backend = _FakeBackend()
+        with HostSlabArena(pinned=True, max_bytes=4 * PAGE, slab_bytes=4 * PAGE, backend=backend) as arena:
+            alloc = arena.allocate(2 * PAGE, alignment=PAGE, slab_hint_bytes=2 * PAGE)
+            assert alloc is not None
+            alloc.release()
+            assert arena.stats.slab_count == 1 and arena.stats.live_allocations == 0
+            # Empty 2p slab will be trimmed to fit 3p, leaving 1p headroom in the new slab.
+            assert (
+                arena.plan_slab_bytes(3 * PAGE, PAGE, [(PAGE, PAGE)], max_bytes=4 * PAGE)
+                == 4 * PAGE
+            )
+
 
 class TestPinnedBounceRing:
     def test_lazy_init_budget_clamping_and_registration_refusal(

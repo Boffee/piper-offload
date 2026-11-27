@@ -3272,3 +3272,139 @@ def test_eager_tier2b_promotion_streams_multi_tensor_batch_under_tight_host_budg
     assert peak2 <= 2 * PAGE
     mgr2.clear()
     assert backend.registered == {}
+
+
+def test_interleaved_anonymous_keeps_request_priority_over_later_checkpoint(
+    backend: FakeBackend, tmp_path,
+) -> None:
+    ckpt_a = _checkpoint(tmp_path, PAGE, "prio_a")
+    ckpt_b = _checkpoint(tmp_path, PAGE, "prio_b")
+    (anon,) = _tensors((0, PAGE))
+    manager = PinManager(2 * PAGE, max_host_bytes=4 * PAGE, bounce_bytes=0, backend=backend)
+    with manager.acquire([ckpt_a, anon, ckpt_b]) as lease:
+        assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, PAGE)
+        assert manager.stats.copy_bytes == PAGE
+        assert anon.data_ptr() in backend.registered
+        assert ckpt_a.untyped_storage().data_ptr() in manager._registrations
+        assert ckpt_b.untyped_storage().data_ptr() not in manager._registrations
+    manager.clear()
+    assert backend.registered == {}
+
+
+@pytest.mark.parametrize("pin_budget", [4 * PAGE, None])
+def test_interleaved_anonymous_keeps_runtime_capacity_priority_over_later_checkpoint(
+    backend: FakeBackend, tmp_path, pin_budget: int | None,
+) -> None:
+    ckpt_a = _checkpoint(tmp_path, PAGE, "cap_a")
+    ckpt_b = _checkpoint(tmp_path, PAGE, "cap_b")
+    (anon,) = _tensors((0, PAGE))
+    backend.capacity = 2 * PAGE
+    manager = PinManager(pin_budget, max_host_bytes=4 * PAGE, bounce_bytes=0, backend=backend)
+    with manager.acquire([ckpt_a, anon, ckpt_b]) as lease:
+        assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, PAGE)
+        assert manager.stats.copy_bytes == PAGE
+        assert anon.data_ptr() in backend.registered
+        assert ckpt_a.untyped_storage().data_ptr() in manager._registrations
+        assert ckpt_b.untyped_storage().data_ptr() not in manager._registrations
+    manager.clear()
+    assert backend.registered == {}
+
+
+def test_unfitting_checkpoint_does_not_starve_trailing_anonymous(
+    backend: FakeBackend, tmp_path,
+) -> None:
+    ckpt_a = _checkpoint(tmp_path, PAGE, "unfit_a")
+    ckpt_b = _checkpoint(tmp_path, 2 * PAGE, "unfit_b")
+    (anon,) = _tensors((0, PAGE))
+    manager = PinManager(2 * PAGE, max_host_bytes=4 * PAGE, bounce_bytes=0, backend=backend)
+    with manager.acquire([ckpt_a, ckpt_b, anon]) as lease:
+        assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 2 * PAGE)
+        assert manager.stats.copy_bytes == PAGE
+        assert anon.data_ptr() in backend.registered
+        assert ckpt_a.untyped_storage().data_ptr() in manager._registrations
+        assert ckpt_b.untyped_storage().data_ptr() not in manager._registrations
+    manager.clear()
+    assert backend.registered == {}
+
+
+def test_existing_slab_hole_does_not_strand_space_and_starve_anonymous(
+    backend: FakeBackend, tmp_path,
+) -> None:
+    keep = _checkpoint(tmp_path, 2 * PAGE, "hole_keep")
+    drop: torch.Tensor | None = _checkpoint(tmp_path, PAGE, "hole_drop")
+    ckpt_a = _checkpoint(tmp_path, 2 * PAGE, "hole_a")
+    ckpt_b = _checkpoint(tmp_path, PAGE, "hole_b")
+    (anon,) = _tensors((0, PAGE))
+
+    manager = PinManager(6 * PAGE, max_host_bytes=8 * PAGE, slab_bytes=6 * PAGE, bounce_bytes=0, backend=backend)
+    with manager.acquire([keep, drop]):
+        pass
+    hold_keep = manager.acquire([keep])
+    drop = None
+    gc.collect()
+    assert manager.stats.pinned_bytes == 3 * PAGE
+    assert manager.stats.copy_bytes == 3 * PAGE
+    assert manager.stats.registrations == 1
+
+    with manager.acquire([ckpt_a, ckpt_b, anon]) as lease:
+        assert (lease.registered_bytes, lease.pageable_bytes) == (4 * PAGE, 0)
+        assert manager.stats.pinned_bytes == 6 * PAGE
+        assert manager.stats.copy_bytes == 5 * PAGE
+        assert anon.data_ptr() in backend.registered
+    hold_keep.close()
+    manager.clear()
+    assert backend.registered == {}
+
+
+def test_contiguous_checkpoint_hint_does_not_leapfrog_over_larger_checkpoint(
+    backend: FakeBackend, tmp_path,
+) -> None:
+    ckpt_a = _checkpoint(tmp_path, PAGE, "leap_a")
+    ckpt_b = _checkpoint(tmp_path, 2 * PAGE, "leap_b")
+    ckpt_c = _checkpoint(tmp_path, PAGE, "leap_c")
+    (idle_anon,) = _tensors((0, PAGE))
+
+    manager = PinManager(3 * PAGE, max_host_bytes=6 * PAGE, slab_bytes=3 * PAGE, bounce_bytes=0, backend=backend)
+    with manager.acquire([idle_anon]):
+        pass
+    assert idle_anon.data_ptr() in backend.registered
+
+    with manager.acquire([ckpt_a, ckpt_b, ckpt_c]) as lease:
+        assert (lease.registered_bytes, lease.pageable_bytes) == (3 * PAGE, PAGE)
+        assert manager.stats.copy_bytes == 3 * PAGE
+        assert ckpt_a.untyped_storage().data_ptr() in manager._registrations
+        assert ckpt_b.untyped_storage().data_ptr() in manager._registrations
+        assert ckpt_c.untyped_storage().data_ptr() not in manager._registrations
+        assert idle_anon.data_ptr() not in backend.registered
+    manager.clear()
+    assert backend.registered == {}
+
+
+def test_combined_host_budget_with_leased_tier2b_does_not_over_evict_for_unfitting_checkpoint(
+    backend: FakeBackend, tmp_path,
+) -> None:
+    held_2b = _checkpoint(tmp_path, PAGE, "hb_held")
+    idle_2b = _checkpoint(tmp_path, PAGE, "hb_idle")
+    ckpt_a = _checkpoint(tmp_path, PAGE, "hb_a")
+    ckpt_b = _checkpoint(tmp_path, 2 * PAGE, "hb_b")
+    (anon,) = _tensors((0, PAGE))
+
+    manager = PinManager(4 * PAGE, max_host_bytes=4 * PAGE, slab_bytes=4 * PAGE, bounce_bytes=0, backend=backend)
+    with manager.acquire([held_2b, idle_2b]):
+        pass
+    manager.max_pinned_bytes = 0
+    assert manager.stats.private_copy_bytes == 2 * PAGE
+    lease_2b = manager.acquire([held_2b], pin=False)
+    manager.max_host_bytes = 3 * PAGE
+    manager.max_pinned_bytes = 4 * PAGE
+
+    with manager.acquire([ckpt_a, ckpt_b, anon]) as lease:
+        assert (lease.registered_bytes, lease.pageable_bytes) == (2 * PAGE, 2 * PAGE)
+        assert manager.stats.copy_bytes == PAGE
+        assert anon.data_ptr() in backend.registered
+        assert ckpt_a.untyped_storage().data_ptr() in manager._registrations
+        assert ckpt_b.untyped_storage().data_ptr() not in manager._registrations
+        assert manager.stats.pinned_bytes + manager.stats.private_copy_bytes == 3 * PAGE
+    lease_2b.close()
+    manager.clear()
+    assert backend.registered == {}

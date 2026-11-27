@@ -25,7 +25,7 @@ import threading
 import weakref
 from bisect import bisect_left
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -320,6 +320,48 @@ class HostArenaStats:
     unregistration_failures: int
 
 
+def _can_fit_in_spans(
+    pointer: int, free_spans: list[tuple[int, int]], aligned_size: int, sub_align: int
+) -> bool:
+    for span_off, span_len in free_spans:
+        pad = (-(pointer + span_off)) % sub_align
+        if span_len >= pad + aligned_size:
+            return True
+    return False
+
+
+def _alloc_from_spans(
+    pointer: int, free_spans: list[tuple[int, int]], aligned_size: int, sub_align: int
+) -> int | None:
+    best_idx = -1
+    best_waste = -1
+    best_pad = 0
+    for idx, (span_off, span_len) in enumerate(free_spans):
+        pad = (-(pointer + span_off)) % sub_align
+        if span_len < pad + aligned_size:
+            continue
+        waste = span_len - aligned_size
+        if best_idx < 0 or waste < best_waste:
+            best_idx = idx
+            best_waste = waste
+            best_pad = pad
+            if waste == 0:
+                break
+    if best_idx < 0:
+        return None
+
+    span_off, span_len = free_spans.pop(best_idx)
+    alloc_off = span_off + best_pad
+    insert_pos = best_idx
+    if best_pad > 0:
+        free_spans.insert(insert_pos, (span_off, best_pad))
+        insert_pos += 1
+    tail = (span_off + span_len) - (alloc_off + aligned_size)
+    if tail > 0:
+        free_spans.insert(insert_pos, (alloc_off + aligned_size, tail))
+    return alloc_off
+
+
 class _Slab:
     """One OS-allocated (and optionally runtime-registered) slab with best-fit coalescing spans."""
 
@@ -343,35 +385,10 @@ class _Slab:
         self.live_allocations = 0
 
     def _alloc(self, aligned_size: int, sub_align: int) -> int | None:
-        best_idx = -1
-        best_waste = -1
-        best_pad = 0
-        for idx, (span_off, span_len) in enumerate(self.free_spans):
-            pad = (-(self.pointer + span_off)) % sub_align
-            if span_len < pad + aligned_size:
-                continue
-            waste = span_len - aligned_size
-            if best_idx < 0 or waste < best_waste:
-                best_idx = idx
-                best_waste = waste
-                best_pad = pad
-                if waste == 0:
-                    break
-        if best_idx < 0:
-            return None
-
-        span_off, span_len = self.free_spans.pop(best_idx)
-        alloc_off = span_off + best_pad
-        insert_pos = best_idx
-        if best_pad > 0:
-            self.free_spans.insert(insert_pos, (span_off, best_pad))
-            insert_pos += 1
-        tail = (span_off + span_len) - (alloc_off + aligned_size)
-        if tail > 0:
-            self.free_spans.insert(insert_pos, (alloc_off + aligned_size, tail))
-
-        self.used_bytes += aligned_size
-        self.live_allocations += 1
+        alloc_off = _alloc_from_spans(self.pointer, self.free_spans, aligned_size, sub_align)
+        if alloc_off is not None:
+            self.used_bytes += aligned_size
+            self.live_allocations += 1
         return alloc_off
 
     def _free(self, offset: int, aligned_size: int) -> None:
@@ -942,29 +959,48 @@ class HostSlabArena:
         sub_align = max(alignment, mmap.PAGESIZE)
         return sub_align, _align_up(head_pad + data_length, sub_align)
 
+    def _plan_slab_headroom_locked(
+        self,
+        min_slab_size: int,
+        max_bytes: int | None,
+    ) -> tuple[list[_Slab], list[_Slab], int | None] | None:
+        if max_bytes is None:
+            return list(self._slabs), [], None
+        if min_slab_size > max_bytes:
+            return None
+        popped: list[_Slab] = []
+        projected = self._reserved_bytes
+        if projected + min_slab_size > max_bytes:
+            headroom_target = max_bytes - min_slab_size
+            surviving: list[_Slab] = []
+            for slab in self._slabs:
+                if slab.live_allocations == 0 and projected > headroom_target:
+                    popped.append(slab)
+                    projected -= slab.size
+                else:
+                    surviving.append(slab)
+            if projected + min_slab_size > max_bytes:
+                return None
+        else:
+            surviving = list(self._slabs)
+        headroom = _align_down(max_bytes - projected, mmap.PAGESIZE)
+        if headroom < min_slab_size:
+            return None
+        return surviving, popped, headroom
+
     def _compute_new_slab_size_locked(
         self,
         min_slab_size: int,
         slab_hint_bytes: int | None,
         popped_for_trim: list[_Slab],
     ) -> int | None:
-        if self._max_bytes is not None:
-            if min_slab_size > self._max_bytes:
-                return None
-            if self._reserved_bytes + min_slab_size > self._max_bytes:
-                headroom_target = self._max_bytes - min_slab_size
-                projected = self._reserved_bytes
-                remaining: list[_Slab] = []
-                for slab in self._slabs:
-                    if slab.live_allocations == 0 and projected > headroom_target:
-                        popped_for_trim.append(slab)
-                        projected -= slab.size
-                    else:
-                        remaining.append(slab)
-                if projected + min_slab_size > self._max_bytes:
-                    popped_for_trim.clear()
-                    return None
-                self._slabs = remaining
+        plan = self._plan_slab_headroom_locked(min_slab_size, self._max_bytes)
+        if plan is None:
+            return None
+        surviving, popped, headroom = plan
+        if popped:
+            popped_for_trim.extend(popped)
+            self._slabs = surviving
 
         desired = (
             self._slab_bytes
@@ -972,13 +1008,65 @@ class HostSlabArena:
             else min(self._slab_bytes, _align_up(slab_hint_bytes, mmap.PAGESIZE))
         )
         candidate_size = max(min_slab_size, desired)
-        if self._max_bytes is not None:
-            reclaimed_bytes = sum(s.size for s in popped_for_trim)
-            headroom = _align_down(self._max_bytes - self._reserved_bytes + reclaimed_bytes, mmap.PAGESIZE)
+        if headroom is not None:
             candidate_size = min(candidate_size, headroom)
-            if candidate_size < min_slab_size:
-                return None
         return candidate_size
+
+    def plan_slab_bytes(
+        self,
+        aligned_size: int,
+        alignment: int = mmap.PAGESIZE,
+        following: Iterable[tuple[int, int]] = (),
+        *,
+        max_bytes: int | None = None,
+    ) -> int:
+        """Compute the exact slab size for a cold allocation given free slab holes and run sizes."""
+        _validate_int(aligned_size, "aligned_size", minimum=1)
+        _validate_power_of_two(alignment, "alignment")
+        if max_bytes is not None:
+            _validate_int(max_bytes, "max_bytes", minimum=0)
+        first_align = max(alignment, mmap.PAGESIZE)
+        first_size = _align_up(aligned_size, first_align)
+        min_slab_size = _align_up(first_size + max(0, first_align - mmap.PAGESIZE), mmap.PAGESIZE)
+
+        with self._state_lock():
+            if self._closed:
+                return min_slab_size
+            for slab in self._slabs:
+                if _can_fit_in_spans(slab.pointer, slab.free_spans, first_size, first_align):
+                    return min_slab_size
+            plan = self._plan_slab_headroom_locked(min_slab_size, max_bytes)
+            if plan is None:
+                return min_slab_size
+            surviving, _, headroom = plan
+            slab_cap = self._slab_bytes if headroom is None else min(self._slab_bytes, headroom)
+            if min_slab_size >= slab_cap:
+                return min_slab_size
+
+            sim_slabs = [(slab.pointer, list(slab.free_spans)) for slab in surviving if slab.free_spans]
+            new_slab_bytes = min_slab_size
+            new_slab_rem = slab_cap - min_slab_size
+            for raw_size, raw_align in following:
+                _validate_int(raw_size, "following size", minimum=1)
+                _validate_power_of_two(raw_align, "following alignment")
+                req_align = max(raw_align, mmap.PAGESIZE)
+                req_size = _align_up(raw_size, req_align)
+                placed_in_existing = False
+                for ptr, spans in sim_slabs:
+                    if _alloc_from_spans(ptr, spans, req_size, req_align) is not None:
+                        placed_in_existing = True
+                        break
+                if placed_in_existing:
+                    continue
+                extra = _align_up(req_size + max(0, req_align - mmap.PAGESIZE), mmap.PAGESIZE)
+                if extra > new_slab_rem:
+                    # Stop lookahead once a member cannot fit so later items never leapfrog it.
+                    break
+                new_slab_bytes += extra
+                new_slab_rem -= extra
+                if new_slab_rem == 0:
+                    break
+            return new_slab_bytes
 
     def _commit_new_slab_locked(
         self,
