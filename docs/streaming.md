@@ -215,6 +215,54 @@ and [`Uint8DualArena`](../src/piper_offload/dual_arena.py):
   idle or colder slots when possible, or otherwise evicts unleased frontier
   slots without disturbing active wave readers.
 
+## Manage VRAM KV chunks (`KvChunkPool`)
+
+`KvChunkPool` manages GPU-born quantized KV chunks on the descending high end of
+a shared `Uint8DualArena` alongside typed `TypedSidePool` side pools described by
+a `SlotSchema`. By default `KvChunkPool` inherits `arena.budget` for its side
+pools (or accepts an explicit `budget=` argument).
+
+```python
+import torch
+
+from piper_offload import KvChunkPool, SlotSchema, Uint8DualArena
+
+kv_schema = SlotSchema(
+    {"key_int8": (2, 1024, 64), "value_int8": (2, 1024, 64)},
+    side_fields={"key_scale": (torch.float32, (2, 1024))},
+)
+with (
+    Uint8DualArena(128 * 1024 * 1024, device="cuda", budget=budget) as arena,
+    KvChunkPool(arena, kv_schema, max_slots=64) as kv_pool,
+):
+    with kv_pool.produce(["c0", "c1"]) as batch:
+        freeze_kv_chunks(raw_k, raw_v, batch.arena_views, batch.side_views, batch.slot_ids)
+    with kv_pool.read(["c0", "c1", None]) as batch:
+        # None sentinels map to -1 in batch.slot_ids; duplicate keys share one slot.
+        attn_out = decode_kv(query, batch.arena_views, batch.side_views, batch.slot_ids)
+    kv_pool.discard(["c0"])
+```
+
+- **VRAM-only capacity (no host spilling):** `KvChunkPool` keeps all resident KV
+  chunks on the device (`ArenaCapacityError` is raised if `produce()` cannot fit
+  in the remaining high slots). It does not spill KV chunks to host RAM or copy
+  live KV chunks during reclaim.
+- **Persistent views, stream ordering, and teardown:** `arena_views`,
+  `side_views`, `arena_bytes`, and `slot_offsets` stay invariant across the
+  lifetime of the pool so `torch.compile(fullgraph=True)` graphs remain stable.
+  Kernels populating or reading a yielded `KvBatch` must enqueue work on the
+  CUDA stream active when entering `produce()` or `read()` before exiting its
+  `with` block; `produce()` commits keys atomically on clean exit, while
+  `read()` deduplicates repeated prefix keys in one `KvBatch` and tracks CUDA
+  consumer streams until exit. Close `kv_pool` outside active `produce()` /
+  `read()` sessions and before closing `arena`.
+- **Non-blocking retirement and peer frontier sharing:** `discard(keys)` marks
+  retired keys empty without blocking on CUDA streams (raising `RuntimeError`
+  atomically if any key is currently producing or has active readers).
+  Top-down slot reuse keeps discarded bottom slots near the arena frontier, where
+  `ExpertSlabPool` can reclaim unleased `EMPTY` bottom slots on low-end pressure
+  (stopping cleanly if a live `READY` or active chunk sits at the frontier).
+
 ## Yield to collectives
 
 Weight copies and transfers of the `piper_relay` process group and CUDA

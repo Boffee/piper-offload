@@ -8,10 +8,10 @@
   lifecycle, including whole-model uploads, block streaming, and
   :meth:`~ModelOffloader.no_record_trace` for speculative passes.
 - :class:`VramBudget`, :class:`VramReservation`, :class:`VramBudgetExhaustedError`,
-  :class:`Uint8DualArena`, :class:`SlotSchema`, :class:`ExpertSlabPool`, and
-  :class:`DeviceTransferContext` coordinate shared per-device CUDA VRAM budgets,
-  reusable async transfer streams, and global expert slab residency across
-  models and pools.
+  :class:`Uint8DualArena`, :class:`SlotSchema`, :class:`ExpertSlabPool`,
+  :class:`KvChunkPool`, and :class:`DeviceTransferContext` coordinate shared
+  per-device CUDA VRAM budgets, reusable async transfer streams, global expert
+  slab residency, and high-end VRAM KV-chunk slots across models and pools.
 - :class:`ResourceCache` and :class:`ObjectSpec` support other cached resources.
 - :class:`Adapter` holds reusable model updates; :func:`merge_adapter` applies
   them permanently.
@@ -40,6 +40,7 @@ from .dual_arena import (
 )
 from .expert_slab_pool import ExpertPoolStats, ExpertSlabPool, ExpertWave
 from .gguf_parameter import GgufParameter
+from .kv_chunk_pool import KvBatch, KvChunkPool, KvPoolStats
 from .lora import LoRAFactor, ScaledLoRAFactor
 from .merge import merge_adapter
 from .model_cache import ModelCache
@@ -107,6 +108,9 @@ __all__ = [
     "FileSlice",
     "GgufParameter",
     "HostRegistrationError",
+    "KvBatch",
+    "KvChunkPool",
+    "KvPoolStats",
     "LRUEvictionPolicy",
     "LoRAFactor",
     "MappedCheckpoint",
