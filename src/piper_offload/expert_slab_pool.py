@@ -885,7 +885,7 @@ class ExpertSlabPool:
         self._unbind_slot_unlocked(v_slot, count_eviction=True, next_phase=_SlotPhase.STAGING)
         return v_slot, admit
 
-    def _obtain_slot_for_miss(
+    def _try_obtain_slot_for_miss_once(
         self,
         key: tuple[int, int],
         *,
@@ -938,6 +938,34 @@ class ExpertSlabPool:
                     key, bypass=bypass, force_resident_evict=force_resident_evict
                 )
         return found
+
+    def _obtain_slot_for_miss(
+        self,
+        key: tuple[int, int],
+        *,
+        bypass: bool,
+        can_evict_resident: bool,
+        require_for_execution: bool,
+        force_resident_evict: bool,
+    ) -> tuple[_SlotState, bool] | None:
+        while True:
+            found = self._try_obtain_slot_for_miss_once(
+                key,
+                bypass=bypass,
+                can_evict_resident=can_evict_resident,
+                require_for_execution=require_for_execution,
+                force_resident_evict=force_resident_evict,
+            )
+            if found is not None or not require_for_execution:
+                return found
+            with self._lock:
+                self._require_open_unlocked()
+                has_relocating = self._inflight_arena_frees > 0 or any(
+                    s.phase is _SlotPhase.RELOCATING for s in self._slots.values()
+                )
+                if not has_relocating:
+                    return None
+                self._op_cond.wait(timeout=0.05)
 
     def _copy_entry_fields(
         self,

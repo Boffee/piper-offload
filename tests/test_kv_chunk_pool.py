@@ -2310,3 +2310,150 @@ def test_free_slot_to_arena_interrupt_retry_and_error_recovery(
         monkeypatch.undo()
         pm.clear()
 
+
+@CUDA
+def test_cuda_spill_copy_stream_failure_releases_host_slab_and_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda")
+    schema = _kv_schema()
+    pm = PinManager(16 * 1024 * 1024, max_host_bytes=16 * 1024 * 1024)
+    payload = _make_chunk_data(740)
+    try:
+        with (
+            Uint8DualArena(schema.drawer_bytes, device=device, alignment=256) as arena,
+            KvChunkPool(
+                arena,
+                schema,
+                max_slots=1,
+                pin_manager=pm,
+                spill_watermark=None,
+                max_host_bytes=pool_cap_bytes(schema, 1),
+            ) as pool,
+        ):
+            _produce_chunks(pool, ["a"], {"a": payload})
+            orig_ensure = pool._ensure_copy_stream
+            calls = 0
+
+            def fail_ensure_once() -> torch.cuda.Stream:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError("copy-stream-oom")
+                return orig_ensure()
+
+            monkeypatch.setattr(pool, "_ensure_copy_stream", fail_ensure_once)
+            with pytest.raises(RuntimeError, match="copy-stream-oom"):
+                pool.spill(["a"])
+            monkeypatch.undo()
+
+            assert pool._live_host_allocs == 0
+            assert pool.stats().host_bytes == 0
+            assert len(pool._pending_host_retires) == 0
+            assert pool.location("a") is KvChunkLocation.GPU_DIRTY
+
+            assert pool.spill(["a"]) == 1
+            assert pool.evict_to_host(["a"]) == 1
+            with pool.waves(["a"]) as w:
+                _verify_wave_batch(next(w), {"a": payload})
+    finally:
+        monkeypatch.undo()
+        pm.clear()
+
+
+def _run_across_op_cond_wait(
+    pool: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_fn: Any,
+    release_fn: Any,
+) -> None:
+    wait_entered = threading.Event()
+    errors: list[BaseException] = []
+    orig_wait = pool._op_cond.wait
+
+    def spy_wait(timeout: float | None = None) -> bool:
+        wait_entered.set()
+        return orig_wait(timeout=timeout)
+
+    def run_worker() -> None:
+        try:
+            worker_fn()
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(pool._op_cond, "wait", spy_wait)
+    worker = threading.Thread(target=run_worker)
+    worker.start()
+    try:
+        assert wait_entered.wait(timeout=5.0)
+        monkeypatch.undo()
+        release_fn()
+        worker.join(timeout=5.0)
+        assert not worker.is_alive() and not errors
+    finally:
+        monkeypatch.undo()
+        if worker.is_alive():
+            release_fn()
+            worker.join(timeout=2.0)
+
+
+def test_obtain_slot_waits_for_relocating_slots_in_both_pools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from piper_offload.expert_slab_pool import _SlotPhase as _ExpSlotPhase
+
+    exp_schema = _expert_schema()
+    kv_schema = _kv_schema()
+    pm = PinManager(16 * 1024 * 1024, max_host_bytes=16 * 1024 * 1024)
+    try:
+        with (
+            Uint8DualArena(2 * exp_schema.drawer_bytes, device="cpu", alignment=256) as exp_arena,
+            ExpertSlabPool(exp_arena, exp_schema, max_slots=2, pin_manager=pm) as exp_pool,
+        ):
+            experts = [_make_expert_data(750 + i) for i in range(3)]
+            exp_pool.register_group("g", experts)
+            with exp_pool.waves("g", [0, 1]) as ew:
+                _ = list(ew)
+            with exp_pool._lock:
+                for s in exp_pool._slots.values():
+                    s.phase = _ExpSlotPhase.RELOCATING
+
+            def load_expert_2() -> None:
+                with exp_pool.waves("g", [2]) as ew:
+                    w = next(ew)
+                    sid = int(w.expert_to_slot[2].item())
+                    torch.testing.assert_close(w.arena_views["up"][sid, :256], experts[2]["up"])
+
+            def release_exp() -> None:
+                with exp_pool._lock:
+                    for s in exp_pool._slots.values():
+                        s.phase = _ExpSlotPhase.READY
+                    exp_pool._op_cond.notify_all()
+
+            _run_across_op_cond_wait(exp_pool, monkeypatch, load_expert_2, release_exp)
+
+        with (
+            Uint8DualArena(2 * kv_schema.drawer_bytes, device="cpu", alignment=256) as kv_arena,
+            KvChunkPool(kv_arena, kv_schema, max_slots=2, pin_manager=pm, spill_watermark=None) as kv_pool,
+        ):
+            payloads = {k: _make_chunk_data(760 + i) for i, k in enumerate(("a", "b", "c"))}
+            _produce_chunks(kv_pool, ["a", "b"], payloads)
+            assert kv_pool.spill(["a", "b"]) == 2
+            with kv_pool._lock:
+                for s in kv_pool._slots.values():
+                    s.phase = _SlotPhase.RELOCATING
+
+            def release_kv() -> None:
+                with kv_pool._lock:
+                    for s in kv_pool._slots.values():
+                        s.phase = _SlotPhase.READY
+                    kv_pool._op_cond.notify_all()
+
+            _run_across_op_cond_wait(
+                kv_pool, monkeypatch, lambda: _produce_chunks(kv_pool, ["c"], payloads), release_kv
+            )
+            assert kv_pool.contains("c")
+    finally:
+        monkeypatch.undo()
+        pm.clear()
+

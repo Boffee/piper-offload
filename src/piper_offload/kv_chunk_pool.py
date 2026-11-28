@@ -1053,8 +1053,9 @@ class KvChunkPool:
         lease = slot.lease
         assert lease is not None
         non_blocking = host_alloc.is_pinned
-        copy_stream = self._ensure_copy_stream()
+        copy_stream: torch.cuda.Stream | None = None
         try:
+            copy_stream = self._ensure_copy_stream()
             with slot.lease_lock:
                 if lease.d2h_in_flight:
                     _sync_interrupt_safe(lease.wait_d2h)
@@ -1068,23 +1069,25 @@ class KvChunkPool:
                     _sync_interrupt_safe(lease.wait_d2h)
                 in_flight = lease.d2h_in_flight
         except BaseException as exc:
-            with slot.lease_lock:
-                in_flight = lease.d2h_in_flight
-            if in_flight:
-                try:
-                    with slot.lease_lock:
-                        _sync_interrupt_safe(lease.wait_d2h)
-                except BaseException as sync_exc:
-                    self._defer_rejected_host_alloc(
-                        host_alloc, copy_stream, rec=rec, attempt_id=attempt_id
-                    )
-                    raise sync_exc from exc
+            if copy_stream is not None:
+                with slot.lease_lock:
+                    in_flight = lease.d2h_in_flight
+                if in_flight:
+                    try:
+                        with slot.lease_lock:
+                            _sync_interrupt_safe(lease.wait_d2h)
+                    except BaseException as sync_exc:
+                        self._defer_rejected_host_alloc(
+                            host_alloc, copy_stream, rec=rec, attempt_id=attempt_id
+                        )
+                        raise sync_exc from exc
             self._release_or_defer_host_allocs([host_alloc])
             with self._lock:
                 self._clear_allocating_spill_unlocked(rec, attempt_id)
                 self._op_cond.notify_all()
             raise
 
+        assert copy_stream is not None
         target_state = _SpillState.IN_FLIGHT if in_flight else _SpillState.COMPLETE
         with self._lock:
             published = self._publish_spill_alloc_unlocked(
@@ -1423,15 +1426,19 @@ class KvChunkPool:
                 self._require_open_unlocked()
                 if self._has_obtainable_slot_unlocked(protected, allow_wait_d2h=allow_wait_d2h):
                     continue
-                has_allocating = any(
-                    key not in protected
-                    and rec.slot is not None
-                    and rec.slot.phase is _SlotPhase.READY
-                    and rec.slot.active_readers == 0
-                    and rec.spill_state is _SpillState.ALLOCATING
-                    for key, rec in self._chunks.items()
+                has_transient_wait = (
+                    self._inflight_arena_frees > 0
+                    or any(s.phase is _SlotPhase.RELOCATING for s in self._slots.values())
+                    or any(
+                        key not in protected
+                        and rec.slot is not None
+                        and rec.slot.phase is _SlotPhase.READY
+                        and rec.slot.active_readers == 0
+                        and rec.spill_state is _SpillState.ALLOCATING
+                        for key, rec in self._chunks.items()
+                    )
                 )
-                if not has_allocating:
+                if not has_transient_wait:
                     return None
                 self._op_cond.wait(timeout=0.05)
 
