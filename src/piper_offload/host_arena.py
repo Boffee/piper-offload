@@ -97,12 +97,24 @@ def _as_flat_uint8(tensor: torch.Tensor) -> torch.Tensor:
     )
 
 
+class _UnsetType:
+    pass
+
+
+_UNSET = _UnsetType()
+
+
+class _AllocatorBudgetRefusedError(Exception):
+    """Internal signal that a ledger-enforced allocator declined budget headroom."""
+
+
 class _RegStatus(Enum):
     REGISTERED = "registered"
     UNPINNED = "unpinned"
     OS_FAILED = "os_failed"
     CAPACITY = "capacity"
     REFUSED = "refused"
+    BUDGET_REFUSED = "budget_refused"
 
 
 _RETAINED_REGIONS: dict[int, AlignedRegion] = {}
@@ -211,6 +223,8 @@ class _RegisteredRegion:
     ) -> tuple[_RegisteredRegion | None, _RegStatus]:
         try:
             region = allocator(size)
+        except _AllocatorBudgetRefusedError:
+            return None, _RegStatus.BUDGET_REFUSED
         except (OSError, MemoryError) as error:
             logger.warning("Could not allocate %d-byte %s: %s", size, context_label, str(error))
             return None, _RegStatus.OS_FAILED
@@ -993,14 +1007,16 @@ class HostSlabArena:
         min_slab_size: int,
         slab_hint_bytes: int | None,
         popped_for_trim: list[_Slab],
+        effective_max: int | None,
     ) -> int | None:
-        plan = self._plan_slab_headroom_locked(min_slab_size, self._max_bytes)
+        plan = self._plan_slab_headroom_locked(min_slab_size, effective_max)
         if plan is None:
             return None
         surviving, popped, headroom = plan
         if popped:
-            popped_for_trim.extend(popped)
             self._slabs = surviving
+            self._mark_reclaiming_locked(popped)
+            popped_for_trim.extend(popped)
 
         desired = (
             self._slab_bytes
@@ -1011,6 +1027,21 @@ class HostSlabArena:
         if headroom is not None:
             candidate_size = min(candidate_size, headroom)
         return candidate_size
+
+    def can_ever_fit_existing_slab(
+        self, aligned_size: int, alignment: int = mmap.PAGESIZE
+    ) -> bool:
+        """Return whether at least one live slab's span size/alignment can ever fit the request."""
+        _validate_int(aligned_size, "aligned_size", minimum=1)
+        _validate_power_of_two(alignment, "alignment")
+        sub_align = max(alignment, mmap.PAGESIZE)
+        req_size = _align_up(aligned_size, sub_align)
+        with self._state_lock():
+            return any(
+                slab.size >= req_size
+                and _can_fit_in_spans(slab.pointer, [(0, slab.size)], req_size, sub_align)
+                for slab in self._slabs
+            )
 
     def plan_slab_bytes(
         self,
@@ -1076,13 +1107,15 @@ class HostSlabArena:
         aligned_size: int,
         sub_align: int,
         trailing_drained: list[_Slab],
+        max_bytes: int | _UnsetType | None,
     ) -> tuple[_Slab, int] | None:
         with self._drain_lock(trailing_drained):
             if self._closed:
                 raise RuntimeError("HostSlabArena is closed.")
+            commit_max = self._max_bytes if isinstance(max_bytes, _UnsetType) else max_bytes
             projected_reserved = (self._reserved_bytes - reserved_delta) + final_size
-            if self._max_bytes is not None and (
-                projected_reserved > self._max_bytes or self._used_bytes + aligned_size > self._max_bytes
+            if commit_max is not None and (
+                projected_reserved > commit_max or self._used_bytes + aligned_size > commit_max
             ):
                 return None
             slab = _Slab(self._next_slab_id, final_size, backing)
@@ -1139,6 +1172,7 @@ class HostSlabArena:
         head_pad: int,
         data_length: int,
         initial_drained: list[_Slab],
+        max_bytes: int | _UnsetType | None,
     ) -> ArenaAllocation | None:
         uncommitted_backing: _RegisteredRegion | None = None
         committed: tuple[_Slab, int] | None = None
@@ -1160,6 +1194,7 @@ class HostSlabArena:
                 aligned_size,
                 sub_align,
                 trailing_drained,
+                max_bytes,
             )
             if committed is None:
                 return None
@@ -1225,20 +1260,20 @@ class HostSlabArena:
         slab_hint_bytes: int | None,
         drained: list[_Slab],
         popped_for_trim: list[_Slab],
+        effective_max: int | None,
     ) -> tuple[tuple[_Slab, int] | None, int | None, bool, bool]:
         if self._closed:
             raise RuntimeError("HostSlabArena is closed.")
-        if self._max_bytes is not None and self._used_bytes + aligned_size > self._max_bytes:
+        if effective_max is not None and self._used_bytes + aligned_size > effective_max:
             return None, None, False, True
         fast_alloc = self._find_and_alloc_locked(aligned_size, sub_align)
         if fast_alloc is not None:
             return fast_alloc, None, False, False
         if not self._creating_slab:
             candidate_size = self._compute_new_slab_size_locked(
-                min_slab_size, slab_hint_bytes, popped_for_trim
+                min_slab_size, slab_hint_bytes, popped_for_trim, effective_max
             )
             if popped_for_trim:
-                self._mark_reclaiming_locked(popped_for_trim)
                 return None, candidate_size, False, False
             if candidate_size is not None:
                 self._reserved_bytes += candidate_size
@@ -1256,11 +1291,14 @@ class HostSlabArena:
         head_pad: int = 0,
         alignment: int = DEFAULT_SECTOR_SIZE,
         slab_hint_bytes: int | None = None,
+        max_bytes: int | _UnsetType | None = _UNSET,
     ) -> ArenaAllocation | None:
         """Allocate a byte span of ``head_pad + data_length`` inside the arena."""
         sub_align, aligned_size = self._validate_alloc_args(
             data_length, head_pad, alignment, slab_hint_bytes
         )
+        if not isinstance(max_bytes, _UnsetType) and max_bytes is not None:
+            _validate_int(max_bytes, "max_bytes", minimum=0)
         min_slab_size = _align_up(aligned_size + max(0, sub_align - mmap.PAGESIZE), mmap.PAGESIZE)
 
         while True:
@@ -1268,16 +1306,29 @@ class HostSlabArena:
             popped_for_trim: list[_Slab] = []
             candidate_size: int | None = None
             create_slab = False
+            fast_alloc: tuple[_Slab, int] | None = None
+            stop = False
             try:
                 with self._drain_lock(drained):
+                    effective_max = (
+                        self._max_bytes if isinstance(max_bytes, _UnsetType) else max_bytes
+                    )
                     fast_alloc, candidate_size, create_slab, stop = self._try_alloc_step_locked(
-                        aligned_size, sub_align, min_slab_size, slab_hint_bytes, drained, popped_for_trim
+                        aligned_size,
+                        sub_align,
+                        min_slab_size,
+                        slab_hint_bytes,
+                        drained,
+                        popped_for_trim,
+                        effective_max,
                     )
             except BaseException:
                 if create_slab and candidate_size is not None:
                     self._abort_creating_slab(candidate_size)
                 if drained:
                     self._try_reclaim_popped_slabs(drained)
+                if popped_for_trim:
+                    self._try_reclaim_popped_slabs(popped_for_trim)
                 raise
 
             if fast_alloc is not None:
@@ -1294,10 +1345,11 @@ class HostSlabArena:
                     head_pad,
                     data_length,
                     drained,
+                    max_bytes,
                 )
-            if popped_for_trim:
-                drained.extend(popped_for_trim)
             reclaim_failed = self._try_reclaim_popped_slabs(drained) if drained else 0
+            if popped_for_trim:
+                reclaim_failed += self._try_reclaim_popped_slabs(popped_for_trim)
             if stop or (popped_for_trim and reclaim_failed > 0):
                 return None
 

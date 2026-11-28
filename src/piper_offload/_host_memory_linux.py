@@ -61,13 +61,17 @@ def available_memory() -> int:
     return total if limit is None else min(total, limit)
 
 
+class _WeakMmap(mmap.mmap):
+    """Weakref-capable anonymous mapping wrapper preserving ``mmap.mmap`` API and buffer checks."""
+
+
 def allocate_aligned_region(size: int) -> mmap.mmap:
     """Allocate ``size`` bytes of page-aligned anonymous memory."""
     if isinstance(size, bool) or not isinstance(size, int) or size <= 0 or size % mmap.PAGESIZE != 0:
         raise ValueError(
             f"Aligned host region size must be a positive multiple of {mmap.PAGESIZE}, got {size!r}."
         )
-    return mmap.mmap(-1, size)
+    return _WeakMmap(-1, size)
 
 
 __all__ = [

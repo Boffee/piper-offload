@@ -50,7 +50,7 @@ from collections import OrderedDict, deque
 from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Self
+from typing import Any, Literal, Protocol, Self
 
 import torch
 
@@ -62,6 +62,7 @@ from ._direct_io import (
     DirectReadRequest,
     align_span,
 )
+from ._host_memory import AlignedRegion
 from ._host_registration import (
     HostRegistrationBackend,
     HostRegistrationRefusedError,
@@ -79,6 +80,7 @@ from .host_arena import (
     PinnedBounceRing,
     _align_down,
     _align_up,
+    _AllocatorBudgetRefusedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -195,6 +197,25 @@ class _Candidate:
     head_pad: int = 0
     aligned_size: int = 0
     use_direct_aligned: bool = False
+    private_source: _PrivateCopy | None = None
+
+
+class _Tier2aSpanRequest(Protocol):
+    size: int
+    sector: int
+    head_pad: int
+    aligned_size: int
+    source: FileSlice | None
+    private_source: _PrivateCopy | None
+
+
+@dataclass(slots=True)
+class _DirectSpanRequest:
+    size: int
+    sector: int
+    aligned_size: int
+    head_pad: int = 0
+    source: FileSlice | None = None
     private_source: _PrivateCopy | None = None
 
 
@@ -468,6 +489,199 @@ class TransferLease:
         self._device = None
 
 
+class _TrackedRegion:
+    """PEP 688 ``AlignedRegion`` wrapper crediting ledger bytes once OS memory closes."""
+
+    __slots__ = ("_closed", "_fin", "_on_release", "_region")
+
+    def __init__(self, region: AlignedRegion, on_release: Callable[[], None]) -> None:
+        self._region = region
+        self._on_release = on_release
+        self._closed = False
+        self._fin: weakref.finalize[[], Any] | None = None
+        with contextlib.suppress(TypeError):
+            fin = weakref.finalize(region, on_release)
+            fin.atexit = False
+            self._fin = fin
+
+    def __buffer__(self, flags: int, /) -> memoryview:
+        return memoryview(self._region)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._region.close()
+        self._on_release()
+        self._closed = True
+        fin = self._fin
+        self._fin = None
+        if fin is not None:
+            fin.detach()
+
+
+class _HostBudgetLedger:
+    """Lock-protected ledger enforcing physical OS ceilings across Tier 2a, 2b, and bounce."""
+
+    def __init__(
+        self,
+        lock: threading.RLock,
+        *,
+        max_pinned_bytes: int | None,
+        max_host_bytes: int | None,
+        bounce_bytes_config: int | None,
+        min_bounce_bytes: int,
+        bounce_slot_bytes: int,
+    ) -> None:
+        self._lock = lock
+        self.max_pinned_bytes = max_pinned_bytes
+        self.max_host_bytes = max_host_bytes
+        self._bounce_bytes_config = bounce_bytes_config
+        self._min_bounce_bytes = min_bounce_bytes
+        self._bounce_slot_bytes = bounce_slot_bytes
+        self.in_place_bytes = 0
+        self.tier2a_bytes = 0
+        self.bounce_bytes = 0
+        self.tier2b_bytes = 0
+
+    def desired_bounce_bytes(self, pin_budget: int | None) -> int | None:
+        """Compute target bounce-ring bytes under ``pin_budget``, ``0`` when disabled, or ``None`` if unbounded."""
+        if pin_budget == 0 or self._bounce_bytes_config == 0:
+            return 0
+        if self._bounce_bytes_config is not None:
+            target = (
+                self._bounce_bytes_config
+                if pin_budget is None
+                else min(self._bounce_bytes_config, pin_budget)
+            )
+            aligned = _align_down(target, mmap.PAGESIZE)
+            return 0 if aligned < _MIN_BOUNCE_SLOT_BYTES else aligned
+        if pin_budget is None:
+            return None
+        if pin_budget < 4 * self._min_bounce_bytes:
+            return 0
+        quarter = _align_down(pin_budget // 4, mmap.PAGESIZE)
+        target = min(DEFAULT_BOUNCE_SLOTS * self._bounce_slot_bytes, quarter)
+        return 0 if target < _MIN_BOUNCE_SLOT_BYTES else target
+
+    def snapshot_locked(self) -> tuple[int, int, int]:
+        return self.tier2a_bytes, self.tier2b_bytes, self.bounce_bytes
+
+    def snapshot_atomic(self) -> tuple[int, int, int]:
+        with self._lock:
+            return self.tier2a_bytes, self.tier2b_bytes, self.bounce_bytes
+
+    def can_reserve_pinned_locked(self, needed: int, pin_ceiling: int | None) -> bool:
+        if self.max_pinned_bytes == 0:
+            return False
+        if (
+            pin_ceiling is not None
+            and self.in_place_bytes + self.tier2a_bytes + self.bounce_bytes + needed > pin_ceiling
+        ):
+            return False
+        return not (
+            self.max_host_bytes is not None
+            and self.max_host_bytes > 0
+            and self.in_place_bytes
+            + self.tier2a_bytes
+            + self.bounce_bytes
+            + self.tier2b_bytes
+            + needed
+            > self.max_host_bytes
+        )
+
+    def can_reserve_bounce_locked(self, size: int) -> bool:
+        if self._bounce_bytes_config == 0 or not self.can_reserve_pinned_locked(
+            size, self.max_pinned_bytes
+        ):
+            return False
+        desired = self.desired_bounce_bytes(self.max_pinned_bytes)
+        return desired is None or self.bounce_bytes + size <= desired
+
+    def can_reserve_tier2b_locked(self, size: int) -> bool:
+        if self.max_host_bytes == 0:
+            return False
+        if self.max_host_bytes is None:
+            return True
+        return (
+            self.in_place_bytes
+            + self.tier2a_bytes
+            + self.bounce_bytes
+            + self.tier2b_bytes
+            + size
+            <= self.max_host_bytes
+        )
+
+    def _get_locked(self, kind: Literal["tier2a", "tier2b", "bounce"]) -> int:
+        if kind == "tier2a":
+            return self.tier2a_bytes
+        if kind == "bounce":
+            return self.bounce_bytes
+        return self.tier2b_bytes
+
+    def _set_locked(self, kind: Literal["tier2a", "tier2b", "bounce"], value: int) -> None:
+        if kind == "tier2a":
+            self.tier2a_bytes = max(0, value)
+        elif kind == "bounce":
+            self.bounce_bytes = max(0, value)
+        else:
+            self.tier2b_bytes = max(0, value)
+
+    def _charge_locked(self, kind: Literal["tier2a", "tier2b", "bounce"], size: int) -> bool:
+        allowed = (
+            self.can_reserve_pinned_locked(size, self.max_pinned_bytes)
+            if kind == "tier2a"
+            else (
+                self.can_reserve_bounce_locked(size)
+                if kind == "bounce"
+                else self.can_reserve_tier2b_locked(size)
+            )
+        )
+        if not allowed:
+            return False
+        self._set_locked(kind, self._get_locked(kind) + size)
+        return True
+
+    def make_allocator(
+        self, kind: Literal["tier2a", "tier2b", "bounce"]
+    ) -> Callable[[int], AlignedRegion]:
+        def _alloc(size: int) -> AlignedRegion:
+            charged = False
+            released = False
+            region: AlignedRegion | None = None
+            tracked: _TrackedRegion | None = None
+
+            def _release_once() -> None:
+                nonlocal released
+                with self._lock:
+                    if not released:
+                        self._set_locked(kind, self._get_locked(kind) - size)
+                        released = True
+
+            try:
+                with self._lock:
+                    charged = self._charge_locked(kind, size)
+                if not charged:
+                    raise _AllocatorBudgetRefusedError()
+                region = host_memory.allocate_aligned_region(size)
+                tracked = _TrackedRegion(region, _release_once)
+                region = None
+                return tracked
+            except BaseException:
+                if tracked is not None:
+                    with contextlib.suppress(BufferError, OSError):
+                        tracked.close()
+                elif region is not None:
+                    with contextlib.suppress(BufferError, OSError):
+                        region.close()
+                    if charged:
+                        _release_once()
+                elif charged:
+                    _release_once()
+                raise
+
+        return _alloc
+
+
 class PinManager:
     """Own pinned registrations, Tier 2a/2b host slab arenas, Direct I/O reader, and bounce ring.
 
@@ -555,6 +769,14 @@ class PinManager:
         self._retired_bounce_reg_failures = 0
         self._retired_bounce_unreg_failures = 0
 
+        self._ledger = _HostBudgetLedger(
+            self._lock,
+            max_pinned_bytes=max_pinned_bytes,
+            max_host_bytes=max_host_bytes,
+            bounce_bytes_config=bounce_bytes,
+            min_bounce_bytes=min_bounce_bytes,
+            bounce_slot_bytes=bounce_slot_bytes,
+        )
         self._tier2a_backend = _Tier2aBackendProxy(self._backend)
         self._resources = _ManagerResources(
             reader=DirectFileReader(),
@@ -563,11 +785,13 @@ class PinManager:
                 max_bytes=max_pinned_bytes,
                 slab_bytes=slab_bytes,
                 backend=self._tier2a_backend,
+                allocator=self._ledger.make_allocator("tier2a"),
             ),
             tier2b=HostSlabArena(
                 pinned=False,
                 max_bytes=max_host_bytes,
                 slab_bytes=slab_bytes,
+                allocator=self._ledger.make_allocator("tier2b"),
             ),
         )
         self._reader = self._resources.reader
@@ -579,24 +803,7 @@ class PinManager:
         self._finalizer.atexit = False
 
     def _desired_bounce_bytes(self, pin_budget: int | None) -> int | None:
-        """Compute target bounce-ring bytes under ``pin_budget``, ``0`` when disabled, or ``None`` if unbounded."""
-        if pin_budget == 0 or self._bounce_bytes_config == 0:
-            return 0
-        if self._bounce_bytes_config is not None:
-            target = (
-                self._bounce_bytes_config
-                if pin_budget is None
-                else min(self._bounce_bytes_config, pin_budget)
-            )
-            aligned = _align_down(target, mmap.PAGESIZE)
-            return 0 if aligned < _MIN_BOUNCE_SLOT_BYTES else aligned
-        if pin_budget is None:
-            return None
-        if pin_budget < 4 * self._min_bounce_bytes:
-            return 0
-        quarter = _align_down(pin_budget // 4, mmap.PAGESIZE)
-        target = min(DEFAULT_BOUNCE_SLOTS * self._bounce_slot_bytes, quarter)
-        return 0 if target < _MIN_BOUNCE_SLOT_BYTES else target
+        return self._ledger.desired_bounce_bytes(pin_budget)
 
     def _active_bounce_bytes_off_lock(self) -> tuple[int, int, int]:
         """Return ``(reserved, reg_fails, unreg_fails)`` across live, creating, closing, and retained rings."""
@@ -631,6 +838,7 @@ class PinManager:
         _validate_optional_non_negative_int(value, "max_pinned_bytes")
         with self._lock:
             self._max_pinned_bytes = value
+            self._ledger.max_pinned_bytes = value
             self._pin_budget_epoch += 1
         self._enforce_pin_budget()
 
@@ -645,6 +853,7 @@ class PinManager:
         _validate_optional_non_negative_int(value, "max_host_bytes")
         with self._lock:
             self._max_host_bytes = value
+            self._ledger.max_host_bytes = value
             self._host_budget_epoch += 1
         self._enforce_host_budget()
 
@@ -663,8 +872,10 @@ class PinManager:
         tier2a_stats = self._tier2a.stats
         tier2b_stats = self._tier2b.stats
         bounce_reserved, bounce_reg_fails, bounce_unreg_fails = self._active_bounce_bytes_off_lock()
-        copy_bytes = tier2a_stats.reserved_bytes
-        private_bytes = tier2b_stats.reserved_bytes
+        ledger_2a, ledger_2b, ledger_bounce = self._ledger.snapshot_atomic()
+        bounce_reserved = max(bounce_reserved, ledger_bounce)
+        copy_bytes = max(tier2a_stats.reserved_bytes, ledger_2a)
+        private_bytes = max(tier2b_stats.reserved_bytes, ledger_2b)
         return PinStats(
             max_pinned_bytes=max_pinned,
             pinned_bytes=in_place + copy_bytes + bounce_reserved,
@@ -992,8 +1203,8 @@ class PinManager:
         host_budget: int | None,
         private_bytes: int,
     ) -> tuple[int | None, bool]:
-        """Clamp ``pin_ceiling`` to remaining combined host headroom when Tier 2b holds pages."""
-        if host_budget is None or host_budget == 0 or private_bytes == 0:
+        """Clamp ``pin_ceiling`` to remaining combined host headroom when ``host_budget`` is positive."""
+        if host_budget is None or host_budget == 0:
             return pin_ceiling, False
         host_pin_cap = max(0, host_budget - private_bytes)
         if pin_ceiling is None or host_pin_cap < pin_ceiling:
@@ -1017,8 +1228,8 @@ class PinManager:
 
     def _effective_candidate_ceiling_locked(
         self, effective_ceiling: int | None
-    ) -> tuple[int, int, bool, int | None, int | None, int]:
-        """Return ``(pin_epoch, host_epoch, budget_open, active_ceiling, host_budget, in_place)``."""
+    ) -> tuple[int, int, bool, int | None, int | None, int, int, int, int]:
+        """Return candidate epochs, ceilings, and live/ledger byte counters."""
         cur_epoch = self._pin_budget_epoch
         cur_host_epoch = self._host_budget_epoch
         cur_budget = self._max_pinned_bytes
@@ -1030,7 +1241,18 @@ class PinManager:
             active_ceiling = cur_budget
         else:
             active_ceiling = min(effective_ceiling, cur_budget)
-        return cur_epoch, cur_host_epoch, cur_budget != 0, active_ceiling, host_budget, in_place
+        ledger_2a, ledger_2b, ledger_bounce = self._ledger.snapshot_locked()
+        return (
+            cur_epoch,
+            cur_host_epoch,
+            cur_budget != 0,
+            active_ceiling,
+            host_budget,
+            in_place,
+            ledger_2a,
+            ledger_2b,
+            ledger_bounce,
+        )
 
     def _allocate_and_reserve_candidates(
         self,
@@ -1108,6 +1330,7 @@ class PinManager:
         size: int,
         expected_epoch: int,
         expected_host_epoch: int,
+        active_ceiling: int | None,
     ) -> str:
         if (
             self._pin_budget_epoch != expected_epoch
@@ -1117,6 +1340,9 @@ class PinManager:
             return "retry"
         if self._max_pinned_bytes == 0:
             return "disabled"
+        needed = self._page_reservation(pointer, size)
+        if not self._ledger.can_reserve_pinned_locked(needed, active_ceiling):
+            return "retry"
         self._reserve_range_locked(pointer, size)
         self._pin_reserving += 1
         return "ok"
@@ -1197,13 +1423,16 @@ class PinManager:
                     active_ceiling,
                     host_budget,
                     in_place,
+                    ledger_2a,
+                    ledger_2b,
+                    ledger_bounce,
                 ) = self._effective_candidate_ceiling_locked(effective_ceiling)
                 needed = self._page_reservation(pointer, size)
             if not budget_open or (active_ceiling is not None and needed > active_ceiling):
                 return False
 
-            bounce_bytes, _, _ = self._active_bounce_bytes_off_lock()
-            private_bytes = self._tier2b.stats.reserved_bytes
+            bounce_bytes = max(self._active_bounce_bytes_off_lock()[0], ledger_bounce)
+            private_bytes = max(self._tier2b.stats.reserved_bytes, ledger_2b)
             combined_ceiling, host_capped = self._apply_host_ceiling(
                 active_ceiling, host_budget, private_bytes
             )
@@ -1212,24 +1441,32 @@ class PinManager:
                     continue
                 return False
 
-            tier2a_bytes = self._tier2a.stats.reserved_bytes
+            tier2a_res = self._tier2a.stats.reserved_bytes
+            tier2a_bytes = max(tier2a_res, ledger_2a)
+            extra_2a = max(0, ledger_2a - tier2a_res)
             if combined_ceiling is not None and in_place + tier2a_bytes + bounce_bytes + needed > combined_ceiling:
                 required = in_place + tier2a_bytes + bounce_bytes + needed
                 if host_capped and self._reserve_host_headroom_for_pinned(host_budget, required):
                     continue
-                target_total = max(0, combined_ceiling - needed)
-                if not self._evict_idle_for_budget(target_total, protected=protected, close_bounce_last=True):
+                evict_target = combined_ceiling - needed - extra_2a
+                if evict_target < 0 or not self._evict_idle_for_budget(
+                    evict_target, protected=protected, close_bounce_last=True
+                ):
                     return False
                 continue
 
             with self._lock:
-                gate = self._enter_in_place_reserve_locked(pointer, size, cur_epoch, cur_host_epoch)
+                gate = self._enter_in_place_reserve_locked(
+                    pointer, size, cur_epoch, cur_host_epoch, active_ceiling
+                )
             if gate == "retry":
                 continue
             if gate == "disabled":
                 return False
 
-            outcome = self._attempt_in_place_registration(candidate, cur_epoch, held, created, protected)
+            outcome = self._attempt_in_place_registration(
+                candidate, cur_epoch, held, created, protected
+            )
             if outcome != "retry":
                 return outcome == "exhausted"
 
@@ -1320,32 +1557,55 @@ class PinManager:
     def _reconcile_tier2a_host_epoch(
         self,
         alloc: ArenaAllocation,
+        cur_pin_budget: int | None,
         cur_host_budget: int | None,
         cur_in_place: int,
-    ) -> bool:
-        """Keep ``alloc`` only if concurrent Tier 2b growth still fits under ``cur_host_budget``."""
-        if cur_host_budget is None or cur_host_budget == 0:
-            return True
-        cur_tier2b = self._tier2b.stats.reserved_bytes
-        if cur_tier2b == 0:
-            return True
+        *,
+        host_epoch_changed: bool,
+        post_epochs: tuple[int, int],
+    ) -> tuple[bool, bool]:
+        """Keep ``alloc`` only if concurrent Tier 2a/2b/in-place growth still fits budgets."""
+        post_pin_epoch, post_host_epoch = post_epochs
         cur_pinned = (
             cur_in_place + self._tier2a.stats.reserved_bytes + self._active_bounce_bytes_off_lock()[0]
         )
-        if cur_pinned + cur_tier2b <= cur_host_budget:
-            return True
-        self._evict_private_to_fit(max(0, cur_host_budget - cur_pinned))
-        if (
-            self._tier2b.stats.reserved_bytes == 0
-            or cur_pinned + self._tier2b.stats.reserved_bytes <= cur_host_budget
-        ):
-            return True
+        before_total = cur_pinned + self._tier2b.stats.reserved_bytes
+        pin_exceeded = cur_pin_budget is not None and cur_pinned > cur_pin_budget
+        host_exceeded = (
+            cur_host_budget is not None and cur_host_budget > 0 and before_total > cur_host_budget
+        )
+        if not pin_exceeded and not host_exceeded:
+            return True, True
+        if not pin_exceeded and self._tier2b.stats.reserved_bytes > 0:
+            assert cur_host_budget is not None
+            self._evict_private_to_fit(max(0, cur_host_budget - cur_pinned))
+            if cur_pinned + self._tier2b.stats.reserved_bytes <= cur_host_budget:
+                return True, True
         try:
             alloc.release()
         finally:
             self._tier2a.trim_empty(0)
-        self._enforce_host_budget()
-        return False
+        if pin_exceeded:
+            self._enforce_pin_budget()
+        else:
+            self._enforce_host_budget()
+        after_pinned = (
+            self._in_place_pinned_bytes_atomic()
+            + self._tier2a.stats.reserved_bytes
+            + self._active_bounce_bytes_off_lock()[0]
+        )
+        after_total = after_pinned + self._tier2b.stats.reserved_bytes
+        still_over = (cur_pin_budget is not None and after_pinned > cur_pin_budget) or (
+            cur_host_budget is not None and cur_host_budget > 0 and after_total > cur_host_budget
+        )
+        with self._lock:
+            unchanged = (
+                not host_epoch_changed
+                and self._pin_budget_epoch == post_pin_epoch
+                and self._host_budget_epoch == post_host_epoch
+            )
+        can_retry = not (unchanged and still_over and after_total >= before_total)
+        return False, can_retry
 
     def _finalize_tier2a_span_alloc(
         self,
@@ -1354,6 +1614,8 @@ class PinManager:
         disabled: bool,
         epoch_changed: bool,
         host_epoch_changed: bool,
+        post_epochs: tuple[int, int],
+        cur_pin_budget: int | None,
         cur_host_budget: int | None,
         cur_in_place: int,
         reg_failed: bool,
@@ -1367,20 +1629,27 @@ class PinManager:
                     released_alloc.release()
                 finally:
                     self._tier2a.trim_empty(0)
-            elif alloc is not None and host_epoch_changed:
-                checked = alloc
-                alloc = None
-                if self._reconcile_tier2a_host_epoch(checked, cur_host_budget, cur_in_place):
-                    alloc = checked
-                else:
-                    return None, reg_failed, refused, "retry"
+            elif alloc is not None:
+                kept, can_retry = self._reconcile_tier2a_host_epoch(
+                    alloc,
+                    cur_pin_budget,
+                    cur_host_budget,
+                    cur_in_place,
+                    host_epoch_changed=host_epoch_changed,
+                    post_epochs=post_epochs,
+                )
+                if not kept:
+                    alloc = None
+                    return None, reg_failed, refused, ("retry" if can_retry else "stop")
             if epoch_changed:
                 self._enforce_pin_budget()
             if disabled or epoch_changed:
                 return None, reg_failed, refused, ("disabled" if disabled else "retry")
+            if alloc is None and host_epoch_changed:
+                return None, reg_failed, refused, "retry"
             return alloc, reg_failed, refused, "ok"
         except BaseException:
-            if alloc is not None:
+            if alloc is not None and not alloc.released:
                 leaked = alloc
                 alloc = None
                 try:
@@ -1391,7 +1660,7 @@ class PinManager:
 
     def _try_alloc_tier2a_span(
         self,
-        candidate: _Candidate,
+        candidate: _Tier2aSpanRequest,
         avail_2a: int | None,
         slab_hint_bytes: int,
         cur_epoch: int,
@@ -1408,17 +1677,21 @@ class PinManager:
                 return None, False, False, "disabled"
             self._pin_reserving += 1
 
+        sub_align = max(candidate.sector, mmap.PAGESIZE)
+        req_size = _align_up(candidate.aligned_size, sub_align)
+        min_slab_2a = _align_up(req_size + max(0, sub_align - mmap.PAGESIZE), mmap.PAGESIZE)
+        needed_2a = max(min_slab_2a, min(self._slab_bytes, _align_up(slab_hint_bytes, mmap.PAGESIZE)))
         alloc: ArenaAllocation | None = None
         fails_before = self._tier2a.stats.registration_failures
         refused_before = self._tier2a_backend.refused_count
         try:
             try:
-                self._tier2a.max_bytes = avail_2a
                 alloc = self._tier2a.allocate(
                     candidate.source.length if candidate.source is not None else candidate.size,
                     head_pad=candidate.head_pad,
-                    alignment=max(candidate.sector, mmap.PAGESIZE),
-                    slab_hint_bytes=max(candidate.aligned_size, slab_hint_bytes),
+                    alignment=sub_align,
+                    slab_hint_bytes=needed_2a,
+                    max_bytes=avail_2a,
                 )
                 fails_after = self._tier2a.stats.registration_failures
                 refused_after = self._tier2a_backend.refused_count
@@ -1429,10 +1702,12 @@ class PinManager:
                     disabled = self._max_pinned_bytes == 0
                     epoch_changed = self._pin_budget_epoch != cur_epoch
                     host_epoch_changed = self._host_budget_epoch != cur_host_epoch
+                    cur_pin_budget = self._max_pinned_bytes
                     cur_host_budget = self._max_host_bytes
                     cur_in_place = self._in_place_pinned_bytes
                     if alloc is not None and not disabled and not epoch_changed:
                         self._host_budget_epoch += 1
+                    post_epochs = (self._pin_budget_epoch, self._host_budget_epoch)
 
             taken_alloc = alloc
             alloc = None
@@ -1441,13 +1716,15 @@ class PinManager:
                 disabled=disabled,
                 epoch_changed=epoch_changed,
                 host_epoch_changed=host_epoch_changed,
+                post_epochs=post_epochs,
+                cur_pin_budget=cur_pin_budget,
                 cur_host_budget=cur_host_budget,
                 cur_in_place=cur_in_place,
                 reg_failed=fails_after > fails_before,
                 refused=refused_after > refused_before,
             )
         except BaseException:
-            if alloc is not None:
+            if alloc is not None and not alloc.released:
                 leaked = alloc
                 alloc = None
                 try:
@@ -1458,7 +1735,7 @@ class PinManager:
 
     def _evict_for_tier2a_headroom(
         self,
-        candidate: _Candidate,
+        candidate: _Tier2aSpanRequest,
         *,
         host_budget: int | None,
         host_capped: bool,
@@ -1472,74 +1749,102 @@ class PinManager:
             evict_target_pinned, protected=protected, close_bounce_last=True
         ):
             return True
-        if host_capped and candidate.private_source is not None:
+        if host_capped and isinstance(candidate, _Candidate) and candidate.private_source is not None:
             self._release_private_candidate_holds([candidate])
             return self._reserve_host_headroom_for_pinned(host_budget, required_pinned)
         return False
 
     def _prepare_tier2a_headroom(
         self,
-        candidate: _Candidate,
-        run_tail: _CandidateRun,
+        candidate: _Tier2aSpanRequest,
+        hint_fn: Callable[[int | None], int],
         *,
         budget_open: bool,
         active_ceiling: int | None,
         host_budget: int | None,
         pinned_2b_floor: int,
         in_place: int,
+        ledger_snap: tuple[int, int, int],
         protected: set[int],
     ) -> tuple[str, int | None, int | None, int, bool]:
-        if not budget_open or (active_ceiling is not None and candidate.aligned_size > active_ceiling):
+        ledger_2a, ledger_2b, ledger_bounce = ledger_snap
+        sub_align = max(candidate.sector, mmap.PAGESIZE)
+        req_size = _align_up(candidate.aligned_size, sub_align)
+        min_slab_size = _align_up(req_size + max(0, sub_align - mmap.PAGESIZE), mmap.PAGESIZE)
+        host_cap = None if (host_budget is None or host_budget == 0) else host_budget
+        overall_ceiling = (
+            host_cap
+            if active_ceiling is None
+            else (active_ceiling if host_cap is None else min(active_ceiling, host_cap))
+        )
+        can_reuse = self._tier2a.can_ever_fit_existing_slab(candidate.aligned_size, sub_align)
+        required_span = req_size if can_reuse else min_slab_size
+        if not budget_open or (overall_ceiling is not None and required_span > overall_ceiling):
             return "stop", None, None, 0, False
-        bounce_bytes, _, _ = self._active_bounce_bytes_off_lock()
-        private_bytes = self._tier2b.stats.reserved_bytes
+        bounce_bytes = max(self._active_bounce_bytes_off_lock()[0], ledger_bounce)
+        tier2a_res = self._tier2a.stats.reserved_bytes
+        tier2b_res = self._tier2b.stats.reserved_bytes
+        private_bytes = max(tier2b_res, ledger_2b)
+        extra_2a = max(0, ledger_2a - tier2a_res)
+        extra_2b = max(0, ledger_2b - tier2b_res)
         combined_ceiling, host_capped = self._apply_host_ceiling(
             active_ceiling, host_budget, private_bytes
         )
         post_evict_ceiling, _ = self._apply_host_ceiling(
-            active_ceiling, host_budget, pinned_2b_floor
+            active_ceiling, host_budget, pinned_2b_floor + extra_2b
         )
         post_evict_avail_2a = (
             None
             if post_evict_ceiling is None
-            else max(0, post_evict_ceiling - in_place - bounce_bytes)
+            else max(0, post_evict_ceiling - in_place - bounce_bytes - extra_2a)
         )
         avail_2a = (
-            None if combined_ceiling is None else max(0, combined_ceiling - in_place - bounce_bytes)
+            None
+            if combined_ceiling is None
+            else max(0, combined_ceiling - in_place - bounce_bytes - extra_2a)
         )
-        if combined_ceiling is not None and candidate.aligned_size > combined_ceiling:
-            action = "retry" if self._evict_for_tier2a_headroom(
-                candidate,
-                host_budget=host_budget,
-                host_capped=host_capped,
-                required_pinned=candidate.aligned_size,
-                evict_target_pinned=None,
-                protected=protected,
-            ) else "stop"
+        if combined_ceiling is not None and required_span > combined_ceiling:
+            action = (
+                "retry"
+                if self._evict_for_tier2a_headroom(
+                    candidate,
+                    host_budget=host_budget,
+                    host_capped=host_capped,
+                    required_pinned=required_span + extra_2a,
+                    evict_target_pinned=None,
+                    protected=protected,
+                )
+                else "stop"
+            )
             return action, avail_2a, post_evict_avail_2a, bounce_bytes, host_capped
-        if host_capped and avail_2a is not None and self._tier2a.stats.reserved_bytes == 0:
-            growth = self._plan_tier2a_slab_hint(candidate, run_tail, post_evict_avail_2a)
+        if host_capped and avail_2a is not None and tier2a_res == 0:
+            growth = hint_fn(post_evict_avail_2a)
             if avail_2a < growth and self._reserve_host_headroom_for_pinned(
-                host_budget, in_place + bounce_bytes + growth
+                host_budget, in_place + bounce_bytes + extra_2a + growth
             ):
                 return "retry", avail_2a, post_evict_avail_2a, bounce_bytes, host_capped
-        if avail_2a is not None and avail_2a < candidate.aligned_size:
+        if avail_2a is not None and avail_2a < required_span:
             assert combined_ceiling is not None
-            action = "retry" if self._evict_for_tier2a_headroom(
-                candidate,
-                host_budget=host_budget,
-                host_capped=host_capped,
-                required_pinned=in_place + bounce_bytes + candidate.aligned_size,
-                evict_target_pinned=max(0, combined_ceiling - candidate.aligned_size),
-                protected=protected,
-            ) else "stop"
+            evict_target = combined_ceiling - required_span - extra_2a
+            action = (
+                "retry"
+                if self._evict_for_tier2a_headroom(
+                    candidate,
+                    host_budget=host_budget,
+                    host_capped=host_capped,
+                    required_pinned=in_place + bounce_bytes + extra_2a + required_span,
+                    evict_target_pinned=evict_target if evict_target >= 0 else None,
+                    protected=protected,
+                )
+                else "stop"
+            )
             return action, avail_2a, post_evict_avail_2a, bounce_bytes, host_capped
         return "ready", avail_2a, post_evict_avail_2a, bounce_bytes, host_capped
 
     def _evict_for_tier2a_miss(
         self,
-        candidate: _Candidate,
-        run_tail: _CandidateRun,
+        candidate: _Tier2aSpanRequest,
+        hint_fn: Callable[[int | None], int],
         *,
         avail_2a: int | None,
         post_evict_avail_2a: int | None,
@@ -1552,7 +1857,7 @@ class PinManager:
         tier2a_reserved = 0
         if host_capped:
             tier2a_reserved = self._tier2a.stats.reserved_bytes
-            growth = self._plan_tier2a_slab_hint(candidate, run_tail, post_evict_avail_2a)
+            growth = hint_fn(post_evict_avail_2a)
             planned_2a = tier2a_reserved + growth
             if post_evict_avail_2a is not None:
                 planned_2a = min(planned_2a, post_evict_avail_2a)
@@ -1560,25 +1865,23 @@ class PinManager:
                 return True
         if self._evict_one_for_tier2a(avail_2a, protected=protected):
             return True
-        if host_capped and candidate.private_source is not None:
+        if host_capped and isinstance(candidate, _Candidate) and candidate.private_source is not None:
             self._release_private_candidate_holds([candidate])
             return self._reserve_host_headroom_for_pinned(
                 host_budget, in_place + bounce_bytes + tier2a_reserved + candidate.aligned_size
             )
         return False
 
-    def _acquire_tier2a_candidate(
+    def _allocate_tier2a_span_loop(
         self,
-        candidate: _Candidate,
+        candidate: _Tier2aSpanRequest,
+        *,
+        hint_fn: Callable[[int | None], int],
         effective_ceiling: int | None,
-        run_tail: _CandidateRun,
-        prepared_copies: list[_PreparedCopy],
         protected: set[int],
-    ) -> tuple[bool, bool]:
-        """Allocate a Tier 2a span for one checkpoint candidate; return ``(capacity_exhausted, used_fallback)``."""
-        assert candidate.source is not None
+    ) -> tuple[ArenaAllocation | None, bool, bool]:
         if effective_ceiling is not None and candidate.aligned_size > effective_ceiling:
-            return False, False
+            return None, False, False
 
         used_fallback = False
         while True:
@@ -1592,6 +1895,9 @@ class PinManager:
                     active_ceiling,
                     host_budget,
                     in_place,
+                    ledger_2a,
+                    ledger_2b,
+                    ledger_bounce,
                 ) = self._effective_candidate_ceiling_locked(effective_ceiling)
                 pinned_2b_floor = (
                     sum(_page_rounded(priv.size) for priv in self._private_copies.values() if priv.leases > 0)
@@ -1601,12 +1907,13 @@ class PinManager:
             state, avail_2a, post_evict_avail_2a, bounce_bytes, host_capped = (
                 self._prepare_tier2a_headroom(
                     candidate,
-                    run_tail,
+                    hint_fn,
                     budget_open=budget_open,
                     active_ceiling=active_ceiling,
                     host_budget=host_budget,
                     pinned_2b_floor=pinned_2b_floor,
                     in_place=in_place,
+                    ledger_snap=(ledger_2a, ledger_2b, ledger_bounce),
                     protected=protected,
                 )
             )
@@ -1615,7 +1922,7 @@ class PinManager:
             if state == "stop":
                 break
 
-            slab_hint_bytes = self._plan_tier2a_slab_hint(candidate, run_tail, avail_2a)
+            slab_hint_bytes = hint_fn(avail_2a)
             alloc, reg_failed, refused, status = self._try_alloc_tier2a_span(
                 candidate, avail_2a, slab_hint_bytes, cur_epoch, cur_host_epoch
             )
@@ -1624,19 +1931,18 @@ class PinManager:
             if status == "retry":
                 continue
             if alloc is not None:
-                self._finish_prepared_tier2a_copy(candidate, alloc, prepared_copies)
-                return False, used_fallback
-            if status == "disabled" or refused:
+                return alloc, False, used_fallback
+            if status in ("disabled", "stop") or refused:
                 break
             if reg_failed:
                 if self._evict_idle_for_runtime_retry(
                     max(mmap.PAGESIZE, candidate.aligned_size), protected=protected
                 ):
                     continue
-                return True, used_fallback
+                return None, True, used_fallback
             if not self._evict_for_tier2a_miss(
                 candidate,
-                run_tail,
+                hint_fn,
                 avail_2a=avail_2a,
                 post_evict_avail_2a=post_evict_avail_2a,
                 host_budget=host_budget,
@@ -1646,7 +1952,231 @@ class PinManager:
                 protected=protected,
             ):
                 break
-        return False, used_fallback
+        return None, False, used_fallback
+
+    def _acquire_tier2a_candidate(
+        self,
+        candidate: _Candidate,
+        effective_ceiling: int | None,
+        run_tail: _CandidateRun,
+        prepared_copies: list[_PreparedCopy],
+        protected: set[int],
+    ) -> tuple[bool, bool]:
+        """Allocate a Tier 2a span for one checkpoint candidate; return ``(capacity_exhausted, used_fallback)``."""
+        assert candidate.source is not None
+        alloc, capacity_exhausted, used_fallback = self._allocate_tier2a_span_loop(
+            candidate,
+            hint_fn=lambda max_2a: self._plan_tier2a_slab_hint(candidate, run_tail, max_2a),
+            effective_ceiling=effective_ceiling,
+            protected=protected,
+        )
+        if alloc is not None:
+            self._finish_prepared_tier2a_copy(candidate, alloc, prepared_copies)
+        return capacity_exhausted, used_fallback
+
+    def _try_evict_for_tier2b_slab(
+        self,
+        host_budget: int | None,
+        avail_2b: int | None,
+        min_slab_size: int,
+    ) -> bool:
+        if host_budget is None or avail_2b is None or min_slab_size > host_budget:
+            return False
+        target_2b = max(0, avail_2b - min_slab_size)
+        before_2b = self._tier2b.stats
+        if before_2b.reserved_bytes > target_2b:
+            self._evict_private_to_fit(target_2b)
+            after_2b = self._tier2b.stats
+            if after_2b.reserved_bytes < before_2b.reserved_bytes or after_2b.used_bytes < before_2b.used_bytes:
+                return True
+        ledger_2a, ledger_2b, ledger_bounce = self._ledger.snapshot_atomic()
+        tier2a_res = self._tier2a.stats.reserved_bytes
+        tier2b_res = self._tier2b.stats.reserved_bytes
+        raw_target_pinned = (
+            host_budget
+            - max(tier2b_res, ledger_2b)
+            - min_slab_size
+            - max(0, ledger_2a - tier2a_res)
+        )
+        if raw_target_pinned < 0:
+            return False
+        bounce_bytes = max(self._active_bounce_bytes_off_lock()[0], ledger_bounce)
+        cur_pinned = self._in_place_pinned_bytes_atomic() + tier2a_res + bounce_bytes
+        if cur_pinned <= raw_target_pinned:
+            return False
+        self._evict_idle_for_budget(raw_target_pinned, protected=set(), close_bounce_last=True)
+        after_pinned = (
+            self._in_place_pinned_bytes_atomic()
+            + self._tier2a.stats.reserved_bytes
+            + max(self._active_bounce_bytes_off_lock()[0], self._ledger.snapshot_atomic()[2])
+        )
+        return after_pinned < cur_pinned
+
+    def _reconcile_tier2b_slab_alloc(
+        self,
+        alloc: ArenaAllocation,
+        *,
+        disabled: bool,
+        epoch_changed: bool,
+        expected_epoch: int,
+        cur_host_budget: int | None,
+        cur_in_place: int,
+    ) -> tuple[ArenaAllocation | None, bool]:
+        before_total = (
+            cur_in_place
+            + self._tier2a.stats.reserved_bytes
+            + max(self._active_bounce_bytes_off_lock()[0], self._ledger.snapshot_atomic()[2])
+            + self._tier2b.stats.reserved_bytes
+        )
+        if not disabled and not epoch_changed and (cur_host_budget is None or before_total <= cur_host_budget):
+            return alloc, True
+        try:
+            alloc.release()
+        finally:
+            self._tier2b.trim_empty(0)
+        self._enforce_host_budget()
+        if disabled:
+            return None, False
+        after_total = (
+            self._in_place_pinned_bytes_atomic()
+            + self._tier2a.stats.reserved_bytes
+            + max(self._active_bounce_bytes_off_lock()[0], self._ledger.snapshot_atomic()[2])
+            + self._tier2b.stats.reserved_bytes
+        )
+        with self._lock:
+            unchanged = not epoch_changed and self._host_budget_epoch == expected_epoch
+        still_over = cur_host_budget is not None and after_total > cur_host_budget
+        return None, not (unchanged and still_over and after_total >= before_total)
+
+    def _run_tier2b_slab_attempt(
+        self,
+        nbytes: int,
+        sub_align: int,
+        aligned_size: int,
+        batch_hint: int,
+        min_slab_size: int,
+    ) -> tuple[str, ArenaAllocation | None]:
+        with self._lock:
+            while self._bounce_publishing:
+                self._bounce_cv.wait()
+            epoch = self._host_budget_epoch
+            host_budget = self._max_host_bytes
+            in_place = self._in_place_pinned_bytes
+            ledger_2a, ledger_2b, ledger_bounce = self._ledger.snapshot_locked()
+        if host_budget == 0:
+            return "stop", None
+        bounce_bytes = max(self._active_bounce_bytes_off_lock()[0], ledger_bounce)
+        tier2a_eff = max(self._tier2a.stats.reserved_bytes, ledger_2a)
+        extra_2b = max(0, ledger_2b - self._tier2b.stats.reserved_bytes)
+        avail_2b: int | None = (
+            None
+            if host_budget is None
+            else max(0, host_budget - (in_place + tier2a_eff + bounce_bytes + extra_2b))
+        )
+        hint_bytes = self._tier2b.plan_slab_bytes(
+            aligned_size, sub_align, ((aligned_size, sub_align) for _ in range(batch_hint - 1)), max_bytes=avail_2b
+        )
+        with self._lock:
+            if self._host_budget_epoch != epoch or self._bounce_publishing:
+                return "retry", None
+        alloc: ArenaAllocation | None = None
+        try:
+            try:
+                alloc = self._tier2b.allocate(
+                    nbytes, head_pad=0, alignment=sub_align, slab_hint_bytes=hint_bytes, max_bytes=avail_2b
+                )
+            finally:
+                with self._lock:
+                    disabled = self._max_host_bytes == 0
+                    epoch_changed = self._host_budget_epoch != epoch
+                    cur_host_budget = self._max_host_bytes
+                    cur_in_place = self._in_place_pinned_bytes
+                    if alloc is not None and not disabled and not epoch_changed:
+                        self._host_budget_epoch += 1
+                    post_epoch = self._host_budget_epoch
+            if alloc is not None:
+                kept, can_retry = self._reconcile_tier2b_slab_alloc(
+                    alloc,
+                    disabled=disabled,
+                    epoch_changed=epoch_changed,
+                    expected_epoch=post_epoch,
+                    cur_host_budget=cur_host_budget,
+                    cur_in_place=cur_in_place,
+                )
+                return ("ok", kept) if kept is not None else ("retry" if can_retry else "stop", None)
+        except BaseException:
+            if alloc is not None and not alloc.released:
+                try:
+                    alloc.release()
+                finally:
+                    self._tier2b.trim_empty(0)
+            raise
+        if epoch_changed:
+            self._enforce_host_budget()
+            return "retry", None
+        if self._try_evict_for_tier2b_slab(host_budget, avail_2b, min_slab_size):
+            return "retry", None
+        return "stop", None
+
+    def _allocate_tier2b_host_slab(
+        self,
+        nbytes: int,
+        sub_align: int,
+        aligned_size: int,
+        batch_hint: int,
+    ) -> ArenaAllocation | None:
+        min_slab_size = _align_up(aligned_size + max(0, sub_align - mmap.PAGESIZE), mmap.PAGESIZE)
+        while True:
+            status, kept = self._run_tier2b_slab_attempt(
+                nbytes, sub_align, aligned_size, batch_hint, min_slab_size
+            )
+            if status == "ok":
+                return kept
+            if status == "stop":
+                return None
+
+    def allocate_host_slab(
+        self,
+        nbytes: int,
+        *,
+        pinned: bool = True,
+        alignment: int = 256,
+        batch_hint: int = 1,
+    ) -> ArenaAllocation | None:
+        """Allocate a budgeted host slab span from Tier 2a (``pinned=True``) or Tier 2b.
+
+        Honors ``max_pinned_bytes`` and ``max_host_bytes``, evicting or demoting idle
+        checkpoint registrations when headroom is needed, and returns ``None`` if the
+        budget cannot accommodate the request without silent drops.
+        """
+        if isinstance(nbytes, bool) or not isinstance(nbytes, int) or nbytes <= 0:
+            raise ValueError(f"nbytes must be a positive integer, got {nbytes!r}.")
+        if (
+            isinstance(alignment, bool)
+            or not isinstance(alignment, int)
+            or alignment < 16
+            or (alignment & (alignment - 1)) != 0
+        ):
+            raise ValueError(f"alignment must be a power of two >= 16, got {alignment!r}.")
+        if isinstance(batch_hint, bool) or not isinstance(batch_hint, int) or batch_hint <= 0:
+            raise ValueError(f"batch_hint must be a positive integer, got {batch_hint!r}.")
+        sub_align = max(alignment, mmap.PAGESIZE)
+        aligned_size = _align_up(nbytes, sub_align)
+        if pinned:
+            req = _DirectSpanRequest(size=nbytes, sector=sub_align, aligned_size=aligned_size)
+            alloc, _exhausted, _fallback = self._allocate_tier2a_span_loop(
+                req,
+                hint_fn=lambda max_2a: self._tier2a.plan_slab_bytes(
+                    aligned_size,
+                    sub_align,
+                    ((aligned_size, sub_align) for _ in range(batch_hint - 1)),
+                    max_bytes=max_2a,
+                ),
+                effective_ceiling=None,
+                protected=set(),
+            )
+            return alloc
+        return self._allocate_tier2b_host_slab(nbytes, sub_align, aligned_size, batch_hint)
 
     def _fill_prepared_copies(self, prepared_copies: list[_PreparedCopy]) -> None:
         if not prepared_copies:
@@ -2151,6 +2681,7 @@ class PinManager:
 
     def _reserve_range_locked(self, pointer: int, size: int) -> None:
         self._in_place_pinned_bytes += self._page_reservation(pointer, size)
+        self._ledger.in_place_bytes = self._in_place_pinned_bytes
         self._host_budget_epoch += 1
         for page in self._boundaries(pointer, size):
             self._boundary_pages[page] = self._boundary_pages.get(page, 0) + 1
@@ -2163,6 +2694,7 @@ class PinManager:
             else:
                 del self._boundary_pages[page]
         self._in_place_pinned_bytes -= self._page_reservation(pointer, size)
+        self._ledger.in_place_bytes = self._in_place_pinned_bytes
 
     # ------------------------------------------------------------------
     # Leases and weakref owner tracking
@@ -2563,34 +3095,44 @@ class PinManager:
         in_place: int,
     ) -> ArenaAllocation | None:
         needed_2b = _page_rounded(reg.size)
+        with self._lock:
+            while self._bounce_publishing:
+                self._bounce_cv.wait()
+            if reg.retired or self._host_budget_epoch != host_epoch:
+                return None
+            ledger_2a, ledger_2b, ledger_bounce = self._ledger.snapshot_locked()
         if host_budget is not None:
-            bounce_bytes, _, _ = self._active_bounce_bytes_off_lock()
-            avail_2b = max(0, host_budget - (in_place + self._tier2a.stats.reserved_bytes + bounce_bytes))
+            bounce_bytes = max(self._active_bounce_bytes_off_lock()[0], ledger_bounce)
+            tier2a_eff = max(self._tier2a.stats.reserved_bytes, ledger_2a)
+            extra_2b = max(0, ledger_2b - self._tier2b.stats.reserved_bytes)
+            avail_2b: int | None = max(
+                0, host_budget - (in_place + tier2a_eff + bounce_bytes + extra_2b)
+            )
             if needed_2b > avail_2b or not self._evict_private_to_fit(max(0, avail_2b - needed_2b)):
                 return None
-            new_limit: int | None = avail_2b
         else:
-            new_limit = None
+            avail_2b = None
 
-        with self._lock:
-            if self._host_budget_epoch != host_epoch:
-                return None
-        self._tier2b.max_bytes = new_limit
-        with self._lock:
-            if self._host_budget_epoch != host_epoch:
-                return None
-
-        priv_alloc = self._tier2b.allocate(
-            reg.size, head_pad=0, alignment=mmap.PAGESIZE, slab_hint_bytes=needed_2b
-        )
-        if priv_alloc is None:
-            return None
+        priv_alloc: ArenaAllocation | None = None
         try:
+            with self._lock:
+                if reg.retired or self._host_budget_epoch != host_epoch or self._bounce_publishing:
+                    return None
+            priv_alloc = self._tier2b.allocate(
+                reg.size,
+                head_pad=0,
+                alignment=mmap.PAGESIZE,
+                slab_hint_bytes=needed_2b,
+                max_bytes=avail_2b,
+            )
+            if priv_alloc is None:
+                return None
             priv_alloc.as_uint8_tensor().copy_(alloc.as_uint8_tensor())
             return priv_alloc
         except BaseException:
-            priv_alloc.release()
-            self._tier2b.trim_empty(0)
+            if priv_alloc is not None and not priv_alloc.released:
+                priv_alloc.release()
+                self._tier2b.trim_empty(0)
             raise
 
     def _demote_tier2a_copy(self, reg: _Registration) -> None:
@@ -2678,7 +3220,9 @@ class PinManager:
                 self._tier2b.max_bytes = None
             else:
                 tier2a_bytes = self._tier2a.stats.reserved_bytes
-                bounce_bytes, _, _ = self._active_bounce_bytes_off_lock()
+                bounce_bytes = max(
+                    self._active_bounce_bytes_off_lock()[0], self._ledger.snapshot_atomic()[2]
+                )
                 avail_2b = max(0, host_budget - (in_place + tier2a_bytes + bounce_bytes))
                 self._tier2b.max_bytes = avail_2b
                 self._evict_private_to_fit(avail_2b)
@@ -2687,7 +3231,9 @@ class PinManager:
                         continue
                     cur_in_place = self._in_place_pinned_bytes
                 cur_tier2a = self._tier2a.stats.reserved_bytes
-                cur_bounce, _, _ = self._active_bounce_bytes_off_lock()
+                cur_bounce = max(
+                    self._active_bounce_bytes_off_lock()[0], self._ledger.snapshot_atomic()[2]
+                )
                 cur_avail = max(0, host_budget - (cur_in_place + cur_tier2a + cur_bounce))
                 if cur_avail != avail_2b:
                     self._tier2b.max_bytes = cur_avail
@@ -2729,7 +3275,9 @@ class PinManager:
         unreleasable: set[int] = set()
         progress = False
         while True:
-            bounce_bytes, _, _ = self._active_bounce_bytes_off_lock()
+            bounce_bytes = max(
+                self._active_bounce_bytes_off_lock()[0], self._ledger.snapshot_atomic()[2]
+            )
             in_place = self._in_place_pinned_bytes_atomic()
             target_2a = max(0, target_pinned - in_place - bounce_bytes)
             before_2a = self._tier2a.stats.reserved_bytes
@@ -2824,9 +3372,14 @@ class PinManager:
                 self._tier2a.max_bytes = None
             else:
                 desired_bounce = self._desired_bounce_bytes(budget) or 0
-                if budget == 0 or self._active_bounce_bytes_off_lock()[0] > desired_bounce:
+                cur_bounce = max(
+                    self._active_bounce_bytes_off_lock()[0], self._ledger.snapshot_atomic()[2]
+                )
+                if budget == 0 or cur_bounce > desired_bounce:
                     self._close_idle_bounce_ring_if_present()
-                bounce_bytes, _, _ = self._active_bounce_bytes_off_lock()
+                bounce_bytes = max(
+                    self._active_bounce_bytes_off_lock()[0], self._ledger.snapshot_atomic()[2]
+                )
                 if in_place + self._tier2a.stats.reserved_bytes + bounce_bytes > budget:
                     self._evict_idle_for_budget(budget, protected=set(), close_bounce_last=True)
                 with self._lock:
@@ -2834,7 +3387,12 @@ class PinManager:
                         continue
                     cur_in_place = self._in_place_pinned_bytes
                 self._tier2a.max_bytes = max(
-                    0, budget - cur_in_place - self._active_bounce_bytes_off_lock()[0]
+                    0,
+                    budget
+                    - cur_in_place
+                    - max(
+                        self._active_bounce_bytes_off_lock()[0], self._ledger.snapshot_atomic()[2]
+                    ),
                 )
             with self._lock:
                 if self._pin_budget_epoch == epoch:
@@ -2918,7 +3476,9 @@ class PinManager:
         if budget == 0:
             self._enforce_pin_budget()
             return
-        total_bounce = self._active_bounce_bytes_off_lock()[0]
+        total_bounce = max(
+            self._active_bounce_bytes_off_lock()[0], self._ledger.snapshot_atomic()[2]
+        )
         desired = self._desired_bounce_bytes(budget) or 0
         if (
             total_bounce > desired
@@ -2998,12 +3558,13 @@ class PinManager:
 
     def _compute_bounce_target_bytes(self) -> tuple[bool, int | None]:
         for can_evict in (True, False):
-            existing_bounce = self._active_bounce_bytes_off_lock()[0]
-            private_bytes = self._tier2b.stats.reserved_bytes
             with self._lock:
                 budget = self._max_pinned_bytes
                 host_budget = self._max_host_bytes
                 in_place = self._in_place_pinned_bytes
+                ledger_2a, ledger_2b, ledger_bounce = self._ledger.snapshot_locked()
+            existing_bounce = max(self._active_bounce_bytes_off_lock()[0], ledger_bounce)
+            private_bytes = max(self._tier2b.stats.reserved_bytes, ledger_2b)
             desired = self._desired_bounce_bytes(budget)
             desired_new = (
                 None
@@ -3016,12 +3577,14 @@ class PinManager:
             if combined_budget is None:
                 return True, desired_new
             want = DEFAULT_BOUNCE_SLOTS * self._bounce_slot_bytes if desired_new is None else desired_new
-            tier2a_reserved = self._tier2a.stats.reserved_bytes
+            tier2a_reserved = max(self._tier2a.stats.reserved_bytes, ledger_2a)
             needed_pinned = in_place + tier2a_reserved + existing_bounce + want
             if can_evict and needed_pinned > combined_budget:
                 if host_capped and self._reserve_host_headroom_for_pinned(host_budget, needed_pinned):
                     combined_budget, _ = self._apply_host_ceiling(
-                        budget, host_budget, self._tier2b.stats.reserved_bytes
+                        budget,
+                        host_budget,
+                        max(self._tier2b.stats.reserved_bytes, self._ledger.snapshot_atomic()[1]),
                     )
                 if combined_budget is not None and needed_pinned > combined_budget:
                     self._evict_idle_for_budget(
@@ -3047,6 +3610,7 @@ class PinManager:
             min_bounce_bytes=self._min_bounce_bytes,
             max_bytes=target_bytes,
             backend=self._backend,
+            allocator=self._ledger.make_allocator("bounce"),
         )
         if track_creating:
             with self._lock:
@@ -3069,9 +3633,9 @@ class PinManager:
         return ring
 
     def _publish_bounce_ring_locked(self, ring: PinnedBounceRing) -> PinnedBounceRing:
-        self._resources.creating_ring = None
         self._resources.bounce_ring = ring
         self._bounce_users += 1
+        self._resources.creating_ring = None
         self._bounce_creating = False
         self._pin_budget_epoch += 1
         self._host_budget_epoch += 1
@@ -3100,9 +3664,7 @@ class PinManager:
         cur_host_budget = self._max_host_bytes
         if cur_budget == 0 or self._bounce_bytes_config == 0:
             return "abort", None
-        if cur_budget is None and (
-            cur_host_budget is None or cur_host_budget == 0 or not self._private_copies
-        ):
+        if cur_budget is None and (cur_host_budget is None or cur_host_budget == 0):
             self._publish_bounce_ring_locked(ring)
             return "published", None
         self._bounce_publishing = True
@@ -3123,12 +3685,19 @@ class PinManager:
             try:
                 if cur_budget is not None and ring_bytes > (self._desired_bounce_bytes(cur_budget) or 0):
                     return False
-                total_bounce, _, _ = self._active_bounce_bytes_off_lock()
-                private_bytes = self._tier2b.stats.reserved_bytes
+                total_bounce = max(
+                    self._active_bounce_bytes_off_lock()[0], self._ledger.snapshot_atomic()[2]
+                )
+                private_bytes = max(
+                    self._tier2b.stats.reserved_bytes, self._ledger.snapshot_atomic()[1]
+                )
                 combined_budget, host_capped = self._apply_host_ceiling(
                     cur_budget, cur_host_budget, private_bytes
                 )
-                required = cur_in_place + self._tier2a.stats.reserved_bytes + total_bounce
+                tier2a_snap = max(
+                    self._tier2a.stats.reserved_bytes, self._ledger.snapshot_atomic()[0]
+                )
+                required = cur_in_place + tier2a_snap + total_bounce
                 if combined_budget is not None and required > combined_budget:
                     if host_capped:
                         self._release_bounce_publishing()
@@ -3171,9 +3740,11 @@ class PinManager:
             return ring if published else None
         finally:
             if not published:
-                if ring is not None:
-                    self._cleanup_failed_ring(ring, track_creating=True)
-                self._clear_bounce_creating()
+                try:
+                    if ring is not None:
+                        self._cleanup_failed_ring(ring, track_creating=True)
+                finally:
+                    self._clear_bounce_creating()
                 if touched_limit[0]:
                     self._enforce_pin_budget()
 
