@@ -7,6 +7,14 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Added VRAM-only `KvChunkPool`, `KvBatch`, and `KvPoolStats` (exported from
+  top-level `piper_offload`), occupying the descending high end of a shared
+  `Uint8DualArena` alongside aligned `TypedSidePool` side pools: batched
+  `produce(keys)` via `StreamLease.write()` with capacity-error rollback,
+  single-batch `read(keys)` with prefix-sharing slot deduplication and
+  `None -> -1` sentinels, non-blocking `discard(keys)`, `ArenaCapacityError`
+  when VRAM is exhausted (no host RAM spill or live-chunk D2D compaction),
+  and `EMPTY`-only frontier reclaim for peer low-end `ExpertSlabPool` growth.
 - Added `ExpertSlabPool`, `ExpertWave`, `ExpertPoolStats`, and `SlotSchema`
   (exported from top-level `piper_offload` alongside `Uint8DualArena` and
   `ArenaCapacityError`; descriptor/layout types `ArenaFieldSpec`, `SideFieldSpec`,

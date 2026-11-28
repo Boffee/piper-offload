@@ -16,6 +16,9 @@ from piper_offload import (
     ExpertPoolStats,
     ExpertSlabPool,
     ExpertWave,
+    KvBatch,
+    KvChunkPool,
+    KvPoolStats,
     ModelCache,
     ModelOffloader,
     ModelSpec,
@@ -128,7 +131,7 @@ def _make_fake_stream_types():
 
 
 def test_top_level_exports_expose_user_coordination_types_only() -> None:
-    _ = (ExpertPoolStats, ExpertSlabPool, ExpertWave)
+    _ = (ExpertPoolStats, ExpertSlabPool, ExpertWave, KvBatch, KvChunkPool, KvPoolStats)
     top_all = set(piper_offload.__all__)
     assert {
         "ArenaCapacityError",
@@ -136,6 +139,9 @@ def test_top_level_exports_expose_user_coordination_types_only() -> None:
         "ExpertPoolStats",
         "ExpertSlabPool",
         "ExpertWave",
+        "KvBatch",
+        "KvChunkPool",
+        "KvPoolStats",
         "SlotSchema",
         "Uint8DualArena",
         "VramBudget",
