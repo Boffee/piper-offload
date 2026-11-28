@@ -215,6 +215,69 @@ and [`Uint8DualArena`](../src/piper_offload/dual_arena.py):
   idle or colder slots when possible, or otherwise evicts unleased frontier
   slots without disturbing active wave readers.
 
+## Stream frozen KV chunks
+
+[`KvChunkPool`](../src/piper_offload/kv_chunk_pool.py) manages frozen immutable
+KV/state chunks on the descending high end of a
+[`Uint8DualArena`](../src/piper_offload/dual_arena.py) alongside dedicated
+`TypedSidePool` metadata allocations described by a format-agnostic
+`SlotSchema` (typically derived once from `piper_kernels.kv_chunk_storage_specs`
+without `piper-offload` importing `piper_kernels`):
+
+- **Invariant views for `torch.compile(fullgraph=True)`:** The pool allocates
+  its `TypedSidePool` tensors and persistent `uint8` `arena_views` / `side_views`
+  / `slot_offsets` up front at initialization. Wrap them once with
+  `PiperKVChunkPool.from_tensors(**pool.arena_views, **pool.side_views)` and
+  pass the request-ordered `int32` `batch.slot_ids` yielded by `produce()` or
+  `waves()` into kernels such as `freeze_kv_chunks_` and
+  `piper_attention_decode` without recompilation as chunks spill, reload, or
+  relocate.
+- **Batched GPU-born freezing (`produce`):** `with pool.produce(keys):`
+  acquires high slots with `StreamLease.produce` ordering on the active compute
+  stream, commits every key in the batch on normal exit (`return` and `break`
+  commit — initialize all slots before leaving normally, or raise an exception
+  to abort and roll back freed slots and keys atomically), and triggers
+  optional `spill_watermark` write-once async D2H spills after commit. Because
+  watermark spills run after commit, an error during watermark spillover leaves
+  the batch keys committed; inspect `contains()` before retrying rather than
+  re-producing the same keys.
+- **Wave reading, branching & compaction (`waves`):** `with pool.waves(keys,
+  max_wave_slots=..., allow_split=..., record_stats=...):` deduplicates unique
+  keys so branched conversations sharing prefix chunks map to the same slot
+  without duplicating GPU or host slabs, maps `None` sentinels to `-1` (skipped
+  by attention kernels), runs hit waves first (`is_hit_wave=True`), streams
+  arbitrary `>> VRAM` context lengths across waves with `allow_split=True` (for
+  online LSE merging with `merge_attention_lse`, where `max_wave_slots` caps how
+  many host-resident miss chunks are staged per reload wave while all-hit GPU
+  chunks yield together in the initial hit wave without re-staging), and
+  supports single-pass compaction reads with `allow_split=False` (raising `ArenaCapacityError` if the
+  request exceeds `max_slots`). Pass `record_stats=False` to inspect or read
+  without updating statistics counters (`hits`, `misses`, `reloads`,
+  `waves_executed`) or LRU recency (`waves_executed` otherwise increments once
+  per yielded wave), and treat yielded wave tensors as read-only on the stream
+  active when entering each wave.
+- **Write-once host spill & TP-safe exhaustion:** Each chunk spills at most once
+  to host RAM (`PinManager.allocate_host_slab` — CUDA tries Tier 2a pinned slabs
+  with async `non_blocking=True` copies first and falls back to Tier 2b
+  pageable slabs with synchronous copies when Tier 2a is full, never disk) via
+  `spill()`, watermark spillover, `evict_to_host()`, or pressure-induced
+  eviction. Reloading a spilled chunk via `prefetch()` or `waves()` retains its
+  immutable host slab so subsequent evictions never re-spill (clean GPU slot ->
+  host-only). Because ranks in tensor-parallel runs must never silently drop
+  divergent KV caches, explicit `spill()` and `evict_to_host()` stop cleanly
+  and return the count processed (possibly `0`) when `PinManager` or
+  `max_host_bytes` (measured in page-rounded host slab span bytes) is full,
+  while slot-demanding operations (`produce()`, `waves(..., allow_split=False)`,
+  or forced dirty eviction) raise `ArenaCapacityError` until `discard()` retires
+  stale or compacted keys (using non-blocking async retirement for in-flight
+  D2H/H2D transfers). Both exhaustion counts and `ArenaCapacityError` exceptions
+  are rank-local: tensor-parallel callers issuing collectives per wave must
+  coordinate wave schedules and failure recovery across ranks.
+- **Dual-end coordination:** When sharing a `Uint8DualArena` and `VramBudget`
+  with `ExpertSlabPool`, low-end growth triggers `_reclaim_high_frontier`
+  outside the arena lock to relocate edge chunks to higher free slots or
+  evict/spill unleased edge slots cleanly without corrupting active waves.
+
 ## Yield to collectives
 
 Weight copies and transfers of the `piper_relay` process group and CUDA

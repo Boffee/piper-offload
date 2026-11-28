@@ -1479,5 +1479,38 @@ class TestHostArenaFinalReviewRegressions:
                 torch.cuda.synchronize()
             torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
 
+    def test_host_arena_default_max_bytes_rechecked_at_commit_when_lowered(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        backend = _FakeBackend()
+        arena = HostSlabArena(slab_bytes=2 * PAGE, pinned=True, backend=backend, max_bytes=4 * PAGE)
+        a1 = arena.allocate(PAGE)
+        assert a1 is not None
+        assert arena.stats.reserved_bytes == 2 * PAGE
+
+        orig_reg_alloc = host_arena_mod._RegisteredRegion.allocate
+        lowered = False
+
+        def lower_before_commit(cls, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+            nonlocal lowered
+            res = orig_reg_alloc(*args, **kwargs)
+            if not lowered:
+                lowered = True
+                arena.max_bytes = 2 * PAGE
+            return res
+
+        monkeypatch.setattr(
+            host_arena_mod._RegisteredRegion, "allocate", classmethod(lower_before_commit)
+        )
+        try:
+            a2 = arena.allocate(2 * PAGE)
+            assert lowered
+            assert a2 is None
+            assert arena.stats.reserved_bytes == 2 * PAGE
+        finally:
+            monkeypatch.undo()
+            a1.release()
+            arena.close()
+            assert backend.registered == {}
 
 

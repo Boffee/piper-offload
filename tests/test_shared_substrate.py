@@ -1,7 +1,9 @@
 """Layer 1 shared substrate contracts: lease ordering, transfers, budget, dual arena, and specs."""
 
 import contextlib
+import mmap
 import threading
+import time
 from dataclasses import dataclass
 from typing import cast
 
@@ -16,10 +18,15 @@ from piper_offload import (
     ExpertPoolStats,
     ExpertSlabPool,
     ExpertWave,
+    KvBatch,
+    KvChunkLocation,
+    KvChunkPool,
+    KvPoolStats,
     ModelCache,
     ModelOffloader,
     ModelSpec,
     OffloadConfig,
+    PinManager,
     SlotSchema,
     Uint8DualArena,
     VramBudget,
@@ -28,12 +35,14 @@ from piper_offload import (
 )
 from piper_offload.dual_arena import (
     ArenaFieldSpec,
+    HighSlotLayout,
     KvMetadataPool,
     LowSlotLayout,
     SideFieldSpec,
     StructuredSidePool,
     TypedSidePool,
 )
+from piper_offload.host_arena import PinnedBounceRing
 from piper_offload.stream_lease import StreamLease
 from piper_offload.tensor_adapters import (
     ArenaBindableTensorAdapter,
@@ -129,7 +138,7 @@ def _make_fake_stream_types():
 
 
 def test_top_level_exports_expose_user_coordination_types_only() -> None:
-    _ = (ExpertPoolStats, ExpertSlabPool, ExpertWave)
+    _ = (ExpertPoolStats, ExpertSlabPool, ExpertWave, KvBatch, KvChunkLocation, KvChunkPool, KvPoolStats)
     top_all = set(piper_offload.__all__)
     assert {
         "ArenaCapacityError",
@@ -137,6 +146,10 @@ def test_top_level_exports_expose_user_coordination_types_only() -> None:
         "ExpertPoolStats",
         "ExpertSlabPool",
         "ExpertWave",
+        "KvBatch",
+        "KvChunkLocation",
+        "KvChunkPool",
+        "KvPoolStats",
         "SlotSchema",
         "Uint8DualArena",
         "VramBudget",
@@ -1938,3 +1951,1179 @@ def test_regular_adapter_bind_gpu_rejects_misaligned_and_wrong_index_cuda_buffer
 
     with pytest.raises(ValueError, match="incompatible buffer"):
         adapter.bind_gpu(host, _WrongIndexAllocator(), torch.device("cuda", 1))
+
+
+def test_stream_lease_produce_and_poll_d2h(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _PollEvent:
+        def __init__(self) -> None:
+            self.done = True
+
+        def query(self) -> bool:
+            return self.done
+
+        def synchronize(self) -> None:
+            self.done = True
+
+    class _PollStream:
+        def __init__(self) -> None:
+            self.events: list[_PollEvent] = []
+            self.waited_events: list[_PollEvent] = []
+            self.waited_streams: list[object] = []
+
+        def wait_event(self, event: _PollEvent) -> None:
+            self.waited_events.append(event)
+
+        def wait_stream(self, stream: object) -> None:
+            self.waited_streams.append(stream)
+
+        def record_event(self) -> _PollEvent:
+            ev = _PollEvent()
+            self.events.append(ev)
+            return ev
+
+        def synchronize(self) -> None:
+            for ev in self.events:
+                ev.done = True
+
+    alloc_stream = _PollStream()
+    compute_stream = _PollStream()
+    d2h_stream = _PollStream()
+    lease = StreamLease(cast(torch.cuda.Stream, alloc_stream))
+    monkeypatch.setattr(torch.cuda, "stream", lambda _s: contextlib.nullcontext())
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with lease.produce(cast(torch.cuda.Stream, compute_stream)):
+            raise RuntimeError("boom")
+    assert not lease.is_dirty
+    assert not lease.is_staged
+
+    with lease.produce(cast(torch.cuda.Stream, compute_stream)):
+        assert not lease.is_staged
+    assert lease.is_dirty
+    assert lease.is_staged
+    assert compute_stream.waited_streams == [alloc_stream]
+
+    lease.spill_to_host(lambda: None, cast(torch.cuda.Stream, d2h_stream))
+    d2h_ev = d2h_stream.events[-1]
+    d2h_ev.done = False
+    assert lease.d2h_in_flight
+    assert not lease.poll_d2h()
+    assert lease.is_dirty
+
+    d2h_ev.done = True
+    assert lease.poll_d2h()
+    assert not lease.d2h_in_flight
+    assert not lease.is_dirty
+    assert lease.poll_d2h()
+
+
+@CUDA
+def test_stream_lease_produce_and_poll_d2h_cuda() -> None:
+    device = torch.device("cuda")
+    compute_stream = torch.cuda.Stream(device=device)
+    d2h_stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(compute_stream):
+        gpu_buf = torch.empty((1024,), dtype=torch.float32, device=device)
+    host_buf = torch.empty((1024,), dtype=torch.float32, pin_memory=True)
+    lease = StreamLease(compute_stream)
+
+    with lease.produce(compute_stream):
+        gpu_buf.fill_(4.25)
+    assert lease.is_dirty
+    lease.spill_to_host(lambda: host_buf.copy_(gpu_buf, non_blocking=True), d2h_stream)
+    deadline = time.monotonic() + 10.0
+    while not lease.poll_d2h():
+        assert time.monotonic() < deadline
+        d2h_stream.query()
+        time.sleep(0.001)
+    assert not lease.is_dirty
+    torch.testing.assert_close(host_buf, torch.full((1024,), 4.25))
+
+
+def test_symmetric_high_slots_limits_views_and_release_owner() -> None:
+    with pytest.raises(ValueError, match="requires slot_bytes"):
+        Uint8DualArena(2048, device="cpu", high_max_slots=2)
+    with pytest.raises(ArenaCapacityError):
+        Uint8DualArena(2048, device="cpu", slot_bytes=768, high_max_slots=3, alignment=256)
+
+    arena = Uint8DualArena(2048, device="cpu", alignment=256)
+    try:
+        arena.configure_high_slots(512, max_slots=3)
+        assert isinstance(arena.slot_layout, HighSlotLayout)
+        assert arena.slot_layout.max_slots == 3
+        s2 = arena.alloc_high_slot(min_slot_id=2)
+        assert s2 == 2
+        with pytest.raises(ArenaCapacityError):
+            arena.alloc_high_slot(min_slot_id=2, allow_reclaim=False)
+        arena.free_high_slot(s2)
+
+        cb = lambda _need: None  # noqa: E731
+        arena.set_high_reclaimer(cb)
+        arena._release_high_owner(cb, reset_expected=arena.slot_layout)
+        assert arena.slot_layout is None
+    finally:
+        arena.close()
+
+    with Uint8DualArena(2048, device="cpu", slot_bytes=512, high_max_slots=3, alignment=256) as a2:
+        view = a2.high_pool_view((128,), field_offset=256)
+        assert tuple(view.shape) == (3, 128)
+        assert view.stride(0) == 512
+        sid = a2.alloc_high_slot()
+        view[sid].fill_(7)
+        assert int(a2.high_slot_tensor(sid)[256:384].min().item()) == 7
+        with pytest.raises(ValueError, match="multiple of 16"):
+            a2.high_pool_view((16,), field_offset=8)
+
+
+class _SimpleSlabBackend:
+    def __init__(self) -> None:
+        self.registered: dict[int, int] = {}
+
+    def register(self, pointer: int, size: int) -> bool:
+        self.registered[pointer] = size
+        return True
+
+    def unregister(self, pointer: int) -> None:
+        self.registered.pop(pointer, None)
+
+
+def test_pin_manager_allocate_host_slab_validation_and_tier2a() -> None:
+    page = mmap.PAGESIZE
+    pm = PinManager(2 * page, max_host_bytes=4 * page, backend=_SimpleSlabBackend())
+    try:
+        for kwargs, match in (
+            ({"nbytes": 0}, "positive integer"),
+            ({"nbytes": True}, "positive integer"),
+            ({"nbytes": 64, "alignment": 8}, "power of two >= 16"),
+            ({"nbytes": 64, "batch_hint": 0}, "positive integer"),
+        ):
+            with pytest.raises(ValueError, match=match):
+                pm.allocate_host_slab(**kwargs)  # type: ignore[arg-type]
+
+        a1 = pm.allocate_host_slab(page, pinned=True)
+        a2 = pm.allocate_host_slab(page, pinned=True)
+        assert a1 is not None and a2 is not None
+        assert a1.is_pinned and a2.is_pinned
+        assert pm.allocate_host_slab(page, pinned=True) is None
+
+        a1.release()
+        a3 = pm.allocate_host_slab(page, pinned=True)
+        assert a3 is not None
+        a2.release()
+        a3.release()
+    finally:
+        pm.clear()
+
+
+def test_pin_manager_allocate_host_slab_tier2b_ceiling_holes_and_clear() -> None:
+    page = mmap.PAGESIZE
+    backend = _SimpleSlabBackend()
+    pm = PinManager(2 * page, max_host_bytes=4 * page, backend=backend)
+    try:
+        # Hold two Tier 2a slabs, then fill remaining Tier 2b capacity with two pageable slabs.
+        p1 = pm.allocate_host_slab(page, pinned=True)
+        p2 = pm.allocate_host_slab(page, pinned=True)
+        b1 = pm.allocate_host_slab(page, pinned=False)
+        b2 = pm.allocate_host_slab(page, pinned=False)
+        assert p1 is not None and p2 is not None and b1 is not None and b2 is not None
+        assert not b1.is_pinned and not b2.is_pinned
+
+        # Full-live Tier 2b returns None cleanly without looping; freeing one reuses its hole.
+        assert pm.allocate_host_slab(page, pinned=False) is None
+        b1.release()
+        b3 = pm.allocate_host_slab(page, pinned=False)
+        assert b3 is not None
+
+        # Clear while allocations remain live keeps returned views writable until release().
+        pm.clear()
+        b3.as_uint8_tensor().fill_(5)
+        assert int(b3.as_uint8_tensor()[0].item()) == 5
+        p1.release()
+        p2.release()
+        b2.release()
+        b3.release()
+    finally:
+        pm.clear()
+
+
+def test_pin_manager_allocate_host_slab_evicts_idle_weights_for_budget() -> None:
+    page = mmap.PAGESIZE
+    buf = mmap.mmap(-1, page)
+    idle: torch.Tensor | None = torch.frombuffer(buf, dtype=torch.uint8)
+    lease = None
+    pm = PinManager(2 * page, max_host_bytes=2 * page, backend=_SimpleSlabBackend())
+    try:
+        assert idle is not None
+        lease = pm.acquire([idle], pin=True)
+        lease.close()
+        lease = None
+        assert pm.stats.pinned_bytes == page
+        assert pm.stats.idle_registrations == 1
+
+        slab = pm.allocate_host_slab(2 * page, pinned=True)
+        assert slab is not None
+        assert pm.stats.idle_registrations == 0
+        slab.release()
+    finally:
+        pm.clear()
+        idle = None
+        buf.close()
+
+
+def test_stream_lease_write_guard_rejects_overlapping_operations(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _GuardStream:
+        def wait_event(self, _event: object) -> None:
+            pass
+
+        def wait_stream(self, _stream: object) -> None:
+            pass
+
+        def record_event(self) -> object:
+            return type("_Ev", (), {"query": lambda _s: True, "synchronize": lambda _s: None})()
+
+    monkeypatch.setattr(torch.cuda, "stream", lambda _s: contextlib.nullcontext())
+    s = cast(torch.cuda.Stream, _GuardStream())
+    lease = StreamLease(s)
+
+    with lease.produce(s):
+        with pytest.raises(RuntimeError, match="while a write is active"):
+            with lease.produce(s):
+                pass
+        with pytest.raises(RuntimeError, match="while a write is active"):
+            lease.acquire(s)
+        with pytest.raises(RuntimeError, match="while a write is active"):
+            lease.spill_to_host(lambda: None, s)
+        with pytest.raises(RuntimeError, match="while a write is active"):
+            lease.discard_dirty()
+        with pytest.raises(RuntimeError, match="while a write is active"):
+            lease.synchronize_and_reset()
+
+    assert lease.is_dirty
+    lease.acquire(s)
+    lease.release(s)
+    lease.discard_dirty()
+    assert not lease.is_dirty
+
+
+def test_dual_arena_rejects_external_reconfigure_while_pool_attached() -> None:
+    schema = SlotSchema({"k": 256})
+    with Uint8DualArena(4096, device="cpu", alignment=256) as arena:
+        kv = KvChunkPool(arena, schema, max_slots=2)
+        exp = ExpertSlabPool(arena, SlotSchema({"up": 256}), max_slots=2)
+        assert arena.active_high_slots == ()
+        assert arena.active_low_slots == ()
+        arena.set_high_reclaimer(None)
+        arena.set_low_reclaimer(None)
+        with pytest.raises(RuntimeError):
+            arena.configure_high_slots(schema.drawer_bytes)
+        with pytest.raises(RuntimeError):
+            arena.configure_low_slots(256)
+        kv.close()
+        exp.close()
+        arena.configure_high_slots(schema.drawer_bytes, max_slots=1)
+        arena.configure_low_slots(256, max_slots=1)
+
+
+def test_pin_manager_allocate_host_slab_ceilings_and_alignment_eviction() -> None:
+    page = mmap.PAGESIZE
+    # Clamping max_pinned_bytes to max_host_bytes when max_host_bytes > 0.
+    pm_clamp = PinManager(4 * page, max_host_bytes=page, backend=_SimpleSlabBackend())
+    try:
+        assert pm_clamp.allocate_host_slab(2 * page, pinned=True) is None
+        s1 = pm_clamp.allocate_host_slab(page, pinned=True)
+        assert s1 is not None
+        s1.release()
+    finally:
+        pm_clamp.clear()
+
+    # max_host_bytes=0 disables Tier 2b/host fallback while keeping Tier 2a pinned slabs active.
+    pm_zero = PinManager(2 * page, max_host_bytes=0, backend=_SimpleSlabBackend())
+    try:
+        s_pin = pm_zero.allocate_host_slab(2 * page, pinned=True)
+        assert s_pin is not None
+        assert pm_zero.allocate_host_slab(page, pinned=False) is None
+        s_pin.release()
+    finally:
+        pm_zero.clear()
+
+    # Alignment pushes min_slab_size past free host_budget; impossible Tier 2b requests do not evict idle weights.
+    buf = mmap.mmap(-1, 2 * page)
+    idle: torch.Tensor | None = torch.frombuffer(buf, dtype=torch.uint8)
+    pm_align = PinManager(2 * page, max_host_bytes=3 * page, backend=_SimpleSlabBackend())
+    try:
+        assert idle is not None
+        lease = pm_align.acquire([idle], pin=True)
+        lease.close()
+        assert pm_align.allocate_host_slab(4 * page, pinned=False) is None
+        assert pm_align.stats.idle_registrations == 1
+        aligned = pm_align.allocate_host_slab(page, pinned=False, alignment=2 * page)
+        assert aligned is not None
+        assert pm_align.stats.idle_registrations == 0
+        aligned.release()
+    finally:
+        pm_align.clear()
+        idle = None
+        buf.close()
+
+
+def test_pin_manager_inflight_reservation_blocks_overcommit_without_spinning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import piper_offload._host_memory as host_memory_mod
+
+    page = mmap.PAGESIZE
+    pm = PinManager(4 * page, max_host_bytes=2 * page, backend=_SimpleSlabBackend())
+    buf = mmap.mmap(-1, page)
+    w_page = torch.frombuffer(buf, dtype=torch.uint8)
+    entered, proceed = threading.Barrier(2), threading.Barrier(2)
+    orig_alloc_region = host_memory_mod.allocate_aligned_region
+    result: list[object] = []
+    result_t2: list[object] = []
+    worker = threading.Thread(target=lambda: result.append(pm.allocate_host_slab(page, pinned=True)))
+    t2 = threading.Thread(target=lambda: result_t2.append(pm.allocate_host_slab(page, pinned=True)))
+
+    def gated_alloc_region(size: int) -> object:
+        if threading.current_thread() is worker:
+            entered.wait(timeout=5.0)
+            proceed.wait(timeout=5.0)
+        return orig_alloc_region(size)
+
+    monkeypatch.setattr(host_memory_mod, "allocate_aligned_region", gated_alloc_region)
+    b1 = None
+    try:
+        worker.start()
+        entered.wait(timeout=5.0)
+        assert pm._ledger.snapshot_atomic()[0] == page
+        b1 = pm.allocate_host_slab(page, pinned=False)
+        assert b1 is not None and pm.allocate_host_slab(page, pinned=False) is None
+        with pm.acquire([w_page], pin=True) as w_lease:
+            assert (
+                w_lease.registered_bytes == 0
+                and w_lease.pageable_bytes == page
+                and pm.stats.registrations == 0
+            )
+        t2.start()
+        proceed.wait(timeout=5.0)
+        worker.join(timeout=5.0)
+        t2.join(timeout=5.0)
+        assert not worker.is_alive() and not t2.is_alive()
+        assert result and result[0] is not None and getattr(result[0], "is_pinned", False)
+        assert result_t2 == [None]
+        t2a, t2b, bounce = pm._ledger.snapshot_atomic()
+        assert pm._ledger.in_place_bytes + t2a + t2b + bounce <= 2 * page
+    finally:
+        entered.abort()
+        proceed.abort()
+        monkeypatch.undo()
+        for thr in (worker, t2):
+            if thr.is_alive():
+                thr.join(timeout=2.0)
+        for alloc in (b1, *result[:1], *result_t2[:1]):
+            if alloc is not None:
+                alloc.release()  # type: ignore[attr-defined]
+        pm.clear()
+        del w_page
+        buf.close()
+
+
+def test_pin_manager_concurrent_tier2a_host_epoch_rollback_under_host_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = mmap.PAGESIZE
+    pm = PinManager(4 * page, max_host_bytes=3 * page, backend=_SimpleSlabBackend())
+    buf = mmap.mmap(-1, page)
+    w_page: torch.Tensor | None = torch.frombuffer(buf, dtype=torch.uint8)
+    entered, proceed = threading.Barrier(2), threading.Barrier(2)
+    orig_alloc = pm._tier2a.allocate
+    result: list[object] = []
+    worker = threading.Thread(target=lambda: result.append(pm.allocate_host_slab(page, pinned=True)))
+
+    def gated_alloc(*args: object, **kwargs: object) -> object:
+        if threading.current_thread() is worker:
+            entered.wait(timeout=5.0)
+            proceed.wait(timeout=5.0)
+        return orig_alloc(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pm._tier2a, "allocate", gated_alloc)
+    b1 = None
+    lease = None
+    try:
+        worker.start()
+        entered.wait(timeout=5.0)
+        b1 = pm.allocate_host_slab(page, pinned=False)
+        assert b1 is not None
+        assert w_page is not None
+        lease = pm.acquire([w_page], pin=True)
+        assert pm.stats.pinned_bytes == page
+        pm.max_host_bytes = 2 * page
+        proceed.wait(timeout=5.0)
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+        assert result == [None]
+        assert pm._tier2a.stats.reserved_bytes == 0
+    finally:
+        entered.abort()
+        proceed.abort()
+        if worker.is_alive():
+            worker.join(timeout=2.0)
+        if lease is not None:
+            lease.close()
+        if b1 is not None:
+            b1.release()
+        pm.clear()
+        w_page = None
+        buf.close()
+
+
+def test_pin_manager_budget_reduction_below_live_slab_does_not_spin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = mmap.PAGESIZE
+    for pinned in (True, False):
+        pm = PinManager(4 * page, max_host_bytes=4 * page, backend=_SimpleSlabBackend())
+        slab = pm.allocate_host_slab(page, pinned=pinned, batch_hint=4)
+        assert slab is not None
+        arena = pm._tier2a if pinned else pm._tier2b
+        calls = 0
+        orig_alloc = arena.allocate
+
+        def counted_alloc(
+            *args: object, _orig: object = orig_alloc, **kwargs: object
+        ) -> object:
+            nonlocal calls
+            calls += 1
+            return _orig(*args, **kwargs)  # type: ignore[operator]
+
+        monkeypatch.setattr(arena, "allocate", counted_alloc)
+        try:
+            pm.max_host_bytes = 2 * page
+            assert pm.allocate_host_slab(page, pinned=pinned) is None
+            assert calls <= 3
+        finally:
+            slab.release()
+            pm.clear()
+
+
+def test_pin_manager_tier2b_impossible_evict_epoch_snapshot_and_max_bytes_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = mmap.PAGESIZE
+    # 1) Non-evictable Tier 2b leaves raw_target_pinned < 0 -> must not evict idle pinned weight.
+    buf = mmap.mmap(-1, page)
+    idle: torch.Tensor | None = torch.frombuffer(buf, dtype=torch.uint8)
+    pm1 = PinManager(2 * page, max_host_bytes=3 * page, backend=_SimpleSlabBackend())
+    b_live = None
+    try:
+        assert idle is not None
+        lease = pm1.acquire([idle], pin=True)
+        lease.close()
+        b_live = pm1.allocate_host_slab(2 * page, pinned=False)
+        assert b_live is not None
+        assert pm1.allocate_host_slab(2 * page, pinned=False) is None
+        assert pm1.stats.idle_registrations == 1
+    finally:
+        if b_live is not None:
+            b_live.release()
+        pm1.clear()
+        idle = None
+        buf.close()
+
+    # 2) Concurrent 2-page and 1-page Tier 2a slabs under 3-page cap succeed without max_bytes clobbering.
+    pm2 = PinManager(3 * page, max_host_bytes=3 * page, backend=_SimpleSlabBackend())
+    entered, proceed = threading.Barrier(2), threading.Barrier(2)
+    res_t1: list[object] = []
+    orig_2a_alloc = pm2._tier2a.allocate
+    t1 = threading.Thread(
+        target=lambda: res_t1.append(pm2.allocate_host_slab(2 * page, pinned=True))
+    )
+
+    def gated_2a(*args: object, **kwargs: object) -> object:
+        if threading.current_thread() is t1:
+            entered.wait(timeout=5.0)
+            proceed.wait(timeout=5.0)
+        return orig_2a_alloc(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pm2._tier2a, "allocate", gated_2a)
+    s2 = None
+    try:
+        t1.start()
+        entered.wait(timeout=5.0)
+        s2 = pm2.allocate_host_slab(page, pinned=True)
+        assert s2 is not None
+        proceed.wait(timeout=5.0)
+        t1.join(timeout=5.0)
+        assert len(res_t1) == 1 and res_t1[0] is not None
+        res_t1[0].release()  # type: ignore[attr-defined]
+    finally:
+        entered.abort()
+        proceed.abort()
+        if s2 is not None:
+            s2.release()
+        pm2.clear()
+
+
+def test_pin_manager_tier2b_epoch_snapshot_prevents_peak_host_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = mmap.PAGESIZE
+    pm = PinManager(page, max_host_bytes=page, backend=_SimpleSlabBackend())
+    entered, proceed = threading.Barrier(2), threading.Barrier(2)
+    orig_bounce = pm._active_bounce_bytes_off_lock
+    orig_2b_alloc = pm._tier2b.allocate
+    max_bytes_seen: list[object] = []
+    peak_total = 0
+    res_2b: list[object] = []
+    t_2b = threading.Thread(target=lambda: res_2b.append(pm.allocate_host_slab(page, pinned=False)))
+
+    gate_once = True
+
+    def gated_bounce() -> tuple[int, int, int]:
+        nonlocal gate_once
+        out = orig_bounce()
+        if gate_once and threading.current_thread() is t_2b:
+            gate_once = False
+            entered.wait(timeout=5.0)
+            proceed.wait(timeout=5.0)
+        return out
+
+    def spy_2b_alloc(*args: object, **kwargs: object) -> object:
+        nonlocal peak_total
+        max_bytes_seen.append(kwargs.get("max_bytes"))
+        out = orig_2b_alloc(*args, **kwargs)  # type: ignore[arg-type]
+        peak_total = max(peak_total, pm._tier2a.stats.reserved_bytes + pm._tier2b.stats.reserved_bytes)
+        return out
+
+    monkeypatch.setattr(pm, "_active_bounce_bytes_off_lock", gated_bounce)
+    monkeypatch.setattr(pm._tier2b, "allocate", spy_2b_alloc)
+    p1 = None
+    try:
+        t_2b.start()
+        entered.wait(timeout=5.0)
+        p1 = pm.allocate_host_slab(page, pinned=True)
+        assert p1 is not None
+        proceed.wait(timeout=5.0)
+        t_2b.join(timeout=5.0)
+        assert res_2b == [None]
+        assert max_bytes_seen == [0]
+        assert peak_total <= page
+    finally:
+        entered.abort()
+        proceed.abort()
+        if p1 is not None:
+            p1.release()
+        pm.clear()
+
+
+def test_pin_manager_bounce_publish_respects_max_host_bytes_without_max_pinned() -> None:
+    pm = PinManager(
+        None,
+        max_host_bytes=128 * 1024,
+        bounce_bytes=128 * 1024,
+        bounce_slot_bytes=64 * 1024,
+        min_bounce_bytes=64 * 1024,
+        backend=_SimpleSlabBackend(),
+    )
+    slab_small = pm.allocate_host_slab(64 * 1024, pinned=False)
+    assert slab_small is not None
+    try:
+        with pm._use_bounce_ring() as ring:
+            assert ring is not None
+            assert pm.stats.bounce_bytes == 64 * 1024
+            assert pm._tier2b.stats.reserved_bytes + pm.stats.bounce_bytes <= 128 * 1024
+    finally:
+        slab_small.release()
+        pm.clear()
+
+    slab_full = pm.allocate_host_slab(128 * 1024, pinned=False)
+    assert slab_full is not None
+    try:
+        with pm._use_bounce_ring() as ring2:
+            assert ring2 is None
+        assert pm.stats.bounce_bytes == 0
+    finally:
+        slab_full.release()
+        pm.clear()
+
+
+class _SubstrateTestInterrupt(BaseException):
+    pass
+
+
+@CUDA
+def test_stream_lease_produce_interrupt_after_yield_retains_writer_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda")
+    alloc_stream = torch.cuda.Stream(device=device)
+    produce_stream = torch.cuda.Stream(device=device)
+    reader_stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(alloc_stream):
+        gpu_buf = torch.zeros((256,), dtype=torch.float32, device=device)
+    reader_buf = torch.empty_like(gpu_buf)
+    lease = StreamLease(alloc_stream)
+
+    # Part A: interrupt after yield while _record_ready_event runs normally.
+    with pytest.raises(_SubstrateTestInterrupt, match="abort produce"), lease.produce(produce_stream):
+        torch.cuda._sleep(25_000_000)
+        gpu_buf.fill_(9.5)
+        raise _SubstrateTestInterrupt("abort produce")
+    assert not lease._writing and not lease.is_dirty and not lease.is_staged
+    assert lease._ready_event is not None
+    lease.stage_with(lambda: reader_buf.copy_(gpu_buf), reader_stream)
+    reader_stream.synchronize()
+    torch.testing.assert_close(reader_buf.cpu(), torch.full((256,), 9.5))
+
+    # Part B: interrupt inside _record_ready_event retains produce_stream in _recorded_streams.
+    orig_record_ready = lease._record_ready_event
+    monkeypatch.setattr(
+        lease,
+        "_record_ready_event",
+        lambda *_a, **_kw: (_ for _ in ()).throw(_SubstrateTestInterrupt("abort ready")),
+    )
+    with pytest.raises(_SubstrateTestInterrupt, match="abort ready"), lease.produce(produce_stream):
+        torch.cuda._sleep(25_000_000)
+        gpu_buf.fill_(11.25)
+    assert not lease._writing and produce_stream in lease._recorded_streams
+    with pytest.raises(_SubstrateTestInterrupt, match="abort ready"):
+        lease.stage_with(lambda: None, produce_stream)
+    assert not lease._writing and produce_stream in lease._recorded_streams
+    monkeypatch.setattr(lease, "_record_ready_event", orig_record_ready)
+    lease.stage_with(lambda: reader_buf.copy_(gpu_buf), reader_stream)
+    reader_stream.synchronize()
+    torch.testing.assert_close(reader_buf.cpu(), torch.full((256,), 11.25))
+
+
+def _exercise_bounce_pause_window(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    max_host_pages: int,
+    pause_after: bool,
+) -> None:
+    import piper_offload._host_memory as host_memory_mod
+
+    page = mmap.PAGESIZE
+    pm = PinManager(
+        max_host_pages * page,
+        max_host_bytes=max_host_pages * page,
+        bounce_bytes=2 * page,
+        bounce_slot_bytes=page,
+        min_bounce_bytes=page,
+        backend=_SimpleSlabBackend(),
+    )
+    entered, proceed = threading.Barrier(2), threading.Barrier(2)
+    orig_init = PinnedBounceRing._ensure_initialized
+    orig_alloc_region = host_memory_mod.allocate_aligned_region
+    t_bounce_ref: list[threading.Thread] = []
+
+    def gated_alloc_region(size: int) -> object:
+        if not pause_after and t_bounce_ref and threading.current_thread() is t_bounce_ref[0]:
+            entered.wait(timeout=5.0)
+            proceed.wait(timeout=5.0)
+        return orig_alloc_region(size)
+
+    def gated_init(self_ring: PinnedBounceRing) -> bool:
+        if pause_after:
+            ok = orig_init(self_ring)
+            entered.wait(timeout=5.0)
+            proceed.wait(timeout=5.0)
+            return ok
+        return orig_init(self_ring)
+
+    def _use_bounce() -> None:
+        with pm._use_bounce_ring():
+            pass
+
+    monkeypatch.setattr(host_memory_mod, "allocate_aligned_region", gated_alloc_region)
+    monkeypatch.setattr(PinnedBounceRing, "_ensure_initialized", gated_init)
+    t_bounce = threading.Thread(target=_use_bounce)
+    t_bounce_ref.append(t_bounce)
+    slab = None
+    try:
+        t_bounce.start()
+        entered.wait(timeout=5.0)
+        assert pm._ledger.snapshot_atomic()[2] == 2 * page
+        slab = pm.allocate_host_slab(page, pinned=False)
+        assert (slab is not None) if pause_after else (slab is None)
+        proceed.wait(timeout=5.0)
+        t_bounce.join(timeout=5.0)
+        _, ledger_2b, ledger_bounce = pm._ledger.snapshot_atomic()
+        assert ledger_2b + ledger_bounce <= max_host_pages * page
+        assert pm._tier2b.stats.reserved_bytes + pm.stats.bounce_bytes <= max_host_pages * page
+    finally:
+        entered.abort()
+        proceed.abort()
+        monkeypatch.undo()
+        if slab is not None:
+            slab.release()
+        pm.clear()
+
+
+def test_pin_manager_bounce_and_tier2b_peak_host_ceiling_and_no_double_charge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _exercise_bounce_pause_window(monkeypatch, max_host_pages=2, pause_after=False)
+    _exercise_bounce_pause_window(monkeypatch, max_host_pages=3, pause_after=True)
+
+
+def test_pin_manager_impossible_cold_aligned_request_does_not_evict_idle() -> None:
+    page = mmap.PAGESIZE
+    pm = PinManager(page, max_host_bytes=page, bounce_bytes=0, backend=_SimpleSlabBackend())
+    buf = mmap.mmap(-1, page)
+    idle_t: torch.Tensor | None = torch.frombuffer(buf, dtype=torch.uint8)
+    try:
+        assert idle_t is not None
+        with pm.acquire([idle_t]):
+            pass
+        assert pm.stats.idle_registrations == 1
+        assert pm._tier2a.stats.reserved_bytes == 0
+        assert pm.allocate_host_slab(page, alignment=2 * page, pinned=True) is None
+        assert pm.stats.idle_registrations == 1
+        assert pm.stats.pinned_bytes == page
+        assert idle_t.data_ptr() in pm._registrations
+    finally:
+        pm.clear()
+        idle_t = None
+        buf.close()
+
+
+def test_pin_manager_bounce_ledger_blocks_concurrent_inplace_pinning_under_max_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import piper_offload._host_memory as host_memory_mod
+
+    page = mmap.PAGESIZE
+    pm = PinManager(
+        2 * page,
+        max_host_bytes=4 * page,
+        bounce_bytes=2 * page,
+        bounce_slot_bytes=page,
+        min_bounce_bytes=page,
+        backend=_SimpleSlabBackend(),
+    )
+    entered, proceed = threading.Barrier(2), threading.Barrier(2)
+    orig_alloc = host_memory_mod.allocate_aligned_region
+    t_holder: list[threading.Thread] = []
+
+    def gated_alloc(size: int) -> object:
+        if t_holder and threading.current_thread() is t_holder[0]:
+            entered.wait(timeout=5.0)
+            proceed.wait(timeout=5.0)
+        return orig_alloc(size)
+
+    def _use_bounce() -> None:
+        with pm._use_bounce_ring():
+            pass
+
+    monkeypatch.setattr(host_memory_mod, "allocate_aligned_region", gated_alloc)
+    t_bounce = threading.Thread(target=_use_bounce)
+    t_holder.append(t_bounce)
+    buf = mmap.mmap(-1, page)
+    fg_t: torch.Tensor | None = torch.frombuffer(buf, dtype=torch.uint8)
+    try:
+        assert fg_t is not None
+        t_bounce.start()
+        entered.wait(timeout=5.0)
+        assert pm._ledger.snapshot_atomic()[2] == 2 * page
+        with pm.acquire([fg_t], pin=True) as lease:
+            assert (lease.registered_bytes, lease.pageable_bytes) == (0, page)
+        assert fg_t.data_ptr() not in pm._registrations
+        assert pm._ledger.in_place_bytes + pm._ledger.bounce_bytes <= 2 * page
+        proceed.wait(timeout=5.0)
+        t_bounce.join(timeout=5.0)
+    finally:
+        entered.abort()
+        proceed.abort()
+        monkeypatch.undo()
+        pm.clear()
+        fg_t = None
+        buf.close()
+
+
+def _write_test_ckpt_tensor(tmp_path, nbytes: int, name: str) -> torch.Tensor:
+    from piper_offload import MappedCheckpoint
+
+    path = tmp_path / f"{name}.safetensors"
+    header = b'{"w": {"dtype": "U8", "shape": [%d], "data_offsets": [0, %d]}}' % (nbytes, nbytes)
+    header += b" " * (-(8 + len(header)) % 8)
+    path.write_bytes(len(header).to_bytes(8, "little") + header + (bytes([1]) * nbytes))
+    return MappedCheckpoint(path).get_tensor("w")
+
+
+def test_pin_manager_demotion_respects_concurrent_foreground_pinning_under_max_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    page = mmap.PAGESIZE
+    idle_ckpt = _write_test_ckpt_tensor(tmp_path, 2 * page, "idle_demote")
+    pm = PinManager(
+        4 * page,
+        max_host_bytes=4 * page,
+        slab_bytes=2 * page,
+        bounce_bytes=0,
+        backend=_SimpleSlabBackend(),
+    )
+    entered, proceed = threading.Barrier(2), threading.Barrier(2)
+    orig_demote_slot = PinManager._allocate_demotion_slot
+    t_holder: list[threading.Thread] = []
+
+    def gated_demote_slot(self_pm: PinManager, *args: object) -> object:
+        if t_holder and threading.current_thread() is t_holder[0]:
+            entered.wait(timeout=5.0)
+            proceed.wait(timeout=5.0)
+        return orig_demote_slot(self_pm, *args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(PinManager, "_allocate_demotion_slot", gated_demote_slot)
+    t_demote = threading.Thread(target=lambda: setattr(pm, "max_pinned_bytes", 0))
+    t_holder.append(t_demote)
+    buf = mmap.mmap(-1, 2 * page)
+    fg_t: torch.Tensor | None = torch.frombuffer(buf, dtype=torch.uint8)
+    fg_lease = None
+    try:
+        assert fg_t is not None
+        with pm.acquire([idle_ckpt]):
+            pass
+        assert pm._ledger.snapshot_atomic()[0] == 2 * page
+        t_demote.start()
+        entered.wait(timeout=5.0)
+        pm.max_pinned_bytes = 4 * page
+        fg_lease = pm.acquire([fg_t], pin=True)
+        assert fg_lease.registered_bytes == 2 * page
+        proceed.wait(timeout=5.0)
+        t_demote.join(timeout=5.0)
+        t2a, t2b, bounce = pm._ledger.snapshot_atomic()
+        assert pm._ledger.in_place_bytes + t2a + t2b + bounce <= 4 * page
+        assert pm.stats.private_copy_bytes == 0
+    finally:
+        entered.abort()
+        proceed.abort()
+        monkeypatch.undo()
+        if fg_lease is not None:
+            fg_lease.close()
+        pm.clear()
+        fg_t = None
+        buf.close()
+
+
+def _setup_warm_tier2a_with_idle_reg(page: int) -> tuple[PinManager, mmap.mmap, torch.Tensor]:
+    pm = PinManager(2 * page, max_host_bytes=2 * page, bounce_bytes=0, backend=_SimpleSlabBackend())
+    buf = mmap.mmap(-1, page)
+    idle_t = torch.frombuffer(buf, dtype=torch.uint8)
+    warm = pm.allocate_host_slab(page, pinned=True)
+    assert warm is not None
+    warm.release()
+    with pm.acquire([idle_t]):
+        pass
+    assert pm.allocate_host_slab(page, alignment=4 * page, pinned=True) is None
+    assert pm.stats.idle_registrations == 1
+    assert pm._tier2a.stats.reserved_bytes == page
+    pm.max_pinned_bytes = page
+    pm.max_pinned_bytes = 2 * page
+    return pm, buf, idle_t
+
+
+def test_pin_manager_warm_tier2a_trim_race_and_overaligned_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import piper_offload._host_memory as host_memory_mod
+
+    page = mmap.PAGESIZE
+    pm, buf, idle_t = _setup_warm_tier2a_with_idle_reg(page)
+    entered, proceed = threading.Barrier(2), threading.Barrier(2)
+    orig_alloc = host_memory_mod.allocate_aligned_region
+    res_2a: list[object] = []
+    t_holder: list[threading.Thread] = []
+
+    def gated_alloc(size: int) -> object:
+        if size == 2 * page and t_holder and threading.current_thread() is t_holder[0]:
+            entered.wait(timeout=5.0)
+            proceed.wait(timeout=5.0)
+        return orig_alloc(size)
+
+    s_2a = None
+    s_2b = None
+    try:
+        _ = idle_t
+        monkeypatch.setattr(host_memory_mod, "allocate_aligned_region", gated_alloc)
+        t_2a = threading.Thread(
+            target=lambda: res_2a.append(pm.allocate_host_slab(2 * page, pinned=True))
+        )
+        t_holder.append(t_2a)
+        t_2a.start()
+        entered.wait(timeout=5.0)
+        s_2b = pm.allocate_host_slab(page, pinned=False)
+        assert s_2b is None
+        proceed.wait(timeout=5.0)
+        t_2a.join(timeout=5.0)
+        s_2a = res_2a[0]
+        assert s_2a is not None
+        t2a, t2b, bounce = pm._ledger.snapshot_atomic()
+        assert pm._ledger.in_place_bytes + t2a + t2b + bounce <= 2 * page
+    finally:
+        entered.abort()
+        proceed.abort()
+        monkeypatch.undo()
+        if s_2b is not None:
+            s_2b.release()
+        if s_2a is not None:
+            s_2a.release()  # type: ignore[attr-defined]
+        pm.clear()
+        del idle_t
+        buf.close()
+
+
+@CUDA
+def test_stream_lease_spill_interrupt_after_copy_keeps_fallback_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import piper_offload.stream_lease as stream_lease_mod
+
+    device = torch.device("cuda")
+    compute_stream = torch.cuda.Stream(device=device)
+    d2h_stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(compute_stream):
+        gpu_buf = torch.empty((1024,), dtype=torch.float32, device=device)
+    host_buf = torch.empty((1024,), dtype=torch.float32, pin_memory=True)
+    lease = StreamLease(compute_stream)
+    with lease.produce(compute_stream):
+        gpu_buf.fill_(7.5)
+
+    def fail_record(_stream: torch.cuda.Stream) -> object:
+        raise _SubstrateTestInterrupt("post-copy-record-fail")
+
+    seen_pre_copy: list[object] = []
+
+    def copy_with_probe() -> None:
+        seen_pre_copy.append(lease._d2h_fallback_stream)
+        host_buf.copy_(gpu_buf, non_blocking=True)
+        raise _SubstrateTestInterrupt("mid-copy-fail")
+
+    monkeypatch.setattr(stream_lease_mod, "_record_event", fail_record)
+    with pytest.raises(_SubstrateTestInterrupt, match="mid-copy-fail"):
+        lease.spill_to_host(copy_with_probe, d2h_stream)
+    monkeypatch.undo()
+    assert seen_pre_copy == [d2h_stream]
+    assert lease.d2h_in_flight and lease._d2h_fallback_stream is d2h_stream
+    lease.wait_d2h()
+    assert not lease.d2h_in_flight and lease._d2h_fallback_stream is None and lease.is_dirty
+    torch.testing.assert_close(host_buf, torch.full((1024,), 7.5))
+
+
+def test_weak_mmap_tracked_region_credits_ledger_on_buffer_error_gc() -> None:
+    import gc
+
+    page = mmap.PAGESIZE
+    pm = PinManager(2 * page, max_host_bytes=2 * page, bounce_bytes=0, backend=_SimpleSlabBackend())
+    mv: memoryview | None = None
+    alloc = pm._tier2b.allocate(page)
+    assert alloc is not None
+    try:
+        assert alloc._lease.slab is not None
+        slab_bytes = alloc._lease.slab.size
+        tracked = alloc._lease.slab.backing._state.region
+        assert tracked is not None
+        mv = memoryview(tracked)
+        alloc.release()
+        assert pm._tier2b.trim_empty(0) == 0
+        assert pm._ledger.snapshot_atomic()[1] == slab_bytes
+        del tracked
+        gc.collect()
+        assert pm._ledger.snapshot_atomic()[1] == slab_bytes
+        del mv
+        mv = None
+        gc.collect()
+        assert pm._ledger.snapshot_atomic()[1] == 0
+    finally:
+        if mv is not None:
+            mv.release()
+        pm.clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_wave_tracker_overlapping_handoff_during_reap_preserves_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import piper_offload._slab_pool_common as common_mod
+
+    schema = SlotSchema({"k": 256, "v": 256}, {"scale": (torch.float32, (8,))}, field_alignment=256)
+    pm = PinManager(4 * 1024 * 1024, max_host_bytes=4 * 1024 * 1024)
+    entered = threading.Event()
+    proceed = threading.Event()
+    reap_err: list[BaseException] = []
+    try:
+        with (
+            Uint8DualArena(2 * schema.drawer_bytes, device="cuda", alignment=256) as arena,
+            KvChunkPool(arena, schema, max_slots=2, pin_manager=pm, spill_watermark=None) as pool,
+        ):
+            with pool.produce(["a"]):
+                pass
+            slot_a = pool._chunks["a"].slot
+            assert slot_a is not None
+            lease1 = pool._wave_releases.new_lease()
+            lease2 = pool._wave_releases.new_lease()
+            with pool._lock:
+                lease1.add_unlocked(slot_a)
+                lease2.add_unlocked(slot_a)
+            lease1.acquire()
+            lease2.acquire()
+            lease1.handoff_to_pool()
+
+            orig_rel = common_mod._release_slot_stream_lease
+
+            def paused_rel(*args: object, **kwargs: object) -> tuple[bool, BaseException | None]:
+                entered.set()
+                proceed.wait(timeout=5.0)
+                return orig_rel(*args, **kwargs)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(common_mod, "_release_slot_stream_lease", paused_rel)
+
+            def run_reap() -> None:
+                try:
+                    pool._wave_releases.reap(lambda: pool._closed or pool._closing)
+                except BaseException as exc:
+                    reap_err.append(exc)
+
+            t_reap = threading.Thread(target=run_reap)
+            t_reap.start()
+            assert entered.wait(timeout=5.0)
+            monkeypatch.undo()
+            lease2.handoff_to_pool()
+            proceed.set()
+            t_reap.join(timeout=5.0)
+            assert not reap_err and len(pool._wave_releases.pending) == 1
+            pool.close()
+            assert slot_a.active_readers == 0
+    finally:
+        entered.set()
+        proceed.set()
+        monkeypatch.undo()
+        pm.clear()
+
+
+@CUDA
+def test_wave_lease_release_and_reap_propagate_interrupt_after_successful_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import piper_offload._slab_pool_common as common_mod
+
+    device = torch.device("cuda")
+    schema = SlotSchema({"k": 256, "v": 256}, {"scale": (torch.float32, (8,))}, field_alignment=256)
+    pm = PinManager(4 * 1024 * 1024, max_host_bytes=4 * 1024 * 1024)
+    try:
+        with (
+            Uint8DualArena(2 * schema.drawer_bytes, device=device, alignment=256) as arena,
+            KvChunkPool(arena, schema, max_slots=2, pin_manager=pm, spill_watermark=None) as pool,
+        ):
+            with pool.produce(["a", "b"]) as batch:
+                batch.arena_bytes.zero_()
+            slot_a = pool._chunks["a"].slot
+            slot_b = pool._chunks["b"].slot
+            assert slot_a is not None and slot_b is not None
+
+            orig_rel = common_mod._release_slot_stream_lease
+            calls = 0
+
+            def release_with_interrupt(
+                slot: object,
+                release_stream: torch.cuda.Stream,
+                end_streams: tuple[torch.cuda.Stream, ...],
+            ) -> tuple[bool, BaseException | None]:
+                nonlocal calls
+                calls += 1
+                ok, _err = orig_rel(slot, release_stream, end_streams)  # type: ignore[arg-type]
+                if calls == 1:
+                    return ok, _SubstrateTestInterrupt("retry-succeeded-interrupt")
+                return ok, None
+
+            lease1 = pool._wave_releases.new_lease()
+            with pool._lock:
+                lease1.add_unlocked(slot_a)
+            lease1.acquire()
+            monkeypatch.setattr(common_mod, "_release_slot_stream_lease", release_with_interrupt)
+            with pytest.raises(_SubstrateTestInterrupt, match="retry-succeeded-interrupt"):
+                lease1.release()
+            monkeypatch.undo()
+            assert slot_a.active_readers == 0
+
+            calls = 0
+            lease2 = pool._wave_releases.new_lease()
+            with pool._lock:
+                lease2.add_unlocked(slot_a)
+                lease2.add_unlocked(slot_b)
+            lease2.acquire()
+            lease2.handoff_to_pool()
+            assert len(pool._wave_releases.pending) == 2
+            monkeypatch.setattr(common_mod, "_release_slot_stream_lease", release_with_interrupt)
+            with pytest.raises(_SubstrateTestInterrupt, match="retry-succeeded-interrupt"):
+                pool._wave_releases.reap(lambda: pool._closed or pool._closing)
+            monkeypatch.undo()
+            assert slot_a.active_readers == 0
+            assert slot_b.active_readers == 1
+            assert len(pool._wave_releases.pending) == 1
+            pool._wave_releases.reap(lambda: pool._closed or pool._closing)
+            assert slot_b.active_readers == 0
+            assert len(pool._wave_releases.pending) == 0
+    finally:
+        monkeypatch.undo()
+        pm.clear()
+
+
+def test_tier2b_eviction_uses_fresh_ledger_and_bounce_cap_without_pin_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = mmap.PAGESIZE
+    buf = mmap.mmap(-1, 2 * page)
+    idle: torch.Tensor | None = torch.frombuffer(buf, dtype=torch.uint8)
+    pm = PinManager(4 * page, max_host_bytes=4 * page, bounce_bytes=0, backend=_SimpleSlabBackend())
+    b1 = None
+    b2 = None
+    try:
+        assert idle is not None
+        with pm.acquire([idle], pin=True):
+            pass
+        assert pm.stats.idle_registrations == 1
+
+        b1 = pm.allocate_host_slab(2 * page, pinned=False)
+        assert b1 is not None
+        orig_alloc = pm._tier2b.allocate
+        released_once = False
+
+        def concurrent_release_on_miss(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+            nonlocal released_once
+            res = orig_alloc(*args, **kwargs)  # type: ignore[arg-type]
+            if res is None and not released_once:
+                released_once = True
+                assert b1 is not None
+                b1.release()
+                pm._tier2b.trim_empty(0)
+            return res
+
+        monkeypatch.setattr(pm._tier2b, "allocate", concurrent_release_on_miss)
+        b2 = pm.allocate_host_slab(3 * page, pinned=False)
+        monkeypatch.undo()
+        assert released_once
+        assert b2 is not None
+        assert pm.stats.idle_registrations == 0
+
+        pm_unbounded_pin = PinManager(
+            None,
+            max_host_bytes=None,
+            bounce_bytes=2 * page,
+            bounce_slot_bytes=page,
+            min_bounce_bytes=page,
+            backend=_SimpleSlabBackend(),
+        )
+        try:
+            with pm_unbounded_pin._lock:
+                assert pm_unbounded_pin._ledger.can_reserve_bounce_locked(2 * page)
+                assert not pm_unbounded_pin._ledger.can_reserve_bounce_locked(3 * page)
+        finally:
+            pm_unbounded_pin.clear()
+    finally:
+        monkeypatch.undo()
+        if b2 is not None and not b2.released:
+            b2.release()
+        if b1 is not None and not b1.released:
+            b1.release()
+        pm.clear()
+        idle = None
+        buf.close()

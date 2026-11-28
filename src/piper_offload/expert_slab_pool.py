@@ -21,12 +21,27 @@ from collections import OrderedDict, deque
 from collections.abc import Callable, Generator, Hashable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from types import MappingProxyType
 from typing import Self
 
 import torch
 
-from . import pin_manager as _pin_manager
+from ._slab_pool_common import (
+    _build_pool_views_common,
+    _build_side_pools,
+    _make_device_int_table,
+    _merge_error,
+    _PendingWaveRelease,
+    _PoolViews,
+    _release_slot_stream_lease,
+    _run_until_complete,
+    _setup_transfer_context,
+    _sync_interrupt_safe,
+    _synchronize_pending_leases,
+    _validate_optional_positive_int,
+    _validate_slab_pool_base_args,
+    _WaveLease,
+    _WaveReleaseTracker,
+)
 from .device_transfer import DeviceTransferContext
 from .dual_arena import (
     ArenaCapacityError,
@@ -115,15 +130,6 @@ class ExpertPoolStats:
 
 
 @dataclass(frozen=True, slots=True)
-class _PoolViews:
-    arena_bytes: torch.Tensor
-    arena_views: MappingProxyType[str, torch.Tensor]
-    arena_flat_views: dict[str, torch.Tensor]
-    side_views: MappingProxyType[str, torch.Tensor]
-    slot_offsets: MappingProxyType[str, torch.Tensor]
-
-
-@dataclass(frozen=True, slots=True)
 class _ExpertHostEntry:
     arena_tensors: tuple[tuple[str, torch.Tensor], ...]
     side_tensors: tuple[tuple[str, torch.Tensor], ...]
@@ -140,20 +146,14 @@ class _SlotState:
     lease_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-@dataclass(frozen=True, slots=True)
-class _PendingWaveRelease:
-    slot: _SlotState
-    release_stream: torch.cuda.Stream
-    end_streams: tuple[torch.cuda.Stream, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _PreparedMiss:
     slot: _SlotState
     key: tuple[int, int]
     entry: _ExpertHostEntry
     admit_resident: bool
     needs_stage: bool = True
+    handled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,216 +220,6 @@ class _CountMinSketch:
         return min(row[idx] for row, idx in zip(self._rows, idxs, strict=True))
 
 
-def _merge_error(current: BaseException | None, incoming: BaseException | None) -> BaseException | None:
-    if incoming is None:
-        return current
-    if current is None or (isinstance(current, Exception) and not isinstance(incoming, Exception)):
-        return incoming
-    return current
-
-
-def _run_until_complete(fn: Callable[[], None]) -> tuple[bool, BaseException | None]:
-    """Run ``fn()``, retrying non-``Exception`` interrupts; return ``(completed, err)``."""
-    interrupt: BaseException | None = None
-    while True:
-        try:
-            fn()
-            return True, interrupt
-        except Exception as exc:
-            return False, (interrupt if interrupt is not None else exc)
-        except BaseException as intr:
-            if interrupt is None:
-                interrupt = intr
-
-
-def _sync_interrupt_safe(fn: Callable[[], None]) -> None:
-    """Run ``fn()``, retrying if interrupted by a non-``Exception`` ``BaseException``."""
-    completed, err = _run_until_complete(fn)
-    if not completed or err is not None:
-        assert err is not None
-        raise err
-
-
-def _synchronize_pending_leases(
-    pending: deque[tuple[torch.cuda.Event | None, PinLease]],
-    copy_stream: torch.cuda.Stream | None,
-) -> None:
-    """Wait for every in-flight H2D DMA event before closing its ``PinLease``."""
-    interrupt: BaseException | None = None
-    while pending:
-        event, lease = pending[0]
-        target_fn = (
-            event.synchronize
-            if event is not None
-            else (copy_stream.synchronize if copy_stream is not None else None)
-        )
-        if target_fn is not None:
-            completed, err = _run_until_complete(target_fn)
-            if not completed:
-                assert err is not None
-                if interrupt is not None and isinstance(err, Exception):
-                    raise interrupt from err
-                raise err
-            interrupt = _merge_error(interrupt, err)
-        lease.close()
-        pending.popleft()
-    if interrupt is not None:
-        raise interrupt
-
-
-def _release_slot_stream_lease(
-    slot: _SlotState,
-    release_stream: torch.cuda.Stream,
-    end_streams: Sequence[torch.cuda.Stream],
-) -> tuple[bool, BaseException | None]:
-    with slot.lease_lock:
-        slot_lease = slot.lease
-        if slot_lease is None:
-            return True, None
-        first_err: BaseException | None = None
-        for end_stream in end_streams:
-            if end_stream == release_stream:
-                continue
-            rec_ok, rec_err = _run_until_complete(
-                lambda sl=slot_lease, es=end_stream: sl.record_stream(es)
-            )
-            first_err = _merge_error(first_err, rec_err)
-            if not rec_ok:
-                return False, first_err
-        rel_ok, rel_err = _run_until_complete(
-            lambda sl=slot_lease, rs=release_stream: sl.release(rs)
-        )
-        return rel_ok, _merge_error(first_err, rel_err)
-
-
-def _merge_end_stream(
-    existing: tuple[torch.cuda.Stream, ...],
-    end_stream: torch.cuda.Stream | None,
-    release_stream: torch.cuda.Stream,
-) -> tuple[torch.cuda.Stream, ...]:
-    if end_stream is None or end_stream == release_stream or end_stream in existing:
-        return existing
-    return (*existing, end_stream)
-
-
-class _WaveLease:
-    """Single RAII owner pairing ``_SlotState.active_readers`` and ``StreamLease`` readers."""
-
-    def __init__(self, pool: ExpertSlabPool) -> None:
-        self._pool = pool
-        self._slots: list[_SlotState] = []
-        self._acquired_slots: set[int] = set()
-        self._end_streams: dict[int, tuple[torch.cuda.Stream, ...]] = {}
-        self._stream: torch.cuda.Stream | None = None
-
-    def add_unlocked(self, slot: _SlotState) -> None:
-        """Increment ``slot.active_readers`` under ``pool._lock`` and track ownership."""
-        slot.active_readers += 1
-        self._slots.append(slot)
-
-    def adopt_unlocked(self, slot: _SlotState) -> None:
-        """Adopt an already-incremented reader slot under ``pool._lock``."""
-        self._slots.append(slot)
-
-    def acquire(self) -> None:
-        """Acquire shared ``StreamLease`` readers on the active CUDA compute stream."""
-        if self._pool._device.type != "cuda":
-            self._acquired_slots = {s.slot_id for s in self._slots}
-            return
-        stream = torch.cuda.current_stream(self._pool._device)
-        self._stream = stream
-        for slot in self._slots:
-            assert slot.lease is not None
-            with slot.lease_lock:
-                slot.lease.acquire(stream, exclusive=False)
-            self._acquired_slots.add(slot.slot_id)
-
-    def release(self) -> None:
-        """Idempotently release ``StreamLease``s and retain failed slots for retry."""
-        if not self._slots:
-            return
-        end_stream = (
-            torch.cuda.current_stream(self._pool._device)
-            if self._pool._device.type == "cuda"
-            else None
-        )
-        release_stream = self._stream
-        remaining_slots: list[_SlotState] = []
-        remaining_acquired: set[int] = set()
-        remaining_ends: dict[int, tuple[torch.cuda.Stream, ...]] = {}
-        first_err: BaseException | None = None
-        for slot in self._slots:
-            if (
-                self._pool._device.type == "cuda"
-                and slot.lease is not None
-                and release_stream is not None
-                and slot.slot_id in self._acquired_slots
-            ):
-                extras = _merge_end_stream(
-                    self._end_streams.get(slot.slot_id, ()),
-                    end_stream,
-                    release_stream,
-                )
-                released, err = _release_slot_stream_lease(slot, release_stream, extras)
-                first_err = _merge_error(first_err, err)
-                if released:
-                    with self._pool._lock:
-                        slot.active_readers = max(0, slot.active_readers - 1)
-                else:
-                    remaining_slots.append(slot)
-                    remaining_acquired.add(slot.slot_id)
-                    if extras:
-                        remaining_ends[slot.slot_id] = extras
-            else:
-                with self._pool._lock:
-                    slot.active_readers = max(0, slot.active_readers - 1)
-        self._slots = remaining_slots
-        self._acquired_slots = remaining_acquired
-        self._end_streams = remaining_ends
-        if not self._slots:
-            self._stream = None
-        if first_err is not None:
-            raise first_err
-
-    def handoff_to_pool(self) -> None:
-        """Transfer any still-unreleased slots to the pool before exiting a wave session."""
-        if not self._slots:
-            return
-        slots = self._slots
-        acquired = self._acquired_slots
-        end_streams = self._end_streams
-        release_stream = self._stream
-        with self._pool._lock:
-            for slot in slots:
-                if (
-                    self._pool._device.type == "cuda"
-                    and slot.lease is not None
-                    and release_stream is not None
-                    and slot.slot_id in acquired
-                ):
-                    self._pool._pending_wave_releases.append(
-                        _PendingWaveRelease(
-                            slot=slot,
-                            release_stream=release_stream,
-                            end_streams=end_streams.get(slot.slot_id, ()),
-                        )
-                    )
-                else:
-                    slot.active_readers = max(0, slot.active_readers - 1)
-        self._slots = []
-        self._acquired_slots = set()
-        self._end_streams = {}
-        self._stream = None
-
-
-def _validate_optional_positive_int(value: int | None, *, name: str) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer or None; got {value!r}.")
-    return value
-
-
 def _validate_pool_init_args(
     arena: Uint8DualArena,
     schema: SlotSchema,
@@ -439,105 +229,18 @@ def _validate_pool_init_args(
     pin_manager: PinManager | None,
     default_bypass_wave_slots: int | None,
 ) -> tuple[int | None, int | None, PinManager, VramBudget | None]:
-    if not isinstance(arena, Uint8DualArena):
-        raise TypeError(f"arena must be a Uint8DualArena; got {type(arena).__name__}.")
-    if not arena.is_open:
-        raise RuntimeError("Cannot attach ExpertSlabPool to a closed Uint8DualArena.")
-    if not isinstance(schema, SlotSchema):
-        raise TypeError(f"schema must be a SlotSchema; got {type(schema).__name__}.")
-    if arena.alignment < schema.field_alignment:
-        raise ValueError(
-            f"Arena alignment ({arena.alignment}) must be >= "
-            f"schema.field_alignment ({schema.field_alignment})."
-        )
-    resolved_max = _validate_optional_positive_int(max_slots, name="max_slots")
+    resolved_max, resolved_pin, effective_budget = _validate_slab_pool_base_args(
+        "ExpertSlabPool",
+        arena,
+        schema,
+        max_slots=max_slots,
+        budget=budget,
+        pin_manager=pin_manager,
+    )
     resolved_bypass = _validate_optional_positive_int(
         default_bypass_wave_slots, name="default_bypass_wave_slots"
     )
-    if budget is not None and not isinstance(budget, VramBudget):
-        raise TypeError(f"budget must be a VramBudget or None; got {type(budget).__name__}.")
-    effective_budget = arena.budget if budget is None else budget
-    resolved_pin = _pin_manager.host_pin_manager if pin_manager is None else pin_manager
-    if not isinstance(resolved_pin, PinManager):
-        raise TypeError(
-            f"pin_manager must be a PinManager or None; got {type(resolved_pin).__name__}."
-        )
     return resolved_max, resolved_bypass, resolved_pin, effective_budget
-
-
-def _configure_or_validate_low_layout(
-    arena: Uint8DualArena,
-    schema: SlotSchema,
-    max_slots: int | None,
-) -> tuple[LowSlotLayout, bool]:
-    existing = arena.low_slot_layout
-    if existing is None:
-        return arena.configure_low_slots(schema.drawer_bytes, max_slots=max_slots), True
-    if arena.active_low_slots:
-        raise RuntimeError(
-            "Cannot attach ExpertSlabPool to a Uint8DualArena with active low slots."
-        )
-    if existing.slot_bytes < schema.drawer_bytes:
-        raise ValueError(
-            f"Arena low slot_bytes ({existing.slot_bytes}) is smaller than "
-            f"schema drawer_bytes ({schema.drawer_bytes})."
-        )
-    if max_slots is not None and existing.max_slots != max_slots:
-        raise ValueError(
-            f"Arena low max_slots ({existing.max_slots}) does not match "
-            f"requested max_slots={max_slots}."
-        )
-    return existing, False
-
-
-def _build_side_pools(
-    schema: SlotSchema,
-    max_slots: int,
-    device: torch.device,
-    budget: VramBudget | None,
-) -> dict[str, TypedSidePool]:
-    pools: dict[str, TypedSidePool] = {}
-    try:
-        with torch.inference_mode(False):
-            for spec in schema.side_fields:
-                pools[spec.name] = TypedSidePool(
-                    max_slots,
-                    spec.shape,
-                    dtype=spec.dtype,
-                    device=device,
-                    alignment_bytes=spec.alignment_bytes,
-                    budget=budget,
-                    reservation_name=f"expert_side_{spec.name}",
-                )
-    except BaseException:
-        for pool in pools.values():
-            with contextlib.suppress(BaseException):
-                pool.close()
-        raise
-    return pools
-
-
-def _setup_transfer_context(
-    device: torch.device,
-    transfer_context: DeviceTransferContext | None,
-) -> tuple[DeviceTransferContext | None, bool, bool]:
-    if device.type != "cuda":
-        if transfer_context is not None:
-            raise ValueError("CPU ExpertSlabPool does not accept a CUDA DeviceTransferContext.")
-        return None, False, False
-    if transfer_context is None:
-        return DeviceTransferContext(device), True, False
-    if not isinstance(transfer_context, DeviceTransferContext):
-        raise TypeError(
-            f"transfer_context must be a DeviceTransferContext or None; "
-            f"got {type(transfer_context).__name__}."
-        )
-    if transfer_context.device != device:
-        raise ValueError(
-            f"transfer_context device ({transfer_context.device}) must match arena device ({device})."
-        )
-    transfer_context._acquire_borrow()
-    return transfer_context, False, True
 
 
 def _validate_host_tensor_base(tensor: object, *, expert_idx: int, name: str) -> torch.Tensor:
@@ -620,31 +323,15 @@ def _build_pool_views(
     side_pools: Mapping[str, TypedSidePool],
     device: torch.device,
 ) -> _PoolViews:
-    with torch.inference_mode(False):
-        arena_bytes = arena.raw_uint8_view()
-        arena_views = {
-            af.name: arena.low_pool_view(af.shape, field_offset=af.offset)
-            for af in schema.arena_fields
-        }
-        arena_flat_views = {
-            af.name: arena.low_pool_view((af.nbytes,), field_offset=af.offset)
-            for af in schema.arena_fields
-        }
-        side_views = {name: sp.tensor for name, sp in side_pools.items()}
-        slot_idx_vec = torch.arange(layout.max_slots, dtype=torch.int64, device=device)
-        slot_offsets = {
-            af.name: slot_idx_vec * layout.slot_stride + af.offset
-            for af in schema.arena_fields
-        }
-        if device.type == "cuda":
-            event = _record_event(torch.cuda.current_stream(device))
-            _sync_interrupt_safe(event.synchronize)
-    return _PoolViews(
-        arena_bytes=arena_bytes,
-        arena_views=MappingProxyType(arena_views),
-        arena_flat_views=arena_flat_views,
-        side_views=MappingProxyType(side_views),
-        slot_offsets=MappingProxyType(slot_offsets),
+    return _build_pool_views_common(
+        arena,
+        schema,
+        max_slots=layout.max_slots,
+        slot_stride=layout.slot_stride,
+        base_offset=0,
+        pool_view_fn=lambda shape, off: arena.low_pool_view(shape, field_offset=off),
+        side_pools=side_pools,
+        device=device,
     )
 
 
@@ -676,6 +363,34 @@ class ExpertSlabPool:
         - Close this pool (or exit its ``with`` block) outside active ``waves()``
           sessions and before closing the backing ``Uint8DualArena``.
     """
+
+    def _init_base_fields(
+        self,
+        arena: Uint8DualArena,
+        schema: SlotSchema,
+        resolved_pin: PinManager,
+        resolved_bypass: int | None,
+    ) -> torch.device:
+        device = arena.device
+        self._lock = threading.Lock()
+        self._op_cond = threading.Condition(self._lock)
+        self._close_lock = threading.Lock()
+        self._arena = arena
+        self._schema = schema
+        self._device = device
+        self._pin_manager = resolved_pin
+        self._default_bypass_wave_slots = resolved_bypass
+        self._layout: LowSlotLayout | None = None
+        self._max_slots = 0
+        self._configured_fresh_layout = False
+        self._transfer_context: DeviceTransferContext | None = None
+        self._owns_transfer_context = False
+        self._borrowed_transfer_context = False
+        self._side_pools: dict[str, TypedSidePool] = {}
+        self._views: _PoolViews | None = None
+        self._init_tracking_state()
+        self._reclaim_cb = self._reclaim_low_frontier
+        return device
 
     def __init__(
         self,
@@ -712,43 +427,32 @@ class ExpertSlabPool:
                 default_bypass_wave_slots=default_bypass_wave_slots,
             )
         )
-        device = arena.device
-        self._lock = threading.Lock()
-        self._op_cond = threading.Condition(self._lock)
-        self._close_lock = threading.Lock()
-        self._arena = arena
-        self._schema = schema
-        self._device = device
-        self._pin_manager = resolved_pin
-        self._default_bypass_wave_slots = resolved_bypass
-        self._layout: LowSlotLayout | None = None
-        self._max_slots = 0
-        self._configured_fresh_layout = False
-        self._transfer_context: DeviceTransferContext | None = None
-        self._owns_transfer_context = False
-        self._borrowed_transfer_context = False
-        self._side_pools: dict[str, TypedSidePool] = {}
-        self._views: _PoolViews | None = None
-        self._init_tracking_state()
-        self._reclaim_cb = self._reclaim_low_frontier
+        device = self._init_base_fields(arena, schema, resolved_pin, resolved_bypass)
 
-        # Claim low-end ownership first so two pools cannot race on arena layout.
-        arena.set_low_reclaimer(self._reclaim_cb)
         try:
-            layout, configured_fresh = _configure_or_validate_low_layout(
-                arena, schema, resolved_max
+            # Atomically claim low-end ownership and configure/validate layout under arena._lock.
+            layout, configured_fresh = arena._claim_low_owner(
+                self._reclaim_cb, schema.drawer_bytes, resolved_max
             )
             self._layout = layout
             self._max_slots = layout.max_slots
             self._configured_fresh_layout = configured_fresh
             self._sketch = _CountMinSketch(layout.max_slots)
 
-            ctx, owns_ctx, borrowed_ctx = _setup_transfer_context(device, transfer_context)
+            ctx, owns_ctx, borrowed_ctx = _setup_transfer_context(
+                "ExpertSlabPool", device, transfer_context
+            )
             self._transfer_context = ctx
             self._owns_transfer_context = owns_ctx
             self._borrowed_transfer_context = borrowed_ctx
 
-            self._side_pools = _build_side_pools(schema, layout.max_slots, device, effective_budget)
+            self._side_pools = _build_side_pools(
+                schema,
+                layout.max_slots,
+                device,
+                effective_budget,
+                reservation_prefix="expert_side_",
+            )
             self._views = _build_pool_views(arena, schema, layout, self._side_pools, device)
         except BaseException as exc:
             cleanup_err = self._teardown_resources()
@@ -770,11 +474,10 @@ class ExpertSlabPool:
 
         self._inflight_arena_allocs = 0
         self._inflight_arena_frees = 0
-        self._inflight_wave_release_reaps = 0
         self._active_wave_sessions = 0
         self._suppress_stats_depth = 0
         self._pending_pin_leases: deque[tuple[torch.cuda.Event | None, PinLease]] = deque()
-        self._pending_wave_releases: deque[_PendingWaveRelease] = deque()
+        self._wave_releases = _WaveReleaseTracker(self._device, self._lock, self._op_cond)
         self._closing = False
         self._closed = False
 
@@ -975,48 +678,7 @@ class ExpertSlabPool:
             raise first_err
 
     def _reap_pending_wave_releases(self) -> None:
-        if self._device.type != "cuda":
-            return
-        with self._lock:
-            if not self._pending_wave_releases or self._closed or self._closing:
-                return
-            batch = list(self._pending_wave_releases)
-            self._pending_wave_releases.clear()
-            self._inflight_wave_release_reaps += 1
-
-        released_slots: list[_SlotState] = []
-        still_pending: list[_PendingWaveRelease] = []
-        interrupt: BaseException | None = None
-        try:
-            for idx, item in enumerate(batch):
-                try:
-                    released, err = _release_slot_stream_lease(
-                        item.slot, item.release_stream, item.end_streams
-                    )
-                except BaseException as exc:
-                    interrupt = _merge_error(interrupt, exc)
-                    still_pending.extend(batch[idx:])
-                    break
-                if released:
-                    released_slots.append(item.slot)
-                elif err is not None and not isinstance(err, Exception):
-                    interrupt = _merge_error(interrupt, err)
-                    still_pending.extend(batch[idx:])
-                    break
-                else:
-                    still_pending.append(item)
-        finally:
-            with self._lock:
-                for slot in released_slots:
-                    slot.active_readers = max(0, slot.active_readers - 1)
-                if still_pending:
-                    self._pending_wave_releases.extendleft(reversed(still_pending))
-                self._inflight_wave_release_reaps = max(
-                    0, self._inflight_wave_release_reaps - 1
-                )
-                self._op_cond.notify_all()
-        if interrupt is not None:
-            raise interrupt
+        self._wave_releases.reap(lambda: self._closed or self._closing)
 
     def stats(self) -> ExpertPoolStats:
         """Return a snapshot of slot usage, hit/miss, eviction, and wave statistics.
@@ -1138,7 +800,7 @@ class ExpertSlabPool:
                 _sync_interrupt_safe(lease.synchronize_and_reset)
         popped = False
         with self._lock:
-            if slot.slot_id in self._slots:
+            if self._slots.get(slot.slot_id) is slot:
                 del self._slots[slot.slot_id]
                 self._inflight_arena_frees += 1
                 popped = True
@@ -1167,31 +829,19 @@ class ExpertSlabPool:
             )
         except ArenaCapacityError:
             return None
-
+        inserted = False
         try:
             new_slot = self._make_slot_state(allocated_id, phase=phase)
+            with self._lock:
+                if not (self._closed or self._closing or not self._arena.is_open):
+                    self._slots[allocated_id] = new_slot
+                    inserted = True
+            if not inserted:
+                raise RuntimeError("ExpertSlabPool was closed during slot allocation.")
         except BaseException:
-            if self._arena.is_open:
+            if not inserted and self._arena.is_open:
                 _sync_interrupt_safe(lambda: self._arena.free_low_slot(allocated_id))
             raise
-        with self._lock:
-            if self._closed or self._closing or not self._arena.is_open:
-                self._inflight_arena_frees += 1
-                release_new = True
-            else:
-                self._slots[allocated_id] = new_slot
-                release_new = False
-        if release_new:
-            try:
-                if new_slot.lease is not None:
-                    _sync_interrupt_safe(new_slot.lease.synchronize_and_reset)
-                if self._arena.is_open:
-                    _sync_interrupt_safe(lambda: self._arena.free_low_slot(allocated_id))
-            finally:
-                with self._lock:
-                    self._inflight_arena_frees = max(0, self._inflight_arena_frees - 1)
-                    self._op_cond.notify_all()
-            raise RuntimeError("ExpertSlabPool was closed during slot allocation.")
         return new_slot
 
     def _try_alloc_miss_slot(self, *, allow_reclaim: bool) -> _SlotState | None:
@@ -1202,11 +852,13 @@ class ExpertSlabPool:
             self._inflight_arena_allocs += 1
         try:
             return self._alloc_new_slot_from_arena(
-                allow_reclaim=allow_reclaim, phase=_SlotPhase.STAGING
+                allow_reclaim=allow_reclaim,
+                phase=_SlotPhase.STAGING,
             )
         finally:
             with self._lock:
                 self._inflight_arena_allocs = max(0, self._inflight_arena_allocs - 1)
+                self._op_cond.notify_all()
 
     def _evict_resident_for_miss_unlocked(
         self,
@@ -1313,8 +965,8 @@ class ExpertSlabPool:
 
         self._reap_completed_pin_leases()
         host_tensors = [t for item in stage_items for t in item.entry.all_host_tensors]
-        pin_lease = self._pin_manager.acquire(host_tensors, pin=not bypass)
         copy_stream = self._ensure_copy_stream()
+        pin_lease = self._pin_manager.acquire(host_tensors, pin=not bypass)
         try:
             for item in stage_items:
                 assert item.slot.lease is not None
@@ -1349,40 +1001,66 @@ class ExpertSlabPool:
             raise sync_err from exc
         raise exc
 
+    def _commit_one_staged_item_unlocked(
+        self,
+        item: _PreparedMiss,
+        *,
+        wave_lease: _WaveLease | None,
+    ) -> tuple[int, int]:
+        slot = item.slot
+        if not item.needs_stage:
+            if wave_lease is not None:
+                wave_lease.adopt_unlocked(slot)
+            else:
+                slot.active_readers = max(0, slot.active_readers - 1)
+            item.handled = True
+            return item.key[1], slot.slot_id
+        existing_id = self._lookup_slot_id_unlocked(item.key)
+        existing = None if existing_id is None else self._slots.get(existing_id)
+        if (
+            existing is not None
+            and existing.slot_id != slot.slot_id
+            and existing.phase is _SlotPhase.READY
+            and existing.key == item.key
+        ):
+            slot.key = None
+            slot.phase = _SlotPhase.EMPTY
+            chosen = existing
+        else:
+            self._bind_slot_unlocked(slot, item.key, admit_resident=item.admit_resident)
+            chosen = slot
+        if wave_lease is not None:
+            wave_lease.add_unlocked(chosen)
+        item.handled = True
+        return item.key[1], chosen.slot_id
+
     def _commit_staged_batch_unlocked(
         self,
-        batch: Sequence[_PreparedMiss],
+        batch: list[_PreparedMiss],
         *,
         wave_lease: _WaveLease | None,
     ) -> list[tuple[int, int]]:
         pairs: list[tuple[int, int]] = []
-        for item in batch:
-            slot = item.slot
-            if not item.needs_stage:
-                if wave_lease is not None:
-                    wave_lease.adopt_unlocked(slot)
+        try:
+            for item in batch:
+                if not item.handled:
+                    pairs.append(
+                        self._commit_one_staged_item_unlocked(item, wave_lease=wave_lease)
+                    )
+            return pairs
+        finally:
+            for item in batch:
+                if item.handled:
+                    continue
+                item.handled = True
+                if item.needs_stage:
+                    if item.slot.phase is _SlotPhase.STAGING:
+                        item.slot.key = None
+                        item.slot.phase = _SlotPhase.EMPTY
                 else:
-                    slot.active_readers = max(0, slot.active_readers - 1)
-                pairs.append((item.key[1], slot.slot_id))
-                continue
-
-            existing_id = self._lookup_slot_id_unlocked(item.key)
-            existing = None if existing_id is None else self._slots.get(existing_id)
-            if (
-                existing is not None
-                and existing.slot_id != slot.slot_id
-                and existing.phase is _SlotPhase.READY
-            ):
-                slot.key = None
-                slot.phase = _SlotPhase.EMPTY
-                chosen = existing
-            else:
-                self._bind_slot_unlocked(slot, item.key, admit_resident=item.admit_resident)
-                chosen = slot
-            if wave_lease is not None:
-                wave_lease.add_unlocked(chosen)
-            pairs.append((item.key[1], chosen.slot_id))
-        return pairs
+                    item.slot.active_readers = max(0, item.slot.active_readers - 1)
+            batch.clear()
+            self._op_cond.notify_all()
 
     def _rollback_claimed_batch(self, items: Sequence[_PreparedMiss]) -> None:
         if not items:
@@ -1395,14 +1073,6 @@ class ExpertSlabPool:
                         item.slot.phase = _SlotPhase.EMPTY
                 else:
                     item.slot.active_readers = max(0, item.slot.active_readers - 1)
-
-    def _make_device_int_table(self, mapping: Sequence[int]) -> torch.Tensor:
-        with torch.inference_mode(False):
-            if self._device.type == "cuda":
-                return torch.tensor(mapping, dtype=torch.int32, pin_memory=True).to(
-                    self._device, non_blocking=True
-                )
-            return torch.tensor(mapping, dtype=torch.int32, device=self._device)
 
     def _build_wave_object(
         self,
@@ -1419,7 +1089,7 @@ class ExpertSlabPool:
             mapping = [-1] * num_experts
             for eid, sid in expert_slot_pairs:
                 mapping[eid] = sid
-            expert_to_slot = self._make_device_int_table(mapping)
+            expert_to_slot = _make_device_int_table(mapping, device=self._device)
         else:
             expert_to_slot = full_table
         return ExpertWave(
@@ -1522,7 +1192,7 @@ class ExpertSlabPool:
             self._require_open_unlocked()
             existing_id = self._lookup_slot_id_unlocked(key)
             existing = None if existing_id is None else self._slots.get(existing_id)
-            if existing is None or existing.phase is not _SlotPhase.READY:
+            if existing is None or existing.phase is not _SlotPhase.READY or existing.key != key:
                 return False, None
             if record_stats and (recorded_eids is None or key[1] not in recorded_eids):
                 self._sketch.increment(*key)
@@ -1536,7 +1206,7 @@ class ExpertSlabPool:
     def _build_device_int_table(
         self, mapping: Sequence[int]
     ) -> tuple[torch.Tensor, torch.cuda.Event | None]:
-        table = self._make_device_int_table(mapping)
+        table = _make_device_int_table(mapping, device=self._device)
         if self._device.type == "cuda":
             return table, _record_event(torch.cuda.current_stream(self._device))
         return table, None
@@ -1555,7 +1225,7 @@ class ExpertSlabPool:
         if effective_record and self._total_registered_experts > self._max_slots:
             return None
         slots = [self._slots[group_map[eid]] for eid in range(num_experts)]
-        if any(s.phase is not _SlotPhase.READY for s in slots):
+        if any(s.phase is not _SlotPhase.READY or s.key != (group_ord, eid) for eid, s in enumerate(slots)):
             return None
         return group_ord, num_experts, slots, self._all_resident_tables.get(group_ord)
 
@@ -1636,8 +1306,6 @@ class ExpertSlabPool:
                     self._resident.move_to_end(s.key)
                 else:
                     self._promote_transient_unlocked(s.key, s.slot_id)
-        self._fast_path_waves += 1
-        self._waves_executed += 1
 
     def _resolve_active_ids(
         self,
@@ -1701,6 +1369,7 @@ class ExpertSlabPool:
             record_stats=False,
         )
         staged: list[_PreparedMiss] = []
+        loaded = 0
         try:
             self._prepare_miss_batch(
                 req,
@@ -1714,8 +1383,8 @@ class ExpertSlabPool:
         finally:
             if staged:
                 with self._lock:
-                    self._commit_staged_batch_unlocked(staged, wave_lease=None)
-        return len(staged)
+                    loaded = len(self._commit_staged_batch_unlocked(staged, wave_lease=None))
+        return loaded
 
     @contextlib.contextmanager
     def waves(
@@ -1780,6 +1449,12 @@ class ExpertSlabPool:
                 with self._lock:
                     self._active_wave_sessions = max(0, self._active_wave_sessions - 1)
 
+    def _record_wave_executed(self, *, fast: bool = False) -> None:
+        with self._lock:
+            if fast:
+                self._fast_path_waves += 1
+            self._waves_executed += 1
+
     def _partition_hits_and_misses(
         self,
         group_ord: int,
@@ -1796,7 +1471,7 @@ class ExpertSlabPool:
                 key = (group_ord, eid)
                 slot_id = self._lookup_slot_id_unlocked(key)
                 slot = None if slot_id is None else self._slots.get(slot_id)
-                if slot is not None and slot.phase is _SlotPhase.READY:
+                if slot is not None and slot.phase is _SlotPhase.READY and slot.key == key:
                     wave_lease.add_unlocked(slot)
                     hit_pairs.append((eid, slot.slot_id))
                     self._hits += 1
@@ -1809,8 +1484,6 @@ class ExpertSlabPool:
                 else:
                     miss_queue.append(eid)
                     self._misses += 1
-            if hit_pairs:
-                self._waves_executed += 1
         return hit_pairs, miss_queue
 
     def _resolve_miss_wave_cap(
@@ -1852,13 +1525,14 @@ class ExpertSlabPool:
         effective_record: bool,
         max_wave_slots: int | None,
     ) -> Generator[ExpertWave]:
-        held_lease = _WaveLease(self)
+        held_lease = self._wave_releases.new_lease()
         staged_batch: list[_PreparedMiss] = []
         try:
             fast_wave = self._try_fast_path_wave(
                 group_id, held_lease, effective_record=effective_record
             )
             if fast_wave is not None:
+                self._record_wave_executed(fast=True)
                 yield fast_wave
                 held_lease.release()
                 return
@@ -1895,10 +1569,12 @@ class ExpertSlabPool:
                         miss_req, miss_queue, staged_batch,
                         wave_cap=wave_cap, require_at_least_one=False, allow_evict_resident=False,
                     )
-                yield self._build_wave_object(
+                hit_wave = self._build_wave_object(
                     index=wave_idx, group_id=group_id, num_experts=num_experts,
                     expert_slot_pairs=hit_pairs, is_hit_wave=True,
                 )
+                self._record_wave_executed()
+                yield hit_wave
                 held_lease.release()
                 wave_idx += 1
 
@@ -1912,18 +1588,18 @@ class ExpertSlabPool:
                     pairs = self._commit_staged_batch_unlocked(
                         staged_batch, wave_lease=held_lease
                     )
-                    staged_batch.clear()
-                    self._waves_executed += 1
                 held_lease.acquire()
                 if miss_queue:
                     self._prepare_miss_batch(
                         miss_req, miss_queue, staged_batch,
                         wave_cap=wave_cap, require_at_least_one=False, allow_evict_resident=False,
                     )
-                yield self._build_wave_object(
+                wave_obj = self._build_wave_object(
                     index=wave_idx, group_id=group_id, num_experts=num_experts,
                     expert_slot_pairs=pairs, is_hit_wave=False,
                 )
+                self._record_wave_executed()
+                yield wave_obj
                 held_lease.release()
                 wave_idx += 1
         finally:
@@ -1934,7 +1610,6 @@ class ExpertSlabPool:
                 if staged_batch:
                     with self._lock:
                         self._commit_staged_batch_unlocked(staged_batch, wave_lease=None)
-                        staged_batch.clear()
 
     def _copy_slot_d2d(self, src_id: int, dst_id: int, *, non_blocking: bool) -> None:
         self._arena.low_slot_tensor(dst_id).copy_(
@@ -1944,6 +1619,31 @@ class ExpertSlabPool:
         for pool in self._side_pools.values():
             pool.slot(dst_id).copy_(pool.slot(src_id), non_blocking=non_blocking)
 
+    def _evict_victim_for_relocate_unlocked(
+        self,
+        *,
+        k_freq: int,
+        max_allowed_slot: int,
+    ) -> tuple[_SlotState, bool] | None:
+        if self._closed or self._closing:
+            return None
+        reused = self._claim_reusable_slot_unlocked(
+            next_phase=_SlotPhase.RELOCATING,
+            max_slot_id=max_allowed_slot,
+        )
+        if reused is not None:
+            return reused, False
+        victim = self._pick_resident_victim_unlocked(
+            max_slot_id=max_allowed_slot, max_freq=k_freq
+        )
+        if victim is None:
+            return None
+        _victim_key, victim_slot, _ = victim
+        self._unbind_slot_unlocked(
+            victim_slot, count_eviction=True, next_phase=_SlotPhase.RELOCATING
+        )
+        return victim_slot, False
+
     def _find_or_alloc_relocate_target(
         self,
         key: tuple[int, int],
@@ -1952,43 +1652,29 @@ class ExpertSlabPool:
     ) -> tuple[_SlotState, bool] | None:
         if max_allowed_slot < 0:
             return None
-        result: tuple[_SlotState, bool] | None = None
         with self._lock:
             if self._closed or self._closing:
                 return None
             k_freq = self._sketch.estimate(*key)
             dst = self._claim_reusable_slot_unlocked(
-                next_phase=_SlotPhase.RELOCATING, max_slot_id=max_allowed_slot
+                next_phase=_SlotPhase.RELOCATING,
+                max_slot_id=max_allowed_slot,
             )
             if dst is not None:
-                result = (dst, False)
+                return dst, False
 
-        if result is None:
-            allocated = self._alloc_new_slot_from_arena(
-                allow_reclaim=False, max_slot_id=max_allowed_slot, phase=_SlotPhase.RELOCATING
+        allocated = self._alloc_new_slot_from_arena(
+            allow_reclaim=False,
+            max_slot_id=max_allowed_slot,
+            phase=_SlotPhase.RELOCATING,
+        )
+        if allocated is not None:
+            return allocated, True
+
+        with self._lock:
+            return self._evict_victim_for_relocate_unlocked(
+                k_freq=k_freq, max_allowed_slot=max_allowed_slot
             )
-            if allocated is not None:
-                result = (allocated, True)
-
-        if result is None:
-            with self._lock:
-                if not self._closed and not self._closing:
-                    reused = self._claim_reusable_slot_unlocked(
-                        next_phase=_SlotPhase.RELOCATING, max_slot_id=max_allowed_slot
-                    )
-                    if reused is not None:
-                        result = (reused, False)
-                    else:
-                        victim = self._pick_resident_victim_unlocked(
-                            max_slot_id=max_allowed_slot, max_freq=k_freq
-                        )
-                        if victim is not None:
-                            _victim_key, victim_slot, _ = victim
-                            self._unbind_slot_unlocked(
-                                victim_slot, count_eviction=True, next_phase=_SlotPhase.RELOCATING
-                            )
-                            result = (victim_slot, False)
-        return result
 
     def _queue_slot_d2d(self, src: _SlotState, dst: _SlotState) -> None:
         if self._device.type != "cuda":
@@ -1998,11 +1684,15 @@ class ExpertSlabPool:
         dst_lease = dst.lease
         assert src_lease is not None
         assert dst_lease is not None
-        copy_stream = self._ensure_copy_stream()
-        with src.lease_lock:
-            src_lease.acquire(copy_stream, exclusive=False)
+        copy_stream: torch.cuda.Stream | None = None
+        acquired = False
         stage_err: BaseException | None = None
+        rel_err: BaseException | None = None
         try:
+            copy_stream = self._ensure_copy_stream()
+            with src.lease_lock:
+                src_lease.acquire(copy_stream, exclusive=False)
+                acquired = True
             with dst.lease_lock:
                 dst_lease.stage_with(
                     lambda: self._copy_slot_d2d(src.slot_id, dst.slot_id, non_blocking=True),
@@ -2011,18 +1701,36 @@ class ExpertSlabPool:
         except BaseException as exc:
             stage_err = exc
         finally:
-            released, rel_err = _release_slot_stream_lease(src, copy_stream, ())
-            if not released:
-                with self._lock:
-                    src.active_readers += 1
-                    self._pending_wave_releases.append(
-                        _PendingWaveRelease(slot=src, release_stream=copy_stream)
-                    )
+            if acquired and copy_stream is not None:
+                released, rel_err = _release_slot_stream_lease(src, copy_stream, ())
+                if not released:
+                    with self._lock:
+                        self._wave_releases.enqueue_unlocked(src, copy_stream)
         merged = _merge_error(stage_err, rel_err)
         if merged is not None:
             if stage_err is not None and merged is not stage_err:
                 raise merged from stage_err
             raise merged
+
+    def _reset_relocate_dst_unlocked(self, dst: _SlotState) -> None:
+        if self._slots.get(dst.slot_id) is dst:
+            if dst.key is not None:
+                self._unbind_slot_unlocked(dst, count_eviction=False, next_phase=_SlotPhase.EMPTY)
+            else:
+                dst.phase = _SlotPhase.EMPTY
+        self._op_cond.notify_all()
+
+    def _release_relocate_target_on_error(self, dst: _SlotState, dst_fresh: bool) -> None:
+        if dst_fresh:
+            try:
+                self._free_slot_to_arena(dst, sync_lease=True)
+            except BaseException:
+                with self._lock:
+                    self._reset_relocate_dst_unlocked(dst)
+                raise
+        else:
+            with self._lock:
+                self._reset_relocate_dst_unlocked(dst)
 
     def _relocate_slot_to_lower(
         self,
@@ -2035,31 +1743,24 @@ class ExpertSlabPool:
         if target is None:
             return False
         dst, dst_fresh = target
+        committed = False
         try:
             self._queue_slot_d2d(src, dst)
-        except BaseException:
-            if dst_fresh:
-                try:
-                    self._free_slot_to_arena(dst, sync_lease=True)
-                except BaseException:
-                    with self._lock:
-                        if dst.slot_id in self._slots:
-                            dst.phase = _SlotPhase.EMPTY
-                    raise
-            else:
-                with self._lock:
+            with self._lock:
+                key_still_owned = self._lookup_slot_id_unlocked(key) == src.slot_id
+                self._unbind_slot_unlocked(src, count_eviction=False, next_phase=_SlotPhase.RELOCATING)
+                if key_still_owned:
+                    self._bind_slot_unlocked(dst, key, admit_resident=True)
+                    self._relocations += 1
+                else:
+                    dst.key = None
                     dst.phase = _SlotPhase.EMPTY
+                committed = True
+                self._op_cond.notify_all()
+        except BaseException:
+            if not committed:
+                self._release_relocate_target_on_error(dst, dst_fresh)
             raise
-
-        with self._lock:
-            key_still_owned = self._lookup_slot_id_unlocked(key) == src.slot_id
-            self._unbind_slot_unlocked(src, count_eviction=False, next_phase=_SlotPhase.RELOCATING)
-            if key_still_owned:
-                self._bind_slot_unlocked(dst, key, admit_resident=True)
-                self._relocations += 1
-            else:
-                dst.key = None
-                dst.phase = _SlotPhase.EMPTY
         self._free_slot_to_arena(src, sync_lease=True)
         return True
 
@@ -2068,6 +1769,48 @@ class ExpertSlabPool:
             self._unbind_slot_unlocked(src, count_eviction=True, next_phase=_SlotPhase.RELOCATING)
         self._free_slot_to_arena(src, sync_lease=True)
 
+    def _pick_reclaim_candidate_unlocked(
+        self, max_allowed_slot: int
+    ) -> tuple[_SlotState, tuple[int, int] | None, bool] | None:
+        while True:
+            while (
+                self._inflight_arena_frees > 0
+                and not self._closed
+                and not self._closing
+                and (not self._slots or max(self._slots) <= max_allowed_slot)
+            ):
+                self._op_cond.wait(timeout=0.05)
+            if self._closed or self._closing or not self._slots:
+                return None
+            top_id = max(self._slots)
+            if top_id <= max_allowed_slot:
+                return None
+            slot = self._slots[top_id]
+            if slot.phase is _SlotPhase.RELOCATING:
+                self._op_cond.wait(timeout=0.05)
+                continue
+            if slot.active_readers > 0 or slot.phase is _SlotPhase.STAGING:
+                return None
+            slot.phase = _SlotPhase.RELOCATING
+            candidate_key = slot.key
+            candidate_is_resident = (
+                candidate_key is not None and candidate_key in self._resident
+            )
+            return slot, candidate_key, candidate_is_resident
+
+    def _restore_frontier_slot_on_error(self, candidate: _SlotState) -> None:
+        with self._lock:
+            if candidate.slot_id in self._slots:
+                if (
+                    candidate.key is not None
+                    and self._lookup_slot_id_unlocked(candidate.key) == candidate.slot_id
+                ):
+                    candidate.phase = _SlotPhase.READY
+                else:
+                    candidate.key = None
+                    candidate.phase = _SlotPhase.EMPTY
+            self._op_cond.notify_all()
+
     def _reclaim_low_frontier(self, target_low_frontier: int) -> None:
         self._reap_pending_wave_releases()
         layout = self._layout
@@ -2075,55 +1818,23 @@ class ExpertSlabPool:
             return
         max_allowed_slot = (target_low_frontier // layout.slot_stride) - 1
         while True:
-            candidate: _SlotState | None = None
-            candidate_key: tuple[int, int] | None = None
-            candidate_is_resident = False
             with self._lock:
-                while (
-                    self._inflight_arena_frees > 0
-                    and not self._closed
-                    and not self._closing
-                ):
-                    if not self._slots or max(self._slots) <= max_allowed_slot:
-                        self._op_cond.wait(timeout=0.05)
-                        continue
-                    break
-                if self._closed or self._closing or not self._slots:
-                    return
-                top_id = max(self._slots)
-                if top_id <= max_allowed_slot:
-                    return
-                slot = self._slots[top_id]
-                if slot.active_readers > 0 or slot.phase in (
-                    _SlotPhase.STAGING,
-                    _SlotPhase.RELOCATING,
-                ):
-                    return
-                slot.phase = _SlotPhase.RELOCATING
-                candidate = slot
-                candidate_key = slot.key
-                candidate_is_resident = (
-                    candidate_key is not None and candidate_key in self._resident
-                )
-
-            assert candidate is not None
+                picked = self._pick_reclaim_candidate_unlocked(max_allowed_slot)
+            if picked is None:
+                return
+            candidate, candidate_key, candidate_is_resident = picked
             try:
-                if candidate_is_resident and candidate_key is not None and self._relocate_slot_to_lower(
-                    candidate, candidate_key, max_allowed_slot=max_allowed_slot
+                if (
+                    candidate_is_resident
+                    and candidate_key is not None
+                    and self._relocate_slot_to_lower(
+                        candidate, candidate_key, max_allowed_slot=max_allowed_slot
+                    )
                 ):
                     continue
                 self._evict_frontier_slot(candidate)
             except BaseException:
-                with self._lock:
-                    if candidate.slot_id in self._slots:
-                        if (
-                            candidate.key is not None
-                            and self._lookup_slot_id_unlocked(candidate.key) == candidate.slot_id
-                        ):
-                            candidate.phase = _SlotPhase.READY
-                        else:
-                            candidate.key = None
-                            candidate.phase = _SlotPhase.EMPTY
+                self._restore_frontier_slot_on_error(candidate)
                 raise
 
     def _teardown_resources(self, *, slots: Sequence[_SlotState] = ()) -> BaseException | None:
@@ -2138,7 +1849,9 @@ class ExpertSlabPool:
 
         for slot in slots:
             _capture(lambda s=slot: self._free_slot_to_arena(s, sync_lease=False))
-        if self._arena.is_open:
+        with self._lock:
+            remaining_slots = bool(self._slots)
+        if self._arena.is_open and not remaining_slots:
             reset_layout = self._layout if self._configured_fresh_layout else None
             _capture(
                 lambda: self._arena._release_low_owner(
@@ -2166,94 +1879,69 @@ class ExpertSlabPool:
             _capture(_release_ctx)
 
         with self._lock:
-            self._views = None
-            self._groups.clear()
-            self._total_registered_experts = 0
-            self._slots.clear()
-            self._resident.clear()
-            self._group_slot_maps.clear()
-            self._all_resident_tables.clear()
-            self._pending_wave_releases.clear()
             if first_err is None:
+                self._views = None
+                self._groups.clear()
+                self._total_registered_experts = 0
+                self._slots.clear()
+                self._resident.clear()
+                self._group_slot_maps.clear()
+                self._all_resident_tables.clear()
+                self._wave_releases.pending.clear()
                 self._closing = False
                 self._closed = True
         return first_err
 
-    def _synchronize_slots_for_close(
-        self,
-        slots: Sequence[_SlotState],
-        pending_by_slot: dict[int, list[_PendingWaveRelease]],
-    ) -> None:
-        for slot in slots:
-            slot_items = pending_by_slot.get(slot.slot_id)
-            if slot_items:
-                for item in slot_items:
-                    for end_stream in item.end_streams:
-                        _sync_interrupt_safe(end_stream.synchronize)
-            if slot.lease is not None:
-                lease = slot.lease
-                with slot.lease_lock:
-                    _sync_interrupt_safe(lease.synchronize_and_reset)
-            if slot_items:
-                del pending_by_slot[slot.slot_id]
-                with self._lock:
-                    slot.active_readers = max(0, slot.active_readers - len(slot_items))
-        for slot_id, slot_items in list(pending_by_slot.items()):
-            for item in slot_items:
-                for end_stream in item.end_streams:
-                    _sync_interrupt_safe(end_stream.synchronize)
-                _sync_interrupt_safe(item.release_stream.synchronize)
-            del pending_by_slot[slot_id]
-
     def close(self) -> None:
         """Synchronize pending CUDA/pin state, free arena low slots, and release all views."""
         with self._close_lock:
-            with self._lock:
-                if self._closed:
-                    return
-                pending_counts: dict[int, int] = {}
-                for item in self._pending_wave_releases:
-                    pending_counts[item.slot.slot_id] = (
-                        pending_counts.get(item.slot.slot_id, 0) + 1
-                    )
-                if (
-                    self._active_wave_sessions > 0
-                    or self._inflight_arena_allocs > 0
-                    or self._inflight_arena_frees > 0
-                    or self._inflight_wave_release_reaps > 0
-                    or any(
-                        s.active_readers > pending_counts.get(s.slot_id, 0)
-                        or s.phase in (_SlotPhase.STAGING, _SlotPhase.RELOCATING)
-                        for s in self._slots.values()
-                    )
-                ):
-                    raise RuntimeError(
-                        "Cannot close ExpertSlabPool while wave, staging, or relocation work is active."
-                    )
-                self._closing = True
-                slots = list(self._slots.values())
-                pending_by_slot: dict[int, list[_PendingWaveRelease]] = {}
-                while self._pending_wave_releases:
-                    item = self._pending_wave_releases.popleft()
-                    pending_by_slot.setdefault(item.slot.slot_id, []).append(item)
-                pending = deque(self._pending_pin_leases)
-                self._pending_pin_leases.clear()
-                copy_stream = (
-                    None
-                    if self._transfer_context is None
-                    else self._transfer_context.copy_stream
-                )
-
+            slots: list[_SlotState] = []
+            pending_by_slot: dict[int, list[_PendingWaveRelease]] = {}
+            pending: deque[tuple[torch.cuda.Event | None, PinLease]] = deque()
+            copy_stream: torch.cuda.Stream | None = None
+            entered_close = False
             try:
-                self._synchronize_slots_for_close(slots, pending_by_slot)
+                with self._lock:
+                    if self._closed:
+                        return
+                    pending_counts = self._wave_releases.pending_counts_unlocked()
+                    if (
+                        self._active_wave_sessions > 0
+                        or self._inflight_arena_allocs > 0
+                        or self._inflight_arena_frees > 0
+                        or self._wave_releases.inflight_reaps > 0
+                        or any(
+                            s.active_readers > pending_counts.get(s.slot_id, 0)
+                            or s.phase in (_SlotPhase.STAGING, _SlotPhase.RELOCATING)
+                            for s in self._slots.values()
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Cannot close ExpertSlabPool while wave, staging, or relocation work is active."
+                        )
+                    slots.extend(self._slots.values())
+                    copy_stream = (
+                        None
+                        if self._transfer_context is None
+                        else self._transfer_context.copy_stream
+                    )
+                    self._closing = True
+                    entered_close = True
+                    self._wave_releases.drain_by_slot_unlocked(out=pending_by_slot)
+                    pending.extend(self._pending_pin_leases)
+                    self._pending_pin_leases.clear()
+
+                self._wave_releases.synchronize_slots_for_close(slots, pending_by_slot)
                 _synchronize_pending_leases(pending, copy_stream)
             except BaseException:
-                # Keep _closing=True so half-reset READY slots cannot be re-entered; retryable via close().
-                with self._lock:
-                    for slot_items in pending_by_slot.values():
-                        self._pending_wave_releases.extend(slot_items)
-                    if pending:
-                        self._pending_pin_leases.extendleft(reversed(pending))
+                if entered_close:
+                    # Keep _closing=True so half-reset READY slots cannot be re-entered; retryable via close().
+                    with self._lock:
+                        self._wave_releases.restore_unlocked(pending_by_slot)
+                        while pending:
+                            item = pending.pop()
+                            if not any(existing is item for existing in self._pending_pin_leases):
+                                self._pending_pin_leases.appendleft(item)
                 raise
 
             err = self._teardown_resources(slots=slots)

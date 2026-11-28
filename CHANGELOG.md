@@ -7,6 +7,22 @@ All notable changes to Piper Offload are documented here. Versions follow the po
 
 ### Added
 
+- Added `KvChunkPool`, `KvBatch`, `KvChunkLocation`, and `KvPoolStats`
+  (exported from top-level `piper_offload`), along with Layer 1/substrate
+  additions `StreamLease.produce()` / `poll_d2h()`, descending
+  `Uint8DualArena` `high_max_slots` / `configure_high_slots(..., max_slots=...)`
+  / `alloc_high_slot(..., min_slot_id=...)` / `high_pool_view(..., field_offset=...)`,
+  and `PinManager.allocate_host_slab(...)` Tier 2a/2b host slab allocation.
+  `KvChunkPool` manages frozen immutable KV/state chunks on descending high
+  arena slots with invariant `arena_views`/`side_views` for one-time
+  `PiperKVChunkPool.from_tensors` binding under `torch.compile(fullgraph=True)`,
+  batched `produce()`, deduplicated prefix-sharing `waves()` (supporting
+  `>> VRAM` multi-wave `allow_split=True` streaming, single-wave
+  `allow_split=False` compaction, and `None` -> `-1` sentinels), write-once
+  async host spill (`spill()`, `spill_watermark`, `evict_to_host()`, `prefetch()`),
+  atomic `discard()` with async retire for in-flight D2H/H2D transfers,
+  TP-safe `ArenaCapacityError` on host RAM exhaustion, and bidirectional
+  frontier coordination with `ExpertSlabPool`.
 - Added `ExpertSlabPool`, `ExpertWave`, `ExpertPoolStats`, and `SlotSchema`
   (exported from top-level `piper_offload` alongside `Uint8DualArena` and
   `ArenaCapacityError`; descriptor/layout types `ArenaFieldSpec`, `SideFieldSpec`,

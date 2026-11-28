@@ -2702,7 +2702,7 @@ def test_bounce_ring_publish_eviction_exception_cleans_creating_ring(
     backend: FakeBackend, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = PinManager(
-        256 * 1024,
+        512 * 1024,
         bounce_bytes=128 * 1024,
         bounce_slot_bytes=64 * 1024,
         min_bounce_bytes=64 * 1024,
@@ -2713,6 +2713,7 @@ def test_bounce_ring_publish_eviction_exception_cleans_creating_ring(
         pass
 
     orig_evict = manager._evict_idle_for_budget
+    orig_create = manager._create_bounce_ring
     evict_calls = 0
 
     def fail_on_publish_evict(
@@ -2720,13 +2721,19 @@ def test_bounce_ring_publish_eviction_exception_cleans_creating_ring(
     ) -> bool:
         nonlocal evict_calls
         evict_calls += 1
-        # First call frees space in _compute_bounce_target_bytes; inject error if called during publish,
-        # or on the very first eviction when total > budget.
         raise RuntimeError("injected publish eviction error")
 
-    # Force total_bounce + in_place > budget while bypassing _compute_bounce_target_bytes eviction.
-    orig_compute = manager._compute_bounce_target_bytes
-    monkeypatch.setattr(manager, "_compute_bounce_target_bytes", lambda: (True, 128 * 1024))
+    # Shrink budget after ring creation so _publish_loop must evict and hit the injected error.
+    def shrink_after_create(*, track_creating: bool = False):  # type: ignore[no-untyped-def]
+        ring = orig_create(track_creating=track_creating)
+        if ring is not None:
+            with manager._lock:
+                manager._max_pinned_bytes = 256 * 1024
+                manager._ledger.max_pinned_bytes = 256 * 1024
+                manager._pin_budget_epoch += 1
+        return ring
+
+    monkeypatch.setattr(manager, "_create_bounce_ring", shrink_after_create)
     monkeypatch.setattr(manager, "_evict_idle_for_budget", fail_on_publish_evict)
     with pytest.raises(RuntimeError, match="injected publish eviction error"), manager._use_bounce_ring():
         pass
@@ -2735,7 +2742,7 @@ def test_bounce_ring_publish_eviction_exception_cleans_creating_ring(
     assert manager._resources.bounce_ring is None
     assert not manager._bounce_creating
     assert manager.stats.bounce_bytes == 0
-    monkeypatch.setattr(manager, "_compute_bounce_target_bytes", orig_compute)
+    monkeypatch.setattr(manager, "_create_bounce_ring", orig_create)
     monkeypatch.setattr(manager, "_evict_idle_for_budget", orig_evict)
     manager.clear()
     assert backend.registered == {}

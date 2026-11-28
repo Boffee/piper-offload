@@ -8,8 +8,8 @@ decisions controlled by independent budgets.
 | What is retained | Control | What it accounts for |
 |---|---|---|
 | Models and adapters | [Cache budget and eviction](models.md#releasing-and-inspecting-resources) | Logical backing bytes in cached stores |
-| Tier 2a pinned memory & CUDA/HIP registrations | `host_pin_manager.max_pinned_bytes` | In-place registered OS pages, Tier 2a pinned checkpoint slabs, and `PinnedBounceRing` reservations |
-| Combined Tier 2a + Tier 2b managed host memory | `host_pin_manager.max_host_bytes` | Pinned bytes plus Tier 2b private pageable overflow slabs holding evicted checkpoint copies |
+| Tier 2a pinned memory & CUDA/HIP registrations | `host_pin_manager.max_pinned_bytes` | In-place registered OS pages, Tier 2a pinned checkpoint and caller-owned host slabs, and `PinnedBounceRing` reservations |
+| Combined Tier 2a + Tier 2b managed host memory | `host_pin_manager.max_host_bytes` | Pinned bytes plus Tier 2b private pageable overflow slabs holding evicted checkpoint copies and caller-owned host slabs |
 
 These are not limits on total process RSS. Unpinned file mappings and
 allocations outside the managed arenas remain under OS page-cache management.
@@ -77,7 +77,7 @@ print(host_pin_manager.stats)
 | Measurement | Meaning |
 |---|---|
 | `pinned_bytes` | In-place registered OS pages + `copy_bytes` + `bounce_bytes` |
-| `copy_bytes` | Reserved Tier 2a pinned slab arena bytes for checkpoint copies |
+| `copy_bytes` | Reserved Tier 2a pinned slab arena bytes for checkpoint copies and caller-owned host slabs |
 | `bounce_bytes` | Reserved `PinnedBounceRing` bytes for pipelined CUDA transfers |
 | `private_copy_bytes` | Reserved Tier 2b private pageable slab arena bytes |
 | `max_pinned_bytes` / `max_host_bytes` | Configured Tier 2a pin ceiling / combined Tier 2a + Tier 2b host ceiling |
@@ -95,8 +95,12 @@ retires its entry and trims empty slabs once active leases close.
 
 `host_pin_manager.clear()` unregisters idle in-place registrations, releases all
 idle Tier 2a and Tier 2b copies, trims empty slabs, and closes the bounce ring,
-while keeping active leases valid. Bytes remaining after `clear()` belong to
-active leases or retained failed unregistrations.
+while keeping active leases valid. Bytes remaining after `clear()` belong to active leases, caller-owned
+`ArenaAllocation`s (such as spilled `KvChunkPool` chunks), queued discard
+allocations still waiting on pending async D2H or H2D transfers, or retained
+failed unregistrations — discard spilled chunks, close pools (or reap after
+pending transfers finish), or release standalone allocations before calling
+`clear()` if those slabs should be reclaimed.
 
 ## Preserve checkpoint backing
 
@@ -149,6 +153,10 @@ stays untouched:
    `FILE_FLAG_NO_BUFFERING` on Windows, with automatic coalescing and buffered
    `preadv` fallback on filesystems such as `tmpfs`). Evicting an idle copy for
    another tensor reuses the existing registered slab without unregistration.
+   Caller-managed spill pools such as `KvChunkPool` also allocate write-once
+   Tier 2a/2b slabs through `PinManager.allocate_host_slab(...)` under the same
+   shared `max_pinned_bytes` and `max_host_bytes` ceilings (returning `None`
+   rather than dropping data when budgets remain exhausted after idle eviction).
 2. **Tier 2b private overflow arena:** When pin-budget pressure or capacity
    retry evicts an idle Tier 2a copy, the manager copies it into a private
    pageable `HostSlabArena` bounded under `max_host_bytes - pinned_bytes` (so
