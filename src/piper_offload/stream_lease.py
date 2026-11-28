@@ -1,6 +1,7 @@
 """Stream-ordered CUDA buffer lifetime and reader/writer synchronization."""
 
-from collections.abc import Callable
+import contextlib
+from collections.abc import Callable, Iterator
 from typing import cast
 
 import torch
@@ -12,20 +13,16 @@ def _record_event(stream: torch.cuda.Stream) -> torch.cuda.Event:
 
 
 class StreamLease:
-    """Coordinate asynchronous H2D, compute, and D2H ordering on CUDA memory.
+    """Coordinate asynchronous writer/reader stream ordering on CUDA memory.
 
     Invariants:
-    - At most one writer may stage into (or produce onto) the leased memory at a
-      time, only after all prior consumers (``_release_events``,
-      ``_recorded_streams``) and any pending D2H copy (``_d2h_event``) are
-      ordered ahead of the write stream.
+    - At most one writer may populate leased storage at a time via
+      :meth:`write` or :meth:`stage_with`, ordered after the allocation stream,
+      prior ready event, and all prior consumers (``_release_events`` and
+      ``_recorded_streams``).
     - Concurrent read-only consumers may hold overlapping acquisitions
       (``exclusive=False``) once ``_staged`` is true, whereas exclusive users
       require sole access (``exclusive=True``).
-    - GPU-born writes via ``produce_with()`` become readable once completed, may
-      spill once to host via ``spill_to_host()``, and must complete ``wait_d2h()``
-      or be explicitly discarded via ``discard_dirty()`` before the buffer can be
-      overwritten or freed.
     - ``synchronize_and_reset()`` leaves state intact on interruption so a
       subsequent call retries safely without leaking unsynchronized work.
     """
@@ -34,16 +31,13 @@ class StreamLease:
         self._allocation_stream = allocation_stream
         self._ready_event: torch.cuda.Event | None = None
         self._staged = False
+        self._writing = False
         self._acquired_count = 0
         self._exclusive = False
         self._stream_readers: dict[torch.cuda.Stream, int] = {}
         self._recorded_streams: set[torch.cuda.Stream] = set()
         self._release_events: dict[torch.cuda.Stream, torch.cuda.Event] = {}
         self._waited_streams: set[torch.cuda.Stream] = set()
-        self._dirty = False
-        self._d2h_event: torch.cuda.Event | None = None
-        self._d2h_fallback_stream: torch.cuda.Stream | None = None
-        self._d2h_succeeded = False
 
     @property
     def allocation_stream(self) -> torch.cuda.Stream:
@@ -52,7 +46,7 @@ class StreamLease:
 
     @property
     def is_staged(self) -> bool:
-        """Return whether the latest H2D stage or GPU-born write succeeded."""
+        """Return whether the latest write or stage completed without error."""
         return self._staged
 
     @property
@@ -65,25 +59,11 @@ class StreamLease:
         """Return the number of active acquisitions on this lease."""
         return self._acquired_count
 
-    @property
-    def is_dirty(self) -> bool:
-        """Return whether GPU-born contents have not yet finished spilling/discarding."""
-        return self._dirty
-
-    @property
-    def d2h_in_flight(self) -> bool:
-        """Return whether a write-once D2H spill is pending completion."""
-        return self._d2h_event is not None or self._d2h_fallback_stream is not None
-
     def _wait_prior_dependencies(self, stream: torch.cuda.Stream) -> None:
         if self._ready_event is not None:
             stream.wait_event(self._ready_event)
         elif stream != self._allocation_stream:
             stream.wait_stream(self._allocation_stream)
-        if self._d2h_event is not None:
-            stream.wait_event(self._d2h_event)
-        if self._d2h_fallback_stream is not None and self._d2h_fallback_stream != stream:
-            stream.wait_stream(self._d2h_fallback_stream)
         for recorded, event in self._release_events.items():
             if recorded != stream:
                 stream.wait_event(event)
@@ -96,56 +76,39 @@ class StreamLease:
             stream.wait_event(self._ready_event)
             self._waited_streams.add(stream)
 
-    def _record_ready_event(
-        self,
-        stream: torch.cuda.Stream,
-        *,
-        clear_d2h: bool = False,
-    ) -> None:
+    def _record_ready_event(self, stream: torch.cuda.Stream) -> None:
         try:
             event = _record_event(stream)
         except BaseException:
             self._recorded_streams.add(stream)
             raise
         self._ready_event = event
-        if clear_d2h:
-            self._d2h_event = None
-            self._d2h_fallback_stream = None
         self._release_events.clear()
         self._recorded_streams.clear()
 
-    def _run_write(
-        self,
-        write_fn: Callable[[], None],
-        stream: torch.cuda.Stream,
-        *,
-        mark_dirty: bool,
-    ) -> None:
-        action = "produced" if mark_dirty else "staged"
+    @contextlib.contextmanager
+    def write(self, stream: torch.cuda.Stream) -> Iterator[None]:
+        """Order ``stream`` after prior users for a single exclusive write."""
+        if self._writing:
+            raise RuntimeError("StreamLease cannot be written while a write is active")
         if self._acquired_count > 0:
-            raise RuntimeError(f"StreamLease cannot be {action} while it is in use")
-        if self._dirty:
-            raise RuntimeError(
-                "Dirty GPU-produced StreamLease must be spilled or discarded before restaging"
-            )
-        if self.d2h_in_flight:
-            raise RuntimeError(
-                f"StreamLease cannot be {action} while a D2H spill is pending"
-            )
-        self._staged = False
-        self._waited_streams.clear()
-        self._d2h_succeeded = False
-        self._wait_prior_dependencies(stream)
+            raise RuntimeError("StreamLease cannot be written while it is in use")
         try:
-            with torch.cuda.stream(stream):
-                write_fn()
-        except BaseException:
-            self._record_ready_event(stream, clear_d2h=True)
-            raise
-        self._record_ready_event(stream, clear_d2h=True)
-        if mark_dirty:
-            self._dirty = True
-        self._staged = True
+            self._staged = False
+            self._writing = True
+            self._waited_streams.clear()
+            self._wait_prior_dependencies(stream)
+            self._recorded_streams.add(stream)
+            try:
+                with torch.cuda.stream(stream):
+                    yield
+            except BaseException:
+                self._record_ready_event(stream)
+                raise
+            self._record_ready_event(stream)
+            self._staged = True
+        finally:
+            self._writing = False
 
     def stage_with(
         self,
@@ -153,15 +116,8 @@ class StreamLease:
         stream: torch.cuda.Stream,
     ) -> None:
         """Order ``stream`` after prior users and run ``copy_fn`` to populate storage."""
-        self._run_write(copy_fn, stream, mark_dirty=False)
-
-    def produce_with(
-        self,
-        write_fn: Callable[[], None],
-        stream: torch.cuda.Stream,
-    ) -> None:
-        """Order ``stream`` after prior users, run GPU-born ``write_fn``, and mark dirty."""
-        self._run_write(write_fn, stream, mark_dirty=True)
+        with self.write(stream):
+            copy_fn()
 
     def acquire(
         self,
@@ -170,22 +126,23 @@ class StreamLease:
         exclusive: bool = False,
     ) -> None:
         """Order ``stream`` after the ready event and register a lease holder."""
+        if self._writing:
+            raise RuntimeError("StreamLease cannot be acquired while a write is active")
         if not self._staged:
             raise RuntimeError("StreamLease must be staged before acquire()")
-        if exclusive and self.d2h_in_flight:
-            raise RuntimeError(
-                "StreamLease cannot be exclusively acquired while a D2H spill is in flight"
-            )
         if self._exclusive or (exclusive and self._acquired_count > 0):
             raise RuntimeError("StreamLease is already acquired")
         prev_count = self._acquired_count
         prev_exclusive = self._exclusive
-        prev_stream_count = self._stream_readers.get(stream, 0)
-        self._acquired_count = prev_count + 1
-        if exclusive:
-            self._exclusive = True
-        self._stream_readers[stream] = prev_stream_count + 1
+        prev_stream_count = 0 if prev_count == 0 else self._stream_readers.get(stream, 0)
+        if prev_count == 0:
+            self._stream_readers.clear()
+            self._exclusive = False
         try:
+            self._acquired_count = prev_count + 1
+            if exclusive:
+                self._exclusive = True
+            self._stream_readers[stream] = prev_stream_count + 1
             self.record_stream(stream)
         except BaseException:
             self._acquired_count = prev_count
@@ -208,13 +165,8 @@ class StreamLease:
         if self._acquired_count == 0:
             return
         if stream is not None:
-            if self._stream_readers:
-                if stream not in self._stream_readers:
-                    raise ValueError("Stream has not acquired this StreamLease")
-            elif stream not in self._recorded_streams:
-                raise ValueError(
-                    "Stream has not acquired or been recorded on this StreamLease"
-                )
+            if stream not in self._stream_readers:
+                raise ValueError("Stream has not acquired this StreamLease")
             stream_count = self._stream_readers.get(stream, 0)
             if self._acquired_count > 1:
                 if stream_count > 1:
@@ -232,67 +184,16 @@ class StreamLease:
             recorded_stream = next(iter(self._recorded_streams))
             self._release_events[recorded_stream] = _record_event(recorded_stream)
             self._recorded_streams.remove(recorded_stream)
-        self._acquired_count = 0
         self._exclusive = False
         self._stream_readers.clear()
-
-    def spill_to_host(
-        self,
-        copy_fn: Callable[[], None],
-        d2h_stream: torch.cuda.Stream,
-    ) -> None:
-        """Launch a write-once asynchronous D2H copy on ``d2h_stream``."""
-        if not self._dirty:
-            raise RuntimeError("StreamLease has no dirty GPU data to spill")
-        if self.d2h_in_flight:
-            raise RuntimeError("StreamLease D2H spill has already been started")
-        if self._exclusive:
-            raise RuntimeError("StreamLease cannot spill while exclusively acquired")
-        self._d2h_succeeded = False
-        if self._ready_event is not None:
-            d2h_stream.wait_event(self._ready_event)
-        elif d2h_stream != self._allocation_stream:
-            d2h_stream.wait_stream(self._allocation_stream)
-        try:
-            with torch.cuda.stream(d2h_stream):
-                copy_fn()
-        except BaseException:
-            try:
-                self._d2h_event = _record_event(d2h_stream)
-            except BaseException:
-                self._d2h_fallback_stream = d2h_stream
-            raise
-        try:
-            self._d2h_event = _record_event(d2h_stream)
-        except BaseException:
-            self._d2h_fallback_stream = d2h_stream
-            raise
-        self._d2h_succeeded = True
-
-    def wait_d2h(self) -> None:
-        """Wait for any pending D2H spill to finish and clear dirty only on success."""
-        if self._d2h_event is not None:
-            self._d2h_event.synchronize()
-            self._d2h_event = None
-        if self._d2h_fallback_stream is not None:
-            self._d2h_fallback_stream.synchronize()
-            self._d2h_fallback_stream = None
-        if self._d2h_succeeded:
-            self._dirty = False
-            self._d2h_succeeded = False
-
-    def discard_dirty(self) -> None:
-        """Drop dirty GPU-born contents cleanly without leaking in-flight D2H writes."""
-        if self._acquired_count > 0:
-            raise RuntimeError("StreamLease cannot be discarded while it is in use")
-        self.wait_d2h()
-        self._dirty = False
-        self._d2h_succeeded = False
-        self._staged = False
+        self._acquired_count = 0
 
     def synchronize_and_reset(self) -> None:
-        """Synchronize every pending D2H, ready, consumer, and allocation stream."""
-        self.wait_d2h()
+        """Synchronize every pending ready, consumer, and allocation stream."""
+        if self._writing:
+            raise RuntimeError(
+                "StreamLease cannot be synchronized or reset while a write is active"
+            )
         if self._ready_event is not None:
             self._ready_event.synchronize()
             self._ready_event = None
@@ -308,8 +209,7 @@ class StreamLease:
         self._exclusive = False
         self._stream_readers.clear()
         self._staged = False
-        self._dirty = False
-        self._d2h_succeeded = False
+        self._writing = False
         self._waited_streams.clear()
 
 

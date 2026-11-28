@@ -28,10 +28,9 @@ from piper_offload import (
 )
 from piper_offload.dual_arena import (
     ArenaFieldSpec,
-    KvMetadataPool,
+    HighSlotLayout,
     LowSlotLayout,
     SideFieldSpec,
-    StructuredSidePool,
     TypedSidePool,
 )
 from piper_offload.stream_lease import StreamLease
@@ -146,17 +145,14 @@ def test_top_level_exports_expose_user_coordination_types_only() -> None:
     submodule_only_names = {
         "ArenaBindableTensorAdapter",
         "ArenaFieldSpec",
-        "ArenaSlice",
         "BudgetTenantHandle",
         "BufferSpec",
         "GpuAllocator",
         "HighSlotLayout",
-        "KvMetadataPool",
         "LowSlotLayout",
         "SideFieldSpec",
         "SliceableTensorAdapter",
         "StreamLease",
-        "StructuredSidePool",
         "TypedSidePool",
     }
     assert top_all.isdisjoint(submodule_only_names)
@@ -256,67 +252,41 @@ def test_stream_lease_acquire_rolls_back_on_wait_event_failure(
     lease.synchronize_and_reset()
 
 
-def test_stream_lease_gpu_born_produce_with_write_once_d2h_and_failure_retry(
+def test_stream_lease_write_guards_and_interrupt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, fake_stream_cls = _make_fake_stream_types()
     alloc_stream = fake_stream_cls()
     compute_stream = fake_stream_cls()
-    d2h_stream = fake_stream_cls()
+    reader_stream = fake_stream_cls()
+    failing_writer = fake_stream_cls(record_failures=1)
     lease = StreamLease(cast(torch.cuda.Stream, alloc_stream))
     monkeypatch.setattr(torch.cuda, "stream", lambda _s: contextlib.nullcontext())
 
-    # Partial write failure still captures ready event for sync without setting dirty/staged.
-    with pytest.raises(Interrupt):
-        lease.produce_with(
-            lambda: (_ for _ in ()).throw(Interrupt),
-            cast(torch.cuda.Stream, compute_stream),
-        )
-    assert compute_stream.waited_streams == [alloc_stream]
-    assert len(compute_stream.events) == 1
-    assert not lease.is_dirty
-    assert not lease.is_staged
-
-    lease.produce_with(lambda: None, cast(torch.cuda.Stream, compute_stream))
-    assert lease.is_dirty
+    with lease.write(cast(torch.cuda.Stream, compute_stream)):
+        with pytest.raises(RuntimeError, match="write is active"):
+            with lease.write(cast(torch.cuda.Stream, compute_stream)):
+                pass
+        with pytest.raises(RuntimeError, match="write is active"):
+            lease.stage_with(lambda: None, cast(torch.cuda.Stream, compute_stream))
+        with pytest.raises(RuntimeError, match="write is active"):
+            lease.acquire(cast(torch.cuda.Stream, reader_stream))
+        with pytest.raises(RuntimeError, match="write is active"):
+            lease.synchronize_and_reset()
     assert lease.is_staged
 
-    with pytest.raises(RuntimeError, match="Dirty"):
-        lease.produce_with(lambda: None, cast(torch.cuda.Stream, compute_stream))
-    with pytest.raises(RuntimeError, match="Dirty"):
-        lease.stage_with(lambda: None, cast(torch.cuda.Stream, compute_stream))
-
-    def fail_d2h() -> None:
-        raise Interrupt
-
+    # Interrupt inside write() while record_event also fails still retains writer stream for sync.
     with pytest.raises(Interrupt):
-        lease.spill_to_host(fail_d2h, cast(torch.cuda.Stream, d2h_stream))
-    assert lease.d2h_in_flight
-    # Failed spill still syncs partial D2H event on wait_d2h(), but keeps is_dirty=True.
-    lease.wait_d2h()
-    assert not lease.d2h_in_flight
-    assert lease.is_dirty
-    assert d2h_stream.events[-1].synchronize_calls == 1
-
-    lease.spill_to_host(lambda: None, cast(torch.cuda.Stream, d2h_stream))
-    assert lease.d2h_in_flight
-    with pytest.raises(RuntimeError, match="already been started"):
-        lease.spill_to_host(lambda: None, cast(torch.cuda.Stream, d2h_stream))
-
-    lease.wait_d2h()
-    assert not lease.d2h_in_flight
-    assert not lease.is_dirty
-
-    lease.produce_with(lambda: None, cast(torch.cuda.Stream, compute_stream))
-    lease.discard_dirty()
-    assert not lease.is_dirty
+        with lease.write(cast(torch.cuda.Stream, failing_writer)):
+            raise Interrupt("aborted during kernel launch")
     assert not lease.is_staged
+    assert cast(torch.cuda.Stream, failing_writer) in lease._recorded_streams
     lease.synchronize_and_reset()
-    assert compute_stream.events[0].synchronize_calls == 0
-    assert compute_stream.events[-1].synchronize_calls == 1
+    assert failing_writer.synchronize_calls == 1
+    assert alloc_stream.synchronize_calls == 1
 
 
-def test_stream_lease_d2h_fallback_stream_exclusive_guard_and_sync_retry(
+def test_stream_lease_release_retry_and_sync_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, fake_stream_cls = _make_fake_stream_types()
@@ -335,29 +305,9 @@ def test_stream_lease_d2h_fallback_stream_exclusive_guard_and_sync_retry(
     alloc_stream = FlakySyncStream(sync_failures=1)
     compute_stream = FlakySyncStream()
     reader_stream = FlakySyncStream()
-    d2h_stream = FlakySyncStream(record_failures=2)
+    flaky_rec_stream = FlakySyncStream(record_failures=1)
     lease = StreamLease(cast(torch.cuda.Stream, alloc_stream))
     monkeypatch.setattr(torch.cuda, "stream", lambda _s: contextlib.nullcontext())
-
-    # If both copy_fn or _record_event fail, d2h_fallback_stream keeps d2h_in_flight=True
-    # so wait_d2h() and discard_dirty() still synchronize d2h_stream on the host.
-    lease.produce_with(lambda: None, cast(torch.cuda.Stream, compute_stream))
-    with pytest.raises(Interrupt):
-        lease.spill_to_host(lambda: None, cast(torch.cuda.Stream, d2h_stream))
-    assert lease.d2h_in_flight
-    with pytest.raises(RuntimeError, match="exclusively acquired while a D2H"):
-        lease.acquire(cast(torch.cuda.Stream, reader_stream), exclusive=True)
-    with pytest.raises(RuntimeError, match="D2H spill is pending"):
-        lease._d2h_succeeded = True
-        lease._dirty = False
-        lease.stage_with(lambda: None, cast(torch.cuda.Stream, compute_stream))
-
-    lease._dirty = True
-    lease._d2h_succeeded = False
-    lease.discard_dirty()
-    assert d2h_stream.synchronize_calls == 1
-    assert not lease.d2h_in_flight
-    assert not lease.is_dirty
 
     # Nested same-stream non-exclusive acquire decrements reader_count step by step.
     lease.stage_with(lambda: None, cast(torch.cuda.Stream, compute_stream))
@@ -367,6 +317,15 @@ def test_stream_lease_d2h_fallback_stream_exclusive_guard_and_sync_retry(
     lease.release(cast(torch.cuda.Stream, reader_stream))
     assert lease.is_acquired
     assert lease.reader_count == 1
+    lease.release(cast(torch.cuda.Stream, reader_stream))
+    assert not lease.is_acquired
+
+    # Release retry when an earlier release recorded some streams and raised on another.
+    lease.acquire(cast(torch.cuda.Stream, reader_stream), exclusive=False)
+    lease.record_stream(cast(torch.cuda.Stream, flaky_rec_stream))
+    with pytest.raises(Interrupt):
+        lease.release()
+    assert lease.is_acquired
     lease.release(cast(torch.cuda.Stream, reader_stream))
     assert not lease.is_acquired
 
@@ -383,24 +342,20 @@ def test_stream_lease_d2h_fallback_stream_exclusive_guard_and_sync_retry(
 
 
 @CUDA
-def test_stream_lease_cuda_gpu_born_spill_and_concurrent_readers() -> None:
+def test_stream_lease_cuda_write_and_concurrent_readers() -> None:
     device = torch.device("cuda")
     alloc_stream = torch.cuda.current_stream(device)
     compute_stream = torch.cuda.Stream(device=device)
     reader_stream_a = torch.cuda.Stream(device=device)
     reader_stream_b = torch.cuda.Stream(device=device)
-    d2h_stream = torch.cuda.Stream(device=device)
 
     gpu_buf = torch.empty((256,), dtype=torch.float32, device=device)
-    host_buf = torch.empty((256,), dtype=torch.float32, pin_memory=True)
     expected = torch.arange(256, dtype=torch.float32) * 1.5
     lease = StreamLease(alloc_stream)
     try:
-        def write_gpu() -> None:
+        with lease.write(compute_stream):
             gpu_buf.copy_(torch.arange(256, dtype=torch.float32, device=device) * 1.5)
-
-        lease.produce_with(write_gpu, compute_stream)
-        assert lease.is_dirty
+        assert lease.is_staged
 
         lease.acquire(reader_stream_a, exclusive=False)
         lease.acquire(reader_stream_b, exclusive=False)
@@ -410,20 +365,19 @@ def test_stream_lease_cuda_gpu_born_spill_and_concurrent_readers() -> None:
         with torch.cuda.stream(reader_stream_b):
             read_b = gpu_buf * 2.0
 
-        lease.spill_to_host(
-            lambda: host_buf.copy_(gpu_buf, non_blocking=True),
-            d2h_stream,
-        )
         lease.release(reader_stream_a)
         lease.release(reader_stream_b)
-        lease.wait_d2h()
-        assert not lease.is_dirty
+
+        # Overwrite on compute_stream after readers released must wait for both readers.
+        with lease.write(compute_stream):
+            gpu_buf.zero_()
 
         reader_stream_a.synchronize()
         reader_stream_b.synchronize()
-        torch.testing.assert_close(host_buf, expected, rtol=0, atol=0)
+        compute_stream.synchronize()
         torch.testing.assert_close(read_a.cpu(), expected, rtol=0, atol=0)
         torch.testing.assert_close(read_b.cpu(), expected * 2.0, rtol=0, atol=0)
+        torch.testing.assert_close(gpu_buf.cpu(), torch.zeros(256), rtol=0, atol=0)
     finally:
         lease.synchronize_and_reset()
 
@@ -1322,11 +1276,11 @@ def test_no_record_trace_isolates_mtp_draft_history() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Uint8DualArena, TypedSidePool, StructuredSidePool, KvMetadataPool
+# Uint8DualArena & TypedSidePool
 # ---------------------------------------------------------------------------
 
 
-def test_dual_arena_low_coalescing_blocking_slices_and_high_descending() -> None:
+def test_dual_arena_budget_validation_and_close() -> None:
     budget = VramBudget(4096 + 256)
     evict_calls: list[int] = []
     budget.register_tenant(
@@ -1342,7 +1296,9 @@ def test_dual_arena_low_coalescing_blocking_slices_and_high_descending() -> None
     with pytest.raises(ValueError, match="power of two"):
         Uint8DualArena(4096, device="cpu", alignment=48)
 
-    arena = Uint8DualArena(4096, device="cpu", slot_bytes=1024, alignment=256, budget=budget)
+    arena = Uint8DualArena(
+        4096, device="cpu", slot_bytes=1024, low_slot_bytes=1024, alignment=256, budget=budget
+    )
     assert budget.reserved_bytes == arena.allocated_bytes
     assert arena.slot_layout is not None
     assert arena.slot_layout.max_slots == 4
@@ -1354,28 +1310,10 @@ def test_dual_arena_low_coalescing_blocking_slices_and_high_descending() -> None
     assert arena.high_frontier == 2048
     assert arena.high_slot_tensor(s3).data_ptr() % 256 == 0
 
-    a = arena.alloc_low(100, tag="w0")  # [0, 256)
-    b = arena.alloc_low(300, tag="w1")  # [256, 768)
-    assert a.tensor.data_ptr() % 256 == 0
-    assert b.tensor.data_ptr() % 256 == 0
-    assert (a.offset, a.aligned_size) == (0, 256)
-    assert (b.offset, b.aligned_size) == (256, 512)
-    assert arena.low_frontier == 768
-
-    with pytest.raises(ArenaCapacityError):
-        arena.alloc_low(1281, tag="too_big")
-
-    arena.free_low(a)
-    assert arena.low_frontier == 768
-    arena.free_low(b)
-    assert arena.low_frontier == 0
-
     arena.free_high_slot(s3)
     assert arena.alloc_high_slot() == 3
-
-    low0 = arena.alloc_low(900, tag="moe0")
-    assert arena.overlapping_low_slices(0) == (low0,)
-    assert arena.blocking_low_slices(0) == (low0,)
+    low0 = arena.alloc_low_slot()
+    assert low0 == 0
     assert arena.alloc_high_slot() == 1
     with pytest.raises(ArenaCapacityError):
         arena.alloc_high_slot()
@@ -1383,34 +1321,9 @@ def test_dual_arena_low_coalescing_blocking_slices_and_high_descending() -> None
     arena.close()
     assert budget.reserved_bytes == 0
     assert arena.available_high_slots == 0
+    assert arena.available_low_slots == 0
     assert arena.free_gap_bytes == 0
     assert not arena.is_open
-
-
-def test_dual_arena_blocking_ranges_and_slice_validation() -> None:
-    small_arena = Uint8DualArena(1024, device="cpu", slot_bytes=256, alignment=256)
-    s_low_a = small_arena.alloc_low(100, tag="h")  # [0, 256)
-    s_low_b = small_arena.alloc_low(100, tag="p")  # [256, 512)
-    assert small_arena.overlapping_low_slices_in_range(100, 100) == ()
-    with pytest.raises(ValueError, match=">="):
-        small_arena.overlapping_low_slices_in_range(200, 100)
-    with pytest.raises(ValueError, match="non-negative integer"):
-        small_arena.overlapping_low_slices_in_range(False, 10)  # type: ignore[arg-type]
-
-    with pytest.raises(ValueError, match="non-negative"):
-        s_low_a.as_uint8((-1, 4))
-    assert tuple(s_low_a.as_uint8(d for d in (2, 50)).shape) == (2, 50)
-    assert tuple(s_low_a.as_uint8(()).shape) == ()
-
-    small_arena.free_low(s_low_a)
-    with pytest.raises(RuntimeError, match="released"):
-        _ = s_low_a.tensor
-    assert not s_low_a.is_active
-    assert small_arena.overlapping_low_slices(0) == ()
-    assert small_arena.blocking_low_slices(0) == (s_low_b,)
-    s_low_b.release()
-    assert small_arena.blocking_low_slices(0) == ()
-    small_arena.close()
 
 
 def test_slot_schema_validation_and_alignment() -> None:
@@ -1462,23 +1375,18 @@ def test_symmetric_low_slots_and_views() -> None:
     with pytest.raises(ArenaCapacityError):
         Uint8DualArena(2048, device="cpu", low_slot_bytes=768, low_max_slots=3, alignment=256)
 
-    # Reject fixed low slot configuration while variable alloc_low slices are active; allow once freed.
-    with Uint8DualArena(2048, device="cpu", alignment=256) as mixed_arena:
+    with Uint8DualArena(2048, device="cpu", alignment=256) as unconfigured:
         for fn in (
-            mixed_arena.alloc_low_slot,
-            lambda: mixed_arena.free_low_slot(0),
-            lambda: mixed_arena.low_slot_tensor(0),
-            lambda: mixed_arena.low_pool_view((64,)),
+            unconfigured.alloc_low_slot,
+            lambda: unconfigured.free_low_slot(0),
+            lambda: unconfigured.low_slot_tensor(0),
+            lambda: unconfigured.low_pool_view((64,)),
         ):
             with pytest.raises(RuntimeError, match="not configured"):
                 fn()
-        var_slc = mixed_arena.alloc_low(128)
-        with pytest.raises(RuntimeError, match="while low allocations are active"):
-            mixed_arena.configure_low_slots(256)
-        var_slc.release()
-        mixed_arena.configure_low_slots(256, max_slots=4)
-        assert mixed_arena.low_slot_layout is not None
-        assert mixed_arena.low_slot_layout.max_slots == 4
+        unconfigured.configure_low_slots(256, max_slots=4)
+        assert unconfigured.low_slot_layout is not None
+        assert unconfigured.low_slot_layout.max_slots == 4
 
     with Uint8DualArena(
         2048,
@@ -1490,8 +1398,6 @@ def test_symmetric_low_slots_and_views() -> None:
         assert isinstance(arena.low_slot_layout, LowSlotLayout)
         assert arena.low_slot_layout.max_slots == 2
         assert arena.available_low_slots == 2
-        with pytest.raises(RuntimeError, match="fixed low slots"):
-            arena.alloc_low(64)
 
         low0 = arena.alloc_low_slot()
         low1 = arena.alloc_low_slot(max_slot_id=1)
@@ -1524,6 +1430,111 @@ def test_symmetric_low_slots_and_views() -> None:
             arena.low_pool_view((4,), field_offset=8)
 
 
+def test_symmetric_high_slots_limits_and_views() -> None:
+    with pytest.raises(ValueError, match="requires slot_bytes"):
+        Uint8DualArena(2048, device="cpu", high_max_slots=2)
+    with pytest.raises(ArenaCapacityError):
+        Uint8DualArena(2048, device="cpu", slot_bytes=768, high_max_slots=3, alignment=256)
+
+    with Uint8DualArena(2048, device="cpu", alignment=256) as arena:
+        arena.configure_high_slots(512, max_slots=3)
+        assert isinstance(arena.slot_layout, HighSlotLayout)
+        assert arena.high_slot_layout is arena.slot_layout
+        assert arena.slot_layout.max_slots == 3
+        assert arena.available_high_slots == 3
+
+        s2 = arena.alloc_high_slot()
+        s1 = arena.alloc_high_slot()
+        assert (s2, s1) == (2, 1)
+        assert arena.active_high_slots == (2, 1)
+        assert arena.available_high_slots == 1
+        # Freeing hole s2 keeps frontier at s1, reusing s2 picks lowest rank (highest id).
+        arena.free_high_slot(s2)
+        assert arena.high_frontier == arena.slot_layout.slot_offset(s1)
+        assert arena.available_high_slots == 2
+        assert arena.alloc_high_slot() == 2
+        # Freeing top-rank s1 shrinks frontier back to s2; freeing s2 shrinks to capacity_bytes.
+        arena.free_high_slot(s1)
+        assert arena.high_frontier == arena.slot_layout.slot_offset(2)
+        arena.free_high_slot(2)
+        assert arena.high_frontier == 2048
+
+    with Uint8DualArena(2048, device="cpu", slot_bytes=512, high_max_slots=3, alignment=256) as a2:
+        view = a2.high_pool_view((128,), field_offset=256)
+        assert tuple(view.shape) == (3, 128)
+        assert view.stride(0) == 512
+        sid = a2.alloc_high_slot()
+        view[sid].fill_(7)
+        assert int(a2.high_slot_tensor(sid)[256:384].min().item()) == 7
+        with pytest.raises(ValueError, match="multiple of 16"):
+            a2.high_pool_view((16,), field_offset=8)
+
+
+def test_high_owner_claim_guards_and_release_reset() -> None:
+    def _reclaim(_need: int) -> None:
+        return None
+
+    with Uint8DualArena(2048, device="cpu", alignment=256) as arena:
+        arena.configure_high_slots(512, max_slots=3)
+        layout, fresh = arena._claim_high_owner(_reclaim, 512, 3)
+        assert not fresh and layout.max_slots == 3
+        with pytest.raises(RuntimeError, match="owner is attached"):
+            arena.configure_high_slots(256)
+        with pytest.raises(RuntimeError, match="owner is attached"):
+            arena.set_high_reclaimer(None)
+        with pytest.raises(RuntimeError, match="owner is attached"):
+            arena.clear_high_reclaimer(_reclaim)
+        arena.clear_high_reclaimer(lambda _need: None)
+        arena._release_high_owner(_reclaim, reset_expected=None)
+        assert arena.slot_layout is not None
+
+        layout, fresh = arena._claim_high_owner(_reclaim, 512, 3)
+        assert not fresh
+        arena._release_high_owner(_reclaim, reset_expected=arena.slot_layout)
+        assert arena.slot_layout is None
+
+        auto_layout, auto_fresh = arena._claim_high_owner(_reclaim, 256, 4)
+        assert auto_fresh and auto_layout.max_slots == 4
+        arena._release_high_owner(_reclaim, reset_expected=auto_layout)
+        assert arena.slot_layout is None
+
+
+def test_slot_tracker_hole_reuse_frontier_and_availability() -> None:
+    with Uint8DualArena(
+        2048,
+        device="cpu",
+        slot_bytes=256,
+        high_max_slots=4,
+        low_slot_bytes=256,
+        low_max_slots=6,
+        alignment=256,
+    ) as arena:
+        l0, l1, l2, l3 = (arena.alloc_low_slot() for _ in range(4))
+        assert (l0, l1, l2, l3) == (0, 1, 2, 3)
+        assert arena.available_low_slots == 2  # capped by low_max_slots=6 (6 - 4)
+        assert arena.available_high_slots == 4  # high occupies [1024, 2048), clear of low_frontier=1024
+        arena.free_low_slot(l1)
+        assert arena.low_frontier == 1024
+        assert arena.available_low_slots == 3
+        arena.free_low_slot(l3)
+        arena.free_low_slot(l2)
+        # Reclaiming l3 then l2 collapses past the hole l1 straight down to l0.
+        assert arena.low_frontier == 256
+        assert arena.available_low_slots == 5
+        assert arena.alloc_low_slot() == 1
+        assert arena.alloc_low_slot(max_slot_id=2) == 2
+
+        h3, h2, h1 = (arena.alloc_high_slot() for _ in range(3))
+        assert (h3, h2, h1) == (3, 2, 1)
+        assert arena.high_frontier == 1280  # 5 low slots fit below 1280; 3 allocated -> 2 available
+        assert arena.available_low_slots == 2
+        assert arena.available_high_slots == 1
+        arena.free_high_slot(h2)
+        arena.free_high_slot(h1)
+        assert arena.high_frontier == 1792
+        assert arena.available_high_slots == 3
+
+
 def test_peer_frontier_reclaimer_callbacks() -> None:
     with Uint8DualArena(
         2048,
@@ -1552,7 +1563,6 @@ def test_peer_frontier_reclaimer_callbacks() -> None:
         with pytest.raises(RuntimeError, match="already registered"):
             arena.set_low_reclaimer(lambda _t: None)
 
-        # Wrong callback identity does not clear the active reclaimer.
         arena.clear_low_reclaimer(lambda _t: None)
         hi2 = arena.alloc_high_slot()
         assert hi2 == 2
@@ -1579,65 +1589,60 @@ def test_peer_frontier_reclaimer_callbacks() -> None:
             arena.alloc_low_slot()
         assert stalled_calls == [1536]
 
-        # Stalled low_reclaimer stops cleanly; set_low_reclaimer(None) clears unconditionally.
-        arena.set_low_reclaimer(None)
+
+def test_peer_frontier_reclaimer_concurrent_race_and_closed() -> None:
+    with Uint8DualArena(
+        2048,
+        device="cpu",
+        slot_bytes=512,
+        low_slot_bytes=768,
+        alignment=256,
+    ) as arena:
+        assert arena.alloc_low_slot() == 0
+        assert arena.alloc_low_slot() == 1
+        assert arena.alloc_high_slot() == 3
+
         stalled_low: list[int] = []
         arena.set_low_reclaimer(stalled_low.append)
         with pytest.raises(ArenaCapacityError):
             arena.alloc_high_slot()
-        assert stalled_low == [512]
+        assert stalled_low == [1024]
         arena.set_low_reclaimer(None)
 
+        # Peer frees a slot, another thread steals it once; free_epoch lets it retry and succeed.
+        race_calls = 0
 
-def test_peer_frontier_reclaimer_closed_and_variable_slice_reclaim() -> None:
-    arena = Uint8DualArena(1024, device="cpu", slot_bytes=512, low_slot_bytes=512, alignment=256)
+        def racing_low_reclaim(_target_low: int) -> None:
+            nonlocal race_calls
+            race_calls += 1
+            arena.free_low_slot(1)
+            if race_calls == 1:
+                assert arena.alloc_low_slot(allow_reclaim=False) == 1
+
+        arena.set_low_reclaimer(racing_low_reclaim)
+        assert arena.alloc_high_slot() == 2
+        assert race_calls == 2
+
+        # Bounded livelock termination when a peer always frees and immediately steals back.
+        livelock_calls = 0
+
+        def livelock_low_reclaim(_target_low: int) -> None:
+            nonlocal livelock_calls
+            livelock_calls += 1
+            arena.free_low_slot(0)
+            assert arena.alloc_low_slot(allow_reclaim=False) == 0
+
+        arena.set_low_reclaimer(None)
+        arena.set_low_reclaimer(livelock_low_reclaim)
+        with pytest.raises(ArenaCapacityError):
+            arena.alloc_high_slot()
+        assert 2 <= livelock_calls <= 10
+
     arena.close()
     with pytest.raises(RuntimeError, match="closed"):
         arena.set_low_reclaimer(lambda _t: None)
     with pytest.raises(RuntimeError, match="closed"):
         arena.set_high_reclaimer(lambda _t: None)
-
-    # Variable alloc_low slices also work with low_reclaimer when alloc_high_slot collides.
-    with Uint8DualArena(1024, device="cpu", slot_bytes=512, alignment=256) as var_arena:
-        s0 = var_arena.alloc_low(512)
-        var_arena.set_low_reclaimer(lambda _target: s0.release())
-        assert var_arena.alloc_high_slot() == 1
-        assert var_arena.alloc_high_slot() == 0
-
-
-def test_interleaved_kv_views_and_structured_side_pools() -> None:
-    h_kv, d, c_tok = 4, 64, 1024
-    slot_bytes = 2 * h_kv * c_tok * d
-    for num_slots in (1, 3):
-        arena = Uint8DualArena(
-            num_slots * slot_bytes, device="cpu", slot_bytes=slot_bytes, alignment=256
-        )
-        try:
-            k, v = arena.interleaved_kv_views(num_kv_heads=h_kv, head_dim=d, chunk_tokens=c_tok)
-            assert k.dtype is torch.uint8
-            assert v.dtype is torch.uint8
-            assert tuple(k.shape) == (num_slots, h_kv, c_tok, d)
-            assert tuple(v.shape) == (num_slots, h_kv, 16, d, 64)
-            assert arena.slot_layout is not None
-            assert k.stride(0) == arena.slot_layout.slot_stride > 0
-            assert v.stride(0) == arena.slot_layout.slot_stride > 0
-            assert k.stride(0) % 16 == 0
-            assert k.data_ptr() % 16 == 0
-            assert v.data_ptr() % 16 == 0
-            assert k.storage_offset() % 16 == 0
-            assert v.storage_offset() % 16 == 0
-            slot = arena.alloc_high_slot()
-            k[slot, 0, 0, :4] = torch.tensor([11, 22, 33, 44], dtype=torch.uint8)
-            assert arena.high_slot_tensor(slot)[:4].tolist() == [11, 22, 33, 44]
-        finally:
-            arena.close()
-
-    with pytest.raises(ValueError, match="multiple of 16"):
-        bad = Uint8DualArena(8192, device="cpu", slot_bytes=2 * 1 * 64 * 1, alignment=256)
-        try:
-            bad.interleaved_kv_views(num_kv_heads=1, head_dim=1, chunk_tokens=8, tail_subblock=4)
-        finally:
-            bad.close()
 
 
 @CUDA
@@ -1648,26 +1653,27 @@ def test_dual_arena_and_side_pools_cuda_custom_alignment_and_inference_mode() ->
     try:
         with torch.inference_mode():
             arena = Uint8DualArena(
-                4096, device=device, slot_bytes=1024, alignment=1024
+                4096, device=device, slot_bytes=1024, low_slot_bytes=1024, alignment=1024
             )
             pool = TypedSidePool(
                 2, (4,), dtype=torch.float32, device=device, alignment_bytes=1024
             )
         try:
-            slc = arena.alloc_low(64)
+            low_id = arena.alloc_low_slot()
+            low_t = arena.low_slot_tensor(low_id)
             slot_id = arena.alloc_high_slot()
             slot_t = arena.high_slot_tensor(slot_id)
-            assert slc.tensor.data_ptr() % 1024 == 0
+            assert low_t.data_ptr() % 1024 == 0
             assert slot_t.data_ptr() % 1024 == 0
             assert pool.tensor.data_ptr() % 1024 == 0
-            assert not slc.tensor.is_inference()
+            assert not low_t.is_inference()
             assert not pool.tensor.is_inference()
             # Writable from normal-mode background thread despite construction inside inference_mode().
             write_err: list[BaseException] = []
 
             def worker_write() -> None:
                 try:
-                    slc.tensor.fill_(9)
+                    low_t.fill_(9)
                     pool.tensor.fill_(3.5)
                 except BaseException as exc:  # pragma: no cover
                     write_err.append(exc)
@@ -1677,62 +1683,13 @@ def test_dual_arena_and_side_pools_cuda_custom_alignment_and_inference_mode() ->
             t.join(timeout=5.0)
             torch.cuda.synchronize(device)
             assert not write_err
-            assert int(slc.tensor[0].item()) == 9
+            assert int(low_t[0].item()) == 9
             assert float(pool.slot(0)[0].item()) == 3.5
         finally:
             pool.close()
             arena.close()
     finally:
         del spacer
-
-def test_structured_and_kv_metadata_side_pools() -> None:
-    # Generic StructuredSidePool with mixed heterogeneous field shapes.
-    side_budget = VramBudget(1024 * 1024)
-    structured = StructuredSidePool(
-        4,
-        {"alpha": (2, 3), "beta": (5,)},
-        dtype=torch.float32,
-        device="cpu",
-        budget=side_budget,
-    )
-    assert structured.field_names == ("alpha", "beta")
-    assert side_budget.reserved_bytes == structured.nbytes
-    for fname in structured.field_names:
-        t = structured[fname]
-        assert t.stride(0) == structured.stride0 > 0
-        assert (t.stride(0) * 4) % 16 == 0
-        assert (t.storage_offset() * 4) % 16 == 0
-        assert t[0].is_contiguous()
-    structured["alpha"].fill_(5.0)
-    structured["beta"].fill_(9.0)
-    assert torch.all(structured.field("alpha") == 5.0)
-    assert torch.all(structured.field("beta") == 9.0)
-    structured.close()
-    assert side_budget.reserved_bytes == 0
-    with pytest.raises(RuntimeError, match="closed"):
-        _ = structured["alpha"]
-
-    # KvMetadataPool wrapper over StructuredSidePool.
-    meta = TypedSidePool.for_kv_metadata(
-        4,
-        key_shape=(3, 1),
-        value_shape=(3, 5),
-        dtype=torch.float32,
-        device="cpu",
-        budget=side_budget,
-    )
-    assert isinstance(meta, KvMetadataPool)
-    assert side_budget.reserved_bytes == meta.nbytes
-    for tensor in (meta.key_scale, meta.key_center, meta.value_scale, meta.value_mean):
-        assert tensor.dtype is torch.float32
-        assert tensor.stride(0) == meta.stride0 > 0
-        assert (tensor.stride(0) * 4) % 16 == 0
-        assert (tensor.storage_offset() * 4) % 16 == 0
-        assert tensor[0].is_contiguous()
-    meta.close()
-    assert side_budget.reserved_bytes == 0
-    with pytest.raises(RuntimeError, match="closed"):
-        _ = meta.key_scale
 
 
 @CUDA
@@ -1743,31 +1700,33 @@ def test_dual_arena_single_dtype_torch_compile_fullgraph(
     request.addfinalizer(torch.compiler.reset)
     device = torch.device("cuda")
     h_kv, d, c_tok = 2, 64, 1024
-    slot_bytes = 2 * h_kv * c_tok * d
-    total_bytes = 4 * slot_bytes
+    kv_schema = SlotSchema({"k": (h_kv, c_tok, d), "v": (h_kv, c_tok // 64, d, 64)}, field_alignment=256)
+    low_schema = SlotSchema({"w": (8, 8)}, field_alignment=256)
+    total_bytes = 2 * kv_schema.drawer_bytes + 2 * low_schema.drawer_bytes
 
-    arena = Uint8DualArena(total_bytes, device=device, slot_bytes=slot_bytes, alignment=256)
-    meta = KvMetadataPool(
-        arena.slot_layout.max_slots if arena.slot_layout is not None else 4,
-        key_shape=(h_kv, d),
-        value_shape=(h_kv, c_tok),
-        dtype=torch.float32,
+    arena = Uint8DualArena(
+        total_bytes,
         device=device,
+        slot_bytes=kv_schema.drawer_bytes,
+        high_max_slots=2,
+        low_slot_bytes=low_schema.drawer_bytes,
+        low_max_slots=2,
+        alignment=256,
     )
+    k_scale_pool = TypedSidePool(2, (h_kv, d), dtype=torch.float32, device=device)
     try:
-        low_slice = arena.alloc_low(64, tag="moe_weight")
-        moe_w = low_slice.as_uint8((8, 8))
-        moe_w.fill_(3)
+        low_id = arena.alloc_low_slot()
+        low_view = arena.low_pool_view(low_schema.arena_field("w").shape)
+        low_view[low_id].fill_(3)
 
         slot_id = arena.alloc_high_slot()
-        k_pool, v_pool = arena.interleaved_kv_views(
-            num_kv_heads=h_kv,
-            head_dim=d,
-            chunk_tokens=c_tok,
-        )
+        k_field = kv_schema.arena_field("k")
+        v_field = kv_schema.arena_field("v")
+        k_pool = arena.high_pool_view(k_field.shape, field_offset=k_field.offset)
+        v_pool = arena.high_pool_view(v_field.shape, field_offset=v_field.offset)
         k_pool[slot_id].zero_()
         v_pool[slot_id].zero_()
-        meta.key_scale[slot_id].zero_()
+        k_scale_pool.tensor[slot_id].zero_()
 
         def compiled_step(
             w: torch.Tensor,
@@ -1778,11 +1737,11 @@ def test_dual_arena_single_dtype_torch_compile_fullgraph(
             k[slot_id, :, 0, :].fill_(5)
             v[slot_id, :, 0, :, 0].fill_(7)
             k_scale[slot_id].fill_(2.5)
-            return w.to(torch.float32).sum() + k_scale[slot_id].sum()
+            return w[low_id].to(torch.float32).sum() + k_scale[slot_id].sum()
 
         fn = torch.compile(compiled_step, fullgraph=True)
-        out1 = fn(moe_w, k_pool, v_pool, meta.key_scale)
-        out2 = fn(moe_w, k_pool, v_pool, meta.key_scale)
+        out1 = fn(low_view, k_pool, v_pool, k_scale_pool.tensor)
+        out2 = fn(low_view, k_pool, v_pool, k_scale_pool.tensor)
         torch.cuda.synchronize(device)
 
         expected = torch.tensor(64 * 3.0 + h_kv * d * 2.5, device=device)
@@ -1792,7 +1751,7 @@ def test_dual_arena_single_dtype_torch_compile_fullgraph(
         assert int(v_pool[slot_id, :, 0, :, 0].min().item()) == 7
         assert int(arena.high_slot_tensor(slot_id)[0].item()) == 5
     finally:
-        meta.close()
+        k_scale_pool.close()
         arena.close()
 
 
@@ -1858,7 +1817,7 @@ def test_regular_adapter_bind_gpu_arena_and_invariant_checks() -> None:
     adapter = RegularAdapter()
     expert_1 = adapter.slice_host(adapter.capture_host(stacked), 1, dim=0)
     f32_host = adapter.capture_host(torch.randn(4, 8, dtype=torch.float32))
-    arena = Uint8DualArena(4096, device="cpu", alignment=256)
+    arena = Uint8DualArena(4096, device="cpu", low_slot_bytes=256, alignment=256)
 
     @dataclass
     class _ArenaAllocator:
@@ -1866,7 +1825,8 @@ def test_regular_adapter_bind_gpu_arena_and_invariant_checks() -> None:
 
         def allocate(self, s: BufferSpec, *, device: torch.device) -> torch.Tensor:
             assert s.arena_eligible and device.type == "cpu"
-            return self.arena_ref.alloc_low(s.nbytes, tag=s.name).as_uint8(s.shape)
+            sid = self.arena_ref.alloc_low_slot()
+            return self.arena_ref.low_slot_tensor(sid)[: s.nbytes].view(s.shape)
 
     allocator: GpuAllocator = _ArenaAllocator(arena)
     gpu_state = adapter.bind_gpu(expert_1, allocator, torch.device("cpu"))
@@ -1938,3 +1898,173 @@ def test_regular_adapter_bind_gpu_rejects_misaligned_and_wrong_index_cuda_buffer
 
     with pytest.raises(ValueError, match="incompatible buffer"):
         adapter.bind_gpu(host, _WrongIndexAllocator(), torch.device("cuda", 1))
+
+
+# ---------------------------------------------------------------------------
+# _WaveReleaseTracker
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _DummyWaveSlot:
+    slot_id: int
+    active_readers: int = 0
+    lease: StreamLease | None = None
+    lease_lock: threading.Lock = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        self.lease_lock = threading.Lock()
+
+
+@CUDA
+def test_wave_tracker_overlapping_handoff_during_reap_preserves_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import piper_offload._slab_pool_common as common_mod
+
+    device = torch.device("cuda")
+    lock = threading.Lock()
+    cond = threading.Condition(lock)
+    tracker = common_mod._WaveReleaseTracker(device, lock, cond)
+    stream = torch.cuda.current_stream(device)
+
+    slot = _DummyWaveSlot(slot_id=0, lease=StreamLease(stream))
+    assert slot.lease is not None
+    slot.lease.stage_with(lambda: None, stream)
+
+    lease1 = tracker.new_lease()
+    lease2 = tracker.new_lease()
+    with lock:
+        lease1.add_unlocked(slot)
+        lease2.add_unlocked(slot)
+    lease1.acquire()
+    lease2.acquire()
+    lease1.handoff_to_pool()
+
+    entered = threading.Event()
+    proceed = threading.Event()
+    reap_err: list[BaseException] = []
+    orig_rel = common_mod._release_slot_stream_lease
+
+    def paused_rel(*args: object, **kwargs: object) -> tuple[bool, BaseException | None]:
+        entered.set()
+        proceed.wait(timeout=5.0)
+        return orig_rel(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(common_mod, "_release_slot_stream_lease", paused_rel)
+    try:
+        def run_reap() -> None:
+            try:
+                tracker.reap(lambda: False)
+            except BaseException as exc:  # pragma: no cover
+                reap_err.append(exc)
+
+        t_reap = threading.Thread(target=run_reap)
+        t_reap.start()
+        assert entered.wait(timeout=5.0)
+        monkeypatch.undo()
+        lease2.handoff_to_pool()
+        proceed.set()
+        t_reap.join(timeout=5.0)
+        assert not reap_err
+        assert len(tracker.pending) == 1
+        tracker.reap(lambda: False)
+        assert slot.active_readers == 0
+        assert len(tracker.pending) == 0
+    finally:
+        entered.set()
+        proceed.set()
+        monkeypatch.undo()
+        slot.lease.synchronize_and_reset()
+
+
+@CUDA
+def test_wave_lease_release_propagates_interrupt_after_successful_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import piper_offload._slab_pool_common as common_mod
+
+    device = torch.device("cuda")
+    lock = threading.Lock()
+    tracker = common_mod._WaveReleaseTracker(device, lock, threading.Condition(lock))
+    stream = torch.cuda.current_stream(device)
+    slot_a = _DummyWaveSlot(slot_id=0, lease=StreamLease(stream))
+    assert slot_a.lease is not None
+    slot_a.lease.stage_with(lambda: None, stream)
+
+    orig_rel = common_mod._release_slot_stream_lease
+
+    def release_with_interrupt(
+        slot: object,
+        release_stream: torch.cuda.Stream,
+        end_streams: tuple[torch.cuda.Stream, ...],
+    ) -> tuple[bool, BaseException | None]:
+        ok, _err = orig_rel(slot, release_stream, end_streams)  # type: ignore[arg-type]
+        return ok, Interrupt("retry-succeeded-interrupt")
+
+    try:
+        lease1 = tracker.new_lease()
+        with lock:
+            lease1.add_unlocked(slot_a)
+        lease1.acquire()
+        monkeypatch.setattr(common_mod, "_release_slot_stream_lease", release_with_interrupt)
+        with pytest.raises(Interrupt, match="retry-succeeded-interrupt"):
+            lease1.release()
+        assert slot_a.active_readers == 0
+    finally:
+        monkeypatch.undo()
+        slot_a.lease.synchronize_and_reset()
+
+
+@CUDA
+def test_wave_tracker_reap_propagates_interrupt_after_successful_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import piper_offload._slab_pool_common as common_mod
+
+    device = torch.device("cuda")
+    lock = threading.Lock()
+    tracker = common_mod._WaveReleaseTracker(device, lock, threading.Condition(lock))
+    stream = torch.cuda.current_stream(device)
+
+    slot_a = _DummyWaveSlot(slot_id=0, lease=StreamLease(stream))
+    slot_b = _DummyWaveSlot(slot_id=1, lease=StreamLease(stream))
+    assert slot_a.lease is not None and slot_b.lease is not None
+    slot_a.lease.stage_with(lambda: None, stream)
+    slot_b.lease.stage_with(lambda: None, stream)
+
+    orig_rel = common_mod._release_slot_stream_lease
+    calls = 0
+
+    def release_first_with_interrupt(
+        slot: object,
+        release_stream: torch.cuda.Stream,
+        end_streams: tuple[torch.cuda.Stream, ...],
+    ) -> tuple[bool, BaseException | None]:
+        nonlocal calls
+        calls += 1
+        ok, _err = orig_rel(slot, release_stream, end_streams)  # type: ignore[arg-type]
+        return (ok, Interrupt("retry-succeeded-interrupt")) if calls == 1 else (ok, None)
+
+    try:
+        lease2 = tracker.new_lease()
+        with lock:
+            lease2.add_unlocked(slot_a)
+            lease2.add_unlocked(slot_b)
+        lease2.acquire()
+        lease2.handoff_to_pool()
+        assert len(tracker.pending) == 2
+        monkeypatch.setattr(common_mod, "_release_slot_stream_lease", release_first_with_interrupt)
+        with pytest.raises(Interrupt, match="retry-succeeded-interrupt"):
+            tracker.reap(lambda: False)
+        monkeypatch.undo()
+        assert slot_a.active_readers == 0
+        assert slot_b.active_readers == 1
+        assert len(tracker.pending) == 1
+        tracker.reap(lambda: False)
+        assert slot_b.active_readers == 0
+        assert len(tracker.pending) == 0
+    finally:
+        monkeypatch.undo()
+        slot_a.lease.synchronize_and_reset()
+        slot_b.lease.synchronize_and_reset()
