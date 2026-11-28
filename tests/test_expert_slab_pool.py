@@ -1402,3 +1402,103 @@ def test_cuda_d2d_release_failure_recovery(monkeypatch: pytest.MonkeyPatch) -> N
         assert budget.reserved_bytes == 0
     finally:
         pin_mgr.clear()
+
+
+def _run_expert_across_op_wait(
+    pool: ExpertSlabPool,
+    monkeypatch: pytest.MonkeyPatch,
+    setup_fn,
+    release_fn,
+    eid: int,
+    expected_up: torch.Tensor,
+) -> None:
+    wait_entered = threading.Event()
+    errors: list[BaseException] = []
+    orig_wait = pool._op_cond.wait
+
+    def spy_wait(timeout: float | None = None) -> bool:
+        wait_entered.set()
+        return orig_wait(timeout=timeout)
+
+    def worker_fn() -> None:
+        try:
+            with pool.waves("moe", [eid]) as ew:
+                w = next(ew)
+                sid = int(w.expert_to_slot[eid].item())
+                torch.testing.assert_close(w.arena_views["up"][sid, :256], expected_up)
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    setup_fn()
+    monkeypatch.setattr(pool._op_cond, "wait", spy_wait)
+    worker = threading.Thread(target=worker_fn)
+    worker.start()
+    try:
+        assert wait_entered.wait(timeout=5.0)
+        monkeypatch.undo()
+        release_fn()
+        worker.join(timeout=5.0)
+        assert not worker.is_alive() and not errors
+    finally:
+        monkeypatch.undo()
+        if worker.is_alive():
+            release_fn()
+            worker.join(timeout=2.0)
+
+
+def test_obtain_slot_waits_for_relocating_and_inflight_frees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from piper_offload.expert_slab_pool import _SlotPhase
+
+    schema = SlotSchema({"up": 256, "down": 128}, {"scale": (torch.float32, (8,))})
+    pm = PinManager(max_pinned_bytes=16 * 1024 * 1024, max_host_bytes=16 * 1024 * 1024)
+    experts = [_make_synthetic_expert(i, up_bytes=256, down_bytes=128) for i in range(3)]
+    try:
+        with (
+            Uint8DualArena(2 * schema.drawer_bytes, device="cpu", alignment=256) as arena,
+            ExpertSlabPool(arena, schema, max_slots=2, pin_manager=pm) as pool,
+        ):
+            pool.register_group("moe", experts)
+            with pool.waves("moe", [0, 1]) as waves:
+                _ = list(waves)
+
+            def setup_relocating() -> None:
+                with pool._lock:
+                    for s in pool._slots.values():
+                        s.phase = _SlotPhase.RELOCATING
+
+            def release_relocating() -> None:
+                with pool._lock:
+                    for s in pool._slots.values():
+                        s.phase = _SlotPhase.READY
+                    pool._op_cond.notify_all()
+
+            _run_expert_across_op_wait(
+                pool, monkeypatch, setup_relocating, release_relocating, 2, experts[2]["up"]
+            )
+
+            # Case 2: _inflight_arena_frees > 0 holds the only slot off-lock before free_low_slot.
+            with pool._lock:
+                slot0 = pool._slots[0]
+                slot0.active_readers = 1
+                slot1 = pool._slots.pop(1)
+                pool._unbind_slot_unlocked(slot1, count_eviction=False, next_phase=_SlotPhase.EMPTY)
+                pool._inflight_arena_frees = 1
+
+            def setup_inflight_free() -> None:
+                pass
+
+            def release_inflight_free() -> None:
+                arena.free_low_slot(1)
+                with pool._lock:
+                    slot0.active_readers = 0
+                    pool._inflight_arena_frees = 0
+                    pool._op_cond.notify_all()
+
+            _run_expert_across_op_wait(
+                pool, monkeypatch, setup_inflight_free, release_inflight_free, 1, experts[1]["up"]
+            )
+    finally:
+        monkeypatch.undo()
+        pm.clear()
